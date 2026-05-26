@@ -1,30 +1,30 @@
 //! Chain-neutral datalens vocabulary shared across workspace crates.
 
 pub mod chain {
-    use serde::{Deserialize, Deserializer, Serialize, de::Error};
+    use serde::{Deserialize, Serialize};
 
     use crate::{DatalensError, DatalensErrorKind};
 
-    #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+    #[derive(Deserialize)]
+    enum RawChainFamily {
+        Evm,
+        Other(String),
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[serde(try_from = "RawChainFamily")]
     pub enum ChainFamily {
         Evm,
         Other(String),
     }
 
-    impl<'de> Deserialize<'de> for ChainFamily {
-        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-        where
-            D: Deserializer<'de>,
-        {
-            #[derive(Deserialize)]
-            enum RawChainFamily {
-                Evm,
-                Other(String),
-            }
+    impl TryFrom<RawChainFamily> for ChainFamily {
+        type Error = DatalensError;
 
-            match RawChainFamily::deserialize(deserializer)? {
+        fn try_from(value: RawChainFamily) -> Result<Self, Self::Error> {
+            match value {
                 RawChainFamily::Evm => Ok(Self::Evm),
-                RawChainFamily::Other(value) => Self::try_other(value).map_err(D::Error::custom),
+                RawChainFamily::Other(value) => Self::try_other(value),
             }
         }
     }
@@ -43,28 +43,28 @@ pub mod chain {
         }
     }
 
-    #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+    #[derive(Deserialize)]
     #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+    enum RawNetworkId {
+        Numeric(u64),
+        Textual(String),
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+    #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+    #[serde(try_from = "RawNetworkId")]
     pub enum NetworkId {
         Numeric(u64),
         Textual(String),
     }
 
-    impl<'de> Deserialize<'de> for NetworkId {
-        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-        where
-            D: Deserializer<'de>,
-        {
-            #[derive(Deserialize)]
-            #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
-            enum RawNetworkId {
-                Numeric(u64),
-                Textual(String),
-            }
+    impl TryFrom<RawNetworkId> for NetworkId {
+        type Error = DatalensError;
 
-            match RawNetworkId::deserialize(deserializer)? {
+        fn try_from(value: RawNetworkId) -> Result<Self, Self::Error> {
+            match value {
                 RawNetworkId::Numeric(value) => Ok(Self::Numeric(value)),
-                RawNetworkId::Textual(value) => Self::textual(value).map_err(D::Error::custom),
+                RawNetworkId::Textual(value) => Self::textual(value),
             }
         }
     }
@@ -89,7 +89,16 @@ pub mod chain {
         }
     }
 
-    #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+    #[derive(Deserialize)]
+    struct RawChainIdentity {
+        family: ChainFamily,
+        configured_name: String,
+        #[serde(default)]
+        network_id: Option<NetworkId>,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[serde(try_from = "RawChainIdentity")]
     pub struct ChainIdentity {
         family: ChainFamily,
         configured_name: String,
@@ -97,21 +106,11 @@ pub mod chain {
         network_id: Option<NetworkId>,
     }
 
-    impl<'de> Deserialize<'de> for ChainIdentity {
-        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-        where
-            D: Deserializer<'de>,
-        {
-            #[derive(Deserialize)]
-            struct RawChainIdentity {
-                family: ChainFamily,
-                configured_name: String,
-                #[serde(default)]
-                network_id: Option<NetworkId>,
-            }
+    impl TryFrom<RawChainIdentity> for ChainIdentity {
+        type Error = DatalensError;
 
-            let raw = RawChainIdentity::deserialize(deserializer)?;
-            Self::try_new(raw.family, raw.configured_name, raw.network_id).map_err(D::Error::custom)
+        fn try_from(raw: RawChainIdentity) -> Result<Self, Self::Error> {
+            Self::try_new(raw.family, raw.configured_name, raw.network_id)
         }
     }
 
@@ -201,29 +200,28 @@ pub mod chain {
 }
 
 pub mod range {
-    use serde::{Deserialize, Deserializer, Serialize, de::Error};
+    use serde::{Deserialize, Serialize};
 
     use crate::{DatalensError, DatalensErrorKind};
 
-    #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+    #[derive(Deserialize)]
+    struct RawTimeRange {
+        start: u64,
+        end: u64,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[serde(try_from = "RawTimeRange")]
     pub struct TimeRange {
         start: u64,
         end: u64,
     }
 
-    impl<'de> Deserialize<'de> for TimeRange {
-        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-        where
-            D: Deserializer<'de>,
-        {
-            #[derive(Deserialize)]
-            struct RawTimeRange {
-                start: u64,
-                end: u64,
-            }
+    impl TryFrom<RawTimeRange> for TimeRange {
+        type Error = DatalensError;
 
-            let raw = RawTimeRange::deserialize(deserializer)?;
-            Self::try_blocks(raw.start, raw.end).map_err(D::Error::custom)
+        fn try_from(raw: RawTimeRange) -> Result<Self, Self::Error> {
+            Self::try_blocks(raw.start, raw.end)
         }
     }
 
@@ -251,25 +249,24 @@ pub mod range {
         }
     }
 
-    #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+    #[derive(Deserialize)]
+    struct RawBlockRange {
+        from_block: u64,
+        to_block: u64,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[serde(try_from = "RawBlockRange")]
     pub struct BlockRange {
         pub from_block: u64,
         pub to_block: u64,
     }
 
-    impl<'de> Deserialize<'de> for BlockRange {
-        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-        where
-            D: Deserializer<'de>,
-        {
-            #[derive(Deserialize)]
-            struct RawBlockRange {
-                from_block: u64,
-                to_block: u64,
-            }
+    impl TryFrom<RawBlockRange> for BlockRange {
+        type Error = DatalensError;
 
-            let raw = RawBlockRange::deserialize(deserializer)?;
-            Self::try_new(raw.from_block, raw.to_block).map_err(D::Error::custom)
+        fn try_from(raw: RawBlockRange) -> Result<Self, Self::Error> {
+            Self::try_new(raw.from_block, raw.to_block)
         }
     }
 
@@ -353,20 +350,19 @@ pub mod range {
 }
 
 pub mod dataset {
-    use serde::{Deserialize, Deserializer, Serialize, de::Error};
+    use serde::{Deserialize, Serialize};
 
     use crate::{DatalensError, chain::validate_identifier};
 
-    #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[serde(try_from = "String")]
     pub struct DatasetId(String);
 
-    impl<'de> Deserialize<'de> for DatasetId {
-        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-        where
-            D: Deserializer<'de>,
-        {
-            let value = String::deserialize(deserializer)?;
-            Self::try_new(value).map_err(D::Error::custom)
+    impl TryFrom<String> for DatasetId {
+        type Error = DatalensError;
+
+        fn try_from(value: String) -> Result<Self, Self::Error> {
+            Self::try_new(value)
         }
     }
 
@@ -402,7 +398,7 @@ pub mod dataset {
 }
 
 pub mod coverage {
-    use serde::{Deserialize, Deserializer, Serialize, de::Error};
+    use serde::{Deserialize, Serialize};
 
     use crate::{
         BlockRange, ChainIdentity, DatalensError, DatalensErrorKind, Dataset, EvmLogFilter,
@@ -495,7 +491,16 @@ pub mod coverage {
         Empty,
     }
 
-    #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+    #[derive(Deserialize)]
+    struct RawCoverageRecord {
+        key: CoverageKey,
+        range: BlockRange,
+        row_count: usize,
+        object_key: Option<String>,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[serde(try_from = "RawCoverageRecord")]
     pub struct CoverageRecord {
         key: CoverageKey,
         range: BlockRange,
@@ -503,22 +508,11 @@ pub mod coverage {
         object_key: Option<String>,
     }
 
-    impl<'de> Deserialize<'de> for CoverageRecord {
-        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-        where
-            D: Deserializer<'de>,
-        {
-            #[derive(Deserialize)]
-            struct RawCoverageRecord {
-                key: CoverageKey,
-                range: BlockRange,
-                row_count: usize,
-                object_key: Option<String>,
-            }
+    impl TryFrom<RawCoverageRecord> for CoverageRecord {
+        type Error = DatalensError;
 
-            let raw = RawCoverageRecord::deserialize(deserializer)?;
+        fn try_from(raw: RawCoverageRecord) -> Result<Self, Self::Error> {
             Self::try_from_parts(raw.key, raw.range, raw.row_count, raw.object_key)
-                .map_err(D::Error::custom)
         }
     }
 
@@ -754,7 +748,7 @@ pub mod result {
 pub mod query {
     use std::collections::BTreeSet;
 
-    use serde::{Deserialize, Deserializer, Serialize, de::Error};
+    use serde::{Deserialize, Serialize};
 
     use crate::{BlockRange, ChainIdentity, DatalensError, DatalensErrorKind, Dataset};
 
@@ -766,7 +760,21 @@ pub mod query {
         pub timestamp: u64,
     }
 
+    #[derive(Deserialize)]
+    struct RawLogRecord {
+        block_number: u64,
+        block_hash: String,
+        transaction_hash: String,
+        transaction_index: u64,
+        log_index: u64,
+        address: String,
+        topics: Vec<String>,
+        data: String,
+        removed: bool,
+    }
+
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[serde(try_from = "RawLogRecord")]
     pub struct LogRecord {
         pub block_number: u64,
         pub block_hash: String,
@@ -777,6 +785,24 @@ pub mod query {
         pub topics: Vec<String>,
         pub data: String,
         pub removed: bool,
+    }
+
+    impl TryFrom<RawLogRecord> for LogRecord {
+        type Error = DatalensError;
+
+        fn try_from(raw: RawLogRecord) -> Result<Self, Self::Error> {
+            Self::try_new(
+                raw.block_number,
+                raw.block_hash,
+                raw.transaction_hash,
+                raw.transaction_index,
+                raw.log_index,
+                raw.address,
+                raw.topics,
+                raw.data,
+                raw.removed,
+            )
+        }
     }
 
     impl LogRecord {
@@ -815,29 +841,27 @@ pub mod query {
         pub topics: Vec<Option<Vec<String>>>,
     }
 
-    #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+    #[derive(Deserialize)]
+    struct RawEvmLogFilter {
+        #[serde(default)]
+        addresses: Vec<String>,
+        #[serde(default)]
+        topics: Vec<TopicFilter>,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[serde(try_from = "RawEvmLogFilter")]
     pub struct EvmLogFilter {
         addresses: Vec<String>,
         topics: Vec<TopicFilter>,
     }
 
-    impl<'de> Deserialize<'de> for EvmLogFilter {
-        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-        where
-            D: Deserializer<'de>,
-        {
-            #[derive(Deserialize)]
-            struct RawEvmLogFilter {
-                #[serde(default)]
-                addresses: Vec<String>,
-                #[serde(default)]
-                topics: Vec<TopicFilter>,
-            }
+    impl TryFrom<RawEvmLogFilter> for EvmLogFilter {
+        type Error = DatalensError;
 
-            let raw = RawEvmLogFilter::deserialize(deserializer)?;
+        fn try_from(raw: RawEvmLogFilter) -> Result<Self, Self::Error> {
             Ok(Self {
-                addresses: normalize_values("address", raw.addresses, 20)
-                    .map_err(D::Error::custom)?,
+                addresses: normalize_values("address", raw.addresses, 20)?,
                 topics: raw.topics,
             })
         }
@@ -902,30 +926,30 @@ pub mod query {
         }
     }
 
-    #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+    #[derive(Deserialize)]
     #[serde(tag = "kind", content = "values", rename_all = "snake_case")]
+    enum RawTopicFilter {
+        Wildcard,
+        AnyOf(Vec<String>),
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[serde(tag = "kind", content = "values", rename_all = "snake_case")]
+    #[serde(try_from = "RawTopicFilter")]
     pub enum TopicFilter {
         Wildcard,
         AnyOf(Vec<String>),
     }
 
-    impl<'de> Deserialize<'de> for TopicFilter {
-        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-        where
-            D: Deserializer<'de>,
-        {
-            #[derive(Deserialize)]
-            #[serde(tag = "kind", content = "values", rename_all = "snake_case")]
-            enum RawTopicFilter {
-                Wildcard,
-                AnyOf(Vec<String>),
-            }
+    impl TryFrom<RawTopicFilter> for TopicFilter {
+        type Error = DatalensError;
 
-            match RawTopicFilter::deserialize(deserializer)? {
+        fn try_from(value: RawTopicFilter) -> Result<Self, Self::Error> {
+            match value {
                 RawTopicFilter::Wildcard => Ok(Self::Wildcard),
-                RawTopicFilter::AnyOf(values) => normalize_values("topic", values, 32)
-                    .map(Self::AnyOf)
-                    .map_err(D::Error::custom),
+                RawTopicFilter::AnyOf(values) => {
+                    normalize_values("topic", values, 32).map(Self::AnyOf)
+                }
             }
         }
     }
@@ -1462,6 +1486,48 @@ mod tests {
             record.topics,
             vec!["0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
         );
+
+        let json = r#"{
+            "block_number":10,
+            "block_hash":"0xblock",
+            "transaction_hash":"0xtx",
+            "transaction_index":0,
+            "log_index":1,
+            "address":"0XAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "topics":["0XBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"],
+            "data":"0x",
+            "removed":false
+        }"#;
+        let decoded: LogRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(decoded.address, record.address);
+        assert_eq!(decoded.topics, record.topics);
+
+        let json = r#"{
+            "block_number":10,
+            "block_hash":"0xblock",
+            "transaction_hash":"0xtx",
+            "transaction_index":0,
+            "log_index":1,
+            "address":"0xabc",
+            "topics":[],
+            "data":"0x",
+            "removed":false
+        }"#;
+        assert!(serde_json::from_str::<LogRecord>(json).is_err());
+
+        let json = r#"{
+            "block_number":10,
+            "block_hash":"0xblock",
+            "transaction_hash":"0xtx",
+            "transaction_index":0,
+            "log_index":1,
+            "address":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "topics":[],
+            "data":"0x0",
+            "removed":false
+        }"#;
+        assert!(serde_json::from_str::<LogRecord>(json).is_err());
+
         assert!(
             LogRecord::try_new(
                 10,
@@ -1504,6 +1570,11 @@ mod tests {
         assert!(DatasetId::try_new("logs").is_ok());
         assert!(DatasetId::try_new(" ").is_err());
         assert!(DatasetId::try_new("bad/path").is_err());
+        assert_eq!(
+            DatasetId::try_from(" logs ".to_owned()).unwrap().as_str(),
+            "logs"
+        );
+        assert!(DatasetId::try_from("bad/path".to_owned()).is_err());
         assert!(TimeRange::try_blocks(1, 2).is_ok());
         assert!(TimeRange::try_blocks(2, 1).is_err());
     }
