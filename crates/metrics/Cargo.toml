@@ -1,0 +1,9 @@
+[package]
+name = "datalens-metrics"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+datalens-core = { path = "../core" }
+prometheus.workspace = true
