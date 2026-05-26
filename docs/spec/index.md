@@ -47,4 +47,6 @@ Then keep the body explicit:
 
 ## Current governing specs
 
-- No topic-specific specs exist yet.
+- Chain-cache project charter:
+  - English: `docs/spec/chain-cache/en/project-charter.md`
+  - Simplified Chinese: `docs/spec/chain-cache/zh-CN/project-charter.md`
