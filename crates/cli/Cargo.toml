@@ -1,15 +1,21 @@
 [package]
-name = "datalens-chain-cache-cli"
+name = "datalens-cli"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
 
 [[bin]]
-name = "datalens-chain-cache"
+name = "datalens"
 path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
-datalens-chain-cache-api = { path = "../api" }
+datalens-api = { path = "../api" }
+datalens-chain = { path = "../chain" }
+datalens-core = { path = "../core" }
+datalens-evm = { path = "../evm" }
+datalens-planner = { path = "../planner" }
+datalens-storage = { path = "../storage" }
+datalens-writer = { path = "../writer" }
 figment.workspace = true
 tokio.workspace = true

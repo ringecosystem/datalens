@@ -1,8 +1,10 @@
 [package]
-name = "datalens-storage"
+name = "datalens-planner"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
 
 [dependencies]
+datalens-chain = { path = "../chain" }
 datalens-core = { path = "../core" }
+datalens-storage = { path = "../storage" }

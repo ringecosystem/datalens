@@ -1,8 +1,9 @@
 [package]
-name = "datalens-storage"
+name = "datalens-writer"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
 
 [dependencies]
 datalens-core = { path = "../core" }
+datalens-storage = { path = "../storage" }
