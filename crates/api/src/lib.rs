@@ -264,7 +264,7 @@ where
                 &fetched,
                 self.writer.record_empty_coverage,
             )?;
-            rows.append(fetched);
+            rows.try_append(fetched)?;
         }
 
         rows.sort();
@@ -294,24 +294,24 @@ where
         }
         if request.chain.configured_name() != self.chain_name {
             return Err(DatalensError::new(
-                DatalensErrorKind::Unsupported,
+                DatalensErrorKind::UnsupportedDataset,
                 "chain is not configured",
             ));
         }
         if self.chain.kind != "evm" {
             return Err(DatalensError::new(
-                DatalensErrorKind::Unsupported,
+                DatalensErrorKind::UnsupportedDataset,
                 "only evm chains are supported",
             ));
         }
 
         match request.dataset {
             Dataset::Blocks if !self.chain.datasets.blocks.enabled => Err(DatalensError::new(
-                DatalensErrorKind::Unsupported,
+                DatalensErrorKind::UnsupportedDataset,
                 "blocks dataset is disabled",
             )),
             Dataset::Logs if !self.chain.datasets.logs.enabled => Err(DatalensError::new(
-                DatalensErrorKind::Unsupported,
+                DatalensErrorKind::UnsupportedDataset,
                 "logs dataset is disabled",
             )),
             Dataset::Logs => {
@@ -400,19 +400,13 @@ impl IntoResponse for ApiError {
             DatalensErrorKind::InvalidInput | DatalensErrorKind::InvalidRequest => {
                 StatusCode::BAD_REQUEST
             }
-            DatalensErrorKind::Unsupported
-            | DatalensErrorKind::UnsupportedDataset
-            | DatalensErrorKind::UnsupportedFilter => StatusCode::UNPROCESSABLE_ENTITY,
+            DatalensErrorKind::UnsupportedDataset => StatusCode::UNPROCESSABLE_ENTITY,
             DatalensErrorKind::ProviderLimit | DatalensErrorKind::RateLimited => {
                 StatusCode::TOO_MANY_REQUESTS
             }
-            DatalensErrorKind::ProviderTimeout
-            | DatalensErrorKind::Unavailable
-            | DatalensErrorKind::ProviderUnavailable => StatusCode::GATEWAY_TIMEOUT,
+            DatalensErrorKind::ProviderTimeout => StatusCode::GATEWAY_TIMEOUT,
             DatalensErrorKind::ProviderFailure => StatusCode::BAD_GATEWAY,
-            DatalensErrorKind::Persistence
-            | DatalensErrorKind::StorageFailure
-            | DatalensErrorKind::StorageReadFailure
+            DatalensErrorKind::StorageReadFailure
             | DatalensErrorKind::StorageWriteFailure
             | DatalensErrorKind::ManifestUpdateFailure => StatusCode::INTERNAL_SERVER_ERROR,
             DatalensErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,

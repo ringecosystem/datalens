@@ -38,7 +38,10 @@ impl EvmAdapter {
 
 impl ChainAdapter for EvmAdapter {
     fn capabilities(&self) -> AdapterCapabilities {
-        AdapterCapabilities::new(ChainIdentity::new(ChainFamily::Evm, "evm-unconfigured"))
+        AdapterCapabilities::new(ChainIdentity::expect_new(
+            ChainFamily::Evm,
+            "evm-unconfigured",
+        ))
     }
 }
 
@@ -94,36 +97,7 @@ impl EvmRpcClient {
                 )
             })?;
 
-        logs.into_iter()
-            .map(|log| {
-                Ok(LogRecord {
-                    block_number: hex_u64_field(&log, "blockNumber")?,
-                    block_hash: string_field(&log, "blockHash")?,
-                    transaction_hash: string_field(&log, "transactionHash")?,
-                    transaction_index: hex_u64_field(&log, "transactionIndex")?,
-                    log_index: hex_u64_field(&log, "logIndex")?,
-                    address: string_field(&log, "address")?,
-                    topics: log
-                        .get("topics")
-                        .and_then(Value::as_array)
-                        .ok_or_else(|| {
-                            DatalensError::new(DatalensErrorKind::ProviderFailure, "missing topics")
-                        })?
-                        .iter()
-                        .map(|topic| {
-                            topic.as_str().map(str::to_owned).ok_or_else(|| {
-                                DatalensError::new(
-                                    DatalensErrorKind::ProviderFailure,
-                                    "invalid topic",
-                                )
-                            })
-                        })
-                        .collect::<Result<Vec<_>, _>>()?,
-                    data: string_field(&log, "data")?,
-                    removed: log.get("removed").and_then(Value::as_bool).unwrap_or(false),
-                })
-            })
-            .collect()
+        logs.into_iter().map(|log| parse_log_record(&log)).collect()
     }
 
     fn call(&self, method: &str, params: Value) -> Result<Option<Value>, DatalensError> {
@@ -169,6 +143,37 @@ impl EvmRpcClient {
     }
 }
 
+fn parse_log_record(log: &Value) -> Result<LogRecord, DatalensError> {
+    LogRecord::try_new(
+        hex_u64_field(log, "blockNumber")?,
+        string_field(log, "blockHash")?,
+        string_field(log, "transactionHash")?,
+        hex_u64_field(log, "transactionIndex")?,
+        hex_u64_field(log, "logIndex")?,
+        string_field(log, "address")?,
+        log.get("topics")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                DatalensError::new(DatalensErrorKind::ProviderFailure, "missing topics")
+            })?
+            .iter()
+            .map(|topic| {
+                topic.as_str().map(str::to_owned).ok_or_else(|| {
+                    DatalensError::new(DatalensErrorKind::ProviderFailure, "invalid topic")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        string_field(log, "data")?,
+        log.get("removed").and_then(Value::as_bool).unwrap_or(false),
+    )
+    .map_err(|error| {
+        DatalensError::new(
+            DatalensErrorKind::ProviderFailure,
+            format!("invalid provider log payload: {}", error.message),
+        )
+    })
+}
+
 fn evm_log_filter(range: BlockRange, filter: &LogFilter) -> Value {
     let mut value = serde_json::Map::new();
     value.insert(
@@ -207,7 +212,7 @@ pub fn classify_provider_error(code: i64, message: &str) -> DatalensError {
     let kind = if code == -32602 {
         DatalensErrorKind::InvalidInput
     } else if code == -32601 || lower.contains("unsupported") || lower.contains("not supported") {
-        DatalensErrorKind::Unsupported
+        DatalensErrorKind::UnsupportedDataset
     } else if code == 429 || lower.contains("rate") {
         DatalensErrorKind::RateLimited
     } else if lower.contains("range")
@@ -259,7 +264,7 @@ mod tests {
         );
         assert_eq!(
             classify_provider_error(-32601, "method not found").kind,
-            DatalensErrorKind::Unsupported
+            DatalensErrorKind::UnsupportedDataset
         );
         assert_eq!(
             classify_provider_error(-32000, "query returned more than 10000 results").kind,
@@ -273,5 +278,45 @@ mod tests {
             classify_provider_error(429, "too many requests").kind,
             DatalensErrorKind::RateLimited
         );
+    }
+
+    #[test]
+    fn test_parse_log_record_canonicalizes_provider_hex_values() {
+        let record = parse_log_record(&json!({
+            "blockNumber": "0xa",
+            "blockHash": "0xblock",
+            "transactionHash": "0xtx",
+            "transactionIndex": "0x0",
+            "logIndex": "0x1",
+            "address": "0XAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "topics": ["0XBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"],
+            "data": "0x",
+            "removed": false
+        }))
+        .expect("valid log");
+
+        assert_eq!(record.address, "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(
+            record.topics,
+            vec!["0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+        );
+    }
+
+    #[test]
+    fn test_parse_log_record_rejects_invalid_provider_hex_values() {
+        let error = parse_log_record(&json!({
+            "blockNumber": "0xa",
+            "blockHash": "0xblock",
+            "transactionHash": "0xtx",
+            "transactionIndex": "0x0",
+            "logIndex": "0x1",
+            "address": "0xabc",
+            "topics": [],
+            "data": "0x",
+            "removed": false
+        }))
+        .expect_err("invalid address");
+
+        assert_eq!(error.kind, DatalensErrorKind::ProviderFailure);
     }
 }

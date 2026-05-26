@@ -99,18 +99,18 @@ impl LocalStorage {
             let object = self.root.join(object_key);
             let bytes = fs::read(&object).map_err(|error| {
                 DatalensError::new(
-                    DatalensErrorKind::StorageFailure,
+                    DatalensErrorKind::StorageReadFailure,
                     format!("read cached object {}: {error}", object.display()),
                 )
             })?;
             let mut object_rows: QueryRows = serde_json::from_slice(&bytes).map_err(|error| {
                 DatalensError::new(
-                    DatalensErrorKind::StorageFailure,
+                    DatalensErrorKind::StorageReadFailure,
                     format!("decode cached object {}: {error}", object.display()),
                 )
             })?;
             object_rows = filter_rows(object_rows, range);
-            rows.append(object_rows);
+            rows.try_append(object_rows)?;
         }
         rows.sort();
         Ok(rows)
@@ -130,7 +130,7 @@ impl LocalStorage {
 
         fs::create_dir_all(&self.root).map_err(|error| {
             DatalensError::new(
-                DatalensErrorKind::StorageFailure,
+                DatalensErrorKind::StorageWriteFailure,
                 format!("create storage root {}: {error}", self.root.display()),
             )
         })?;
@@ -150,7 +150,7 @@ impl LocalStorage {
             if let Some(parent) = object_path.parent() {
                 fs::create_dir_all(parent).map_err(|error| {
                     DatalensError::new(
-                        DatalensErrorKind::StorageFailure,
+                        DatalensErrorKind::StorageWriteFailure,
                         format!("create object directory {}: {error}", parent.display()),
                     )
                 })?;
@@ -163,7 +163,7 @@ impl LocalStorage {
             })?;
             fs::write(&object_path, bytes).map_err(|error| {
                 DatalensError::new(
-                    DatalensErrorKind::StorageFailure,
+                    DatalensErrorKind::StorageWriteFailure,
                     format!("write cached object {}: {error}", object_path.display()),
                 )
             })?;
@@ -188,13 +188,13 @@ impl LocalStorage {
         }
         let bytes = fs::read(&path).map_err(|error| {
             DatalensError::new(
-                DatalensErrorKind::StorageFailure,
+                DatalensErrorKind::StorageReadFailure,
                 format!("read manifest {}: {error}", path.display()),
             )
         })?;
         serde_json::from_slice(&bytes).map_err(|error| {
             DatalensError::new(
-                DatalensErrorKind::StorageFailure,
+                DatalensErrorKind::StorageReadFailure,
                 format!("decode manifest {}: {error}", path.display()),
             )
         })
@@ -210,7 +210,7 @@ impl LocalStorage {
         })?;
         fs::write(&path, bytes).map_err(|error| {
             DatalensError::new(
-                DatalensErrorKind::StorageFailure,
+                DatalensErrorKind::ManifestUpdateFailure,
                 format!("write manifest {}: {error}", path.display()),
             )
         })
@@ -253,7 +253,7 @@ pub fn missing_ranges(range: BlockRange, covered: &[BlockRange]) -> Vec<BlockRan
             break;
         }
         if cursor < covered_range.from_block {
-            missing.push(BlockRange::new(cursor, covered_range.from_block - 1));
+            missing.push(BlockRange::expect_new(cursor, covered_range.from_block - 1));
         }
         cursor = cursor.max(covered_range.to_block.saturating_add(1));
         if cursor > range.to_block {
@@ -261,7 +261,7 @@ pub fn missing_ranges(range: BlockRange, covered: &[BlockRange]) -> Vec<BlockRan
         }
     }
     if cursor <= range.to_block {
-        missing.push(BlockRange::new(cursor, range.to_block));
+        missing.push(BlockRange::expect_new(cursor, range.to_block));
     }
     missing
 }
@@ -270,11 +270,14 @@ fn coverage_key(dataset: Dataset, filter: Option<&LogFilter>) -> Result<String, 
     Ok(match dataset {
         Dataset::Blocks => "all".to_owned(),
         Dataset::Logs => {
-            let Some(filter) = filter else {
-                return Ok("evm-logs/addr=*/topics=*".to_owned());
+            let filter = match filter {
+                Some(filter) => EvmLogFilter::try_from(filter)?,
+                None => EvmLogFilter::try_from(LogFilter {
+                    addresses: Vec::new(),
+                    topics: Vec::new(),
+                })?,
             };
-            let filter = EvmLogFilter::try_from(filter)?;
-            format!("evm-logs/{}", filter.canonical_key())
+            format!("evm-logs/{}", filter.compact_key())
         }
     })
 }
@@ -319,5 +322,66 @@ fn filter_rows(rows: QueryRows, range: BlockRange) -> QueryRows {
                 .filter(|row| range.contains(row.block_number))
                 .collect(),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use datalens_core::{LogRecord, QueryRows};
+
+    use super::*;
+
+    #[test]
+    fn test_log_filter_object_key_uses_compact_storage_safe_segment() {
+        let storage = LocalStorage::new(temp_storage_root("compact-log-filter"));
+        let range = BlockRange::expect_new(1, 1);
+        let filter = LogFilter {
+            addresses: vec!["0XAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned()],
+            topics: vec![None],
+        };
+        let rows = QueryRows::Logs(vec![
+            LogRecord::try_new(
+                1,
+                "0xblock".to_owned(),
+                "0xtx".to_owned(),
+                0,
+                0,
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                Vec::new(),
+                "0x".to_owned(),
+                false,
+            )
+            .unwrap(),
+        ]);
+
+        storage
+            .write_rows(Dataset::Logs, Some(&filter), range, &rows, true)
+            .expect("write rows");
+
+        let manifest = storage.manifest().expect("manifest");
+        let entry = manifest.entries.first().expect("manifest entry");
+        assert!(entry.filter_key.starts_with("evm-logs/addr-topic-"));
+        assert!(!entry.filter_key.contains("0xaaaaaaaa"));
+        assert!(
+            entry
+                .object_key
+                .as_deref()
+                .expect("object key")
+                .contains("evm-logs/addr-topic-")
+        );
+    }
+
+    fn temp_storage_root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "datalens-storage-{name}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp storage root");
+        root
     }
 }
