@@ -10,8 +10,8 @@ use axum::{
     routing::{get, post},
 };
 use datalens_core::{
-    BlockHeader, BlockRange, CacheSummary, DatalensError, DatalensErrorKind, Dataset, LogFilter,
-    LogRecord, QueryRequest, QueryResponse, QueryRows,
+    BlockHeader, BlockRange, CacheSummary, DatalensError, DatalensErrorKind, Dataset, EvmLogFilter,
+    LogFilter, LogRecord, QueryRequest, QueryResponse, QueryRows,
 };
 use datalens_storage::{LocalStorage, missing_ranges};
 use serde::{Deserialize, Serialize};
@@ -286,13 +286,13 @@ where
                 "from_block must be less than or equal to to_block",
             ));
         }
-        if request.range.len() > self.planner.max_query_range_blocks {
+        if request.range.len() > u128::from(self.planner.max_query_range_blocks) {
             return Err(DatalensError::new(
                 DatalensErrorKind::InvalidInput,
                 "query range exceeds planner.max_query_range_blocks",
             ));
         }
-        if request.chain != self.chain_name {
+        if request.chain.configured_name() != self.chain_name {
             return Err(DatalensError::new(
                 DatalensErrorKind::Unsupported,
                 "chain is not configured",
@@ -318,6 +318,7 @@ where
                 let filter = request.filter.as_ref().ok_or_else(|| {
                     DatalensError::new(DatalensErrorKind::InvalidInput, "logs require filter")
                 })?;
+                EvmLogFilter::try_from(filter)?;
                 if filter.addresses.len() > self.chain.datasets.logs.max_addresses_per_query {
                     return Err(DatalensError::new(
                         DatalensErrorKind::InvalidInput,
@@ -399,17 +400,21 @@ impl IntoResponse for ApiError {
             DatalensErrorKind::InvalidInput | DatalensErrorKind::InvalidRequest => {
                 StatusCode::BAD_REQUEST
             }
-            DatalensErrorKind::Unsupported => StatusCode::UNPROCESSABLE_ENTITY,
+            DatalensErrorKind::Unsupported
+            | DatalensErrorKind::UnsupportedDataset
+            | DatalensErrorKind::UnsupportedFilter => StatusCode::UNPROCESSABLE_ENTITY,
             DatalensErrorKind::ProviderLimit | DatalensErrorKind::RateLimited => {
                 StatusCode::TOO_MANY_REQUESTS
             }
-            DatalensErrorKind::ProviderTimeout | DatalensErrorKind::Unavailable => {
-                StatusCode::GATEWAY_TIMEOUT
-            }
+            DatalensErrorKind::ProviderTimeout
+            | DatalensErrorKind::Unavailable
+            | DatalensErrorKind::ProviderUnavailable => StatusCode::GATEWAY_TIMEOUT,
             DatalensErrorKind::ProviderFailure => StatusCode::BAD_GATEWAY,
-            DatalensErrorKind::Persistence | DatalensErrorKind::StorageFailure => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            DatalensErrorKind::Persistence
+            | DatalensErrorKind::StorageFailure
+            | DatalensErrorKind::StorageReadFailure
+            | DatalensErrorKind::StorageWriteFailure
+            | DatalensErrorKind::ManifestUpdateFailure => StatusCode::INTERNAL_SERVER_ERROR,
             DatalensErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (
@@ -438,19 +443,8 @@ where
 }
 
 fn split_ranges(ranges: &[BlockRange], chunk_size: u64) -> Vec<BlockRange> {
-    let mut split = Vec::new();
-    for range in ranges {
-        let mut from_block = range.from_block;
-        while from_block <= range.to_block {
-            let to_block = range
-                .to_block
-                .min(from_block.saturating_add(chunk_size).saturating_sub(1));
-            split.push(BlockRange::new(from_block, to_block));
-            if to_block == u64::MAX {
-                break;
-            }
-            from_block = to_block + 1;
-        }
-    }
-    split
+    ranges
+        .iter()
+        .flat_map(|range| range.split(chunk_size).expect("positive chunk size"))
+        .collect()
 }

@@ -8,8 +8,8 @@ use datalens_api::{
     config::{ChainConfig, DatasetsConfig, LogsDatasetConfig, PlannerConfig, WriterConfig},
 };
 use datalens_core::{
-    BlockHeader, BlockRange, DatalensError, DatalensErrorKind, Dataset, LogFilter, LogRecord,
-    QueryRequest, QueryResponse, QueryRows,
+    BlockHeader, BlockRange, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, Dataset,
+    LogFilter, LogRecord, NetworkId, QueryRequest, QueryResponse, QueryRows,
 };
 use datalens_storage::LocalStorage;
 
@@ -64,7 +64,7 @@ fn test_query_empty_logs_records_empty_coverage_without_data_object() {
     let root = storage.root().to_path_buf();
     let source = MockSource::default();
     let service = service(storage, source.clone());
-    let request = logs_request(50, 52, vec!["0xabc"]);
+    let request = logs_request(50, 52, vec!["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]);
 
     let first = service
         .query(request.clone())
@@ -89,12 +89,32 @@ fn test_query_empty_logs_records_empty_coverage_without_data_object() {
 fn test_query_logs_miss_persists_then_equivalent_hit_uses_cache() {
     let storage = LocalStorage::new(temp_storage_root("logs-miss-hit"));
     let source = MockSource::default().with_logs(vec![
-        log(20, 0, "0xabc", vec!["0xtopic-a"]),
-        log(20, 1, "0xdef", vec!["0xtopic-a"]),
-        log(21, 0, "0xabc", vec!["0xtopic-b"]),
+        log(
+            20,
+            0,
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            vec![TOPIC_A],
+        ),
+        log(
+            20,
+            1,
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            vec![TOPIC_A],
+        ),
+        log(
+            21,
+            0,
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            vec![TOPIC_B],
+        ),
     ]);
     let service = service(storage, source.clone());
-    let request = logs_request_with_topics(20, 21, vec!["0xabc"], vec![Some(vec!["0xtopic-a"])]);
+    let request = logs_request_with_topics(
+        20,
+        21,
+        vec!["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        vec![Some(vec![TOPIC_A])],
+    );
 
     let first = service
         .query(request.clone())
@@ -107,7 +127,10 @@ fn test_query_logs_miss_persists_then_equivalent_hit_uses_cache() {
         source.calls(),
         vec![SourceCall::Logs(BlockRange::new(20, 21))]
     );
-    assert_eq!(log_addresses(&second), vec!["0xabc"]);
+    assert_eq!(
+        log_addresses(&second),
+        vec!["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+    );
     assert_eq!(log_indexes(&second), vec![0]);
 }
 
@@ -130,7 +153,11 @@ fn test_provider_limit_error_is_classified() {
     let root = temp_storage_root("provider-limit");
     let service = service(LocalStorage::new(&root), source);
     let error = service
-        .query(logs_request(1, 2, vec!["0xabc"]))
+        .query(logs_request(
+            1,
+            2,
+            vec!["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        ))
         .expect_err("provider limit");
 
     assert_eq!(error.kind, DatalensErrorKind::ProviderLimit);
@@ -172,7 +199,7 @@ fn service(storage: LocalStorage, source: MockSource) -> QueryService<MockSource
 
 fn blocks_request(from_block: u64, to_block: u64) -> QueryRequest {
     QueryRequest {
-        chain: "ethereum".to_owned(),
+        chain: ethereum_identity(),
         dataset: Dataset::Blocks,
         range: BlockRange::new(from_block, to_block),
         filter: None,
@@ -196,7 +223,7 @@ fn logs_request_with_topics(
     topics: Vec<Option<Vec<&str>>>,
 ) -> QueryRequest {
     QueryRequest {
-        chain: "ethereum".to_owned(),
+        chain: ethereum_identity(),
         dataset: Dataset::Logs,
         range: BlockRange::new(from_block, to_block),
         filter: Some(LogFilter {
@@ -208,6 +235,14 @@ fn logs_request_with_topics(
         }),
         include_block: false,
     }
+}
+
+const TOPIC_A: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const TOPIC_B: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+fn ethereum_identity() -> ChainIdentity {
+    ChainIdentity::try_new(ChainFamily::Evm, "ethereum", Some(NetworkId::numeric(1)))
+        .expect("valid chain identity")
 }
 
 fn block(number: u64, hash: &str) -> BlockHeader {
