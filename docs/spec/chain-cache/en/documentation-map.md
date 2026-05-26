@@ -51,6 +51,7 @@ docs/spec/chain-cache/
 | --- | --- | --- |
 | `documentation-map.md` | Where do durable chain-cache specs belong, and how are the bilingual files kept in parity? | HBX-5; all future chain-cache documentation work |
 | `architecture.md` | What are the canonical chain-cache module boundaries and request/fill data flow? | Workspace crate creation; module ownership; chain-family extension planning |
+| `chain-adapter-contract.md` | What must chain adapters provide while keeping EVM-specific concepts out of chain-neutral modules? | Chain adapter design; EVM adapter implementation planning; future chain-family extension checks |
 | `storage-manifest.md` | What durable object storage, chunk coverage, and manifest semantics decide cache hit/miss correctness? | Storage implementation; planner coverage checks; chunk writer idempotency and migration planning |
 | `overview.md` | What is the chain-cache responsibility boundary and what must remain out of scope? | Early architecture framing; implementation planning before storage, query, API, or SDK work |
 | `storage.md` | What storage model, persistence contract, and durability invariants must chain-cache implementations satisfy? | Storage implementation phase; schema and migration planning; persistence tests |

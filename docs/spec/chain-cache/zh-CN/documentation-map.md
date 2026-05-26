@@ -50,6 +50,7 @@ docs/spec/chain-cache/
 | --- | --- | --- |
 | `documentation-map.md` | Durable chain-cache specs 应放在哪里，以及双语文件如何维持 parity？ | HBX-5；所有未来 chain-cache documentation work |
 | `architecture.md` | Canonical chain-cache module boundaries 与 request/fill data flow 是什么？ | Workspace crate creation；module ownership；chain-family extension planning |
+| `chain-adapter-contract.md` | Chain adapters 必须提供什么，同时如何避免 EVM-specific concepts 进入 chain-neutral modules？ | Chain adapter design；EVM adapter implementation planning；future chain-family extension checks |
 | `storage-manifest.md` | 哪些 durable object storage、chunk coverage 与 manifest semantics 用于判断 cache hit/miss correctness？ | Storage implementation；planner coverage checks；chunk writer idempotency and migration planning |
 | `overview.md` | chain-cache responsibility boundary 是什么，以及哪些内容必须维持 out of scope？ | Early architecture framing；storage、query、API 或 SDK work 之前的 implementation planning |
 | `storage.md` | chain-cache implementations 必须满足哪些 storage model、persistence contract 与 durability invariants？ | Storage implementation phase；schema and migration planning；persistence tests |
