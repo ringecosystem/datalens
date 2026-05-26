@@ -55,6 +55,7 @@ docs/spec/chain-cache/
 | `storage.md` | chain-cache implementations 必须满足哪些 storage model、persistence contract 与 durability invariants？ | Storage implementation phase；schema and migration planning；persistence tests |
 | `ingestion.md` | ingestion 必须满足哪些 inputs、normalization rules 与 cache population behavior？ | Ingestion implementation phase；data validation tests；pipeline integration planning |
 | `query.md` | query paths 必须满足哪些 lookup semantics、filtering rules、ordering rules 与 miss behavior？ | Query implementation phase；correctness tests；performance-oriented follow-up work |
+| `query-cache-behavior.md` | query-driven cache execution 必须满足哪些 lifecycle、cache-hit、partial-hit、miss 与 missing-range materialization behavior？ | Query planner implementation；writer sequencing；manifest coverage tests；response streaming behavior |
 | `api.md` | callers 必须依赖哪些 service 或 crate-facing API contracts？ | API implementation phase；integration tests；caller migration planning |
 | `sdk.md` | external consumers 必须依赖哪些 SDK-facing behavior、naming 与 compatibility expectations？ | SDK implementation phase；release readiness；compatibility tests |
 | `operations.md` | deployments 必须保留哪些 observable states、limits 与 operational invariants？ | Runbook planning；validation gates；production readiness work |

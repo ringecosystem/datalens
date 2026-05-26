@@ -56,6 +56,7 @@ docs/spec/chain-cache/
 | `storage.md` | What storage model, persistence contract, and durability invariants must chain-cache implementations satisfy? | Storage implementation phase; schema and migration planning; persistence tests |
 | `ingestion.md` | What inputs, normalization rules, and cache population behavior must ingestion satisfy? | Ingestion implementation phase; data validation tests; pipeline integration planning |
 | `query.md` | What lookup semantics, filtering rules, ordering rules, and miss behavior must query paths satisfy? | Query implementation phase; correctness tests; performance-oriented follow-up work |
+| `query-cache-behavior.md` | What lifecycle, cache-hit, partial-hit, miss, and missing-range materialization behavior must query-driven cache execution satisfy? | Query planner implementation; writer sequencing; manifest coverage tests; response streaming behavior |
 | `api.md` | What service or crate-facing API contracts must callers rely on? | API implementation phase; integration tests; caller migration planning |
 | `sdk.md` | What SDK-facing behavior, naming, and compatibility expectations must external consumers rely on? | SDK implementation phase; release readiness; compatibility tests |
 | `operations.md` | What observable states, limits, and operational invariants must deployments preserve? | Runbook planning; validation gates; production readiness work |
