@@ -10,8 +10,8 @@ use axum::{
     routing::{get, post},
 };
 use datalens_chain::{
-    ChainAdapter, ChainFetchRequest, ChainFetchResponse, DatasetSelector, FetchContext,
-    HeightRange, HeightRangeKind,
+    ChainAdapter, ChainFetchRequest, ChainFetchResponse, ChainHeight, DatasetSelector,
+    FetchContext, FinalityKind, HeightRange, HeightRangeKind,
 };
 use datalens_core::{
     BlockRange, CacheSummary, DatalensError, DatalensErrorKind, Dataset, QueryRequest,
@@ -242,6 +242,8 @@ where
             log::warn!("query validation failed kind={:?}", error.kind);
             return Err(error);
         }
+        let safe_height = self.source.safe_height()?;
+        validate_safe_query_range(request.range, &safe_height)?;
 
         let hit_ranges = self.storage.covered_ranges(
             &request.chain,
@@ -261,6 +263,7 @@ where
                 .read_rows(&request.chain, request.dataset, &selector, request.range)?;
 
         for range in split_ranges(&misses, self.chunk_size(request.dataset)) {
+            validate_safe_query_range(range, &safe_height)?;
             let fetch_request = ChainFetchRequest::new(
                 request.chain.clone(),
                 request.dataset,
@@ -453,6 +456,37 @@ fn validate_fetch_response(
         return Err(DatalensError::new(
             DatalensErrorKind::Internal,
             "chain adapter response does not match fetch request",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_safe_query_range(
+    range: BlockRange,
+    safe_height: &ChainHeight,
+) -> Result<(), DatalensError> {
+    if safe_height.range_kind != HeightRangeKind::Block {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "adapter safe/finalized height is not a block height",
+        ));
+    }
+    if !matches!(
+        safe_height.finality,
+        FinalityKind::Safe | FinalityKind::Finalized
+    ) {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "adapter safe/finalized height is not safe or finalized",
+        ));
+    }
+    if range.to_block > safe_height.value {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            format!(
+                "query range exceeds adapter safe/finalized height: requested to_block {}, safe/finalized height {}",
+                range.to_block, safe_height.value
+            ),
         ));
     }
     Ok(())

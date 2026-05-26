@@ -45,7 +45,20 @@ logs 来说，它应该由标准化后的过滤条件确定性生成，例如 ad
 
 ## Manifest 覆盖范围
 
-Manifest 描述持久化覆盖范围。一个覆盖范围记录应包含：
+Manifest 描述 safe 或 finalized 的历史持久化覆盖范围。第一阶段的持久化覆盖范围不能表达
+latest、不稳定或 hot 数据。只有当一个范围的结束高度小于等于该 adapter 针对对应链族范围模型
+给出的 safe/finalized height 时，才能写入对象存储或在 Manifest 中声明覆盖。
+
+对于 EVM block range，持久化写入不变量是：
+
+```text
+range.to_block <= adapter.safe_height().value
+```
+
+adapter safe height 必须带有 `Safe` 或 `Finalized` finality。未来链族可以使用非 EVM 的范围
+kind，但在记录持久化覆盖之前，必须暴露等价的 safe/finalized height。
+
+一个覆盖范围记录应包含：
 
 - 链家族，例如 `evm`。
 - 链名称或配置中的链标识。
@@ -56,9 +69,15 @@ Manifest 描述持久化覆盖范围。一个覆盖范围记录应包含：
 - 字段覆盖范围或标准分片形态。
 - 持久化分片的 object key。
 - 可用时记录 size、checksum 和写入元数据。
+- finality 元数据的 schema 扩展点。第一阶段中，Manifest 覆盖范围按定义表示
+  safe/finalized durable history。
 
 因为 datalens 缓存的是按需求选择的数据，某个带 address filter 的 `logs` 分片并不代表同一区间
 的完整日志覆盖，也不代表另一个合约的覆盖。Manifest 必须明确区分这些含义。
+
+Manifest 覆盖范围不能用于 non-durable hot query 结果。empty coverage 和 data-object coverage
+具有相同 finality 要求：如果请求范围超过 safe/finalized height，datalens 不能写入 empty
+coverage 记录。
 
 正常写入路径不应该把已有范围分片解压出来、追加另一个合约的数据、重新压缩并覆盖上传。那会
 让并发补齐很难推理，也会让每个新过滤条件都变成读改写操作。第一版实现应该写入不可变的逻辑
@@ -98,16 +117,21 @@ Manifest 描述持久化覆盖范围。一个覆盖范围记录应包含：
 写入器应使用安全顺序：
 
 1. 接收一个计划补齐片段的标准化拉取数据。
-2. 在不超过最大范围配置的前提下，合并相邻且兼容的片段，以改善对象大小。
-3. 用数据集、覆盖 key、schema 版本和实际覆盖范围构建确定性的逻辑分片标识。
-4. 片段有数据行时，写入数据对象。
-5. 片段没有数据行时，只写入 Manifest 空覆盖记录。
-6. 根据后端能力验证或信任对象写入结果。
-7. 更新 Manifest 覆盖范围记录。
-8. 让新的覆盖范围对后续查询可见。
+2. 在任何持久化写入或 Manifest 更新前，验证该片段处于 adapter safe/finalized height 内。
+3. 在不超过最大范围配置的前提下，合并相邻且兼容的片段，以改善对象大小。
+4. 用数据集、覆盖 key、schema 版本和实际覆盖范围构建确定性的逻辑分片标识。
+5. 片段有数据行时，写入数据对象。
+6. 片段没有数据行时，只写入 Manifest 空覆盖记录。
+7. 根据后端能力验证或信任对象写入结果。
+8. 更新 Manifest 覆盖范围记录。
+9. 让新的覆盖范围对后续查询可见。
 
 如果对象写入失败，Manifest 覆盖范围不能变化。如果对象写入成功但 Manifest 更新失败，重试
 应能收敛到一致状态，不破坏覆盖范围。
+
+第一阶段通过拒绝持久化 unsafe range 来避免 durable rollback。如果未来需要更强的 canonical
+chain proof，可以在覆盖记录中扩展 block hash、parent hash 或其他链族 canonicality proof。
+这些 proof 是持久化验证能力的扩展，不是把不稳定 latest 数据写入 durable coverage 的许可。
 
 ## 这一步要实现什么
 

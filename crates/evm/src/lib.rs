@@ -276,11 +276,10 @@ impl ChainAdapter for EvmRpcClient {
     }
 
     fn safe_height(&self) -> Result<ChainHeight, DatalensError> {
-        Ok(ChainHeight::block(
-            self.latest_height()?
-                .value
-                .saturating_sub(self.safe_height_lag_blocks),
-        )
+        Ok(ChainHeight::block(safe_height_from_latest(
+            self.latest_height()?.value,
+            self.safe_height_lag_blocks,
+        ))
         .with_finality(FinalityKind::Safe))
     }
 
@@ -399,6 +398,10 @@ fn classify_transport_error(error: reqwest::Error) -> DatalensError {
             format!("provider request failed: {error}"),
         )
     }
+}
+
+fn safe_height_from_latest(latest_height: u64, lag_blocks: u64) -> u64 {
+    latest_height.saturating_sub(lag_blocks)
 }
 
 pub fn classify_provider_error(code: i64, message: &str) -> DatalensError {
@@ -538,5 +541,11 @@ mod tests {
         let error = client.fetch(request).expect_err("chain mismatch");
 
         assert_eq!(error.kind, DatalensErrorKind::UnsupportedDataset);
+    }
+
+    #[test]
+    fn test_safe_height_lag_blocks_is_applied_to_latest_height() {
+        assert_eq!(safe_height_from_latest(100, 12), 88);
+        assert_eq!(safe_height_from_latest(10, 12), 0);
     }
 }

@@ -176,6 +176,85 @@ fn test_query_range_limit_rejection_returns_invalid_input() {
 }
 
 #[test]
+fn test_query_rejects_range_above_safe_height_without_fetch_or_cache_write() {
+    let root = temp_storage_root("unsafe-range");
+    let source = MockSource::default()
+        .with_blocks(vec![block(99, "0x63"), block(100, "0x64")])
+        .with_safe_height(99, FinalityKind::Safe);
+    let service = service(LocalStorage::new(&root), source.clone());
+
+    let error = service
+        .query(blocks_request(99, 100))
+        .expect_err("unsafe range is rejected");
+
+    assert_eq!(error.kind, DatalensErrorKind::InvalidInput);
+    assert!(error.message.contains("safe/finalized height"));
+    assert_eq!(source.calls(), Vec::<SourceCall>::new());
+    assert!(!root.join("manifest.json").exists());
+    assert!(!root.join("objects").exists());
+}
+
+#[test]
+fn test_query_allows_range_at_safe_height_and_writes_cache() {
+    let root = temp_storage_root("safe-range");
+    let source = MockSource::default()
+        .with_blocks(vec![block(98, "0x62"), block(99, "0x63")])
+        .with_safe_height(99, FinalityKind::Safe);
+    let service = service(LocalStorage::new(&root), source.clone());
+
+    let response = service
+        .query(blocks_request(98, 99))
+        .expect("safe range succeeds");
+
+    assert_eq!(block_numbers(&response), vec![98, 99]);
+    assert_eq!(
+        source.calls(),
+        vec![SourceCall::Blocks(BlockRange::expect_new(98, 99))]
+    );
+    assert!(root.join("manifest.json").exists());
+    assert!(root.join("objects").exists());
+}
+
+#[test]
+fn test_query_rejects_empty_unsafe_range_without_empty_coverage() {
+    let root = temp_storage_root("unsafe-empty-coverage");
+    let source = MockSource::default().with_safe_height(49, FinalityKind::Safe);
+    let service = service(LocalStorage::new(&root), source.clone());
+
+    let error = service
+        .query(logs_request(
+            50,
+            50,
+            vec!["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        ))
+        .expect_err("unsafe empty range is rejected");
+
+    assert_eq!(error.kind, DatalensErrorKind::InvalidInput);
+    assert_eq!(source.calls(), Vec::<SourceCall>::new());
+    assert!(!root.join("manifest.json").exists());
+    assert!(!root.join("objects").exists());
+}
+
+#[test]
+fn test_query_accepts_finalized_adapter_height_without_evm_specific_assumption() {
+    let root = temp_storage_root("finalized-range");
+    let source = MockSource::default()
+        .with_blocks(vec![block(7, "0x07")])
+        .with_safe_height(7, FinalityKind::Finalized);
+    let service = service(LocalStorage::new(&root), source.clone());
+
+    let response = service
+        .query(blocks_request(7, 7))
+        .expect("finalized range succeeds");
+
+    assert_eq!(block_numbers(&response), vec![7]);
+    assert_eq!(
+        source.calls(),
+        vec![SourceCall::Blocks(BlockRange::expect_new(7, 7))]
+    );
+}
+
+#[test]
 fn test_provider_limit_error_is_classified() {
     let source = MockSource::default().with_error(DatalensErrorKind::ProviderLimit);
     let root = temp_storage_root("provider-limit");
@@ -492,6 +571,7 @@ struct MockSource {
     blocks_max_range_blocks: Arc<Mutex<u64>>,
     logs_max_range_blocks: Arc<Mutex<u64>>,
     max_addresses_per_query: Arc<Mutex<usize>>,
+    safe_height: Arc<Mutex<ChainHeight>>,
 }
 
 impl Default for MockSource {
@@ -505,6 +585,9 @@ impl Default for MockSource {
             blocks_max_range_blocks: Arc::new(Mutex::new(2)),
             logs_max_range_blocks: Arc::new(Mutex::new(2)),
             max_addresses_per_query: Arc::new(Mutex::new(2)),
+            safe_height: Arc::new(Mutex::new(
+                ChainHeight::block(100).with_finality(FinalityKind::Safe),
+            )),
         }
     }
 }
@@ -554,6 +637,12 @@ impl MockSource {
             .max_addresses_per_query
             .lock()
             .expect("max addresses per query lock") = max_addresses_per_query;
+        self
+    }
+
+    fn with_safe_height(self, value: u64, finality: FinalityKind) -> Self {
+        *self.safe_height.lock().expect("safe height lock") =
+            ChainHeight::block(value).with_finality(finality);
         self
     }
 
@@ -615,7 +704,7 @@ impl ChainAdapter for MockSource {
     }
 
     fn safe_height(&self) -> Result<ChainHeight, DatalensError> {
-        Ok(ChainHeight::block(100).with_finality(FinalityKind::Safe))
+        Ok(self.safe_height.lock().expect("safe height lock").clone())
     }
 
     fn fetch(&self, request: ChainFetchRequest) -> Result<ChainFetchResponse, DatalensError> {
