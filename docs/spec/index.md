@@ -50,3 +50,6 @@ Then keep the body explicit:
 - Chain-cache documentation map and bilingual contract:
   `docs/spec/chain-cache/en/documentation-map.md` and
   `docs/spec/chain-cache/zh-CN/documentation-map.md`
+- Chain-cache architecture and module boundaries:
+  `docs/spec/chain-cache/en/architecture.md` and
+  `docs/spec/chain-cache/zh-CN/architecture.md`
