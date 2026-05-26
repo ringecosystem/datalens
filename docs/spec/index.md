@@ -47,4 +47,6 @@ Then keep the body explicit:
 
 ## Current governing specs
 
-- No topic-specific specs exist yet.
+- Chain-cache documentation map and bilingual contract:
+  `docs/spec/chain-cache/en/documentation-map.md` and
+  `docs/spec/chain-cache/zh-CN/documentation-map.md`
