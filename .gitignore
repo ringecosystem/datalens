@@ -1,0 +1,27 @@
+.DS_Store
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+logs/
+
+# Dependencies
+node_modules/
+vendor/
+
+# Build outputs
+dist/
+build/
+out/
+target/
+coverage/
+
+# Editor and local tooling
+.idea/
+.vscode/
+*.swp
+*.swo
