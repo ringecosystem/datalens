@@ -1,9 +1,12 @@
 //! EVM chain-family adapter boundary.
 
-use datalens_chain::{AdapterCapabilities, ChainAdapter};
+use datalens_chain::{
+    AdapterCapabilities, ChainAdapter, ChainFetchRequest, ChainFetchResponse, ChainHeight,
+    DatasetCapability, DatasetSelector, FinalityKind, HeightRange, HeightRangeKind, SelectorKind,
+};
 use datalens_core::{
-    BlockHeader, BlockRange, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind,
-    LogFilter, LogRecord,
+    BlockHeader, BlockRange, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, Dataset,
+    EvmLogFilter, LogFilter, LogRecord, QueryRows, TopicFilter,
 };
 use reqwest::blocking::Client;
 use serde_json::{Value, json};
@@ -43,12 +46,38 @@ impl ChainAdapter for EvmAdapter {
             "evm-unconfigured",
         ))
     }
+
+    fn latest_height(&self) -> Result<ChainHeight, DatalensError> {
+        Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "EVM adapter has no configured provider",
+        ))
+    }
+
+    fn safe_height(&self) -> Result<ChainHeight, DatalensError> {
+        Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "EVM adapter has no configured provider",
+        ))
+    }
+
+    fn fetch(&self, _request: ChainFetchRequest) -> Result<ChainFetchResponse, DatalensError> {
+        Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "EVM adapter has no configured provider",
+        ))
+    }
 }
 
 #[derive(Clone)]
 pub struct EvmRpcClient {
     rpc_urls: Vec<String>,
     client: Client,
+    chain: ChainIdentity,
+    safe_height_lag_blocks: u64,
+    max_block_batch_blocks: u64,
+    max_get_logs_range_blocks: u64,
+    max_addresses_per_query: usize,
 }
 
 impl EvmRpcClient {
@@ -56,6 +85,30 @@ impl EvmRpcClient {
         Self {
             rpc_urls,
             client: Client::new(),
+            chain: ChainIdentity::expect_new(ChainFamily::Evm, "evm-unconfigured"),
+            safe_height_lag_blocks: 0,
+            max_block_batch_blocks: u64::MAX,
+            max_get_logs_range_blocks: u64::MAX,
+            max_addresses_per_query: usize::MAX,
+        }
+    }
+
+    pub fn with_chain(
+        rpc_urls: Vec<String>,
+        chain: ChainIdentity,
+        safe_height_lag_blocks: u64,
+        max_block_batch_blocks: u64,
+        max_get_logs_range_blocks: u64,
+        max_addresses_per_query: usize,
+    ) -> Self {
+        Self {
+            rpc_urls,
+            client: Client::new(),
+            chain,
+            safe_height_lag_blocks,
+            max_block_batch_blocks,
+            max_get_logs_range_blocks,
+            max_addresses_per_query,
         }
     }
 
@@ -93,12 +146,21 @@ impl EvmRpcClient {
         range: BlockRange,
         filter: &LogFilter,
     ) -> Result<Vec<LogRecord>, DatalensError> {
+        let filter = EvmLogFilter::try_from(filter)?;
+        self.fetch_evm_logs(range, &filter)
+    }
+
+    pub fn fetch_evm_logs(
+        &self,
+        range: BlockRange,
+        filter: &EvmLogFilter,
+    ) -> Result<Vec<LogRecord>, DatalensError> {
         log::info!(
             "fetching EVM logs range={}-{} addresses={} topic_slots={}",
             range.from_block,
             range.to_block,
-            filter.addresses.len(),
-            filter.topics.len()
+            filter.addresses().len(),
+            filter.topics().len()
         );
         let result = self.call("eth_getLogs", json!([evm_log_filter(range, filter)]))?;
         let logs = result
@@ -174,6 +236,89 @@ impl EvmRpcClient {
     }
 }
 
+impl ChainAdapter for EvmRpcClient {
+    fn capabilities(&self) -> AdapterCapabilities {
+        AdapterCapabilities::new(self.chain.clone())
+            .with_dataset_capability(
+                DatasetCapability::new(Dataset::Blocks)
+                    .with_selector(SelectorKind::All)
+                    .with_range(HeightRangeKind::Block)
+                    .with_max_range_blocks(self.max_block_batch_blocks)
+                    .with_empty_coverage(true),
+            )
+            .with_dataset_capability(
+                DatasetCapability::new(Dataset::Logs)
+                    .with_selector(SelectorKind::EvmLogs)
+                    .with_range(HeightRangeKind::Block)
+                    .with_max_range_blocks(self.max_get_logs_range_blocks)
+                    .with_max_batch_rows(self.max_addresses_per_query)
+                    .with_empty_coverage(true),
+            )
+    }
+
+    fn latest_height(&self) -> Result<ChainHeight, DatalensError> {
+        let result = self.call("eth_blockNumber", json!([]))?;
+        let value = result
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .ok_or_else(|| {
+                DatalensError::new(
+                    DatalensErrorKind::ProviderFailure,
+                    "invalid eth_blockNumber result",
+                )
+            })?;
+        let height = u64::from_str_radix(value.trim_start_matches("0x"), 16).map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::ProviderFailure,
+                format!("invalid eth_blockNumber result: {error}"),
+            )
+        })?;
+        Ok(ChainHeight::block(height))
+    }
+
+    fn safe_height(&self) -> Result<ChainHeight, DatalensError> {
+        Ok(ChainHeight::block(
+            self.latest_height()?
+                .value
+                .saturating_sub(self.safe_height_lag_blocks),
+        )
+        .with_finality(FinalityKind::Safe))
+    }
+
+    fn fetch(&self, request: ChainFetchRequest) -> Result<ChainFetchResponse, DatalensError> {
+        let range = request.range.block_range().ok_or_else(|| {
+            DatalensError::new(
+                DatalensErrorKind::UnsupportedDataset,
+                "only block ranges are supported",
+            )
+        })?;
+        let rows = match (&request.dataset, &request.selector) {
+            (Dataset::Blocks, DatasetSelector::All) => QueryRows::Blocks(self.fetch_blocks(range)?),
+            (Dataset::Logs, DatasetSelector::EvmLogs(filter)) => {
+                QueryRows::Logs(self.fetch_evm_logs(range, filter)?)
+            }
+            (Dataset::Blocks, _) => {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::UnsupportedDataset,
+                    "blocks require all selector",
+                ));
+            }
+            (Dataset::Logs, _) => {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::UnsupportedDataset,
+                    "logs require evm logs selector",
+                ));
+            }
+        };
+        Ok(ChainFetchResponse::new(
+            request.chain,
+            request.dataset,
+            HeightRange::Block(range),
+            request.selector,
+            rows,
+        ))
+    }
+}
+
 fn parse_log_record(log: &Value) -> Result<LogRecord, DatalensError> {
     LogRecord::try_new(
         hex_u64_field(log, "blockNumber")?,
@@ -205,7 +350,7 @@ fn parse_log_record(log: &Value) -> Result<LogRecord, DatalensError> {
     })
 }
 
-fn evm_log_filter(range: BlockRange, filter: &LogFilter) -> Value {
+fn evm_log_filter(range: BlockRange, filter: &EvmLogFilter) -> Value {
     let mut value = serde_json::Map::new();
     value.insert(
         "fromBlock".to_owned(),
@@ -215,11 +360,23 @@ fn evm_log_filter(range: BlockRange, filter: &LogFilter) -> Value {
         "toBlock".to_owned(),
         json!(format!("0x{:x}", range.to_block)),
     );
-    if !filter.addresses.is_empty() {
-        value.insert("address".to_owned(), json!(filter.addresses));
+    if !filter.addresses().is_empty() {
+        value.insert("address".to_owned(), json!(filter.addresses()));
     }
-    if !filter.topics.is_empty() {
-        value.insert("topics".to_owned(), json!(filter.topics));
+    if !filter.topics().is_empty() {
+        value.insert(
+            "topics".to_owned(),
+            Value::Array(
+                filter
+                    .topics()
+                    .iter()
+                    .map(|topic| match topic {
+                        TopicFilter::Wildcard => Value::Null,
+                        TopicFilter::AnyOf(values) => json!(values),
+                    })
+                    .collect(),
+            ),
+        );
     }
     Value::Object(value)
 }

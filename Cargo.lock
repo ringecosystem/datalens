@@ -323,6 +323,7 @@ name = "datalens-api"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "datalens-chain",
  "datalens-core",
  "datalens-planner",
  "datalens-storage",
@@ -402,6 +403,7 @@ dependencies = [
 name = "datalens-storage"
 version = "0.1.0"
 dependencies = [
+ "datalens-chain",
  "datalens-core",
  "log",
  "serde",

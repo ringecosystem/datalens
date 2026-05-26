@@ -9,9 +9,12 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use datalens_chain::{
+    ChainAdapter, ChainFetchRequest, DatasetSelector, FetchContext, HeightRange, HeightRangeKind,
+};
 use datalens_core::{
-    BlockHeader, BlockRange, CacheSummary, DatalensError, DatalensErrorKind, Dataset, EvmLogFilter,
-    LogFilter, LogRecord, QueryRequest, QueryResponse, QueryRows,
+    BlockRange, CacheSummary, DatalensError, DatalensErrorKind, Dataset, QueryRequest,
+    QueryResponse,
 };
 use datalens_storage::{LocalStorage, missing_ranges};
 use serde::{Deserialize, Serialize};
@@ -183,16 +186,6 @@ pub mod config {
 
 use config::{ChainConfig, PlannerConfig, WriterConfig};
 
-pub trait Source: Clone + Send + Sync + 'static {
-    fn fetch_blocks(&self, range: BlockRange) -> Result<Vec<BlockHeader>, DatalensError>;
-
-    fn fetch_logs(
-        &self,
-        range: BlockRange,
-        filter: &LogFilter,
-    ) -> Result<Vec<LogRecord>, DatalensError>;
-}
-
 #[derive(Clone)]
 pub struct QueryService<S> {
     storage: LocalStorage,
@@ -205,7 +198,7 @@ pub struct QueryService<S> {
 
 impl<S> QueryService<S>
 where
-    S: Source,
+    S: ChainAdapter,
 {
     pub fn new(
         storage: LocalStorage,
@@ -243,15 +236,18 @@ where
             request.range.from_block,
             request.range.to_block
         );
-        if let Err(error) = self.validate(&request) {
+        let selector = self.selector_for_request(&request)?;
+        if let Err(error) = self.validate(&request, &selector) {
             log::warn!("query validation failed kind={:?}", error.kind);
             return Err(error);
         }
 
-        let filter = request.filter.as_ref();
-        let hit_ranges = self
-            .storage
-            .covered_ranges(request.dataset, filter, request.range)?;
+        let hit_ranges = self.storage.covered_ranges(
+            &request.chain,
+            request.dataset,
+            &selector,
+            request.range,
+        )?;
         let misses = missing_ranges(request.range, &hit_ranges);
         log::info!(
             "cache summary dataset={} hit_ranges={} missing_ranges={}",
@@ -259,45 +255,39 @@ where
             hit_ranges.len(),
             misses.len()
         );
-        let mut rows = self
-            .storage
-            .read_rows(request.dataset, filter, request.range)?;
+        let mut rows =
+            self.storage
+                .read_rows(&request.chain, request.dataset, &selector, request.range)?;
 
         for range in split_ranges(&misses, self.chunk_size(request.dataset)) {
-            let fetched = match request.dataset {
-                Dataset::Blocks => match self.source.fetch_blocks(range) {
-                    Ok(rows) => QueryRows::Blocks(rows),
-                    Err(error) => {
-                        log::warn!(
-                            "block provider fetch failed range={}-{} kind={:?}",
-                            range.from_block,
-                            range.to_block,
-                            error.kind
-                        );
-                        return Err(error);
-                    }
-                },
-                Dataset::Logs => {
-                    let filter = filter.ok_or_else(|| {
-                        DatalensError::new(DatalensErrorKind::InvalidInput, "logs require filter")
-                    })?;
-                    match self.source.fetch_logs(range, filter) {
-                        Ok(rows) => QueryRows::Logs(rows),
-                        Err(error) => {
-                            log::warn!(
-                                "log provider fetch failed range={}-{} kind={:?}",
-                                range.from_block,
-                                range.to_block,
-                                error.kind
-                            );
-                            return Err(error);
-                        }
-                    }
+            let fetched = match self.source.fetch(
+                ChainFetchRequest::new(
+                    request.chain.clone(),
+                    request.dataset,
+                    HeightRange::Block(range),
+                    selector.clone(),
+                )
+                .with_context(FetchContext {
+                    request_id: None,
+                    cache_write: true,
+                }),
+            ) {
+                Ok(response) => response.rows,
+                Err(error) => {
+                    log::warn!(
+                        "provider fetch failed dataset={} range={}-{} kind={:?}",
+                        request.dataset.as_str(),
+                        range.from_block,
+                        range.to_block,
+                        error.kind
+                    );
+                    return Err(error);
                 }
             };
             if let Err(error) = self.storage.write_rows(
+                &request.chain,
                 request.dataset,
-                filter,
+                &selector,
                 range,
                 &fetched,
                 self.writer.record_empty_coverage,
@@ -326,7 +316,11 @@ where
         })
     }
 
-    fn validate(&self, request: &QueryRequest) -> Result<(), DatalensError> {
+    fn validate(
+        &self,
+        request: &QueryRequest,
+        selector: &DatasetSelector,
+    ) -> Result<(), DatalensError> {
         if request.range.from_block > request.range.to_block {
             return Err(DatalensError::new(
                 DatalensErrorKind::InvalidInput,
@@ -351,6 +345,34 @@ where
                 "only evm chains are supported",
             ));
         }
+        let capabilities = self.source.capabilities();
+        if capabilities.chain() != &request.chain {
+            return Err(DatalensError::new(
+                DatalensErrorKind::UnsupportedDataset,
+                "chain is not supported by adapter",
+            ));
+        }
+        let dataset_capability = capabilities.dataset(request.dataset).ok_or_else(|| {
+            DatalensError::new(
+                DatalensErrorKind::UnsupportedDataset,
+                "dataset is not supported by adapter",
+            )
+        })?;
+        if !dataset_capability.supports_selector(selector.kind()) {
+            return Err(DatalensError::new(
+                DatalensErrorKind::UnsupportedDataset,
+                "selector is not supported by adapter",
+            ));
+        }
+        if !dataset_capability
+            .ranges()
+            .contains(&HeightRangeKind::Block)
+        {
+            return Err(DatalensError::new(
+                DatalensErrorKind::UnsupportedDataset,
+                "block ranges are not supported by adapter",
+            ));
+        }
 
         match request.dataset {
             Dataset::Blocks if !self.chain.datasets.blocks.enabled => Err(DatalensError::new(
@@ -365,7 +387,6 @@ where
                 let filter = request.filter.as_ref().ok_or_else(|| {
                     DatalensError::new(DatalensErrorKind::InvalidInput, "logs require filter")
                 })?;
-                EvmLogFilter::try_from(filter)?;
                 if filter.addresses.len() > self.chain.datasets.logs.max_addresses_per_query {
                     return Err(DatalensError::new(
                         DatalensErrorKind::InvalidInput,
@@ -375,6 +396,21 @@ where
                 Ok(())
             }
             Dataset::Blocks => Ok(()),
+        }
+    }
+
+    fn selector_for_request(
+        &self,
+        request: &QueryRequest,
+    ) -> Result<DatasetSelector, DatalensError> {
+        match request.dataset {
+            Dataset::Blocks => Ok(DatasetSelector::all()),
+            Dataset::Logs => {
+                let filter = request.filter.clone().ok_or_else(|| {
+                    DatalensError::new(DatalensErrorKind::InvalidInput, "logs require filter")
+                })?;
+                DatasetSelector::try_evm_logs(filter)
+            }
         }
     }
 
@@ -400,7 +436,7 @@ where
 
 pub fn router<S>(service: QueryService<S>, chain_names: Vec<String>) -> Router
 where
-    S: Source,
+    S: ChainAdapter,
 {
     Router::new()
         .route("/health", get(health))
@@ -424,7 +460,7 @@ async fn health() -> Json<serde_json::Value> {
 
 async fn chains<S>(State(state): State<AppState<S>>) -> Json<serde_json::Value>
 where
-    S: Source,
+    S: ChainAdapter,
 {
     Json(serde_json::json!({ "chains": state.chain_names }))
 }
@@ -434,7 +470,7 @@ async fn query<S>(
     Json(request): Json<QueryRequest>,
 ) -> Result<Json<QueryResponse>, ApiError>
 where
-    S: Source,
+    S: ChainAdapter,
 {
     state.service.query(request).map(Json).map_err(ApiError)
 }
@@ -482,7 +518,7 @@ pub async fn serve<S>(
     chain_names: Vec<String>,
 ) -> Result<(), std::io::Error>
 where
-    S: Source,
+    S: ChainAdapter,
 {
     let listener = tokio::net::TcpListener::bind(bind).await?;
     log::info!("api listener bound to {bind}");
