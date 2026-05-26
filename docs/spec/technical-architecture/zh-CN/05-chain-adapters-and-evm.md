@@ -19,6 +19,10 @@
 核心模块不应该知道 EVM 是否使用 `eth_getLogs`，Solana 是否使用 slots，或者 Tron 是否有
 不同的事件模型。
 
+对于 durable cache 写入，adapter 的 safe/finalized height 是其链族范围 kind 的权威边界。
+第一阶段 datalens 只接受带有 `Safe` 或 `Finalized` finality 的 adapter height 来记录 durable
+coverage。`Latest` 是可观测的数据源状态，不是 durable cache finality。
+
 ## EVM 优先
 
 第一个适配器应是 `datalens-evm`。它应支持能证明按查询驱动历史缓存的最小数据集：
@@ -39,6 +43,14 @@ headers 也应尽早加入，因为很多索引器需要 height、hash、parent 
 Provider 行为应隔离在 `datalens-evm`：batching、rate-limit backoff、range splitting、
 retry decisions 和 EVM response decoding 都属于这里。数据离开适配器边界后，应被标准化成
 datalens 数据集记录。
+
+第一版 EVM safe-height 策略可以使用 `safe_height_lag_blocks`：
+
+```text
+safe_height = latest_height.saturating_sub(safe_height_lag_blocks)
+```
+
+该 lag-based 值以 `Safe` finality 暴露。这是第一版 EVM 策略，不是未来 adapter 的链无关规则。
 
 ## 未来 Tron 和 Solana 支持
 

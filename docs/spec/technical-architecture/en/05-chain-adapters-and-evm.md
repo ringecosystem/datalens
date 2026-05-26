@@ -22,6 +22,11 @@ An adapter should expose:
 The core should not know whether EVM uses `eth_getLogs`, whether Solana uses slots, or
 whether Tron has a different event model.
 
+For durable cache writes, the adapter's safe/finalized height is authoritative for the
+chain-family range kind it exposes. First-stage datalens accepts only `Safe` or
+`Finalized` adapter heights for durable coverage. `Latest` is observable source state, not
+durable cache finality.
+
 ## EVM First
 
 The first adapter should be `datalens-evm`. It should support the minimum datasets needed
@@ -45,6 +50,15 @@ transport support means it replaces every RPC workflow.
 Provider behavior should be isolated in `datalens-evm`: batching, rate-limit backoff,
 range splitting, retry decisions, and EVM response decoding belong there. Once data leaves
 the adapter boundary, it should be normalized into datalens dataset rows.
+
+The first EVM safe-height strategy may use `safe_height_lag_blocks`:
+
+```text
+safe_height = latest_height.saturating_sub(safe_height_lag_blocks)
+```
+
+That lag-based value is exposed as `Safe` finality. It is a first EVM strategy, not a
+chain-neutral rule for future adapters.
 
 ## Future Tron And Solana Support
 

@@ -21,6 +21,13 @@ The plan should be bounded before any storage lookup or fetch begins. If a reque
 require unbounded work, the planner should reject it or split it into configured maximum
 ranges.
 
+The plan must also be bounded by the adapter safe/finalized height before any storage
+lookup, fetch, or durable write. First-stage datalens serves only safe/finalized
+historical ranges from the durable cache path. If the requested range ends above
+`adapter.safe_height()`, the query must fail with a clear invalid-input error. It must not
+silently truncate the range, fetch only the safe part, or return a response that looks
+complete.
+
 ## Cache States
 
 A cache hit means manifest coverage satisfies the whole plan. The system reads stored
@@ -36,11 +43,21 @@ persists them, updates manifest coverage, and returns the response.
 The caller should not need to know which state happened except through optional metadata,
 latency, or observability. The result should have the same meaning.
 
+The interval above safe/finalized height and up to latest height is outside first-stage
+durable cache semantics. Callers that need that interval must query RPC directly or use a
+future explicitly non-durable hot path. Hot data must not update durable manifest
+coverage.
+
 ## Fill Execution
 
 Missing ranges should be grouped into fetch tasks. The resolver should prefer fewer
 larger fetches when the adapter and provider allow it, but must respect provider limits
 and configured range caps.
+
+Every fetch task that will write through the durable cache path must satisfy the same
+safe/finalized height bound as the original plan. If a task is above that height, the
+executor must fail before calling storage. It must not write a data object, manifest
+coverage, or empty coverage.
 
 For EVM logs, the first fill implementation can fetch by `eth_getLogs` using the planned
 address/topic/range filters. For block headers, it can fetch by block number batches. For

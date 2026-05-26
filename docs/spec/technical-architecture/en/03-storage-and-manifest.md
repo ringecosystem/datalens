@@ -52,7 +52,22 @@ the existing coverage already satisfies the second query.
 
 ## Manifest Coverage
 
-The manifest describes durable coverage. A coverage entry should include:
+The manifest describes durable safe or finalized historical coverage. First-stage durable
+coverage must never represent latest, unstable, or hot data. A range can be written to
+object storage or declared in the manifest only when its end height is less than or equal
+to the adapter's safe/finalized height for that chain-family range model.
+
+For EVM block ranges, the durable write invariant is:
+
+```text
+range.to_block <= adapter.safe_height().value
+```
+
+The adapter safe height must carry `Safe` or `Finalized` finality. Future chain families
+may use non-EVM range kinds, but they must expose an equivalent safe/finalized height
+before their durable coverage can be recorded.
+
+A coverage entry should include:
 
 - Chain kind, for example `evm`.
 - Chain name or configured chain identity.
@@ -63,10 +78,16 @@ The manifest describes durable coverage. A coverage entry should include:
 - Field coverage or canonical chunk shape.
 - Object key for the durable chunk.
 - Size, checksum, and write metadata when available.
+- A schema extension point for finality metadata. In the first implementation, manifest
+  coverage means safe/finalized durable history by definition.
 
 Because datalens caches selected data, a chunk for `logs` with one address filter does not
 imply full log coverage for the same block range or coverage for another contract. The
 manifest must make that distinction explicit.
+
+Manifest coverage must not be used for non-durable hot query results. Empty coverage has
+the same finality requirement as data-object coverage: if the requested range is above the
+safe/finalized height, datalens must not write an empty coverage record.
 
 The normal write path should not decompress an existing range chunk, append another
 contract's rows, recompress it, and overwrite the object. That would make concurrent fills
@@ -117,18 +138,25 @@ The implementation should make the actual range sizing configurable and observab
 The writer should use a safe sequence:
 
 1. Receive normalized fetched data for one planned fill segment.
-2. Merge adjacent compatible segments when doing so improves object size and stays within
+2. Verify the segment is within the adapter's safe/finalized height before any durable
+   write or manifest update.
+3. Merge adjacent compatible segments when doing so improves object size and stays within
    the configured maximum range.
-3. Build a deterministic logical chunk identity from dataset, coverage key, schema
+4. Build a deterministic logical chunk identity from dataset, coverage key, schema
    version, and actual covered range.
-4. Write a data object when the segment has rows.
-5. Write only manifest empty coverage when the segment has no rows.
-6. Verify or trust the object write according to backend capabilities.
-7. Update the manifest coverage entry.
-8. Make the new coverage visible to future queries.
+5. Write a data object when the segment has rows.
+6. Write only manifest empty coverage when the segment has no rows.
+7. Verify or trust the object write according to backend capabilities.
+8. Update the manifest coverage entry.
+9. Make the new coverage visible to future queries.
 
 If the object write fails, manifest coverage must not change. If the object write succeeds
 but manifest update fails, retry should be able to converge without corrupting coverage.
+
+The first stage avoids durable rollback by refusing to persist unsafe ranges. If future
+work needs stronger canonical-chain proof, coverage records can be extended with block
+hash, parent hash, or another chain-family canonicality proof. That proof is an extension
+to durable validation, not permission to write unstable latest data into durable coverage.
 
 ## What To Implement In This Step
 
