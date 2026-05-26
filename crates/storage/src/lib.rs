@@ -1,15 +1,13 @@
 //! Storage boundary for durable datalens objects and coverage metadata.
 
 use std::{
-    collections::hash_map::DefaultHasher,
     fs,
-    hash::{Hash, Hasher},
     path::{Path, PathBuf},
 };
 
 use datalens_core::{
     BlockRange, ChainIdentity, CoverageLevel, DatalensError, DatalensErrorKind, Dataset, DatasetId,
-    LogFilter, QueryRows, TimeRange,
+    EvmLogFilter, LogFilter, QueryRows, TimeRange,
 };
 use serde::{Deserialize, Serialize};
 
@@ -68,7 +66,7 @@ impl LocalStorage {
         filter: Option<&LogFilter>,
         range: BlockRange,
     ) -> Result<Vec<BlockRange>, DatalensError> {
-        let filter_key = coverage_key(dataset, filter);
+        let filter_key = coverage_key(dataset, filter)?;
         let mut ranges = self
             .manifest()?
             .entries
@@ -86,7 +84,7 @@ impl LocalStorage {
         filter: Option<&LogFilter>,
         range: BlockRange,
     ) -> Result<QueryRows, DatalensError> {
-        let filter_key = coverage_key(dataset, filter);
+        let filter_key = coverage_key(dataset, filter)?;
         let mut rows = empty_rows(dataset);
         for entry in self.manifest()?.entries {
             if entry.dataset != dataset || entry.filter_key != filter_key {
@@ -137,7 +135,7 @@ impl LocalStorage {
             )
         })?;
 
-        let filter_key = coverage_key(dataset, filter);
+        let filter_key = coverage_key(dataset, filter)?;
         let object_key = if rows.row_count() == 0 {
             None
         } else {
@@ -268,17 +266,17 @@ pub fn missing_ranges(range: BlockRange, covered: &[BlockRange]) -> Vec<BlockRan
     missing
 }
 
-fn coverage_key(dataset: Dataset, filter: Option<&LogFilter>) -> String {
-    match dataset {
+fn coverage_key(dataset: Dataset, filter: Option<&LogFilter>) -> Result<String, DatalensError> {
+    Ok(match dataset {
         Dataset::Blocks => "all".to_owned(),
         Dataset::Logs => {
-            let mut hasher = DefaultHasher::new();
-            serde_json::to_string(&filter)
-                .unwrap_or_else(|_| "null".to_owned())
-                .hash(&mut hasher);
-            format!("{:016x}", hasher.finish())
+            let Some(filter) = filter else {
+                return Ok("evm-logs/addr=*/topics=*".to_owned());
+            };
+            let filter = EvmLogFilter::try_from(filter)?;
+            format!("evm-logs/{}", filter.canonical_key())
         }
-    }
+    })
 }
 
 fn merge_ranges(mut ranges: Vec<BlockRange>) -> Vec<BlockRange> {
@@ -299,9 +297,7 @@ fn merge_ranges(mut ranges: Vec<BlockRange>) -> Vec<BlockRange> {
 }
 
 fn intersect(left: BlockRange, right: BlockRange) -> Option<BlockRange> {
-    let from_block = left.from_block.max(right.from_block);
-    let to_block = left.to_block.min(right.to_block);
-    (from_block <= to_block).then_some(BlockRange::new(from_block, to_block))
+    left.intersection(&right)
 }
 
 fn empty_rows(dataset: Dataset) -> QueryRows {
