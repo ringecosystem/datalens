@@ -47,24 +47,24 @@ Then keep the body explicit:
 
 ## Current governing specs
 
-- Chain-cache project charter:
-  - English: `docs/spec/chain-cache/en/project-charter.md`
-  - Simplified Chinese: `docs/spec/chain-cache/zh-CN/project-charter.md`
-- Chain-cache documentation map and bilingual contract:
-  `docs/spec/chain-cache/en/documentation-map.md` and
-  `docs/spec/chain-cache/zh-CN/documentation-map.md`
-- Chain-cache architecture and module boundaries:
-  `docs/spec/chain-cache/en/architecture.md` and
-  `docs/spec/chain-cache/zh-CN/architecture.md`
-- Chain-cache chain adapter contract:
-  `docs/spec/chain-cache/en/chain-adapter-contract.md` and
-  `docs/spec/chain-cache/zh-CN/chain-adapter-contract.md`
-- Chain-cache storage manifest and selective coverage semantics:
-  `docs/spec/chain-cache/en/storage-manifest.md` and
-  `docs/spec/chain-cache/zh-CN/storage-manifest.md`
-- Chain-cache query-cache behavior:
-  `docs/spec/chain-cache/en/query-cache-behavior.md` and
-  `docs/spec/chain-cache/zh-CN/query-cache-behavior.md`
-- Chain-cache API, SDK, and compatibility boundary:
-  `docs/spec/chain-cache/en/api-sdk-boundary.md` and
-  `docs/spec/chain-cache/zh-CN/api-sdk-boundary.md`
+- Technical architecture reading order and development roadmap:
+  - English: `docs/spec/technical-architecture/en/00-reading-order.md`
+  - Simplified Chinese: `docs/spec/technical-architecture/zh-CN/00-reading-order.md`
+- Technical architecture project direction:
+  `docs/spec/technical-architecture/en/01-project-direction.md` and
+  `docs/spec/technical-architecture/zh-CN/01-project-direction.md`
+- Technical architecture system architecture:
+  `docs/spec/technical-architecture/en/02-system-architecture.md` and
+  `docs/spec/technical-architecture/zh-CN/02-system-architecture.md`
+- Technical architecture storage and manifest plan:
+  `docs/spec/technical-architecture/en/03-storage-and-manifest.md` and
+  `docs/spec/technical-architecture/zh-CN/03-storage-and-manifest.md`
+- Technical architecture query and fill flow:
+  `docs/spec/technical-architecture/en/04-query-and-fill-flow.md` and
+  `docs/spec/technical-architecture/zh-CN/04-query-and-fill-flow.md`
+- Technical architecture chain adapters and EVM plan:
+  `docs/spec/technical-architecture/en/05-chain-adapters-and-evm.md` and
+  `docs/spec/technical-architecture/zh-CN/05-chain-adapters-and-evm.md`
+- Technical architecture API, SDK, and compatibility plan:
+  `docs/spec/technical-architecture/en/06-api-sdk-and-compatibility.md` and
+  `docs/spec/technical-architecture/zh-CN/06-api-sdk-and-compatibility.md`

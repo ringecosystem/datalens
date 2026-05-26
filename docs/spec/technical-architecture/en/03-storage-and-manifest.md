@@ -1,0 +1,145 @@
+# 03 - Storage And Manifest
+
+This step designs how datalens remembers what it has cached. The important point is that
+the durable archive is not "whatever files happen to exist locally". The durable archive
+is the combination of object storage chunks plus manifest coverage records.
+
+## Storage Role
+
+Object storage is the long-term source of truth. The first implementation can use MinIO
+locally and an S3-compatible service such as DigitalOcean Spaces later. The storage layer
+should hide provider details behind a small interface so query, planner, and writer code
+do not know whether the backend is MinIO, Spaces, R2, S3, or another compatible store.
+
+Local disk is scratch space. It can hold downloaded chunks during a query, staged files
+before upload, temporary retry artifacts, and local test fixtures. It should not decide
+whether a range is covered. If the process restarts and local scratch files disappear,
+the durable state should still be recoverable from object storage and manifests.
+
+## Provisional Object Layout
+
+The exact object layout can evolve, but the first implementation should use a predictable
+shape:
+
+```text
+chains/<chain-kind>/<chain-name>/
+├── manifest.json
+└── datasets/
+    └── <dataset>/<schema-version>/<coverage-key>/<range-key>.parquet
+```
+
+Examples:
+
+```text
+chains/evm/ethereum-mainnet/manifest.json
+chains/evm/ethereum-mainnet/datasets/logs/v1/addr-topic-7f3a91/018000000-018099999.parquet
+chains/evm/darwinia/datasets/blocks/v1/all/000000000-000099999.parquet
+```
+
+The layout uses `chain-kind` so future `tron` or `solana` adapters do not need to fit
+inside an EVM-only namespace.
+
+`range-key` is only the range portion of the object identity. For EVM block-number ranges,
+`018000000-018099999` means blocks `18,000,000` through `18,099,999`, padded so object
+listing remains sortable. It does not mean datalens has complete coverage for every
+dataset or every contract in that block range.
+
+`coverage-key` identifies the logical coverage shape for that chunk. For full block
+headers it can be `all`. For filtered logs it should be a deterministic key derived from
+the normalized filter set, such as addresses, topics, and field coverage. A second contract
+queried over the same block range should therefore produce a different coverage key unless
+the existing coverage already satisfies the second query.
+
+## Manifest Coverage
+
+The manifest describes durable coverage. A coverage entry should include:
+
+- Chain kind, for example `evm`.
+- Chain name or configured chain identity.
+- Dataset, for example `blocks`, `logs`, `transactions`, or future family-specific names.
+- Covered range, such as block range or another chain-family range model.
+- Schema or normalization version.
+- Optional filter coverage, such as EVM addresses and topic filters.
+- Field coverage or canonical chunk shape.
+- Object key for the durable chunk.
+- Size, checksum, and write metadata when available.
+
+Because datalens caches selected data, a chunk for `logs` with one address filter does not
+imply full log coverage for the same block range or coverage for another contract. The
+manifest must make that distinction explicit.
+
+The normal write path should not decompress an existing range chunk, append another
+contract's rows, recompress it, and overwrite the object. That would make concurrent fills
+hard to reason about and would turn every new filter into a read-modify-write operation.
+The first implementation should write immutable logical chunks keyed by dataset, coverage
+key, schema version, and range. Later offline compaction may merge compatible chunks, but
+compaction is an optimization and must not be required for correctness.
+
+## Chunk Range Sizing
+
+Chunk ranges should not be a single global constant. The range size should be chosen per
+chain family and dataset with four constraints in mind:
+
+- Provider limit: the range must fit within the RPC/provider query limits for that
+  dataset.
+- Target object size: the writer should try to avoid producing many tiny objects when a
+  sparse filter returns very few rows.
+- Maximum scan span: the range must still have an upper bound so one fill task cannot scan
+  an unreasonably large history window.
+- Reuse boundary: the range should be stable enough that future equivalent queries can
+  reuse the same coverage records.
+
+For the first EVM logs implementation, use a configurable default rather than hardcoding a
+permanent value. A practical starting point is:
+
+- `max_range_blocks`: the largest range a single fill task may scan, for example
+  `100_000` blocks when the provider allows it.
+- `target_object_bytes`: the preferred compressed object size, for example 16-64 MiB.
+- `min_object_rows`: the preferred minimum row count before flushing a non-empty object.
+- `empty_coverage`: a manifest coverage entry for a range/filter pair that produced no
+  rows.
+
+Sparse filters are expected. If a contract has no matching logs in a range, the system
+should not write a tiny empty Parquet file just to remember the miss. It should record an
+empty coverage entry in the manifest, with row count `0` and no data object, so the same
+range/filter does not need to be fetched again.
+
+If a non-empty result is still too small, the writer may keep accumulating adjacent ranges
+for the same dataset, coverage key, and schema version until it reaches the target object
+size or the maximum scan span. It should then write one immutable object for the combined
+range and record that exact combined coverage.
+
+This means `018000000-018099999` is not a universal rule. It is an example of a range key.
+The implementation should make the actual range sizing configurable and observable.
+
+## Write Sequence
+
+The writer should use a safe sequence:
+
+1. Receive normalized fetched data for one planned fill segment.
+2. Merge adjacent compatible segments when doing so improves object size and stays within
+   the configured maximum range.
+3. Build a deterministic logical chunk identity from dataset, coverage key, schema
+   version, and actual covered range.
+4. Write a data object when the segment has rows.
+5. Write only manifest empty coverage when the segment has no rows.
+6. Verify or trust the object write according to backend capabilities.
+7. Update the manifest coverage entry.
+8. Make the new coverage visible to future queries.
+
+If the object write fails, manifest coverage must not change. If the object write succeeds
+but manifest update fails, retry should be able to converge without corrupting coverage.
+
+## What To Implement In This Step
+
+The first storage implementation should include:
+
+- A storage trait for object get, put, exists, list, and delete when needed.
+- A local filesystem or MinIO-backed development implementation.
+- Manifest data structures in `datalens-core` or `datalens-storage`.
+- Coverage matching code that can answer: covered, partial, or missing.
+- Idempotent write tests for the same logical chunk.
+- Tests proving local scratch files are not treated as durable coverage.
+
+This step does not need to choose every future Parquet column. It needs to make coverage
+truth precise enough that query planning can safely depend on it.
