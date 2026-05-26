@@ -10,7 +10,8 @@ use axum::{
     routing::{get, post},
 };
 use datalens_chain::{
-    ChainAdapter, ChainFetchRequest, DatasetSelector, FetchContext, HeightRange, HeightRangeKind,
+    ChainAdapter, ChainFetchRequest, ChainFetchResponse, DatasetSelector, FetchContext,
+    HeightRange, HeightRangeKind,
 };
 use datalens_core::{
     BlockRange, CacheSummary, DatalensError, DatalensErrorKind, Dataset, QueryRequest,
@@ -260,19 +261,21 @@ where
                 .read_rows(&request.chain, request.dataset, &selector, request.range)?;
 
         for range in split_ranges(&misses, self.chunk_size(request.dataset)) {
-            let fetched = match self.source.fetch(
-                ChainFetchRequest::new(
-                    request.chain.clone(),
-                    request.dataset,
-                    HeightRange::Block(range),
-                    selector.clone(),
-                )
-                .with_context(FetchContext {
-                    request_id: None,
-                    cache_write: true,
-                }),
-            ) {
-                Ok(response) => response.rows,
+            let fetch_request = ChainFetchRequest::new(
+                request.chain.clone(),
+                request.dataset,
+                HeightRange::Block(range),
+                selector.clone(),
+            )
+            .with_context(FetchContext {
+                request_id: None,
+                cache_write: true,
+            });
+            let fetched = match self.source.fetch(fetch_request.clone()) {
+                Ok(response) => {
+                    validate_fetch_response(&fetch_request, &response)?;
+                    response.rows
+                }
                 Err(error) => {
                     log::warn!(
                         "provider fetch failed dataset={} range={}-{} kind={:?}",
@@ -387,7 +390,11 @@ where
                 let filter = request.filter.as_ref().ok_or_else(|| {
                     DatalensError::new(DatalensErrorKind::InvalidInput, "logs require filter")
                 })?;
-                if filter.addresses.len() > self.chain.datasets.logs.max_addresses_per_query {
+                let max_addresses = dataset_capability
+                    .max_addresses_per_query()
+                    .unwrap_or(usize::MAX)
+                    .min(self.chain.datasets.logs.max_addresses_per_query);
+                if filter.addresses.len() > max_addresses {
                     return Err(DatalensError::new(
                         DatalensErrorKind::InvalidInput,
                         "too many log addresses",
@@ -415,23 +422,39 @@ where
     }
 
     fn chunk_size(&self, dataset: Dataset) -> u64 {
-        match dataset {
-            Dataset::Blocks => self
-                .chain
-                .datasets
-                .blocks
-                .max_batch_blocks
-                .min(self.planner.default_chunk_range_blocks)
-                .max(1),
-            Dataset::Logs => self
-                .chain
-                .datasets
-                .logs
-                .max_get_logs_range_blocks
-                .min(self.planner.default_chunk_range_blocks)
-                .max(1),
-        }
+        let configured_limit = match dataset {
+            Dataset::Blocks => self.chain.datasets.blocks.max_batch_blocks,
+            Dataset::Logs => self.chain.datasets.logs.max_get_logs_range_blocks,
+        };
+        let adapter_limit = self
+            .source
+            .capabilities()
+            .dataset(dataset)
+            .and_then(|capability| capability.max_range_blocks())
+            .unwrap_or(u64::MAX);
+
+        configured_limit
+            .min(self.planner.default_chunk_range_blocks)
+            .min(adapter_limit)
+            .max(1)
     }
+}
+
+fn validate_fetch_response(
+    request: &ChainFetchRequest,
+    response: &ChainFetchResponse,
+) -> Result<(), DatalensError> {
+    if response.chain != request.chain
+        || response.dataset != request.dataset
+        || response.range != request.range
+        || response.coverage_selector != request.selector
+    {
+        return Err(DatalensError::new(
+            DatalensErrorKind::Internal,
+            "chain adapter response does not match fetch request",
+        ));
+    }
+    Ok(())
 }
 
 pub fn router<S>(service: QueryService<S>, chain_names: Vec<String>) -> Router
