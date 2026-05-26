@@ -354,6 +354,7 @@ dependencies = [
  "datalens-writer",
  "figment",
  "log",
+ "serde_json",
  "tokio",
  "tracing-log",
  "tracing-subscriber",
