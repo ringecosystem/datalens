@@ -1,8 +1,11 @@
 ---
 schema: conductor/repository-workflow-policy/1
 execution:
-  canonicalize_commands: []
-  verify_commands: []
+  canonicalize_commands:
+    - just fmt
+  verify_commands:
+    - just check
+    - just clippy
   max_attempts: 3
   retry_backoff_seconds: 60
   command_timeout_seconds: 1800

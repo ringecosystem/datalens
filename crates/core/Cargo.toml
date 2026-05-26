@@ -1,0 +1,10 @@
+[package]
+name = "datalens-chain-cache-core"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+alloy.workspace = true
+arrow.workspace = true
+parquet.workspace = true

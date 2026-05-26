@@ -1,0 +1,15 @@
+[package]
+name = "datalens-chain-cache-cli"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "datalens-chain-cache"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+datalens-chain-cache-api = { path = "../api" }
+figment.workspace = true
+tokio.workspace = true

@@ -1,0 +1,26 @@
+[workspace]
+members = [
+  "crates/api",
+  "crates/cli",
+  "crates/core",
+  "crates/ingest",
+  "crates/query",
+  "crates/storage",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+alloy = { version = "2.0.5", default-features = false, features = ["reqwest-rustls-tls", "rpc-client"] }
+arrow = "58.3.0"
+aws-sdk-s3 = "1.133.0"
+axum = "0.8.9"
+clap = { version = "4.6.1", features = ["derive"] }
+figment = "0.10.19"
+parquet = "58.3.0"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
