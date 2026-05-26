@@ -9,7 +9,7 @@ use datalens_core::{
     BlockRange, ChainIdentity, CoverageLevel, DatalensError, DatalensErrorKind, Dataset, DatasetId,
     EvmLogFilter, LogFilter, QueryRows, TimeRange,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StorageRequest {
@@ -233,13 +233,88 @@ struct Manifest {
     entries: Vec<ManifestEntry>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct ManifestEntry {
     dataset: Dataset,
     filter_key: String,
     range: BlockRange,
     object_key: Option<String>,
     row_count: usize,
+}
+
+impl<'de> Deserialize<'de> for ManifestEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawManifestEntry {
+            dataset: Dataset,
+            filter_key: String,
+            range: BlockRange,
+            object_key: Option<String>,
+            row_count: usize,
+        }
+
+        let raw = RawManifestEntry::deserialize(deserializer)?;
+        ManifestEntry::try_from_parts(
+            raw.dataset,
+            raw.filter_key,
+            raw.range,
+            raw.object_key,
+            raw.row_count,
+        )
+        .map_err(D::Error::custom)
+    }
+}
+
+impl ManifestEntry {
+    fn try_from_parts(
+        dataset: Dataset,
+        filter_key: String,
+        range: BlockRange,
+        object_key: Option<String>,
+        row_count: usize,
+    ) -> Result<Self, DatalensError> {
+        match object_key {
+            Some(object_key) => {
+                if row_count == 0 {
+                    return Err(DatalensError::new(
+                        DatalensErrorKind::InvalidInput,
+                        "data object coverage must have row_count greater than zero",
+                    ));
+                }
+                if object_key.trim().is_empty() {
+                    return Err(DatalensError::new(
+                        DatalensErrorKind::InvalidInput,
+                        "data object coverage must have a non-empty object key",
+                    ));
+                }
+                Ok(Self {
+                    dataset,
+                    filter_key,
+                    range,
+                    object_key: Some(object_key),
+                    row_count,
+                })
+            }
+            None => {
+                if row_count != 0 {
+                    return Err(DatalensError::new(
+                        DatalensErrorKind::InvalidInput,
+                        "empty coverage must have row_count zero",
+                    ));
+                }
+                Ok(Self {
+                    dataset,
+                    filter_key,
+                    range,
+                    object_key: None,
+                    row_count,
+                })
+            }
+        }
+    }
 }
 
 pub fn missing_ranges(range: BlockRange, covered: &[BlockRange]) -> Vec<BlockRange> {
@@ -371,6 +446,129 @@ mod tests {
                 .expect("object key")
                 .contains("evm-logs/addr-topic-")
         );
+    }
+
+    #[test]
+    fn test_manifest_deserialization_rejects_invalid_coverage_semantics() {
+        let row_count_without_object = r#"{
+            "entries":[{
+                "dataset":"logs",
+                "filter_key":"evm-logs/addr-topic-deadbeef",
+                "range":{"from_block":1,"to_block":2},
+                "object_key":null,
+                "row_count":1
+            }]
+        }"#;
+        assert!(serde_json::from_str::<Manifest>(row_count_without_object).is_err());
+
+        let object_without_rows = r#"{
+            "entries":[{
+                "dataset":"logs",
+                "filter_key":"evm-logs/addr-topic-deadbeef",
+                "range":{"from_block":1,"to_block":2},
+                "object_key":"objects/logs/key/1-2.json",
+                "row_count":0
+            }]
+        }"#;
+        assert!(serde_json::from_str::<Manifest>(object_without_rows).is_err());
+    }
+
+    #[test]
+    fn test_manifest_deserialization_accepts_valid_coverage_semantics() {
+        let empty = r#"{
+            "entries":[{
+                "dataset":"logs",
+                "filter_key":"evm-logs/addr-topic-deadbeef",
+                "range":{"from_block":1,"to_block":2},
+                "object_key":null,
+                "row_count":0
+            }]
+        }"#;
+        assert!(serde_json::from_str::<Manifest>(empty).is_ok());
+
+        let data_object = r#"{
+            "entries":[{
+                "dataset":"logs",
+                "filter_key":"evm-logs/addr-topic-deadbeef",
+                "range":{"from_block":1,"to_block":2},
+                "object_key":"objects/logs/key/1-2.json",
+                "row_count":1
+            }]
+        }"#;
+        assert!(serde_json::from_str::<Manifest>(data_object).is_ok());
+    }
+
+    #[test]
+    fn test_covered_ranges_rejects_malformed_manifest_entries() {
+        let storage = LocalStorage::new(temp_storage_root("malformed-manifest"));
+        std::fs::write(
+            storage.manifest_path(),
+            r#"{
+                "entries":[{
+                    "dataset":"logs",
+                    "filter_key":"evm-logs/addr-topic-deadbeef",
+                    "range":{"from_block":1,"to_block":2},
+                    "object_key":null,
+                    "row_count":1
+                }]
+            }"#,
+        )
+        .expect("write manifest");
+
+        let error = storage
+            .covered_ranges(Dataset::Logs, None, BlockRange::expect_new(1, 2))
+            .expect_err("malformed manifest");
+
+        assert_eq!(error.kind, DatalensErrorKind::StorageReadFailure);
+    }
+
+    #[test]
+    fn test_read_rows_rejects_invalid_cached_log_record() {
+        let storage = LocalStorage::new(temp_storage_root("invalid-cached-log"));
+        let filter_key = coverage_key(Dataset::Logs, None).expect("coverage key");
+        let object_key = format!("objects/logs/{filter_key}/1-1.json");
+        let object_path = storage.root().join(&object_key);
+        std::fs::create_dir_all(object_path.parent().expect("object parent"))
+            .expect("create object dir");
+        std::fs::write(
+            &object_path,
+            r#"{
+                "dataset":"logs",
+                "rows":[{
+                    "block_number":1,
+                    "block_hash":"0xblock",
+                    "transaction_hash":"0xtx",
+                    "transaction_index":0,
+                    "log_index":0,
+                    "address":"0xabc",
+                    "topics":[],
+                    "data":"0x",
+                    "removed":false
+                }]
+            }"#,
+        )
+        .expect("write object");
+        std::fs::write(
+            storage.manifest_path(),
+            format!(
+                r#"{{
+                    "entries":[{{
+                        "dataset":"logs",
+                        "filter_key":"{filter_key}",
+                        "range":{{"from_block":1,"to_block":1}},
+                        "object_key":"{object_key}",
+                        "row_count":1
+                    }}]
+                }}"#
+            ),
+        )
+        .expect("write manifest");
+
+        let error = storage
+            .read_rows(Dataset::Logs, None, BlockRange::expect_new(1, 1))
+            .expect_err("invalid cached log");
+
+        assert_eq!(error.kind, DatalensErrorKind::StorageReadFailure);
     }
 
     fn temp_storage_root(name: &str) -> PathBuf {

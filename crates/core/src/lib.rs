@@ -417,12 +417,41 @@ pub mod coverage {
 
     pub const COVERAGE_SCHEMA_VERSION: u16 = 1;
 
-    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
     pub struct CoverageKey {
         chain: ChainIdentity,
         dataset: Dataset,
         schema_version: u16,
         coverage: CoverageShape,
+    }
+
+    impl<'de> Deserialize<'de> for CoverageKey {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            #[derive(Deserialize)]
+            struct RawCoverageKey {
+                chain: ChainIdentity,
+                dataset: Dataset,
+                schema_version: u16,
+                coverage: CoverageShape,
+            }
+
+            let raw = RawCoverageKey::deserialize(deserializer)?;
+            if raw.schema_version != COVERAGE_SCHEMA_VERSION {
+                return Err(D::Error::custom(format!(
+                    "unsupported coverage schema_version {}; only {COVERAGE_SCHEMA_VERSION} is supported",
+                    raw.schema_version
+                )));
+            }
+            Ok(Self {
+                chain: raw.chain,
+                dataset: raw.dataset,
+                schema_version: raw.schema_version,
+                coverage: raw.coverage,
+            })
+        }
     }
 
     impl CoverageKey {
@@ -755,6 +784,7 @@ pub mod query {
     use std::collections::BTreeSet;
 
     use serde::{Deserialize, Deserializer, Serialize, de::Error};
+    use sha2::{Digest, Sha256};
 
     use crate::{BlockRange, ChainIdentity, DatalensError, DatalensErrorKind, Dataset};
 
@@ -766,7 +796,7 @@ pub mod query {
         pub timestamp: u64,
     }
 
-    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
     pub struct LogRecord {
         pub block_number: u64,
         pub block_hash: String,
@@ -777,6 +807,40 @@ pub mod query {
         pub topics: Vec<String>,
         pub data: String,
         pub removed: bool,
+    }
+
+    impl<'de> Deserialize<'de> for LogRecord {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            #[derive(Deserialize)]
+            struct RawLogRecord {
+                block_number: u64,
+                block_hash: String,
+                transaction_hash: String,
+                transaction_index: u64,
+                log_index: u64,
+                address: String,
+                topics: Vec<String>,
+                data: String,
+                removed: bool,
+            }
+
+            let raw = RawLogRecord::deserialize(deserializer)?;
+            Self::try_new(
+                raw.block_number,
+                raw.block_hash,
+                raw.transaction_hash,
+                raw.transaction_index,
+                raw.log_index,
+                raw.address,
+                raw.topics,
+                raw.data,
+                raw.removed,
+            )
+            .map_err(D::Error::custom)
+        }
     }
 
     impl LogRecord {
@@ -873,7 +937,7 @@ pub mod query {
         }
 
         pub fn compact_key(&self) -> String {
-            format!("addr-topic-{:016x}", stable_hash(&self.canonical_key()))
+            format!("addr-topic-{}", stable_digest_prefix(&self.canonical_key()))
         }
     }
 
@@ -1066,13 +1130,14 @@ pub mod query {
         Ok(())
     }
 
-    fn stable_hash(value: &str) -> u64 {
-        let mut hash = 0xcbf29ce484222325u64;
-        for byte in value.as_bytes() {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        hash
+    fn stable_digest_prefix(value: &str) -> String {
+        const PREFIX_BYTES: usize = 16;
+
+        let digest = Sha256::digest(value.as_bytes());
+        digest[..PREFIX_BYTES]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
     }
 }
 
@@ -1262,6 +1327,71 @@ mod tests {
     }
 
     #[test]
+    fn test_log_record_deserialization_canonicalizes_hex_values() {
+        let json = r#"{
+            "block_number":10,
+            "block_hash":"0xblock",
+            "transaction_hash":"0xtx",
+            "transaction_index":0,
+            "log_index":1,
+            "address":"0XAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "topics":["0XBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"],
+            "data":"0xCAFE",
+            "removed":false
+        }"#;
+
+        let record: LogRecord = serde_json::from_str(json).expect("valid log record");
+
+        assert_eq!(record.address, "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(
+            record.topics,
+            vec!["0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+        );
+    }
+
+    #[test]
+    fn test_log_record_deserialization_rejects_invalid_hex_values() {
+        let invalid_address = r#"{
+            "block_number":10,
+            "block_hash":"0xblock",
+            "transaction_hash":"0xtx",
+            "transaction_index":0,
+            "log_index":1,
+            "address":"0xabc",
+            "topics":[],
+            "data":"0x",
+            "removed":false
+        }"#;
+        assert!(serde_json::from_str::<LogRecord>(invalid_address).is_err());
+
+        let invalid_topic = r#"{
+            "block_number":10,
+            "block_hash":"0xblock",
+            "transaction_hash":"0xtx",
+            "transaction_index":0,
+            "log_index":1,
+            "address":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "topics":["0xabc"],
+            "data":"0x",
+            "removed":false
+        }"#;
+        assert!(serde_json::from_str::<LogRecord>(invalid_topic).is_err());
+
+        let invalid_data = r#"{
+            "block_number":10,
+            "block_hash":"0xblock",
+            "transaction_hash":"0xtx",
+            "transaction_index":0,
+            "log_index":1,
+            "address":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "topics":[],
+            "data":"0x0",
+            "removed":false
+        }"#;
+        assert!(serde_json::from_str::<LogRecord>(invalid_data).is_err());
+    }
+
+    #[test]
     fn test_empty_coverage_record_is_distinct_from_missing_and_satisfies_same_key_range() {
         let chain =
             ChainIdentity::try_new(ChainFamily::Evm, "darwinia", Some(NetworkId::numeric(46)))
@@ -1440,6 +1570,40 @@ mod tests {
         assert_ne!(first.compact_key(), third.compact_key());
         assert!(first.compact_key().starts_with("addr-topic-"));
         assert!(!first.compact_key().contains('/'));
+    }
+
+    #[test]
+    fn test_compact_coverage_key_uses_sha256_prefix() {
+        let filter = EvmLogFilter::try_from(LogFilter {
+            addresses: vec!["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()],
+            topics: vec![None],
+        })
+        .unwrap();
+        let key = filter.compact_key();
+        let digest = key.strip_prefix("addr-topic-").expect("compact key prefix");
+
+        assert_eq!(digest.len(), 32, "128-bit SHA-256 prefix");
+        assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(!key.contains("0xaaaaaaaa"));
+    }
+
+    #[test]
+    fn test_coverage_key_deserialization_rejects_unsupported_schema_version() {
+        let supported = r#"{
+            "chain":{"family":"Evm","configured_name":"ethereum","network_id":{"kind":"numeric","value":1}},
+            "dataset":"blocks",
+            "schema_version":1,
+            "coverage":{"shape":"all"}
+        }"#;
+        assert!(serde_json::from_str::<CoverageKey>(supported).is_ok());
+
+        let unsupported = r#"{
+            "chain":{"family":"Evm","configured_name":"ethereum","network_id":{"kind":"numeric","value":1}},
+            "dataset":"blocks",
+            "schema_version":2,
+            "coverage":{"shape":"all"}
+        }"#;
+        assert!(serde_json::from_str::<CoverageKey>(unsupported).is_err());
     }
 
     #[test]
