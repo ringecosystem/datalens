@@ -56,6 +56,9 @@ Then keep the body explicit:
 - Chain-cache architecture and module boundaries:
   `docs/spec/chain-cache/en/architecture.md` and
   `docs/spec/chain-cache/zh-CN/architecture.md`
+- Chain-cache chain adapter contract:
+  `docs/spec/chain-cache/en/chain-adapter-contract.md` and
+  `docs/spec/chain-cache/zh-CN/chain-adapter-contract.md`
 - Chain-cache query-cache behavior:
   `docs/spec/chain-cache/en/query-cache-behavior.md` and
   `docs/spec/chain-cache/zh-CN/query-cache-behavior.md`
