@@ -11,9 +11,9 @@ use datalens_writer::{WriteRequest, WriteStatus};
 
 #[test]
 fn workspace_exposes_architecture_boundaries() {
-    let chain = ChainIdentity::new(ChainFamily::Evm, "ethereum-mainnet");
-    let dataset = DatasetId::new("logs");
-    let range = TimeRange::blocks(1, 2);
+    let chain = ChainIdentity::expect_new(ChainFamily::Evm, "ethereum-mainnet");
+    let dataset = DatasetId::expect_new("logs");
+    let range = TimeRange::expect_blocks(1, 2);
     let envelope = ResultEnvelope::ok(dataset.clone(), range, Vec::<u8>::new());
     let capabilities = AdapterCapabilities::new(chain.clone()).with_dataset(dataset.clone());
 
@@ -24,7 +24,7 @@ fn workspace_exposes_architecture_boundaries() {
     assert_eq!(capabilities.chain(), &chain);
     assert_eq!(CoverageLevel::Missing, PlanStatus::Missing.coverage_level());
     assert_eq!(
-        DatalensErrorKind::Unsupported,
+        DatalensErrorKind::UnsupportedDataset,
         WriteStatus::Deferred.error_kind()
     );
 

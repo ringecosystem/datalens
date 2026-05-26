@@ -29,7 +29,7 @@ impl WriteStatus {
     pub fn error_kind(&self) -> DatalensErrorKind {
         match self {
             Self::Persisted => DatalensErrorKind::Internal,
-            Self::Deferred => DatalensErrorKind::Unsupported,
+            Self::Deferred => DatalensErrorKind::UnsupportedDataset,
         }
     }
 }

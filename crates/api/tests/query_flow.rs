@@ -25,11 +25,17 @@ fn test_query_blocks_miss_persists_then_equivalent_hit_uses_cache() {
         .expect("first query succeeds");
     let second = service.query(request).expect("second query succeeds");
 
-    assert_eq!(first.cache.missing_ranges, vec![BlockRange::new(10, 11)]);
-    assert_eq!(second.cache.hit_ranges, vec![BlockRange::new(10, 11)]);
+    assert_eq!(
+        first.cache.missing_ranges,
+        vec![BlockRange::expect_new(10, 11)]
+    );
+    assert_eq!(
+        second.cache.hit_ranges,
+        vec![BlockRange::expect_new(10, 11)]
+    );
     assert_eq!(
         source.calls(),
-        vec![SourceCall::Blocks(BlockRange::new(10, 11))]
+        vec![SourceCall::Blocks(BlockRange::expect_new(10, 11))]
     );
     assert_eq!(block_numbers(&second), vec![10, 11]);
 }
@@ -49,11 +55,17 @@ fn test_query_blocks_partial_hit_fetches_only_missing_range() {
     source.clear_calls();
     let response = service.query(blocks_request(1, 4)).expect("partial query");
 
-    assert_eq!(response.cache.hit_ranges, vec![BlockRange::new(1, 2)]);
-    assert_eq!(response.cache.missing_ranges, vec![BlockRange::new(3, 4)]);
+    assert_eq!(
+        response.cache.hit_ranges,
+        vec![BlockRange::expect_new(1, 2)]
+    );
+    assert_eq!(
+        response.cache.missing_ranges,
+        vec![BlockRange::expect_new(3, 4)]
+    );
     assert_eq!(
         source.calls(),
-        vec![SourceCall::Blocks(BlockRange::new(3, 4))]
+        vec![SourceCall::Blocks(BlockRange::expect_new(3, 4))]
     );
     assert_eq!(block_numbers(&response), vec![1, 2, 3, 4]);
 }
@@ -71,13 +83,19 @@ fn test_query_empty_logs_records_empty_coverage_without_data_object() {
         .expect("empty log query succeeds");
     let second = service.query(request).expect("empty log query hits cache");
 
-    assert_eq!(first.cache.missing_ranges, vec![BlockRange::new(50, 52)]);
-    assert_eq!(second.cache.hit_ranges, vec![BlockRange::new(50, 52)]);
+    assert_eq!(
+        first.cache.missing_ranges,
+        vec![BlockRange::expect_new(50, 52)]
+    );
+    assert_eq!(
+        second.cache.hit_ranges,
+        vec![BlockRange::expect_new(50, 52)]
+    );
     assert_eq!(
         source.calls(),
         vec![
-            SourceCall::Logs(BlockRange::new(50, 51)),
-            SourceCall::Logs(BlockRange::new(52, 52)),
+            SourceCall::Logs(BlockRange::expect_new(50, 51)),
+            SourceCall::Logs(BlockRange::expect_new(52, 52)),
         ]
     );
     assert_eq!(log_indexes(&second), Vec::<u64>::new());
@@ -121,11 +139,17 @@ fn test_query_logs_miss_persists_then_equivalent_hit_uses_cache() {
         .expect("first log query succeeds");
     let second = service.query(request).expect("second log query succeeds");
 
-    assert_eq!(first.cache.missing_ranges, vec![BlockRange::new(20, 21)]);
-    assert_eq!(second.cache.hit_ranges, vec![BlockRange::new(20, 21)]);
+    assert_eq!(
+        first.cache.missing_ranges,
+        vec![BlockRange::expect_new(20, 21)]
+    );
+    assert_eq!(
+        second.cache.hit_ranges,
+        vec![BlockRange::expect_new(20, 21)]
+    );
     assert_eq!(
         source.calls(),
-        vec![SourceCall::Logs(BlockRange::new(20, 21))]
+        vec![SourceCall::Logs(BlockRange::expect_new(20, 21))]
     );
     assert_eq!(
         log_addresses(&second),
@@ -201,7 +225,7 @@ fn blocks_request(from_block: u64, to_block: u64) -> QueryRequest {
     QueryRequest {
         chain: ethereum_identity(),
         dataset: Dataset::Blocks,
-        range: BlockRange::new(from_block, to_block),
+        range: BlockRange::expect_new(from_block, to_block),
         filter: None,
         include_block: false,
     }
@@ -225,7 +249,7 @@ fn logs_request_with_topics(
     QueryRequest {
         chain: ethereum_identity(),
         dataset: Dataset::Logs,
-        range: BlockRange::new(from_block, to_block),
+        range: BlockRange::expect_new(from_block, to_block),
         filter: Some(LogFilter {
             addresses: addresses.into_iter().map(str::to_owned).collect(),
             topics: topics

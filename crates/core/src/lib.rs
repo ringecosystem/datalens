@@ -1,14 +1,32 @@
 //! Chain-neutral datalens vocabulary shared across workspace crates.
 
 pub mod chain {
-    use serde::{Deserialize, Serialize};
+    use serde::{Deserialize, Deserializer, Serialize, de::Error};
 
     use crate::{DatalensError, DatalensErrorKind};
 
-    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
     pub enum ChainFamily {
         Evm,
         Other(String),
+    }
+
+    impl<'de> Deserialize<'de> for ChainFamily {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            #[derive(Deserialize)]
+            enum RawChainFamily {
+                Evm,
+                Other(String),
+            }
+
+            match RawChainFamily::deserialize(deserializer)? {
+                RawChainFamily::Evm => Ok(Self::Evm),
+                RawChainFamily::Other(value) => Self::try_other(value).map_err(D::Error::custom),
+            }
+        }
     }
 
     impl ChainFamily {
@@ -25,11 +43,30 @@ pub mod chain {
         }
     }
 
-    #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+    #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
     #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
     pub enum NetworkId {
         Numeric(u64),
         Textual(String),
+    }
+
+    impl<'de> Deserialize<'de> for NetworkId {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            #[derive(Deserialize)]
+            #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+            enum RawNetworkId {
+                Numeric(u64),
+                Textual(String),
+            }
+
+            match RawNetworkId::deserialize(deserializer)? {
+                RawNetworkId::Numeric(value) => Ok(Self::Numeric(value)),
+                RawNetworkId::Textual(value) => Self::textual(value).map_err(D::Error::custom),
+            }
+        }
     }
 
     impl NetworkId {
@@ -52,7 +89,7 @@ pub mod chain {
         }
     }
 
-    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
     pub struct ChainIdentity {
         family: ChainFamily,
         configured_name: String,
@@ -60,12 +97,30 @@ pub mod chain {
         network_id: Option<NetworkId>,
     }
 
+    impl<'de> Deserialize<'de> for ChainIdentity {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            #[derive(Deserialize)]
+            struct RawChainIdentity {
+                family: ChainFamily,
+                configured_name: String,
+                #[serde(default)]
+                network_id: Option<NetworkId>,
+            }
+
+            let raw = RawChainIdentity::deserialize(deserializer)?;
+            Self::try_new(raw.family, raw.configured_name, raw.network_id).map_err(D::Error::custom)
+        }
+    }
+
     impl ChainIdentity {
-        pub fn new(family: ChainFamily, id: impl Into<String>) -> Self {
+        pub fn expect_new(family: ChainFamily, id: impl Into<String>) -> Self {
             Self::try_new(family, id, None).expect("valid chain identity")
         }
 
-        pub fn with_network_id(
+        pub fn expect_with_network_id(
             family: ChainFamily,
             configured_name: impl Into<String>,
             network_id: NetworkId,
@@ -127,7 +182,7 @@ pub mod chain {
         }
     }
 
-    fn validate_identifier(kind: &str, value: String) -> Result<String, DatalensError> {
+    pub(crate) fn validate_identifier(kind: &str, value: String) -> Result<String, DatalensError> {
         let value = value.trim();
         if value.is_empty() {
             return Err(DatalensError::new(
@@ -146,19 +201,45 @@ pub mod chain {
 }
 
 pub mod range {
-    use serde::{Deserialize, Serialize};
+    use serde::{Deserialize, Deserializer, Serialize, de::Error};
 
     use crate::{DatalensError, DatalensErrorKind};
 
-    #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
     pub struct TimeRange {
         start: u64,
         end: u64,
     }
 
+    impl<'de> Deserialize<'de> for TimeRange {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            #[derive(Deserialize)]
+            struct RawTimeRange {
+                start: u64,
+                end: u64,
+            }
+
+            let raw = RawTimeRange::deserialize(deserializer)?;
+            Self::try_blocks(raw.start, raw.end).map_err(D::Error::custom)
+        }
+    }
+
     impl TimeRange {
-        pub fn blocks(start: u64, end: u64) -> Self {
-            Self { start, end }
+        pub fn expect_blocks(start: u64, end: u64) -> Self {
+            Self::try_blocks(start, end).expect("valid time range")
+        }
+
+        pub fn try_blocks(start: u64, end: u64) -> Result<Self, DatalensError> {
+            if start > end {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::InvalidInput,
+                    "time range start must be less than or equal to end",
+                ));
+            }
+            Ok(Self { start, end })
         }
 
         pub fn start(&self) -> u64 {
@@ -170,14 +251,30 @@ pub mod range {
         }
     }
 
-    #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
     pub struct BlockRange {
         pub from_block: u64,
         pub to_block: u64,
     }
 
+    impl<'de> Deserialize<'de> for BlockRange {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            #[derive(Deserialize)]
+            struct RawBlockRange {
+                from_block: u64,
+                to_block: u64,
+            }
+
+            let raw = RawBlockRange::deserialize(deserializer)?;
+            Self::try_new(raw.from_block, raw.to_block).map_err(D::Error::custom)
+        }
+    }
+
     impl BlockRange {
-        pub fn new(from_block: u64, to_block: u64) -> Self {
+        pub fn expect_new(from_block: u64, to_block: u64) -> Self {
             Self::try_new(from_block, to_block).expect("valid block range")
         }
 
@@ -222,10 +319,10 @@ pub mod range {
             };
             let mut ranges = Vec::new();
             if self.from_block < overlap.from_block {
-                ranges.push(Self::new(self.from_block, overlap.from_block - 1));
+                ranges.push(Self::expect_new(self.from_block, overlap.from_block - 1));
             }
             if overlap.to_block < self.to_block {
-                ranges.push(Self::new(overlap.to_block + 1, self.to_block));
+                ranges.push(Self::expect_new(overlap.to_block + 1, self.to_block));
             }
             ranges
         }
@@ -244,7 +341,7 @@ pub mod range {
                 let offset = max_blocks - 1;
                 let chunk_end = from_block.saturating_add(offset);
                 let to_block = self.to_block.min(chunk_end);
-                ranges.push(Self::new(from_block, to_block));
+                ranges.push(Self::expect_new(from_block, to_block));
                 if to_block == self.to_block || to_block == u64::MAX {
                     break;
                 }
@@ -256,14 +353,30 @@ pub mod range {
 }
 
 pub mod dataset {
-    use serde::{Deserialize, Serialize};
+    use serde::{Deserialize, Deserializer, Serialize, de::Error};
 
-    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    use crate::{DatalensError, chain::validate_identifier};
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
     pub struct DatasetId(String);
 
+    impl<'de> Deserialize<'de> for DatasetId {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            let value = String::deserialize(deserializer)?;
+            Self::try_new(value).map_err(D::Error::custom)
+        }
+    }
+
     impl DatasetId {
-        pub fn new(id: impl Into<String>) -> Self {
-            Self(id.into())
+        pub fn expect_new(id: impl Into<String>) -> Self {
+            Self::try_new(id).expect("valid dataset id")
+        }
+
+        pub fn try_new(id: impl Into<String>) -> Result<Self, DatalensError> {
+            Ok(Self(validate_identifier("dataset id", id.into())?))
         }
 
         pub fn as_str(&self) -> &str {
@@ -289,9 +402,11 @@ pub mod dataset {
 }
 
 pub mod coverage {
-    use serde::{Deserialize, Serialize};
+    use serde::{Deserialize, Deserializer, Serialize, de::Error};
 
-    use crate::{BlockRange, ChainIdentity, Dataset, EvmLogFilter};
+    use crate::{
+        BlockRange, ChainIdentity, DatalensError, DatalensErrorKind, Dataset, EvmLogFilter,
+    };
 
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
     pub enum CoverageLevel {
@@ -344,6 +459,13 @@ pub mod coverage {
         pub fn coverage_key(&self) -> String {
             match &self.coverage {
                 CoverageShape::All => "all".to_owned(),
+                CoverageShape::EvmLogs(filter) => format!("evm-logs/{}", filter.compact_key()),
+            }
+        }
+
+        pub fn canonical_coverage_key(&self) -> String {
+            match &self.coverage {
+                CoverageShape::All => "all".to_owned(),
                 CoverageShape::EvmLogs(filter) => format!("evm-logs/{}", filter.canonical_key()),
             }
         }
@@ -373,7 +495,7 @@ pub mod coverage {
         Empty,
     }
 
-    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
     pub struct CoverageRecord {
         key: CoverageKey,
         range: BlockRange,
@@ -381,27 +503,85 @@ pub mod coverage {
         object_key: Option<String>,
     }
 
+    impl<'de> Deserialize<'de> for CoverageRecord {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            #[derive(Deserialize)]
+            struct RawCoverageRecord {
+                key: CoverageKey,
+                range: BlockRange,
+                row_count: usize,
+                object_key: Option<String>,
+            }
+
+            let raw = RawCoverageRecord::deserialize(deserializer)?;
+            Self::try_from_parts(raw.key, raw.range, raw.row_count, raw.object_key)
+                .map_err(D::Error::custom)
+        }
+    }
+
     impl CoverageRecord {
-        pub fn data_object(
+        pub fn try_data_object(
             key: CoverageKey,
             range: BlockRange,
             row_count: usize,
             object_key: impl Into<String>,
-        ) -> Self {
-            Self {
-                key,
-                range,
-                row_count,
-                object_key: Some(object_key.into()),
-            }
+        ) -> Result<Self, DatalensError> {
+            Self::try_from_parts(key, range, row_count, Some(object_key.into()))
         }
 
-        pub fn empty(key: CoverageKey, range: BlockRange) -> Self {
-            Self {
-                key,
-                range,
-                row_count: 0,
-                object_key: None,
+        pub fn try_empty(
+            key: CoverageKey,
+            range: BlockRange,
+            row_count: usize,
+            object_key: Option<String>,
+        ) -> Result<Self, DatalensError> {
+            Self::try_from_parts(key, range, row_count, object_key)
+        }
+
+        fn try_from_parts(
+            key: CoverageKey,
+            range: BlockRange,
+            row_count: usize,
+            object_key: Option<String>,
+        ) -> Result<Self, DatalensError> {
+            match object_key {
+                Some(object_key) => {
+                    if row_count == 0 {
+                        return Err(DatalensError::new(
+                            DatalensErrorKind::InvalidInput,
+                            "data object coverage must have row_count greater than zero",
+                        ));
+                    }
+                    if object_key.trim().is_empty() {
+                        return Err(DatalensError::new(
+                            DatalensErrorKind::InvalidInput,
+                            "data object coverage must have a non-empty object key",
+                        ));
+                    }
+                    Ok(Self {
+                        key,
+                        range,
+                        row_count,
+                        object_key: Some(object_key),
+                    })
+                }
+                None => {
+                    if row_count != 0 {
+                        return Err(DatalensError::new(
+                            DatalensErrorKind::InvalidInput,
+                            "empty coverage must have row_count zero",
+                        ));
+                    }
+                    Ok(Self {
+                        key,
+                        range,
+                        row_count,
+                        object_key: None,
+                    })
+                }
             }
         }
 
@@ -422,13 +602,14 @@ pub mod coverage {
         }
 
         pub fn value(&self) -> CoverageValue {
-            if self.object_key.is_some() {
+            if self.row_count > 0 && self.object_key.is_some() {
                 CoverageValue::DataObject
             } else {
                 CoverageValue::Empty
             }
         }
 
+        /// First-stage coverage matching is exact by key; broader filters do not satisfy narrower filters.
         pub fn covers(&self, key: &CoverageKey, range: &BlockRange) -> bool {
             &self.key == key
                 && self.range.from_block <= range.from_block
@@ -446,17 +627,11 @@ pub mod error {
     pub enum DatalensErrorKind {
         InvalidInput,
         InvalidRequest,
-        Unsupported,
         UnsupportedDataset,
-        UnsupportedFilter,
         ProviderFailure,
         ProviderLimit,
         ProviderTimeout,
         RateLimited,
-        Unavailable,
-        ProviderUnavailable,
-        Persistence,
-        StorageFailure,
         StorageReadFailure,
         StorageWriteFailure,
         ManifestUpdateFailure,
@@ -470,9 +645,6 @@ pub mod error {
                 Self::ProviderFailure
                     | Self::ProviderTimeout
                     | Self::RateLimited
-                    | Self::Unavailable
-                    | Self::ProviderUnavailable
-                    | Self::StorageFailure
                     | Self::StorageReadFailure
                     | Self::StorageWriteFailure
                     | Self::ManifestUpdateFailure
@@ -582,7 +754,7 @@ pub mod result {
 pub mod query {
     use std::collections::BTreeSet;
 
-    use serde::{Deserialize, Serialize};
+    use serde::{Deserialize, Deserializer, Serialize, de::Error};
 
     use crate::{BlockRange, ChainIdentity, DatalensError, DatalensErrorKind, Dataset};
 
@@ -607,6 +779,34 @@ pub mod query {
         pub removed: bool,
     }
 
+    impl LogRecord {
+        #[allow(clippy::too_many_arguments)]
+        pub fn try_new(
+            block_number: u64,
+            block_hash: String,
+            transaction_hash: String,
+            transaction_index: u64,
+            log_index: u64,
+            address: impl AsRef<str>,
+            topics: Vec<String>,
+            data: String,
+            removed: bool,
+        ) -> Result<Self, DatalensError> {
+            validate_hex_data("data", &data)?;
+            Ok(Self {
+                block_number,
+                block_hash,
+                transaction_hash,
+                transaction_index,
+                log_index,
+                address: normalize_hex("address", address.as_ref(), 20)?,
+                topics: normalize_values("topic", topics, 32)?,
+                data,
+                removed,
+            })
+        }
+    }
+
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
     pub struct LogFilter {
         #[serde(default)]
@@ -615,10 +815,32 @@ pub mod query {
         pub topics: Vec<Option<Vec<String>>>,
     }
 
-    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
     pub struct EvmLogFilter {
         addresses: Vec<String>,
         topics: Vec<TopicFilter>,
+    }
+
+    impl<'de> Deserialize<'de> for EvmLogFilter {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            #[derive(Deserialize)]
+            struct RawEvmLogFilter {
+                #[serde(default)]
+                addresses: Vec<String>,
+                #[serde(default)]
+                topics: Vec<TopicFilter>,
+            }
+
+            let raw = RawEvmLogFilter::deserialize(deserializer)?;
+            Ok(Self {
+                addresses: normalize_values("address", raw.addresses, 20)
+                    .map_err(D::Error::custom)?,
+                topics: raw.topics,
+            })
+        }
     }
 
     impl EvmLogFilter {
@@ -649,6 +871,10 @@ pub mod query {
             };
             format!("{addresses}/{topics}")
         }
+
+        pub fn compact_key(&self) -> String {
+            format!("addr-topic-{:016x}", stable_hash(&self.canonical_key()))
+        }
     }
 
     impl TryFrom<LogFilter> for EvmLogFilter {
@@ -676,11 +902,32 @@ pub mod query {
         }
     }
 
-    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
     #[serde(tag = "kind", content = "values", rename_all = "snake_case")]
     pub enum TopicFilter {
         Wildcard,
         AnyOf(Vec<String>),
+    }
+
+    impl<'de> Deserialize<'de> for TopicFilter {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            #[derive(Deserialize)]
+            #[serde(tag = "kind", content = "values", rename_all = "snake_case")]
+            enum RawTopicFilter {
+                Wildcard,
+                AnyOf(Vec<String>),
+            }
+
+            match RawTopicFilter::deserialize(deserializer)? {
+                RawTopicFilter::Wildcard => Ok(Self::Wildcard),
+                RawTopicFilter::AnyOf(values) => normalize_values("topic", values, 32)
+                    .map(Self::AnyOf)
+                    .map_err(D::Error::custom),
+            }
+        }
     }
 
     impl TopicFilter {
@@ -724,11 +971,20 @@ pub mod query {
             }
         }
 
-        pub fn append(&mut self, other: QueryRows) {
+        pub fn try_append(&mut self, other: QueryRows) -> Result<(), DatalensError> {
             match (self, other) {
-                (Self::Blocks(left), Self::Blocks(mut right)) => left.append(&mut right),
-                (Self::Logs(left), Self::Logs(mut right)) => left.append(&mut right),
-                _ => {}
+                (Self::Blocks(left), Self::Blocks(mut right)) => {
+                    left.append(&mut right);
+                    Ok(())
+                }
+                (Self::Logs(left), Self::Logs(mut right)) => {
+                    left.append(&mut right);
+                    Ok(())
+                }
+                _ => Err(DatalensError::new(
+                    DatalensErrorKind::Internal,
+                    "cannot append rows from a different dataset",
+                )),
             }
         }
 
@@ -784,6 +1040,40 @@ pub mod query {
         }
         Ok(format!("0x{}", hex.to_ascii_lowercase()))
     }
+
+    fn validate_hex_data(kind: &str, value: &str) -> Result<(), DatalensError> {
+        let Some(hex) = value
+            .strip_prefix("0x")
+            .or_else(|| value.strip_prefix("0X"))
+        else {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                format!("{kind} must be 0x-prefixed hex"),
+            ));
+        };
+        if hex.len() % 2 != 0 {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                format!("{kind} must have an even number of hex digits"),
+            ));
+        }
+        if !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                format!("{kind} must contain only hex digits"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn stable_hash(value: &str) -> u64 {
+        let mut hash = 0xcbf29ce484222325u64;
+        for byte in value.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash
+    }
 }
 
 pub use chain::{ChainFamily, ChainIdentity, NetworkId};
@@ -801,7 +1091,8 @@ pub use result::ResultEnvelope;
 mod tests {
     use crate::{
         BlockRange, ChainFamily, ChainIdentity, CoverageKey, CoverageRecord, CoverageValue,
-        DatalensError, DatalensErrorKind, EvmLogFilter, LogFilter, NetworkId, TopicFilter,
+        DatalensError, DatalensErrorKind, DatasetId, EvmLogFilter, LogFilter, LogRecord, NetworkId,
+        QueryRows, TimeRange, TopicFilter,
     };
 
     #[test]
@@ -977,7 +1268,7 @@ mod tests {
                 .unwrap();
         let key = CoverageKey::full_blocks(chain);
         let range = BlockRange::try_new(100, 110).unwrap();
-        let record = CoverageRecord::empty(key.clone(), range);
+        let record = CoverageRecord::try_empty(key.clone(), range, 0, None).unwrap();
 
         assert_eq!(record.row_count(), 0);
         assert_eq!(record.object_key(), None);
@@ -1006,5 +1297,241 @@ mod tests {
             DatalensError::manifest_update("manifest").kind,
             DatalensErrorKind::ManifestUpdateFailure
         );
+    }
+
+    #[test]
+    fn test_deserialization_rejects_invalid_domain_values() {
+        assert!(
+            serde_json::from_str::<ChainIdentity>(
+                r#"{"family":{"Other":" "},"configured_name":"ethereum"}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<ChainIdentity>(
+                r#"{"family":"Evm","configured_name":"eth/mainnet"}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<NetworkId>(r#"{"kind":"textual","value":"eth/mainnet"}"#)
+                .is_err()
+        );
+        assert!(serde_json::from_str::<BlockRange>(r#"{"from_block":10,"to_block":9}"#).is_err());
+        assert!(
+            serde_json::from_str::<TopicFilter>(r#"{"kind":"any_of","values":["0xabc"]}"#).is_err()
+        );
+        assert!(
+            serde_json::from_str::<EvmLogFilter>(r#"{"addresses":["0xabc"],"topics":[]}"#).is_err()
+        );
+
+        let toml_text = r#"
+            family = "Evm"
+            configured_name = " "
+        "#;
+        assert!(toml::from_str::<ChainIdentity>(toml_text).is_err());
+    }
+
+    #[test]
+    fn test_deserialized_equivalent_filters_keep_same_coverage_key() {
+        let chain =
+            ChainIdentity::try_new(ChainFamily::Evm, "ethereum", Some(NetworkId::numeric(1)))
+                .unwrap();
+        let filter = EvmLogFilter::try_from(LogFilter {
+            addresses: vec!["0XAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned()],
+            topics: vec![Some(vec![
+                "0XBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".to_owned(),
+            ])],
+        })
+        .unwrap();
+        let encoded = serde_json::to_string(&filter).unwrap();
+        let decoded: EvmLogFilter = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(
+            CoverageKey::evm_logs(chain.clone(), filter).coverage_key(),
+            CoverageKey::evm_logs(chain, decoded).coverage_key()
+        );
+    }
+
+    #[test]
+    fn test_coverage_record_checked_constructors_reject_invalid_semantics() {
+        let key = CoverageKey::full_blocks(
+            ChainIdentity::try_new(ChainFamily::Evm, "ethereum", Some(NetworkId::numeric(1)))
+                .unwrap(),
+        );
+        let range = BlockRange::try_new(1, 2).unwrap();
+
+        assert!(CoverageRecord::try_data_object(key.clone(), range, 0, "obj.json").is_err());
+        assert!(CoverageRecord::try_data_object(key.clone(), range, 1, " ").is_err());
+        assert!(CoverageRecord::try_empty(key.clone(), range, 1, None).is_err());
+        assert!(
+            CoverageRecord::try_empty(key.clone(), range, 0, Some("obj.json".to_owned())).is_err()
+        );
+
+        let record = CoverageRecord::try_empty(key.clone(), range, 0, None).unwrap();
+        assert_eq!(record.value(), CoverageValue::Empty);
+        assert!(record.covers(&key, &range));
+    }
+
+    #[test]
+    fn test_coverage_record_deserialization_rejects_invalid_semantics() {
+        let json = r#"{
+            "key":{"chain":{"family":"Evm","configured_name":"ethereum","network_id":{"kind":"numeric","value":1}},"dataset":"blocks","schema_version":1,"coverage":{"shape":"all"}},
+            "range":{"from_block":1,"to_block":2},
+            "row_count":0,
+            "object_key":"objects/blocks/all/1-2.json"
+        }"#;
+        assert!(serde_json::from_str::<CoverageRecord>(json).is_err());
+
+        let json = r#"{
+            "key":{"chain":{"family":"Evm","configured_name":"ethereum","network_id":{"kind":"numeric","value":1}},"dataset":"blocks","schema_version":1,"coverage":{"shape":"all"}},
+            "range":{"from_block":1,"to_block":2},
+            "row_count":1,
+            "object_key":null
+        }"#;
+        assert!(serde_json::from_str::<CoverageRecord>(json).is_err());
+    }
+
+    #[test]
+    fn test_query_rows_try_append_checks_dataset_mismatch() {
+        let mut blocks = QueryRows::Blocks(vec![crate::BlockHeader {
+            number: 1,
+            hash: "0x1".to_owned(),
+            parent_hash: "0x0".to_owned(),
+            timestamp: 10,
+        }]);
+
+        blocks
+            .try_append(QueryRows::Blocks(vec![crate::BlockHeader {
+                number: 2,
+                hash: "0x2".to_owned(),
+                parent_hash: "0x1".to_owned(),
+                timestamp: 20,
+            }]))
+            .unwrap();
+        assert_eq!(blocks.row_count(), 2);
+
+        let error = blocks
+            .try_append(QueryRows::Logs(Vec::new()))
+            .expect_err("dataset mismatch");
+        assert_eq!(error.kind, DatalensErrorKind::Internal);
+    }
+
+    #[test]
+    fn test_compact_coverage_key_is_deterministic_and_storage_safe() {
+        let first = EvmLogFilter::try_from(LogFilter {
+            addresses: vec!["0XAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned()],
+            topics: vec![None],
+        })
+        .unwrap();
+        let second = EvmLogFilter::try_from(LogFilter {
+            addresses: vec!["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()],
+            topics: vec![None],
+        })
+        .unwrap();
+        let third = EvmLogFilter::try_from(LogFilter {
+            addresses: vec!["0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned()],
+            topics: vec![None],
+        })
+        .unwrap();
+
+        assert_eq!(first.canonical_key(), second.canonical_key());
+        assert_eq!(first.compact_key(), second.compact_key());
+        assert_ne!(first.compact_key(), third.compact_key());
+        assert!(first.compact_key().starts_with("addr-topic-"));
+        assert!(!first.compact_key().contains('/'));
+    }
+
+    #[test]
+    fn test_log_record_checked_constructor_canonicalizes_hex_values() {
+        let record = LogRecord::try_new(
+            10,
+            "0xblock".to_owned(),
+            "0xtx".to_owned(),
+            0,
+            1,
+            "0XAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            vec!["0XBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".to_owned()],
+            "0x".to_owned(),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(record.address, "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(
+            record.topics,
+            vec!["0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
+        );
+        assert!(
+            LogRecord::try_new(
+                10,
+                "0xblock".to_owned(),
+                "0xtx".to_owned(),
+                0,
+                1,
+                "0xabc",
+                Vec::new(),
+                "0x".to_owned(),
+                false,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_error_retryability_is_explicit_for_every_variant() {
+        let cases = [
+            (DatalensErrorKind::InvalidInput, false),
+            (DatalensErrorKind::InvalidRequest, false),
+            (DatalensErrorKind::UnsupportedDataset, false),
+            (DatalensErrorKind::ProviderFailure, true),
+            (DatalensErrorKind::ProviderLimit, false),
+            (DatalensErrorKind::ProviderTimeout, true),
+            (DatalensErrorKind::RateLimited, true),
+            (DatalensErrorKind::StorageReadFailure, true),
+            (DatalensErrorKind::StorageWriteFailure, true),
+            (DatalensErrorKind::ManifestUpdateFailure, true),
+            (DatalensErrorKind::Internal, false),
+        ];
+
+        for (kind, retryable) in cases {
+            assert_eq!(kind.is_retryable(), retryable, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn test_dataset_id_and_time_range_have_checked_semantics() {
+        assert!(DatasetId::try_new("logs").is_ok());
+        assert!(DatasetId::try_new(" ").is_err());
+        assert!(DatasetId::try_new("bad/path").is_err());
+        assert!(TimeRange::try_blocks(1, 2).is_ok());
+        assert!(TimeRange::try_blocks(2, 1).is_err());
+    }
+
+    #[test]
+    fn test_coverage_matching_is_exact_by_key() {
+        let chain =
+            ChainIdentity::try_new(ChainFamily::Evm, "ethereum", Some(NetworkId::numeric(1)))
+                .unwrap();
+        let range = BlockRange::try_new(1, 10).unwrap();
+        let all_logs = CoverageKey::evm_logs(
+            chain.clone(),
+            EvmLogFilter::try_from(LogFilter {
+                addresses: Vec::new(),
+                topics: Vec::new(),
+            })
+            .unwrap(),
+        );
+        let address_logs = CoverageKey::evm_logs(
+            chain,
+            EvmLogFilter::try_from(LogFilter {
+                addresses: vec!["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()],
+                topics: Vec::new(),
+            })
+            .unwrap(),
+        );
+        let record = CoverageRecord::try_empty(all_logs, range, 0, None).unwrap();
+
+        assert!(!record.covers(&address_logs, &range));
     }
 }
