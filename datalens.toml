@@ -1,0 +1,30 @@
+[server]
+bind = "0.0.0.0:8080"
+
+[storage]
+backend = "local"
+root = ".datalens/storage"
+
+[planner]
+max_query_range_blocks = 100000
+default_chunk_range_blocks = 10000
+
+[writer]
+target_object_bytes = 67108864
+min_object_rows = 1000
+record_empty_coverage = true
+
+[chains.ethereum]
+kind = "evm"
+chain_id = 1
+rpc_urls = ["${ETHEREUM_RPC_URL}"]
+safe_height_lag_blocks = 12
+
+[chains.ethereum.datasets.blocks]
+enabled = true
+max_batch_blocks = 1000
+
+[chains.ethereum.datasets.logs]
+enabled = true
+max_get_logs_range_blocks = 10000
+max_addresses_per_query = 20

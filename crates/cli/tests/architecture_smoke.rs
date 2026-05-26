@@ -14,7 +14,7 @@ fn workspace_exposes_architecture_boundaries() {
     let chain = ChainIdentity::new(ChainFamily::Evm, "ethereum-mainnet");
     let dataset = DatasetId::new("logs");
     let range = TimeRange::blocks(1, 2);
-    let envelope = ResultEnvelope::ok(dataset.clone(), range.clone(), Vec::<u8>::new());
+    let envelope = ResultEnvelope::ok(dataset.clone(), range, Vec::<u8>::new());
     let capabilities = AdapterCapabilities::new(chain.clone()).with_dataset(dataset.clone());
 
     assert_eq!(chain.family(), ChainFamily::Evm);
@@ -34,7 +34,7 @@ fn workspace_exposes_architecture_boundaries() {
     fn assert_compatibility<T: CompatibilityAdapter>() {}
 
     let _ = EvmAdapterMetadata::default();
-    let _ = PlanRequest::new(chain.clone(), dataset.clone(), range.clone());
+    let _ = PlanRequest::new(chain.clone(), dataset.clone(), range);
     let _ = WriteRequest::new(chain, dataset, range);
 
     let _chain_adapter_type_check = assert_chain_adapter::<datalens_evm::EvmAdapter>;
