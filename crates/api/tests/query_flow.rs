@@ -3,9 +3,13 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use datalens_api::{
-    QueryService, Source,
-    config::{ChainConfig, DatasetsConfig, LogsDatasetConfig, PlannerConfig, WriterConfig},
+use datalens_api::QueryService;
+use datalens_api::config::{
+    ChainConfig, DatasetsConfig, LogsDatasetConfig, PlannerConfig, WriterConfig,
+};
+use datalens_chain::{
+    AdapterCapabilities, ChainAdapter, ChainFetchRequest, ChainFetchResponse, ChainHeight,
+    DatasetCapability, DatasetSelector, FinalityKind, HeightRange, HeightRangeKind, SelectorKind,
 };
 use datalens_core::{
     BlockHeader, BlockRange, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, Dataset,
@@ -364,7 +368,68 @@ impl MockSource {
     }
 }
 
-impl Source for MockSource {
+impl ChainAdapter for MockSource {
+    fn capabilities(&self) -> AdapterCapabilities {
+        AdapterCapabilities::new(ethereum_identity())
+            .with_dataset_capability(
+                DatasetCapability::new(Dataset::Blocks)
+                    .with_selector(SelectorKind::All)
+                    .with_range(HeightRangeKind::Block)
+                    .with_max_range_blocks(2)
+                    .with_empty_coverage(true),
+            )
+            .with_dataset_capability(
+                DatasetCapability::new(Dataset::Logs)
+                    .with_selector(SelectorKind::EvmLogs)
+                    .with_range(HeightRangeKind::Block)
+                    .with_max_range_blocks(2)
+                    .with_empty_coverage(true),
+            )
+    }
+
+    fn latest_height(&self) -> Result<ChainHeight, DatalensError> {
+        Ok(ChainHeight::block(100))
+    }
+
+    fn safe_height(&self) -> Result<ChainHeight, DatalensError> {
+        Ok(ChainHeight::block(100).with_finality(FinalityKind::Safe))
+    }
+
+    fn fetch(&self, request: ChainFetchRequest) -> Result<ChainFetchResponse, DatalensError> {
+        let range = match request.range {
+            HeightRange::Block(range) => range,
+            HeightRange::Other { .. } => panic!("expected block range"),
+        };
+        match request.dataset {
+            Dataset::Blocks => self.fetch_blocks(range).map(|rows| {
+                ChainFetchResponse::new(
+                    request.chain,
+                    Dataset::Blocks,
+                    HeightRange::Block(range),
+                    request.selector,
+                    QueryRows::Blocks(rows),
+                )
+            }),
+            Dataset::Logs => {
+                let filter = match &request.selector {
+                    DatasetSelector::EvmLogs(filter) => filter,
+                    selector => panic!("expected EVM logs selector, got {selector:?}"),
+                };
+                self.fetch_logs(range, filter).map(|rows| {
+                    ChainFetchResponse::new(
+                        request.chain,
+                        Dataset::Logs,
+                        HeightRange::Block(range),
+                        request.selector,
+                        QueryRows::Logs(rows),
+                    )
+                })
+            }
+        }
+    }
+}
+
+impl MockSource {
     fn fetch_blocks(&self, range: BlockRange) -> Result<Vec<BlockHeader>, DatalensError> {
         self.calls
             .lock()
@@ -386,7 +451,7 @@ impl Source for MockSource {
     fn fetch_logs(
         &self,
         range: BlockRange,
-        filter: &LogFilter,
+        filter: &datalens_core::EvmLogFilter,
     ) -> Result<Vec<LogRecord>, DatalensError> {
         self.calls
             .lock()
@@ -407,10 +472,10 @@ impl Source for MockSource {
     }
 }
 
-fn log_matches_filter(log: &LogRecord, filter: &LogFilter) -> bool {
-    if !filter.addresses.is_empty()
+fn log_matches_filter(log: &LogRecord, filter: &datalens_core::EvmLogFilter) -> bool {
+    if !filter.addresses().is_empty()
         && !filter
-            .addresses
+            .addresses()
             .iter()
             .any(|address| address == &log.address)
     {
@@ -418,14 +483,14 @@ fn log_matches_filter(log: &LogRecord, filter: &LogFilter) -> bool {
     }
 
     filter
-        .topics
+        .topics()
         .iter()
         .enumerate()
         .all(|(index, expected)| match expected {
-            Some(values) => log
+            datalens_core::TopicFilter::AnyOf(values) => log
                 .topics
                 .get(index)
                 .is_some_and(|topic| values.iter().any(|value| value == topic)),
-            None => true,
+            datalens_core::TopicFilter::Wildcard => true,
         })
 }

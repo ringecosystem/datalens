@@ -5,9 +5,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use datalens_chain::DatasetSelector;
 use datalens_core::{
     BlockRange, ChainIdentity, CoverageLevel, DatalensError, DatalensErrorKind, Dataset, DatasetId,
-    EvmLogFilter, LogFilter, QueryRows, TimeRange,
+    QueryRows, TimeRange,
 };
 use serde::{Deserialize, Deserializer, Serialize, de::Error};
 
@@ -62,11 +63,12 @@ impl LocalStorage {
 
     pub fn covered_ranges(
         &self,
+        chain: &ChainIdentity,
         dataset: Dataset,
-        filter: Option<&LogFilter>,
+        selector: &DatasetSelector,
         range: BlockRange,
     ) -> Result<Vec<BlockRange>, DatalensError> {
-        let filter_key = coverage_key(dataset, filter)?;
+        let filter_key = coverage_key(chain, dataset, selector);
         let mut ranges = self
             .manifest()?
             .entries
@@ -80,8 +82,9 @@ impl LocalStorage {
 
     pub fn read_rows(
         &self,
+        chain: &ChainIdentity,
         dataset: Dataset,
-        filter: Option<&LogFilter>,
+        selector: &DatasetSelector,
         range: BlockRange,
     ) -> Result<QueryRows, DatalensError> {
         log::debug!(
@@ -90,7 +93,7 @@ impl LocalStorage {
             range.from_block,
             range.to_block
         );
-        let filter_key = coverage_key(dataset, filter)?;
+        let filter_key = coverage_key(chain, dataset, selector);
         let mut rows = empty_rows(dataset);
         for entry in self.manifest()?.entries {
             if entry.dataset != dataset || entry.filter_key != filter_key {
@@ -129,8 +132,9 @@ impl LocalStorage {
 
     pub fn write_rows(
         &self,
+        chain: &ChainIdentity,
         dataset: Dataset,
-        filter: Option<&LogFilter>,
+        selector: &DatasetSelector,
         range: BlockRange,
         rows: &QueryRows,
         record_empty_coverage: bool,
@@ -156,7 +160,7 @@ impl LocalStorage {
             )
         })?;
 
-        let filter_key = coverage_key(dataset, filter)?;
+        let filter_key = coverage_key(chain, dataset, selector);
         let object_key = if rows.row_count() == 0 {
             None
         } else {
@@ -380,20 +384,13 @@ pub fn missing_ranges(range: BlockRange, covered: &[BlockRange]) -> Vec<BlockRan
     missing
 }
 
-fn coverage_key(dataset: Dataset, filter: Option<&LogFilter>) -> Result<String, DatalensError> {
-    Ok(match dataset {
-        Dataset::Blocks => "all".to_owned(),
-        Dataset::Logs => {
-            let filter = match filter {
-                Some(filter) => EvmLogFilter::try_from(filter)?,
-                None => EvmLogFilter::try_from(LogFilter {
-                    addresses: Vec::new(),
-                    topics: Vec::new(),
-                })?,
-            };
-            format!("evm-logs/{}", filter.compact_key())
-        }
-    })
+fn coverage_key(chain: &ChainIdentity, dataset: Dataset, selector: &DatasetSelector) -> String {
+    format!(
+        "chains/{}/datasets/{}/{}",
+        chain.key_prefix(),
+        dataset.as_str(),
+        selector.fingerprint()
+    )
 }
 
 fn merge_ranges(mut ranges: Vec<BlockRange>) -> Vec<BlockRange> {
@@ -443,7 +440,8 @@ fn filter_rows(rows: QueryRows, range: BlockRange) -> QueryRows {
 mod tests {
     use std::path::PathBuf;
 
-    use datalens_core::{LogRecord, QueryRows};
+    use datalens_chain::DatasetSelector;
+    use datalens_core::{ChainFamily, LogFilter, LogRecord, NetworkId, QueryRows};
 
     use super::*;
 
@@ -455,6 +453,8 @@ mod tests {
             addresses: vec!["0XAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned()],
             topics: vec![None],
         };
+        let chain = test_chain();
+        let selector = DatasetSelector::try_evm_logs(filter).expect("valid selector");
         let rows = QueryRows::Logs(vec![
             LogRecord::try_new(
                 1,
@@ -471,12 +471,12 @@ mod tests {
         ]);
 
         storage
-            .write_rows(Dataset::Logs, Some(&filter), range, &rows, true)
+            .write_rows(&chain, Dataset::Logs, &selector, range, &rows, true)
             .expect("write rows");
 
         let manifest = storage.manifest().expect("manifest");
         let entry = manifest.entries.first().expect("manifest entry");
-        assert!(entry.filter_key.starts_with("evm-logs/addr-topic-"));
+        assert!(entry.filter_key.contains("/evm-logs/addr-topic-"));
         assert!(!entry.filter_key.contains("0xaaaaaaaa"));
         assert!(
             entry
@@ -555,7 +555,12 @@ mod tests {
         .expect("write manifest");
 
         let error = storage
-            .covered_ranges(Dataset::Logs, None, BlockRange::expect_new(1, 2))
+            .covered_ranges(
+                &test_chain(),
+                Dataset::Logs,
+                &DatasetSelector::all(),
+                BlockRange::expect_new(1, 2),
+            )
             .expect_err("malformed manifest");
 
         assert_eq!(error.kind, DatalensErrorKind::StorageReadFailure);
@@ -564,7 +569,7 @@ mod tests {
     #[test]
     fn test_read_rows_rejects_invalid_cached_log_record() {
         let storage = LocalStorage::new(temp_storage_root("invalid-cached-log"));
-        let filter_key = coverage_key(Dataset::Logs, None).expect("coverage key");
+        let filter_key = coverage_key(&test_chain(), Dataset::Logs, &DatasetSelector::all());
         let object_key = format!("objects/logs/{filter_key}/1-1.json");
         let object_path = storage.root().join(&object_key);
         std::fs::create_dir_all(object_path.parent().expect("object parent"))
@@ -604,7 +609,12 @@ mod tests {
         .expect("write manifest");
 
         let error = storage
-            .read_rows(Dataset::Logs, None, BlockRange::expect_new(1, 1))
+            .read_rows(
+                &test_chain(),
+                Dataset::Logs,
+                &DatasetSelector::all(),
+                BlockRange::expect_new(1, 1),
+            )
             .expect_err("invalid cached log");
 
         assert_eq!(error.kind, DatalensErrorKind::StorageReadFailure);
@@ -620,5 +630,29 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).expect("create temp storage root");
         root
+    }
+
+    fn test_chain() -> ChainIdentity {
+        ChainIdentity::expect_with_network_id(ChainFamily::Evm, "ethereum", NetworkId::numeric(1))
+    }
+
+    #[test]
+    fn test_selector_coverage_key_includes_chain_dataset_and_stable_fingerprint() {
+        let chain = ChainIdentity::expect_with_network_id(
+            ChainFamily::Evm,
+            "ethereum",
+            NetworkId::numeric(1),
+        );
+        let selector = DatasetSelector::try_evm_logs(LogFilter {
+            addresses: vec!["0XAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned()],
+            topics: vec![None],
+        })
+        .expect("valid selector");
+
+        let key = coverage_key(&chain, Dataset::Logs, &selector);
+
+        assert!(key.starts_with("chains/evm/ethereum/1/datasets/logs/"));
+        assert!(key.contains("/evm-logs/addr-topic-"));
+        assert!(!key.contains("0xaaaaaaaa"));
     }
 }

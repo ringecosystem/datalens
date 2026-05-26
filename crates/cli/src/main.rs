@@ -2,13 +2,13 @@ use std::net::SocketAddr;
 
 use clap::{Args, Parser, Subcommand};
 use datalens_api::{
-    QueryService, Source,
+    QueryService,
     config::{ChainConfig, DatalensConfig},
 };
 use datalens_chain::ChainAdapter;
 use datalens_core::{
-    BlockHeader, BlockRange, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, Dataset,
-    EvmLogFilter, LogFilter, LogRecord, NetworkId, QueryRequest,
+    BlockRange, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, Dataset,
+    EvmLogFilter, LogFilter, NetworkId, QueryRequest,
 };
 use datalens_evm::{EvmAdapter, EvmAdapterMetadata, EvmRpcClient};
 use datalens_storage::LocalStorage;
@@ -341,14 +341,21 @@ fn build_service(
     config: &DatalensConfig,
     chain_name: &str,
     chain: &ChainConfig,
-) -> QueryService<EvmSource> {
+) -> QueryService<EvmRpcClient> {
     log::info!(
         "using chain {chain_name} kind={} chain_id={}",
         chain.kind,
         chain.chain_id
     );
     let storage = LocalStorage::new(&config.storage.root);
-    let source = EvmSource(EvmRpcClient::new(chain.rpc_urls.clone()));
+    let source = EvmRpcClient::with_chain(
+        chain.rpc_urls.clone(),
+        chain_identity(chain_name, chain).expect("validated chain identity"),
+        chain.safe_height_lag_blocks,
+        chain.datasets.blocks.max_batch_blocks,
+        chain.datasets.logs.max_get_logs_range_blocks,
+        chain.datasets.logs.max_addresses_per_query,
+    );
     datalens_api::QueryService::new_named(
         storage,
         source,
@@ -437,23 +444,6 @@ fn init_logging() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .with_env_filter(filter)
         .try_init()?;
     Ok(())
-}
-
-#[derive(Clone)]
-struct EvmSource(EvmRpcClient);
-
-impl Source for EvmSource {
-    fn fetch_blocks(&self, range: BlockRange) -> Result<Vec<BlockHeader>, DatalensError> {
-        self.0.fetch_blocks(range)
-    }
-
-    fn fetch_logs(
-        &self,
-        range: BlockRange,
-        filter: &LogFilter,
-    ) -> Result<Vec<LogRecord>, DatalensError> {
-        self.0.fetch_logs(range, filter)
-    }
 }
 
 #[cfg(test)]

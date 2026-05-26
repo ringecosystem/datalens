@@ -6,6 +6,7 @@ version.workspace = true
 
 [dependencies]
 axum.workspace = true
+datalens-chain = { path = "../chain" }
 datalens-core = { path = "../core" }
 datalens-planner = { path = "../planner" }
 datalens-storage = { path = "../storage" }
