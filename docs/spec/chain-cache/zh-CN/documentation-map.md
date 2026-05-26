@@ -49,6 +49,7 @@ docs/spec/chain-cache/
 | Document | Owner question | Informs |
 | --- | --- | --- |
 | `documentation-map.md` | Durable chain-cache specs 应放在哪里，以及双语文件如何维持 parity？ | HBX-5；所有未来 chain-cache documentation work |
+| `architecture.md` | Canonical chain-cache module boundaries 与 request/fill data flow 是什么？ | Workspace crate creation；module ownership；chain-family extension planning |
 | `overview.md` | chain-cache responsibility boundary 是什么，以及哪些内容必须维持 out of scope？ | Early architecture framing；storage、query、API 或 SDK work 之前的 implementation planning |
 | `storage.md` | chain-cache implementations 必须满足哪些 storage model、persistence contract 与 durability invariants？ | Storage implementation phase；schema and migration planning；persistence tests |
 | `ingestion.md` | ingestion 必须满足哪些 inputs、normalization rules 与 cache population behavior？ | Ingestion implementation phase；data validation tests；pipeline integration planning |
