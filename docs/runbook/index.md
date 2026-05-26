@@ -19,4 +19,5 @@ outputs.
 
 ## Current runbooks
 
-- No topic-specific runbooks exist yet.
+- `e2e-native-query-flow.md`: local validation for the initial native EVM block and
+  log query flow, including deterministic cache behavior checks.

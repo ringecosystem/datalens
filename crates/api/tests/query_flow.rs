@@ -86,6 +86,32 @@ fn test_query_empty_logs_records_empty_coverage_without_data_object() {
 }
 
 #[test]
+fn test_query_logs_miss_persists_then_equivalent_hit_uses_cache() {
+    let storage = LocalStorage::new(temp_storage_root("logs-miss-hit"));
+    let source = MockSource::default().with_logs(vec![
+        log(20, 0, "0xabc", vec!["0xtopic-a"]),
+        log(20, 1, "0xdef", vec!["0xtopic-a"]),
+        log(21, 0, "0xabc", vec!["0xtopic-b"]),
+    ]);
+    let service = service(storage, source.clone());
+    let request = logs_request_with_topics(20, 21, vec!["0xabc"], vec![Some(vec!["0xtopic-a"])]);
+
+    let first = service
+        .query(request.clone())
+        .expect("first log query succeeds");
+    let second = service.query(request).expect("second log query succeeds");
+
+    assert_eq!(first.cache.missing_ranges, vec![BlockRange::new(20, 21)]);
+    assert_eq!(second.cache.hit_ranges, vec![BlockRange::new(20, 21)]);
+    assert_eq!(
+        source.calls(),
+        vec![SourceCall::Logs(BlockRange::new(20, 21))]
+    );
+    assert_eq!(log_addresses(&second), vec!["0xabc"]);
+    assert_eq!(log_indexes(&second), vec![0]);
+}
+
+#[test]
 fn test_query_range_limit_rejection_returns_invalid_input() {
     let service = service(
         LocalStorage::new(temp_storage_root("range-limit")),
@@ -101,15 +127,14 @@ fn test_query_range_limit_rejection_returns_invalid_input() {
 #[test]
 fn test_provider_limit_error_is_classified() {
     let source = MockSource::default().with_error(DatalensErrorKind::ProviderLimit);
-    let service = service(
-        LocalStorage::new(temp_storage_root("provider-limit")),
-        source,
-    );
+    let root = temp_storage_root("provider-limit");
+    let service = service(LocalStorage::new(&root), source);
     let error = service
         .query(logs_request(1, 2, vec!["0xabc"]))
         .expect_err("provider limit");
 
     assert_eq!(error.kind, DatalensErrorKind::ProviderLimit);
+    assert!(!root.join("manifest.json").exists());
 }
 
 fn service(storage: LocalStorage, source: MockSource) -> QueryService<MockSource> {
@@ -156,13 +181,30 @@ fn blocks_request(from_block: u64, to_block: u64) -> QueryRequest {
 }
 
 fn logs_request(from_block: u64, to_block: u64, addresses: Vec<&str>) -> QueryRequest {
+    logs_request_with_topics(
+        from_block,
+        to_block,
+        addresses,
+        vec![None, None, None, None],
+    )
+}
+
+fn logs_request_with_topics(
+    from_block: u64,
+    to_block: u64,
+    addresses: Vec<&str>,
+    topics: Vec<Option<Vec<&str>>>,
+) -> QueryRequest {
     QueryRequest {
         chain: "ethereum".to_owned(),
         dataset: Dataset::Logs,
         range: BlockRange::new(from_block, to_block),
         filter: Some(LogFilter {
             addresses: addresses.into_iter().map(str::to_owned).collect(),
-            topics: vec![None, None, None, None],
+            topics: topics
+                .into_iter()
+                .map(|topic| topic.map(|values| values.into_iter().map(str::to_owned).collect()))
+                .collect(),
         }),
         include_block: false,
     }
@@ -174,6 +216,20 @@ fn block(number: u64, hash: &str) -> BlockHeader {
         hash: hash.to_owned(),
         parent_hash: format!("{hash}-parent"),
         timestamp: number * 10,
+    }
+}
+
+fn log(block_number: u64, log_index: u64, address: &str, topics: Vec<&str>) -> LogRecord {
+    LogRecord {
+        block_number,
+        block_hash: format!("0xblock-{block_number}"),
+        transaction_hash: format!("0xtx-{block_number}-{log_index}"),
+        transaction_index: 0,
+        log_index,
+        address: address.to_owned(),
+        topics: topics.into_iter().map(str::to_owned).collect(),
+        data: "0x".to_owned(),
+        removed: false,
     }
 }
 
@@ -203,6 +259,13 @@ fn log_indexes(response: &QueryResponse) -> Vec<u64> {
     }
 }
 
+fn log_addresses(response: &QueryResponse) -> Vec<String> {
+    match &response.rows {
+        QueryRows::Logs(rows) => rows.iter().map(|row| row.address.clone()).collect(),
+        QueryRows::Blocks(_) => panic!("expected logs"),
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum SourceCall {
     Blocks(BlockRange),
@@ -220,6 +283,11 @@ struct MockSource {
 impl MockSource {
     fn with_blocks(self, blocks: Vec<BlockHeader>) -> Self {
         *self.blocks.lock().expect("blocks lock") = blocks;
+        self
+    }
+
+    fn with_logs(self, logs: Vec<LogRecord>) -> Self {
+        *self.logs.lock().expect("logs lock") = logs;
         self
     }
 
@@ -259,7 +327,7 @@ impl Source for MockSource {
     fn fetch_logs(
         &self,
         range: BlockRange,
-        _filter: &LogFilter,
+        filter: &LogFilter,
     ) -> Result<Vec<LogRecord>, DatalensError> {
         self.calls
             .lock()
@@ -274,7 +342,31 @@ impl Source for MockSource {
             .expect("logs lock")
             .iter()
             .filter(|log| range.contains(log.block_number))
+            .filter(|log| log_matches_filter(log, filter))
             .cloned()
             .collect())
     }
+}
+
+fn log_matches_filter(log: &LogRecord, filter: &LogFilter) -> bool {
+    if !filter.addresses.is_empty()
+        && !filter
+            .addresses
+            .iter()
+            .any(|address| address == &log.address)
+    {
+        return false;
+    }
+
+    filter
+        .topics
+        .iter()
+        .enumerate()
+        .all(|(index, expected)| match expected {
+            Some(values) => log
+                .topics
+                .get(index)
+                .is_some_and(|topic| values.iter().any(|value| value == topic)),
+            None => true,
+        })
 }
