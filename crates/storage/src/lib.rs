@@ -84,6 +84,12 @@ impl LocalStorage {
         filter: Option<&LogFilter>,
         range: BlockRange,
     ) -> Result<QueryRows, DatalensError> {
+        log::debug!(
+            "storage read dataset={} range={}-{}",
+            dataset.as_str(),
+            range.from_block,
+            range.to_block
+        );
         let filter_key = coverage_key(dataset, filter)?;
         let mut rows = empty_rows(dataset);
         for entry in self.manifest()?.entries {
@@ -98,12 +104,17 @@ impl LocalStorage {
             };
             let object = self.root.join(object_key);
             let bytes = fs::read(&object).map_err(|error| {
+                log::warn!("failed to read cached object {}: {error}", object.display());
                 DatalensError::new(
                     DatalensErrorKind::StorageReadFailure,
                     format!("read cached object {}: {error}", object.display()),
                 )
             })?;
             let mut object_rows: QueryRows = serde_json::from_slice(&bytes).map_err(|error| {
+                log::warn!(
+                    "failed to decode cached object {}: {error}",
+                    object.display()
+                );
                 DatalensError::new(
                     DatalensErrorKind::StorageReadFailure,
                     format!("decode cached object {}: {error}", object.display()),
@@ -125,10 +136,20 @@ impl LocalStorage {
         record_empty_coverage: bool,
     ) -> Result<(), DatalensError> {
         if rows.row_count() == 0 && !record_empty_coverage {
+            log::debug!(
+                "storage skipped empty coverage dataset={} range={}-{}",
+                dataset.as_str(),
+                range.from_block,
+                range.to_block
+            );
             return Ok(());
         }
 
         fs::create_dir_all(&self.root).map_err(|error| {
+            log::error!(
+                "failed to create storage root {}: {error}",
+                self.root.display()
+            );
             DatalensError::new(
                 DatalensErrorKind::StorageWriteFailure,
                 format!("create storage root {}: {error}", self.root.display()),
@@ -149,6 +170,10 @@ impl LocalStorage {
             let object_path = self.root.join(&object_key);
             if let Some(parent) = object_path.parent() {
                 fs::create_dir_all(parent).map_err(|error| {
+                    log::error!(
+                        "failed to create object directory {}: {error}",
+                        parent.display()
+                    );
                     DatalensError::new(
                         DatalensErrorKind::StorageWriteFailure,
                         format!("create object directory {}: {error}", parent.display()),
@@ -162,6 +187,10 @@ impl LocalStorage {
                 )
             })?;
             fs::write(&object_path, bytes).map_err(|error| {
+                log::error!(
+                    "failed to write cached object {}: {error}",
+                    object_path.display()
+                );
                 DatalensError::new(
                     DatalensErrorKind::StorageWriteFailure,
                     format!("write cached object {}: {error}", object_path.display()),
@@ -178,6 +207,13 @@ impl LocalStorage {
             object_key,
             row_count: rows.row_count(),
         });
+        log::info!(
+            "storage wrote coverage dataset={} range={}-{} rows={}",
+            dataset.as_str(),
+            range.from_block,
+            range.to_block,
+            rows.row_count()
+        );
         self.write_manifest(&manifest)
     }
 
@@ -187,12 +223,14 @@ impl LocalStorage {
             return Ok(Manifest::default());
         }
         let bytes = fs::read(&path).map_err(|error| {
+            log::warn!("failed to read manifest {}: {error}", path.display());
             DatalensError::new(
                 DatalensErrorKind::StorageReadFailure,
                 format!("read manifest {}: {error}", path.display()),
             )
         })?;
         serde_json::from_slice(&bytes).map_err(|error| {
+            log::warn!("failed to decode manifest {}: {error}", path.display());
             DatalensError::new(
                 DatalensErrorKind::StorageReadFailure,
                 format!("decode manifest {}: {error}", path.display()),
@@ -209,6 +247,7 @@ impl LocalStorage {
             )
         })?;
         fs::write(&path, bytes).map_err(|error| {
+            log::error!("failed to write manifest {}: {error}", path.display());
             DatalensError::new(
                 DatalensErrorKind::ManifestUpdateFailure,
                 format!("write manifest {}: {error}", path.display()),
