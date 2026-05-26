@@ -52,11 +52,13 @@ docs/spec/chain-cache/
 | `documentation-map.md` | Where do durable chain-cache specs belong, and how are the bilingual files kept in parity? | HBX-5; all future chain-cache documentation work |
 | `architecture.md` | What are the canonical chain-cache module boundaries and request/fill data flow? | Workspace crate creation; module ownership; chain-family extension planning |
 | `chain-adapter-contract.md` | What must chain adapters provide while keeping EVM-specific concepts out of chain-neutral modules? | Chain adapter design; EVM adapter implementation planning; future chain-family extension checks |
+| `storage-manifest.md` | What durable object storage, chunk coverage, and manifest semantics decide cache hit/miss correctness? | Storage implementation; planner coverage checks; chunk writer idempotency and migration planning |
 | `overview.md` | What is the chain-cache responsibility boundary and what must remain out of scope? | Early architecture framing; implementation planning before storage, query, API, or SDK work |
 | `storage.md` | What storage model, persistence contract, and durability invariants must chain-cache implementations satisfy? | Storage implementation phase; schema and migration planning; persistence tests |
 | `ingestion.md` | What inputs, normalization rules, and cache population behavior must ingestion satisfy? | Ingestion implementation phase; data validation tests; pipeline integration planning |
 | `query.md` | What lookup semantics, filtering rules, ordering rules, and miss behavior must query paths satisfy? | Query implementation phase; correctness tests; performance-oriented follow-up work |
 | `query-cache-behavior.md` | What lifecycle, cache-hit, partial-hit, miss, and missing-range materialization behavior must query-driven cache execution satisfy? | Query planner implementation; writer sequencing; manifest coverage tests; response streaming behavior |
+| `api-sdk-boundary.md` | What is the authority boundary between the native service API, SDK convenience, direct RPC indexing, and compatibility adapters? | API scope decisions; SDK responsibility decisions; compatibility adapter planning |
 | `api.md` | What service or crate-facing API contracts must callers rely on? | API implementation phase; integration tests; caller migration planning |
 | `sdk.md` | What SDK-facing behavior, naming, and compatibility expectations must external consumers rely on? | SDK implementation phase; release readiness; compatibility tests |
 | `operations.md` | What observable states, limits, and operational invariants must deployments preserve? | Runbook planning; validation gates; production readiness work |

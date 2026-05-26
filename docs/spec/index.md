@@ -59,6 +59,12 @@ Then keep the body explicit:
 - Chain-cache chain adapter contract:
   `docs/spec/chain-cache/en/chain-adapter-contract.md` and
   `docs/spec/chain-cache/zh-CN/chain-adapter-contract.md`
+- Chain-cache storage manifest and selective coverage semantics:
+  `docs/spec/chain-cache/en/storage-manifest.md` and
+  `docs/spec/chain-cache/zh-CN/storage-manifest.md`
 - Chain-cache query-cache behavior:
   `docs/spec/chain-cache/en/query-cache-behavior.md` and
   `docs/spec/chain-cache/zh-CN/query-cache-behavior.md`
+- Chain-cache API, SDK, and compatibility boundary:
+  `docs/spec/chain-cache/en/api-sdk-boundary.md` and
+  `docs/spec/chain-cache/zh-CN/api-sdk-boundary.md`

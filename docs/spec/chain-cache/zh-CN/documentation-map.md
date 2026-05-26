@@ -51,11 +51,13 @@ docs/spec/chain-cache/
 | `documentation-map.md` | Durable chain-cache specs 应放在哪里，以及双语文件如何维持 parity？ | HBX-5；所有未来 chain-cache documentation work |
 | `architecture.md` | Canonical chain-cache module boundaries 与 request/fill data flow 是什么？ | Workspace crate creation；module ownership；chain-family extension planning |
 | `chain-adapter-contract.md` | Chain adapters 必须提供什么，同时如何避免 EVM-specific concepts 进入 chain-neutral modules？ | Chain adapter design；EVM adapter implementation planning；future chain-family extension checks |
+| `storage-manifest.md` | 哪些 durable object storage、chunk coverage 与 manifest semantics 用于判断 cache hit/miss correctness？ | Storage implementation；planner coverage checks；chunk writer idempotency and migration planning |
 | `overview.md` | chain-cache responsibility boundary 是什么，以及哪些内容必须维持 out of scope？ | Early architecture framing；storage、query、API 或 SDK work 之前的 implementation planning |
 | `storage.md` | chain-cache implementations 必须满足哪些 storage model、persistence contract 与 durability invariants？ | Storage implementation phase；schema and migration planning；persistence tests |
 | `ingestion.md` | ingestion 必须满足哪些 inputs、normalization rules 与 cache population behavior？ | Ingestion implementation phase；data validation tests；pipeline integration planning |
 | `query.md` | query paths 必须满足哪些 lookup semantics、filtering rules、ordering rules 与 miss behavior？ | Query implementation phase；correctness tests；performance-oriented follow-up work |
 | `query-cache-behavior.md` | query-driven cache execution 必须满足哪些 lifecycle、cache-hit、partial-hit、miss 与 missing-range materialization behavior？ | Query planner implementation；writer sequencing；manifest coverage tests；response streaming behavior |
+| `api-sdk-boundary.md` | native service API、SDK convenience、direct RPC indexing 与 compatibility adapters 之间的 authority boundary 是什么？ | API scope decisions；SDK responsibility decisions；compatibility adapter planning |
 | `api.md` | callers 必须依赖哪些 service 或 crate-facing API contracts？ | API implementation phase；integration tests；caller migration planning |
 | `sdk.md` | external consumers 必须依赖哪些 SDK-facing behavior、naming 与 compatibility expectations？ | SDK implementation phase；release readiness；compatibility tests |
 | `operations.md` | deployments 必须保留哪些 observable states、limits 与 operational invariants？ | Runbook planning；validation gates；production readiness work |
