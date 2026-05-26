@@ -448,6 +448,7 @@ fn validate_fetch_response(
         || response.dataset != request.dataset
         || response.range != request.range
         || response.coverage_selector != request.selector
+        || response.rows.dataset() != request.dataset
     {
         return Err(DatalensError::new(
             DatalensErrorKind::Internal,

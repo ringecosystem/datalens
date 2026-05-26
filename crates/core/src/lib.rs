@@ -1018,6 +1018,13 @@ pub mod query {
     }
 
     impl QueryRows {
+        pub fn dataset(&self) -> Dataset {
+            match self {
+                Self::Blocks(_) => Dataset::Blocks,
+                Self::Logs(_) => Dataset::Logs,
+            }
+        }
+
         pub fn row_count(&self) -> usize {
             match self {
                 Self::Blocks(rows) => rows.len(),

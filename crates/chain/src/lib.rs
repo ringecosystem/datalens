@@ -362,7 +362,11 @@ fn validate_storage_key(kind: &str, value: String) -> Result<String, DatalensErr
             format!("{kind} must not be empty"),
         ));
     }
-    if value.contains('\\') || value.split('/').any(str::is_empty) {
+    if value.contains('\\')
+        || value
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
         return Err(DatalensError::new(
             DatalensErrorKind::InvalidInput,
             format!("{kind} must be a relative storage key"),
@@ -626,5 +630,21 @@ mod tests {
             HeightRange::try_other(AdapterKey::try_new("bad-range").expect("valid key"), 2, 1,)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn test_other_selector_rejects_dot_path_segments() {
+        let kind = AdapterKey::try_new("other-selector").expect("valid key");
+
+        for key in ["../x", "a/../b", ".", "a/./b"] {
+            assert!(
+                DatasetSelector::try_other(kind.clone(), key, "accounts/fingerprint").is_err(),
+                "fingerprint {key:?} should be rejected"
+            );
+            assert!(
+                DatasetSelector::try_other(kind.clone(), "accounts/fingerprint", key).is_err(),
+                "canonical key {key:?} should be rejected"
+            );
+        }
     }
 }
