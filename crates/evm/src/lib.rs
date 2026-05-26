@@ -251,7 +251,7 @@ impl ChainAdapter for EvmRpcClient {
                     .with_selector(SelectorKind::EvmLogs)
                     .with_range(HeightRangeKind::Block)
                     .with_max_range_blocks(self.max_get_logs_range_blocks)
-                    .with_max_batch_rows(self.max_addresses_per_query)
+                    .with_max_addresses_per_query(self.max_addresses_per_query)
                     .with_empty_coverage(true),
             )
     }
@@ -285,6 +285,12 @@ impl ChainAdapter for EvmRpcClient {
     }
 
     fn fetch(&self, request: ChainFetchRequest) -> Result<ChainFetchResponse, DatalensError> {
+        if request.chain != self.chain {
+            return Err(DatalensError::new(
+                DatalensErrorKind::UnsupportedDataset,
+                "request chain is not supported by adapter",
+            ));
+        }
         let range = request.range.block_range().ok_or_else(|| {
             DatalensError::new(
                 DatalensErrorKind::UnsupportedDataset,
@@ -442,6 +448,8 @@ fn hex_u64_field(value: &Value, field: &str) -> Result<u64, DatalensError> {
 
 #[cfg(test)]
 mod tests {
+    use datalens_core::NetworkId;
+
     use super::*;
 
     #[test]
@@ -506,5 +514,29 @@ mod tests {
         .expect_err("invalid address");
 
         assert_eq!(error.kind, DatalensErrorKind::ProviderFailure);
+    }
+
+    #[test]
+    fn test_fetch_rejects_chain_mismatch_before_provider_call() {
+        let client = EvmRpcClient::with_chain(
+            Vec::new(),
+            ChainIdentity::try_new(ChainFamily::Evm, "ethereum", Some(NetworkId::numeric(1)))
+                .expect("valid chain"),
+            0,
+            10,
+            10,
+            10,
+        );
+        let request = ChainFetchRequest::new(
+            ChainIdentity::try_new(ChainFamily::Evm, "polygon", Some(NetworkId::numeric(137)))
+                .expect("valid chain"),
+            Dataset::Blocks,
+            HeightRange::Block(BlockRange::expect_new(1, 1)),
+            DatasetSelector::All,
+        );
+
+        let error = client.fetch(request).expect_err("chain mismatch");
+
+        assert_eq!(error.kind, DatalensErrorKind::UnsupportedDataset);
     }
 }

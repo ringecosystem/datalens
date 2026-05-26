@@ -1,8 +1,8 @@
 //! Chain-neutral adapter boundary for datalens chain sources.
 
 use datalens_core::{
-    BlockRange, ChainIdentity, DatalensError, Dataset, DatasetId, EvmLogFilter, LogFilter,
-    QueryRows, ResultEnvelope, TimeRange,
+    BlockRange, ChainIdentity, DatalensError, DatalensErrorKind, Dataset, DatasetId, EvmLogFilter,
+    LogFilter, QueryRows, ResultEnvelope, TimeRange,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -58,7 +58,7 @@ pub struct DatasetCapability {
     selectors: Vec<SelectorKind>,
     ranges: Vec<HeightRangeKind>,
     max_range_blocks: Option<u64>,
-    max_batch_rows: Option<usize>,
+    max_addresses_per_query: Option<usize>,
     supports_empty_coverage: bool,
 }
 
@@ -69,7 +69,7 @@ impl DatasetCapability {
             selectors: Vec::new(),
             ranges: Vec::new(),
             max_range_blocks: None,
-            max_batch_rows: None,
+            max_addresses_per_query: None,
             supports_empty_coverage: false,
         }
     }
@@ -89,8 +89,8 @@ impl DatasetCapability {
         self
     }
 
-    pub fn with_max_batch_rows(mut self, max_batch_rows: usize) -> Self {
-        self.max_batch_rows = Some(max_batch_rows);
+    pub fn with_max_addresses_per_query(mut self, max_addresses_per_query: usize) -> Self {
+        self.max_addresses_per_query = Some(max_addresses_per_query);
         self
     }
 
@@ -119,8 +119,8 @@ impl DatasetCapability {
         self.max_range_blocks
     }
 
-    pub fn max_batch_rows(&self) -> Option<usize> {
-        self.max_batch_rows
+    pub fn max_addresses_per_query(&self) -> Option<usize> {
+        self.max_addresses_per_query
     }
 
     pub fn supports_empty_coverage(&self) -> bool {
@@ -128,17 +128,44 @@ impl DatasetCapability {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdapterKey(String);
+
+impl AdapterKey {
+    pub fn try_new(value: impl Into<String>) -> Result<Self, DatalensError> {
+        let value = value.into();
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                "adapter key must not be empty",
+            ));
+        }
+        if value.contains('/') || value.contains('\\') {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                "adapter key must not contain path separators",
+            ));
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SelectorKind {
     All,
     EvmLogs,
-    Other(&'static str),
+    Other(AdapterKey),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HeightRangeKind {
     Block,
-    Other(&'static str),
+    Other(AdapterKey),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -146,7 +173,7 @@ pub enum DatasetSelector {
     All,
     EvmLogs(EvmLogFilter),
     Other {
-        kind: &'static str,
+        kind: AdapterKey,
         fingerprint: String,
         canonical_key: String,
     },
@@ -161,11 +188,25 @@ impl DatasetSelector {
         Ok(Self::EvmLogs(EvmLogFilter::try_from(filter)?))
     }
 
+    pub fn try_other(
+        kind: AdapterKey,
+        fingerprint: impl Into<String>,
+        canonical_key: impl Into<String>,
+    ) -> Result<Self, DatalensError> {
+        let fingerprint = validate_storage_key("selector fingerprint", fingerprint.into())?;
+        let canonical_key = validate_storage_key("selector canonical key", canonical_key.into())?;
+        Ok(Self::Other {
+            kind,
+            fingerprint,
+            canonical_key,
+        })
+    }
+
     pub fn kind(&self) -> SelectorKind {
         match self {
             Self::All => SelectorKind::All,
             Self::EvmLogs(_) => SelectorKind::EvmLogs,
-            Self::Other { kind, .. } => SelectorKind::Other(kind),
+            Self::Other { kind, .. } => SelectorKind::Other(kind.clone()),
         }
     }
 
@@ -243,11 +284,11 @@ impl ChainFetchRequest {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HeightRange {
     Block(BlockRange),
     Other {
-        kind: &'static str,
+        kind: AdapterKey,
         start: u64,
         end: u64,
     },
@@ -258,10 +299,20 @@ impl HeightRange {
         Self::Block(range)
     }
 
+    pub fn try_other(kind: AdapterKey, start: u64, end: u64) -> Result<Self, DatalensError> {
+        if start > end {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                "height range start must be less than or equal to end",
+            ));
+        }
+        Ok(Self::Other { kind, start, end })
+    }
+
     pub fn kind(&self) -> HeightRangeKind {
         match self {
             Self::Block(_) => HeightRangeKind::Block,
-            Self::Other { kind, .. } => HeightRangeKind::Other(kind),
+            Self::Other { kind, .. } => HeightRangeKind::Other(kind.clone()),
         }
     }
 
@@ -281,7 +332,7 @@ pub enum FinalityKind {
     Other(&'static str),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChainHeight {
     pub range_kind: HeightRangeKind,
     pub value: u64,
@@ -301,6 +352,23 @@ impl ChainHeight {
         self.finality = finality;
         self
     }
+}
+
+fn validate_storage_key(kind: &str, value: String) -> Result<String, DatalensError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            format!("{kind} must not be empty"),
+        ));
+    }
+    if value.contains('\\') || value.split('/').any(str::is_empty) {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            format!("{kind} must be a relative storage key"),
+        ));
+    }
+    Ok(value.to_owned())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -413,7 +481,7 @@ mod tests {
                     .with_selector(SelectorKind::EvmLogs)
                     .with_range(HeightRangeKind::Block)
                     .with_max_range_blocks(2)
-                    .with_max_batch_rows(100)
+                    .with_max_addresses_per_query(100)
                     .with_empty_coverage(true),
             )
         }
@@ -514,5 +582,49 @@ mod tests {
         assert_eq!(response.coverage_selector.kind(), SelectorKind::EvmLogs);
         assert_eq!(response.source_metadata.provider, "mock");
         assert_eq!(response.provider_diagnostics.calls, 1);
+    }
+
+    #[test]
+    fn test_other_selector_and_range_kinds_are_owned_stable_and_storage_safe() {
+        let first = AdapterKey::try_new("solana-accounts").expect("valid key");
+        let second = AdapterKey::try_new("solana-accounts").expect("valid key");
+
+        assert_eq!(
+            SelectorKind::Other(first.clone()),
+            SelectorKind::Other(second.clone())
+        );
+        assert_eq!(
+            HeightRangeKind::Other(first.clone()),
+            HeightRangeKind::Other(second.clone())
+        );
+        assert_eq!(first.as_str(), "solana-accounts");
+        assert!(AdapterKey::try_new("").is_err());
+        assert!(AdapterKey::try_new("bad/key").is_err());
+        assert!(AdapterKey::try_new("bad\\key").is_err());
+
+        let selector = DatasetSelector::try_other(
+            first.clone(),
+            "accounts-fingerprint",
+            "accounts/canonical-key",
+        )
+        .expect("valid selector");
+        let range = HeightRange::try_other(first, 1, 2).expect("valid range");
+
+        assert_eq!(selector.kind(), SelectorKind::Other(second.clone()));
+        assert_eq!(range.kind(), HeightRangeKind::Other(second));
+        assert_eq!(selector.fingerprint(), "accounts-fingerprint");
+        assert_eq!(selector.canonical_key(), "accounts/canonical-key");
+        assert!(
+            DatasetSelector::try_other(
+                AdapterKey::try_new("bad-selector").expect("valid key"),
+                "bad\\fingerprint",
+                "canonical",
+            )
+            .is_err()
+        );
+        assert!(
+            HeightRange::try_other(AdapterKey::try_new("bad-range").expect("valid key"), 2, 1,)
+                .is_err()
+        );
     }
 }
