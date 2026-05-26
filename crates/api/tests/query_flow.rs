@@ -234,6 +234,19 @@ fn test_query_rejects_fetch_response_selector_mismatch_without_cache_write() {
 }
 
 #[test]
+fn test_query_rejects_fetch_response_rows_mismatch_without_cache_write() {
+    assert_contract_violation_not_cached(
+        "contract-rows",
+        ResponseMutation::Rows(QueryRows::Logs(vec![log(
+            1,
+            0,
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            vec![TOPIC_A],
+        )])),
+    );
+}
+
+#[test]
 fn test_query_uses_adapter_range_limit_when_smaller_than_config() {
     let source = MockSource::default()
         .with_blocks(vec![
@@ -323,6 +336,7 @@ fn assert_contract_violation_not_cached(name: &str, mutation: ResponseMutation) 
 
     assert_eq!(error.kind, DatalensErrorKind::Internal);
     assert!(!root.join("manifest.json").exists());
+    assert!(!root.join("objects").exists());
 }
 
 fn service(storage: LocalStorage, source: MockSource) -> QueryService<MockSource> {
@@ -558,6 +572,7 @@ enum ResponseMutation {
     Dataset(Dataset),
     Range(HeightRange),
     Selector(DatasetSelector),
+    Rows(QueryRows),
 }
 
 impl ChainAdapter for MockSource {
@@ -651,6 +666,7 @@ impl MockSource {
             Some(ResponseMutation::Dataset(dataset)) => response.dataset = dataset,
             Some(ResponseMutation::Range(range)) => response.range = range,
             Some(ResponseMutation::Selector(selector)) => response.coverage_selector = selector,
+            Some(ResponseMutation::Rows(rows)) => response.rows = rows,
             None => {}
         }
         response
