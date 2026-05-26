@@ -236,34 +236,81 @@ where
     }
 
     pub fn query(&self, request: QueryRequest) -> Result<QueryResponse, DatalensError> {
-        self.validate(&request)?;
+        log::info!(
+            "query start chain={} dataset={} range={}-{}",
+            request.chain.configured_name(),
+            request.dataset.as_str(),
+            request.range.from_block,
+            request.range.to_block
+        );
+        if let Err(error) = self.validate(&request) {
+            log::warn!("query validation failed kind={:?}", error.kind);
+            return Err(error);
+        }
 
         let filter = request.filter.as_ref();
         let hit_ranges = self
             .storage
             .covered_ranges(request.dataset, filter, request.range)?;
         let misses = missing_ranges(request.range, &hit_ranges);
+        log::info!(
+            "cache summary dataset={} hit_ranges={} missing_ranges={}",
+            request.dataset.as_str(),
+            hit_ranges.len(),
+            misses.len()
+        );
         let mut rows = self
             .storage
             .read_rows(request.dataset, filter, request.range)?;
 
         for range in split_ranges(&misses, self.chunk_size(request.dataset)) {
             let fetched = match request.dataset {
-                Dataset::Blocks => QueryRows::Blocks(self.source.fetch_blocks(range)?),
+                Dataset::Blocks => match self.source.fetch_blocks(range) {
+                    Ok(rows) => QueryRows::Blocks(rows),
+                    Err(error) => {
+                        log::warn!(
+                            "block provider fetch failed range={}-{} kind={:?}",
+                            range.from_block,
+                            range.to_block,
+                            error.kind
+                        );
+                        return Err(error);
+                    }
+                },
                 Dataset::Logs => {
                     let filter = filter.ok_or_else(|| {
                         DatalensError::new(DatalensErrorKind::InvalidInput, "logs require filter")
                     })?;
-                    QueryRows::Logs(self.source.fetch_logs(range, filter)?)
+                    match self.source.fetch_logs(range, filter) {
+                        Ok(rows) => QueryRows::Logs(rows),
+                        Err(error) => {
+                            log::warn!(
+                                "log provider fetch failed range={}-{} kind={:?}",
+                                range.from_block,
+                                range.to_block,
+                                error.kind
+                            );
+                            return Err(error);
+                        }
+                    }
                 }
             };
-            self.storage.write_rows(
+            if let Err(error) = self.storage.write_rows(
                 request.dataset,
                 filter,
                 range,
                 &fetched,
                 self.writer.record_empty_coverage,
-            )?;
+            ) {
+                log::error!(
+                    "cache write failed dataset={} range={}-{} kind={:?}",
+                    request.dataset.as_str(),
+                    range.from_block,
+                    range.to_block,
+                    error.kind
+                );
+                return Err(error);
+            }
             rows.try_append(fetched)?;
         }
 
@@ -411,6 +458,11 @@ impl IntoResponse for ApiError {
             | DatalensErrorKind::ManifestUpdateFailure => StatusCode::INTERNAL_SERVER_ERROR,
             DatalensErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         };
+        log::warn!(
+            "query response error status={} kind={:?}",
+            status.as_u16(),
+            self.0.kind
+        );
         (
             status,
             Json(serde_json::json!({
@@ -433,6 +485,7 @@ where
     S: Source,
 {
     let listener = tokio::net::TcpListener::bind(bind).await?;
+    log::info!("api listener bound to {bind}");
     axum::serve(listener, router(service, chain_names)).await
 }
 
