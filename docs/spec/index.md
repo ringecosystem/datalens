@@ -56,3 +56,6 @@ Then keep the body explicit:
 - Chain-cache architecture and module boundaries:
   `docs/spec/chain-cache/en/architecture.md` and
   `docs/spec/chain-cache/zh-CN/architecture.md`
+- Chain-cache query-cache behavior:
+  `docs/spec/chain-cache/en/query-cache-behavior.md` and
+  `docs/spec/chain-cache/zh-CN/query-cache-behavior.md`
