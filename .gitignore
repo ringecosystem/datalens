@@ -25,3 +25,8 @@ coverage/
 .vscode/
 *.swp
 *.swo
+
+# workspace
+.worktree
+.worktrees
+.workspace
