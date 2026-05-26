@@ -56,3 +56,6 @@ Then keep the body explicit:
 - Chain-cache architecture and module boundaries:
   `docs/spec/chain-cache/en/architecture.md` and
   `docs/spec/chain-cache/zh-CN/architecture.md`
+- Chain-cache storage manifest and selective coverage semantics:
+  `docs/spec/chain-cache/en/storage-manifest.md` and
+  `docs/spec/chain-cache/zh-CN/storage-manifest.md`
