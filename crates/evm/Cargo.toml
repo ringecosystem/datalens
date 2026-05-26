@@ -1,8 +1,9 @@
 [package]
-name = "datalens-storage"
+name = "datalens-evm"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
 
 [dependencies]
+datalens-chain = { path = "../chain" }
 datalens-core = { path = "../core" }

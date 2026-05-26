@@ -1,11 +1,9 @@
 [package]
-name = "datalens-chain-cache-api"
+name = "datalens-api"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
 
 [dependencies]
-axum.workspace = true
-datalens-chain-cache-query = { path = "../query" }
-datalens-chain-cache-storage = { path = "../storage" }
-tokio.workspace = true
+datalens-core = { path = "../core" }
+datalens-planner = { path = "../planner" }

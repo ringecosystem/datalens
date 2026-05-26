@@ -1,5 +1,5 @@
 [package]
-name = "datalens-storage"
+name = "datalens-chain"
 edition.workspace = true
 license.workspace = true
 version.workspace = true

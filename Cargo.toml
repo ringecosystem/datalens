@@ -1,11 +1,13 @@
 [workspace]
 members = [
   "crates/api",
+  "crates/chain",
   "crates/cli",
   "crates/core",
-  "crates/ingest",
-  "crates/query",
+  "crates/evm",
+  "crates/planner",
   "crates/storage",
+  "crates/writer",
 ]
 resolver = "3"
 
