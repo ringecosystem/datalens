@@ -9,6 +9,7 @@ axum.workspace = true
 datalens-core = { path = "../core" }
 datalens-planner = { path = "../planner" }
 datalens-storage = { path = "../storage" }
+log.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

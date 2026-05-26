@@ -60,6 +60,11 @@ impl EvmRpcClient {
     }
 
     pub fn fetch_blocks(&self, range: BlockRange) -> Result<Vec<BlockHeader>, DatalensError> {
+        log::info!(
+            "fetching EVM blocks range={}-{}",
+            range.from_block,
+            range.to_block
+        );
         let mut blocks = Vec::new();
         for number in range.from_block..=range.to_block {
             let result = self.call(
@@ -67,6 +72,7 @@ impl EvmRpcClient {
                 json!([format!("0x{number:x}"), false]),
             )?;
             let Some(block) = result else {
+                log::warn!("provider returned null block for {number}");
                 return Err(DatalensError::new(
                     DatalensErrorKind::ProviderFailure,
                     format!("provider returned null block for {number}"),
@@ -87,10 +93,18 @@ impl EvmRpcClient {
         range: BlockRange,
         filter: &LogFilter,
     ) -> Result<Vec<LogRecord>, DatalensError> {
+        log::info!(
+            "fetching EVM logs range={}-{} addresses={} topic_slots={}",
+            range.from_block,
+            range.to_block,
+            filter.addresses.len(),
+            filter.topics.len()
+        );
         let result = self.call("eth_getLogs", json!([evm_log_filter(range, filter)]))?;
         let logs = result
             .and_then(|value| value.as_array().cloned())
             .ok_or_else(|| {
+                log::warn!("provider returned invalid eth_getLogs result");
                 DatalensError::new(
                     DatalensErrorKind::ProviderFailure,
                     "invalid eth_getLogs result",
@@ -104,6 +118,7 @@ impl EvmRpcClient {
         let url = self.rpc_urls.first().ok_or_else(|| {
             DatalensError::new(DatalensErrorKind::InvalidInput, "chain has no rpc_urls")
         })?;
+        log::debug!("sending EVM provider request method={method}");
         let response = self
             .client
             .post(url)
@@ -114,19 +129,30 @@ impl EvmRpcClient {
                 "params": params,
             }))
             .send()
-            .map_err(classify_transport_error)?;
+            .map_err(|error| {
+                let error = classify_transport_error(error);
+                log::warn!(
+                    "provider transport failed method={method} kind={:?}",
+                    error.kind
+                );
+                error
+            })?;
         let status = response.status();
         let body: Value = response.json().map_err(|error| {
+            log::warn!("failed to decode provider response method={method}: {error}");
             DatalensError::new(
                 DatalensErrorKind::ProviderFailure,
                 format!("decode JSON-RPC response: {error}"),
             )
         })?;
         if !status.is_success() {
-            return Err(classify_provider_error(
-                status.as_u16() as i64,
-                &body.to_string(),
-            ));
+            let error = classify_provider_error(status.as_u16() as i64, &body.to_string());
+            log::warn!(
+                "provider returned HTTP error method={method} status={} kind={:?}",
+                status.as_u16(),
+                error.kind
+            );
+            return Err(error);
         }
         if let Some(error) = body.get("error") {
             let code = error
@@ -137,7 +163,12 @@ impl EvmRpcClient {
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("provider error");
-            return Err(classify_provider_error(code, message));
+            let error = classify_provider_error(code, message);
+            log::warn!(
+                "provider returned JSON-RPC error method={method} code={code} kind={:?}",
+                error.kind
+            );
+            return Err(error);
         }
         Ok(body.get("result").cloned())
     }
