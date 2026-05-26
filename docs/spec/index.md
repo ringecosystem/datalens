@@ -50,3 +50,6 @@ Then keep the body explicit:
 - Chain-cache project charter:
   - English: `docs/spec/chain-cache/en/project-charter.md`
   - Simplified Chinese: `docs/spec/chain-cache/zh-CN/project-charter.md`
+- Chain-cache documentation map and bilingual contract:
+  `docs/spec/chain-cache/en/documentation-map.md` and
+  `docs/spec/chain-cache/zh-CN/documentation-map.md`

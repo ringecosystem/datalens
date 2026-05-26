@@ -20,6 +20,9 @@ The split below is by question type, not by human-versus-agent audience.
 
 - Need contracts, invariants, schemas, state machines, conventions, or required behavior
   -> `docs/spec/`
+- Need the chain-cache spec map or bilingual spec contract
+  -> `docs/spec/chain-cache/en/documentation-map.md` or
+  `docs/spec/chain-cache/zh-CN/documentation-map.md`
 - Need runbooks, migrations, validation steps, troubleshooting, or operational sequences
   -> `docs/runbook/`
 - Need current repository layout, ownership boundaries, or implementation surface maps
