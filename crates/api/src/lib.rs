@@ -443,18 +443,9 @@ where
                 DatalensErrorKind::UnsupportedDataset,
                 "logs dataset is disabled",
             )),
-            Dataset::Logs => {
-                let filter = request.filter.as_ref().ok_or_else(|| {
-                    DatalensError::new(DatalensErrorKind::InvalidInput, "logs require filter")
-                })?;
-                if filter.addresses.len() > self.chain.datasets.logs.max_addresses_per_query {
-                    return Err(DatalensError::new(
-                        DatalensErrorKind::InvalidInput,
-                        "too many log addresses",
-                    ));
-                }
-                Ok(())
-            }
+            Dataset::Logs => request.filter.as_ref().map(|_| ()).ok_or_else(|| {
+                DatalensError::new(DatalensErrorKind::InvalidInput, "logs require filter")
+            }),
             Dataset::Blocks => Ok(()),
         }
     }
@@ -515,36 +506,67 @@ struct ApiError(DatalensError);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let status = match self.0.kind {
-            DatalensErrorKind::InvalidInput | DatalensErrorKind::InvalidRequest => {
-                StatusCode::BAD_REQUEST
-            }
-            DatalensErrorKind::UnsupportedDataset => StatusCode::UNPROCESSABLE_ENTITY,
-            DatalensErrorKind::ProviderLimit | DatalensErrorKind::RateLimited => {
-                StatusCode::TOO_MANY_REQUESTS
-            }
-            DatalensErrorKind::ProviderTimeout => StatusCode::GATEWAY_TIMEOUT,
-            DatalensErrorKind::ProviderFailure => StatusCode::BAD_GATEWAY,
-            DatalensErrorKind::StorageReadFailure
-            | DatalensErrorKind::StorageWriteFailure
-            | DatalensErrorKind::ManifestUpdateFailure => StatusCode::INTERNAL_SERVER_ERROR,
-            DatalensErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
-        };
+        let status = api_error_status(&self.0.kind);
         log::warn!(
             "query response error status={} kind={:?}",
             status.as_u16(),
             self.0.kind
         );
-        (
-            status,
-            Json(serde_json::json!({
-                "error": {
-                    "kind": self.0.kind,
-                    "message": self.0.message,
-                }
-            })),
-        )
-            .into_response()
+        (status, Json(api_error_body(self.0))).into_response()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ApiErrorBody {
+    pub error: ApiErrorDetail,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ApiErrorDetail {
+    pub kind: &'static str,
+    pub message: String,
+}
+
+pub fn api_error_status(kind: &DatalensErrorKind) -> StatusCode {
+    match kind {
+        DatalensErrorKind::InvalidInput | DatalensErrorKind::InvalidRequest => {
+            StatusCode::BAD_REQUEST
+        }
+        DatalensErrorKind::UnsupportedDataset => StatusCode::UNPROCESSABLE_ENTITY,
+        DatalensErrorKind::ProviderLimit | DatalensErrorKind::RateLimited => {
+            StatusCode::TOO_MANY_REQUESTS
+        }
+        DatalensErrorKind::ProviderTimeout => StatusCode::GATEWAY_TIMEOUT,
+        DatalensErrorKind::ProviderFailure => StatusCode::BAD_GATEWAY,
+        DatalensErrorKind::StorageReadFailure
+        | DatalensErrorKind::StorageWriteFailure
+        | DatalensErrorKind::ManifestUpdateFailure
+        | DatalensErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+pub fn api_error_body(error: DatalensError) -> ApiErrorBody {
+    ApiErrorBody {
+        error: ApiErrorDetail {
+            kind: api_error_kind(&error.kind),
+            message: error.message,
+        },
+    }
+}
+
+fn api_error_kind(kind: &DatalensErrorKind) -> &'static str {
+    match kind {
+        DatalensErrorKind::InvalidInput => "invalid_input",
+        DatalensErrorKind::InvalidRequest => "invalid_request",
+        DatalensErrorKind::UnsupportedDataset => "unsupported_dataset",
+        DatalensErrorKind::ProviderFailure => "provider_failure",
+        DatalensErrorKind::ProviderLimit => "provider_limit",
+        DatalensErrorKind::ProviderTimeout => "provider_timeout",
+        DatalensErrorKind::RateLimited => "rate_limited",
+        DatalensErrorKind::StorageReadFailure => "storage_read_failure",
+        DatalensErrorKind::StorageWriteFailure => "storage_write_failure",
+        DatalensErrorKind::ManifestUpdateFailure => "manifest_update_failure",
+        DatalensErrorKind::Internal => "internal",
     }
 }
 
