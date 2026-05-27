@@ -70,16 +70,16 @@ before their durable coverage can be recorded.
 A coverage entry should include:
 
 - Chain kind, for example `evm`.
-- Chain name or configured chain identity.
-- Dataset, for example `blocks`, `logs`, `transactions`, or future family-specific names.
-- Covered range, such as block range or another chain-family range model.
+- Chain name or configured chain identity, including network id when configured.
+- Dataset key, for example `evm.blocks`, `evm.logs`, `tron.events`, or
+  `solana.transactions`.
+- Covered ledger range, including range kind, start, and end.
 - Schema or normalization version.
-- Optional filter coverage, such as EVM addresses and topic filters.
+- Selector fingerprint for lookup and selector canonical key for audit.
 - Field coverage or canonical chunk shape.
 - Object key for the durable chunk.
 - Size, checksum, and write metadata when available.
-- A schema extension point for finality metadata. In the first implementation, manifest
-  coverage means safe/finalized durable history by definition.
+- Finality metadata. The durable manifest may record only safe or finalized coverage.
 
 Because datalens caches selected data, a chunk for `logs` with one address filter does not
 imply full log coverage for the same block range or coverage for another contract. The
