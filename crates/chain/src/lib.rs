@@ -2,7 +2,7 @@
 
 use datalens_core::{
     BlockRange, ChainIdentity, DatalensError, DatalensErrorKind, Dataset, DatasetId, EvmLogFilter,
-    LogFilter, QueryRows, ResultEnvelope, TimeRange,
+    LogFilter, QueryRows,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -59,7 +59,12 @@ pub struct DatasetCapability {
     ranges: Vec<HeightRangeKind>,
     max_range_blocks: Option<u64>,
     max_addresses_per_query: Option<usize>,
+    max_topics_per_query: Option<usize>,
     supports_empty_coverage: bool,
+    supports_safe_height: bool,
+    supports_finalized_height: bool,
+    supports_provider_native_finality_tags: bool,
+    supports_range_split: bool,
 }
 
 impl DatasetCapability {
@@ -70,7 +75,12 @@ impl DatasetCapability {
             ranges: Vec::new(),
             max_range_blocks: None,
             max_addresses_per_query: None,
+            max_topics_per_query: None,
             supports_empty_coverage: false,
+            supports_safe_height: false,
+            supports_finalized_height: false,
+            supports_provider_native_finality_tags: false,
+            supports_range_split: false,
         }
     }
 
@@ -94,8 +104,36 @@ impl DatasetCapability {
         self
     }
 
+    pub fn with_max_topics_per_query(mut self, max_topics_per_query: usize) -> Self {
+        self.max_topics_per_query = Some(max_topics_per_query);
+        self
+    }
+
     pub fn with_empty_coverage(mut self, supports_empty_coverage: bool) -> Self {
         self.supports_empty_coverage = supports_empty_coverage;
+        self
+    }
+
+    pub fn with_safe_height(mut self, supports_safe_height: bool) -> Self {
+        self.supports_safe_height = supports_safe_height;
+        self
+    }
+
+    pub fn with_finalized_height(mut self, supports_finalized_height: bool) -> Self {
+        self.supports_finalized_height = supports_finalized_height;
+        self
+    }
+
+    pub fn with_provider_native_finality_tags(
+        mut self,
+        supports_provider_native_finality_tags: bool,
+    ) -> Self {
+        self.supports_provider_native_finality_tags = supports_provider_native_finality_tags;
+        self
+    }
+
+    pub fn with_range_split(mut self, supports_range_split: bool) -> Self {
+        self.supports_range_split = supports_range_split;
         self
     }
 
@@ -123,8 +161,28 @@ impl DatasetCapability {
         self.max_addresses_per_query
     }
 
+    pub fn max_topics_per_query(&self) -> Option<usize> {
+        self.max_topics_per_query
+    }
+
     pub fn supports_empty_coverage(&self) -> bool {
         self.supports_empty_coverage
+    }
+
+    pub fn supports_safe_height(&self) -> bool {
+        self.supports_safe_height
+    }
+
+    pub fn supports_finalized_height(&self) -> bool {
+        self.supports_finalized_height
+    }
+
+    pub fn supports_provider_native_finality_tags(&self) -> bool {
+        self.supports_provider_native_finality_tags
+    }
+
+    pub fn supports_range_split(&self) -> bool {
+        self.supports_range_split
     }
 }
 
@@ -322,6 +380,17 @@ impl HeightRange {
             Self::Other { .. } => None,
         }
     }
+
+    pub fn end(&self) -> u64 {
+        match self {
+            Self::Block(range) => range.to_block,
+            Self::Other { end, .. } => *end,
+        }
+    }
+
+    pub fn is_covered_by(&self, height: &ChainHeight) -> Result<(), DatalensError> {
+        validate_durable_range(self, height)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -351,6 +420,20 @@ impl ChainHeight {
     pub fn with_finality(mut self, finality: FinalityKind) -> Self {
         self.finality = finality;
         self
+    }
+
+    pub fn is_durable_cache_safe(&self) -> bool {
+        matches!(self.finality, FinalityKind::Safe | FinalityKind::Finalized)
+    }
+
+    pub fn validate_durable_cache_safe(&self) -> Result<(), DatalensError> {
+        if !self.is_durable_cache_safe() {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                "adapter cache-safe height is not safe or finalized",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -427,6 +510,27 @@ impl ChainFetchResponse {
         self.provider_diagnostics = provider_diagnostics;
         self
     }
+
+    pub fn validate_for_request(&self, request: &ChainFetchRequest) -> Result<(), DatalensError> {
+        if self.chain != request.chain
+            || self.dataset != request.dataset
+            || self.range != request.range
+            || self.coverage_selector != request.selector
+            || self.rows.dataset() != request.dataset
+        {
+            return Err(DatalensError::new(
+                DatalensErrorKind::Internal,
+                "chain adapter response does not match fetch request",
+            ));
+        }
+        if self.rows.row_count() == 0 && self.provider_diagnostics.calls == 0 {
+            return Err(DatalensError::new(
+                DatalensErrorKind::Internal,
+                "empty chain adapter response must include provider diagnostics confirming a provider query",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -442,16 +546,28 @@ pub struct ProviderDiagnostics {
     pub warnings: Vec<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FetchRequest {
-    pub chain: ChainIdentity,
-    pub dataset: DatasetId,
-    pub range: TimeRange,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FetchResponse<T> {
-    pub envelope: ResultEnvelope<T>,
+pub fn validate_durable_range(
+    range: &HeightRange,
+    cache_safe_height: &ChainHeight,
+) -> Result<(), DatalensError> {
+    cache_safe_height.validate_durable_cache_safe()?;
+    if range.kind() != cache_safe_height.range_kind {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "range kind does not match adapter cache-safe height kind",
+        ));
+    }
+    if range.end() > cache_safe_height.value {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            format!(
+                "range exceeds adapter safe/finalized height: requested end {}, safe/finalized height {}",
+                range.end(),
+                cache_safe_height.value
+            ),
+        ));
+    }
+    Ok(())
 }
 
 pub trait ChainAdapter: Clone + Send + Sync + 'static {
@@ -459,7 +575,14 @@ pub trait ChainAdapter: Clone + Send + Sync + 'static {
 
     fn latest_height(&self) -> Result<ChainHeight, DatalensError>;
 
-    fn safe_height(&self) -> Result<ChainHeight, DatalensError>;
+    fn cache_safe_height(&self) -> Result<ChainHeight, DatalensError>;
+
+    fn finalized_height(&self) -> Result<ChainHeight, DatalensError> {
+        Err(DatalensError::new(
+            DatalensErrorKind::UnsupportedDataset,
+            "adapter does not expose finalized height",
+        ))
+    }
 
     fn fetch(&self, request: ChainFetchRequest) -> Result<ChainFetchResponse, DatalensError>;
 }
@@ -486,7 +609,12 @@ mod tests {
                     .with_range(HeightRangeKind::Block)
                     .with_max_range_blocks(2)
                     .with_max_addresses_per_query(100)
-                    .with_empty_coverage(true),
+                    .with_max_topics_per_query(4)
+                    .with_empty_coverage(true)
+                    .with_safe_height(true)
+                    .with_finalized_height(true)
+                    .with_provider_native_finality_tags(true)
+                    .with_range_split(true),
             )
         }
 
@@ -494,7 +622,7 @@ mod tests {
             Ok(ChainHeight::block(12))
         }
 
-        fn safe_height(&self) -> Result<ChainHeight, DatalensError> {
+        fn cache_safe_height(&self) -> Result<ChainHeight, DatalensError> {
             Ok(ChainHeight::block(10).with_finality(FinalityKind::Safe))
         }
 
@@ -553,7 +681,12 @@ mod tests {
             .expect("logs capability");
         assert!(logs.supports_selector(SelectorKind::EvmLogs));
         assert_eq!(logs.max_range_blocks(), Some(2));
+        assert_eq!(logs.max_topics_per_query(), Some(4));
         assert!(logs.supports_empty_coverage());
+        assert!(logs.supports_safe_height());
+        assert!(logs.supports_finalized_height());
+        assert!(logs.supports_provider_native_finality_tags());
+        assert!(logs.supports_range_split());
 
         let request = ChainFetchRequest::new(
             chain.clone(),
@@ -570,13 +703,16 @@ mod tests {
             request_id: Some("query-1".to_owned()),
             cache_write: true,
         });
-        let response = adapter.fetch(request).expect("fetch response");
+        let response = adapter.fetch(request.clone()).expect("fetch response");
 
         assert_eq!(adapter.latest_height().unwrap(), ChainHeight::block(12));
         assert_eq!(
-            adapter.safe_height().unwrap(),
+            adapter.cache_safe_height().unwrap(),
             ChainHeight::block(10).with_finality(FinalityKind::Safe)
         );
+        response
+            .validate_for_request(&request)
+            .expect("response matches request");
         assert_eq!(response.dataset, Dataset::Logs);
         assert_eq!(
             response.range,
@@ -586,6 +722,111 @@ mod tests {
         assert_eq!(response.coverage_selector.kind(), SelectorKind::EvmLogs);
         assert_eq!(response.source_metadata.provider, "mock");
         assert_eq!(response.provider_diagnostics.calls, 1);
+    }
+
+    #[test]
+    fn test_fetch_response_validate_for_request_rejects_contract_mismatch() {
+        let chain =
+            ChainIdentity::try_new(ChainFamily::Evm, "ethereum", Some(NetworkId::numeric(1)))
+                .expect("valid chain");
+        let selector = DatasetSelector::all();
+        let request = ChainFetchRequest::new(
+            chain.clone(),
+            Dataset::Blocks,
+            HeightRange::blocks(BlockRange::expect_new(1, 2)),
+            selector.clone(),
+        );
+        let response = ChainFetchResponse::new(
+            chain,
+            Dataset::Logs,
+            HeightRange::blocks(BlockRange::expect_new(1, 2)),
+            selector,
+            QueryRows::Logs(Vec::new()),
+        );
+
+        let error = response
+            .validate_for_request(&request)
+            .expect_err("dataset mismatch rejected");
+
+        assert_eq!(error.kind, DatalensErrorKind::Internal);
+    }
+
+    #[test]
+    fn test_fetch_response_validate_for_request_rejects_unconfirmed_empty_response() {
+        let chain =
+            ChainIdentity::try_new(ChainFamily::Evm, "ethereum", Some(NetworkId::numeric(1)))
+                .expect("valid chain");
+        let request = ChainFetchRequest::new(
+            chain.clone(),
+            Dataset::Logs,
+            HeightRange::blocks(BlockRange::expect_new(1, 2)),
+            DatasetSelector::try_evm_logs(LogFilter {
+                addresses: Vec::new(),
+                topics: Vec::new(),
+            })
+            .expect("valid selector"),
+        );
+        let response = ChainFetchResponse::empty(
+            chain,
+            Dataset::Logs,
+            HeightRange::blocks(BlockRange::expect_new(1, 2)),
+            request.selector.clone(),
+        );
+
+        let error = response
+            .validate_for_request(&request)
+            .expect_err("unconfirmed empty response rejected");
+
+        assert_eq!(error.kind, DatalensErrorKind::Internal);
+    }
+
+    #[test]
+    fn test_durable_range_requires_safe_or_finalized_matching_height_kind() {
+        let range = HeightRange::blocks(BlockRange::expect_new(1, 10));
+        assert!(
+            validate_durable_range(
+                &range,
+                &ChainHeight::block(10).with_finality(FinalityKind::Safe),
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_durable_range(
+                &range,
+                &ChainHeight::block(10).with_finality(FinalityKind::Finalized),
+            )
+            .is_ok()
+        );
+
+        let latest_error = validate_durable_range(&range, &ChainHeight::block(10))
+            .expect_err("latest is not durable");
+        assert_eq!(latest_error.kind, DatalensErrorKind::InvalidInput);
+
+        let too_high_error = validate_durable_range(
+            &range,
+            &ChainHeight::block(9).with_finality(FinalityKind::Safe),
+        )
+        .expect_err("range above safe height is rejected");
+        assert_eq!(too_high_error.kind, DatalensErrorKind::InvalidInput);
+
+        let other_height = ChainHeight {
+            range_kind: HeightRangeKind::Other(
+                AdapterKey::try_new("solana-slots").expect("valid key"),
+            ),
+            value: 10,
+            finality: FinalityKind::Safe,
+        };
+        let kind_error =
+            validate_durable_range(&range, &other_height).expect_err("kind mismatch rejected");
+        assert_eq!(kind_error.kind, DatalensErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_other_finality_cannot_authorize_durable_cache_write() {
+        let height = ChainHeight::block(10).with_finality(FinalityKind::Other("checkpoint"));
+
+        assert!(!height.is_durable_cache_safe());
+        assert!(height.validate_durable_cache_safe().is_err());
     }
 
     #[test]

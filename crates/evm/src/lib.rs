@@ -54,7 +54,7 @@ impl ChainAdapter for EvmAdapter {
         ))
     }
 
-    fn safe_height(&self) -> Result<ChainHeight, DatalensError> {
+    fn cache_safe_height(&self) -> Result<ChainHeight, DatalensError> {
         Err(DatalensError::new(
             DatalensErrorKind::InvalidInput,
             "EVM adapter has no configured provider",
@@ -274,7 +274,14 @@ impl ChainAdapter for EvmRpcClient {
                     .with_selector(SelectorKind::All)
                     .with_range(HeightRangeKind::Block)
                     .with_max_range_blocks(self.max_block_batch_blocks)
-                    .with_empty_coverage(true),
+                    .with_empty_coverage(true)
+                    .with_safe_height(true)
+                    .with_finalized_height(true)
+                    .with_provider_native_finality_tags(matches!(
+                        self.finality_policy,
+                        EvmFinalityPolicy::Auto | EvmFinalityPolicy::RpcTags { .. }
+                    ))
+                    .with_range_split(true),
             )
             .with_dataset_capability(
                 DatasetCapability::new(Dataset::Logs)
@@ -282,7 +289,14 @@ impl ChainAdapter for EvmRpcClient {
                     .with_range(HeightRangeKind::Block)
                     .with_max_range_blocks(self.max_get_logs_range_blocks)
                     .with_max_addresses_per_query(self.max_addresses_per_query)
-                    .with_empty_coverage(true),
+                    .with_empty_coverage(true)
+                    .with_safe_height(true)
+                    .with_finalized_height(true)
+                    .with_provider_native_finality_tags(matches!(
+                        self.finality_policy,
+                        EvmFinalityPolicy::Auto | EvmFinalityPolicy::RpcTags { .. }
+                    ))
+                    .with_range_split(true),
             )
     }
 
@@ -305,7 +319,7 @@ impl ChainAdapter for EvmRpcClient {
         Ok(ChainHeight::block(height))
     }
 
-    fn safe_height(&self) -> Result<ChainHeight, DatalensError> {
+    fn cache_safe_height(&self) -> Result<ChainHeight, DatalensError> {
         match &self.finality_policy {
             EvmFinalityPolicy::Auto => self
                 .rpc_finality_height("finalized", "safe")
@@ -336,6 +350,24 @@ impl ChainAdapter for EvmRpcClient {
         }
     }
 
+    fn finalized_height(&self) -> Result<ChainHeight, DatalensError> {
+        match &self.finality_policy {
+            EvmFinalityPolicy::Auto => {
+                self.finality_tag_height("finalized", FinalityKind::Finalized)
+            }
+            EvmFinalityPolicy::Lag {
+                finalized_lag_blocks,
+                ..
+            } => self.lag_finality_height(&LagFinalityPolicy {
+                safe_lag_blocks: None,
+                finalized_lag_blocks: *finalized_lag_blocks,
+            }),
+            EvmFinalityPolicy::RpcTags { finalized_tag, .. } => {
+                self.finality_tag_height(finalized_tag, FinalityKind::Finalized)
+            }
+        }
+    }
+
     fn fetch(&self, request: ChainFetchRequest) -> Result<ChainFetchResponse, DatalensError> {
         if request.chain != self.chain {
             return Err(DatalensError::new(
@@ -349,10 +381,13 @@ impl ChainAdapter for EvmRpcClient {
                 "only block ranges are supported",
             )
         })?;
-        let rows = match (&request.dataset, &request.selector) {
-            (Dataset::Blocks, DatasetSelector::All) => QueryRows::Blocks(self.fetch_blocks(range)?),
+        let (rows, provider_calls) = match (&request.dataset, &request.selector) {
+            (Dataset::Blocks, DatasetSelector::All) => (
+                QueryRows::Blocks(self.fetch_blocks(range)?),
+                range.len().min(usize::MAX as u128) as usize,
+            ),
             (Dataset::Logs, DatasetSelector::EvmLogs(filter)) => {
-                QueryRows::Logs(self.fetch_evm_logs(range, filter)?)
+                (QueryRows::Logs(self.fetch_evm_logs(range, filter)?), 1)
             }
             (Dataset::Blocks, _) => {
                 return Err(DatalensError::new(
@@ -373,7 +408,12 @@ impl ChainAdapter for EvmRpcClient {
             HeightRange::Block(range),
             request.selector,
             rows,
-        ))
+        )
+        .with_provider_diagnostics(datalens_chain::ProviderDiagnostics {
+            calls: provider_calls,
+            rows_scanned: 0,
+            warnings: Vec::new(),
+        }))
     }
 }
 
@@ -692,7 +732,7 @@ mod tests {
             10,
         );
 
-        let height = client.safe_height().expect("finalized height");
+        let height = client.cache_safe_height().expect("finalized height");
 
         assert_eq!(
             height,
@@ -732,7 +772,7 @@ mod tests {
             10,
         );
 
-        let height = client.safe_height().expect("safe height");
+        let height = client.cache_safe_height().expect("safe height");
 
         assert_eq!(
             height,
@@ -764,7 +804,7 @@ mod tests {
             10,
         );
 
-        let height = client.safe_height().expect("profile fallback height");
+        let height = client.cache_safe_height().expect("profile fallback height");
 
         assert_eq!(
             height,
@@ -793,7 +833,7 @@ mod tests {
             10,
         );
 
-        let error = client.safe_height().expect_err("unknown finality");
+        let error = client.cache_safe_height().expect_err("unknown finality");
 
         assert_eq!(error.kind, DatalensErrorKind::InvalidInput);
         assert!(error.message.contains("finality"));
@@ -819,7 +859,7 @@ mod tests {
             10,
         );
 
-        let height = client.safe_height().expect("manual lag height");
+        let height = client.cache_safe_height().expect("manual lag height");
 
         assert_eq!(
             height,

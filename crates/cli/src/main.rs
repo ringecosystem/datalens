@@ -331,7 +331,7 @@ fn doctor_chain_summary(
         chain.datasets.logs.max_get_logs_range_blocks,
         chain.datasets.logs.max_addresses_per_query,
     );
-    let safe_height = source.safe_height().map_err(|error| {
+    let safe_height = source.cache_safe_height().map_err(|error| {
         DatalensError::new(
             error.kind,
             format!(
