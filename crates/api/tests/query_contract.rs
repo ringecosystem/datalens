@@ -160,8 +160,8 @@ fn assert_contract_violation_not_cached(name: &str, mutation: ResponseMutation) 
         .expect_err("contract violation");
 
     assert_eq!(error.kind, DatalensErrorKind::Internal);
-    assert!(!root.join("manifest.json").exists());
-    assert!(!root.join("objects").exists());
+    assert!(!root.join("chains/evm/ethereum/1/manifest.json").exists());
+    assert!(!root.join("chains/evm/ethereum/1/datasets").exists());
 }
 
 fn service(storage: LocalStorage, source: MockSource) -> QueryService<MockSource> {

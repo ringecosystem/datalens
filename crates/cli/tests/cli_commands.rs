@@ -155,6 +155,96 @@ fn test_validate_config_rejects_zero_lag_finality_override() {
 }
 
 #[test]
+fn test_validate_config_accepts_s3_compatible_storage_backend() {
+    let config = toml::from_str::<DatalensConfig>(
+        r#"
+        [server]
+        bind = "127.0.0.1:8080"
+
+        [storage]
+        backend = "s3"
+
+        [storage.s3]
+        bucket = "datalens"
+        prefix = "dev"
+        region = "auto"
+        endpoint_url = "http://localhost:9000"
+        force_path_style = true
+
+        [planner]
+        max_query_range_blocks = 100
+        default_chunk_range_blocks = 10
+
+        [writer]
+        target_object_bytes = 1024
+        min_object_rows = 1
+        record_empty_coverage = true
+
+        [chains.private]
+        kind = "evm"
+        chain_id = 31337
+        rpc_urls = ["http://example.invalid"]
+
+        [chains.private.datasets.blocks]
+        enabled = true
+        max_batch_blocks = 10
+
+        [chains.private.datasets.logs]
+        enabled = true
+        max_get_logs_range_blocks = 10
+        max_addresses_per_query = 2
+        "#,
+    )
+    .expect("config parses");
+
+    validate_config(&config).expect("s3-compatible config is valid");
+}
+
+#[test]
+fn test_validate_config_keeps_legacy_storage_root_compatible() {
+    let config = toml::from_str::<DatalensConfig>(
+        r#"
+        [server]
+        bind = "127.0.0.1:8080"
+
+        [storage]
+        backend = "local"
+        root = ".datalens/storage"
+
+        [planner]
+        max_query_range_blocks = 100
+        default_chunk_range_blocks = 10
+
+        [writer]
+        target_object_bytes = 1024
+        min_object_rows = 1
+        record_empty_coverage = true
+
+        [chains.private]
+        kind = "evm"
+        chain_id = 31337
+        rpc_urls = ["http://example.invalid"]
+
+        [chains.private.datasets.blocks]
+        enabled = true
+        max_batch_blocks = 10
+
+        [chains.private.datasets.logs]
+        enabled = true
+        max_get_logs_range_blocks = 10
+        max_addresses_per_query = 2
+        "#,
+    )
+    .expect("config parses");
+
+    validate_config(&config).expect("legacy local root config remains valid");
+    assert_eq!(
+        config.storage.local.expect("legacy local config").root,
+        ".datalens/storage"
+    );
+}
+
+#[test]
 fn test_doctor_chain_summary_rejects_unknown_auto_finality_without_profile() {
     let (url, _requests) =
         start_rpc_server(vec![unsupported_tag_response(), unsupported_tag_response()]);

@@ -104,8 +104,8 @@ fn test_query_empty_logs_records_empty_coverage_without_data_object() {
         ]
     );
     assert_eq!(log_indexes(&second), Vec::<u64>::new());
-    assert!(root.join("manifest.json").exists());
-    assert!(!root.join("objects").exists());
+    assert!(root.join("chains/evm/ethereum/1/manifest.json").exists());
+    assert!(!root.join("chains/evm/ethereum/1/datasets").exists());
 }
 
 #[test]
@@ -191,8 +191,8 @@ fn test_query_rejects_range_above_safe_height_without_fetch_or_cache_write() {
     assert_eq!(error.kind, DatalensErrorKind::InvalidInput);
     assert!(error.message.contains("safe/finalized height"));
     assert_eq!(source.calls(), Vec::<SourceCall>::new());
-    assert!(!root.join("manifest.json").exists());
-    assert!(!root.join("objects").exists());
+    assert!(!root.join("chains/evm/ethereum/1/manifest.json").exists());
+    assert!(!root.join("chains/evm/ethereum/1/datasets").exists());
 }
 
 #[test]
@@ -212,8 +212,8 @@ fn test_query_allows_range_at_safe_height_and_writes_cache() {
         source.calls(),
         vec![SourceCall::Blocks(BlockRange::expect_new(98, 99))]
     );
-    assert!(root.join("manifest.json").exists());
-    assert!(root.join("objects").exists());
+    assert!(root.join("chains/evm/ethereum/1/manifest.json").exists());
+    assert!(root.join("chains/evm/ethereum/1/datasets").exists());
 }
 
 #[test]
@@ -232,8 +232,8 @@ fn test_query_rejects_empty_unsafe_range_without_empty_coverage() {
 
     assert_eq!(error.kind, DatalensErrorKind::InvalidInput);
     assert_eq!(source.calls(), Vec::<SourceCall>::new());
-    assert!(!root.join("manifest.json").exists());
-    assert!(!root.join("objects").exists());
+    assert!(!root.join("chains/evm/ethereum/1/manifest.json").exists());
+    assert!(!root.join("chains/evm/ethereum/1/datasets").exists());
 }
 
 #[test]
@@ -269,7 +269,7 @@ fn test_provider_limit_error_is_classified() {
         .expect_err("provider limit");
 
     assert_eq!(error.kind, DatalensErrorKind::ProviderLimit);
-    assert!(!root.join("manifest.json").exists());
+    assert!(!root.join("chains/evm/ethereum/1/manifest.json").exists());
 }
 
 #[test]

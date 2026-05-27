@@ -1,16 +1,14 @@
 //! Storage boundary for durable datalens objects and coverage metadata.
 
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
-
 use datalens_chain::{DatasetSelector, FinalityLevel};
 use datalens_core::{
     ChainIdentity, CoverageLevel, DatalensError, DatalensErrorKind, DatasetId, DatasetKey,
     DatasetRows, LedgerRange, LedgerRangeKind, QueryRows, TimeRange,
 };
 use serde::{Deserialize, Deserializer, Serialize, de::Error};
+use std::path::{Path, PathBuf};
+
+const OBJECT_SCHEMA_VERSION: &str = "json";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StorageRequest {
@@ -58,18 +56,45 @@ impl Storage for InMemoryStorage {
     }
 }
 
+mod object_store;
+pub use object_store::{
+    LocalObjectStore, ObjectMetadata, ObjectStore, S3ObjectStore, S3ObjectStoreConfig,
+    validate_object_key,
+};
+
 #[derive(Clone, Debug)]
-pub struct LocalStorage {
-    root: PathBuf,
+pub struct DurableStorage<S> {
+    object_store: S,
 }
 
-impl LocalStorage {
+pub type LocalStorage = DurableStorage<LocalObjectStore>;
+
+impl DurableStorage<LocalObjectStore> {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            object_store: LocalObjectStore::new(root),
+        }
     }
 
     pub fn root(&self) -> &Path {
-        &self.root
+        self.object_store.root()
+    }
+
+    pub fn manifest_path(&self, chain: &ChainIdentity) -> PathBuf {
+        self.root().join(manifest_key(chain))
+    }
+}
+
+impl<S> DurableStorage<S>
+where
+    S: ObjectStore,
+{
+    pub fn from_object_store(object_store: S) -> Self {
+        Self { object_store }
+    }
+
+    pub fn object_store(&self) -> &S {
+        &self.object_store
     }
 
     pub fn covered_ranges(
@@ -81,7 +106,7 @@ impl LocalStorage {
     ) -> Result<Vec<LedgerRange>, DatalensError> {
         let selector_fingerprint = selector.fingerprint();
         let mut ranges = self
-            .manifest()?
+            .manifest_for_chain(chain)?
             .entries
             .into_iter()
             .filter(|entry| {
@@ -111,7 +136,7 @@ impl LocalStorage {
         );
         let selector_fingerprint = selector.fingerprint();
         let mut rows = empty_rows(dataset_key.clone())?.into_rows();
-        for entry in self.manifest()?.entries {
+        for entry in self.manifest_for_chain(chain)?.entries {
             if entry.chain != *chain
                 || entry.dataset_key != *dataset_key
                 || entry.range.kind() != range.kind()
@@ -125,22 +150,17 @@ impl LocalStorage {
             let Some(object_key) = entry.object_key else {
                 continue;
             };
-            let object = self.root.join(object_key);
-            let bytes = fs::read(&object).map_err(|error| {
-                log::warn!("failed to read cached object {}: {error}", object.display());
-                DatalensError::new(
+            if !self.object_store.exists(&object_key)? {
+                return Err(DatalensError::new(
                     DatalensErrorKind::StorageReadFailure,
-                    format!("read cached object {}: {error}", object.display()),
-                )
-            })?;
+                    format!("manifest entry object not found {object_key}"),
+                ));
+            }
+            let bytes = self.object_store.get(&object_key)?;
             let mut object_rows: DatasetRows = serde_json::from_slice(&bytes).map_err(|error| {
-                log::warn!(
-                    "failed to decode cached object {}: {error}",
-                    object.display()
-                );
                 DatalensError::new(
                     DatalensErrorKind::StorageReadFailure,
-                    format!("decode cached object {}: {error}", object.display()),
+                    format!("decode cached object {object_key}: {error}"),
                 )
             })?;
             object_rows = filter_rows(object_rows, range.clone());
@@ -178,63 +198,24 @@ impl LocalStorage {
             return Ok(());
         }
 
-        fs::create_dir_all(&self.root).map_err(|error| {
-            log::error!(
-                "failed to create storage root {}: {error}",
-                self.root.display()
-            );
-            DatalensError::new(
-                DatalensErrorKind::StorageWriteFailure,
-                format!("create storage root {}: {error}", self.root.display()),
-            )
-        })?;
-
         let selector_fingerprint = selector.fingerprint();
         let selector_canonical_key = selector.canonical_key();
         let object_key = if rows.row_count() == 0 {
             None
         } else {
-            let coverage_key = coverage_key(chain, &dataset_key, range.kind(), selector);
-            let object_key = format!(
-                "objects/{}/{}-{}.json",
-                coverage_key,
-                range.start(),
-                range.end()
-            );
-            let object_path = self.root.join(&object_key);
-            if let Some(parent) = object_path.parent() {
-                fs::create_dir_all(parent).map_err(|error| {
-                    log::error!(
-                        "failed to create object directory {}: {error}",
-                        parent.display()
-                    );
-                    DatalensError::new(
-                        DatalensErrorKind::StorageWriteFailure,
-                        format!("create object directory {}: {error}", parent.display()),
-                    )
-                })?;
-            }
+            let object_key = object_key(chain, &dataset_key, range.clone(), &selector_fingerprint);
             let bytes = serde_json::to_vec(rows).map_err(|error| {
                 DatalensError::new(
                     DatalensErrorKind::Internal,
                     format!("encode cached rows: {error}"),
                 )
             })?;
-            fs::write(&object_path, bytes).map_err(|error| {
-                log::error!(
-                    "failed to write cached object {}: {error}",
-                    object_path.display()
-                );
-                DatalensError::new(
-                    DatalensErrorKind::StorageWriteFailure,
-                    format!("write cached object {}: {error}", object_path.display()),
-                )
-            })?;
+            self.object_store.put(&object_key, &bytes)?;
             Some(object_key)
         };
 
-        let mut manifest = self.manifest()?;
-        manifest.entries.push(ManifestEntry {
+        let mut manifest = self.manifest_for_chain(chain)?;
+        let entry = ManifestEntry {
             chain: chain.clone(),
             dataset_key: dataset_key.clone(),
             range,
@@ -243,7 +224,8 @@ impl LocalStorage {
             finality_level,
             object_key,
             row_count: rows.row_count(),
-        });
+        };
+        manifest.upsert(entry);
         log::info!(
             "storage wrote coverage dataset={} range={}-{} rows={}",
             dataset_key.as_str(),
@@ -256,55 +238,154 @@ impl LocalStorage {
             manifest.entries.last().expect("manifest entry").range.end(),
             rows.row_count()
         );
-        self.write_manifest(&manifest)
+        self.write_manifest(chain, &manifest)
     }
 
-    pub fn manifest(&self) -> Result<Manifest, DatalensError> {
-        let path = self.manifest_path();
-        if !path.exists() {
+    fn manifest_for_chain(&self, chain: &ChainIdentity) -> Result<Manifest, DatalensError> {
+        let key = manifest_key(chain);
+        if !self.object_store.exists(&key)? {
             return Ok(Manifest::default());
         }
-        let bytes = fs::read(&path).map_err(|error| {
-            log::warn!("failed to read manifest {}: {error}", path.display());
-            DatalensError::new(
-                DatalensErrorKind::StorageReadFailure,
-                format!("read manifest {}: {error}", path.display()),
-            )
-        })?;
+        let bytes = self.object_store.get(&key)?;
         serde_json::from_slice(&bytes).map_err(|error| {
-            log::warn!("failed to decode manifest {}: {error}", path.display());
             DatalensError::new(
                 DatalensErrorKind::StorageReadFailure,
-                format!("decode manifest {}: {error}", path.display()),
+                format!("decode manifest {key}: {error}"),
             )
         })
     }
 
-    fn write_manifest(&self, manifest: &Manifest) -> Result<(), DatalensError> {
-        let path = self.manifest_path();
+    pub fn manifest(&self) -> Result<Manifest, DatalensError> {
+        let mut manifest = Manifest::default();
+        for object in self.object_store.list("chains")? {
+            if object.key.ends_with("/manifest.json") {
+                let bytes = self.object_store.get(&object.key)?;
+                let mut chain_manifest: Manifest =
+                    serde_json::from_slice(&bytes).map_err(|error| {
+                        DatalensError::new(
+                            DatalensErrorKind::StorageReadFailure,
+                            format!("decode manifest {}: {error}", object.key),
+                        )
+                    })?;
+                manifest.entries.append(&mut chain_manifest.entries);
+            }
+        }
+        Ok(manifest)
+    }
+
+    fn write_manifest(
+        &self,
+        chain: &ChainIdentity,
+        manifest: &Manifest,
+    ) -> Result<(), DatalensError> {
+        for entry in &manifest.entries {
+            if let Some(object_key) = &entry.object_key
+                && !self.object_store.exists(object_key)?
+            {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::ManifestUpdateFailure,
+                    format!("manifest entry object not found {object_key}"),
+                ));
+            }
+        }
+        let key = manifest_key(chain);
         let bytes = serde_json::to_vec_pretty(manifest).map_err(|error| {
             DatalensError::new(
                 DatalensErrorKind::Internal,
                 format!("encode manifest: {error}"),
             )
         })?;
-        fs::write(&path, bytes).map_err(|error| {
-            log::error!("failed to write manifest {}: {error}", path.display());
+        self.object_store.put(&key, &bytes).map_err(|error| {
             DatalensError::new(
                 DatalensErrorKind::ManifestUpdateFailure,
-                format!("write manifest {}: {error}", path.display()),
+                format!("write manifest {key}: {}", error.message),
             )
         })
     }
+}
 
-    pub fn manifest_path(&self) -> PathBuf {
-        self.root.join("manifest.json")
+impl<S> Storage for DurableStorage<S>
+where
+    S: ObjectStore,
+{
+    fn coverage(&self, _request: &StorageRequest) -> StorageCoverage {
+        StorageCoverage::new(CoverageLevel::Missing)
     }
 }
 
-impl Storage for LocalStorage {
-    fn coverage(&self, _request: &StorageRequest) -> StorageCoverage {
-        StorageCoverage::new(CoverageLevel::Missing)
+pub trait StorageRepository: Send + Sync {
+    fn covered_ranges(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+    ) -> Result<Vec<LedgerRange>, DatalensError>;
+
+    fn read_rows(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+    ) -> Result<DatasetRows, DatalensError>;
+
+    fn write_rows(&self, request: StorageWriteRequest<'_>) -> Result<(), DatalensError>;
+}
+
+impl<S> StorageRepository for DurableStorage<S>
+where
+    S: ObjectStore + 'static,
+{
+    fn covered_ranges(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+    ) -> Result<Vec<LedgerRange>, DatalensError> {
+        Self::covered_ranges(self, chain, dataset_key, selector, range)
+    }
+
+    fn read_rows(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+    ) -> Result<DatasetRows, DatalensError> {
+        Self::read_rows(self, chain, dataset_key, selector, range)
+    }
+
+    fn write_rows(&self, request: StorageWriteRequest<'_>) -> Result<(), DatalensError> {
+        Self::write_rows(self, request)
+    }
+}
+
+impl StorageRepository for Box<dyn StorageRepository> {
+    fn covered_ranges(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+    ) -> Result<Vec<LedgerRange>, DatalensError> {
+        self.as_ref()
+            .covered_ranges(chain, dataset_key, selector, range)
+    }
+
+    fn read_rows(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+    ) -> Result<DatasetRows, DatalensError> {
+        self.as_ref().read_rows(chain, dataset_key, selector, range)
+    }
+
+    fn write_rows(&self, request: StorageWriteRequest<'_>) -> Result<(), DatalensError> {
+        self.as_ref().write_rows(request)
     }
 }
 
@@ -312,6 +393,31 @@ impl Storage for LocalStorage {
 pub struct Manifest {
     #[serde(default)]
     pub entries: Vec<ManifestEntry>,
+}
+
+impl Manifest {
+    fn upsert(&mut self, entry: ManifestEntry) {
+        if let Some(existing) = self.entries.iter_mut().find(|existing| {
+            existing.chain == entry.chain
+                && existing.dataset_key == entry.dataset_key
+                && existing.selector_fingerprint == entry.selector_fingerprint
+                && existing.range == entry.range
+                && existing.finality_level == entry.finality_level
+        }) {
+            *existing = entry;
+        } else {
+            self.entries.push(entry);
+        }
+        self.entries.sort_by_key(|entry| {
+            (
+                entry.dataset_key.as_str().to_owned(),
+                entry.range.kind().key(),
+                entry.selector_fingerprint.clone(),
+                entry.range.start(),
+                entry.range.end(),
+            )
+        });
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -350,20 +456,17 @@ impl<'de> Deserialize<'de> for ManifestEntry {
 
 impl ManifestEntry {
     fn try_from_raw(raw: RawManifestEntry) -> Result<Self, DatalensError> {
-        validate_storage_key("selector fingerprint", &raw.selector_fingerprint)?;
-        validate_storage_key("selector canonical key", &raw.selector_canonical_key)?;
+        validate_object_key(&raw.selector_fingerprint)?;
+        validate_object_key(&raw.selector_canonical_key)?;
+        if let Some(object_key) = raw.object_key.as_deref() {
+            validate_object_key(object_key)?;
+        }
         match raw.object_key {
             Some(object_key) => {
                 if raw.row_count == 0 {
                     return Err(DatalensError::new(
                         DatalensErrorKind::InvalidInput,
                         "data object coverage must have row_count greater than zero",
-                    ));
-                }
-                if object_key.trim().is_empty() {
-                    return Err(DatalensError::new(
-                        DatalensErrorKind::InvalidInput,
-                        "data object coverage must have a non-empty object key",
                     ));
                 }
                 Ok(Self {
@@ -455,12 +558,33 @@ pub fn coverage_key(
     selector: &DatasetSelector,
 ) -> String {
     format!(
-        "chains/{}/datasets/{}/ranges/{}/selectors/{}",
+        "chains/{}/datasets/{}/{}/{}/{}",
         chain.key_prefix(),
         dataset_key.as_str(),
+        OBJECT_SCHEMA_VERSION,
         range_kind_key(range_kind),
         selector.fingerprint()
     )
+}
+
+fn object_key(
+    chain: &ChainIdentity,
+    dataset_key: &DatasetKey,
+    range: LedgerRange,
+    selector_fingerprint: &str,
+) -> String {
+    format!(
+        "chains/{}/datasets/{}/{}/{}/{}",
+        chain.key_prefix(),
+        dataset_key.as_str(),
+        OBJECT_SCHEMA_VERSION,
+        range_kind_key(range.kind()),
+        selector_fingerprint,
+    ) + &format!("/{:#020}-{:#020}.json", range.start(), range.end()).replace("0x", "")
+}
+
+fn manifest_key(chain: &ChainIdentity) -> String {
+    format!("chains/{}/manifest.json", chain.key_prefix())
 }
 
 fn range_kind_key(kind: LedgerRangeKind) -> String {
@@ -472,19 +596,14 @@ fn range_kind_key(kind: LedgerRangeKind) -> String {
     }
 }
 
-fn validate_storage_key(kind: &str, value: &str) -> Result<(), DatalensError> {
-    if value.trim().is_empty()
-        || value.contains('\\')
-        || value
-            .split('/')
-            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
-    {
-        return Err(DatalensError::new(
-            DatalensErrorKind::InvalidInput,
-            format!("{kind} must be a relative storage key"),
-        ));
+trait LedgerRangeKindExt {
+    fn key(self) -> String;
+}
+
+impl LedgerRangeKindExt for LedgerRangeKind {
+    fn key(self) -> String {
+        range_kind_key(self)
     }
-    Ok(())
 }
 
 fn merge_ranges(mut ranges: Vec<LedgerRange>) -> Vec<LedgerRange> {
