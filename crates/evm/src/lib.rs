@@ -6,7 +6,7 @@ use datalens_chain::{
 };
 use datalens_core::{
     BlockHeader, BlockRange, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, Dataset,
-    EvmLogFilter, LogFilter, LogRecord, QueryRows, TopicFilter,
+    EvmLogFilter, LogFilter, LogRecord, NetworkId, QueryRows, TopicFilter,
 };
 use reqwest::blocking::Client;
 use serde_json::{Value, json};
@@ -69,12 +69,26 @@ impl ChainAdapter for EvmAdapter {
     }
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum EvmFinalityPolicy {
+    #[default]
+    Auto,
+    Lag {
+        safe_lag_blocks: Option<u64>,
+        finalized_lag_blocks: Option<u64>,
+    },
+    RpcTags {
+        safe_tag: String,
+        finalized_tag: String,
+    },
+}
+
 #[derive(Clone)]
 pub struct EvmRpcClient {
     rpc_urls: Vec<String>,
     client: Client,
     chain: ChainIdentity,
-    safe_height_lag_blocks: u64,
+    finality_policy: EvmFinalityPolicy,
     max_block_batch_blocks: u64,
     max_get_logs_range_blocks: u64,
     max_addresses_per_query: usize,
@@ -86,7 +100,7 @@ impl EvmRpcClient {
             rpc_urls,
             client: Client::new(),
             chain: ChainIdentity::expect_new(ChainFamily::Evm, "evm-unconfigured"),
-            safe_height_lag_blocks: 0,
+            finality_policy: EvmFinalityPolicy::Auto,
             max_block_batch_blocks: u64::MAX,
             max_get_logs_range_blocks: u64::MAX,
             max_addresses_per_query: usize::MAX,
@@ -96,7 +110,7 @@ impl EvmRpcClient {
     pub fn with_chain(
         rpc_urls: Vec<String>,
         chain: ChainIdentity,
-        safe_height_lag_blocks: u64,
+        finality_policy: EvmFinalityPolicy,
         max_block_batch_blocks: u64,
         max_get_logs_range_blocks: u64,
         max_addresses_per_query: usize,
@@ -105,7 +119,7 @@ impl EvmRpcClient {
             rpc_urls,
             client: Client::new(),
             chain,
-            safe_height_lag_blocks,
+            finality_policy,
             max_block_batch_blocks,
             max_get_logs_range_blocks,
             max_addresses_per_query,
@@ -174,6 +188,22 @@ impl EvmRpcClient {
             })?;
 
         logs.into_iter().map(|log| parse_log_record(&log)).collect()
+    }
+
+    fn finality_tag_height(
+        &self,
+        tag: &str,
+        finality: FinalityKind,
+    ) -> Result<ChainHeight, DatalensError> {
+        let result = self.call("eth_getBlockByNumber", json!([tag, false]))?;
+        let Some(block) = result else {
+            return Err(DatalensError::new(
+                DatalensErrorKind::UnsupportedDataset,
+                format!("provider returned no block for finality tag {tag}"),
+            ));
+        };
+        let height = hex_u64_field(&block, "number")?;
+        Ok(ChainHeight::block(height).with_finality(finality))
     }
 
     fn call(&self, method: &str, params: Value) -> Result<Option<Value>, DatalensError> {
@@ -276,11 +306,34 @@ impl ChainAdapter for EvmRpcClient {
     }
 
     fn safe_height(&self) -> Result<ChainHeight, DatalensError> {
-        Ok(ChainHeight::block(safe_height_from_latest(
-            self.latest_height()?.value,
-            self.safe_height_lag_blocks,
-        ))
-        .with_finality(FinalityKind::Safe))
+        match &self.finality_policy {
+            EvmFinalityPolicy::Auto => self
+                .rpc_finality_height("finalized", "safe")
+                .or_else(|error| {
+                    if is_finality_tag_unsupported(&error) {
+                        let profile = chain_profile(self.chain.network_id()).ok_or_else(|| {
+                            DatalensError::new(
+                                DatalensErrorKind::InvalidInput,
+                                "unable to determine EVM finality: RPC finality tags are unsupported and chain profile has no lag fallback; configure [chains.<name>.finality] mode = \"lag\"",
+                            )
+                        })?;
+                        self.lag_finality_height(&profile)
+                    } else {
+                        Err(error)
+                    }
+                }),
+            EvmFinalityPolicy::Lag {
+                safe_lag_blocks,
+                finalized_lag_blocks,
+            } => self.lag_finality_height(&LagFinalityPolicy {
+                safe_lag_blocks: *safe_lag_blocks,
+                finalized_lag_blocks: *finalized_lag_blocks,
+            }),
+            EvmFinalityPolicy::RpcTags {
+                safe_tag,
+                finalized_tag,
+            } => self.rpc_finality_height(finalized_tag, safe_tag),
+        }
     }
 
     fn fetch(&self, request: ChainFetchRequest) -> Result<ChainFetchResponse, DatalensError> {
@@ -320,6 +373,47 @@ impl ChainAdapter for EvmRpcClient {
             HeightRange::Block(range),
             request.selector,
             rows,
+        ))
+    }
+}
+
+impl EvmRpcClient {
+    fn rpc_finality_height(
+        &self,
+        finalized_tag: &str,
+        safe_tag: &str,
+    ) -> Result<ChainHeight, DatalensError> {
+        match self.finality_tag_height(finalized_tag, FinalityKind::Finalized) {
+            Ok(height) => Ok(height),
+            Err(error) if is_finality_tag_unsupported(&error) => {
+                self.finality_tag_height(safe_tag, FinalityKind::Safe)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn lag_finality_height(
+        &self,
+        policy: &LagFinalityPolicy,
+    ) -> Result<ChainHeight, DatalensError> {
+        let latest = self.latest_height()?.value;
+        if let Some(lag) = policy.finalized_lag_blocks {
+            if lag == 0 {
+                return Err(zero_lag_error());
+            }
+            return Ok(ChainHeight::block(height_from_latest_lag(latest, lag))
+                .with_finality(FinalityKind::Finalized));
+        }
+        if let Some(lag) = policy.safe_lag_blocks {
+            if lag == 0 {
+                return Err(zero_lag_error());
+            }
+            return Ok(ChainHeight::block(height_from_latest_lag(latest, lag))
+                .with_finality(FinalityKind::Safe));
+        }
+        Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "lag finality policy must define safe_lag_blocks or finalized_lag_blocks",
         ))
     }
 }
@@ -400,8 +494,38 @@ fn classify_transport_error(error: reqwest::Error) -> DatalensError {
     }
 }
 
-fn safe_height_from_latest(latest_height: u64, lag_blocks: u64) -> u64 {
+fn height_from_latest_lag(latest_height: u64, lag_blocks: u64) -> u64 {
     latest_height.saturating_sub(lag_blocks)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LagFinalityPolicy {
+    safe_lag_blocks: Option<u64>,
+    finalized_lag_blocks: Option<u64>,
+}
+
+fn chain_profile(network_id: Option<&NetworkId>) -> Option<LagFinalityPolicy> {
+    match network_id {
+        Some(NetworkId::Numeric(1)) => Some(LagFinalityPolicy {
+            safe_lag_blocks: Some(64),
+            finalized_lag_blocks: Some(128),
+        }),
+        _ => None,
+    }
+}
+
+fn is_finality_tag_unsupported(error: &DatalensError) -> bool {
+    matches!(
+        error.kind,
+        DatalensErrorKind::InvalidInput | DatalensErrorKind::UnsupportedDataset
+    )
+}
+
+fn zero_lag_error() -> DatalensError {
+    DatalensError::new(
+        DatalensErrorKind::InvalidInput,
+        "lag finality policy must not use zero lag for durable cache safety",
+    )
 }
 
 pub fn classify_provider_error(code: i64, message: &str) -> DatalensError {
@@ -451,6 +575,13 @@ fn hex_u64_field(value: &Value, field: &str) -> Result<u64, DatalensError> {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        sync::{Arc, Mutex},
+        thread,
+    };
+
     use datalens_core::NetworkId;
 
     use super::*;
@@ -525,7 +656,7 @@ mod tests {
             Vec::new(),
             ChainIdentity::try_new(ChainFamily::Evm, "ethereum", Some(NetworkId::numeric(1)))
                 .expect("valid chain"),
-            0,
+            EvmFinalityPolicy::Auto,
             10,
             10,
             10,
@@ -544,8 +675,211 @@ mod tests {
     }
 
     #[test]
-    fn test_safe_height_lag_blocks_is_applied_to_latest_height() {
-        assert_eq!(safe_height_from_latest(100, 12), 88);
-        assert_eq!(safe_height_from_latest(10, 12), 0);
+    fn test_safe_height_prefers_rpc_finalized_tag() {
+        let (url, requests) = start_rpc_server(vec![json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "number": "0x64"
+            }
+        })]);
+        let client = EvmRpcClient::with_chain(
+            vec![url],
+            ethereum_identity(),
+            EvmFinalityPolicy::Auto,
+            10,
+            10,
+            10,
+        );
+
+        let height = client.safe_height().expect("finalized height");
+
+        assert_eq!(
+            height,
+            ChainHeight::block(100).with_finality(FinalityKind::Finalized)
+        );
+        let requests = requests.lock().expect("requests");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["method"], "eth_getBlockByNumber");
+        assert_eq!(requests[0]["params"][0], "finalized");
+    }
+
+    #[test]
+    fn test_safe_height_uses_rpc_safe_when_finalized_tag_is_unsupported() {
+        let (url, requests) = start_rpc_server(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": {
+                    "code": -32602,
+                    "message": "unsupported block tag finalized"
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "number": "0x5a"
+                }
+            }),
+        ]);
+        let client = EvmRpcClient::with_chain(
+            vec![url],
+            ethereum_identity(),
+            EvmFinalityPolicy::Auto,
+            10,
+            10,
+            10,
+        );
+
+        let height = client.safe_height().expect("safe height");
+
+        assert_eq!(
+            height,
+            ChainHeight::block(90).with_finality(FinalityKind::Safe)
+        );
+        let requests = requests.lock().expect("requests");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["params"][0], "finalized");
+        assert_eq!(requests[1]["params"][0], "safe");
+    }
+
+    #[test]
+    fn test_safe_height_uses_chain_profile_when_rpc_finality_tags_are_unsupported() {
+        let (url, requests) = start_rpc_server(vec![
+            unsupported_tag_response(),
+            unsupported_tag_response(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": "0xc8"
+            }),
+        ]);
+        let client = EvmRpcClient::with_chain(
+            vec![url],
+            ethereum_identity(),
+            EvmFinalityPolicy::Auto,
+            10,
+            10,
+            10,
+        );
+
+        let height = client.safe_height().expect("profile fallback height");
+
+        assert_eq!(
+            height,
+            ChainHeight::block(72).with_finality(FinalityKind::Finalized)
+        );
+        let requests = requests.lock().expect("requests");
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[2]["method"], "eth_blockNumber");
+    }
+
+    #[test]
+    fn test_safe_height_rejects_unknown_chain_without_rpc_tags_or_override() {
+        let (url, _requests) =
+            start_rpc_server(vec![unsupported_tag_response(), unsupported_tag_response()]);
+        let client = EvmRpcClient::with_chain(
+            vec![url],
+            ChainIdentity::try_new(
+                ChainFamily::Evm,
+                "unknown",
+                Some(NetworkId::numeric(999999)),
+            )
+            .expect("valid chain"),
+            EvmFinalityPolicy::Auto,
+            10,
+            10,
+            10,
+        );
+
+        let error = client.safe_height().expect_err("unknown finality");
+
+        assert_eq!(error.kind, DatalensErrorKind::InvalidInput);
+        assert!(error.message.contains("finality"));
+    }
+
+    #[test]
+    fn test_safe_height_uses_manual_lag_override_without_rpc_finality_tags() {
+        let (url, requests) = start_rpc_server(vec![json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": "0xc8"
+        })]);
+        let client = EvmRpcClient::with_chain(
+            vec![url],
+            ChainIdentity::try_new(ChainFamily::Evm, "private", Some(NetworkId::numeric(31337)))
+                .expect("valid chain"),
+            EvmFinalityPolicy::Lag {
+                safe_lag_blocks: Some(64),
+                finalized_lag_blocks: Some(128),
+            },
+            10,
+            10,
+            10,
+        );
+
+        let height = client.safe_height().expect("manual lag height");
+
+        assert_eq!(
+            height,
+            ChainHeight::block(72).with_finality(FinalityKind::Finalized)
+        );
+        let requests = requests.lock().expect("requests");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["method"], "eth_blockNumber");
+    }
+
+    #[test]
+    fn test_height_from_latest_lag_applies_lag_without_underflow() {
+        assert_eq!(height_from_latest_lag(100, 12), 88);
+        assert_eq!(height_from_latest_lag(10, 12), 0);
+    }
+
+    fn ethereum_identity() -> ChainIdentity {
+        ChainIdentity::try_new(ChainFamily::Evm, "ethereum", Some(NetworkId::numeric(1)))
+            .expect("valid chain")
+    }
+
+    fn unsupported_tag_response() -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {
+                "code": -32602,
+                "message": "unsupported block tag"
+            }
+        })
+    }
+
+    fn start_rpc_server(responses: Vec<Value>) -> (String, Arc<Mutex<Vec<Value>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let request_log = Arc::clone(&requests);
+        let responses = Arc::new(Mutex::new(responses));
+
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.expect("test server connection");
+                let mut buffer = [0; 8192];
+                let bytes = stream.read(&mut buffer).expect("read request");
+                let request = String::from_utf8_lossy(&buffer[..bytes]);
+                let body = request.split("\r\n\r\n").nth(1).expect("request body");
+                let request_json: Value = serde_json::from_str(body).expect("request JSON");
+                request_log.lock().expect("request log").push(request_json);
+                let response = responses.lock().expect("responses").remove(0);
+                let response = response.to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                    response.len(),
+                    response
+                )
+                .expect("write response");
+            }
+        });
+
+        (format!("http://{address}"), requests)
     }
 }

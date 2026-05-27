@@ -107,7 +107,9 @@ record_empty_coverage = true
 kind = "evm"
 chain_id = 1
 rpc_urls = ["${DATALENS_E2E_RPC_URL}"]
-safe_height_lag_blocks = 0
+
+[chains.ethereum.finality]
+mode = "auto"
 
 [chains.ethereum.datasets.blocks]
 enabled = true

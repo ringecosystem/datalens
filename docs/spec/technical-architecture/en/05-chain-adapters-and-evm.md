@@ -51,14 +51,20 @@ Provider behavior should be isolated in `datalens-evm`: batching, rate-limit bac
 range splitting, retry decisions, and EVM response decoding belong there. Once data leaves
 the adapter boundary, it should be normalized into datalens dataset rows.
 
-The first EVM safe-height strategy may use `safe_height_lag_blocks`:
+The EVM adapter determines safe/finalized height through a chain-level finality policy:
 
-```text
-safe_height = latest_height.saturating_sub(safe_height_lag_blocks)
-```
+- `mode = "auto"` first tries `eth_getBlockByNumber("finalized", false)`, then
+  `eth_getBlockByNumber("safe", false)`.
+- If RPC finality tags are unsupported, `auto` may use an adapter-owned chain profile
+  with conservative lag values.
+- Unknown chains without RPC finality tag support must require an explicit override
+  instead of treating `latest` as safe.
+- `mode = "lag"` is an explicit operator override using positive `safe_lag_blocks` or
+  `finalized_lag_blocks`.
+- `mode = "rpc_tags"` is an advanced override for provider-specific tag names.
 
-That lag-based value is exposed as `Safe` finality. It is a first EVM strategy, not a
-chain-neutral rule for future adapters.
+Lag-based values are fallback policy, not the default source of truth. A lag of zero must
+not be used for durable cache writes because that would mark `latest` as safe/finalized.
 
 ## Future Tron And Solana Support
 
