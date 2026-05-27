@@ -79,7 +79,7 @@ A coverage entry should include:
 - Selector fingerprint for lookup and selector canonical key for audit.
 - Field coverage or canonical chunk shape.
 - Object key for the durable chunk.
-- Size, checksum, and write metadata when available.
+- Size, checksum, checksum algorithm, and write timestamp metadata when available.
 - Finality metadata. The durable manifest may record only safe or finalized coverage.
 
 Because datalens caches selected data, a chunk for `logs` with one address filter does not
@@ -130,6 +130,13 @@ If a non-empty result is still too small, the writer may keep accumulating adjac
 for the same dataset, coverage key, and schema version until it reaches the target object
 size or the maximum scan span. It should then write one immutable object for the combined
 range and record that exact combined coverage.
+
+The first implementation uses `min_object_rows` as the primary sparse-result merge
+threshold and a conservative JSON-encoded row estimate for `target_object_bytes` before
+the final object encoding is written. The recorded manifest metadata stores the actual
+encoded object size and SHA-256 checksum after storage encodes the object. Empty coverage
+continues to be manifest-only and must not synthesize object size, checksum, or write
+timestamp fields.
 
 This means `018000000-018099999` is not a universal rule. It is an example of a range key.
 The implementation should make the actual range sizing configurable and observable.

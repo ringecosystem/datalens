@@ -353,6 +353,10 @@ fn test_manifest_entry_records_chain_neutral_coverage_identity() {
     assert_eq!(entry.selector_canonical_key, "all");
     assert_eq!(entry.finality_level, ManifestFinalityLevel::Finalized);
     assert_eq!(entry.object_encoding, Some(ObjectEncoding::ParquetV1));
+    assert!(entry.object_size_bytes.expect("object size") > 0);
+    assert_eq!(entry.checksum_algorithm.as_deref(), Some("sha256"));
+    assert_eq!(entry.checksum.as_deref().expect("checksum").len(), 64);
+    assert!(entry.written_at_unix_seconds.is_some());
     assert!(
         entry
             .object_key
@@ -360,6 +364,43 @@ fn test_manifest_entry_records_chain_neutral_coverage_identity() {
             .expect("object key")
             .starts_with("chains/evm/ethereum/1/datasets/evm.blocks/parquet-v1/block/all/")
     );
+}
+
+#[test]
+fn test_write_rows_returns_data_object_metadata() {
+    let storage = LocalStorage::new(temp_storage_root("write-outcome-metadata"));
+    let chain = test_chain();
+    let rows = DatasetRows::new(
+        DatasetKey::evm_blocks(),
+        QueryRows::EvmBlocks(vec![BlockHeader {
+            number: 1,
+            hash: "0xblock".to_owned(),
+            parent_hash: "0xparent".to_owned(),
+            timestamp: 1,
+        }]),
+    )
+    .expect("dataset rows");
+
+    let outcome = storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &DatasetSelector::all(),
+            range: LedgerRange::blocks(1, 1).expect("valid range"),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write rows");
+
+    let object = outcome.data_object.expect("data object metadata");
+    assert!(object.object_key.ends_with(".parquet"));
+    assert_eq!(object.object_encoding, ObjectEncoding::ParquetV1);
+    assert_eq!(object.row_count, 1);
+    assert!(object.object_size_bytes > 0);
+    assert_eq!(object.checksum_algorithm, "sha256");
+    assert_eq!(object.checksum.len(), 64);
+    assert!(!outcome.recorded_empty_coverage);
 }
 
 #[test]

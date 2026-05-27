@@ -5,8 +5,12 @@ use datalens_core::{
     ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey, DatasetRows, LedgerRange,
     LedgerRangeKind, QueryRows,
 };
-use serde::{Deserialize, Deserializer, Serialize, de::Error};
-use std::path::{Path, PathBuf};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 #[derive(Debug)]
 pub struct StorageWriteRequest<'a> {
@@ -19,8 +23,29 @@ pub struct StorageWriteRequest<'a> {
     pub record_empty_coverage: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StorageWriteOutcome {
+    pub range: LedgerRange,
+    pub row_count: usize,
+    pub data_object: Option<StorageDataObject>,
+    pub recorded_empty_coverage: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StorageDataObject {
+    pub object_key: String,
+    pub object_encoding: ObjectEncoding,
+    pub row_count: usize,
+    pub object_size_bytes: u64,
+    pub checksum: String,
+    pub checksum_algorithm: String,
+    pub written_at_unix_seconds: u64,
+}
+
+mod manifest;
 mod object_store;
 mod parquet_codec;
+pub use manifest::{Manifest, ManifestEntry, ManifestFinalityLevel};
 pub use object_store::{
     LocalObjectStore, ObjectMetadata, ObjectStore, S3ObjectStore, S3ObjectStoreConfig,
     validate_object_key,
@@ -138,7 +163,10 @@ where
         DatasetRows::new(dataset_key.clone(), rows)
     }
 
-    pub fn write_rows(&self, request: StorageWriteRequest<'_>) -> Result<(), DatalensError> {
+    pub fn write_rows(
+        &self,
+        request: StorageWriteRequest<'_>,
+    ) -> Result<StorageWriteOutcome, DatalensError> {
         let StorageWriteRequest {
             chain,
             dataset_key,
@@ -163,12 +191,18 @@ where
                 range.start(),
                 range.end()
             );
-            return Ok(());
+            return Ok(StorageWriteOutcome {
+                range,
+                row_count: 0,
+                data_object: None,
+                recorded_empty_coverage: false,
+            });
         }
 
         let selector_fingerprint = selector.fingerprint();
         let selector_canonical_key = selector.canonical_key();
-        let object_key = if rows.row_count() == 0 {
+        let mut manifest = self.manifest_for_chain(chain)?;
+        let data_object = if rows.row_count() == 0 {
             None
         } else {
             let encoding = object_encoding_for_dataset(&dataset_key);
@@ -180,11 +214,45 @@ where
                 encoding,
             );
             let bytes = encode_object_rows(encoding, rows)?;
+            let data_object = StorageDataObject {
+                object_key,
+                object_encoding: encoding,
+                row_count: rows.row_count(),
+                object_size_bytes: bytes.len() as u64,
+                checksum: checksum_hex(&bytes),
+                checksum_algorithm: "sha256".to_owned(),
+                written_at_unix_seconds: unix_seconds_now()?,
+            };
+            if let Some(existing) = manifest.find_logical(
+                chain,
+                &dataset_key,
+                &selector_fingerprint,
+                &range,
+                finality_level,
+            ) {
+                validate_existing_data_object(existing, &data_object)?;
+                if existing.object_size_bytes.is_some()
+                    && existing.checksum.is_some()
+                    && existing.checksum_algorithm.is_some()
+                    && let Some(written_at_unix_seconds) = existing.written_at_unix_seconds
+                    && self.object_store.exists(&data_object.object_key)?
+                {
+                    return Ok(StorageWriteOutcome {
+                        range,
+                        row_count: rows.row_count(),
+                        data_object: Some(StorageDataObject {
+                            written_at_unix_seconds,
+                            ..data_object
+                        }),
+                        recorded_empty_coverage: false,
+                    });
+                }
+            }
+            let object_key = data_object.object_key.clone();
             self.object_store.put(&object_key, &bytes)?;
-            Some(object_key)
+            Some(data_object)
         };
 
-        let mut manifest = self.manifest_for_chain(chain)?;
         let entry = ManifestEntry {
             chain: chain.clone(),
             dataset_key: dataset_key.clone(),
@@ -192,13 +260,33 @@ where
             selector_fingerprint,
             selector_canonical_key,
             finality_level,
-            object_key,
+            object_key: data_object
+                .as_ref()
+                .map(|data_object| data_object.object_key.clone()),
             object_encoding: if rows.row_count() == 0 {
                 None
             } else {
                 Some(object_encoding_for_dataset(&dataset_key))
             },
             row_count: rows.row_count(),
+            object_size_bytes: data_object
+                .as_ref()
+                .map(|data_object| data_object.object_size_bytes),
+            checksum: data_object
+                .as_ref()
+                .map(|data_object| data_object.checksum.clone()),
+            checksum_algorithm: data_object
+                .as_ref()
+                .map(|data_object| data_object.checksum_algorithm.clone()),
+            written_at_unix_seconds: data_object
+                .as_ref()
+                .map(|data_object| data_object.written_at_unix_seconds),
+        };
+        let outcome = StorageWriteOutcome {
+            range: entry.range.clone(),
+            row_count: rows.row_count(),
+            data_object,
+            recorded_empty_coverage: rows.row_count() == 0,
         };
         manifest.upsert(entry);
         log::info!(
@@ -213,7 +301,8 @@ where
             manifest.entries.last().expect("manifest entry").range.end(),
             rows.row_count()
         );
-        self.write_manifest(chain, &manifest)
+        self.write_manifest(chain, &manifest)?;
+        Ok(outcome)
     }
 
     fn manifest_for_chain(&self, chain: &ChainIdentity) -> Result<Manifest, DatalensError> {
@@ -296,7 +385,10 @@ pub trait StorageRepository: Send + Sync {
         range: LedgerRange,
     ) -> Result<DatasetRows, DatalensError>;
 
-    fn write_rows(&self, request: StorageWriteRequest<'_>) -> Result<(), DatalensError>;
+    fn write_rows(
+        &self,
+        request: StorageWriteRequest<'_>,
+    ) -> Result<StorageWriteOutcome, DatalensError>;
 }
 
 impl<S> StorageRepository for DurableStorage<S>
@@ -323,7 +415,10 @@ where
         Self::read_rows(self, chain, dataset_key, selector, range)
     }
 
-    fn write_rows(&self, request: StorageWriteRequest<'_>) -> Result<(), DatalensError> {
+    fn write_rows(
+        &self,
+        request: StorageWriteRequest<'_>,
+    ) -> Result<StorageWriteOutcome, DatalensError> {
         Self::write_rows(self, request)
     }
 }
@@ -350,132 +445,41 @@ impl StorageRepository for Box<dyn StorageRepository> {
         self.as_ref().read_rows(chain, dataset_key, selector, range)
     }
 
-    fn write_rows(&self, request: StorageWriteRequest<'_>) -> Result<(), DatalensError> {
+    fn write_rows(
+        &self,
+        request: StorageWriteRequest<'_>,
+    ) -> Result<StorageWriteOutcome, DatalensError> {
         self.as_ref().write_rows(request)
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct Manifest {
-    #[serde(default)]
-    pub entries: Vec<ManifestEntry>,
-}
-
-impl Manifest {
-    fn upsert(&mut self, entry: ManifestEntry) {
-        if let Some(existing) = self.entries.iter_mut().find(|existing| {
-            existing.chain == entry.chain
-                && existing.dataset_key == entry.dataset_key
-                && existing.selector_fingerprint == entry.selector_fingerprint
-                && existing.range == entry.range
-                && existing.finality_level == entry.finality_level
-        }) {
-            *existing = entry;
-        } else {
-            self.entries.push(entry);
-        }
-        self.entries.sort_by_key(|entry| {
-            (
-                entry.dataset_key.as_str().to_owned(),
-                entry.range.kind().key(),
-                entry.selector_fingerprint.clone(),
-                entry.range.start(),
-                entry.range.end(),
-            )
-        });
+impl StorageRepository for Arc<dyn StorageRepository> {
+    fn covered_ranges(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+    ) -> Result<Vec<LedgerRange>, DatalensError> {
+        self.as_ref()
+            .covered_ranges(chain, dataset_key, selector, range)
     }
-}
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct ManifestEntry {
-    pub chain: ChainIdentity,
-    pub dataset_key: DatasetKey,
-    pub range: LedgerRange,
-    pub selector_fingerprint: String,
-    pub selector_canonical_key: String,
-    pub finality_level: ManifestFinalityLevel,
-    pub object_key: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub object_encoding: Option<ObjectEncoding>,
-    pub row_count: usize,
-}
-
-#[derive(Deserialize)]
-struct RawManifestEntry {
-    chain: ChainIdentity,
-    dataset_key: DatasetKey,
-    range: LedgerRange,
-    selector_fingerprint: String,
-    selector_canonical_key: String,
-    finality_level: ManifestFinalityLevel,
-    object_key: Option<String>,
-    #[serde(default)]
-    object_encoding: Option<ObjectEncoding>,
-    row_count: usize,
-}
-
-impl<'de> Deserialize<'de> for ManifestEntry {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let raw = RawManifestEntry::deserialize(deserializer)?;
-        ManifestEntry::try_from_raw(raw).map_err(D::Error::custom)
+    fn read_rows(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+    ) -> Result<DatasetRows, DatalensError> {
+        self.as_ref().read_rows(chain, dataset_key, selector, range)
     }
-}
 
-impl ManifestEntry {
-    fn try_from_raw(raw: RawManifestEntry) -> Result<Self, DatalensError> {
-        validate_object_key(&raw.selector_fingerprint)?;
-        validate_object_key(&raw.selector_canonical_key)?;
-        if let Some(object_key) = raw.object_key.as_deref() {
-            validate_object_key(object_key)?;
-        }
-        if let (Some(object_key), Some(object_encoding)) =
-            (raw.object_key.as_deref(), raw.object_encoding)
-        {
-            object_encoding.validate_object_key(object_key)?;
-        }
-        match raw.object_key {
-            Some(object_key) => {
-                if raw.row_count == 0 {
-                    return Err(DatalensError::new(
-                        DatalensErrorKind::InvalidInput,
-                        "data object coverage must have row_count greater than zero",
-                    ));
-                }
-                Ok(Self {
-                    chain: raw.chain,
-                    dataset_key: raw.dataset_key,
-                    range: raw.range,
-                    selector_fingerprint: raw.selector_fingerprint,
-                    selector_canonical_key: raw.selector_canonical_key,
-                    finality_level: raw.finality_level,
-                    object_key: Some(object_key),
-                    object_encoding: raw.object_encoding,
-                    row_count: raw.row_count,
-                })
-            }
-            None => {
-                if raw.row_count != 0 {
-                    return Err(DatalensError::new(
-                        DatalensErrorKind::InvalidInput,
-                        "empty coverage must have row_count zero",
-                    ));
-                }
-                Ok(Self {
-                    chain: raw.chain,
-                    dataset_key: raw.dataset_key,
-                    range: raw.range,
-                    selector_fingerprint: raw.selector_fingerprint,
-                    selector_canonical_key: raw.selector_canonical_key,
-                    finality_level: raw.finality_level,
-                    object_key: None,
-                    object_encoding: None,
-                    row_count: raw.row_count,
-                })
-            }
-        }
+    fn write_rows(
+        &self,
+        request: StorageWriteRequest<'_>,
+    ) -> Result<StorageWriteOutcome, DatalensError> {
+        self.as_ref().write_rows(request)
     }
 }
 
@@ -523,28 +527,6 @@ impl ObjectEncoding {
             ));
         }
         Ok(())
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ManifestFinalityLevel {
-    Safe,
-    Finalized,
-}
-
-impl TryFrom<FinalityLevel> for ManifestFinalityLevel {
-    type Error = DatalensError;
-
-    fn try_from(value: FinalityLevel) -> Result<Self, Self::Error> {
-        match value {
-            FinalityLevel::Safe => Ok(Self::Safe),
-            FinalityLevel::Finalized => Ok(Self::Finalized),
-            FinalityLevel::Latest | FinalityLevel::ChainSpecific(_) => Err(DatalensError::new(
-                DatalensErrorKind::InvalidInput,
-                "durable storage coverage requires safe or finalized finality",
-            )),
-        }
     }
 }
 
@@ -618,22 +600,56 @@ fn manifest_key(chain: &ChainIdentity) -> String {
     format!("chains/{}/manifest.json", chain.key_prefix())
 }
 
+fn checksum_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+}
+
+fn unix_seconds_now() -> Result<u64, DatalensError> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|error| {
+            DatalensError::internal(format!("system clock before unix epoch: {error}"))
+        })
+}
+
+fn validate_existing_data_object(
+    existing: &ManifestEntry,
+    data_object: &StorageDataObject,
+) -> Result<(), DatalensError> {
+    if existing.object_key.as_deref() != Some(data_object.object_key.as_str())
+        || existing.object_encoding != Some(data_object.object_encoding)
+        || existing.row_count != data_object.row_count
+        || existing
+            .object_size_bytes
+            .is_some_and(|size| size != data_object.object_size_bytes)
+        || existing
+            .checksum
+            .as_deref()
+            .is_some_and(|checksum| checksum != data_object.checksum)
+        || existing
+            .checksum_algorithm
+            .as_deref()
+            .is_some_and(|algorithm| algorithm != data_object.checksum_algorithm)
+    {
+        return Err(DatalensError::new(
+            DatalensErrorKind::StorageWriteFailure,
+            "existing manifest data object metadata differs for logical shard",
+        ));
+    }
+    Ok(())
+}
+
 fn range_kind_key(kind: LedgerRangeKind) -> String {
     match kind {
         LedgerRangeKind::Block => "block".to_owned(),
         LedgerRangeKind::Slot => "slot".to_owned(),
         LedgerRangeKind::Height => "height".to_owned(),
         LedgerRangeKind::Other(value) => value,
-    }
-}
-
-trait LedgerRangeKindExt {
-    fn key(self) -> String;
-}
-
-impl LedgerRangeKindExt for LedgerRangeKind {
-    fn key(self) -> String {
-        range_kind_key(self)
     }
 }
 

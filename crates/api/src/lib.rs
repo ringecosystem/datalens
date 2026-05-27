@@ -15,8 +15,9 @@ use datalens_core::{
     LedgerRange, LogFilter, QueryRows,
 };
 use datalens_planner::{NativePlanner, NativePlannerConfig, NativeQueryInput};
-use datalens_storage::{
-    S3ObjectStoreConfig, StorageRepository, StorageWriteRequest, missing_ranges,
+use datalens_storage::{S3ObjectStoreConfig, StorageRepository, missing_ranges};
+use datalens_writer::{
+    DurableWriteRequest, DurableWriteSegment, DurableWriter, DurableWriterConfig,
 };
 use serde::{Deserialize, Serialize};
 
@@ -424,6 +425,11 @@ where
             )?
             .into_rows();
 
+        let finality_level = match &plan.finality_policy {
+            datalens_planner::FinalityPolicy::DurableCache { boundary } => boundary.finality,
+        };
+        let mut fetched_segments = Vec::new();
+
         for range in plan.split_ranges(miss_ledger_ranges.clone())? {
             let fetch_request = ChainFetchRequest::new(
                 plan.chain.clone(),
@@ -451,17 +457,28 @@ where
                     return Err(error);
                 }
             };
-            let finality_level = match &plan.finality_policy {
-                datalens_planner::FinalityPolicy::DurableCache { boundary } => boundary.finality,
-            };
-            if let Err(error) = self.storage.write_rows(StorageWriteRequest {
-                chain: &plan.chain,
-                dataset_key: plan.dataset_key.clone(),
-                selector: &plan.selector,
+            fetched_segments.push(DurableWriteSegment {
                 range,
-                rows: &fetched,
+                rows: fetched.clone(),
+            });
+            rows.try_append(fetched.into_rows())?;
+        }
+
+        if !fetched_segments.is_empty() {
+            let writer = DurableWriter::new(
+                self.storage.clone(),
+                DurableWriterConfig {
+                    target_object_bytes: self.writer.target_object_bytes,
+                    min_object_rows: self.writer.min_object_rows,
+                    record_empty_coverage: self.writer.record_empty_coverage,
+                },
+            );
+            if let Err(error) = writer.write(DurableWriteRequest {
+                chain: plan.chain.clone(),
+                dataset_key: plan.dataset_key.clone(),
+                selector: plan.selector.clone(),
                 finality_level,
-                record_empty_coverage: self.writer.record_empty_coverage,
+                segments: fetched_segments,
             }) {
                 log::error!(
                     "cache write failed dataset={} range={}-{} kind={:?}",
@@ -472,7 +489,6 @@ where
                 );
                 return Err(error);
             }
-            rows.try_append(fetched.into_rows())?;
         }
 
         rows.sort();
