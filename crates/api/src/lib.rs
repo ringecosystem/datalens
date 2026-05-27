@@ -17,7 +17,7 @@ use datalens_core::{
     BlockRange, CacheSummary, DatalensError, DatalensErrorKind, Dataset, DatasetKey, LedgerRange,
     QueryRequest, QueryResponse,
 };
-use datalens_storage::{LocalStorage, missing_ranges};
+use datalens_storage::{LocalStorage, StorageWriteRequest, missing_ranges};
 use serde::{Deserialize, Serialize};
 
 pub mod auth {
@@ -261,30 +261,60 @@ where
             return Err(error);
         }
         let safe_height = self.source.cache_safe_height()?;
-        validate_durable_range(&LedgerRange::from_block_range(request.range), &safe_height)?;
+        let dataset_key = DatasetKey::from(request.dataset);
+        let request_range = LedgerRange::from_block_range(request.range);
+        validate_durable_range(&request_range, &safe_height)?;
 
-        let hit_ranges = self.storage.covered_ranges(
+        let hit_ledger_ranges = self.storage.covered_ranges(
             &request.chain,
-            request.dataset,
+            &dataset_key,
             &selector,
-            request.range,
+            request_range.clone(),
         )?;
-        let misses = missing_ranges(request.range, &hit_ranges);
+        let miss_ledger_ranges = missing_ranges(request_range, &hit_ledger_ranges);
+        let hit_ranges = hit_ledger_ranges
+            .iter()
+            .map(|range| {
+                range.block_range().ok_or_else(|| {
+                    DatalensError::new(
+                        DatalensErrorKind::Internal,
+                        "storage returned non-block range for legacy evm query",
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let misses = miss_ledger_ranges
+            .iter()
+            .map(|range| {
+                range.block_range().ok_or_else(|| {
+                    DatalensError::new(
+                        DatalensErrorKind::Internal,
+                        "storage returned non-block missing range for legacy evm query",
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         log::info!(
             "cache summary dataset={} hit_ranges={} missing_ranges={}",
             request.dataset.as_str(),
             hit_ranges.len(),
             misses.len()
         );
-        let mut rows =
-            self.storage
-                .read_rows(&request.chain, request.dataset, &selector, request.range)?;
+        let mut rows = self
+            .storage
+            .read_rows(
+                &request.chain,
+                &dataset_key,
+                &selector,
+                LedgerRange::from_block_range(request.range),
+            )?
+            .into_rows();
 
         for range in split_ranges(&misses, self.chunk_size(request.dataset)) {
             validate_durable_range(&LedgerRange::from_block_range(range), &safe_height)?;
             let fetch_request = ChainFetchRequest::new(
                 request.chain.clone(),
-                DatasetKey::from(request.dataset),
+                dataset_key.clone(),
                 LedgerRange::from_block_range(range),
                 selector.clone(),
             )
@@ -295,7 +325,7 @@ where
             let fetched = match self.source.fetch(fetch_request.clone()) {
                 Ok(response) => {
                     response.validate_for_request(&fetch_request)?;
-                    response.rows.into_rows()
+                    response.rows
                 }
                 Err(error) => {
                     log::warn!(
@@ -308,14 +338,15 @@ where
                     return Err(error);
                 }
             };
-            if let Err(error) = self.storage.write_rows(
-                &request.chain,
-                request.dataset,
-                &selector,
-                range,
-                &fetched,
-                self.writer.record_empty_coverage,
-            ) {
+            if let Err(error) = self.storage.write_rows(StorageWriteRequest {
+                chain: &request.chain,
+                dataset_key: dataset_key.clone(),
+                selector: &selector,
+                range: LedgerRange::from_block_range(range),
+                rows: &fetched,
+                finality_level: safe_height.finality,
+                record_empty_coverage: self.writer.record_empty_coverage,
+            }) {
                 log::error!(
                     "cache write failed dataset={} range={}-{} kind={:?}",
                     request.dataset.as_str(),
@@ -325,7 +356,7 @@ where
                 );
                 return Err(error);
             }
-            rows.try_append(fetched)?;
+            rows.try_append(fetched.into_rows())?;
         }
 
         rows.sort();

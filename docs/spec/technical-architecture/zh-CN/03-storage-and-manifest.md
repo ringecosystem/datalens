@@ -61,16 +61,16 @@ kind，但在记录持久化覆盖之前，必须暴露等价的 safe/finalized 
 一个覆盖范围记录应包含：
 
 - 链家族，例如 `evm`。
-- 链名称或配置中的链标识。
-- 数据集，例如 `blocks`、`logs`、`transactions`，或未来链家族自己的数据集名称。
-- 已覆盖范围，例如区块范围或其他链家族的范围模型。
+- 链名称或配置中的链标识；如果配置了 network id，也应包含 network id。
+- 数据集 key，例如 `evm.blocks`、`evm.logs`、`tron.events` 或
+  `solana.transactions`。
+- 已覆盖 ledger range，包括 range kind、start 和 end。
 - Schema 或标准化版本。
-- 可选过滤覆盖范围，例如 EVM addresses 和 topic filters。
+- 用于查找的 selector fingerprint，以及用于审计的 selector canonical key。
 - 字段覆盖范围或标准分片形态。
 - 持久化分片的 object key。
 - 可用时记录 size、checksum 和写入元数据。
-- finality 元数据的 schema 扩展点。第一阶段中，Manifest 覆盖范围按定义表示
-  safe/finalized durable history。
+- finality 元数据。durable Manifest 只能记录 safe 或 finalized coverage。
 
 因为 datalens 缓存的是按需求选择的数据，某个带 address filter 的 `logs` 分片并不代表同一区间
 的完整日志覆盖，也不代表另一个合约的覆盖。Manifest 必须明确区分这些含义。
