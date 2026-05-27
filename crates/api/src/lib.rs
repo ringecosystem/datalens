@@ -580,7 +580,17 @@ async fn query<S>(
 where
     S: ChainAdapter,
 {
-    state.service.query(request).map(Json).map_err(ApiError)
+    let service = state.service.clone();
+    tokio::task::spawn_blocking(move || service.query(request))
+        .await
+        .map_err(|error| {
+            ApiError(DatalensError::new(
+                DatalensErrorKind::Internal,
+                format!("query task failed: {error}"),
+            ))
+        })?
+        .map(Json)
+        .map_err(ApiError)
 }
 
 struct ApiError(DatalensError);

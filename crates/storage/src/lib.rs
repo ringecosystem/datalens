@@ -2,39 +2,13 @@
 
 use datalens_chain::{DatasetSelector, FinalityLevel};
 use datalens_core::{
-    ChainIdentity, CoverageLevel, DatalensError, DatalensErrorKind, DatasetId, DatasetKey,
-    DatasetRows, LedgerRange, LedgerRangeKind, QueryRows, TimeRange,
+    ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey, DatasetRows, LedgerRange,
+    LedgerRangeKind, QueryRows,
 };
 use serde::{Deserialize, Deserializer, Serialize, de::Error};
 use std::path::{Path, PathBuf};
 
 const OBJECT_SCHEMA_VERSION: &str = "json";
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StorageRequest {
-    pub chain: ChainIdentity,
-    pub dataset: DatasetId,
-    pub range: TimeRange,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StorageCoverage {
-    level: CoverageLevel,
-}
-
-impl StorageCoverage {
-    pub fn new(level: CoverageLevel) -> Self {
-        Self { level }
-    }
-
-    pub fn level(&self) -> &CoverageLevel {
-        &self.level
-    }
-}
-
-pub trait Storage {
-    fn coverage(&self, request: &StorageRequest) -> StorageCoverage;
-}
 
 #[derive(Debug)]
 pub struct StorageWriteRequest<'a> {
@@ -45,15 +19,6 @@ pub struct StorageWriteRequest<'a> {
     pub rows: &'a DatasetRows,
     pub finality_level: FinalityLevel,
     pub record_empty_coverage: bool,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct InMemoryStorage;
-
-impl Storage for InMemoryStorage {
-    fn coverage(&self, _request: &StorageRequest) -> StorageCoverage {
-        StorageCoverage::new(CoverageLevel::Missing)
-    }
 }
 
 mod object_store;
@@ -301,15 +266,6 @@ where
                 format!("write manifest {key}: {}", error.message),
             )
         })
-    }
-}
-
-impl<S> Storage for DurableStorage<S>
-where
-    S: ObjectStore,
-{
-    fn coverage(&self, _request: &StorageRequest) -> StorageCoverage {
-        StorageCoverage::new(CoverageLevel::Missing)
     }
 }
 
