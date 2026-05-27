@@ -1,0 +1,42 @@
+services:
+  rustfs-perms:
+    image: alpine:3.22
+    user: root
+    volumes:
+      - ./.data/oss:/data
+    command: sh -c "mkdir -p /data && chown -R 10001:10001 /data"
+
+  rustfs:
+    image: rustfs/rustfs:latest
+    depends_on:
+      rustfs-perms:
+        condition: service_completed_successfully
+    environment:
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-datalens-dev}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-datalens-dev-secret}
+      RUSTFS_CONSOLE_ENABLE: ${RUSTFS_CONSOLE_ENABLE:-true}
+      RUSTFS_ADDRESS: ${RUSTFS_ADDRESS:-:9000}
+      RUSTFS_CONSOLE_ADDRESS: ${RUSTFS_CONSOLE_ADDRESS:-0.0.0.0:9001}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - ./.data/oss:/data
+    command: /data
+
+  rustfs-init:
+    image: minio/mc:latest
+    depends_on:
+      - rustfs
+    environment:
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-datalens-dev}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-datalens-dev-secret}
+      DATALENS_S3_BUCKET: ${DATALENS_S3_BUCKET:-datalens}
+    entrypoint: /bin/sh
+    command: >
+      -c '
+      until mc alias set rustfs http://rustfs:9000 "$$RUSTFS_ACCESS_KEY" "$$RUSTFS_SECRET_KEY";
+      do sleep 1;
+      done;
+      mc mb --ignore-existing "rustfs/$$DATALENS_S3_BUCKET"
+      '

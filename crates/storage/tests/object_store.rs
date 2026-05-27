@@ -136,24 +136,32 @@ fn temp_storage_root(name: &str) -> PathBuf {
 }
 
 fn s3_test_config() -> Option<S3ObjectStoreConfig> {
-    if std::env::var("DATALENS_S3_TEST").ok().as_deref() != Some("1") {
+    if std::env::var("DATALENS_RUN_S3_TESTS").ok().as_deref() != Some("1") {
         return None;
     }
-    let bucket = std::env::var("DATALENS_S3_TEST_BUCKET")
-        .expect("DATALENS_S3_TEST_BUCKET must be set when DATALENS_S3_TEST=1");
-    let prefix = format!(
-        "datalens-tests/object-store-{}",
+    let bucket = std::env::var("DATALENS_S3_BUCKET")
+        .expect("DATALENS_S3_BUCKET must be set when DATALENS_RUN_S3_TESTS=1");
+    let base_prefix =
+        std::env::var("DATALENS_S3_PREFIX").unwrap_or_else(|_| "datalens-tests".to_owned());
+    let test_prefix = format!(
+        "object-store-{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock")
             .as_nanos()
     );
+    let base_prefix = base_prefix.trim().trim_matches('/');
+    let prefix = if base_prefix.is_empty() {
+        test_prefix
+    } else {
+        format!("{base_prefix}/{test_prefix}")
+    };
     Some(S3ObjectStoreConfig {
         bucket,
         prefix: Some(prefix),
-        region: std::env::var("DATALENS_S3_TEST_REGION").unwrap_or_else(|_| "auto".to_owned()),
-        endpoint_url: std::env::var("DATALENS_S3_TEST_ENDPOINT").ok(),
-        force_path_style: std::env::var("DATALENS_S3_TEST_FORCE_PATH_STYLE")
+        region: std::env::var("DATALENS_S3_REGION").unwrap_or_else(|_| "auto".to_owned()),
+        endpoint_url: std::env::var("DATALENS_S3_ENDPOINT_URL").ok(),
+        force_path_style: std::env::var("DATALENS_S3_FORCE_PATH_STYLE")
             .map(|value| value != "0" && value != "false")
             .unwrap_or(true),
     })
