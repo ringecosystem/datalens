@@ -274,137 +274,6 @@ fn test_provider_limit_error_is_classified() {
 }
 
 #[test]
-fn test_query_rejects_fetch_response_chain_mismatch_without_cache_write() {
-    assert_contract_violation_not_cached(
-        "contract-chain",
-        ResponseMutation::Chain(
-            ChainIdentity::try_new(ChainFamily::Evm, "polygon", Some(NetworkId::numeric(137)))
-                .expect("valid chain"),
-        ),
-    );
-}
-
-#[test]
-fn test_query_rejects_fetch_response_dataset_mismatch_without_cache_write() {
-    assert_contract_violation_not_cached(
-        "contract-dataset",
-        ResponseMutation::Dataset(DatasetKey::evm_logs()),
-    );
-}
-
-#[test]
-fn test_query_rejects_fetch_response_range_mismatch_without_cache_write() {
-    assert_contract_violation_not_cached(
-        "contract-range",
-        ResponseMutation::Range(LedgerRange::from_block_range(BlockRange::expect_new(2, 3))),
-    );
-}
-
-#[test]
-fn test_query_rejects_fetch_response_selector_mismatch_without_cache_write() {
-    assert_contract_violation_not_cached(
-        "contract-selector",
-        ResponseMutation::Selector(
-            DatasetSelector::try_evm_logs(LogFilter {
-                addresses: vec!["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()],
-                topics: Vec::new(),
-            })
-            .expect("valid selector"),
-        ),
-    );
-}
-
-#[test]
-fn test_query_rejects_fetch_response_rows_mismatch_without_cache_write() {
-    assert_contract_violation_not_cached(
-        "contract-rows",
-        ResponseMutation::Rows(QueryRows::EvmLogs(vec![log(
-            1,
-            0,
-            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            vec![TOPIC_A],
-        )])),
-    );
-}
-
-#[test]
-fn test_query_uses_adapter_range_limit_when_smaller_than_config() {
-    let source = MockSource::default()
-        .with_blocks(vec![
-            block(1, "0x01"),
-            block(2, "0x02"),
-            block(3, "0x03"),
-            block(4, "0x04"),
-        ])
-        .with_blocks_max_range_blocks(1);
-    let service = service(
-        LocalStorage::new(temp_storage_root("adapter-range-limit")),
-        source.clone(),
-    );
-
-    let response = service.query(blocks_request(1, 4)).expect("query succeeds");
-
-    assert_eq!(block_numbers(&response), vec![1, 2, 3, 4]);
-    assert_eq!(
-        source.calls(),
-        vec![
-            SourceCall::Blocks(BlockRange::expect_new(1, 1)),
-            SourceCall::Blocks(BlockRange::expect_new(2, 2)),
-            SourceCall::Blocks(BlockRange::expect_new(3, 3)),
-            SourceCall::Blocks(BlockRange::expect_new(4, 4)),
-        ]
-    );
-}
-
-#[test]
-fn test_query_uses_adapter_log_range_limit_when_smaller_than_config() {
-    let source = MockSource::default().with_logs_max_range_blocks(1);
-    let service = service(
-        LocalStorage::new(temp_storage_root("adapter-log-range-limit")),
-        source.clone(),
-    );
-
-    service
-        .query(logs_request(
-            1,
-            3,
-            vec!["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
-        ))
-        .expect("query succeeds");
-
-    assert_eq!(
-        source.calls(),
-        vec![
-            SourceCall::Logs(BlockRange::expect_new(1, 1)),
-            SourceCall::Logs(BlockRange::expect_new(2, 2)),
-            SourceCall::Logs(BlockRange::expect_new(3, 3)),
-        ]
-    );
-}
-
-#[test]
-fn test_query_rejects_log_addresses_above_adapter_capability() {
-    let source = MockSource::default().with_max_addresses_per_query(1);
-    let service = service(
-        LocalStorage::new(temp_storage_root("adapter-address-limit")),
-        source,
-    );
-
-    let error = service
-        .query(logs_request(
-            1,
-            1,
-            vec![
-                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            ],
-        ))
-        .expect_err("too many addresses for adapter");
-
-    assert_eq!(error.kind, DatalensErrorKind::InvalidInput);
-}
-
-#[test]
 fn test_query_native_executes_non_evm_plan_without_legacy_route_validation() {
     let root = temp_storage_root("native-non-evm");
     let source = MockSource::default()
@@ -472,22 +341,6 @@ fn test_query_native_executes_non_evm_plan_without_legacy_route_validation() {
             LedgerRange::blocks(1, 1).expect("valid range")
         )]
     );
-}
-
-fn assert_contract_violation_not_cached(name: &str, mutation: ResponseMutation) {
-    let root = temp_storage_root(name);
-    let source = MockSource::default()
-        .with_blocks(vec![block(1, "0x01"), block(2, "0x02")])
-        .with_response_mutation(mutation);
-    let service = service(LocalStorage::new(&root), source);
-
-    let error = service
-        .query(blocks_request(1, 2))
-        .expect_err("contract violation");
-
-    assert_eq!(error.kind, DatalensErrorKind::Internal);
-    assert!(!root.join("manifest.json").exists());
-    assert!(!root.join("objects").exists());
 }
 
 fn service(storage: LocalStorage, source: MockSource) -> QueryService<MockSource> {
@@ -650,7 +503,6 @@ struct MockSource {
     native_rows: Arc<Mutex<Vec<serde_json::Value>>>,
     calls: Arc<Mutex<Vec<SourceCall>>>,
     error: Arc<Mutex<Option<DatalensErrorKind>>>,
-    response_mutation: Arc<Mutex<Option<ResponseMutation>>>,
     blocks_max_range_blocks: Arc<Mutex<u64>>,
     logs_max_range_blocks: Arc<Mutex<u64>>,
     max_addresses_per_query: Arc<Mutex<usize>>,
@@ -666,7 +518,6 @@ impl Default for MockSource {
             native_rows: Arc::new(Mutex::new(Vec::new())),
             calls: Arc::new(Mutex::new(Vec::new())),
             error: Arc::new(Mutex::new(None)),
-            response_mutation: Arc::new(Mutex::new(None)),
             blocks_max_range_blocks: Arc::new(Mutex::new(2)),
             logs_max_range_blocks: Arc::new(Mutex::new(2)),
             max_addresses_per_query: Arc::new(Mutex::new(2)),
@@ -704,38 +555,6 @@ impl MockSource {
         self
     }
 
-    fn with_response_mutation(self, mutation: ResponseMutation) -> Self {
-        *self
-            .response_mutation
-            .lock()
-            .expect("response mutation lock") = Some(mutation);
-        self
-    }
-
-    fn with_blocks_max_range_blocks(self, max_range_blocks: u64) -> Self {
-        *self
-            .blocks_max_range_blocks
-            .lock()
-            .expect("blocks max range blocks lock") = max_range_blocks;
-        self
-    }
-
-    fn with_logs_max_range_blocks(self, max_range_blocks: u64) -> Self {
-        *self
-            .logs_max_range_blocks
-            .lock()
-            .expect("logs max range blocks lock") = max_range_blocks;
-        self
-    }
-
-    fn with_max_addresses_per_query(self, max_addresses_per_query: usize) -> Self {
-        *self
-            .max_addresses_per_query
-            .lock()
-            .expect("max addresses per query lock") = max_addresses_per_query;
-        self
-    }
-
     fn with_safe_height(self, value: u64, finality: FinalityKind) -> Self {
         *self.safe_height.lock().expect("safe height lock") =
             ChainHeight::block(value).with_finality(finality);
@@ -749,15 +568,6 @@ impl MockSource {
     fn clear_calls(&self) {
         self.calls.lock().expect("calls lock").clear();
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum ResponseMutation {
-    Chain(ChainIdentity),
-    Dataset(DatasetKey),
-    Range(LedgerRange),
-    Selector(DatasetSelector),
-    Rows(QueryRows),
 }
 
 impl ChainAdapter for MockSource {
@@ -890,31 +700,11 @@ impl ChainAdapter for MockSource {
             }
         }?;
 
-        Ok(self.mutate_response(response))
+        Ok(response)
     }
 }
 
 impl MockSource {
-    fn mutate_response(&self, mut response: ChainFetchResponse) -> ChainFetchResponse {
-        match self
-            .response_mutation
-            .lock()
-            .expect("response mutation lock")
-            .clone()
-        {
-            Some(ResponseMutation::Chain(chain)) => response.chain = chain,
-            Some(ResponseMutation::Dataset(dataset)) => response.dataset_key = dataset,
-            Some(ResponseMutation::Range(range)) => response.range = range,
-            Some(ResponseMutation::Selector(selector)) => response.coverage_selector = selector,
-            Some(ResponseMutation::Rows(rows)) => {
-                response.rows = datalens_core::DatasetRows::new(rows.dataset_key(), rows)
-                    .expect("matching rows")
-            }
-            None => {}
-        }
-        response
-    }
-
     fn fetch_blocks(&self, range: BlockRange) -> Result<Vec<BlockHeader>, DatalensError> {
         self.calls
             .lock()

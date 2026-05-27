@@ -52,6 +52,22 @@ This repository standardizes on four primary documentation lanes:
   than paraphrasing it.
 - If human readability and machine routing conflict, prefer the machine-readable form.
 
+## Rust code organization
+
+- Keep `src/` focused on implementation code.
+- Put Rust tests in the owning crate's `tests/` directory by default.
+- Split crate-level tests by behavior or module boundary, using names such as
+  `dataset_key.rs`, `ledger_range.rs`, `query_flow.rs`, or `manifest.rs`.
+- Do not add large `#[cfg(test)] mod tests` blocks to `src/lib.rs` or `src/main.rs`.
+- If a test needs a non-public helper, first decide whether that helper is part of a
+  stable public or internal contract; do not widen APIs only to reach incidental
+  implementation details.
+- Keep each Rust source file at or below 800 lines as a repository style limit.
+- When a Rust source file approaches or exceeds 800 lines, split by responsibility,
+  move tests into `tests/`, or adjust module boundaries.
+- Do not delete necessary behavior or compress readable code only to satisfy the line
+  limit.
+
 ## Naming rules
 
 - Directory names express document type.

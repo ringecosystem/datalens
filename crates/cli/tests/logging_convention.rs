@@ -20,11 +20,11 @@ fn test_logging_dependencies_are_declared_in_expected_crates() {
 
 #[test]
 fn test_cli_owns_tracing_backed_log_output() {
-    let main = read("crates/cli/src/main.rs");
+    let cli = read("crates/cli/src/lib.rs");
 
-    assert!(main.contains("tracing_log::LogTracer"));
-    assert!(main.contains("tracing_subscriber::EnvFilter"));
-    assert!(main.contains("datalens=info"));
+    assert!(cli.contains("tracing_log::LogTracer"));
+    assert!(cli.contains("tracing_subscriber::EnvFilter"));
+    assert!(cli.contains("datalens=info"));
 }
 
 #[test]
