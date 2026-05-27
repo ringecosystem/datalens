@@ -11,8 +11,8 @@ use axum::{
 };
 use datalens_chain::{ChainAdapter, ChainFetchRequest, FetchContext};
 use datalens_core::{
-    BlockRange, CacheSummary, DatalensError, DatalensErrorKind, Dataset, DatasetKey, LedgerRange,
-    QueryRequest, QueryResponse,
+    BlockRange, CacheSummary, DatalensError, DatalensErrorKind, Dataset, DatasetKey, DatasetRows,
+    LedgerRange, LegacyEvmQueryRequest, LegacyEvmQueryResponse,
 };
 use datalens_planner::{NativePlanner, NativePlannerConfig, NativeQueryInput};
 use datalens_storage::{LocalStorage, StorageWriteRequest, missing_ranges};
@@ -213,6 +213,21 @@ pub struct QueryService<S> {
     chain: ChainConfig,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeCacheSummary {
+    pub hit_ranges: Vec<LedgerRange>,
+    pub missing_ranges: Vec<LedgerRange>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeQueryResponse {
+    pub chain: datalens_core::ChainIdentity,
+    pub dataset_key: DatasetKey,
+    pub ledger_range: LedgerRange,
+    pub cache: NativeCacheSummary,
+    pub rows: DatasetRows,
+}
+
 impl<S> QueryService<S>
 where
     S: ChainAdapter,
@@ -245,24 +260,53 @@ where
         }
     }
 
-    pub fn query(&self, request: QueryRequest) -> Result<QueryResponse, DatalensError> {
+    pub fn query(
+        &self,
+        request: LegacyEvmQueryRequest,
+    ) -> Result<LegacyEvmQueryResponse, DatalensError> {
         log::info!(
-            "query start chain={} dataset={} range={}-{}",
+            "legacy evm query start chain={} dataset={} range={}-{}",
             request.chain.configured_name(),
             request.dataset.as_str(),
             request.range.from_block,
             request.range.to_block
         );
-        if let Err(error) = self.validate_evm_route(&request) {
+        if let Err(error) = self.validate_legacy_evm_route(&request) {
             log::warn!("query validation failed kind={:?}", error.kind);
             return Err(error);
         }
         let response_range = request.range;
-        let native_input = NativeQueryInput::from_evm_query(request)?;
+        let response = self.query_native(NativeQueryInput::from_legacy_evm_query(request)?)?;
+        let hit_ranges = legacy_block_ranges(&response.cache.hit_ranges)?;
+        let misses = legacy_block_ranges(&response.cache.missing_ranges)?;
+
+        Ok(LegacyEvmQueryResponse {
+            chain: response.chain,
+            range: response_range,
+            cache: CacheSummary {
+                hit_ranges,
+                missing_ranges: misses,
+            },
+            rows: response.rows.into_rows(),
+        })
+    }
+
+    pub fn query_native(
+        &self,
+        native_input: NativeQueryInput,
+    ) -> Result<NativeQueryResponse, DatalensError> {
+        log::info!(
+            "native query start chain={} dataset={} range={}-{}",
+            native_input.chain.configured_name(),
+            native_input.dataset_key.as_str(),
+            native_input.ledger_range.start(),
+            native_input.ledger_range.end()
+        );
         let safe_height = self.source.cache_safe_height()?;
+        let default_chunk_range_len = self.chunk_size(native_input.dataset_key.clone());
         let plan = NativePlanner::new(NativePlannerConfig {
             max_query_range_len: self.planner.max_query_range_blocks,
-            default_chunk_range_len: self.evm_chunk_size(native_input.dataset_key.clone()),
+            default_chunk_range_len,
         })
         .plan(native_input, &self.source.capabilities(), safe_height)?;
 
@@ -273,13 +317,11 @@ where
             plan.ledger_range.clone(),
         )?;
         let miss_ledger_ranges = missing_ranges(plan.ledger_range.clone(), &hit_ledger_ranges);
-        let hit_ranges = legacy_block_ranges(&hit_ledger_ranges)?;
-        let misses = legacy_block_ranges(&miss_ledger_ranges)?;
         log::info!(
             "cache summary dataset={} hit_ranges={} missing_ranges={}",
             plan.dataset_key.as_str(),
-            hit_ranges.len(),
-            misses.len()
+            hit_ledger_ranges.len(),
+            miss_ledger_ranges.len()
         );
         let mut rows = self
             .storage
@@ -291,7 +333,7 @@ where
             )?
             .into_rows();
 
-        for range in plan.split_ranges(miss_ledger_ranges)? {
+        for range in plan.split_ranges(miss_ledger_ranges.clone())? {
             let fetch_request = ChainFetchRequest::new(
                 plan.chain.clone(),
                 plan.dataset_key.clone(),
@@ -343,18 +385,22 @@ where
         }
 
         rows.sort();
-        Ok(QueryResponse {
+        Ok(NativeQueryResponse {
             chain: plan.chain,
-            range: response_range,
-            cache: CacheSummary {
-                hit_ranges,
-                missing_ranges: misses,
+            dataset_key: plan.dataset_key.clone(),
+            ledger_range: plan.ledger_range,
+            cache: NativeCacheSummary {
+                hit_ranges: hit_ledger_ranges,
+                missing_ranges: miss_ledger_ranges,
             },
-            rows,
+            rows: DatasetRows::new(plan.dataset_key, rows)?,
         })
     }
 
-    fn validate_evm_route(&self, request: &QueryRequest) -> Result<(), DatalensError> {
+    fn validate_legacy_evm_route(
+        &self,
+        request: &LegacyEvmQueryRequest,
+    ) -> Result<(), DatalensError> {
         if request.chain.configured_name() != self.chain_name {
             return Err(DatalensError::new(
                 DatalensErrorKind::UnsupportedDataset,
@@ -393,7 +439,7 @@ where
         }
     }
 
-    fn evm_chunk_size(&self, dataset_key: DatasetKey) -> u64 {
+    fn chunk_size(&self, dataset_key: DatasetKey) -> u64 {
         let configured_limit = match dataset_key.legacy_dataset() {
             Some(Dataset::Blocks) => self.chain.datasets.blocks.max_batch_blocks,
             Some(Dataset::Logs) => self.chain.datasets.logs.max_get_logs_range_blocks,
@@ -438,8 +484,8 @@ where
 
 async fn query<S>(
     State(state): State<AppState<S>>,
-    Json(request): Json<QueryRequest>,
-) -> Result<Json<QueryResponse>, ApiError>
+    Json(request): Json<LegacyEvmQueryRequest>,
+) -> Result<Json<LegacyEvmQueryResponse>, ApiError>
 where
     S: ChainAdapter,
 {
