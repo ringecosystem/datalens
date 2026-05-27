@@ -293,6 +293,37 @@ fn test_chain() -> ChainIdentity {
     ChainIdentity::expect_with_network_id(ChainFamily::Evm, "ethereum", NetworkId::numeric(1))
 }
 
+fn single_block_rows(number: u64) -> DatasetRows {
+    DatasetRows::new(
+        DatasetKey::evm_blocks(),
+        QueryRows::EvmBlocks(vec![BlockHeader {
+            number,
+            hash: format!("0xblock{number}"),
+            parent_hash: "0xparent".to_owned(),
+            timestamp: 1,
+        }]),
+    )
+    .expect("dataset rows")
+}
+
+fn first_manifest_object_key(storage: &LocalStorage, chain: &ChainIdentity) -> String {
+    let manifest = read_manifest_json(storage, chain);
+    manifest["entries"][0]["object_key"]
+        .as_str()
+        .expect("object key")
+        .to_owned()
+}
+
+fn read_manifest_json(storage: &LocalStorage, chain: &ChainIdentity) -> serde_json::Value {
+    let bytes = std::fs::read(storage.manifest_path(chain)).expect("manifest bytes");
+    serde_json::from_slice(&bytes).expect("manifest json")
+}
+
+fn write_manifest_json(storage: &LocalStorage, chain: &ChainIdentity, manifest: serde_json::Value) {
+    let bytes = serde_json::to_vec_pretty(&manifest).expect("manifest bytes");
+    std::fs::write(storage.manifest_path(chain), bytes).expect("write manifest");
+}
+
 #[test]
 fn test_selector_coverage_key_includes_chain_dataset_and_stable_fingerprint() {
     let chain =
@@ -456,6 +487,171 @@ fn test_evm_blocks_rows_write_parquet_and_read_back() {
     let read = storage
         .read_rows(&chain, &DatasetKey::evm_blocks(), &selector, range)
         .expect("read rows");
+    assert_eq!(read, rows);
+}
+
+#[test]
+fn test_read_rows_accepts_matching_object_metadata() {
+    let storage = LocalStorage::new(temp_storage_root("matching-object-metadata"));
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let range = LedgerRange::blocks(1, 1).expect("valid range");
+    let rows = single_block_rows(1);
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &selector,
+            range: range.clone(),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write rows");
+
+    let read = storage
+        .read_rows(&chain, &DatasetKey::evm_blocks(), &selector, range)
+        .expect("read rows");
+
+    assert_eq!(read, rows);
+}
+
+#[test]
+fn test_read_rows_rejects_object_size_mismatch() {
+    let storage = LocalStorage::new(temp_storage_root("object-size-mismatch"));
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let range = LedgerRange::blocks(1, 1).expect("valid range");
+    let rows = single_block_rows(1);
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &selector,
+            range: range.clone(),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write rows");
+    let object_key = first_manifest_object_key(&storage, &chain);
+    let object_path = storage.root().join(&object_key);
+    let mut bytes = std::fs::read(&object_path).expect("object bytes");
+    bytes.push(0);
+    std::fs::write(&object_path, bytes).expect("tamper object");
+
+    let error = storage
+        .read_rows(&chain, &DatasetKey::evm_blocks(), &selector, range)
+        .expect_err("size mismatch");
+
+    assert_eq!(error.kind, DatalensErrorKind::StorageReadFailure);
+    assert!(error.message.contains(&object_key));
+    assert!(error.message.contains("size mismatch"));
+}
+
+#[test]
+fn test_read_rows_rejects_object_checksum_mismatch() {
+    let storage = LocalStorage::new(temp_storage_root("object-checksum-mismatch"));
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let range = LedgerRange::blocks(1, 1).expect("valid range");
+    let rows = single_block_rows(1);
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &selector,
+            range: range.clone(),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write rows");
+    let object_key = first_manifest_object_key(&storage, &chain);
+    let object_path = storage.root().join(&object_key);
+    let mut bytes = std::fs::read(&object_path).expect("object bytes");
+    let index = bytes.len() / 2;
+    bytes[index] ^= 0xff;
+    std::fs::write(&object_path, bytes).expect("tamper object");
+
+    let error = storage
+        .read_rows(&chain, &DatasetKey::evm_blocks(), &selector, range)
+        .expect_err("checksum mismatch");
+
+    assert_eq!(error.kind, DatalensErrorKind::StorageReadFailure);
+    assert!(error.message.contains(&object_key));
+    assert!(error.message.contains("checksum mismatch"));
+}
+
+#[test]
+fn test_read_rows_rejects_unknown_checksum_algorithm() {
+    let storage = LocalStorage::new(temp_storage_root("unknown-checksum-algorithm"));
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let range = LedgerRange::blocks(1, 1).expect("valid range");
+    let rows = single_block_rows(1);
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &selector,
+            range: range.clone(),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write rows");
+    let mut manifest = read_manifest_json(&storage, &chain);
+    manifest["entries"][0]["checksum_algorithm"] = serde_json::Value::String("md5".to_owned());
+    write_manifest_json(&storage, &chain, manifest);
+    let object_key = first_manifest_object_key(&storage, &chain);
+
+    let error = storage
+        .read_rows(&chain, &DatasetKey::evm_blocks(), &selector, range)
+        .expect_err("unknown checksum algorithm");
+
+    assert_eq!(error.kind, DatalensErrorKind::StorageReadFailure);
+    assert!(error.message.contains(&object_key));
+    assert!(error.message.contains("unknown checksum algorithm"));
+}
+
+#[test]
+fn test_read_rows_accepts_legacy_manifest_without_object_metadata() {
+    let storage = LocalStorage::new(temp_storage_root("legacy-object-metadata"));
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let range = LedgerRange::blocks(1, 1).expect("valid range");
+    let rows = single_block_rows(1);
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &selector,
+            range: range.clone(),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write rows");
+    let mut manifest = read_manifest_json(&storage, &chain);
+    let entry = manifest["entries"][0]
+        .as_object_mut()
+        .expect("manifest entry object");
+    entry.remove("object_size_bytes");
+    entry.remove("checksum");
+    entry.remove("checksum_algorithm");
+    entry.remove("written_at_unix_seconds");
+    write_manifest_json(&storage, &chain, manifest);
+
+    let read = storage
+        .read_rows(&chain, &DatasetKey::evm_blocks(), &selector, range)
+        .expect("read legacy manifest");
+
     assert_eq!(read, rows);
 }
 

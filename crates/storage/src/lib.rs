@@ -136,18 +136,19 @@ where
             if intersect(entry.range.clone(), range.clone()).is_none() {
                 continue;
             }
-            let Some(object_key) = entry.object_key else {
+            let Some(object_key) = entry.object_key.as_deref() else {
                 continue;
             };
-            if !self.object_store.exists(&object_key)? {
+            if !self.object_store.exists(object_key)? {
                 return Err(DatalensError::new(
                     DatalensErrorKind::StorageReadFailure,
                     format!("manifest entry object not found {object_key}"),
                 ));
             }
-            let bytes = self.object_store.get(&object_key)?;
+            let bytes = self.object_store.get(object_key)?;
+            verify_manifest_object_metadata(&entry, object_key, &bytes)?;
             let encoding = entry.object_encoding.unwrap_or_else(|| {
-                ObjectEncoding::from_object_key(&object_key).unwrap_or(ObjectEncoding::Json)
+                ObjectEncoding::from_object_key(object_key).unwrap_or(ObjectEncoding::Json)
             });
             let mut object_rows = decode_object_rows(encoding, dataset_key.clone(), &bytes)
                 .map_err(|error| {
@@ -641,6 +642,53 @@ fn validate_existing_data_object(
             "existing manifest data object metadata differs for logical shard",
         ));
     }
+    Ok(())
+}
+
+fn verify_manifest_object_metadata(
+    entry: &ManifestEntry,
+    object_key: &str,
+    bytes: &[u8],
+) -> Result<(), DatalensError> {
+    if let Some(expected_size) = entry.object_size_bytes {
+        let actual_size = bytes.len() as u64;
+        if actual_size != expected_size {
+            return Err(DatalensError::new(
+                DatalensErrorKind::StorageReadFailure,
+                format!(
+                    "cached object {object_key} size mismatch: expected {expected_size} bytes, got {actual_size} bytes"
+                ),
+            ));
+        }
+    }
+
+    match (
+        entry.checksum.as_deref(),
+        entry.checksum_algorithm.as_deref(),
+    ) {
+        (Some(expected_checksum), Some("sha256")) => {
+            let actual_checksum = checksum_hex(bytes);
+            if actual_checksum != expected_checksum {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::StorageReadFailure,
+                    format!("cached object {object_key} checksum mismatch for sha256"),
+                ));
+            }
+        }
+        (Some(_), Some(algorithm)) => {
+            return Err(DatalensError::new(
+                DatalensErrorKind::StorageReadFailure,
+                format!("cached object {object_key} unknown checksum algorithm {algorithm}"),
+            ));
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            log::debug!(
+                "storage skipped incomplete cached object checksum metadata object_key={object_key}"
+            );
+        }
+        (None, None) => {}
+    }
+
     Ok(())
 }
 
