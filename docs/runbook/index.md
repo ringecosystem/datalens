@@ -21,3 +21,5 @@ outputs.
 
 - `e2e-native-query-flow.md`: local validation for the initial native EVM block and
   log query flow, including deterministic cache behavior checks.
+- `local-rustfs.md`: local RustFS object storage setup, bucket initialization, S3 test
+  variables, stop, and cleanup commands.
