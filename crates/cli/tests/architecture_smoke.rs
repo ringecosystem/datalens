@@ -6,7 +6,6 @@ use datalens_core::{
 };
 use datalens_evm::EvmAdapterMetadata;
 use datalens_planner::{PlanRequest, PlanStatus};
-use datalens_storage::Storage;
 use datalens_writer::{WriteRequest, WriteStatus};
 
 #[test]
@@ -29,7 +28,7 @@ fn workspace_exposes_architecture_boundaries() {
     );
 
     fn assert_chain_adapter<T: ChainAdapter>() {}
-    fn assert_storage<T: Storage>() {}
+    fn assert_storage_repository<T: datalens_storage::StorageRepository>() {}
     fn assert_auth_hook<T: AuthenticationHook>() {}
     fn assert_compatibility<T: CompatibilityAdapter>() {}
 
@@ -38,7 +37,7 @@ fn workspace_exposes_architecture_boundaries() {
     let _ = WriteRequest::new(chain, dataset, range);
 
     let _chain_adapter_type_check = assert_chain_adapter::<datalens_evm::EvmAdapter>;
-    let _storage_type_check = assert_storage::<datalens_storage::InMemoryStorage>;
+    let _storage_type_check = assert_storage_repository::<datalens_storage::LocalStorage>;
     let _auth_hook_type_check = assert_auth_hook::<datalens_api::auth::NoAuthentication>;
     let _compatibility_type_check =
         assert_compatibility::<datalens_api::compatibility::NativeCompatibility>;
