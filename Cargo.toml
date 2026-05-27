@@ -5,6 +5,7 @@ members = [
   "crates/cli",
   "crates/core",
   "crates/evm",
+  "crates/executor",
   "crates/metrics",
   "crates/planner",
   "crates/storage",

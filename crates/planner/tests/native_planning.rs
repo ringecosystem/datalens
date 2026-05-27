@@ -124,6 +124,222 @@ fn test_native_planner_builds_executable_plan_from_capabilities() {
     );
 }
 
+#[test]
+fn test_native_planner_builds_full_hit_durable_plan_from_coverage() {
+    let plan = NativePlanner::new(NativePlannerConfig {
+        max_query_range_len: 10,
+        default_chunk_range_len: 3,
+    })
+    .plan_with_coverage(
+        blocks_input(1, 4),
+        &capabilities(),
+        ChainHeight::block(4).with_finality(FinalityKind::Safe),
+        vec![LedgerRange::blocks(1, 4).expect("valid range")],
+    )
+    .expect("native plan");
+
+    assert_eq!(plan.coverage.status, QueryPlanStatus::FullHit);
+    assert_eq!(
+        plan.read_segments,
+        vec![DurableReadSegment {
+            range: LedgerRange::blocks(1, 4).expect("valid range")
+        }]
+    );
+    assert_eq!(plan.fetch_tasks, Vec::<DurableFetchTask>::new());
+}
+
+#[test]
+fn test_native_planner_builds_partial_hit_durable_plan_from_coverage() {
+    let plan = NativePlanner::new(NativePlannerConfig {
+        max_query_range_len: 10,
+        default_chunk_range_len: 3,
+    })
+    .plan_with_coverage(
+        blocks_input(1, 5),
+        &capabilities(),
+        ChainHeight::block(5).with_finality(FinalityKind::Safe),
+        vec![
+            LedgerRange::blocks(1, 2).expect("valid range"),
+            LedgerRange::blocks(5, 5).expect("valid range"),
+        ],
+    )
+    .expect("native plan");
+
+    assert_eq!(plan.coverage.status, QueryPlanStatus::PartialHit);
+    assert_eq!(
+        plan.coverage.missing_ranges,
+        vec![LedgerRange::blocks(3, 4).expect("valid range")]
+    );
+    assert_eq!(
+        plan.read_segments,
+        vec![
+            DurableReadSegment {
+                range: LedgerRange::blocks(1, 2).expect("valid range")
+            },
+            DurableReadSegment {
+                range: LedgerRange::blocks(5, 5).expect("valid range")
+            },
+        ]
+    );
+    assert_eq!(
+        plan.fetch_tasks,
+        vec![DurableFetchTask {
+            range: LedgerRange::blocks(3, 4).expect("valid range"),
+            cache_write: true,
+        }]
+    );
+}
+
+#[test]
+fn test_native_planner_builds_miss_plan_for_empty_coverage() {
+    let plan = NativePlanner::new(NativePlannerConfig {
+        max_query_range_len: 10,
+        default_chunk_range_len: 3,
+    })
+    .plan_with_coverage(
+        blocks_input(1, 4),
+        &capabilities(),
+        ChainHeight::block(4).with_finality(FinalityKind::Safe),
+        Vec::new(),
+    )
+    .expect("native plan");
+
+    assert_eq!(plan.coverage.status, QueryPlanStatus::Miss);
+    assert_eq!(plan.read_segments, Vec::<DurableReadSegment>::new());
+    assert_eq!(
+        plan.fetch_tasks,
+        vec![
+            DurableFetchTask {
+                range: LedgerRange::blocks(1, 2).expect("valid range"),
+                cache_write: true,
+            },
+            DurableFetchTask {
+                range: LedgerRange::blocks(3, 4).expect("valid range"),
+                cache_write: true,
+            },
+        ]
+    );
+}
+
+#[test]
+fn test_native_planner_treats_empty_coverage_manifest_ranges_as_hits() {
+    let plan = NativePlanner::new(NativePlannerConfig {
+        max_query_range_len: 10,
+        default_chunk_range_len: 3,
+    })
+    .plan_with_coverage(
+        logs_input(50, 52),
+        &capabilities(),
+        ChainHeight::block(52).with_finality(FinalityKind::Safe),
+        vec![LedgerRange::blocks(50, 52).expect("valid range")],
+    )
+    .expect("native plan");
+
+    assert_eq!(plan.coverage.status, QueryPlanStatus::FullHit);
+    assert_eq!(
+        plan.read_segments,
+        vec![DurableReadSegment {
+            range: LedgerRange::blocks(50, 52).expect("valid range")
+        }]
+    );
+    assert_eq!(plan.fetch_tasks, Vec::<DurableFetchTask>::new());
+}
+
+#[test]
+fn test_native_planner_rejects_unsupported_dataset() {
+    let error = NativePlanner::new(NativePlannerConfig {
+        max_query_range_len: 10,
+        default_chunk_range_len: 3,
+    })
+    .plan_with_coverage(
+        NativeQueryInput {
+            dataset_key: DatasetKey::tron_events(),
+            ..blocks_input(1, 1)
+        },
+        &capabilities(),
+        ChainHeight::block(1).with_finality(FinalityKind::Safe),
+        Vec::new(),
+    )
+    .expect_err("unsupported dataset");
+
+    assert_eq!(error.kind, DatalensErrorKind::UnsupportedDataset);
+}
+
+#[test]
+fn test_native_planner_rejects_unsupported_selector() {
+    let error = NativePlanner::new(NativePlannerConfig {
+        max_query_range_len: 10,
+        default_chunk_range_len: 3,
+    })
+    .plan_with_coverage(
+        NativeQueryInput {
+            selector: datalens_chain::DatasetSelector::all(),
+            ..logs_input(1, 1)
+        },
+        &capabilities(),
+        ChainHeight::block(1).with_finality(FinalityKind::Safe),
+        Vec::new(),
+    )
+    .expect_err("unsupported selector");
+
+    assert_eq!(error.kind, DatalensErrorKind::UnsupportedDataset);
+}
+
+#[test]
+fn test_native_planner_uses_adapter_range_limit_for_fetch_tasks() {
+    let plan = NativePlanner::new(NativePlannerConfig {
+        max_query_range_len: 10,
+        default_chunk_range_len: 3,
+    })
+    .plan_with_coverage(
+        blocks_input(1, 4),
+        &capabilities(),
+        ChainHeight::block(4).with_finality(FinalityKind::Safe),
+        Vec::new(),
+    )
+    .expect("native plan");
+
+    assert_eq!(
+        plan.fetch_tasks,
+        vec![
+            DurableFetchTask {
+                range: LedgerRange::blocks(1, 2).expect("valid range"),
+                cache_write: true,
+            },
+            DurableFetchTask {
+                range: LedgerRange::blocks(3, 4).expect("valid range"),
+                cache_write: true,
+            },
+        ]
+    );
+}
+
+fn blocks_input(start: u64, end: u64) -> NativeQueryInput {
+    NativeQueryInput {
+        chain: ethereum_identity(),
+        dataset_key: DatasetKey::evm_blocks(),
+        ledger_range: LedgerRange::blocks(start, end).expect("valid range"),
+        selector: datalens_chain::DatasetSelector::all(),
+        response_shape: ResponseShape::LegacyEvmBlocks,
+        field_selection: FieldSelection::All,
+    }
+}
+
+fn logs_input(start: u64, end: u64) -> NativeQueryInput {
+    NativeQueryInput {
+        chain: ethereum_identity(),
+        dataset_key: DatasetKey::evm_logs(),
+        ledger_range: LedgerRange::blocks(start, end).expect("valid range"),
+        selector: datalens_chain::DatasetSelector::try_evm_logs(datalens_core::LogFilter {
+            addresses: vec!["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()],
+            topics: vec![None],
+        })
+        .expect("valid selector"),
+        response_shape: ResponseShape::LegacyEvmLogs,
+        field_selection: FieldSelection::All,
+    }
+}
+
 fn capabilities() -> AdapterCapabilities {
     AdapterCapabilities::new(ethereum_identity())
         .with_dataset_capability(

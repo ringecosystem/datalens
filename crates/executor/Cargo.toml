@@ -1,19 +1,14 @@
 [package]
-name = "datalens-api"
+name = "datalens-executor"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
 
 [dependencies]
-axum.workspace = true
 datalens-chain = { path = "../chain" }
 datalens-core = { path = "../core" }
-datalens-executor = { path = "../executor" }
 datalens-planner = { path = "../planner" }
 datalens-storage = { path = "../storage" }
 datalens-writer = { path = "../writer" }
 log.workspace = true
-serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
-toml.workspace = true

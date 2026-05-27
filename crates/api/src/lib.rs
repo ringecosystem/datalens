@@ -9,16 +9,15 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use datalens_chain::{ChainAdapter, ChainFetchRequest, FetchContext};
+use datalens_chain::ChainAdapter;
 use datalens_core::{
     BlockRange, ChainIdentity, DatalensError, DatalensErrorKind, Dataset, DatasetKey, DatasetRows,
     LedgerRange, LogFilter, QueryRows,
 };
-use datalens_planner::{NativePlanner, NativePlannerConfig, NativeQueryInput};
-use datalens_storage::{S3ObjectStoreConfig, StorageRepository, missing_ranges};
-use datalens_writer::{
-    DurableWriteRequest, DurableWriteSegment, DurableWriter, DurableWriterConfig,
-};
+use datalens_executor::{NativeQueryExecutionConfig, NativeQueryExecutor};
+use datalens_planner::{NativePlannerConfig, NativeQueryInput};
+use datalens_storage::{S3ObjectStoreConfig, StorageRepository};
+use datalens_writer::DurableWriterConfig;
 use serde::{Deserialize, Serialize};
 
 pub mod auth {
@@ -297,10 +296,7 @@ pub fn legacy_evm_to_native_input(
 
 #[derive(Clone)]
 pub struct QueryService<S> {
-    storage: Arc<dyn StorageRepository>,
-    source: S,
-    planner: PlannerConfig,
-    writer: DurableWriter<Arc<dyn StorageRepository>>,
+    executor: NativeQueryExecutor<Arc<dyn StorageRepository>, S>,
     chain_name: String,
     chain: ChainConfig,
 }
@@ -343,20 +339,24 @@ where
         chain: ChainConfig,
     ) -> Self {
         let storage: Arc<dyn StorageRepository> = Arc::new(storage);
-        let durable_writer = DurableWriter::new(
-            storage.clone(),
-            DurableWriterConfig {
-                target_object_bytes: writer.target_object_bytes,
-                min_object_rows: writer.min_object_rows,
-                record_empty_coverage: writer.record_empty_coverage,
+        let executor = NativeQueryExecutor::new(
+            storage,
+            source,
+            NativeQueryExecutionConfig {
+                planner: NativePlannerConfig {
+                    max_query_range_len: planner.max_query_range_blocks,
+                    default_chunk_range_len: planner.default_chunk_range_blocks,
+                },
+                writer: DurableWriterConfig {
+                    target_object_bytes: writer.target_object_bytes,
+                    min_object_rows: writer.min_object_rows,
+                    record_empty_coverage: writer.record_empty_coverage,
+                },
             },
         );
 
         Self {
-            storage,
-            source,
-            planner,
-            writer: durable_writer,
+            executor,
             chain_name: chain_name.into(),
             chain,
         }
@@ -404,105 +404,16 @@ where
             native_input.ledger_range.start(),
             native_input.ledger_range.end()
         );
-        let safe_height = self.source.cache_safe_height()?;
-        let default_chunk_range_len = self.chunk_size(native_input.dataset_key.clone());
-        let plan = NativePlanner::new(NativePlannerConfig {
-            max_query_range_len: self.planner.max_query_range_blocks,
-            default_chunk_range_len,
-        })
-        .plan(native_input, &self.source.capabilities(), safe_height)?;
-
-        let hit_ledger_ranges = self.storage.covered_ranges(
-            &plan.chain,
-            &plan.dataset_key,
-            &plan.selector,
-            plan.ledger_range.clone(),
-        )?;
-        let miss_ledger_ranges = missing_ranges(plan.ledger_range.clone(), &hit_ledger_ranges);
-        log::info!(
-            "cache summary dataset={} hit_ranges={} missing_ranges={}",
-            plan.dataset_key.as_str(),
-            hit_ledger_ranges.len(),
-            miss_ledger_ranges.len()
-        );
-        let mut rows = self
-            .storage
-            .read_rows(
-                &plan.chain,
-                &plan.dataset_key,
-                &plan.selector,
-                plan.ledger_range.clone(),
-            )?
-            .into_rows();
-
-        let finality_level = match &plan.finality_policy {
-            datalens_planner::FinalityPolicy::DurableCache { boundary } => boundary.finality,
-        };
-        let mut fetched_segments = Vec::new();
-
-        for range in plan.split_ranges(miss_ledger_ranges.clone())? {
-            let fetch_request = ChainFetchRequest::new(
-                plan.chain.clone(),
-                plan.dataset_key.clone(),
-                range.clone(),
-                plan.selector.clone(),
-            )
-            .with_context(FetchContext {
-                request_id: None,
-                cache_write: true,
-            });
-            let fetched = match self.source.fetch(fetch_request.clone()) {
-                Ok(response) => {
-                    response.validate_for_request(&fetch_request)?;
-                    response.rows
-                }
-                Err(error) => {
-                    log::warn!(
-                        "provider fetch failed dataset={} range={}-{} kind={:?}",
-                        plan.dataset_key.as_str(),
-                        range.start(),
-                        range.end(),
-                        error.kind
-                    );
-                    return Err(error);
-                }
-            };
-            fetched_segments.push(DurableWriteSegment {
-                range,
-                rows: fetched.clone(),
-            });
-            rows.try_append(fetched.into_rows())?;
-        }
-
-        if !fetched_segments.is_empty()
-            && let Err(error) = self.writer.write(DurableWriteRequest {
-                chain: plan.chain.clone(),
-                dataset_key: plan.dataset_key.clone(),
-                selector: plan.selector.clone(),
-                finality_level,
-                segments: fetched_segments,
-            })
-        {
-            log::error!(
-                "cache write failed dataset={} range={}-{} kind={:?}",
-                plan.dataset_key.as_str(),
-                plan.ledger_range.start(),
-                plan.ledger_range.end(),
-                error.kind
-            );
-            return Err(error);
-        }
-
-        rows.sort();
+        let result = self.executor.execute(native_input)?;
         Ok(NativeQueryResponse {
-            chain: plan.chain,
-            dataset_key: plan.dataset_key.clone(),
-            ledger_range: plan.ledger_range,
+            chain: result.chain,
+            dataset_key: result.dataset_key,
+            ledger_range: result.ledger_range,
             cache: NativeCacheSummary {
-                hit_ranges: hit_ledger_ranges,
-                missing_ranges: miss_ledger_ranges,
+                hit_ranges: result.cache.hit_ranges,
+                missing_ranges: result.cache.missing_ranges,
             },
-            rows: DatasetRows::new(plan.dataset_key, rows)?,
+            rows: result.rows,
         })
     }
 
@@ -546,17 +457,6 @@ where
             }
             Dataset::Blocks => Ok(()),
         }
-    }
-
-    fn chunk_size(&self, dataset_key: DatasetKey) -> u64 {
-        let configured_limit = match dataset_key.legacy_dataset() {
-            Some(Dataset::Blocks) => self.chain.datasets.blocks.max_batch_blocks,
-            Some(Dataset::Logs) => self.chain.datasets.logs.max_get_logs_range_blocks,
-            None => self.planner.default_chunk_range_blocks,
-        };
-        configured_limit
-            .min(self.planner.default_chunk_range_blocks)
-            .max(1)
     }
 }
 
