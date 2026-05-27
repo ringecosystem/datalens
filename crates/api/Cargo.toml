@@ -10,6 +10,7 @@ datalens-chain = { path = "../chain" }
 datalens-core = { path = "../core" }
 datalens-planner = { path = "../planner" }
 datalens-storage = { path = "../storage" }
+datalens-writer = { path = "../writer" }
 log.workspace = true
 serde.workspace = true
 serde_json.workspace = true
