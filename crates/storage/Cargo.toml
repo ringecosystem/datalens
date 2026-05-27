@@ -6,10 +6,13 @@ version.workspace = true
 
 [dependencies]
 aws-config = "1.8.11"
+arrow.workspace = true
 aws-sdk-s3.workspace = true
+bytes = "1.11.1"
 datalens-chain = { path = "../chain" }
 datalens-core = { path = "../core" }
 log.workspace = true
+parquet.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
