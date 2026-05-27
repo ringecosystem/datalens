@@ -6,7 +6,10 @@ use std::{
 use datalens_api::config::{
     ChainConfig, DatasetsConfig, LogsDatasetConfig, PlannerConfig, WriterConfig,
 };
-use datalens_api::{LegacyEvmQueryRequest, LegacyEvmQueryResponse, QueryService};
+use datalens_api::{
+    LegacyEvmQueryRequest, LegacyEvmQueryResponse, QueryService, api_error_body, api_error_status,
+    legacy_evm_to_native_input,
+};
 use datalens_chain::{
     AdapterCapabilities, ChainAdapter, ChainFetchRequest, ChainFetchResponse, ChainHeight,
     DatasetCapability, DatasetSelector, FinalityKind, HeightRangeKind, SelectorKind,
@@ -15,7 +18,59 @@ use datalens_core::{
     BlockHeader, BlockRange, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, Dataset,
     DatasetKey, LedgerRange, LogFilter, LogRecord, NetworkId, QueryRows,
 };
+use datalens_planner::{FieldSelection, ResponseShape};
 use datalens_storage::LocalStorage;
+
+#[test]
+fn test_legacy_blocks_request_maps_to_native_domain_input() {
+    let input = legacy_evm_to_native_input(blocks_request(10, 12)).expect("blocks request maps");
+
+    assert_eq!(input.chain, ethereum_identity());
+    assert_eq!(input.dataset_key, DatasetKey::evm_blocks());
+    assert_eq!(
+        input.ledger_range,
+        LedgerRange::from_block_range(BlockRange::expect_new(10, 12))
+    );
+    assert_eq!(input.selector, DatasetSelector::all());
+    assert_eq!(input.response_shape, ResponseShape::LegacyEvmBlocks);
+    assert_eq!(input.field_selection, FieldSelection::All);
+}
+
+#[test]
+fn test_legacy_logs_request_maps_to_native_domain_input() {
+    let input = legacy_evm_to_native_input(logs_request_with_topics(
+        20,
+        21,
+        vec!["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        vec![Some(vec![TOPIC_A])],
+    ))
+    .expect("logs request maps");
+
+    assert_eq!(input.chain, ethereum_identity());
+    assert_eq!(input.dataset_key, DatasetKey::evm_logs());
+    assert_eq!(
+        input.ledger_range,
+        LedgerRange::from_block_range(BlockRange::expect_new(20, 21))
+    );
+    assert!(matches!(input.selector, DatasetSelector::EvmLogs(_)));
+    assert_eq!(input.response_shape, ResponseShape::LegacyEvmLogs);
+    assert_eq!(input.field_selection, FieldSelection::All);
+}
+
+#[test]
+fn test_api_error_mapping_uses_stable_response_codes() {
+    let body = api_error_body(DatalensError::new(
+        DatalensErrorKind::ProviderLimit,
+        "mock provider limit",
+    ));
+
+    assert_eq!(
+        api_error_status(&DatalensErrorKind::ProviderLimit),
+        axum::http::StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(body.error.kind, "provider_limit");
+    assert_eq!(body.error.message, "mock provider limit");
+}
 
 #[test]
 fn test_query_rejects_fetch_response_chain_mismatch_without_cache_write() {
@@ -148,6 +203,41 @@ fn test_query_rejects_log_addresses_above_adapter_capability() {
     assert_eq!(error.kind, DatalensErrorKind::InvalidInput);
 }
 
+#[test]
+fn test_query_delegates_log_address_limit_to_planner_capabilities() {
+    let source = MockSource::default().with_max_addresses_per_query(2);
+    let service = QueryService::new(
+        LocalStorage::new(temp_storage_root("planner-address-limit")),
+        source.clone(),
+        PlannerConfig {
+            max_query_range_blocks: 4,
+            default_chunk_range_blocks: 2,
+        },
+        WriterConfig {
+            target_object_bytes: 1024,
+            min_object_rows: 1,
+            record_empty_coverage: true,
+        },
+        chain_config(1),
+    );
+
+    service
+        .query(logs_request(
+            1,
+            1,
+            vec![
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ],
+        ))
+        .expect("planner capability allows two addresses");
+
+    assert_eq!(
+        source.calls(),
+        vec![SourceCall::Logs(BlockRange::expect_new(1, 1))]
+    );
+}
+
 fn assert_contract_violation_not_cached(name: &str, mutation: ResponseMutation) {
     let root = temp_storage_root(name);
     let source = MockSource::default()
@@ -177,24 +267,28 @@ fn service(storage: LocalStorage, source: MockSource) -> QueryService<MockSource
             min_object_rows: 1,
             record_empty_coverage: true,
         },
-        ChainConfig {
-            kind: "evm".to_owned(),
-            chain_id: 1,
-            rpc_urls: vec!["http://example.invalid".to_owned()],
-            finality: datalens_api::config::FinalityConfig::Auto,
-            datasets: DatasetsConfig {
-                blocks: datalens_api::config::BlocksDatasetConfig {
-                    enabled: true,
-                    max_batch_blocks: 2,
-                },
-                logs: LogsDatasetConfig {
-                    enabled: true,
-                    max_get_logs_range_blocks: 2,
-                    max_addresses_per_query: 2,
-                },
+        chain_config(2),
+    )
+}
+
+fn chain_config(max_addresses_per_query: usize) -> ChainConfig {
+    ChainConfig {
+        kind: "evm".to_owned(),
+        chain_id: 1,
+        rpc_urls: vec!["http://example.invalid".to_owned()],
+        finality: datalens_api::config::FinalityConfig::Auto,
+        datasets: DatasetsConfig {
+            blocks: datalens_api::config::BlocksDatasetConfig {
+                enabled: true,
+                max_batch_blocks: 2,
+            },
+            logs: LogsDatasetConfig {
+                enabled: true,
+                max_get_logs_range_blocks: 2,
+                max_addresses_per_query,
             },
         },
-    )
+    }
 }
 
 fn blocks_request(from_block: u64, to_block: u64) -> LegacyEvmQueryRequest {
