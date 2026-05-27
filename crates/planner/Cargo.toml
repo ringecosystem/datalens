@@ -7,4 +7,3 @@ version.workspace = true
 [dependencies]
 datalens-chain = { path = "../chain" }
 datalens-core = { path = "../core" }
-datalens-storage = { path = "../storage" }

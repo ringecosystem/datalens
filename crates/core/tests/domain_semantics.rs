@@ -137,6 +137,26 @@ fn test_ledger_range_supports_block_slot_and_height_math() {
 }
 
 #[test]
+fn test_missing_ranges_handles_unsorted_and_mixed_kind_coverage() {
+    let missing = datalens_core::missing_ranges(
+        datalens_core::LedgerRange::blocks(4, 8).expect("valid range"),
+        &[
+            datalens_core::LedgerRange::slots(4, 8).expect("other kind ignored"),
+            datalens_core::LedgerRange::blocks(7, 7).expect("valid range"),
+            datalens_core::LedgerRange::blocks(5, 6).expect("valid range"),
+        ],
+    );
+
+    assert_eq!(
+        missing,
+        vec![
+            datalens_core::LedgerRange::blocks(4, 4).expect("valid range"),
+            datalens_core::LedgerRange::blocks(8, 8).expect("valid range"),
+        ]
+    );
+}
+
+#[test]
 fn test_evm_log_filter_normalization_is_canonical() {
     let left = LogFilter {
         addresses: vec![

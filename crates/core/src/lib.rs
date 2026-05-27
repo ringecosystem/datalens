@@ -21,5 +21,5 @@ pub use error::{DatalensError, DatalensErrorKind};
 pub use query::{
     BlockHeader, DatasetRows, EvmLogFilter, LogFilter, LogRecord, QueryRows, TopicFilter,
 };
-pub use range::{BlockRange, LedgerRange, LedgerRangeKind, TimeRange};
+pub use range::{BlockRange, LedgerRange, LedgerRangeKind, TimeRange, missing_ranges};
 pub use result::ResultEnvelope;

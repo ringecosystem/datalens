@@ -5,6 +5,7 @@ use datalens_chain::FinalityLevel;
 use datalens_core::{
     BlockHeader, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey,
     DatasetRows, LedgerRange, LedgerRangeKind, LogFilter, LogRecord, NetworkId, QueryRows,
+    missing_ranges,
 };
 
 use datalens_storage::*;

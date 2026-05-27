@@ -6,9 +6,8 @@ use datalens_chain::{
 };
 use datalens_core::{
     ChainIdentity, CoverageLevel, DatalensError, DatalensErrorKind, DatasetId, DatasetKey,
-    LedgerRange, TimeRange,
+    LedgerRange, TimeRange, missing_ranges,
 };
-use datalens_storage::missing_ranges;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlanRequest {

@@ -531,33 +531,6 @@ impl ObjectEncoding {
     }
 }
 
-pub fn missing_ranges(range: LedgerRange, covered: &[LedgerRange]) -> Vec<LedgerRange> {
-    let mut missing = Vec::new();
-    let mut cursor = range.start();
-    for covered_range in covered {
-        if covered_range.kind() != range.kind() || covered_range.end() < cursor {
-            continue;
-        }
-        if covered_range.start() > range.end() {
-            break;
-        }
-        if cursor < covered_range.start() {
-            missing.push(
-                LedgerRange::try_new(range.kind(), cursor, covered_range.start() - 1)
-                    .expect("valid missing range"),
-            );
-        }
-        cursor = cursor.max(covered_range.end().saturating_add(1));
-        if cursor > range.end() {
-            break;
-        }
-    }
-    if cursor <= range.end() {
-        missing.push(LedgerRange::try_new(range.kind(), cursor, range.end()).expect("valid range"));
-    }
-    missing
-}
-
 pub fn coverage_key(
     chain: &ChainIdentity,
     dataset_key: &DatasetKey,

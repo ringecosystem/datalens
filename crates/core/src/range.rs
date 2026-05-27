@@ -322,3 +322,36 @@ impl LedgerRange {
         Ok(ranges)
     }
 }
+
+pub fn missing_ranges(range: LedgerRange, covered: &[LedgerRange]) -> Vec<LedgerRange> {
+    let mut covered = covered
+        .iter()
+        .filter_map(|covered_range| covered_range.intersection(&range))
+        .collect::<Vec<_>>();
+    covered.sort_by_key(|range| range.start());
+
+    let mut missing = Vec::new();
+    let mut cursor = range.start();
+    for covered_range in covered {
+        if covered_range.end() < cursor {
+            continue;
+        }
+        if covered_range.start() > range.end() {
+            break;
+        }
+        if cursor < covered_range.start() {
+            missing.push(
+                LedgerRange::try_new(range.kind(), cursor, covered_range.start() - 1)
+                    .expect("valid missing range"),
+            );
+        }
+        cursor = cursor.max(covered_range.end().saturating_add(1));
+        if cursor > range.end() {
+            break;
+        }
+    }
+    if cursor <= range.end() {
+        missing.push(LedgerRange::try_new(range.kind(), cursor, range.end()).expect("valid range"));
+    }
+    missing
+}

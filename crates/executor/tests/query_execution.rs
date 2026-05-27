@@ -13,7 +13,7 @@ use datalens_core::{
 };
 use datalens_executor::{NativeQueryExecutionConfig, NativeQueryExecutor};
 use datalens_planner::{FieldSelection, NativePlannerConfig, NativeQueryInput, ResponseShape};
-use datalens_storage::LocalStorage;
+use datalens_storage::{LocalStorage, StorageRepository, StorageWriteOutcome, StorageWriteRequest};
 use datalens_writer::{DurableWriteRequest, DurableWriteSegment, DurableWriterConfig};
 
 #[test]
@@ -26,6 +26,26 @@ fn test_executor_cache_hit_reads_cache_without_fetch() {
     let result = executor
         .execute(blocks_input(1, 2))
         .expect("cache hit succeeds");
+
+    assert_eq!(
+        result.cache.hit_ranges,
+        vec![LedgerRange::blocks(1, 2).unwrap()]
+    );
+    assert_eq!(result.cache.missing_ranges, Vec::<LedgerRange>::new());
+    assert_eq!(source.calls(), Vec::<SourceCall>::new());
+    assert_eq!(block_numbers(&result.rows), vec![1, 2]);
+}
+
+#[test]
+fn test_executor_full_cache_hit_does_not_require_provider_safe_height() {
+    let storage = LocalStorage::new(temp_storage_root("executor-hit-provider-down"));
+    seed_blocks(&storage, 1, 2, vec![block(1, "0x01"), block(2, "0x02")]);
+    let source = MockSource::default().with_safe_height_error(DatalensErrorKind::ProviderFailure);
+    let executor = executor(storage, source.clone());
+
+    let result = executor
+        .execute(blocks_input(1, 2))
+        .expect("full cache hit succeeds without provider safe height");
 
     assert_eq!(
         result.cache.hit_ranges,
@@ -65,6 +85,25 @@ fn test_executor_miss_fetches_and_persists_through_writer() {
 }
 
 #[test]
+fn test_executor_miss_requires_provider_safe_height_before_fetch_or_write() {
+    let root = temp_storage_root("executor-miss-provider-down");
+    let storage = LocalStorage::new(&root);
+    let source = MockSource::default()
+        .with_blocks(vec![block(1, "0x01")])
+        .with_safe_height_error(DatalensErrorKind::ProviderFailure);
+    let executor = executor(storage, source.clone());
+
+    let error = executor
+        .execute(blocks_input(1, 1))
+        .expect_err("miss requires provider safe height");
+
+    assert_eq!(error.kind, DatalensErrorKind::ProviderFailure);
+    assert_eq!(source.calls(), Vec::<SourceCall>::new());
+    assert!(!root.join("chains/evm/ethereum/1/manifest.json").exists());
+    assert!(!root.join("chains/evm/ethereum/1/datasets").exists());
+}
+
+#[test]
 fn test_executor_partial_hit_fetches_only_missing_range() {
     let storage = LocalStorage::new(temp_storage_root("executor-partial"));
     seed_blocks(&storage, 1, 2, vec![block(1, "0x01"), block(2, "0x02")]);
@@ -93,6 +132,70 @@ fn test_executor_partial_hit_fetches_only_missing_range() {
         vec![SourceCall::Blocks(BlockRange::expect_new(3, 4))]
     );
     assert_eq!(block_numbers(&result.rows), vec![1, 2, 3, 4]);
+}
+
+#[test]
+fn test_executor_partial_hit_requires_provider_safe_height_before_fetch_or_write() {
+    let root = temp_storage_root("executor-partial-provider-down");
+    let storage = LocalStorage::new(&root);
+    seed_blocks(&storage, 1, 2, vec![block(1, "0x01"), block(2, "0x02")]);
+    let source = MockSource::default()
+        .with_blocks(vec![block(3, "0x03"), block(4, "0x04")])
+        .with_safe_height_error(DatalensErrorKind::ProviderFailure);
+    let executor = executor(storage, source.clone());
+
+    let error = executor
+        .execute(blocks_input(1, 4))
+        .expect_err("partial hit requires provider safe height");
+
+    assert_eq!(error.kind, DatalensErrorKind::ProviderFailure);
+    assert_eq!(source.calls(), Vec::<SourceCall>::new());
+    assert!(
+        !root
+            .join("chains/evm/ethereum/1/datasets/evm-blocks/all/block/3-4.parquet")
+            .exists()
+    );
+}
+
+#[test]
+fn test_executor_full_miss_does_not_read_cache_rows() {
+    let storage = CountingStorage::new(LocalStorage::new(temp_storage_root(
+        "executor-miss-no-read",
+    )));
+    let source = MockSource::default().with_blocks(vec![block(1, "0x01"), block(2, "0x02")]);
+    let executor = executor(storage.clone(), source);
+
+    let result = executor.execute(blocks_input(1, 2)).expect("miss succeeds");
+
+    assert_eq!(
+        result.cache.missing_ranges,
+        vec![LedgerRange::blocks(1, 2).unwrap()]
+    );
+    assert_eq!(storage.read_ranges(), Vec::<LedgerRange>::new());
+}
+
+#[test]
+fn test_executor_partial_hit_reads_only_planned_read_segments() {
+    let inner = LocalStorage::new(temp_storage_root("executor-partial-read-segments"));
+    seed_blocks(&inner, 1, 2, vec![block(1, "0x01"), block(2, "0x02")]);
+    let storage = CountingStorage::new(inner);
+    let source = MockSource::default().with_blocks(vec![
+        block(1, "0x01"),
+        block(2, "0x02"),
+        block(3, "0x03"),
+        block(4, "0x04"),
+    ]);
+    let executor = executor(storage.clone(), source);
+
+    let result = executor
+        .execute(blocks_input(1, 4))
+        .expect("partial hit succeeds");
+
+    assert_eq!(block_numbers(&result.rows), vec![1, 2, 3, 4]);
+    assert_eq!(
+        storage.read_ranges(),
+        vec![LedgerRange::blocks(1, 2).unwrap()]
+    );
 }
 
 #[test]
@@ -163,10 +266,10 @@ fn assert_response_mismatch_not_cached(name: &str, mutation: ResponseMutation) {
     assert!(!root.join("chains/evm/ethereum/1/datasets").exists());
 }
 
-fn executor(
-    storage: LocalStorage,
-    source: MockSource,
-) -> NativeQueryExecutor<LocalStorage, MockSource> {
+fn executor<R>(storage: R, source: MockSource) -> NativeQueryExecutor<R, MockSource>
+where
+    R: StorageRepository + Clone,
+{
     NativeQueryExecutor::new(
         storage,
         source,
@@ -182,6 +285,59 @@ fn executor(
             },
         },
     )
+}
+
+#[derive(Clone)]
+struct CountingStorage {
+    inner: LocalStorage,
+    read_ranges: Arc<Mutex<Vec<LedgerRange>>>,
+}
+
+impl CountingStorage {
+    fn new(inner: LocalStorage) -> Self {
+        Self {
+            inner,
+            read_ranges: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn read_ranges(&self) -> Vec<LedgerRange> {
+        self.read_ranges.lock().expect("read ranges lock").clone()
+    }
+}
+
+impl StorageRepository for CountingStorage {
+    fn covered_ranges(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+    ) -> Result<Vec<LedgerRange>, DatalensError> {
+        self.inner
+            .covered_ranges(chain, dataset_key, selector, range)
+    }
+
+    fn read_rows(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+    ) -> Result<DatasetRows, DatalensError> {
+        self.read_ranges
+            .lock()
+            .expect("read ranges lock")
+            .push(range.clone());
+        self.inner.read_rows(chain, dataset_key, selector, range)
+    }
+
+    fn write_rows(
+        &self,
+        request: StorageWriteRequest<'_>,
+    ) -> Result<StorageWriteOutcome, DatalensError> {
+        self.inner.write_rows(request)
+    }
 }
 
 fn seed_blocks(storage: &LocalStorage, start: u64, end: u64, blocks: Vec<BlockHeader>) {
@@ -261,6 +417,7 @@ struct MockSource {
     blocks: Arc<Mutex<Vec<BlockHeader>>>,
     calls: Arc<Mutex<Vec<SourceCall>>>,
     response_mutation: Arc<Mutex<Option<ResponseMutation>>>,
+    safe_height_error: Arc<Mutex<Option<DatalensErrorKind>>>,
 }
 
 impl Default for MockSource {
@@ -269,6 +426,7 @@ impl Default for MockSource {
             blocks: Arc::new(Mutex::new(Vec::new())),
             calls: Arc::new(Mutex::new(Vec::new())),
             response_mutation: Arc::new(Mutex::new(None)),
+            safe_height_error: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -284,6 +442,14 @@ impl MockSource {
             .response_mutation
             .lock()
             .expect("response mutation lock") = Some(mutation);
+        self
+    }
+
+    fn with_safe_height_error(self, kind: DatalensErrorKind) -> Self {
+        *self
+            .safe_height_error
+            .lock()
+            .expect("safe height error lock") = Some(kind);
         self
     }
 
@@ -320,6 +486,14 @@ impl ChainAdapter for MockSource {
     }
 
     fn cache_safe_height(&self) -> Result<ChainHeight, DatalensError> {
+        if let Some(kind) = self
+            .safe_height_error
+            .lock()
+            .expect("safe height error lock")
+            .clone()
+        {
+            return Err(DatalensError::new(kind, "injected safe height failure"));
+        }
         Ok(ChainHeight::block(100).with_finality(FinalityKind::Safe))
     }
 

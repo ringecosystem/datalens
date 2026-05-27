@@ -1337,7 +1337,6 @@ version = "0.1.0"
 dependencies = [
  "datalens-chain",
  "datalens-core",
- "datalens-storage",
 ]
 
 [[package]]
