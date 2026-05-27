@@ -11,8 +11,8 @@ use axum::{
 };
 use datalens_chain::{ChainAdapter, ChainFetchRequest, FetchContext};
 use datalens_core::{
-    BlockRange, CacheSummary, DatalensError, DatalensErrorKind, Dataset, DatasetKey, DatasetRows,
-    LedgerRange, LegacyEvmQueryRequest, LegacyEvmQueryResponse,
+    BlockRange, ChainIdentity, DatalensError, DatalensErrorKind, Dataset, DatasetKey, DatasetRows,
+    LedgerRange, LogFilter, QueryRows,
 };
 use datalens_planner::{NativePlanner, NativePlannerConfig, NativeQueryInput};
 use datalens_storage::{LocalStorage, StorageWriteRequest, missing_ranges};
@@ -203,6 +203,57 @@ pub mod config {
 
 use config::{ChainConfig, PlannerConfig, WriterConfig};
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LegacyEvmQueryRequest {
+    pub chain: ChainIdentity,
+    pub dataset: Dataset,
+    pub range: BlockRange,
+    pub filter: Option<LogFilter>,
+    #[serde(default)]
+    pub include_block: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CacheSummary {
+    pub hit_ranges: Vec<BlockRange>,
+    pub missing_ranges: Vec<BlockRange>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LegacyEvmQueryResponse {
+    pub chain: ChainIdentity,
+    pub range: BlockRange,
+    pub cache: CacheSummary,
+    pub rows: QueryRows,
+}
+
+pub fn legacy_evm_to_native_input(
+    request: LegacyEvmQueryRequest,
+) -> Result<NativeQueryInput, DatalensError> {
+    let selector = match request.dataset {
+        Dataset::Blocks => datalens_chain::DatasetSelector::all(),
+        Dataset::Logs => {
+            let filter = request.filter.ok_or_else(|| {
+                DatalensError::new(DatalensErrorKind::InvalidInput, "logs require filter")
+            })?;
+            datalens_chain::DatasetSelector::try_evm_logs(filter)?
+        }
+    };
+    let response_shape = match request.dataset {
+        Dataset::Blocks => datalens_planner::ResponseShape::LegacyEvmBlocks,
+        Dataset::Logs => datalens_planner::ResponseShape::LegacyEvmLogs,
+    };
+
+    Ok(NativeQueryInput {
+        chain: request.chain,
+        dataset_key: DatasetKey::from(request.dataset),
+        ledger_range: LedgerRange::from_block_range(request.range),
+        selector,
+        response_shape,
+        field_selection: datalens_planner::FieldSelection::All,
+    })
+}
+
 #[derive(Clone)]
 pub struct QueryService<S> {
     storage: LocalStorage,
@@ -276,7 +327,7 @@ where
             return Err(error);
         }
         let response_range = request.range;
-        let response = self.query_native(NativeQueryInput::from_legacy_evm_query(request)?)?;
+        let response = self.query_native(legacy_evm_to_native_input(request)?)?;
         let hit_ranges = legacy_block_ranges(&response.cache.hit_ranges)?;
         let misses = legacy_block_ranges(&response.cache.missing_ranges)?;
 

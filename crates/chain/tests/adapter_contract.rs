@@ -16,7 +16,7 @@ impl ChainAdapter for EmptyAdapter {
             DatasetCapability::new(Dataset::Logs)
                 .with_selector(SelectorKind::EvmLogs)
                 .with_range(HeightRangeKind::Block)
-                .with_max_range_blocks(2)
+                .with_max_range_len(2)
                 .with_max_addresses_per_query(100)
                 .with_max_topics_per_query(4)
                 .with_empty_coverage(true)
@@ -36,12 +36,12 @@ impl ChainAdapter for EmptyAdapter {
     }
 
     fn fetch(&self, request: ChainFetchRequest) -> Result<ChainFetchResponse, DatalensError> {
-        Ok(ChainFetchResponse::empty(
+        Ok(ChainFetchResponse::try_empty(
             request.chain,
             request.dataset_key,
             request.range,
             request.selector,
-        )
+        )?
         .with_source_metadata(SourceMetadata {
             provider: "mock".to_owned(),
             request_id: Some("req-1".to_owned()),
@@ -88,7 +88,7 @@ fn test_fetch_request_response_and_capabilities_cover_query_cache_contract() {
         .dataset(&DatasetKey::evm_logs())
         .expect("logs capability");
     assert!(logs.supports_selector(SelectorKind::EvmLogs));
-    assert_eq!(logs.max_range_blocks(), Some(2));
+    assert_eq!(logs.max_range_len(), Some(2));
     assert_eq!(logs.max_topics_per_query(), Some(4));
     assert!(logs.supports_empty_coverage());
     assert!(logs.supports_safe_height());
@@ -146,13 +146,14 @@ fn test_fetch_response_validate_for_request_rejects_contract_mismatch() {
         LedgerRange::blocks(1, 2).expect("valid range"),
         selector.clone(),
     );
-    let response = ChainFetchResponse::new(
+    let response = ChainFetchResponse::try_new(
         chain,
         DatasetKey::evm_logs(),
         LedgerRange::blocks(1, 2).expect("valid range"),
         selector,
         QueryRows::EvmLogs(Vec::new()),
-    );
+    )
+    .expect("valid response");
 
     let error = response
         .validate_for_request(&request)
@@ -175,12 +176,13 @@ fn test_fetch_response_validate_for_request_rejects_unconfirmed_empty_response()
         })
         .expect("valid selector"),
     );
-    let response = ChainFetchResponse::empty(
+    let response = ChainFetchResponse::try_empty(
         chain,
         DatasetKey::evm_logs(),
         LedgerRange::blocks(1, 2).expect("valid range"),
         request.selector.clone(),
-    );
+    )
+    .expect("valid response");
 
     let error = response
         .validate_for_request(&request)

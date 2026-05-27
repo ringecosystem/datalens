@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{BlockRange, ChainIdentity, DatalensError, DatalensErrorKind, Dataset, DatasetKey};
+use crate::{DatalensError, DatalensErrorKind, DatasetKey};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BlockHeader {
@@ -216,32 +216,16 @@ impl TopicFilter {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct LegacyEvmQueryRequest {
-    pub chain: ChainIdentity,
-    pub dataset: Dataset,
-    pub range: BlockRange,
-    pub filter: Option<LogFilter>,
-    #[serde(default)]
-    pub include_block: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct CacheSummary {
-    pub hit_ranges: Vec<BlockRange>,
-    pub missing_ranges: Vec<BlockRange>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "dataset", content = "rows", rename_all = "snake_case")]
 pub enum QueryRows {
     #[serde(rename = "blocks", alias = "evm_blocks")]
     EvmBlocks(Vec<BlockHeader>),
     #[serde(rename = "logs", alias = "evm_logs")]
     EvmLogs(Vec<LogRecord>),
-    TronEvents(Vec<serde_json::Value>),
-    SolanaTransactions(Vec<serde_json::Value>),
-    SolanaInstructions(Vec<serde_json::Value>),
-    OtherJson(Vec<serde_json::Value>),
+    AdapterJson {
+        dataset_key: DatasetKey,
+        rows: Vec<serde_json::Value>,
+    },
 }
 
 impl QueryRows {
@@ -249,12 +233,7 @@ impl QueryRows {
         match self {
             Self::EvmBlocks(_) => DatasetKey::evm_blocks(),
             Self::EvmLogs(_) => DatasetKey::evm_logs(),
-            Self::TronEvents(_) => DatasetKey::tron_events(),
-            Self::SolanaTransactions(_) => DatasetKey::solana_transactions(),
-            Self::SolanaInstructions(_) => DatasetKey::solana_instructions(),
-            Self::OtherJson(_) => {
-                DatasetKey::try_new(crate::ChainFamily::Other("other".to_owned()), "json").unwrap()
-            }
+            Self::AdapterJson { dataset_key, .. } => dataset_key.clone(),
         }
     }
 
@@ -262,10 +241,7 @@ impl QueryRows {
         match self {
             Self::EvmBlocks(rows) => rows.len(),
             Self::EvmLogs(rows) => rows.len(),
-            Self::TronEvents(rows) => rows.len(),
-            Self::SolanaTransactions(rows) => rows.len(),
-            Self::SolanaInstructions(rows) => rows.len(),
-            Self::OtherJson(rows) => rows.len(),
+            Self::AdapterJson { rows, .. } => rows.len(),
         }
     }
 
@@ -279,19 +255,16 @@ impl QueryRows {
                 left.append(&mut right);
                 Ok(())
             }
-            (Self::TronEvents(left), Self::TronEvents(mut right)) => {
-                left.append(&mut right);
-                Ok(())
-            }
-            (Self::SolanaTransactions(left), Self::SolanaTransactions(mut right)) => {
-                left.append(&mut right);
-                Ok(())
-            }
-            (Self::SolanaInstructions(left), Self::SolanaInstructions(mut right)) => {
-                left.append(&mut right);
-                Ok(())
-            }
-            (Self::OtherJson(left), Self::OtherJson(mut right)) => {
+            (
+                Self::AdapterJson {
+                    dataset_key: left_key,
+                    rows: left,
+                },
+                Self::AdapterJson {
+                    dataset_key: right_key,
+                    rows: mut right,
+                },
+            ) if *left_key == right_key => {
                 left.append(&mut right);
                 Ok(())
             }
@@ -306,10 +279,7 @@ impl QueryRows {
         match self {
             Self::EvmBlocks(rows) => rows.sort_by_key(|row| row.number),
             Self::EvmLogs(rows) => rows.sort_by_key(|row| (row.block_number, row.log_index)),
-            Self::TronEvents(_)
-            | Self::SolanaTransactions(_)
-            | Self::SolanaInstructions(_)
-            | Self::OtherJson(_) => {}
+            Self::AdapterJson { .. } => {}
         }
     }
 }
@@ -322,7 +292,7 @@ pub struct DatasetRows {
 
 impl DatasetRows {
     pub fn new(dataset_key: DatasetKey, rows: QueryRows) -> Result<Self, DatalensError> {
-        if dataset_key != rows.dataset_key() && !matches!(rows, QueryRows::OtherJson(_)) {
+        if dataset_key != rows.dataset_key() {
             return Err(DatalensError::new(
                 DatalensErrorKind::Internal,
                 "dataset rows key does not match typed rows",
@@ -346,14 +316,6 @@ impl DatasetRows {
     pub fn row_count(&self) -> usize {
         self.rows.row_count()
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct LegacyEvmQueryResponse {
-    pub chain: ChainIdentity,
-    pub range: BlockRange,
-    pub cache: CacheSummary,
-    pub rows: QueryRows,
 }
 
 fn normalize_values(

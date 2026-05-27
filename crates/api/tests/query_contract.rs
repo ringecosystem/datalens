@@ -3,18 +3,17 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use datalens_api::QueryService;
 use datalens_api::config::{
     ChainConfig, DatasetsConfig, LogsDatasetConfig, PlannerConfig, WriterConfig,
 };
+use datalens_api::{LegacyEvmQueryRequest, LegacyEvmQueryResponse, QueryService};
 use datalens_chain::{
     AdapterCapabilities, ChainAdapter, ChainFetchRequest, ChainFetchResponse, ChainHeight,
     DatasetCapability, DatasetSelector, FinalityKind, HeightRangeKind, SelectorKind,
 };
 use datalens_core::{
     BlockHeader, BlockRange, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, Dataset,
-    DatasetKey, LedgerRange, LegacyEvmQueryRequest, LegacyEvmQueryResponse, LogFilter, LogRecord,
-    NetworkId, QueryRows,
+    DatasetKey, LedgerRange, LogFilter, LogRecord, NetworkId, QueryRows,
 };
 use datalens_storage::LocalStorage;
 
@@ -81,7 +80,7 @@ fn test_query_uses_adapter_range_limit_when_smaller_than_config() {
             block(3, "0x03"),
             block(4, "0x04"),
         ])
-        .with_blocks_max_range_blocks(1);
+        .with_blocks_max_range_len(1);
     let service = service(
         LocalStorage::new(temp_storage_root("adapter-range-limit")),
         source.clone(),
@@ -103,7 +102,7 @@ fn test_query_uses_adapter_range_limit_when_smaller_than_config() {
 
 #[test]
 fn test_query_uses_adapter_log_range_limit_when_smaller_than_config() {
-    let source = MockSource::default().with_logs_max_range_blocks(1);
+    let source = MockSource::default().with_logs_max_range_len(1);
     let service = service(
         LocalStorage::new(temp_storage_root("adapter-log-range-limit")),
         source.clone(),
@@ -299,8 +298,8 @@ struct MockSource {
     calls: Arc<Mutex<Vec<SourceCall>>>,
     error: Arc<Mutex<Option<DatalensErrorKind>>>,
     response_mutation: Arc<Mutex<Option<ResponseMutation>>>,
-    blocks_max_range_blocks: Arc<Mutex<u64>>,
-    logs_max_range_blocks: Arc<Mutex<u64>>,
+    blocks_max_range_len: Arc<Mutex<u64>>,
+    logs_max_range_len: Arc<Mutex<u64>>,
     max_addresses_per_query: Arc<Mutex<usize>>,
     safe_height: Arc<Mutex<ChainHeight>>,
 }
@@ -313,8 +312,8 @@ impl Default for MockSource {
             calls: Arc::new(Mutex::new(Vec::new())),
             error: Arc::new(Mutex::new(None)),
             response_mutation: Arc::new(Mutex::new(None)),
-            blocks_max_range_blocks: Arc::new(Mutex::new(2)),
-            logs_max_range_blocks: Arc::new(Mutex::new(2)),
+            blocks_max_range_len: Arc::new(Mutex::new(2)),
+            logs_max_range_len: Arc::new(Mutex::new(2)),
             max_addresses_per_query: Arc::new(Mutex::new(2)),
             safe_height: Arc::new(Mutex::new(
                 ChainHeight::block(100).with_finality(FinalityKind::Safe),
@@ -337,19 +336,19 @@ impl MockSource {
         self
     }
 
-    fn with_blocks_max_range_blocks(self, max_range_blocks: u64) -> Self {
+    fn with_blocks_max_range_len(self, max_range_len: u64) -> Self {
         *self
-            .blocks_max_range_blocks
+            .blocks_max_range_len
             .lock()
-            .expect("blocks max range blocks lock") = max_range_blocks;
+            .expect("blocks max range len lock") = max_range_len;
         self
     }
 
-    fn with_logs_max_range_blocks(self, max_range_blocks: u64) -> Self {
+    fn with_logs_max_range_len(self, max_range_len: u64) -> Self {
         *self
-            .logs_max_range_blocks
+            .logs_max_range_len
             .lock()
-            .expect("logs max range blocks lock") = max_range_blocks;
+            .expect("logs max range len lock") = max_range_len;
         self
     }
 
@@ -382,11 +381,11 @@ impl ChainAdapter for MockSource {
                 DatasetCapability::new(Dataset::Blocks)
                     .with_selector(SelectorKind::All)
                     .with_range(HeightRangeKind::Block)
-                    .with_max_range_blocks(
+                    .with_max_range_len(
                         *self
-                            .blocks_max_range_blocks
+                            .blocks_max_range_len
                             .lock()
-                            .expect("blocks max range blocks lock"),
+                            .expect("blocks max range len lock"),
                     )
                     .with_empty_coverage(true)
                     .with_safe_height(true)
@@ -397,11 +396,11 @@ impl ChainAdapter for MockSource {
                 DatasetCapability::new(Dataset::Logs)
                     .with_selector(SelectorKind::EvmLogs)
                     .with_range(HeightRangeKind::Block)
-                    .with_max_range_blocks(
+                    .with_max_range_len(
                         *self
-                            .logs_max_range_blocks
+                            .logs_max_range_len
                             .lock()
-                            .expect("logs max range blocks lock"),
+                            .expect("logs max range len lock"),
                     )
                     .with_max_addresses_per_query(
                         *self
@@ -431,40 +430,40 @@ impl ChainAdapter for MockSource {
             .legacy_dataset()
             .expect("legacy dataset")
         {
-            Dataset::Blocks => self.fetch_blocks(range).map(|rows| {
-                ChainFetchResponse::new(
+            Dataset::Blocks => self.fetch_blocks(range).and_then(|rows| {
+                Ok(ChainFetchResponse::try_new(
                     request.chain,
                     DatasetKey::evm_blocks(),
                     LedgerRange::from_block_range(range),
                     request.selector,
                     QueryRows::EvmBlocks(rows),
-                )
+                )?
                 .with_provider_diagnostics(datalens_chain::ProviderDiagnostics {
                     calls: range.len().min(usize::MAX as u128) as usize,
                     rows_scanned: 0,
                     warnings: Vec::new(),
-                })
+                }))
             }),
             Dataset::Logs => {
                 let filter = match &request.selector {
                     DatasetSelector::EvmLogs(filter) => filter,
                     selector => panic!("expected EVM logs selector, got {selector:?}"),
                 };
-                self.fetch_logs(range, filter).map(|rows| {
-                    ChainFetchResponse::new(
+                self.fetch_logs(range, filter).and_then(|rows| {
+                    Ok(ChainFetchResponse::try_new(
                         request.chain,
                         DatasetKey::evm_logs(),
                         LedgerRange::from_block_range(range),
                         request.selector,
                         QueryRows::EvmLogs(rows),
-                    )
+                    )?
                     .with_provider_diagnostics(
                         datalens_chain::ProviderDiagnostics {
                             calls: 1,
                             rows_scanned: 0,
                             warnings: Vec::new(),
                         },
-                    )
+                    ))
                 })
             }
         }?;

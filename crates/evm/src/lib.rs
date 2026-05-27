@@ -273,7 +273,7 @@ impl ChainAdapter for EvmRpcClient {
                 DatasetCapability::new(Dataset::Blocks)
                     .with_selector(SelectorKind::All)
                     .with_range(HeightRangeKind::Block)
-                    .with_max_range_blocks(self.max_block_batch_blocks)
+                    .with_max_range_len(self.max_block_batch_blocks)
                     .with_empty_coverage(true)
                     .with_safe_height(true)
                     .with_finalized_height(true)
@@ -287,7 +287,7 @@ impl ChainAdapter for EvmRpcClient {
                 DatasetCapability::new(Dataset::Logs)
                     .with_selector(SelectorKind::EvmLogs)
                     .with_range(HeightRangeKind::Block)
-                    .with_max_range_blocks(self.max_get_logs_range_blocks)
+                    .with_max_range_len(self.max_get_logs_range_blocks)
                     .with_max_addresses_per_query(self.max_addresses_per_query)
                     .with_empty_coverage(true)
                     .with_safe_height(true)
@@ -408,13 +408,13 @@ impl ChainAdapter for EvmRpcClient {
                 ));
             }
         };
-        Ok(ChainFetchResponse::new(
+        Ok(ChainFetchResponse::try_new(
             request.chain,
             request.dataset_key,
             LedgerRange::from_block_range(range),
             request.selector,
             rows,
-        )
+        )?
         .with_provider_diagnostics(datalens_chain::ProviderDiagnostics {
             calls: provider_calls,
             rows_scanned: 0,

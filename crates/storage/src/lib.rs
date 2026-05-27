@@ -513,7 +513,10 @@ fn empty_rows(dataset_key: DatasetKey) -> Result<DatasetRows, DatalensError> {
     let rows = match dataset_key.legacy_dataset() {
         Some(datalens_core::Dataset::Blocks) => QueryRows::EvmBlocks(Vec::new()),
         Some(datalens_core::Dataset::Logs) => QueryRows::EvmLogs(Vec::new()),
-        None => QueryRows::OtherJson(Vec::new()),
+        None => QueryRows::AdapterJson {
+            dataset_key: dataset_key.clone(),
+            rows: Vec::new(),
+        },
     };
     DatasetRows::new(dataset_key, rows)
 }
@@ -534,10 +537,9 @@ fn filter_rows(rows: DatasetRows, range: LedgerRange) -> DatasetRows {
                 .filter(|row| block_range.contains(row.block_number))
                 .collect(),
         ),
-        QueryRows::TronEvents(rows) => QueryRows::TronEvents(rows),
-        QueryRows::SolanaTransactions(rows) => QueryRows::SolanaTransactions(rows),
-        QueryRows::SolanaInstructions(rows) => QueryRows::SolanaInstructions(rows),
-        QueryRows::OtherJson(rows) => QueryRows::OtherJson(rows),
+        QueryRows::AdapterJson { dataset_key, rows } => {
+            QueryRows::AdapterJson { dataset_key, rows }
+        }
     };
     DatasetRows::new(dataset_key, rows).expect("filtered rows keep dataset key")
 }

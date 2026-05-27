@@ -5,8 +5,8 @@ use datalens_chain::{
     validate_durable_range,
 };
 use datalens_core::{
-    ChainIdentity, CoverageLevel, DatalensError, DatalensErrorKind, Dataset, DatasetId, DatasetKey,
-    LedgerRange, LegacyEvmQueryRequest, TimeRange,
+    ChainIdentity, CoverageLevel, DatalensError, DatalensErrorKind, DatasetId, DatasetKey,
+    LedgerRange, TimeRange,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -63,33 +63,6 @@ pub struct NativeQueryInput {
     pub selector: DatasetSelector,
     pub response_shape: ResponseShape,
     pub field_selection: FieldSelection,
-}
-
-impl NativeQueryInput {
-    pub fn from_legacy_evm_query(request: LegacyEvmQueryRequest) -> Result<Self, DatalensError> {
-        let selector = match request.dataset {
-            Dataset::Blocks => DatasetSelector::all(),
-            Dataset::Logs => {
-                let filter = request.filter.ok_or_else(|| {
-                    DatalensError::new(DatalensErrorKind::InvalidInput, "logs require filter")
-                })?;
-                DatasetSelector::try_evm_logs(filter)?
-            }
-        };
-        let response_shape = match request.dataset {
-            Dataset::Blocks => ResponseShape::LegacyEvmBlocks,
-            Dataset::Logs => ResponseShape::LegacyEvmLogs,
-        };
-
-        Ok(Self {
-            chain: request.chain,
-            dataset_key: DatasetKey::from(request.dataset),
-            ledger_range: LedgerRange::from_block_range(request.range),
-            selector,
-            response_shape,
-            field_selection: FieldSelection::All,
-        })
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -214,7 +187,7 @@ impl NativePlanner {
         validate_selector_limits(&input.selector, dataset_capability)?;
 
         let max_len = dataset_capability
-            .max_range_blocks()
+            .max_range_len()
             .unwrap_or(u64::MAX)
             .min(self.config.default_chunk_range_len)
             .max(1);

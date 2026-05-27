@@ -19,8 +19,7 @@ pub use coverage::CoverageLevel;
 pub use dataset::{Dataset, DatasetId, DatasetKey};
 pub use error::{DatalensError, DatalensErrorKind};
 pub use query::{
-    BlockHeader, CacheSummary, DatasetRows, EvmLogFilter, LegacyEvmQueryRequest,
-    LegacyEvmQueryResponse, LogFilter, LogRecord, QueryRows, TopicFilter,
+    BlockHeader, DatasetRows, EvmLogFilter, LogFilter, LogRecord, QueryRows, TopicFilter,
 };
 pub use range::{BlockRange, LedgerRange, LedgerRangeKind, TimeRange};
 pub use result::ResultEnvelope;
