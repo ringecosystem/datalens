@@ -416,23 +416,27 @@ fn intersect(left: BlockRange, right: BlockRange) -> Option<BlockRange> {
 
 fn empty_rows(dataset: Dataset) -> QueryRows {
     match dataset {
-        Dataset::Blocks => QueryRows::Blocks(Vec::new()),
-        Dataset::Logs => QueryRows::Logs(Vec::new()),
+        Dataset::Blocks => QueryRows::EvmBlocks(Vec::new()),
+        Dataset::Logs => QueryRows::EvmLogs(Vec::new()),
     }
 }
 
 fn filter_rows(rows: QueryRows, range: BlockRange) -> QueryRows {
     match rows {
-        QueryRows::Blocks(rows) => QueryRows::Blocks(
+        QueryRows::EvmBlocks(rows) => QueryRows::EvmBlocks(
             rows.into_iter()
                 .filter(|row| range.contains(row.number))
                 .collect(),
         ),
-        QueryRows::Logs(rows) => QueryRows::Logs(
+        QueryRows::EvmLogs(rows) => QueryRows::EvmLogs(
             rows.into_iter()
                 .filter(|row| range.contains(row.block_number))
                 .collect(),
         ),
+        QueryRows::TronEvents(rows) => QueryRows::TronEvents(rows),
+        QueryRows::SolanaTransactions(rows) => QueryRows::SolanaTransactions(rows),
+        QueryRows::SolanaInstructions(rows) => QueryRows::SolanaInstructions(rows),
+        QueryRows::OtherJson(rows) => QueryRows::OtherJson(rows),
     }
 }
 
@@ -455,7 +459,7 @@ mod tests {
         };
         let chain = test_chain();
         let selector = DatasetSelector::try_evm_logs(filter).expect("valid selector");
-        let rows = QueryRows::Logs(vec![
+        let rows = QueryRows::EvmLogs(vec![
             LogRecord::try_new(
                 1,
                 "0xblock".to_owned(),

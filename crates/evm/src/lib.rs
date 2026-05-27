@@ -2,11 +2,11 @@
 
 use datalens_chain::{
     AdapterCapabilities, ChainAdapter, ChainFetchRequest, ChainFetchResponse, ChainHeight,
-    DatasetCapability, DatasetSelector, FinalityKind, HeightRange, HeightRangeKind, SelectorKind,
+    DatasetCapability, DatasetSelector, FinalityKind, HeightRangeKind, SelectorKind,
 };
 use datalens_core::{
     BlockHeader, BlockRange, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, Dataset,
-    EvmLogFilter, LogFilter, LogRecord, NetworkId, QueryRows, TopicFilter,
+    DatasetKey, EvmLogFilter, LedgerRange, LogFilter, LogRecord, NetworkId, QueryRows, TopicFilter,
 };
 use reqwest::blocking::Client;
 use serde_json::{Value, json};
@@ -381,31 +381,37 @@ impl ChainAdapter for EvmRpcClient {
                 "only block ranges are supported",
             )
         })?;
-        let (rows, provider_calls) = match (&request.dataset, &request.selector) {
-            (Dataset::Blocks, DatasetSelector::All) => (
-                QueryRows::Blocks(self.fetch_blocks(range)?),
+        let (rows, provider_calls) = match (&request.dataset_key, &request.selector) {
+            (dataset, DatasetSelector::All) if *dataset == DatasetKey::evm_blocks() => (
+                QueryRows::EvmBlocks(self.fetch_blocks(range)?),
                 range.len().min(usize::MAX as u128) as usize,
             ),
-            (Dataset::Logs, DatasetSelector::EvmLogs(filter)) => {
-                (QueryRows::Logs(self.fetch_evm_logs(range, filter)?), 1)
+            (dataset, DatasetSelector::EvmLogs(filter)) if *dataset == DatasetKey::evm_logs() => {
+                (QueryRows::EvmLogs(self.fetch_evm_logs(range, filter)?), 1)
             }
-            (Dataset::Blocks, _) => {
+            (dataset, _) if *dataset == DatasetKey::evm_blocks() => {
                 return Err(DatalensError::new(
                     DatalensErrorKind::UnsupportedDataset,
                     "blocks require all selector",
                 ));
             }
-            (Dataset::Logs, _) => {
+            (dataset, _) if *dataset == DatasetKey::evm_logs() => {
                 return Err(DatalensError::new(
                     DatalensErrorKind::UnsupportedDataset,
                     "logs require evm logs selector",
                 ));
             }
+            _ => {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::UnsupportedDataset,
+                    "dataset is not supported by EVM adapter",
+                ));
+            }
         };
         Ok(ChainFetchResponse::new(
             request.chain,
-            request.dataset,
-            HeightRange::Block(range),
+            request.dataset_key,
+            LedgerRange::from_block_range(range),
             request.selector,
             rows,
         )
@@ -704,8 +710,8 @@ mod tests {
         let request = ChainFetchRequest::new(
             ChainIdentity::try_new(ChainFamily::Evm, "polygon", Some(NetworkId::numeric(137)))
                 .expect("valid chain"),
-            Dataset::Blocks,
-            HeightRange::Block(BlockRange::expect_new(1, 1)),
+            DatasetKey::evm_blocks(),
+            LedgerRange::from_block_range(BlockRange::expect_new(1, 1)),
             DatasetSelector::All,
         );
 
