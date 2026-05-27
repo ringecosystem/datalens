@@ -362,6 +362,32 @@ fn test_dataset_rows_envelope_keeps_dataset_key_with_typed_rows() {
 }
 
 #[test]
+fn test_dataset_rows_envelope_checks_adapter_json_dataset_key() {
+    let dataset_key = datalens_core::DatasetKey::tron_events();
+    let rows = datalens_core::DatasetRows::new(
+        dataset_key.clone(),
+        QueryRows::AdapterJson {
+            dataset_key: dataset_key.clone(),
+            rows: vec![serde_json::json!({"event": "Transfer"})],
+        },
+    )
+    .expect("matching adapter json rows");
+
+    assert_eq!(rows.dataset_key(), &dataset_key);
+    assert_eq!(rows.rows().row_count(), 1);
+
+    let error = datalens_core::DatasetRows::new(
+        datalens_core::DatasetKey::solana_transactions(),
+        QueryRows::AdapterJson {
+            dataset_key,
+            rows: Vec::new(),
+        },
+    )
+    .expect_err("adapter json dataset key mismatch");
+    assert_eq!(error.kind, DatalensErrorKind::Internal);
+}
+
+#[test]
 fn test_compact_coverage_key_is_deterministic_and_storage_safe() {
     let first = EvmLogFilter::try_from(LogFilter {
         addresses: vec!["0XAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned()],

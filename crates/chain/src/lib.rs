@@ -56,7 +56,7 @@ pub struct DatasetCapability {
     dataset: DatasetKey,
     selectors: Vec<SelectorKind>,
     ranges: Vec<HeightRangeKind>,
-    max_range_blocks: Option<u64>,
+    max_range_len: Option<u64>,
     max_addresses_per_query: Option<usize>,
     max_topics_per_query: Option<usize>,
     supports_empty_coverage: bool,
@@ -72,7 +72,7 @@ impl DatasetCapability {
             dataset: dataset.into(),
             selectors: Vec::new(),
             ranges: Vec::new(),
-            max_range_blocks: None,
+            max_range_len: None,
             max_addresses_per_query: None,
             max_topics_per_query: None,
             supports_empty_coverage: false,
@@ -93,8 +93,8 @@ impl DatasetCapability {
         self
     }
 
-    pub fn with_max_range_blocks(mut self, max_range_blocks: u64) -> Self {
-        self.max_range_blocks = Some(max_range_blocks);
+    pub fn with_max_range_len(mut self, max_range_len: u64) -> Self {
+        self.max_range_len = Some(max_range_len);
         self
     }
 
@@ -152,8 +152,8 @@ impl DatasetCapability {
         &self.ranges
     }
 
-    pub fn max_range_blocks(&self) -> Option<u64> {
-        self.max_range_blocks
+    pub fn max_range_len(&self) -> Option<u64> {
+        self.max_range_len
     }
 
     pub fn max_addresses_per_query(&self) -> Option<usize> {
@@ -427,15 +427,15 @@ pub struct ChainFetchResponse {
 }
 
 impl ChainFetchResponse {
-    pub fn new(
+    pub fn try_new(
         chain: ChainIdentity,
         dataset_key: DatasetKey,
         range: HeightRange,
         coverage_selector: DatasetSelector,
         rows: QueryRows,
-    ) -> Self {
-        let rows = DatasetRows::new(dataset_key.clone(), rows).expect("matching dataset rows");
-        Self {
+    ) -> Result<Self, DatalensError> {
+        let rows = DatasetRows::new(dataset_key.clone(), rows)?;
+        Ok(Self {
             chain,
             dataset_key,
             range,
@@ -443,21 +443,45 @@ impl ChainFetchResponse {
             coverage_selector,
             source_metadata: SourceMetadata::default(),
             provider_diagnostics: ProviderDiagnostics::default(),
-        }
+        })
     }
 
-    pub fn empty(
+    pub fn try_empty(
+        chain: ChainIdentity,
+        dataset_key: DatasetKey,
+        range: HeightRange,
+        coverage_selector: DatasetSelector,
+    ) -> Result<Self, DatalensError> {
+        let rows = match dataset_key.legacy_dataset() {
+            Some(Dataset::Blocks) => QueryRows::EvmBlocks(Vec::new()),
+            Some(Dataset::Logs) => QueryRows::EvmLogs(Vec::new()),
+            None => QueryRows::AdapterJson {
+                dataset_key: dataset_key.clone(),
+                rows: Vec::new(),
+            },
+        };
+        Self::try_new(chain, dataset_key, range, coverage_selector, rows)
+    }
+
+    pub fn expect_new(
+        chain: ChainIdentity,
+        dataset_key: DatasetKey,
+        range: HeightRange,
+        coverage_selector: DatasetSelector,
+        rows: QueryRows,
+    ) -> Self {
+        Self::try_new(chain, dataset_key, range, coverage_selector, rows)
+            .expect("matching dataset rows")
+    }
+
+    pub fn expect_empty(
         chain: ChainIdentity,
         dataset_key: DatasetKey,
         range: HeightRange,
         coverage_selector: DatasetSelector,
     ) -> Self {
-        let rows = match dataset_key.legacy_dataset() {
-            Some(Dataset::Blocks) => QueryRows::EvmBlocks(Vec::new()),
-            Some(Dataset::Logs) => QueryRows::EvmLogs(Vec::new()),
-            None => QueryRows::OtherJson(Vec::new()),
-        };
-        Self::new(chain, dataset_key, range, coverage_selector, rows)
+        Self::try_empty(chain, dataset_key, range, coverage_selector)
+            .expect("matching empty dataset rows")
     }
 
     pub fn with_source_metadata(mut self, source_metadata: SourceMetadata) -> Self {

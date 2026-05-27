@@ -3,26 +3,25 @@ use datalens_chain::{
     SelectorKind,
 };
 use datalens_core::{
-    ChainFamily, ChainIdentity, DatalensErrorKind, Dataset, DatasetKey, LedgerRange,
-    LegacyEvmQueryRequest, LogFilter, NetworkId,
+    ChainFamily, ChainIdentity, DatalensErrorKind, DatasetKey, LedgerRange, NetworkId,
 };
 
 use datalens_planner::*;
 
 #[test]
-fn test_evm_query_request_converts_to_native_plan_input() {
-    let request = LegacyEvmQueryRequest {
+fn test_native_query_input_is_planner_boundary() {
+    let input = NativeQueryInput {
         chain: ethereum_identity(),
-        dataset: Dataset::Logs,
-        range: datalens_core::BlockRange::expect_new(10, 12),
-        filter: Some(LogFilter {
+        dataset_key: DatasetKey::evm_logs(),
+        ledger_range: LedgerRange::blocks(10, 12).expect("valid range"),
+        selector: datalens_chain::DatasetSelector::try_evm_logs(datalens_core::LogFilter {
             addresses: vec!["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()],
             topics: vec![None],
-        }),
-        include_block: false,
+        })
+        .expect("valid selector"),
+        response_shape: ResponseShape::LegacyEvmLogs,
+        field_selection: FieldSelection::All,
     };
-
-    let input = NativeQueryInput::from_legacy_evm_query(request).expect("native input");
 
     assert_eq!(input.chain, ethereum_identity());
     assert_eq!(input.dataset_key, DatasetKey::evm_logs());
@@ -36,14 +35,14 @@ fn test_evm_query_request_converts_to_native_plan_input() {
 
 #[test]
 fn test_native_planner_rejects_range_beyond_durable_boundary() {
-    let input = NativeQueryInput::from_legacy_evm_query(LegacyEvmQueryRequest {
+    let input = NativeQueryInput {
         chain: ethereum_identity(),
-        dataset: Dataset::Blocks,
-        range: datalens_core::BlockRange::expect_new(9, 10),
-        filter: None,
-        include_block: false,
-    })
-    .expect("native input");
+        dataset_key: DatasetKey::evm_blocks(),
+        ledger_range: LedgerRange::blocks(9, 10).expect("valid range"),
+        selector: datalens_chain::DatasetSelector::all(),
+        response_shape: ResponseShape::LegacyEvmBlocks,
+        field_selection: FieldSelection::All,
+    };
 
     let error = NativePlanner::new(NativePlannerConfig {
         max_query_range_len: 10,
@@ -62,17 +61,18 @@ fn test_native_planner_rejects_range_beyond_durable_boundary() {
 
 #[test]
 fn test_native_planner_builds_executable_plan_from_capabilities() {
-    let input = NativeQueryInput::from_legacy_evm_query(LegacyEvmQueryRequest {
+    let input = NativeQueryInput {
         chain: ethereum_identity(),
-        dataset: Dataset::Logs,
-        range: datalens_core::BlockRange::expect_new(1, 4),
-        filter: Some(LogFilter {
+        dataset_key: DatasetKey::evm_logs(),
+        ledger_range: LedgerRange::blocks(1, 4).expect("valid range"),
+        selector: datalens_chain::DatasetSelector::try_evm_logs(datalens_core::LogFilter {
             addresses: vec!["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()],
             topics: vec![None],
-        }),
-        include_block: false,
-    })
-    .expect("native input");
+        })
+        .expect("valid selector"),
+        response_shape: ResponseShape::LegacyEvmLogs,
+        field_selection: FieldSelection::All,
+    };
 
     let plan = NativePlanner::new(NativePlannerConfig {
         max_query_range_len: 10,
@@ -127,19 +127,19 @@ fn test_native_planner_builds_executable_plan_from_capabilities() {
 fn capabilities() -> AdapterCapabilities {
     AdapterCapabilities::new(ethereum_identity())
         .with_dataset_capability(
-            DatasetCapability::new(Dataset::Blocks)
+            DatasetCapability::new(DatasetKey::evm_blocks())
                 .with_selector(SelectorKind::All)
                 .with_range(HeightRangeKind::Block)
-                .with_max_range_blocks(2)
+                .with_max_range_len(2)
                 .with_safe_height(true)
                 .with_finalized_height(true)
                 .with_range_split(true),
         )
         .with_dataset_capability(
-            DatasetCapability::new(Dataset::Logs)
+            DatasetCapability::new(DatasetKey::evm_logs())
                 .with_selector(SelectorKind::EvmLogs)
                 .with_range(HeightRangeKind::Block)
-                .with_max_range_blocks(2)
+                .with_max_range_len(2)
                 .with_max_addresses_per_query(1)
                 .with_max_topics_per_query(4)
                 .with_safe_height(true)

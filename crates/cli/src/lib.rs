@@ -1,13 +1,13 @@
 use std::net::SocketAddr;
 
 use clap::{Args, Parser, Subcommand};
-use datalens_api::QueryService;
 pub use datalens_api::config::{ChainConfig, DatalensConfig, FinalityConfig};
+use datalens_api::{LegacyEvmQueryRequest, QueryService};
 use datalens_chain::ChainAdapter;
 pub use datalens_core::DatalensErrorKind;
 use datalens_core::{
-    BlockRange, ChainFamily, ChainIdentity, DatalensError, Dataset, EvmLogFilter,
-    LegacyEvmQueryRequest, LogFilter, NetworkId,
+    BlockRange, ChainFamily, ChainIdentity, DatalensError, Dataset, EvmLogFilter, LogFilter,
+    NetworkId,
 };
 use datalens_evm::{EvmAdapter, EvmAdapterMetadata, EvmFinalityPolicy, EvmRpcClient};
 use datalens_storage::LocalStorage;
