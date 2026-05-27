@@ -1250,6 +1250,7 @@ dependencies = [
  "axum",
  "datalens-chain",
  "datalens-core",
+ "datalens-executor",
  "datalens-planner",
  "datalens-storage",
  "datalens-writer",
@@ -1306,6 +1307,19 @@ dependencies = [
  "datalens-core",
  "log",
  "reqwest",
+ "serde_json",
+]
+
+[[package]]
+name = "datalens-executor"
+version = "0.1.0"
+dependencies = [
+ "datalens-chain",
+ "datalens-core",
+ "datalens-planner",
+ "datalens-storage",
+ "datalens-writer",
+ "log",
  "serde_json",
 ]
 

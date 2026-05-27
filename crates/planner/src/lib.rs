@@ -8,6 +8,7 @@ use datalens_core::{
     ChainIdentity, CoverageLevel, DatalensError, DatalensErrorKind, DatasetId, DatasetKey,
     LedgerRange, TimeRange,
 };
+use datalens_storage::missing_ranges;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlanRequest {
@@ -99,6 +100,31 @@ pub enum FinalityPolicy {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum QueryPlanStatus {
+    FullHit,
+    PartialHit,
+    Miss,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoverageSummary {
+    pub status: QueryPlanStatus,
+    pub hit_ranges: Vec<LedgerRange>,
+    pub missing_ranges: Vec<LedgerRange>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DurableReadSegment {
+    pub range: LedgerRange,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DurableFetchTask {
+    pub range: LedgerRange,
+    pub cache_write: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeQueryPlan {
     pub chain: ChainIdentity,
     pub dataset_key: DatasetKey,
@@ -109,6 +135,9 @@ pub struct NativeQueryPlan {
     pub range_split: RangeSplitStrategy,
     pub capability_requirements: Vec<AdapterCapabilityRequirement>,
     pub finality_policy: FinalityPolicy,
+    pub coverage: CoverageSummary,
+    pub read_segments: Vec<DurableReadSegment>,
+    pub fetch_tasks: Vec<DurableFetchTask>,
 }
 
 impl NativeQueryPlan {
@@ -141,6 +170,16 @@ impl NativePlanner {
         input: NativeQueryInput,
         capabilities: &AdapterCapabilities,
         durable_boundary: ChainHeight,
+    ) -> Result<NativeQueryPlan, DatalensError> {
+        self.plan_with_coverage(input, capabilities, durable_boundary, Vec::new())
+    }
+
+    pub fn plan_with_coverage(
+        &self,
+        input: NativeQueryInput,
+        capabilities: &AdapterCapabilities,
+        durable_boundary: ChainHeight,
+        covered_ranges: Vec<LedgerRange>,
     ) -> Result<NativeQueryPlan, DatalensError> {
         if input.ledger_range.len() > u128::from(self.config.max_query_range_len) {
             return Err(DatalensError::new(
@@ -192,6 +231,33 @@ impl NativePlanner {
             .min(self.config.default_chunk_range_len)
             .max(1);
 
+        let hit_ranges = covered_ranges
+            .into_iter()
+            .filter_map(|range| range.intersection(&input.ledger_range))
+            .collect::<Vec<_>>();
+        let miss_ranges = missing_ranges(input.ledger_range.clone(), &hit_ranges);
+        let status = match (hit_ranges.is_empty(), miss_ranges.is_empty()) {
+            (_, true) => QueryPlanStatus::FullHit,
+            (true, false) => QueryPlanStatus::Miss,
+            (false, false) => QueryPlanStatus::PartialHit,
+        };
+        let read_segments = hit_ranges
+            .iter()
+            .cloned()
+            .map(|range| DurableReadSegment { range })
+            .collect();
+        let fetch_tasks = miss_ranges
+            .iter()
+            .map(|range| range.split(max_len))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .map(|range| DurableFetchTask {
+                range,
+                cache_write: true,
+            })
+            .collect();
+
         Ok(NativeQueryPlan {
             chain: input.chain,
             dataset_key: input.dataset_key.clone(),
@@ -211,6 +277,13 @@ impl NativePlanner {
             finality_policy: FinalityPolicy::DurableCache {
                 boundary: durable_boundary,
             },
+            coverage: CoverageSummary {
+                status,
+                hit_ranges,
+                missing_ranges: miss_ranges,
+            },
+            read_segments,
+            fetch_tasks,
         })
     }
 }
