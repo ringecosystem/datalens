@@ -5,8 +5,11 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
+aws-config = "1.8.11"
+aws-sdk-s3.workspace = true
 datalens-chain = { path = "../chain" }
 datalens-core = { path = "../core" }
 log.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tokio.workspace = true

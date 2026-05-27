@@ -1,6 +1,6 @@
 //! Edge API boundary for datalens.
 
-use std::{collections::BTreeMap, env, fs, net::SocketAddr, path::Path};
+use std::{collections::BTreeMap, env, fs, net::SocketAddr, path::Path, sync::Arc};
 
 use axum::{
     Json, Router,
@@ -15,7 +15,9 @@ use datalens_core::{
     LedgerRange, LogFilter, QueryRows,
 };
 use datalens_planner::{NativePlanner, NativePlannerConfig, NativeQueryInput};
-use datalens_storage::{LocalStorage, StorageWriteRequest, missing_ranges};
+use datalens_storage::{
+    S3ObjectStoreConfig, StorageRepository, StorageWriteRequest, missing_ranges,
+};
 use serde::{Deserialize, Serialize};
 
 pub mod auth {
@@ -109,9 +111,47 @@ pub mod config {
         pub bind: String,
     }
 
-    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
     pub struct StorageConfig {
         pub backend: String,
+        #[serde(default)]
+        pub local: Option<LocalStorageConfig>,
+        #[serde(default)]
+        pub s3: Option<S3ObjectStoreConfig>,
+    }
+
+    #[derive(Deserialize)]
+    struct RawStorageConfig {
+        backend: String,
+        #[serde(default)]
+        root: Option<String>,
+        #[serde(default)]
+        local: Option<LocalStorageConfig>,
+        #[serde(default)]
+        s3: Option<S3ObjectStoreConfig>,
+    }
+
+    impl<'de> Deserialize<'de> for StorageConfig {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            let raw = RawStorageConfig::deserialize(deserializer)?;
+            let local = match (raw.local, raw.root) {
+                (Some(local), _) => Some(local),
+                (None, Some(root)) => Some(LocalStorageConfig { root }),
+                (None, None) => None,
+            };
+            Ok(Self {
+                backend: raw.backend,
+                local,
+                s3: raw.s3,
+            })
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    pub struct LocalStorageConfig {
         pub root: String,
     }
 
@@ -256,7 +296,7 @@ pub fn legacy_evm_to_native_input(
 
 #[derive(Clone)]
 pub struct QueryService<S> {
-    storage: LocalStorage,
+    storage: Arc<dyn StorageRepository>,
     source: S,
     planner: PlannerConfig,
     writer: WriterConfig,
@@ -284,7 +324,7 @@ where
     S: ChainAdapter,
 {
     pub fn new(
-        storage: LocalStorage,
+        storage: impl StorageRepository + 'static,
         source: S,
         planner: PlannerConfig,
         writer: WriterConfig,
@@ -294,7 +334,7 @@ where
     }
 
     pub fn new_named(
-        storage: LocalStorage,
+        storage: impl StorageRepository + 'static,
         source: S,
         planner: PlannerConfig,
         writer: WriterConfig,
@@ -302,7 +342,7 @@ where
         chain: ChainConfig,
     ) -> Self {
         Self {
-            storage,
+            storage: Arc::new(storage),
             source,
             planner,
             writer,

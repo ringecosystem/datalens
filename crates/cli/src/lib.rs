@@ -10,7 +10,7 @@ use datalens_core::{
     NetworkId,
 };
 use datalens_evm::{EvmAdapter, EvmAdapterMetadata, EvmFinalityPolicy, EvmRpcClient};
-use datalens_storage::LocalStorage;
+use datalens_storage::{DurableStorage, LocalStorage, S3ObjectStore};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -118,7 +118,7 @@ async fn serve_command(
     validate_config(&config)?;
     let bind = parse_bind(&config.server.bind)?;
     let (chain_name, chain) = first_chain(&config)?;
-    let service = build_service(&config, chain_name, chain);
+    let service = build_service(&config, chain_name, chain)?;
 
     let adapter = EvmAdapter::new(EvmAdapterMetadata::default());
     let _capabilities = adapter.capabilities();
@@ -144,7 +144,8 @@ fn doctor_command(command: ConfigCommand) -> Result<(), Box<dyn std::error::Erro
         },
         "storage": {
             "backend": config.storage.backend,
-            "root": config.storage.root,
+            "local": config.storage.local,
+            "s3": config.storage.s3,
         },
         "planner": config.planner,
         "writer": config.writer,
@@ -159,7 +160,7 @@ fn query_command(command: QueryCommand) -> Result<(), Box<dyn std::error::Error 
     validate_config(&config)?;
     let chain_name = query_chain(&command.command);
     let (chain_name, chain) = configured_chain(&config, &chain_name)?;
-    let service = build_service(&config, chain_name, chain);
+    let service = build_service(&config, chain_name, chain)?;
     let request = match command.command {
         QuerySubcommand::Blocks(command) => LegacyEvmQueryRequest {
             chain: chain_identity(chain_name, chain)?,
@@ -203,7 +204,8 @@ fn inspect_command(
             "read_only": true,
             "storage": {
                 "backend": config.storage.backend,
-                "root": config.storage.root,
+                "local": config.storage.local,
+                "s3": config.storage.s3,
             },
             "message": "inspect manifest is reserved for the storage inspection API",
         }),
@@ -212,7 +214,8 @@ fn inspect_command(
             "read_only": true,
             "storage": {
                 "backend": config.storage.backend,
-                "root": config.storage.root,
+                "local": config.storage.local,
+                "s3": config.storage.s3,
             },
             "message": "inspect coverage is reserved for the storage inspection API",
         }),
@@ -239,17 +242,42 @@ pub fn validate_config(config: &DatalensConfig) -> Result<(), DatalensError> {
         ));
     }
     parse_bind(&config.server.bind)?;
-    if config.storage.backend != "local" {
+    if !matches!(config.storage.backend.as_str(), "local" | "s3") {
         return Err(DatalensError::new(
             DatalensErrorKind::UnsupportedDataset,
-            "only local storage backend is supported",
+            "storage.backend must be local or s3",
         ));
     }
-    if config.storage.root.trim().is_empty() {
-        return Err(DatalensError::new(
-            DatalensErrorKind::InvalidInput,
-            "storage.root must not be empty",
-        ));
+    match config.storage.backend.as_str() {
+        "local" => {
+            let local = config.storage.local.as_ref().ok_or_else(|| {
+                DatalensError::new(
+                    DatalensErrorKind::InvalidInput,
+                    "storage.local.root or legacy storage.root must be set",
+                )
+            })?;
+            if local.root.trim().is_empty() {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::InvalidInput,
+                    "storage.local.root must not be empty",
+                ));
+            }
+        }
+        "s3" => {
+            let s3 = config.storage.s3.as_ref().ok_or_else(|| {
+                DatalensError::new(
+                    DatalensErrorKind::InvalidInput,
+                    "storage.s3 must be set when storage.backend is s3",
+                )
+            })?;
+            if s3.bucket.trim().is_empty() {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::InvalidInput,
+                    "storage.s3.bucket must not be empty",
+                ));
+            }
+        }
+        _ => unreachable!("storage backend validated"),
     }
     if config.planner.max_query_range_blocks == 0 {
         return Err(DatalensError::new(
@@ -404,13 +432,13 @@ fn build_service(
     config: &DatalensConfig,
     chain_name: &str,
     chain: &ChainConfig,
-) -> QueryService<EvmRpcClient> {
+) -> Result<QueryService<EvmRpcClient>, DatalensError> {
     log::info!(
         "using chain {chain_name} kind={} chain_id={}",
         chain.kind,
         chain.chain_id
     );
-    let storage = LocalStorage::new(&config.storage.root);
+    let storage = build_storage(config)?;
     let source = EvmRpcClient::with_chain(
         chain.rpc_urls.clone(),
         chain_identity(chain_name, chain).expect("validated chain identity"),
@@ -419,14 +447,44 @@ fn build_service(
         chain.datasets.logs.max_get_logs_range_blocks,
         chain.datasets.logs.max_addresses_per_query,
     );
-    datalens_api::QueryService::new_named(
+    Ok(datalens_api::QueryService::new_named(
         storage,
         source,
         config.planner.clone(),
         config.writer.clone(),
         chain_name.to_owned(),
         chain.clone(),
-    )
+    ))
+}
+
+fn build_storage(
+    config: &DatalensConfig,
+) -> Result<Box<dyn datalens_storage::StorageRepository>, DatalensError> {
+    match config.storage.backend.as_str() {
+        "local" => {
+            let local = config.storage.local.as_ref().ok_or_else(|| {
+                DatalensError::new(
+                    DatalensErrorKind::InvalidInput,
+                    "storage.local.root or legacy storage.root must be set",
+                )
+            })?;
+            Ok(Box::new(LocalStorage::new(&local.root)))
+        }
+        "s3" => {
+            let s3 = config.storage.s3.clone().ok_or_else(|| {
+                DatalensError::new(
+                    DatalensErrorKind::InvalidInput,
+                    "storage.s3 must be set when storage.backend is s3",
+                )
+            })?;
+            let store = S3ObjectStore::from_config(s3)?;
+            Ok(Box::new(DurableStorage::from_object_store(store)))
+        }
+        _ => Err(DatalensError::new(
+            DatalensErrorKind::UnsupportedDataset,
+            "storage.backend must be local or s3",
+        )),
+    }
 }
 
 fn evm_finality_policy(finality: &FinalityConfig) -> EvmFinalityPolicy {

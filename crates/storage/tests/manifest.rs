@@ -3,11 +3,49 @@ use std::path::PathBuf;
 use datalens_chain::DatasetSelector;
 use datalens_chain::FinalityLevel;
 use datalens_core::{
-    BlockHeader, ChainFamily, ChainIdentity, DatalensErrorKind, DatasetKey, DatasetRows,
-    LedgerRange, LedgerRangeKind, LogFilter, LogRecord, NetworkId, QueryRows,
+    BlockHeader, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey,
+    DatasetRows, LedgerRange, LedgerRangeKind, LogFilter, LogRecord, NetworkId, QueryRows,
 };
 
 use datalens_storage::*;
+
+#[derive(Clone, Debug)]
+struct FailingPutObjectStore {
+    inner: LocalObjectStore,
+}
+
+impl FailingPutObjectStore {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            inner: LocalObjectStore::new(root),
+        }
+    }
+}
+
+impl ObjectStore for FailingPutObjectStore {
+    fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError> {
+        self.inner.get(key)
+    }
+
+    fn put(&self, _key: &str, _bytes: &[u8]) -> Result<(), DatalensError> {
+        Err(DatalensError::new(
+            DatalensErrorKind::StorageWriteFailure,
+            "injected object write failure",
+        ))
+    }
+
+    fn exists(&self, key: &str) -> Result<bool, DatalensError> {
+        self.inner.exists(key)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
+        self.inner.list(prefix)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), DatalensError> {
+        self.inner.delete(key)
+    }
+}
 
 #[test]
 fn test_log_filter_object_key_uses_compact_storage_safe_segment() {
@@ -128,8 +166,10 @@ fn test_manifest_deserialization_accepts_valid_coverage_semantics() {
 #[test]
 fn test_covered_ranges_rejects_malformed_manifest_entries() {
     let storage = LocalStorage::new(temp_storage_root("malformed-manifest"));
+    std::fs::create_dir_all(storage.root().join("chains/evm/ethereum/1"))
+        .expect("create manifest parent");
     std::fs::write(
-        storage.manifest_path(),
+        storage.manifest_path(&test_chain()),
         r#"{
             "entries":[{
                 "chain":{"family":"Evm","configured_name":"ethereum","network_id":{"kind":"numeric","value":1}},
@@ -166,7 +206,7 @@ fn test_read_rows_rejects_invalid_cached_log_record() {
         LedgerRangeKind::Block,
         &DatasetSelector::all(),
     );
-    let object_key = format!("objects/{filter_key}/1-1.json");
+    let object_key = format!("{filter_key}/00000000000000000001-00000000000000000001.json");
     let object_path = storage.root().join(&object_key);
     std::fs::create_dir_all(object_path.parent().expect("object parent"))
         .expect("create object dir");
@@ -188,8 +228,10 @@ fn test_read_rows_rejects_invalid_cached_log_record() {
         }"#,
     )
     .expect("write object");
+    std::fs::create_dir_all(storage.root().join("chains/evm/ethereum/1"))
+        .expect("create manifest parent");
     std::fs::write(
-        storage.manifest_path(),
+        storage.manifest_path(&test_chain()),
         format!(
             r#"{{
                 "entries":[{{
@@ -253,7 +295,7 @@ fn test_selector_coverage_key_includes_chain_dataset_and_stable_fingerprint() {
         &selector,
     );
 
-    assert!(key.starts_with("chains/evm/ethereum/1/datasets/evm.logs/ranges/block/selectors/"));
+    assert!(key.starts_with("chains/evm/ethereum/1/datasets/evm.logs/json/block/"));
     assert!(key.contains("/evm-logs/addr-topic-"));
     assert!(!key.contains("0xaaaaaaaa"));
 }
@@ -300,10 +342,135 @@ fn test_manifest_entry_records_chain_neutral_coverage_identity() {
             .object_key
             .as_deref()
             .expect("object key")
-            .starts_with(
-                "objects/chains/evm/ethereum/1/datasets/evm.blocks/ranges/block/selectors/all/"
-            )
+            .starts_with("chains/evm/ethereum/1/datasets/evm.blocks/json/block/all/")
     );
+}
+
+#[test]
+fn test_manifest_is_chain_namespaced() {
+    let storage = LocalStorage::new(temp_storage_root("chain-manifest"));
+    let chain = test_chain();
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &DatasetSelector::all(),
+            range: LedgerRange::blocks(1, 1).expect("valid range"),
+            rows: &DatasetRows::new(DatasetKey::evm_logs(), QueryRows::EvmLogs(Vec::new()))
+                .expect("dataset rows"),
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write rows");
+
+    assert!(
+        storage
+            .root()
+            .join("chains/evm/ethereum/1/manifest.json")
+            .exists()
+    );
+}
+
+#[test]
+fn test_write_rows_is_idempotent_for_same_logical_shard() {
+    let storage = LocalStorage::new(temp_storage_root("idempotent-write"));
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let range = LedgerRange::blocks(1, 2).expect("valid range");
+    let rows = DatasetRows::new(
+        DatasetKey::evm_blocks(),
+        QueryRows::EvmBlocks(vec![BlockHeader {
+            number: 1,
+            hash: "0xblock".to_owned(),
+            parent_hash: "0xparent".to_owned(),
+            timestamp: 1,
+        }]),
+    )
+    .expect("dataset rows");
+
+    for _ in 0..2 {
+        storage
+            .write_rows(StorageWriteRequest {
+                chain: &chain,
+                dataset_key: DatasetKey::evm_blocks(),
+                selector: &selector,
+                range: range.clone(),
+                rows: &rows,
+                finality_level: FinalityLevel::Safe,
+                record_empty_coverage: true,
+            })
+            .expect("write rows");
+    }
+
+    let manifest = storage.manifest().expect("manifest");
+    assert_eq!(manifest.entries.len(), 1);
+}
+
+#[test]
+fn test_object_write_failure_does_not_update_manifest() {
+    let root = temp_storage_root("object-write-failure");
+    let storage = DurableStorage::from_object_store(FailingPutObjectStore::new(root.clone()));
+    let rows = DatasetRows::new(
+        DatasetKey::evm_blocks(),
+        QueryRows::EvmBlocks(vec![BlockHeader {
+            number: 1,
+            hash: "0xblock".to_owned(),
+            parent_hash: "0xparent".to_owned(),
+            timestamp: 1,
+        }]),
+    )
+    .expect("dataset rows");
+
+    let error = storage
+        .write_rows(StorageWriteRequest {
+            chain: &test_chain(),
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &DatasetSelector::all(),
+            range: LedgerRange::blocks(1, 1).expect("valid range"),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect_err("write failure");
+
+    assert_eq!(error.kind, DatalensErrorKind::StorageWriteFailure);
+    assert!(!root.join("chains/evm/ethereum/1/manifest.json").exists());
+}
+
+#[test]
+fn test_read_rows_rejects_manifest_entry_with_missing_object() {
+    let storage = LocalStorage::new(temp_storage_root("missing-object"));
+    std::fs::create_dir_all(storage.root().join("chains/evm/ethereum/1"))
+        .expect("create manifest parent");
+    std::fs::write(
+        storage.manifest_path(&test_chain()),
+        r#"{
+            "entries":[{
+                "chain":{"family":"Evm","configured_name":"ethereum","network_id":{"kind":"numeric","value":1}},
+                "dataset_key":{"family":"Evm","name":"blocks"},
+                "range":{"kind":{"kind":"block"},"start":1,"end":1},
+                "selector_fingerprint":"all",
+                "selector_canonical_key":"all",
+                "finality_level":"safe",
+                "object_key":"chains/evm/ethereum/1/datasets/evm.blocks/json/block/all/00000000000000000001-00000000000000000001.json",
+                "row_count":1
+            }]
+        }"#,
+    )
+    .expect("write manifest");
+
+    let error = storage
+        .read_rows(
+            &test_chain(),
+            &DatasetKey::evm_blocks(),
+            &DatasetSelector::all(),
+            LedgerRange::blocks(1, 1).expect("valid range"),
+        )
+        .expect_err("missing object");
+
+    assert_eq!(error.kind, DatalensErrorKind::StorageReadFailure);
+    assert!(error.message.contains("object not found"));
 }
 
 #[test]
