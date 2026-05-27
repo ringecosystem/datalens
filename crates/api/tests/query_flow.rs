@@ -677,7 +677,10 @@ impl ChainAdapter for MockSource {
                             .lock()
                             .expect("blocks max range blocks lock"),
                     )
-                    .with_empty_coverage(true),
+                    .with_empty_coverage(true)
+                    .with_safe_height(true)
+                    .with_finalized_height(true)
+                    .with_range_split(true),
             )
             .with_dataset_capability(
                 DatasetCapability::new(Dataset::Logs)
@@ -695,7 +698,10 @@ impl ChainAdapter for MockSource {
                             .lock()
                             .expect("max addresses per query lock"),
                     )
-                    .with_empty_coverage(true),
+                    .with_empty_coverage(true)
+                    .with_safe_height(true)
+                    .with_finalized_height(true)
+                    .with_range_split(true),
             )
     }
 
@@ -703,7 +709,7 @@ impl ChainAdapter for MockSource {
         Ok(ChainHeight::block(100))
     }
 
-    fn safe_height(&self) -> Result<ChainHeight, DatalensError> {
+    fn cache_safe_height(&self) -> Result<ChainHeight, DatalensError> {
         Ok(self.safe_height.lock().expect("safe height lock").clone())
     }
 
@@ -721,6 +727,11 @@ impl ChainAdapter for MockSource {
                     request.selector,
                     QueryRows::Blocks(rows),
                 )
+                .with_provider_diagnostics(datalens_chain::ProviderDiagnostics {
+                    calls: range.len().min(usize::MAX as u128) as usize,
+                    rows_scanned: 0,
+                    warnings: Vec::new(),
+                })
             }),
             Dataset::Logs => {
                 let filter = match &request.selector {
@@ -734,6 +745,13 @@ impl ChainAdapter for MockSource {
                         HeightRange::Block(range),
                         request.selector,
                         QueryRows::Logs(rows),
+                    )
+                    .with_provider_diagnostics(
+                        datalens_chain::ProviderDiagnostics {
+                            calls: 1,
+                            rows_scanned: 0,
+                            warnings: Vec::new(),
+                        },
                     )
                 })
             }

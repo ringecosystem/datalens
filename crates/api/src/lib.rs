@@ -10,8 +10,8 @@ use axum::{
     routing::{get, post},
 };
 use datalens_chain::{
-    ChainAdapter, ChainFetchRequest, ChainFetchResponse, ChainHeight, DatasetSelector,
-    FetchContext, FinalityKind, HeightRange, HeightRangeKind,
+    ChainAdapter, ChainFetchRequest, DatasetSelector, FetchContext, HeightRange, HeightRangeKind,
+    validate_durable_range,
 };
 use datalens_core::{
     BlockRange, CacheSummary, DatalensError, DatalensErrorKind, Dataset, QueryRequest,
@@ -260,8 +260,8 @@ where
             log::warn!("query validation failed kind={:?}", error.kind);
             return Err(error);
         }
-        let safe_height = self.source.safe_height()?;
-        validate_safe_query_range(request.range, &safe_height)?;
+        let safe_height = self.source.cache_safe_height()?;
+        validate_durable_range(&HeightRange::Block(request.range), &safe_height)?;
 
         let hit_ranges = self.storage.covered_ranges(
             &request.chain,
@@ -281,7 +281,7 @@ where
                 .read_rows(&request.chain, request.dataset, &selector, request.range)?;
 
         for range in split_ranges(&misses, self.chunk_size(request.dataset)) {
-            validate_safe_query_range(range, &safe_height)?;
+            validate_durable_range(&HeightRange::Block(range), &safe_height)?;
             let fetch_request = ChainFetchRequest::new(
                 request.chain.clone(),
                 request.dataset,
@@ -294,7 +294,7 @@ where
             });
             let fetched = match self.source.fetch(fetch_request.clone()) {
                 Ok(response) => {
-                    validate_fetch_response(&fetch_request, &response)?;
+                    response.validate_for_request(&fetch_request)?;
                     response.rows
                 }
                 Err(error) => {
@@ -397,6 +397,14 @@ where
                 "block ranges are not supported by adapter",
             ));
         }
+        if !dataset_capability.supports_safe_height()
+            && !dataset_capability.supports_finalized_height()
+        {
+            return Err(DatalensError::new(
+                DatalensErrorKind::UnsupportedDataset,
+                "adapter dataset does not expose safe or finalized height for durable cache",
+            ));
+        }
 
         match request.dataset {
             Dataset::Blocks if !self.chain.datasets.blocks.enabled => Err(DatalensError::new(
@@ -459,55 +467,6 @@ where
             .min(adapter_limit)
             .max(1)
     }
-}
-
-fn validate_fetch_response(
-    request: &ChainFetchRequest,
-    response: &ChainFetchResponse,
-) -> Result<(), DatalensError> {
-    if response.chain != request.chain
-        || response.dataset != request.dataset
-        || response.range != request.range
-        || response.coverage_selector != request.selector
-        || response.rows.dataset() != request.dataset
-    {
-        return Err(DatalensError::new(
-            DatalensErrorKind::Internal,
-            "chain adapter response does not match fetch request",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_safe_query_range(
-    range: BlockRange,
-    safe_height: &ChainHeight,
-) -> Result<(), DatalensError> {
-    if safe_height.range_kind != HeightRangeKind::Block {
-        return Err(DatalensError::new(
-            DatalensErrorKind::InvalidInput,
-            "adapter safe/finalized height is not a block height",
-        ));
-    }
-    if !matches!(
-        safe_height.finality,
-        FinalityKind::Safe | FinalityKind::Finalized
-    ) {
-        return Err(DatalensError::new(
-            DatalensErrorKind::InvalidInput,
-            "adapter safe/finalized height is not safe or finalized",
-        ));
-    }
-    if range.to_block > safe_height.value {
-        return Err(DatalensError::new(
-            DatalensErrorKind::InvalidInput,
-            format!(
-                "query range exceeds adapter safe/finalized height: requested to_block {}, safe/finalized height {}",
-                range.to_block, safe_height.value
-            ),
-        ));
-    }
-    Ok(())
 }
 
 pub fn router<S>(service: QueryService<S>, chain_names: Vec<String>) -> Router
