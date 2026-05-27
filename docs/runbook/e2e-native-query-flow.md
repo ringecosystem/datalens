@@ -481,9 +481,9 @@ find "$DATALENS_E2E_STORAGE_ROOT" -maxdepth 5 -type f | sort
 Expected object layout:
 
 ```text
-manifest.json
-objects/blocks/all/<from>-<to>.json
-objects/logs/<filter-key>/<from>-<to>.json
+chains/evm/<chain-name>/<network-id>/manifest.json
+chains/evm/<chain-name>/<network-id>/datasets/evm.blocks/parquet-v1/block/all/<from>-<to>.parquet
+chains/evm/<chain-name>/<network-id>/datasets/evm.logs/parquet-v1/block/<filter-key>/<from>-<to>.parquet
 ```
 
 Empty coverage entries should appear only in `manifest.json` with `row_count: 0` and

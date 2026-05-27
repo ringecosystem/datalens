@@ -28,8 +28,8 @@ chains/<chain-kind>/<chain-name>/
 
 ```text
 chains/evm/ethereum-mainnet/manifest.json
-chains/evm/ethereum-mainnet/datasets/logs/v1/addr-topic-7f3a91/018000000-018099999.parquet
-chains/evm/darwinia/datasets/blocks/v1/all/000000000-000099999.parquet
+chains/evm/ethereum-mainnet/datasets/evm.logs/parquet-v1/block/addr-topic-7f3a91/018000000-018099999.parquet
+chains/evm/darwinia/datasets/evm.blocks/parquet-v1/block/all/000000000-000099999.parquet
 ```
 
 布局使用 `chain-kind`，这样未来 `tron` 或 `solana` 适配器不需要塞进 EVM-only namespace。
@@ -66,6 +66,7 @@ kind，但在记录持久化覆盖之前，必须暴露等价的 safe/finalized 
   `solana.transactions`。
 - 已覆盖 ledger range，包括 range kind、start 和 end。
 - Schema 或标准化版本。
+- Object encoding，例如 `parquet-v1`。
 - 用于查找的 selector fingerprint，以及用于审计的 selector canonical key。
 - 字段覆盖范围或标准分片形态。
 - 持久化分片的 object key。

@@ -32,8 +32,8 @@ Examples:
 
 ```text
 chains/evm/ethereum-mainnet/manifest.json
-chains/evm/ethereum-mainnet/datasets/logs/v1/addr-topic-7f3a91/018000000-018099999.parquet
-chains/evm/darwinia/datasets/blocks/v1/all/000000000-000099999.parquet
+chains/evm/ethereum-mainnet/datasets/evm.logs/parquet-v1/block/addr-topic-7f3a91/018000000-018099999.parquet
+chains/evm/darwinia/datasets/evm.blocks/parquet-v1/block/all/000000000-000099999.parquet
 ```
 
 The layout uses `chain-kind` so future `tron` or `solana` adapters do not need to fit
@@ -75,6 +75,7 @@ A coverage entry should include:
   `solana.transactions`.
 - Covered ledger range, including range kind, start, and end.
 - Schema or normalization version.
+- Object encoding, for example `parquet-v1`.
 - Selector fingerprint for lookup and selector canonical key for audit.
 - Field coverage or canonical chunk shape.
 - Object key for the durable chunk.

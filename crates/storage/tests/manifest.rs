@@ -130,6 +130,21 @@ fn test_manifest_deserialization_rejects_invalid_coverage_semantics() {
         }]
     }"#;
     assert!(serde_json::from_str::<Manifest>(object_without_rows).is_err());
+
+    let encoding_key_mismatch = r#"{
+        "entries":[{
+            "chain":{"family":"Evm","configured_name":"ethereum","network_id":{"kind":"numeric","value":1}},
+            "dataset_key":{"family":"Evm","name":"logs"},
+            "range":{"kind":{"kind":"block"},"start":1,"end":2},
+            "selector_fingerprint":"evm-logs/addr-topic-deadbeef",
+            "selector_canonical_key":"evm-logs/addr=*",
+            "finality_level":"safe",
+            "object_key":"objects/logs/key/1-2.json",
+            "object_encoding":"parquet-v1",
+            "row_count":1
+        }]
+    }"#;
+    assert!(serde_json::from_str::<Manifest>(encoding_key_mismatch).is_err());
 }
 
 #[test]
@@ -295,7 +310,7 @@ fn test_selector_coverage_key_includes_chain_dataset_and_stable_fingerprint() {
         &selector,
     );
 
-    assert!(key.starts_with("chains/evm/ethereum/1/datasets/evm.logs/json/block/"));
+    assert!(key.starts_with("chains/evm/ethereum/1/datasets/evm.logs/parquet-v1/block/"));
     assert!(key.contains("/evm-logs/addr-topic-"));
     assert!(!key.contains("0xaaaaaaaa"));
 }
@@ -337,12 +352,199 @@ fn test_manifest_entry_records_chain_neutral_coverage_identity() {
     assert_eq!(entry.selector_fingerprint, "all");
     assert_eq!(entry.selector_canonical_key, "all");
     assert_eq!(entry.finality_level, ManifestFinalityLevel::Finalized);
+    assert_eq!(entry.object_encoding, Some(ObjectEncoding::ParquetV1));
     assert!(
         entry
             .object_key
             .as_deref()
             .expect("object key")
-            .starts_with("chains/evm/ethereum/1/datasets/evm.blocks/json/block/all/")
+            .starts_with("chains/evm/ethereum/1/datasets/evm.blocks/parquet-v1/block/all/")
+    );
+}
+
+#[test]
+fn test_evm_blocks_rows_write_parquet_and_read_back() {
+    let storage = LocalStorage::new(temp_storage_root("blocks-parquet-roundtrip"));
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let range = LedgerRange::blocks(10, 12).expect("valid range");
+    let rows = DatasetRows::new(
+        DatasetKey::evm_blocks(),
+        QueryRows::EvmBlocks(vec![
+            BlockHeader {
+                number: 10,
+                hash: "0xblock10".to_owned(),
+                parent_hash: "0xparent09".to_owned(),
+                timestamp: 100,
+            },
+            BlockHeader {
+                number: 12,
+                hash: "0xblock12".to_owned(),
+                parent_hash: "0xparent11".to_owned(),
+                timestamp: 120,
+            },
+        ]),
+    )
+    .expect("dataset rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &selector,
+            range: range.clone(),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write rows");
+
+    let manifest_bytes =
+        std::fs::read(storage.manifest_path(&chain)).expect("manifest bytes after write");
+    let manifest_json: serde_json::Value =
+        serde_json::from_slice(&manifest_bytes).expect("manifest json");
+    let entry = &manifest_json["entries"][0];
+    let object_key = entry["object_key"].as_str().expect("object key");
+    assert_eq!(entry["object_encoding"], "parquet-v1");
+    assert!(object_key.contains("/parquet-v1/"));
+    assert!(object_key.ends_with(".parquet"));
+
+    let object_bytes = std::fs::read(storage.root().join(object_key)).expect("object bytes");
+    assert_eq!(&object_bytes[..4], b"PAR1");
+
+    let read = storage
+        .read_rows(&chain, &DatasetKey::evm_blocks(), &selector, range)
+        .expect("read rows");
+    assert_eq!(read, rows);
+}
+
+#[test]
+fn test_evm_logs_rows_write_parquet_and_read_back() {
+    let storage = LocalStorage::new(temp_storage_root("logs-parquet-roundtrip"));
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let range = LedgerRange::blocks(10, 12).expect("valid range");
+    let rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![
+            LogRecord::try_new(
+                10,
+                "0xblock10".to_owned(),
+                "0xtx10".to_owned(),
+                1,
+                0,
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                vec![
+                    "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+                ],
+                "0x1234".to_owned(),
+                false,
+            )
+            .expect("log row"),
+            LogRecord::try_new(
+                12,
+                "0xblock12".to_owned(),
+                "0xtx12".to_owned(),
+                2,
+                1,
+                "0xcccccccccccccccccccccccccccccccccccccccc",
+                Vec::new(),
+                "0x".to_owned(),
+                true,
+            )
+            .expect("log row"),
+        ]),
+    )
+    .expect("dataset rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &selector,
+            range: range.clone(),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write rows");
+
+    let manifest_bytes =
+        std::fs::read(storage.manifest_path(&chain)).expect("manifest bytes after write");
+    let manifest_json: serde_json::Value =
+        serde_json::from_slice(&manifest_bytes).expect("manifest json");
+    let entry = &manifest_json["entries"][0];
+    let object_key = entry["object_key"].as_str().expect("object key");
+    assert_eq!(entry["object_encoding"], "parquet-v1");
+    assert!(object_key.contains("/parquet-v1/"));
+    assert!(object_key.ends_with(".parquet"));
+
+    let object_bytes = std::fs::read(storage.root().join(object_key)).expect("object bytes");
+    assert_eq!(&object_bytes[..4], b"PAR1");
+
+    let read = storage
+        .read_rows(&chain, &DatasetKey::evm_logs(), &selector, range)
+        .expect("read rows");
+    assert_eq!(read, rows);
+}
+
+#[test]
+fn test_parquet_read_rows_keeps_range_filtering() {
+    let storage = LocalStorage::new(temp_storage_root("parquet-range-filter"));
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let rows = DatasetRows::new(
+        DatasetKey::evm_blocks(),
+        QueryRows::EvmBlocks(vec![
+            BlockHeader {
+                number: 10,
+                hash: "0xblock10".to_owned(),
+                parent_hash: "0xparent09".to_owned(),
+                timestamp: 100,
+            },
+            BlockHeader {
+                number: 11,
+                hash: "0xblock11".to_owned(),
+                parent_hash: "0xparent10".to_owned(),
+                timestamp: 110,
+            },
+        ]),
+    )
+    .expect("dataset rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &selector,
+            range: LedgerRange::blocks(10, 11).expect("valid range"),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write rows");
+
+    let read = storage
+        .read_rows(
+            &chain,
+            &DatasetKey::evm_blocks(),
+            &selector,
+            LedgerRange::blocks(11, 11).expect("valid range"),
+        )
+        .expect("read rows");
+
+    assert_eq!(
+        read,
+        DatasetRows::new(
+            DatasetKey::evm_blocks(),
+            QueryRows::EvmBlocks(vec![BlockHeader {
+                number: 11,
+                hash: "0xblock11".to_owned(),
+                parent_hash: "0xparent10".to_owned(),
+                timestamp: 110,
+            }])
+        )
+        .expect("dataset rows")
     );
 }
 
@@ -537,6 +739,7 @@ fn test_empty_coverage_uses_chain_neutral_missing_ranges() {
     let manifest = storage.manifest().expect("manifest");
     let entry = manifest.entries.first().expect("manifest entry");
     assert_eq!(entry.object_key, None);
+    assert_eq!(entry.object_encoding, None);
     assert_eq!(entry.row_count, 0);
     assert_eq!(entry.finality_level, ManifestFinalityLevel::Safe);
 }

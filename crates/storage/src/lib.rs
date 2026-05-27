@@ -8,8 +8,6 @@ use datalens_core::{
 use serde::{Deserialize, Deserializer, Serialize, de::Error};
 use std::path::{Path, PathBuf};
 
-const OBJECT_SCHEMA_VERSION: &str = "json";
-
 #[derive(Debug)]
 pub struct StorageWriteRequest<'a> {
     pub chain: &'a ChainIdentity,
@@ -22,6 +20,7 @@ pub struct StorageWriteRequest<'a> {
 }
 
 mod object_store;
+mod parquet_codec;
 pub use object_store::{
     LocalObjectStore, ObjectMetadata, ObjectStore, S3ObjectStore, S3ObjectStoreConfig,
     validate_object_key,
@@ -122,12 +121,16 @@ where
                 ));
             }
             let bytes = self.object_store.get(&object_key)?;
-            let mut object_rows: DatasetRows = serde_json::from_slice(&bytes).map_err(|error| {
-                DatalensError::new(
-                    DatalensErrorKind::StorageReadFailure,
-                    format!("decode cached object {object_key}: {error}"),
-                )
-            })?;
+            let encoding = entry.object_encoding.unwrap_or_else(|| {
+                ObjectEncoding::from_object_key(&object_key).unwrap_or(ObjectEncoding::Json)
+            });
+            let mut object_rows = decode_object_rows(encoding, dataset_key.clone(), &bytes)
+                .map_err(|error| {
+                    DatalensError::new(
+                        DatalensErrorKind::StorageReadFailure,
+                        format!("decode cached object {object_key}: {}", error.message),
+                    )
+                })?;
             object_rows = filter_rows(object_rows, range.clone());
             rows.try_append(object_rows.into_rows())?;
         }
@@ -168,13 +171,15 @@ where
         let object_key = if rows.row_count() == 0 {
             None
         } else {
-            let object_key = object_key(chain, &dataset_key, range.clone(), &selector_fingerprint);
-            let bytes = serde_json::to_vec(rows).map_err(|error| {
-                DatalensError::new(
-                    DatalensErrorKind::Internal,
-                    format!("encode cached rows: {error}"),
-                )
-            })?;
+            let encoding = object_encoding_for_dataset(&dataset_key);
+            let object_key = object_key(
+                chain,
+                &dataset_key,
+                range.clone(),
+                &selector_fingerprint,
+                encoding,
+            );
+            let bytes = encode_object_rows(encoding, rows)?;
             self.object_store.put(&object_key, &bytes)?;
             Some(object_key)
         };
@@ -188,6 +193,11 @@ where
             selector_canonical_key,
             finality_level,
             object_key,
+            object_encoding: if rows.row_count() == 0 {
+                None
+            } else {
+                Some(object_encoding_for_dataset(&dataset_key))
+            },
             row_count: rows.row_count(),
         };
         manifest.upsert(entry);
@@ -385,6 +395,8 @@ pub struct ManifestEntry {
     pub selector_canonical_key: String,
     pub finality_level: ManifestFinalityLevel,
     pub object_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub object_encoding: Option<ObjectEncoding>,
     pub row_count: usize,
 }
 
@@ -397,6 +409,8 @@ struct RawManifestEntry {
     selector_canonical_key: String,
     finality_level: ManifestFinalityLevel,
     object_key: Option<String>,
+    #[serde(default)]
+    object_encoding: Option<ObjectEncoding>,
     row_count: usize,
 }
 
@@ -417,6 +431,11 @@ impl ManifestEntry {
         if let Some(object_key) = raw.object_key.as_deref() {
             validate_object_key(object_key)?;
         }
+        if let (Some(object_key), Some(object_encoding)) =
+            (raw.object_key.as_deref(), raw.object_encoding)
+        {
+            object_encoding.validate_object_key(object_key)?;
+        }
         match raw.object_key {
             Some(object_key) => {
                 if raw.row_count == 0 {
@@ -433,6 +452,7 @@ impl ManifestEntry {
                     selector_canonical_key: raw.selector_canonical_key,
                     finality_level: raw.finality_level,
                     object_key: Some(object_key),
+                    object_encoding: raw.object_encoding,
                     row_count: raw.row_count,
                 })
             }
@@ -451,10 +471,58 @@ impl ManifestEntry {
                     selector_canonical_key: raw.selector_canonical_key,
                     finality_level: raw.finality_level,
                     object_key: None,
+                    object_encoding: None,
                     row_count: raw.row_count,
                 })
             }
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ObjectEncoding {
+    Json,
+    ParquetV1,
+}
+
+impl ObjectEncoding {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Json => "json",
+            Self::ParquetV1 => "parquet-v1",
+        }
+    }
+
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Json => ".json",
+            Self::ParquetV1 => ".parquet",
+        }
+    }
+
+    fn from_object_key(object_key: &str) -> Option<Self> {
+        if object_key.contains("/parquet-v1/") || object_key.ends_with(".parquet") {
+            Some(Self::ParquetV1)
+        } else if object_key.contains("/json/") || object_key.ends_with(".json") {
+            Some(Self::Json)
+        } else {
+            None
+        }
+    }
+
+    fn validate_object_key(self, object_key: &str) -> Result<(), DatalensError> {
+        let schema_segment = format!("/{}/", self.as_str());
+        if !object_key.contains(&schema_segment) || !object_key.ends_with(self.extension()) {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                format!(
+                    "manifest object encoding {} does not match object key {object_key}",
+                    self.as_str()
+                ),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -517,7 +585,7 @@ pub fn coverage_key(
         "chains/{}/datasets/{}/{}/{}/{}",
         chain.key_prefix(),
         dataset_key.as_str(),
-        OBJECT_SCHEMA_VERSION,
+        object_encoding_for_dataset(dataset_key).as_str(),
         range_kind_key(range_kind),
         selector.fingerprint()
     )
@@ -528,15 +596,22 @@ fn object_key(
     dataset_key: &DatasetKey,
     range: LedgerRange,
     selector_fingerprint: &str,
+    encoding: ObjectEncoding,
 ) -> String {
     format!(
         "chains/{}/datasets/{}/{}/{}/{}",
         chain.key_prefix(),
         dataset_key.as_str(),
-        OBJECT_SCHEMA_VERSION,
+        encoding.as_str(),
         range_kind_key(range.kind()),
         selector_fingerprint,
-    ) + &format!("/{:#020}-{:#020}.json", range.start(), range.end()).replace("0x", "")
+    ) + &format!(
+        "/{:#020}-{:#020}{}",
+        range.start(),
+        range.end(),
+        encoding.extension()
+    )
+    .replace("0x", "")
 }
 
 fn manifest_key(chain: &ChainIdentity) -> String {
@@ -582,6 +657,46 @@ fn merge_ranges(mut ranges: Vec<LedgerRange>) -> Vec<LedgerRange> {
 
 fn intersect(left: LedgerRange, right: LedgerRange) -> Option<LedgerRange> {
     left.intersection(&right)
+}
+
+fn object_encoding_for_dataset(dataset_key: &DatasetKey) -> ObjectEncoding {
+    match dataset_key.legacy_dataset() {
+        Some(datalens_core::Dataset::Blocks | datalens_core::Dataset::Logs) => {
+            ObjectEncoding::ParquetV1
+        }
+        None => ObjectEncoding::Json,
+    }
+}
+
+fn encode_object_rows(
+    encoding: ObjectEncoding,
+    rows: &DatasetRows,
+) -> Result<Vec<u8>, DatalensError> {
+    match encoding {
+        ObjectEncoding::Json => serde_json::to_vec(rows).map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::Internal,
+                format!("encode cached rows: {error}"),
+            )
+        }),
+        ObjectEncoding::ParquetV1 => parquet_codec::encode_rows(rows),
+    }
+}
+
+fn decode_object_rows(
+    encoding: ObjectEncoding,
+    dataset_key: DatasetKey,
+    bytes: &[u8],
+) -> Result<DatasetRows, DatalensError> {
+    match encoding {
+        ObjectEncoding::Json => serde_json::from_slice(bytes).map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::StorageReadFailure,
+                format!("decode json cached rows: {error}"),
+            )
+        }),
+        ObjectEncoding::ParquetV1 => parquet_codec::decode_rows(dataset_key, bytes),
+    }
 }
 
 fn empty_rows(dataset_key: DatasetKey) -> Result<DatasetRows, DatalensError> {
