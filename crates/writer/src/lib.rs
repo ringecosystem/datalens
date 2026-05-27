@@ -2,42 +2,10 @@
 
 use datalens_chain::{DatasetSelector, FinalityLevel};
 use datalens_core::{
-    ChainIdentity, DatalensError, DatalensErrorKind, DatasetId, DatasetKey, DatasetRows,
-    LedgerRange, QueryRows, TimeRange,
+    ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey, DatasetRows, LedgerRange,
+    QueryRows,
 };
 use datalens_storage::{StorageDataObject, StorageRepository, StorageWriteRequest};
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WriteRequest {
-    pub chain: ChainIdentity,
-    pub dataset: DatasetId,
-    pub range: TimeRange,
-}
-
-impl WriteRequest {
-    pub fn new(chain: ChainIdentity, dataset: DatasetId, range: TimeRange) -> Self {
-        Self {
-            chain,
-            dataset,
-            range,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum WriteStatus {
-    Persisted,
-    Deferred,
-}
-
-impl WriteStatus {
-    pub fn error_kind(&self) -> DatalensErrorKind {
-        match self {
-            Self::Persisted => DatalensErrorKind::Internal,
-            Self::Deferred => DatalensErrorKind::UnsupportedDataset,
-        }
-    }
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DurableWriterConfig {

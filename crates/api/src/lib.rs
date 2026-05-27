@@ -300,7 +300,7 @@ pub struct QueryService<S> {
     storage: Arc<dyn StorageRepository>,
     source: S,
     planner: PlannerConfig,
-    writer: WriterConfig,
+    writer: DurableWriter<Arc<dyn StorageRepository>>,
     chain_name: String,
     chain: ChainConfig,
 }
@@ -342,11 +342,21 @@ where
         chain_name: impl Into<String>,
         chain: ChainConfig,
     ) -> Self {
+        let storage: Arc<dyn StorageRepository> = Arc::new(storage);
+        let durable_writer = DurableWriter::new(
+            storage.clone(),
+            DurableWriterConfig {
+                target_object_bytes: writer.target_object_bytes,
+                min_object_rows: writer.min_object_rows,
+                record_empty_coverage: writer.record_empty_coverage,
+            },
+        );
+
         Self {
-            storage: Arc::new(storage),
+            storage,
             source,
             planner,
-            writer,
+            writer: durable_writer,
             chain_name: chain_name.into(),
             chain,
         }
@@ -464,31 +474,23 @@ where
             rows.try_append(fetched.into_rows())?;
         }
 
-        if !fetched_segments.is_empty() {
-            let writer = DurableWriter::new(
-                self.storage.clone(),
-                DurableWriterConfig {
-                    target_object_bytes: self.writer.target_object_bytes,
-                    min_object_rows: self.writer.min_object_rows,
-                    record_empty_coverage: self.writer.record_empty_coverage,
-                },
-            );
-            if let Err(error) = writer.write(DurableWriteRequest {
+        if !fetched_segments.is_empty()
+            && let Err(error) = self.writer.write(DurableWriteRequest {
                 chain: plan.chain.clone(),
                 dataset_key: plan.dataset_key.clone(),
                 selector: plan.selector.clone(),
                 finality_level,
                 segments: fetched_segments,
-            }) {
-                log::error!(
-                    "cache write failed dataset={} range={}-{} kind={:?}",
-                    plan.dataset_key.as_str(),
-                    plan.ledger_range.start(),
-                    plan.ledger_range.end(),
-                    error.kind
-                );
-                return Err(error);
-            }
+            })
+        {
+            log::error!(
+                "cache write failed dataset={} range={}-{} kind={:?}",
+                plan.dataset_key.as_str(),
+                plan.ledger_range.start(),
+                plan.ledger_range.end(),
+                error.kind
+            );
+            return Err(error);
         }
 
         rows.sort();

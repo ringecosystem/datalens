@@ -37,14 +37,16 @@ API 兼容、EVM 细节、查询规划、存储和持久化混在一个服务文
 `datalens-evm` 是第一个链家族适配器。它拥有 EVM RPC/provider 集成、EVM 专属分页、
 EVM 响应标准化和 EVM 错误解释。它不应该决定存储策略或原生 API 形态。
 
-`datalens-storage` 拥有对象存储访问、Manifest 读写、持久化分片存在性检查和本地临时工作区
-行为。它应该是唯一把对象存储当成持久化依据的边界。
+`datalens-storage` 拥有对象存储访问、对象编码、object key、对象字节、Manifest 读写、
+持久化分片存在性检查和本地临时工作区行为。它应该是唯一把对象存储当成持久化依据的边界。
 
 `datalens-planner` 拥有查询规划。它将原生请求转换成可执行计划，验证范围和能力，决定所需
 数据集，并结合 Manifest 覆盖范围找出缺失工作。
 
-`datalens-writer` 拥有分片持久化。它接收标准化后的拉取数据，写入对象，验证写入完成，并以
-安全顺序更新 Manifest 覆盖范围。
+`datalens-writer` 拥有 durable write policy 和协调流程。它接收标准化后的拉取片段，合并相邻且
+兼容的稀疏片段，把对象和 Manifest 写入委托给 storage，按配置记录 empty coverage，跟踪
+skipped ranges，并把 storage metadata 汇总返回给查询流程。它不拥有对象编码、object key 布局、
+对象存储 provider 或 Manifest repository 细节。
 
 `datalens-api` 拥有边界层行为：HTTP 解析、原生 API 路由、认证接入点、响应流式返回和兼容
 适配层。它在调用规划器前做边界转换，在原生响应组装后做兼容响应转换。
@@ -61,7 +63,7 @@ EVM 响应标准化和 EVM 错误解释。它不应该决定存储策略或原�
 - `datalens-chain` 中的适配器能力元数据。
 - `datalens-storage` 中的存储 trait 形态。
 - `datalens-planner` 中的规划器输入/输出骨架。
-- `datalens-writer` 中的写入器输入/输出骨架。
+- `datalens-writer` 中的 durable writer coordinator 输入/输出 contract。
 - 一个能证明所有 crates 可以一起编译的最小 CLI 或服务入口。
 
 ## 为什么边界重要
