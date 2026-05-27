@@ -6,7 +6,7 @@ use datalens_chain::{
 };
 use datalens_core::{
     ChainIdentity, CoverageLevel, DatalensError, DatalensErrorKind, Dataset, DatasetId, DatasetKey,
-    LedgerRange, QueryRequest, TimeRange,
+    LedgerRange, LegacyEvmQueryRequest, TimeRange,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -66,7 +66,7 @@ pub struct NativeQueryInput {
 }
 
 impl NativeQueryInput {
-    pub fn from_evm_query(request: QueryRequest) -> Result<Self, DatalensError> {
+    pub fn from_legacy_evm_query(request: LegacyEvmQueryRequest) -> Result<Self, DatalensError> {
         let selector = match request.dataset {
             Dataset::Blocks => DatasetSelector::all(),
             Dataset::Logs => {
@@ -274,15 +274,15 @@ mod tests {
         SelectorKind,
     };
     use datalens_core::{
-        ChainFamily, ChainIdentity, DatalensErrorKind, Dataset, DatasetKey, LedgerRange, LogFilter,
-        NetworkId, QueryRequest,
+        ChainFamily, ChainIdentity, DatalensErrorKind, Dataset, DatasetKey, LedgerRange,
+        LegacyEvmQueryRequest, LogFilter, NetworkId,
     };
 
     use super::*;
 
     #[test]
     fn test_evm_query_request_converts_to_native_plan_input() {
-        let request = QueryRequest {
+        let request = LegacyEvmQueryRequest {
             chain: ethereum_identity(),
             dataset: Dataset::Logs,
             range: datalens_core::BlockRange::expect_new(10, 12),
@@ -293,7 +293,7 @@ mod tests {
             include_block: false,
         };
 
-        let input = NativeQueryInput::from_evm_query(request).expect("native input");
+        let input = NativeQueryInput::from_legacy_evm_query(request).expect("native input");
 
         assert_eq!(input.chain, ethereum_identity());
         assert_eq!(input.dataset_key, DatasetKey::evm_logs());
@@ -307,7 +307,7 @@ mod tests {
 
     #[test]
     fn test_native_planner_rejects_range_beyond_durable_boundary() {
-        let input = NativeQueryInput::from_evm_query(QueryRequest {
+        let input = NativeQueryInput::from_legacy_evm_query(LegacyEvmQueryRequest {
             chain: ethereum_identity(),
             dataset: Dataset::Blocks,
             range: datalens_core::BlockRange::expect_new(9, 10),
@@ -333,7 +333,7 @@ mod tests {
 
     #[test]
     fn test_native_planner_builds_executable_plan_from_capabilities() {
-        let input = NativeQueryInput::from_evm_query(QueryRequest {
+        let input = NativeQueryInput::from_legacy_evm_query(LegacyEvmQueryRequest {
             chain: ethereum_identity(),
             dataset: Dataset::Logs,
             range: datalens_core::BlockRange::expect_new(1, 4),

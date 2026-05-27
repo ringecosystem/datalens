@@ -674,246 +674,13 @@ pub mod dataset {
 }
 
 pub mod coverage {
-    use serde::{Deserialize, Deserializer, Serialize, de::Error};
-
-    use crate::{
-        BlockRange, ChainIdentity, DatalensError, DatalensErrorKind, Dataset, EvmLogFilter,
-    };
+    use serde::{Deserialize, Serialize};
 
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
     pub enum CoverageLevel {
         Covered,
         Partial,
         Missing,
-    }
-
-    pub const COVERAGE_SCHEMA_VERSION: u16 = 1;
-
-    #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-    pub struct CoverageKey {
-        chain: ChainIdentity,
-        dataset: Dataset,
-        schema_version: u16,
-        coverage: CoverageShape,
-    }
-
-    impl<'de> Deserialize<'de> for CoverageKey {
-        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-        where
-            D: Deserializer<'de>,
-        {
-            #[derive(Deserialize)]
-            struct RawCoverageKey {
-                chain: ChainIdentity,
-                dataset: Dataset,
-                schema_version: u16,
-                coverage: CoverageShape,
-            }
-
-            let raw = RawCoverageKey::deserialize(deserializer)?;
-            if raw.schema_version != COVERAGE_SCHEMA_VERSION {
-                return Err(D::Error::custom(format!(
-                    "unsupported coverage schema_version {}; only {COVERAGE_SCHEMA_VERSION} is supported",
-                    raw.schema_version
-                )));
-            }
-            Ok(Self {
-                chain: raw.chain,
-                dataset: raw.dataset,
-                schema_version: raw.schema_version,
-                coverage: raw.coverage,
-            })
-        }
-    }
-
-    impl CoverageKey {
-        pub fn full_blocks(chain: ChainIdentity) -> Self {
-            Self {
-                chain,
-                dataset: Dataset::Blocks,
-                schema_version: COVERAGE_SCHEMA_VERSION,
-                coverage: CoverageShape::All,
-            }
-        }
-
-        pub fn evm_logs(chain: ChainIdentity, filter: EvmLogFilter) -> Self {
-            Self {
-                chain,
-                dataset: Dataset::Logs,
-                schema_version: COVERAGE_SCHEMA_VERSION,
-                coverage: CoverageShape::EvmLogs(filter),
-            }
-        }
-
-        pub fn chain(&self) -> &ChainIdentity {
-            &self.chain
-        }
-
-        pub fn dataset(&self) -> Dataset {
-            self.dataset
-        }
-
-        pub fn schema_version(&self) -> u16 {
-            self.schema_version
-        }
-
-        pub fn coverage_key(&self) -> String {
-            match &self.coverage {
-                CoverageShape::All => "all".to_owned(),
-                CoverageShape::EvmLogs(filter) => format!("evm-logs/{}", filter.compact_key()),
-            }
-        }
-
-        pub fn canonical_coverage_key(&self) -> String {
-            match &self.coverage {
-                CoverageShape::All => "all".to_owned(),
-                CoverageShape::EvmLogs(filter) => format!("evm-logs/{}", filter.canonical_key()),
-            }
-        }
-
-        pub fn object_prefix(&self) -> String {
-            format!(
-                "chains/{}/datasets/{}/v{}/{}",
-                self.chain.key_prefix(),
-                self.dataset.as_str(),
-                self.schema_version,
-                self.coverage_key()
-            )
-        }
-    }
-
-    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-    #[serde(tag = "shape", content = "filter", rename_all = "snake_case")]
-    pub enum CoverageShape {
-        All,
-        EvmLogs(EvmLogFilter),
-    }
-
-    #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-    #[serde(rename_all = "snake_case")]
-    pub enum CoverageValue {
-        DataObject,
-        Empty,
-    }
-
-    #[derive(Deserialize)]
-    struct RawCoverageRecord {
-        key: CoverageKey,
-        range: BlockRange,
-        row_count: usize,
-        object_key: Option<String>,
-    }
-
-    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-    #[serde(try_from = "RawCoverageRecord")]
-    pub struct CoverageRecord {
-        key: CoverageKey,
-        range: BlockRange,
-        row_count: usize,
-        object_key: Option<String>,
-    }
-
-    impl TryFrom<RawCoverageRecord> for CoverageRecord {
-        type Error = DatalensError;
-
-        fn try_from(raw: RawCoverageRecord) -> Result<Self, Self::Error> {
-            Self::try_from_parts(raw.key, raw.range, raw.row_count, raw.object_key)
-        }
-    }
-
-    impl CoverageRecord {
-        pub fn try_data_object(
-            key: CoverageKey,
-            range: BlockRange,
-            row_count: usize,
-            object_key: impl Into<String>,
-        ) -> Result<Self, DatalensError> {
-            Self::try_from_parts(key, range, row_count, Some(object_key.into()))
-        }
-
-        pub fn try_empty(
-            key: CoverageKey,
-            range: BlockRange,
-            row_count: usize,
-            object_key: Option<String>,
-        ) -> Result<Self, DatalensError> {
-            Self::try_from_parts(key, range, row_count, object_key)
-        }
-
-        fn try_from_parts(
-            key: CoverageKey,
-            range: BlockRange,
-            row_count: usize,
-            object_key: Option<String>,
-        ) -> Result<Self, DatalensError> {
-            match object_key {
-                Some(object_key) => {
-                    if row_count == 0 {
-                        return Err(DatalensError::new(
-                            DatalensErrorKind::InvalidInput,
-                            "data object coverage must have row_count greater than zero",
-                        ));
-                    }
-                    if object_key.trim().is_empty() {
-                        return Err(DatalensError::new(
-                            DatalensErrorKind::InvalidInput,
-                            "data object coverage must have a non-empty object key",
-                        ));
-                    }
-                    Ok(Self {
-                        key,
-                        range,
-                        row_count,
-                        object_key: Some(object_key),
-                    })
-                }
-                None => {
-                    if row_count != 0 {
-                        return Err(DatalensError::new(
-                            DatalensErrorKind::InvalidInput,
-                            "empty coverage must have row_count zero",
-                        ));
-                    }
-                    Ok(Self {
-                        key,
-                        range,
-                        row_count,
-                        object_key: None,
-                    })
-                }
-            }
-        }
-
-        pub fn key(&self) -> &CoverageKey {
-            &self.key
-        }
-
-        pub fn range(&self) -> BlockRange {
-            self.range
-        }
-
-        pub fn row_count(&self) -> usize {
-            self.row_count
-        }
-
-        pub fn object_key(&self) -> Option<&str> {
-            self.object_key.as_deref()
-        }
-
-        pub fn value(&self) -> CoverageValue {
-            if self.row_count > 0 && self.object_key.is_some() {
-                CoverageValue::DataObject
-            } else {
-                CoverageValue::Empty
-            }
-        }
-
-        /// First-stage coverage matching is exact by key; broader filters do not satisfy narrower filters.
-        pub fn covers(&self, key: &CoverageKey, range: &BlockRange) -> bool {
-            &self.key == key
-                && self.range.from_block <= range.from_block
-                && range.to_block <= self.range.to_block
-        }
     }
 }
 
@@ -1271,7 +1038,7 @@ pub mod query {
     }
 
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-    pub struct QueryRequest {
+    pub struct LegacyEvmQueryRequest {
         pub chain: ChainIdentity,
         pub dataset: Dataset,
         pub range: BlockRange,
@@ -1300,19 +1067,6 @@ pub mod query {
     }
 
     impl QueryRows {
-        pub fn dataset(&self) -> Dataset {
-            match self {
-                Self::EvmBlocks(_) => Dataset::Blocks,
-                Self::EvmLogs(_) => Dataset::Logs,
-                Self::TronEvents(_)
-                | Self::SolanaTransactions(_)
-                | Self::SolanaInstructions(_)
-                | Self::OtherJson(_) => {
-                    panic!("non-EVM rows do not have a legacy Dataset")
-                }
-            }
-        }
-
         pub fn dataset_key(&self) -> DatasetKey {
             match self {
                 Self::EvmBlocks(_) => DatasetKey::evm_blocks(),
@@ -1418,7 +1172,7 @@ pub mod query {
     }
 
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-    pub struct QueryResponse {
+    pub struct LegacyEvmQueryResponse {
         pub chain: ChainIdentity,
         pub range: BlockRange,
         pub cache: CacheSummary,
@@ -1499,12 +1253,12 @@ pub mod query {
 }
 
 pub use chain::{ChainFamily, ChainIdentity, NetworkId};
-pub use coverage::{CoverageKey, CoverageLevel, CoverageRecord, CoverageShape, CoverageValue};
+pub use coverage::CoverageLevel;
 pub use dataset::{Dataset, DatasetId, DatasetKey};
 pub use error::{DatalensError, DatalensErrorKind};
 pub use query::{
-    BlockHeader, CacheSummary, DatasetRows, EvmLogFilter, LogFilter, LogRecord, QueryRequest,
-    QueryResponse, QueryRows, TopicFilter,
+    BlockHeader, CacheSummary, DatasetRows, EvmLogFilter, LegacyEvmQueryRequest,
+    LegacyEvmQueryResponse, LogFilter, LogRecord, QueryRows, TopicFilter,
 };
 pub use range::{BlockRange, LedgerRange, LedgerRangeKind, TimeRange};
 pub use result::ResultEnvelope;
@@ -1512,9 +1266,9 @@ pub use result::ResultEnvelope;
 #[cfg(test)]
 mod tests {
     use crate::{
-        BlockRange, ChainFamily, ChainIdentity, CoverageKey, CoverageRecord, CoverageValue,
-        DatalensError, DatalensErrorKind, Dataset, DatasetId, EvmLogFilter, LogFilter, LogRecord,
-        NetworkId, QueryRows, TimeRange, TopicFilter,
+        BlockRange, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, Dataset,
+        DatasetId, EvmLogFilter, LogFilter, LogRecord, NetworkId, QueryRows, TimeRange,
+        TopicFilter,
     };
 
     #[test]
@@ -1702,50 +1456,6 @@ mod tests {
     }
 
     #[test]
-    fn test_coverage_key_is_deterministic_for_equivalent_inputs() {
-        let chain = ChainIdentity::try_new(
-            ChainFamily::Evm,
-            "ethereum-mainnet",
-            Some(NetworkId::numeric(1)),
-        )
-        .unwrap();
-        let first = EvmLogFilter::try_from(LogFilter {
-            addresses: vec![
-                "0x2222222222222222222222222222222222222222".to_owned(),
-                "0x1111111111111111111111111111111111111111".to_owned(),
-            ],
-            topics: vec![None],
-        })
-        .unwrap();
-        let second = EvmLogFilter::try_from(LogFilter {
-            addresses: vec![
-                "0X1111111111111111111111111111111111111111".to_owned(),
-                "0X2222222222222222222222222222222222222222".to_owned(),
-            ],
-            topics: vec![None],
-        })
-        .unwrap();
-
-        let block_key = CoverageKey::full_blocks(chain.clone());
-        let log_key = CoverageKey::evm_logs(chain.clone(), first);
-        let equivalent_log_key = CoverageKey::evm_logs(chain.clone(), second);
-        let other_log_key = CoverageKey::evm_logs(
-            chain,
-            EvmLogFilter::try_from(LogFilter {
-                addresses: vec!["0x3333333333333333333333333333333333333333".to_owned()],
-                topics: vec![None],
-            })
-            .unwrap(),
-        );
-
-        assert_eq!(block_key.coverage_key(), "all");
-        assert_eq!(log_key, equivalent_log_key);
-        assert_eq!(log_key.coverage_key(), equivalent_log_key.coverage_key());
-        assert_ne!(log_key.coverage_key(), other_log_key.coverage_key());
-        assert!(log_key.object_prefix().contains("logs/v1/evm-logs/"));
-    }
-
-    #[test]
     fn test_log_record_deserialization_canonicalizes_hex_values() {
         let json = r#"{
             "block_number":10,
@@ -1811,28 +1521,6 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_coverage_record_is_distinct_from_missing_and_satisfies_same_key_range() {
-        let chain =
-            ChainIdentity::try_new(ChainFamily::Evm, "darwinia", Some(NetworkId::numeric(46)))
-                .unwrap();
-        let key = CoverageKey::full_blocks(chain);
-        let range = BlockRange::try_new(100, 110).unwrap();
-        let record = CoverageRecord::try_empty(key.clone(), range, 0, None).unwrap();
-
-        assert_eq!(record.row_count(), 0);
-        assert_eq!(record.object_key(), None);
-        assert_eq!(record.value(), CoverageValue::Empty);
-        assert!(record.covers(&key, &BlockRange::try_new(102, 103).unwrap()));
-        assert!(!record.covers(&key, &BlockRange::try_new(90, 103).unwrap()));
-
-        let other_key = CoverageKey::full_blocks(
-            ChainIdentity::try_new(ChainFamily::Evm, "ethereum", Some(NetworkId::numeric(1)))
-                .unwrap(),
-        );
-        assert!(!record.covers(&other_key, &BlockRange::try_new(102, 103).unwrap()));
-    }
-
-    #[test]
     fn test_error_retryability_and_constructors() {
         assert!(!DatalensError::invalid_input("bad input").is_retryable());
         assert!(!DatalensError::unsupported("unsupported").is_retryable());
@@ -1879,66 +1567,6 @@ mod tests {
             configured_name = " "
         "#;
         assert!(toml::from_str::<ChainIdentity>(toml_text).is_err());
-    }
-
-    #[test]
-    fn test_deserialized_equivalent_filters_keep_same_coverage_key() {
-        let chain =
-            ChainIdentity::try_new(ChainFamily::Evm, "ethereum", Some(NetworkId::numeric(1)))
-                .unwrap();
-        let filter = EvmLogFilter::try_from(LogFilter {
-            addresses: vec!["0XAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned()],
-            topics: vec![Some(vec![
-                "0XBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".to_owned(),
-            ])],
-        })
-        .unwrap();
-        let encoded = serde_json::to_string(&filter).unwrap();
-        let decoded: EvmLogFilter = serde_json::from_str(&encoded).unwrap();
-
-        assert_eq!(
-            CoverageKey::evm_logs(chain.clone(), filter).coverage_key(),
-            CoverageKey::evm_logs(chain, decoded).coverage_key()
-        );
-    }
-
-    #[test]
-    fn test_coverage_record_checked_constructors_reject_invalid_semantics() {
-        let key = CoverageKey::full_blocks(
-            ChainIdentity::try_new(ChainFamily::Evm, "ethereum", Some(NetworkId::numeric(1)))
-                .unwrap(),
-        );
-        let range = BlockRange::try_new(1, 2).unwrap();
-
-        assert!(CoverageRecord::try_data_object(key.clone(), range, 0, "obj.json").is_err());
-        assert!(CoverageRecord::try_data_object(key.clone(), range, 1, " ").is_err());
-        assert!(CoverageRecord::try_empty(key.clone(), range, 1, None).is_err());
-        assert!(
-            CoverageRecord::try_empty(key.clone(), range, 0, Some("obj.json".to_owned())).is_err()
-        );
-
-        let record = CoverageRecord::try_empty(key.clone(), range, 0, None).unwrap();
-        assert_eq!(record.value(), CoverageValue::Empty);
-        assert!(record.covers(&key, &range));
-    }
-
-    #[test]
-    fn test_coverage_record_deserialization_rejects_invalid_semantics() {
-        let json = r#"{
-            "key":{"chain":{"family":"Evm","configured_name":"ethereum","network_id":{"kind":"numeric","value":1}},"dataset":"blocks","schema_version":1,"coverage":{"shape":"all"}},
-            "range":{"from_block":1,"to_block":2},
-            "row_count":0,
-            "object_key":"objects/blocks/all/1-2.json"
-        }"#;
-        assert!(serde_json::from_str::<CoverageRecord>(json).is_err());
-
-        let json = r#"{
-            "key":{"chain":{"family":"Evm","configured_name":"ethereum","network_id":{"kind":"numeric","value":1}},"dataset":"blocks","schema_version":1,"coverage":{"shape":"all"}},
-            "range":{"from_block":1,"to_block":2},
-            "row_count":1,
-            "object_key":null
-        }"#;
-        assert!(serde_json::from_str::<CoverageRecord>(json).is_err());
     }
 
     #[test]
@@ -2028,25 +1656,6 @@ mod tests {
         assert_eq!(digest.len(), 32, "128-bit SHA-256 prefix");
         assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert!(!key.contains("0xaaaaaaaa"));
-    }
-
-    #[test]
-    fn test_coverage_key_deserialization_rejects_unsupported_schema_version() {
-        let supported = r#"{
-            "chain":{"family":"Evm","configured_name":"ethereum","network_id":{"kind":"numeric","value":1}},
-            "dataset":"blocks",
-            "schema_version":1,
-            "coverage":{"shape":"all"}
-        }"#;
-        assert!(serde_json::from_str::<CoverageKey>(supported).is_ok());
-
-        let unsupported = r#"{
-            "chain":{"family":"Evm","configured_name":"ethereum","network_id":{"kind":"numeric","value":1}},
-            "dataset":"blocks",
-            "schema_version":2,
-            "coverage":{"shape":"all"}
-        }"#;
-        assert!(serde_json::from_str::<CoverageKey>(unsupported).is_err());
     }
 
     #[test]
@@ -2160,32 +1769,5 @@ mod tests {
         assert!(DatasetId::try_from("bad/path".to_owned()).is_err());
         assert!(TimeRange::try_blocks(1, 2).is_ok());
         assert!(TimeRange::try_blocks(2, 1).is_err());
-    }
-
-    #[test]
-    fn test_coverage_matching_is_exact_by_key() {
-        let chain =
-            ChainIdentity::try_new(ChainFamily::Evm, "ethereum", Some(NetworkId::numeric(1)))
-                .unwrap();
-        let range = BlockRange::try_new(1, 10).unwrap();
-        let all_logs = CoverageKey::evm_logs(
-            chain.clone(),
-            EvmLogFilter::try_from(LogFilter {
-                addresses: Vec::new(),
-                topics: Vec::new(),
-            })
-            .unwrap(),
-        );
-        let address_logs = CoverageKey::evm_logs(
-            chain,
-            EvmLogFilter::try_from(LogFilter {
-                addresses: vec!["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()],
-                topics: Vec::new(),
-            })
-            .unwrap(),
-        );
-        let record = CoverageRecord::try_empty(all_logs, range, 0, None).unwrap();
-
-        assert!(!record.covers(&address_logs, &range));
     }
 }
