@@ -9,14 +9,12 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use datalens_chain::{
-    ChainAdapter, ChainFetchRequest, DatasetSelector, FetchContext, HeightRangeKind,
-    validate_durable_range,
-};
+use datalens_chain::{ChainAdapter, ChainFetchRequest, FetchContext};
 use datalens_core::{
     BlockRange, CacheSummary, DatalensError, DatalensErrorKind, Dataset, DatasetKey, LedgerRange,
     QueryRequest, QueryResponse,
 };
+use datalens_planner::{NativePlanner, NativePlannerConfig, NativeQueryInput};
 use datalens_storage::{LocalStorage, StorageWriteRequest, missing_ranges};
 use serde::{Deserialize, Serialize};
 
@@ -255,68 +253,50 @@ where
             request.range.from_block,
             request.range.to_block
         );
-        let selector = self.selector_for_request(&request)?;
-        if let Err(error) = self.validate(&request, &selector) {
+        if let Err(error) = self.validate_evm_route(&request) {
             log::warn!("query validation failed kind={:?}", error.kind);
             return Err(error);
         }
+        let response_range = request.range;
+        let native_input = NativeQueryInput::from_evm_query(request)?;
         let safe_height = self.source.cache_safe_height()?;
-        let dataset_key = DatasetKey::from(request.dataset);
-        let request_range = LedgerRange::from_block_range(request.range);
-        validate_durable_range(&request_range, &safe_height)?;
+        let plan = NativePlanner::new(NativePlannerConfig {
+            max_query_range_len: self.planner.max_query_range_blocks,
+            default_chunk_range_len: self.evm_chunk_size(native_input.dataset_key.clone()),
+        })
+        .plan(native_input, &self.source.capabilities(), safe_height)?;
 
         let hit_ledger_ranges = self.storage.covered_ranges(
-            &request.chain,
-            &dataset_key,
-            &selector,
-            request_range.clone(),
+            &plan.chain,
+            &plan.dataset_key,
+            &plan.selector,
+            plan.ledger_range.clone(),
         )?;
-        let miss_ledger_ranges = missing_ranges(request_range, &hit_ledger_ranges);
-        let hit_ranges = hit_ledger_ranges
-            .iter()
-            .map(|range| {
-                range.block_range().ok_or_else(|| {
-                    DatalensError::new(
-                        DatalensErrorKind::Internal,
-                        "storage returned non-block range for legacy evm query",
-                    )
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let misses = miss_ledger_ranges
-            .iter()
-            .map(|range| {
-                range.block_range().ok_or_else(|| {
-                    DatalensError::new(
-                        DatalensErrorKind::Internal,
-                        "storage returned non-block missing range for legacy evm query",
-                    )
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let miss_ledger_ranges = missing_ranges(plan.ledger_range.clone(), &hit_ledger_ranges);
+        let hit_ranges = legacy_block_ranges(&hit_ledger_ranges)?;
+        let misses = legacy_block_ranges(&miss_ledger_ranges)?;
         log::info!(
             "cache summary dataset={} hit_ranges={} missing_ranges={}",
-            request.dataset.as_str(),
+            plan.dataset_key.as_str(),
             hit_ranges.len(),
             misses.len()
         );
         let mut rows = self
             .storage
             .read_rows(
-                &request.chain,
-                &dataset_key,
-                &selector,
-                LedgerRange::from_block_range(request.range),
+                &plan.chain,
+                &plan.dataset_key,
+                &plan.selector,
+                plan.ledger_range.clone(),
             )?
             .into_rows();
 
-        for range in split_ranges(&misses, self.chunk_size(request.dataset)) {
-            validate_durable_range(&LedgerRange::from_block_range(range), &safe_height)?;
+        for range in plan.split_ranges(miss_ledger_ranges)? {
             let fetch_request = ChainFetchRequest::new(
-                request.chain.clone(),
-                dataset_key.clone(),
-                LedgerRange::from_block_range(range),
-                selector.clone(),
+                plan.chain.clone(),
+                plan.dataset_key.clone(),
+                range.clone(),
+                plan.selector.clone(),
             )
             .with_context(FetchContext {
                 request_id: None,
@@ -330,28 +310,31 @@ where
                 Err(error) => {
                     log::warn!(
                         "provider fetch failed dataset={} range={}-{} kind={:?}",
-                        request.dataset.as_str(),
-                        range.from_block,
-                        range.to_block,
+                        plan.dataset_key.as_str(),
+                        range.start(),
+                        range.end(),
                         error.kind
                     );
                     return Err(error);
                 }
             };
+            let finality_level = match &plan.finality_policy {
+                datalens_planner::FinalityPolicy::DurableCache { boundary } => boundary.finality,
+            };
             if let Err(error) = self.storage.write_rows(StorageWriteRequest {
-                chain: &request.chain,
-                dataset_key: dataset_key.clone(),
-                selector: &selector,
-                range: LedgerRange::from_block_range(range),
+                chain: &plan.chain,
+                dataset_key: plan.dataset_key.clone(),
+                selector: &plan.selector,
+                range,
                 rows: &fetched,
-                finality_level: safe_height.finality,
+                finality_level,
                 record_empty_coverage: self.writer.record_empty_coverage,
             }) {
                 log::error!(
                     "cache write failed dataset={} range={}-{} kind={:?}",
-                    request.dataset.as_str(),
-                    range.from_block,
-                    range.to_block,
+                    plan.dataset_key.as_str(),
+                    plan.ledger_range.start(),
+                    plan.ledger_range.end(),
                     error.kind
                 );
                 return Err(error);
@@ -361,8 +344,8 @@ where
 
         rows.sort();
         Ok(QueryResponse {
-            chain: request.chain,
-            range: request.range,
+            chain: plan.chain,
+            range: response_range,
             cache: CacheSummary {
                 hit_ranges,
                 missing_ranges: misses,
@@ -371,23 +354,7 @@ where
         })
     }
 
-    fn validate(
-        &self,
-        request: &QueryRequest,
-        selector: &DatasetSelector,
-    ) -> Result<(), DatalensError> {
-        if request.range.from_block > request.range.to_block {
-            return Err(DatalensError::new(
-                DatalensErrorKind::InvalidInput,
-                "from_block must be less than or equal to to_block",
-            ));
-        }
-        if request.range.len() > u128::from(self.planner.max_query_range_blocks) {
-            return Err(DatalensError::new(
-                DatalensErrorKind::InvalidInput,
-                "query range exceeds planner.max_query_range_blocks",
-            ));
-        }
+    fn validate_evm_route(&self, request: &QueryRequest) -> Result<(), DatalensError> {
         if request.chain.configured_name() != self.chain_name {
             return Err(DatalensError::new(
                 DatalensErrorKind::UnsupportedDataset,
@@ -398,43 +365,6 @@ where
             return Err(DatalensError::new(
                 DatalensErrorKind::UnsupportedDataset,
                 "only evm chains are supported",
-            ));
-        }
-        let capabilities = self.source.capabilities();
-        if capabilities.chain() != &request.chain {
-            return Err(DatalensError::new(
-                DatalensErrorKind::UnsupportedDataset,
-                "chain is not supported by adapter",
-            ));
-        }
-        let dataset_key = DatasetKey::from(request.dataset);
-        let dataset_capability = capabilities.dataset(&dataset_key).ok_or_else(|| {
-            DatalensError::new(
-                DatalensErrorKind::UnsupportedDataset,
-                "dataset is not supported by adapter",
-            )
-        })?;
-        if !dataset_capability.supports_selector(selector.kind()) {
-            return Err(DatalensError::new(
-                DatalensErrorKind::UnsupportedDataset,
-                "selector is not supported by adapter",
-            ));
-        }
-        if !dataset_capability
-            .ranges()
-            .contains(&HeightRangeKind::Block)
-        {
-            return Err(DatalensError::new(
-                DatalensErrorKind::UnsupportedDataset,
-                "block ranges are not supported by adapter",
-            ));
-        }
-        if !dataset_capability.supports_safe_height()
-            && !dataset_capability.supports_finalized_height()
-        {
-            return Err(DatalensError::new(
-                DatalensErrorKind::UnsupportedDataset,
-                "adapter dataset does not expose safe or finalized height for durable cache",
             ));
         }
 
@@ -451,11 +381,7 @@ where
                 let filter = request.filter.as_ref().ok_or_else(|| {
                     DatalensError::new(DatalensErrorKind::InvalidInput, "logs require filter")
                 })?;
-                let max_addresses = dataset_capability
-                    .max_addresses_per_query()
-                    .unwrap_or(usize::MAX)
-                    .min(self.chain.datasets.logs.max_addresses_per_query);
-                if filter.addresses.len() > max_addresses {
+                if filter.addresses.len() > self.chain.datasets.logs.max_addresses_per_query {
                     return Err(DatalensError::new(
                         DatalensErrorKind::InvalidInput,
                         "too many log addresses",
@@ -467,36 +393,14 @@ where
         }
     }
 
-    fn selector_for_request(
-        &self,
-        request: &QueryRequest,
-    ) -> Result<DatasetSelector, DatalensError> {
-        match request.dataset {
-            Dataset::Blocks => Ok(DatasetSelector::all()),
-            Dataset::Logs => {
-                let filter = request.filter.clone().ok_or_else(|| {
-                    DatalensError::new(DatalensErrorKind::InvalidInput, "logs require filter")
-                })?;
-                DatasetSelector::try_evm_logs(filter)
-            }
-        }
-    }
-
-    fn chunk_size(&self, dataset: Dataset) -> u64 {
-        let configured_limit = match dataset {
-            Dataset::Blocks => self.chain.datasets.blocks.max_batch_blocks,
-            Dataset::Logs => self.chain.datasets.logs.max_get_logs_range_blocks,
+    fn evm_chunk_size(&self, dataset_key: DatasetKey) -> u64 {
+        let configured_limit = match dataset_key.legacy_dataset() {
+            Some(Dataset::Blocks) => self.chain.datasets.blocks.max_batch_blocks,
+            Some(Dataset::Logs) => self.chain.datasets.logs.max_get_logs_range_blocks,
+            None => self.planner.default_chunk_range_blocks,
         };
-        let adapter_limit = self
-            .source
-            .capabilities()
-            .dataset(&DatasetKey::from(dataset))
-            .and_then(|capability| capability.max_range_blocks())
-            .unwrap_or(u64::MAX);
-
         configured_limit
             .min(self.planner.default_chunk_range_blocks)
-            .min(adapter_limit)
             .max(1)
     }
 }
@@ -592,9 +496,16 @@ where
     axum::serve(listener, router(service, chain_names)).await
 }
 
-fn split_ranges(ranges: &[BlockRange], chunk_size: u64) -> Vec<BlockRange> {
+fn legacy_block_ranges(ranges: &[LedgerRange]) -> Result<Vec<BlockRange>, DatalensError> {
     ranges
         .iter()
-        .flat_map(|range| range.split(chunk_size).expect("positive chunk size"))
+        .map(|range| {
+            range.block_range().ok_or_else(|| {
+                DatalensError::new(
+                    DatalensErrorKind::Internal,
+                    "native plan returned non-block range for legacy evm response",
+                )
+            })
+        })
         .collect()
 }
