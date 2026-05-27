@@ -135,8 +135,26 @@ pub mod config {
         pub kind: String,
         pub chain_id: u64,
         pub rpc_urls: Vec<String>,
-        pub safe_height_lag_blocks: u64,
+        #[serde(default)]
+        pub finality: FinalityConfig,
         pub datasets: DatasetsConfig,
+    }
+
+    #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+    #[serde(tag = "mode", rename_all = "snake_case")]
+    pub enum FinalityConfig {
+        #[default]
+        Auto,
+        Lag {
+            #[serde(default)]
+            safe_lag_blocks: Option<u64>,
+            #[serde(default)]
+            finalized_lag_blocks: Option<u64>,
+        },
+        RpcTags {
+            safe_tag: String,
+            finalized_tag: String,
+        },
     }
 
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

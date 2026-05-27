@@ -44,13 +44,19 @@ Provider 行为应隔离在 `datalens-evm`：batching、rate-limit backoff、ran
 retry decisions 和 EVM response decoding 都属于这里。数据离开适配器边界后，应被标准化成
 datalens 数据集记录。
 
-第一版 EVM safe-height 策略可以使用 `safe_height_lag_blocks`：
+EVM adapter 通过链级 finality policy 判断 safe/finalized height：
 
-```text
-safe_height = latest_height.saturating_sub(safe_height_lag_blocks)
-```
+- `mode = "auto"` 先尝试 `eth_getBlockByNumber("finalized", false)`，再尝试
+  `eth_getBlockByNumber("safe", false)`。
+- 如果 RPC finality tags 不支持，`auto` 可以使用 adapter 自有 chain profile 中的保守 lag
+  值。
+- 未知链如果不支持 RPC finality tags，必须要求显式 override，而不能把 `latest` 当成 safe。
+- `mode = "lag"` 是 operator 显式 override，使用大于零的 `safe_lag_blocks` 或
+  `finalized_lag_blocks`。
+- `mode = "rpc_tags"` 是面向 provider-specific tag names 的高级 override。
 
-该 lag-based 值以 `Safe` finality 暴露。这是第一版 EVM 策略，不是未来 adapter 的链无关规则。
+Lag-based value 是 fallback policy，不是默认 truth source。Durable cache writes 不能使用
+zero lag，因为这会把 `latest` 标记为 safe/finalized。
 
 ## 未来 Tron 和 Solana 支持
 

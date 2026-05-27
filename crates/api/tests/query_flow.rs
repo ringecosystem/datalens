@@ -435,7 +435,7 @@ fn service(storage: LocalStorage, source: MockSource) -> QueryService<MockSource
             kind: "evm".to_owned(),
             chain_id: 1,
             rpc_urls: vec!["http://example.invalid".to_owned()],
-            safe_height_lag_blocks: 0,
+            finality: datalens_api::config::FinalityConfig::Auto,
             datasets: DatasetsConfig {
                 blocks: datalens_api::config::BlocksDatasetConfig {
                     enabled: true,
