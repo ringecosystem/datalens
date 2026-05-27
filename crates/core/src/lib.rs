@@ -15,12 +15,12 @@ pub mod result;
 pub mod query;
 
 pub use chain::{ChainFamily, ChainIdentity, NetworkId};
-pub use coverage::{CoverageKey, CoverageLevel, CoverageRecord, CoverageShape, CoverageValue};
+pub use coverage::CoverageLevel;
 pub use dataset::{Dataset, DatasetId, DatasetKey};
 pub use error::{DatalensError, DatalensErrorKind};
 pub use query::{
-    BlockHeader, CacheSummary, DatasetRows, EvmLogFilter, LogFilter, LogRecord, QueryRequest,
-    QueryResponse, QueryRows, TopicFilter,
+    BlockHeader, CacheSummary, DatasetRows, EvmLogFilter, LegacyEvmQueryRequest,
+    LegacyEvmQueryResponse, LogFilter, LogRecord, QueryRows, TopicFilter,
 };
 pub use range::{BlockRange, LedgerRange, LedgerRangeKind, TimeRange};
 pub use result::ResultEnvelope;

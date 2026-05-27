@@ -13,8 +13,8 @@ use datalens_chain::{
 };
 use datalens_core::{
     BlockHeader, BlockRange, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, Dataset,
-    DatasetKey, LedgerRange, LogFilter, LogRecord, NetworkId, QueryRequest, QueryResponse,
-    QueryRows,
+    DatasetKey, LedgerRange, LegacyEvmQueryRequest, LegacyEvmQueryResponse, LogFilter, LogRecord,
+    NetworkId, QueryRows,
 };
 use datalens_storage::LocalStorage;
 
@@ -198,8 +198,8 @@ fn service(storage: LocalStorage, source: MockSource) -> QueryService<MockSource
     )
 }
 
-fn blocks_request(from_block: u64, to_block: u64) -> QueryRequest {
-    QueryRequest {
+fn blocks_request(from_block: u64, to_block: u64) -> LegacyEvmQueryRequest {
+    LegacyEvmQueryRequest {
         chain: ethereum_identity(),
         dataset: Dataset::Blocks,
         range: BlockRange::expect_new(from_block, to_block),
@@ -208,7 +208,7 @@ fn blocks_request(from_block: u64, to_block: u64) -> QueryRequest {
     }
 }
 
-fn logs_request(from_block: u64, to_block: u64, addresses: Vec<&str>) -> QueryRequest {
+fn logs_request(from_block: u64, to_block: u64, addresses: Vec<&str>) -> LegacyEvmQueryRequest {
     logs_request_with_topics(
         from_block,
         to_block,
@@ -222,8 +222,8 @@ fn logs_request_with_topics(
     to_block: u64,
     addresses: Vec<&str>,
     topics: Vec<Option<Vec<&str>>>,
-) -> QueryRequest {
-    QueryRequest {
+) -> LegacyEvmQueryRequest {
+    LegacyEvmQueryRequest {
         chain: ethereum_identity(),
         dataset: Dataset::Logs,
         range: BlockRange::expect_new(from_block, to_block),
@@ -279,7 +279,7 @@ fn temp_storage_root(name: &str) -> PathBuf {
     root
 }
 
-fn block_numbers(response: &QueryResponse) -> Vec<u64> {
+fn block_numbers(response: &LegacyEvmQueryResponse) -> Vec<u64> {
     match &response.rows {
         QueryRows::EvmBlocks(rows) => rows.iter().map(|row| row.number).collect(),
         _ => panic!("expected blocks"),

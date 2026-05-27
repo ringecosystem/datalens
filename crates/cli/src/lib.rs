@@ -6,8 +6,8 @@ pub use datalens_api::config::{ChainConfig, DatalensConfig, FinalityConfig};
 use datalens_chain::ChainAdapter;
 pub use datalens_core::DatalensErrorKind;
 use datalens_core::{
-    BlockRange, ChainFamily, ChainIdentity, DatalensError, Dataset, EvmLogFilter, LogFilter,
-    NetworkId, QueryRequest,
+    BlockRange, ChainFamily, ChainIdentity, DatalensError, Dataset, EvmLogFilter,
+    LegacyEvmQueryRequest, LogFilter, NetworkId,
 };
 use datalens_evm::{EvmAdapter, EvmAdapterMetadata, EvmFinalityPolicy, EvmRpcClient};
 use datalens_storage::LocalStorage;
@@ -161,7 +161,7 @@ fn query_command(command: QueryCommand) -> Result<(), Box<dyn std::error::Error 
     let (chain_name, chain) = configured_chain(&config, &chain_name)?;
     let service = build_service(&config, chain_name, chain);
     let request = match command.command {
-        QuerySubcommand::Blocks(command) => QueryRequest {
+        QuerySubcommand::Blocks(command) => LegacyEvmQueryRequest {
             chain: chain_identity(chain_name, chain)?,
             dataset: Dataset::Blocks,
             range: BlockRange::try_new(command.from_block, command.to_block)?,
@@ -178,7 +178,7 @@ fn query_command(command: QueryCommand) -> Result<(), Box<dyn std::error::Error 
                     .collect(),
             };
             EvmLogFilter::try_from(&filter)?;
-            QueryRequest {
+            LegacyEvmQueryRequest {
                 chain: chain_identity(chain_name, chain)?,
                 dataset: Dataset::Logs,
                 range: BlockRange::try_new(command.from_block, command.to_block)?,

@@ -8,14 +8,15 @@ use datalens_api::config::{
     ChainConfig, DatasetsConfig, LogsDatasetConfig, PlannerConfig, WriterConfig,
 };
 use datalens_chain::{
-    AdapterCapabilities, ChainAdapter, ChainFetchRequest, ChainFetchResponse, ChainHeight,
-    DatasetCapability, DatasetSelector, FinalityKind, HeightRangeKind, SelectorKind,
+    AdapterCapabilities, AdapterKey, ChainAdapter, ChainFetchRequest, ChainFetchResponse,
+    ChainHeight, DatasetCapability, DatasetSelector, FinalityKind, HeightRangeKind, SelectorKind,
 };
 use datalens_core::{
     BlockHeader, BlockRange, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, Dataset,
-    DatasetKey, LedgerRange, LogFilter, LogRecord, NetworkId, QueryRequest, QueryResponse,
-    QueryRows,
+    DatasetKey, LedgerRange, LegacyEvmQueryRequest, LegacyEvmQueryResponse, LogFilter, LogRecord,
+    NetworkId, QueryRows,
 };
+use datalens_planner::{FieldSelection, NativeQueryInput, ResponseShape};
 use datalens_storage::LocalStorage;
 
 #[test]
@@ -272,6 +273,76 @@ fn test_provider_limit_error_is_classified() {
     assert!(!root.join("manifest.json").exists());
 }
 
+#[test]
+fn test_query_native_executes_non_evm_plan_without_legacy_route_validation() {
+    let root = temp_storage_root("native-non-evm");
+    let source = MockSource::default()
+        .with_chain(tron_identity())
+        .with_native_rows(vec![serde_json::json!({"event": "transfer"})]);
+    let service = QueryService::new_named(
+        LocalStorage::new(&root),
+        source.clone(),
+        PlannerConfig {
+            max_query_range_blocks: 4,
+            default_chunk_range_blocks: 2,
+        },
+        WriterConfig {
+            target_object_bytes: 1024,
+            min_object_rows: 1,
+            record_empty_coverage: true,
+        },
+        "tron",
+        ChainConfig {
+            kind: "tron".to_owned(),
+            chain_id: 1,
+            rpc_urls: vec!["http://example.invalid".to_owned()],
+            finality: datalens_api::config::FinalityConfig::Auto,
+            datasets: DatasetsConfig {
+                blocks: datalens_api::config::BlocksDatasetConfig {
+                    enabled: false,
+                    max_batch_blocks: 2,
+                },
+                logs: LogsDatasetConfig {
+                    enabled: false,
+                    max_get_logs_range_blocks: 2,
+                    max_addresses_per_query: 2,
+                },
+            },
+        },
+    );
+    let input = NativeQueryInput {
+        chain: tron_identity(),
+        dataset_key: DatasetKey::tron_events(),
+        ledger_range: LedgerRange::blocks(1, 1).expect("valid range"),
+        selector: DatasetSelector::try_other(
+            AdapterKey::try_new("tron-events").expect("valid selector kind"),
+            "tron-events/all",
+            "tron-events/all",
+        )
+        .expect("valid selector"),
+        response_shape: ResponseShape::NativeRows,
+        field_selection: FieldSelection::All,
+    };
+
+    let response = service.query_native(input).expect("native query succeeds");
+
+    assert_eq!(response.chain, tron_identity());
+    assert_eq!(response.dataset_key, DatasetKey::tron_events());
+    assert_eq!(
+        response.cache.missing_ranges,
+        vec![LedgerRange::blocks(1, 1).expect("valid range")]
+    );
+    assert_eq!(response.rows.dataset_key(), &DatasetKey::tron_events());
+    assert_eq!(response.rows.row_count(), 1);
+    assert_eq!(
+        source.calls(),
+        vec![SourceCall::Native(
+            DatasetKey::tron_events(),
+            LedgerRange::blocks(1, 1).expect("valid range")
+        )]
+    );
+}
+
 fn service(storage: LocalStorage, source: MockSource) -> QueryService<MockSource> {
     QueryService::new(
         storage,
@@ -305,8 +376,8 @@ fn service(storage: LocalStorage, source: MockSource) -> QueryService<MockSource
     )
 }
 
-fn blocks_request(from_block: u64, to_block: u64) -> QueryRequest {
-    QueryRequest {
+fn blocks_request(from_block: u64, to_block: u64) -> LegacyEvmQueryRequest {
+    LegacyEvmQueryRequest {
         chain: ethereum_identity(),
         dataset: Dataset::Blocks,
         range: BlockRange::expect_new(from_block, to_block),
@@ -315,7 +386,7 @@ fn blocks_request(from_block: u64, to_block: u64) -> QueryRequest {
     }
 }
 
-fn logs_request(from_block: u64, to_block: u64, addresses: Vec<&str>) -> QueryRequest {
+fn logs_request(from_block: u64, to_block: u64, addresses: Vec<&str>) -> LegacyEvmQueryRequest {
     logs_request_with_topics(
         from_block,
         to_block,
@@ -329,8 +400,8 @@ fn logs_request_with_topics(
     to_block: u64,
     addresses: Vec<&str>,
     topics: Vec<Option<Vec<&str>>>,
-) -> QueryRequest {
-    QueryRequest {
+) -> LegacyEvmQueryRequest {
+    LegacyEvmQueryRequest {
         chain: ethereum_identity(),
         dataset: Dataset::Logs,
         range: BlockRange::expect_new(from_block, to_block),
@@ -351,6 +422,15 @@ const TOPIC_B: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 fn ethereum_identity() -> ChainIdentity {
     ChainIdentity::try_new(ChainFamily::Evm, "ethereum", Some(NetworkId::numeric(1)))
         .expect("valid chain identity")
+}
+
+fn tron_identity() -> ChainIdentity {
+    ChainIdentity::try_new(
+        ChainFamily::Other("tron".to_owned()),
+        "tron",
+        Some(NetworkId::numeric(1)),
+    )
+    .expect("valid chain identity")
 }
 
 fn block(number: u64, hash: &str) -> BlockHeader {
@@ -388,21 +468,21 @@ fn temp_storage_root(name: &str) -> PathBuf {
     root
 }
 
-fn block_numbers(response: &QueryResponse) -> Vec<u64> {
+fn block_numbers(response: &LegacyEvmQueryResponse) -> Vec<u64> {
     match &response.rows {
         QueryRows::EvmBlocks(rows) => rows.iter().map(|row| row.number).collect(),
         _ => panic!("expected blocks"),
     }
 }
 
-fn log_indexes(response: &QueryResponse) -> Vec<u64> {
+fn log_indexes(response: &LegacyEvmQueryResponse) -> Vec<u64> {
     match &response.rows {
         QueryRows::EvmLogs(rows) => rows.iter().map(|row| row.log_index).collect(),
         _ => panic!("expected logs"),
     }
 }
 
-fn log_addresses(response: &QueryResponse) -> Vec<String> {
+fn log_addresses(response: &LegacyEvmQueryResponse) -> Vec<String> {
     match &response.rows {
         QueryRows::EvmLogs(rows) => rows.iter().map(|row| row.address.clone()).collect(),
         _ => panic!("expected logs"),
@@ -413,18 +493,21 @@ fn log_addresses(response: &QueryResponse) -> Vec<String> {
 enum SourceCall {
     Blocks(BlockRange),
     Logs(BlockRange),
+    Native(DatasetKey, LedgerRange),
 }
 
 #[derive(Clone)]
 struct MockSource {
     blocks: Arc<Mutex<Vec<BlockHeader>>>,
     logs: Arc<Mutex<Vec<LogRecord>>>,
+    native_rows: Arc<Mutex<Vec<serde_json::Value>>>,
     calls: Arc<Mutex<Vec<SourceCall>>>,
     error: Arc<Mutex<Option<DatalensErrorKind>>>,
     blocks_max_range_blocks: Arc<Mutex<u64>>,
     logs_max_range_blocks: Arc<Mutex<u64>>,
     max_addresses_per_query: Arc<Mutex<usize>>,
     safe_height: Arc<Mutex<ChainHeight>>,
+    chain: Arc<Mutex<ChainIdentity>>,
 }
 
 impl Default for MockSource {
@@ -432,6 +515,7 @@ impl Default for MockSource {
         Self {
             blocks: Arc::new(Mutex::new(Vec::new())),
             logs: Arc::new(Mutex::new(Vec::new())),
+            native_rows: Arc::new(Mutex::new(Vec::new())),
             calls: Arc::new(Mutex::new(Vec::new())),
             error: Arc::new(Mutex::new(None)),
             blocks_max_range_blocks: Arc::new(Mutex::new(2)),
@@ -440,6 +524,7 @@ impl Default for MockSource {
             safe_height: Arc::new(Mutex::new(
                 ChainHeight::block(100).with_finality(FinalityKind::Safe),
             )),
+            chain: Arc::new(Mutex::new(ethereum_identity())),
         }
     }
 }
@@ -452,6 +537,16 @@ impl MockSource {
 
     fn with_logs(self, logs: Vec<LogRecord>) -> Self {
         *self.logs.lock().expect("logs lock") = logs;
+        self
+    }
+
+    fn with_native_rows(self, rows: Vec<serde_json::Value>) -> Self {
+        *self.native_rows.lock().expect("native rows lock") = rows;
+        self
+    }
+
+    fn with_chain(self, chain: ChainIdentity) -> Self {
+        *self.chain.lock().expect("chain lock") = chain;
         self
     }
 
@@ -477,7 +572,8 @@ impl MockSource {
 
 impl ChainAdapter for MockSource {
     fn capabilities(&self) -> AdapterCapabilities {
-        AdapterCapabilities::new(ethereum_identity())
+        let chain = self.chain.lock().expect("chain lock").clone();
+        let capabilities = AdapterCapabilities::new(chain.clone())
             .with_dataset_capability(
                 DatasetCapability::new(Dataset::Blocks)
                     .with_selector(SelectorKind::All)
@@ -513,7 +609,23 @@ impl ChainAdapter for MockSource {
                     .with_safe_height(true)
                     .with_finalized_height(true)
                     .with_range_split(true),
+            );
+        if chain.family() == ChainFamily::Evm {
+            capabilities
+        } else {
+            capabilities.with_dataset_capability(
+                DatasetCapability::new(DatasetKey::tron_events())
+                    .with_selector(SelectorKind::Other(
+                        AdapterKey::try_new("tron-events").expect("valid selector kind"),
+                    ))
+                    .with_range(HeightRangeKind::Block)
+                    .with_max_range_blocks(2)
+                    .with_empty_coverage(true)
+                    .with_safe_height(true)
+                    .with_finalized_height(true)
+                    .with_range_split(true),
             )
+        }
     }
 
     fn latest_height(&self) -> Result<ChainHeight, DatalensError> {
@@ -526,12 +638,8 @@ impl ChainAdapter for MockSource {
 
     fn fetch(&self, request: ChainFetchRequest) -> Result<ChainFetchResponse, DatalensError> {
         let range = request.range.block_range().expect("expected block range");
-        let response = match request
-            .dataset_key
-            .legacy_dataset()
-            .expect("legacy dataset")
-        {
-            Dataset::Blocks => self.fetch_blocks(range).map(|rows| {
+        let response = match request.dataset_key.legacy_dataset() {
+            Some(Dataset::Blocks) => self.fetch_blocks(range).map(|rows| {
                 ChainFetchResponse::new(
                     request.chain,
                     DatasetKey::evm_blocks(),
@@ -545,7 +653,7 @@ impl ChainAdapter for MockSource {
                     warnings: Vec::new(),
                 })
             }),
-            Dataset::Logs => {
+            Some(Dataset::Logs) => {
                 let filter = match &request.selector {
                     DatasetSelector::EvmLogs(filter) => filter,
                     selector => panic!("expected EVM logs selector, got {selector:?}"),
@@ -566,6 +674,29 @@ impl ChainAdapter for MockSource {
                         },
                     )
                 })
+            }
+            None => {
+                self.calls
+                    .lock()
+                    .expect("calls lock")
+                    .push(SourceCall::Native(
+                        request.dataset_key.clone(),
+                        request.range.clone(),
+                    ));
+                Ok(ChainFetchResponse::new(
+                    request.chain,
+                    request.dataset_key,
+                    request.range,
+                    request.selector,
+                    QueryRows::OtherJson(
+                        self.native_rows.lock().expect("native rows lock").clone(),
+                    ),
+                )
+                .with_provider_diagnostics(datalens_chain::ProviderDiagnostics {
+                    calls: 1,
+                    rows_scanned: 0,
+                    warnings: Vec::new(),
+                }))
             }
         }?;
 

@@ -3,15 +3,15 @@ use datalens_chain::{
     SelectorKind,
 };
 use datalens_core::{
-    ChainFamily, ChainIdentity, DatalensErrorKind, Dataset, DatasetKey, LedgerRange, LogFilter,
-    NetworkId, QueryRequest,
+    ChainFamily, ChainIdentity, DatalensErrorKind, Dataset, DatasetKey, LedgerRange,
+    LegacyEvmQueryRequest, LogFilter, NetworkId,
 };
 
 use datalens_planner::*;
 
 #[test]
 fn test_evm_query_request_converts_to_native_plan_input() {
-    let request = QueryRequest {
+    let request = LegacyEvmQueryRequest {
         chain: ethereum_identity(),
         dataset: Dataset::Logs,
         range: datalens_core::BlockRange::expect_new(10, 12),
@@ -22,7 +22,7 @@ fn test_evm_query_request_converts_to_native_plan_input() {
         include_block: false,
     };
 
-    let input = NativeQueryInput::from_evm_query(request).expect("native input");
+    let input = NativeQueryInput::from_legacy_evm_query(request).expect("native input");
 
     assert_eq!(input.chain, ethereum_identity());
     assert_eq!(input.dataset_key, DatasetKey::evm_logs());
@@ -36,7 +36,7 @@ fn test_evm_query_request_converts_to_native_plan_input() {
 
 #[test]
 fn test_native_planner_rejects_range_beyond_durable_boundary() {
-    let input = NativeQueryInput::from_evm_query(QueryRequest {
+    let input = NativeQueryInput::from_legacy_evm_query(LegacyEvmQueryRequest {
         chain: ethereum_identity(),
         dataset: Dataset::Blocks,
         range: datalens_core::BlockRange::expect_new(9, 10),
@@ -62,7 +62,7 @@ fn test_native_planner_rejects_range_beyond_durable_boundary() {
 
 #[test]
 fn test_native_planner_builds_executable_plan_from_capabilities() {
-    let input = NativeQueryInput::from_evm_query(QueryRequest {
+    let input = NativeQueryInput::from_legacy_evm_query(LegacyEvmQueryRequest {
         chain: ethereum_identity(),
         dataset: Dataset::Logs,
         range: datalens_core::BlockRange::expect_new(1, 4),

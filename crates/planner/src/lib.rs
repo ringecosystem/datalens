@@ -6,7 +6,7 @@ use datalens_chain::{
 };
 use datalens_core::{
     ChainIdentity, CoverageLevel, DatalensError, DatalensErrorKind, Dataset, DatasetId, DatasetKey,
-    LedgerRange, QueryRequest, TimeRange,
+    LedgerRange, LegacyEvmQueryRequest, TimeRange,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -66,7 +66,7 @@ pub struct NativeQueryInput {
 }
 
 impl NativeQueryInput {
-    pub fn from_evm_query(request: QueryRequest) -> Result<Self, DatalensError> {
+    pub fn from_legacy_evm_query(request: LegacyEvmQueryRequest) -> Result<Self, DatalensError> {
         let selector = match request.dataset {
             Dataset::Blocks => DatasetSelector::all(),
             Dataset::Logs => {

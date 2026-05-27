@@ -216,7 +216,7 @@ impl TopicFilter {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct QueryRequest {
+pub struct LegacyEvmQueryRequest {
     pub chain: ChainIdentity,
     pub dataset: Dataset,
     pub range: BlockRange,
@@ -245,19 +245,6 @@ pub enum QueryRows {
 }
 
 impl QueryRows {
-    pub fn dataset(&self) -> Dataset {
-        match self {
-            Self::EvmBlocks(_) => Dataset::Blocks,
-            Self::EvmLogs(_) => Dataset::Logs,
-            Self::TronEvents(_)
-            | Self::SolanaTransactions(_)
-            | Self::SolanaInstructions(_)
-            | Self::OtherJson(_) => {
-                panic!("non-EVM rows do not have a legacy Dataset")
-            }
-        }
-    }
-
     pub fn dataset_key(&self) -> DatasetKey {
         match self {
             Self::EvmBlocks(_) => DatasetKey::evm_blocks(),
@@ -362,7 +349,7 @@ impl DatasetRows {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct QueryResponse {
+pub struct LegacyEvmQueryResponse {
     pub chain: ChainIdentity,
     pub range: BlockRange,
     pub cache: CacheSummary,
