@@ -10,12 +10,12 @@ use axum::{
     routing::{get, post},
 };
 use datalens_chain::{
-    ChainAdapter, ChainFetchRequest, DatasetSelector, FetchContext, HeightRange, HeightRangeKind,
+    ChainAdapter, ChainFetchRequest, DatasetSelector, FetchContext, HeightRangeKind,
     validate_durable_range,
 };
 use datalens_core::{
-    BlockRange, CacheSummary, DatalensError, DatalensErrorKind, Dataset, QueryRequest,
-    QueryResponse,
+    BlockRange, CacheSummary, DatalensError, DatalensErrorKind, Dataset, DatasetKey, LedgerRange,
+    QueryRequest, QueryResponse,
 };
 use datalens_storage::{LocalStorage, missing_ranges};
 use serde::{Deserialize, Serialize};
@@ -261,7 +261,7 @@ where
             return Err(error);
         }
         let safe_height = self.source.cache_safe_height()?;
-        validate_durable_range(&HeightRange::Block(request.range), &safe_height)?;
+        validate_durable_range(&LedgerRange::from_block_range(request.range), &safe_height)?;
 
         let hit_ranges = self.storage.covered_ranges(
             &request.chain,
@@ -281,11 +281,11 @@ where
                 .read_rows(&request.chain, request.dataset, &selector, request.range)?;
 
         for range in split_ranges(&misses, self.chunk_size(request.dataset)) {
-            validate_durable_range(&HeightRange::Block(range), &safe_height)?;
+            validate_durable_range(&LedgerRange::from_block_range(range), &safe_height)?;
             let fetch_request = ChainFetchRequest::new(
                 request.chain.clone(),
-                request.dataset,
-                HeightRange::Block(range),
+                DatasetKey::from(request.dataset),
+                LedgerRange::from_block_range(range),
                 selector.clone(),
             )
             .with_context(FetchContext {
@@ -295,7 +295,7 @@ where
             let fetched = match self.source.fetch(fetch_request.clone()) {
                 Ok(response) => {
                     response.validate_for_request(&fetch_request)?;
-                    response.rows
+                    response.rows.into_rows()
                 }
                 Err(error) => {
                     log::warn!(
@@ -376,7 +376,8 @@ where
                 "chain is not supported by adapter",
             ));
         }
-        let dataset_capability = capabilities.dataset(request.dataset).ok_or_else(|| {
+        let dataset_key = DatasetKey::from(request.dataset);
+        let dataset_capability = capabilities.dataset(&dataset_key).ok_or_else(|| {
             DatalensError::new(
                 DatalensErrorKind::UnsupportedDataset,
                 "dataset is not supported by adapter",
@@ -458,7 +459,7 @@ where
         let adapter_limit = self
             .source
             .capabilities()
-            .dataset(dataset)
+            .dataset(&DatasetKey::from(dataset))
             .and_then(|capability| capability.max_range_blocks())
             .unwrap_or(u64::MAX);
 

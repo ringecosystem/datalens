@@ -347,12 +347,189 @@ pub mod range {
             Ok(ranges)
         }
     }
+
+    #[derive(Deserialize)]
+    #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+    enum RawLedgerRangeKind {
+        Block,
+        Slot,
+        Height,
+        Other(String),
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+    #[serde(try_from = "RawLedgerRangeKind")]
+    pub enum LedgerRangeKind {
+        Block,
+        Slot,
+        Height,
+        Other(String),
+    }
+
+    impl TryFrom<RawLedgerRangeKind> for LedgerRangeKind {
+        type Error = DatalensError;
+
+        fn try_from(value: RawLedgerRangeKind) -> Result<Self, Self::Error> {
+            match value {
+                RawLedgerRangeKind::Block => Ok(Self::Block),
+                RawLedgerRangeKind::Slot => Ok(Self::Slot),
+                RawLedgerRangeKind::Height => Ok(Self::Height),
+                RawLedgerRangeKind::Other(value) => Ok(Self::Other(
+                    crate::chain::validate_identifier("ledger range kind", value)?,
+                )),
+            }
+        }
+    }
+
+    #[derive(Deserialize)]
+    struct RawLedgerRange {
+        kind: LedgerRangeKind,
+        start: u64,
+        end: u64,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[serde(try_from = "RawLedgerRange")]
+    pub struct LedgerRange {
+        kind: LedgerRangeKind,
+        start: u64,
+        end: u64,
+    }
+
+    impl TryFrom<RawLedgerRange> for LedgerRange {
+        type Error = DatalensError;
+
+        fn try_from(raw: RawLedgerRange) -> Result<Self, Self::Error> {
+            Self::try_new(raw.kind, raw.start, raw.end)
+        }
+    }
+
+    impl LedgerRange {
+        pub fn try_new(kind: LedgerRangeKind, start: u64, end: u64) -> Result<Self, DatalensError> {
+            let kind = match kind {
+                LedgerRangeKind::Other(value) => LedgerRangeKind::Other(
+                    crate::chain::validate_identifier("ledger range kind", value)?,
+                ),
+                kind => kind,
+            };
+            if start > end {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::InvalidInput,
+                    "ledger range start must be less than or equal to end",
+                ));
+            }
+            Ok(Self { kind, start, end })
+        }
+
+        pub fn blocks(start: u64, end: u64) -> Result<Self, DatalensError> {
+            Self::try_new(LedgerRangeKind::Block, start, end)
+        }
+
+        pub fn slots(start: u64, end: u64) -> Result<Self, DatalensError> {
+            Self::try_new(LedgerRangeKind::Slot, start, end)
+        }
+
+        pub fn heights(start: u64, end: u64) -> Result<Self, DatalensError> {
+            Self::try_new(LedgerRangeKind::Height, start, end)
+        }
+
+        pub fn from_block_range(range: BlockRange) -> Self {
+            Self {
+                kind: LedgerRangeKind::Block,
+                start: range.from_block,
+                end: range.to_block,
+            }
+        }
+
+        pub fn block_range(&self) -> Option<BlockRange> {
+            if self.kind == LedgerRangeKind::Block {
+                Some(BlockRange::expect_new(self.start, self.end))
+            } else {
+                None
+            }
+        }
+
+        pub fn kind(&self) -> LedgerRangeKind {
+            self.kind.clone()
+        }
+
+        pub fn start(&self) -> u64 {
+            self.start
+        }
+
+        pub fn end(&self) -> u64 {
+            self.end
+        }
+
+        pub fn len(&self) -> u128 {
+            u128::from(self.end) - u128::from(self.start) + 1
+        }
+
+        pub fn is_empty(&self) -> bool {
+            false
+        }
+
+        pub fn contains(&self, position: u64) -> bool {
+            self.start <= position && position <= self.end
+        }
+
+        pub fn overlaps(&self, other: &Self) -> bool {
+            self.kind == other.kind && self.start <= other.end && other.start <= self.end
+        }
+
+        pub fn intersection(&self, other: &Self) -> Option<Self> {
+            if self.kind != other.kind {
+                return None;
+            }
+            let start = self.start.max(other.start);
+            let end = self.end.min(other.end);
+            Self::try_new(self.kind.clone(), start, end).ok()
+        }
+
+        pub fn difference(&self, covered: &Self) -> Vec<Self> {
+            let Some(overlap) = self.intersection(covered) else {
+                return vec![self.clone()];
+            };
+            let mut ranges = Vec::new();
+            if self.start < overlap.start {
+                ranges
+                    .push(Self::try_new(self.kind.clone(), self.start, overlap.start - 1).unwrap());
+            }
+            if overlap.end < self.end {
+                ranges.push(Self::try_new(self.kind.clone(), overlap.end + 1, self.end).unwrap());
+            }
+            ranges
+        }
+
+        pub fn split(&self, max_len: u64) -> Result<Vec<Self>, DatalensError> {
+            if max_len == 0 {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::InvalidInput,
+                    "max_len must be greater than zero",
+                ));
+            }
+
+            let mut ranges = Vec::new();
+            let mut start = self.start;
+            loop {
+                let chunk_end = start.saturating_add(max_len - 1);
+                let end = self.end.min(chunk_end);
+                ranges.push(Self::try_new(self.kind.clone(), start, end).unwrap());
+                if end == self.end || end == u64::MAX {
+                    break;
+                }
+                start = end + 1;
+            }
+            Ok(ranges)
+        }
+    }
 }
 
 pub mod dataset {
     use serde::{Deserialize, Serialize};
 
-    use crate::{DatalensError, chain::validate_identifier};
+    use crate::{ChainFamily, DatalensError, chain::validate_identifier};
 
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
     #[serde(try_from = "String")]
@@ -392,6 +569,105 @@ pub mod dataset {
             match self {
                 Self::Blocks => "blocks",
                 Self::Logs => "logs",
+            }
+        }
+    }
+
+    #[derive(Deserialize)]
+    struct RawDatasetKey {
+        family: ChainFamily,
+        name: DatasetId,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[serde(try_from = "RawDatasetKey")]
+    pub struct DatasetKey {
+        family: ChainFamily,
+        name: DatasetId,
+        #[serde(skip)]
+        key: String,
+    }
+
+    impl TryFrom<RawDatasetKey> for DatasetKey {
+        type Error = DatalensError;
+
+        fn try_from(raw: RawDatasetKey) -> Result<Self, Self::Error> {
+            Self::try_new(raw.family, raw.name.as_str())
+        }
+    }
+
+    impl DatasetKey {
+        pub fn try_new(
+            family: ChainFamily,
+            name: impl Into<String>,
+        ) -> Result<Self, DatalensError> {
+            let family = match family {
+                ChainFamily::Evm => ChainFamily::Evm,
+                ChainFamily::Other(value) => ChainFamily::try_other(value)?,
+            };
+            let name = DatasetId::try_new(name)?;
+            let key = format!("{}.{}", family.key(), name.as_str());
+            Ok(Self { family, name, key })
+        }
+
+        pub fn evm_blocks() -> Self {
+            Self::from(Dataset::Blocks)
+        }
+
+        pub fn evm_logs() -> Self {
+            Self::from(Dataset::Logs)
+        }
+
+        pub fn tron_blocks() -> Self {
+            Self::try_new(ChainFamily::Other("tron".to_owned()), "blocks").unwrap()
+        }
+
+        pub fn tron_events() -> Self {
+            Self::try_new(ChainFamily::Other("tron".to_owned()), "events").unwrap()
+        }
+
+        pub fn solana_slots() -> Self {
+            Self::try_new(ChainFamily::Other("solana".to_owned()), "slots").unwrap()
+        }
+
+        pub fn solana_transactions() -> Self {
+            Self::try_new(ChainFamily::Other("solana".to_owned()), "transactions").unwrap()
+        }
+
+        pub fn solana_instructions() -> Self {
+            Self::try_new(ChainFamily::Other("solana".to_owned()), "instructions").unwrap()
+        }
+
+        pub fn solana_account_updates() -> Self {
+            Self::try_new(ChainFamily::Other("solana".to_owned()), "account_updates").unwrap()
+        }
+
+        pub fn family(&self) -> &ChainFamily {
+            &self.family
+        }
+
+        pub fn name(&self) -> &DatasetId {
+            &self.name
+        }
+
+        pub fn as_str(&self) -> &str {
+            &self.key
+        }
+
+        pub fn legacy_dataset(&self) -> Option<Dataset> {
+            match (self.family(), self.name().as_str()) {
+                (ChainFamily::Evm, "blocks") => Some(Dataset::Blocks),
+                (ChainFamily::Evm, "logs") => Some(Dataset::Logs),
+                _ => None,
+            }
+        }
+    }
+
+    impl From<Dataset> for DatasetKey {
+        fn from(dataset: Dataset) -> Self {
+            match dataset {
+                Dataset::Blocks => Self::try_new(ChainFamily::Evm, "blocks").unwrap(),
+                Dataset::Logs => Self::try_new(ChainFamily::Evm, "logs").unwrap(),
             }
         }
     }
@@ -780,7 +1056,7 @@ pub mod query {
     use serde::{Deserialize, Serialize};
     use sha2::{Digest, Sha256};
 
-    use crate::{BlockRange, ChainIdentity, DatalensError, DatalensErrorKind, Dataset};
+    use crate::{BlockRange, ChainIdentity, DatalensError, DatalensErrorKind, Dataset, DatasetKey};
 
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
     pub struct BlockHeader {
@@ -1013,32 +1289,78 @@ pub mod query {
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
     #[serde(tag = "dataset", content = "rows", rename_all = "snake_case")]
     pub enum QueryRows {
-        Blocks(Vec<BlockHeader>),
-        Logs(Vec<LogRecord>),
+        #[serde(rename = "blocks", alias = "evm_blocks")]
+        EvmBlocks(Vec<BlockHeader>),
+        #[serde(rename = "logs", alias = "evm_logs")]
+        EvmLogs(Vec<LogRecord>),
+        TronEvents(Vec<serde_json::Value>),
+        SolanaTransactions(Vec<serde_json::Value>),
+        SolanaInstructions(Vec<serde_json::Value>),
+        OtherJson(Vec<serde_json::Value>),
     }
 
     impl QueryRows {
         pub fn dataset(&self) -> Dataset {
             match self {
-                Self::Blocks(_) => Dataset::Blocks,
-                Self::Logs(_) => Dataset::Logs,
+                Self::EvmBlocks(_) => Dataset::Blocks,
+                Self::EvmLogs(_) => Dataset::Logs,
+                Self::TronEvents(_)
+                | Self::SolanaTransactions(_)
+                | Self::SolanaInstructions(_)
+                | Self::OtherJson(_) => {
+                    panic!("non-EVM rows do not have a legacy Dataset")
+                }
+            }
+        }
+
+        pub fn dataset_key(&self) -> DatasetKey {
+            match self {
+                Self::EvmBlocks(_) => DatasetKey::evm_blocks(),
+                Self::EvmLogs(_) => DatasetKey::evm_logs(),
+                Self::TronEvents(_) => DatasetKey::tron_events(),
+                Self::SolanaTransactions(_) => DatasetKey::solana_transactions(),
+                Self::SolanaInstructions(_) => DatasetKey::solana_instructions(),
+                Self::OtherJson(_) => {
+                    DatasetKey::try_new(crate::ChainFamily::Other("other".to_owned()), "json")
+                        .unwrap()
+                }
             }
         }
 
         pub fn row_count(&self) -> usize {
             match self {
-                Self::Blocks(rows) => rows.len(),
-                Self::Logs(rows) => rows.len(),
+                Self::EvmBlocks(rows) => rows.len(),
+                Self::EvmLogs(rows) => rows.len(),
+                Self::TronEvents(rows) => rows.len(),
+                Self::SolanaTransactions(rows) => rows.len(),
+                Self::SolanaInstructions(rows) => rows.len(),
+                Self::OtherJson(rows) => rows.len(),
             }
         }
 
         pub fn try_append(&mut self, other: QueryRows) -> Result<(), DatalensError> {
             match (self, other) {
-                (Self::Blocks(left), Self::Blocks(mut right)) => {
+                (Self::EvmBlocks(left), Self::EvmBlocks(mut right)) => {
                     left.append(&mut right);
                     Ok(())
                 }
-                (Self::Logs(left), Self::Logs(mut right)) => {
+                (Self::EvmLogs(left), Self::EvmLogs(mut right)) => {
+                    left.append(&mut right);
+                    Ok(())
+                }
+                (Self::TronEvents(left), Self::TronEvents(mut right)) => {
+                    left.append(&mut right);
+                    Ok(())
+                }
+                (Self::SolanaTransactions(left), Self::SolanaTransactions(mut right)) => {
+                    left.append(&mut right);
+                    Ok(())
+                }
+                (Self::SolanaInstructions(left), Self::SolanaInstructions(mut right)) => {
+                    left.append(&mut right);
+                    Ok(())
+                }
+                (Self::OtherJson(left), Self::OtherJson(mut right)) => {
                     left.append(&mut right);
                     Ok(())
                 }
@@ -1051,9 +1373,47 @@ pub mod query {
 
         pub fn sort(&mut self) {
             match self {
-                Self::Blocks(rows) => rows.sort_by_key(|row| row.number),
-                Self::Logs(rows) => rows.sort_by_key(|row| (row.block_number, row.log_index)),
+                Self::EvmBlocks(rows) => rows.sort_by_key(|row| row.number),
+                Self::EvmLogs(rows) => rows.sort_by_key(|row| (row.block_number, row.log_index)),
+                Self::TronEvents(_)
+                | Self::SolanaTransactions(_)
+                | Self::SolanaInstructions(_)
+                | Self::OtherJson(_) => {}
             }
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    pub struct DatasetRows {
+        dataset_key: DatasetKey,
+        rows: QueryRows,
+    }
+
+    impl DatasetRows {
+        pub fn new(dataset_key: DatasetKey, rows: QueryRows) -> Result<Self, DatalensError> {
+            if dataset_key != rows.dataset_key() && !matches!(rows, QueryRows::OtherJson(_)) {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::Internal,
+                    "dataset rows key does not match typed rows",
+                ));
+            }
+            Ok(Self { dataset_key, rows })
+        }
+
+        pub fn dataset_key(&self) -> &DatasetKey {
+            &self.dataset_key
+        }
+
+        pub fn rows(&self) -> &QueryRows {
+            &self.rows
+        }
+
+        pub fn into_rows(self) -> QueryRows {
+            self.rows
+        }
+
+        pub fn row_count(&self) -> usize {
+            self.rows.row_count()
         }
     }
 
@@ -1140,21 +1500,21 @@ pub mod query {
 
 pub use chain::{ChainFamily, ChainIdentity, NetworkId};
 pub use coverage::{CoverageKey, CoverageLevel, CoverageRecord, CoverageShape, CoverageValue};
-pub use dataset::{Dataset, DatasetId};
+pub use dataset::{Dataset, DatasetId, DatasetKey};
 pub use error::{DatalensError, DatalensErrorKind};
 pub use query::{
-    BlockHeader, CacheSummary, EvmLogFilter, LogFilter, LogRecord, QueryRequest, QueryResponse,
-    QueryRows, TopicFilter,
+    BlockHeader, CacheSummary, DatasetRows, EvmLogFilter, LogFilter, LogRecord, QueryRequest,
+    QueryResponse, QueryRows, TopicFilter,
 };
-pub use range::{BlockRange, TimeRange};
+pub use range::{BlockRange, LedgerRange, LedgerRangeKind, TimeRange};
 pub use result::ResultEnvelope;
 
 #[cfg(test)]
 mod tests {
     use crate::{
         BlockRange, ChainFamily, ChainIdentity, CoverageKey, CoverageRecord, CoverageValue,
-        DatalensError, DatalensErrorKind, DatasetId, EvmLogFilter, LogFilter, LogRecord, NetworkId,
-        QueryRows, TimeRange, TopicFilter,
+        DatalensError, DatalensErrorKind, Dataset, DatasetId, EvmLogFilter, LogFilter, LogRecord,
+        NetworkId, QueryRows, TimeRange, TopicFilter,
     };
 
     #[test]
@@ -1213,6 +1573,68 @@ mod tests {
             u128::from(u64::MAX) + 1
         );
         assert!(BlockRange::try_new(2, 1).is_err());
+        assert!(range.split(0).is_err());
+    }
+
+    #[test]
+    fn test_dataset_key_has_builtin_chain_neutral_ids() {
+        assert_eq!(crate::DatasetKey::evm_blocks().as_str(), "evm.blocks");
+        assert_eq!(crate::DatasetKey::evm_logs().as_str(), "evm.logs");
+        assert_eq!(crate::DatasetKey::tron_blocks().as_str(), "tron.blocks");
+        assert_eq!(crate::DatasetKey::tron_events().as_str(), "tron.events");
+        assert_eq!(crate::DatasetKey::solana_slots().as_str(), "solana.slots");
+        assert_eq!(
+            crate::DatasetKey::solana_transactions().as_str(),
+            "solana.transactions"
+        );
+        assert_eq!(
+            crate::DatasetKey::solana_instructions().as_str(),
+            "solana.instructions"
+        );
+        assert_eq!(
+            crate::DatasetKey::solana_account_updates().as_str(),
+            "solana.account_updates"
+        );
+        assert_eq!(
+            crate::DatasetKey::from(Dataset::Logs),
+            crate::DatasetKey::evm_logs()
+        );
+        assert!(crate::DatasetKey::try_new(ChainFamily::Evm, "bad/path").is_err());
+    }
+
+    #[test]
+    fn test_ledger_range_supports_block_slot_and_height_math() {
+        let range = crate::LedgerRange::blocks(10, 14).expect("valid range");
+        assert_eq!(range.kind(), crate::LedgerRangeKind::Block);
+        assert_eq!(range.len(), 5);
+        assert!(range.contains(12));
+        assert_eq!(
+            range.intersection(&crate::LedgerRange::blocks(12, 20).unwrap()),
+            Some(crate::LedgerRange::blocks(12, 14).unwrap())
+        );
+        assert!(range.overlaps(&crate::LedgerRange::blocks(14, 20).unwrap()));
+        assert!(!range.overlaps(&crate::LedgerRange::slots(14, 20).unwrap()));
+        assert_eq!(
+            range.difference(&crate::LedgerRange::blocks(12, 13).unwrap()),
+            vec![
+                crate::LedgerRange::blocks(10, 11).unwrap(),
+                crate::LedgerRange::blocks(14, 14).unwrap()
+            ]
+        );
+        assert_eq!(
+            range.split(2).expect("split"),
+            vec![
+                crate::LedgerRange::blocks(10, 11).unwrap(),
+                crate::LedgerRange::blocks(12, 13).unwrap(),
+                crate::LedgerRange::blocks(14, 14).unwrap()
+            ]
+        );
+
+        let slot = crate::LedgerRange::slots(1, 1).expect("slot range");
+        assert_eq!(slot.kind(), crate::LedgerRangeKind::Slot);
+        assert_eq!(slot.start(), 1);
+        assert_eq!(slot.end(), 1);
+        assert!(crate::LedgerRange::heights(2, 1).is_err());
         assert!(range.split(0).is_err());
     }
 
@@ -1521,7 +1943,7 @@ mod tests {
 
     #[test]
     fn test_query_rows_try_append_checks_dataset_mismatch() {
-        let mut blocks = QueryRows::Blocks(vec![crate::BlockHeader {
+        let mut blocks = QueryRows::EvmBlocks(vec![crate::BlockHeader {
             number: 1,
             hash: "0x1".to_owned(),
             parent_hash: "0x0".to_owned(),
@@ -1529,7 +1951,7 @@ mod tests {
         }]);
 
         blocks
-            .try_append(QueryRows::Blocks(vec![crate::BlockHeader {
+            .try_append(QueryRows::EvmBlocks(vec![crate::BlockHeader {
                 number: 2,
                 hash: "0x2".to_owned(),
                 parent_hash: "0x1".to_owned(),
@@ -1539,8 +1961,32 @@ mod tests {
         assert_eq!(blocks.row_count(), 2);
 
         let error = blocks
-            .try_append(QueryRows::Logs(Vec::new()))
+            .try_append(QueryRows::EvmLogs(Vec::new()))
             .expect_err("dataset mismatch");
+        assert_eq!(error.kind, DatalensErrorKind::Internal);
+    }
+
+    #[test]
+    fn test_dataset_rows_envelope_keeps_dataset_key_with_typed_rows() {
+        let rows = crate::DatasetRows::new(
+            crate::DatasetKey::evm_blocks(),
+            QueryRows::EvmBlocks(vec![crate::BlockHeader {
+                number: 1,
+                hash: "0x1".to_owned(),
+                parent_hash: "0x0".to_owned(),
+                timestamp: 10,
+            }]),
+        )
+        .expect("matching dataset rows");
+
+        assert_eq!(rows.dataset_key(), &crate::DatasetKey::evm_blocks());
+        assert_eq!(rows.rows().row_count(), 1);
+
+        let error = crate::DatasetRows::new(
+            crate::DatasetKey::evm_logs(),
+            QueryRows::EvmBlocks(Vec::new()),
+        )
+        .expect_err("dataset key mismatch");
         assert_eq!(error.kind, DatalensErrorKind::Internal);
     }
 

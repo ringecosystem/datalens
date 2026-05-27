@@ -1,14 +1,14 @@
 //! Chain-neutral adapter boundary for datalens chain sources.
 
 use datalens_core::{
-    BlockRange, ChainIdentity, DatalensError, DatalensErrorKind, Dataset, DatasetId, EvmLogFilter,
-    LogFilter, QueryRows,
+    ChainIdentity, DatalensError, DatalensErrorKind, Dataset, DatasetKey, DatasetRows,
+    EvmLogFilter, LedgerRange, LedgerRangeKind, LogFilter, QueryRows,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdapterCapabilities {
     chain: ChainIdentity,
-    datasets: Vec<DatasetId>,
+    datasets: Vec<DatasetKey>,
     dataset_capabilities: Vec<DatasetCapability>,
 }
 
@@ -21,14 +21,13 @@ impl AdapterCapabilities {
         }
     }
 
-    pub fn with_dataset(mut self, dataset: DatasetId) -> Self {
+    pub fn with_dataset(mut self, dataset: DatasetKey) -> Self {
         self.datasets.push(dataset);
         self
     }
 
     pub fn with_dataset_capability(mut self, capability: DatasetCapability) -> Self {
-        self.datasets
-            .push(DatasetId::expect_new(capability.dataset.as_str()));
+        self.datasets.push(capability.dataset.clone());
         self.dataset_capabilities.push(capability);
         self
     }
@@ -37,14 +36,14 @@ impl AdapterCapabilities {
         &self.chain
     }
 
-    pub fn datasets(&self) -> &[DatasetId] {
+    pub fn datasets(&self) -> &[DatasetKey] {
         &self.datasets
     }
 
-    pub fn dataset(&self, dataset: Dataset) -> Option<&DatasetCapability> {
+    pub fn dataset(&self, dataset: &DatasetKey) -> Option<&DatasetCapability> {
         self.dataset_capabilities
             .iter()
-            .find(|capability| capability.dataset == dataset)
+            .find(|capability| &capability.dataset == dataset)
     }
 
     pub fn dataset_capabilities(&self) -> &[DatasetCapability] {
@@ -54,7 +53,7 @@ impl AdapterCapabilities {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DatasetCapability {
-    dataset: Dataset,
+    dataset: DatasetKey,
     selectors: Vec<SelectorKind>,
     ranges: Vec<HeightRangeKind>,
     max_range_blocks: Option<u64>,
@@ -68,9 +67,9 @@ pub struct DatasetCapability {
 }
 
 impl DatasetCapability {
-    pub fn new(dataset: Dataset) -> Self {
+    pub fn new(dataset: impl Into<DatasetKey>) -> Self {
         Self {
-            dataset,
+            dataset: dataset.into(),
             selectors: Vec::new(),
             ranges: Vec::new(),
             max_range_blocks: None,
@@ -137,8 +136,8 @@ impl DatasetCapability {
         self
     }
 
-    pub fn dataset(&self) -> Dataset {
-        self.dataset
+    pub fn dataset(&self) -> &DatasetKey {
+        &self.dataset
     }
 
     pub fn selectors(&self) -> &[SelectorKind] {
@@ -220,11 +219,8 @@ pub enum SelectorKind {
     Other(AdapterKey),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum HeightRangeKind {
-    Block,
-    Other(AdapterKey),
-}
+pub type HeightRangeKind = LedgerRangeKind;
+pub type HeightRange = LedgerRange;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DatasetSelector {
@@ -288,7 +284,7 @@ impl DatasetSelector {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChainFetchRequest {
     pub chain: ChainIdentity,
-    pub dataset: Dataset,
+    pub dataset_key: DatasetKey,
     pub range: HeightRange,
     pub selector: DatasetSelector,
     pub limit: Option<FetchLimit>,
@@ -317,13 +313,13 @@ pub struct FetchContext {
 impl ChainFetchRequest {
     pub fn new(
         chain: ChainIdentity,
-        dataset: Dataset,
+        dataset_key: DatasetKey,
         range: HeightRange,
         selector: DatasetSelector,
     ) -> Self {
         Self {
             chain,
-            dataset,
+            dataset_key,
             range,
             selector,
             limit: None,
@@ -342,70 +338,27 @@ impl ChainFetchRequest {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum HeightRange {
-    Block(BlockRange),
-    Other {
-        kind: AdapterKey,
-        start: u64,
-        end: u64,
-    },
-}
-
-impl HeightRange {
-    pub fn blocks(range: BlockRange) -> Self {
-        Self::Block(range)
-    }
-
-    pub fn try_other(kind: AdapterKey, start: u64, end: u64) -> Result<Self, DatalensError> {
-        if start > end {
-            return Err(DatalensError::new(
-                DatalensErrorKind::InvalidInput,
-                "height range start must be less than or equal to end",
-            ));
-        }
-        Ok(Self::Other { kind, start, end })
-    }
-
-    pub fn kind(&self) -> HeightRangeKind {
-        match self {
-            Self::Block(_) => HeightRangeKind::Block,
-            Self::Other { kind, .. } => HeightRangeKind::Other(kind.clone()),
-        }
-    }
-
-    pub fn block_range(&self) -> Option<BlockRange> {
-        match self {
-            Self::Block(range) => Some(*range),
-            Self::Other { .. } => None,
-        }
-    }
-
-    pub fn end(&self) -> u64 {
-        match self {
-            Self::Block(range) => range.to_block,
-            Self::Other { end, .. } => *end,
-        }
-    }
-
-    pub fn is_covered_by(&self, height: &ChainHeight) -> Result<(), DatalensError> {
-        validate_durable_range(self, height)
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FinalityKind {
+pub enum FinalityLevel {
     Latest,
     Safe,
     Finalized,
-    Other(&'static str),
+    ChainSpecific(&'static str),
 }
+
+impl FinalityLevel {
+    pub fn is_durable_writable(&self) -> bool {
+        matches!(self, Self::Safe | Self::Finalized)
+    }
+}
+
+pub type FinalityKind = FinalityLevel;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChainHeight {
     pub range_kind: HeightRangeKind,
     pub value: u64,
-    pub finality: FinalityKind,
+    pub finality: FinalityLevel,
 }
 
 impl ChainHeight {
@@ -413,24 +366,28 @@ impl ChainHeight {
         Self {
             range_kind: HeightRangeKind::Block,
             value,
-            finality: FinalityKind::Latest,
+            finality: FinalityLevel::Latest,
         }
     }
 
-    pub fn with_finality(mut self, finality: FinalityKind) -> Self {
+    pub fn with_finality(mut self, finality: FinalityLevel) -> Self {
         self.finality = finality;
         self
     }
 
     pub fn is_durable_cache_safe(&self) -> bool {
-        matches!(self.finality, FinalityKind::Safe | FinalityKind::Finalized)
+        self.finality.is_durable_writable()
     }
 
     pub fn validate_durable_cache_safe(&self) -> Result<(), DatalensError> {
-        if !self.is_durable_cache_safe() {
+        self.validate_durable_writable()
+    }
+
+    pub fn validate_durable_writable(&self) -> Result<(), DatalensError> {
+        if !self.finality.is_durable_writable() {
             return Err(DatalensError::new(
                 DatalensErrorKind::InvalidInput,
-                "adapter cache-safe height is not safe or finalized",
+                "adapter durable boundary is not safe or finalized",
             ));
         }
         Ok(())
@@ -461,9 +418,9 @@ fn validate_storage_key(kind: &str, value: String) -> Result<String, DatalensErr
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChainFetchResponse {
     pub chain: ChainIdentity,
-    pub dataset: Dataset,
+    pub dataset_key: DatasetKey,
     pub range: HeightRange,
-    pub rows: QueryRows,
+    pub rows: DatasetRows,
     pub coverage_selector: DatasetSelector,
     pub source_metadata: SourceMetadata,
     pub provider_diagnostics: ProviderDiagnostics,
@@ -472,14 +429,15 @@ pub struct ChainFetchResponse {
 impl ChainFetchResponse {
     pub fn new(
         chain: ChainIdentity,
-        dataset: Dataset,
+        dataset_key: DatasetKey,
         range: HeightRange,
         coverage_selector: DatasetSelector,
         rows: QueryRows,
     ) -> Self {
+        let rows = DatasetRows::new(dataset_key.clone(), rows).expect("matching dataset rows");
         Self {
             chain,
-            dataset,
+            dataset_key,
             range,
             rows,
             coverage_selector,
@@ -490,15 +448,16 @@ impl ChainFetchResponse {
 
     pub fn empty(
         chain: ChainIdentity,
-        dataset: Dataset,
+        dataset_key: DatasetKey,
         range: HeightRange,
         coverage_selector: DatasetSelector,
     ) -> Self {
-        let rows = match dataset {
-            Dataset::Blocks => QueryRows::Blocks(Vec::new()),
-            Dataset::Logs => QueryRows::Logs(Vec::new()),
+        let rows = match dataset_key.legacy_dataset() {
+            Some(Dataset::Blocks) => QueryRows::EvmBlocks(Vec::new()),
+            Some(Dataset::Logs) => QueryRows::EvmLogs(Vec::new()),
+            None => QueryRows::OtherJson(Vec::new()),
         };
-        Self::new(chain, dataset, range, coverage_selector, rows)
+        Self::new(chain, dataset_key, range, coverage_selector, rows)
     }
 
     pub fn with_source_metadata(mut self, source_metadata: SourceMetadata) -> Self {
@@ -513,10 +472,10 @@ impl ChainFetchResponse {
 
     pub fn validate_for_request(&self, request: &ChainFetchRequest) -> Result<(), DatalensError> {
         if self.chain != request.chain
-            || self.dataset != request.dataset
+            || self.dataset_key != request.dataset_key
             || self.range != request.range
             || self.coverage_selector != request.selector
-            || self.rows.dataset() != request.dataset
+            || self.rows.dataset_key() != &request.dataset_key
         {
             return Err(DatalensError::new(
                 DatalensErrorKind::Internal,
@@ -550,7 +509,7 @@ pub fn validate_durable_range(
     range: &HeightRange,
     cache_safe_height: &ChainHeight,
 ) -> Result<(), DatalensError> {
-    cache_safe_height.validate_durable_cache_safe()?;
+    cache_safe_height.validate_durable_writable()?;
     if range.kind() != cache_safe_height.range_kind {
         return Err(DatalensError::new(
             DatalensErrorKind::InvalidInput,
@@ -590,8 +549,8 @@ pub trait ChainAdapter: Clone + Send + Sync + 'static {
 #[cfg(test)]
 mod tests {
     use datalens_core::{
-        BlockRange, ChainFamily, ChainIdentity, DatalensError, Dataset, LogFilter, NetworkId,
-        QueryRows,
+        ChainFamily, ChainIdentity, DatalensError, Dataset, DatasetKey, DatasetRows, LedgerRange,
+        LedgerRangeKind, LogFilter, NetworkId, QueryRows,
     };
 
     use super::*;
@@ -629,7 +588,7 @@ mod tests {
         fn fetch(&self, request: ChainFetchRequest) -> Result<ChainFetchResponse, DatalensError> {
             Ok(ChainFetchResponse::empty(
                 request.chain,
-                request.dataset,
+                request.dataset_key,
                 request.range,
                 request.selector,
             )
@@ -677,7 +636,7 @@ mod tests {
 
         assert_eq!(capabilities.chain(), &chain);
         let logs = capabilities
-            .dataset(Dataset::Logs)
+            .dataset(&DatasetKey::evm_logs())
             .expect("logs capability");
         assert!(logs.supports_selector(SelectorKind::EvmLogs));
         assert_eq!(logs.max_range_blocks(), Some(2));
@@ -690,8 +649,8 @@ mod tests {
 
         let request = ChainFetchRequest::new(
             chain.clone(),
-            Dataset::Logs,
-            HeightRange::blocks(BlockRange::expect_new(10, 11)),
+            DatasetKey::evm_logs(),
+            LedgerRange::blocks(10, 11).expect("valid range"),
             DatasetSelector::try_evm_logs(LogFilter {
                 addresses: Vec::new(),
                 topics: Vec::new(),
@@ -713,12 +672,15 @@ mod tests {
         response
             .validate_for_request(&request)
             .expect("response matches request");
-        assert_eq!(response.dataset, Dataset::Logs);
+        assert_eq!(response.dataset_key, DatasetKey::evm_logs());
         assert_eq!(
             response.range,
-            HeightRange::blocks(BlockRange::expect_new(10, 11))
+            LedgerRange::blocks(10, 11).expect("valid range")
         );
-        assert_eq!(response.rows, QueryRows::Logs(Vec::new()));
+        assert_eq!(
+            response.rows,
+            DatasetRows::new(DatasetKey::evm_logs(), QueryRows::EvmLogs(Vec::new())).unwrap()
+        );
         assert_eq!(response.coverage_selector.kind(), SelectorKind::EvmLogs);
         assert_eq!(response.source_metadata.provider, "mock");
         assert_eq!(response.provider_diagnostics.calls, 1);
@@ -732,16 +694,16 @@ mod tests {
         let selector = DatasetSelector::all();
         let request = ChainFetchRequest::new(
             chain.clone(),
-            Dataset::Blocks,
-            HeightRange::blocks(BlockRange::expect_new(1, 2)),
+            DatasetKey::evm_blocks(),
+            LedgerRange::blocks(1, 2).expect("valid range"),
             selector.clone(),
         );
         let response = ChainFetchResponse::new(
             chain,
-            Dataset::Logs,
-            HeightRange::blocks(BlockRange::expect_new(1, 2)),
+            DatasetKey::evm_logs(),
+            LedgerRange::blocks(1, 2).expect("valid range"),
             selector,
-            QueryRows::Logs(Vec::new()),
+            QueryRows::EvmLogs(Vec::new()),
         );
 
         let error = response
@@ -758,8 +720,8 @@ mod tests {
                 .expect("valid chain");
         let request = ChainFetchRequest::new(
             chain.clone(),
-            Dataset::Logs,
-            HeightRange::blocks(BlockRange::expect_new(1, 2)),
+            DatasetKey::evm_logs(),
+            LedgerRange::blocks(1, 2).expect("valid range"),
             DatasetSelector::try_evm_logs(LogFilter {
                 addresses: Vec::new(),
                 topics: Vec::new(),
@@ -768,8 +730,8 @@ mod tests {
         );
         let response = ChainFetchResponse::empty(
             chain,
-            Dataset::Logs,
-            HeightRange::blocks(BlockRange::expect_new(1, 2)),
+            DatasetKey::evm_logs(),
+            LedgerRange::blocks(1, 2).expect("valid range"),
             request.selector.clone(),
         );
 
@@ -782,7 +744,7 @@ mod tests {
 
     #[test]
     fn test_durable_range_requires_safe_or_finalized_matching_height_kind() {
-        let range = HeightRange::blocks(BlockRange::expect_new(1, 10));
+        let range = LedgerRange::blocks(1, 10).expect("valid range");
         assert!(
             validate_durable_range(
                 &range,
@@ -810,11 +772,9 @@ mod tests {
         assert_eq!(too_high_error.kind, DatalensErrorKind::InvalidInput);
 
         let other_height = ChainHeight {
-            range_kind: HeightRangeKind::Other(
-                AdapterKey::try_new("solana-slots").expect("valid key"),
-            ),
+            range_kind: LedgerRangeKind::Slot,
             value: 10,
-            finality: FinalityKind::Safe,
+            finality: FinalityLevel::Safe,
         };
         let kind_error =
             validate_durable_range(&range, &other_height).expect_err("kind mismatch rejected");
@@ -823,10 +783,11 @@ mod tests {
 
     #[test]
     fn test_other_finality_cannot_authorize_durable_cache_write() {
-        let height = ChainHeight::block(10).with_finality(FinalityKind::Other("checkpoint"));
+        let height =
+            ChainHeight::block(10).with_finality(FinalityLevel::ChainSpecific("checkpoint"));
 
-        assert!(!height.is_durable_cache_safe());
-        assert!(height.validate_durable_cache_safe().is_err());
+        assert!(!height.finality.is_durable_writable());
+        assert!(height.validate_durable_writable().is_err());
     }
 
     #[test]
@@ -839,8 +800,8 @@ mod tests {
             SelectorKind::Other(second.clone())
         );
         assert_eq!(
-            HeightRangeKind::Other(first.clone()),
-            HeightRangeKind::Other(second.clone())
+            HeightRangeKind::Other(first.as_str().to_owned()),
+            HeightRangeKind::Other(second.as_str().to_owned())
         );
         assert_eq!(first.as_str(), "solana-accounts");
         assert!(AdapterKey::try_new("").is_err());
@@ -853,10 +814,14 @@ mod tests {
             "accounts/canonical-key",
         )
         .expect("valid selector");
-        let range = HeightRange::try_other(first, 1, 2).expect("valid range");
+        let range = HeightRange::try_new(HeightRangeKind::Other(first.as_str().to_owned()), 1, 2)
+            .expect("valid range");
 
         assert_eq!(selector.kind(), SelectorKind::Other(second.clone()));
-        assert_eq!(range.kind(), HeightRangeKind::Other(second));
+        assert_eq!(
+            range.kind(),
+            HeightRangeKind::Other(second.as_str().to_owned())
+        );
         assert_eq!(selector.fingerprint(), "accounts-fingerprint");
         assert_eq!(selector.canonical_key(), "accounts/canonical-key");
         assert!(
@@ -868,8 +833,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            HeightRange::try_other(AdapterKey::try_new("bad-range").expect("valid key"), 2, 1,)
-                .is_err()
+            HeightRange::try_new(HeightRangeKind::Other("bad-range".to_owned()), 2, 1,).is_err()
         );
     }
 

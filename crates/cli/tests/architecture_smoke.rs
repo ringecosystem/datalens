@@ -1,8 +1,8 @@
 use datalens_api::{auth::AuthenticationHook, compatibility::CompatibilityAdapter};
 use datalens_chain::{AdapterCapabilities, ChainAdapter};
 use datalens_core::{
-    ChainFamily, ChainIdentity, CoverageLevel, DatalensErrorKind, DatasetId, ResultEnvelope,
-    TimeRange,
+    ChainFamily, ChainIdentity, CoverageLevel, DatalensErrorKind, DatasetId, DatasetKey,
+    ResultEnvelope, TimeRange,
 };
 use datalens_evm::EvmAdapterMetadata;
 use datalens_planner::{PlanRequest, PlanStatus};
@@ -15,7 +15,7 @@ fn workspace_exposes_architecture_boundaries() {
     let dataset = DatasetId::expect_new("logs");
     let range = TimeRange::expect_blocks(1, 2);
     let envelope = ResultEnvelope::ok(dataset.clone(), range, Vec::<u8>::new());
-    let capabilities = AdapterCapabilities::new(chain.clone()).with_dataset(dataset.clone());
+    let capabilities = AdapterCapabilities::new(chain.clone()).with_dataset(DatasetKey::evm_logs());
 
     assert_eq!(chain.family(), ChainFamily::Evm);
     assert_eq!(range.start(), 1);

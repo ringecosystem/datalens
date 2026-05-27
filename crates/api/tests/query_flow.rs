@@ -9,11 +9,12 @@ use datalens_api::config::{
 };
 use datalens_chain::{
     AdapterCapabilities, ChainAdapter, ChainFetchRequest, ChainFetchResponse, ChainHeight,
-    DatasetCapability, DatasetSelector, FinalityKind, HeightRange, HeightRangeKind, SelectorKind,
+    DatasetCapability, DatasetSelector, FinalityKind, HeightRangeKind, SelectorKind,
 };
 use datalens_core::{
     BlockHeader, BlockRange, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, Dataset,
-    LogFilter, LogRecord, NetworkId, QueryRequest, QueryResponse, QueryRows,
+    DatasetKey, LedgerRange, LogFilter, LogRecord, NetworkId, QueryRequest, QueryResponse,
+    QueryRows,
 };
 use datalens_storage::LocalStorage;
 
@@ -286,7 +287,7 @@ fn test_query_rejects_fetch_response_chain_mismatch_without_cache_write() {
 fn test_query_rejects_fetch_response_dataset_mismatch_without_cache_write() {
     assert_contract_violation_not_cached(
         "contract-dataset",
-        ResponseMutation::Dataset(Dataset::Logs),
+        ResponseMutation::Dataset(DatasetKey::evm_logs()),
     );
 }
 
@@ -294,7 +295,7 @@ fn test_query_rejects_fetch_response_dataset_mismatch_without_cache_write() {
 fn test_query_rejects_fetch_response_range_mismatch_without_cache_write() {
     assert_contract_violation_not_cached(
         "contract-range",
-        ResponseMutation::Range(HeightRange::Block(BlockRange::expect_new(2, 3))),
+        ResponseMutation::Range(LedgerRange::from_block_range(BlockRange::expect_new(2, 3))),
     );
 }
 
@@ -316,7 +317,7 @@ fn test_query_rejects_fetch_response_selector_mismatch_without_cache_write() {
 fn test_query_rejects_fetch_response_rows_mismatch_without_cache_write() {
     assert_contract_violation_not_cached(
         "contract-rows",
-        ResponseMutation::Rows(QueryRows::Logs(vec![log(
+        ResponseMutation::Rows(QueryRows::EvmLogs(vec![log(
             1,
             0,
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -536,22 +537,22 @@ fn temp_storage_root(name: &str) -> PathBuf {
 
 fn block_numbers(response: &QueryResponse) -> Vec<u64> {
     match &response.rows {
-        QueryRows::Blocks(rows) => rows.iter().map(|row| row.number).collect(),
-        QueryRows::Logs(_) => panic!("expected blocks"),
+        QueryRows::EvmBlocks(rows) => rows.iter().map(|row| row.number).collect(),
+        _ => panic!("expected blocks"),
     }
 }
 
 fn log_indexes(response: &QueryResponse) -> Vec<u64> {
     match &response.rows {
-        QueryRows::Logs(rows) => rows.iter().map(|row| row.log_index).collect(),
-        QueryRows::Blocks(_) => panic!("expected logs"),
+        QueryRows::EvmLogs(rows) => rows.iter().map(|row| row.log_index).collect(),
+        _ => panic!("expected logs"),
     }
 }
 
 fn log_addresses(response: &QueryResponse) -> Vec<String> {
     match &response.rows {
-        QueryRows::Logs(rows) => rows.iter().map(|row| row.address.clone()).collect(),
-        QueryRows::Blocks(_) => panic!("expected logs"),
+        QueryRows::EvmLogs(rows) => rows.iter().map(|row| row.address.clone()).collect(),
+        _ => panic!("expected logs"),
     }
 }
 
@@ -658,8 +659,8 @@ impl MockSource {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ResponseMutation {
     Chain(ChainIdentity),
-    Dataset(Dataset),
-    Range(HeightRange),
+    Dataset(DatasetKey),
+    Range(LedgerRange),
     Selector(DatasetSelector),
     Rows(QueryRows),
 }
@@ -714,18 +715,19 @@ impl ChainAdapter for MockSource {
     }
 
     fn fetch(&self, request: ChainFetchRequest) -> Result<ChainFetchResponse, DatalensError> {
-        let range = match request.range {
-            HeightRange::Block(range) => range,
-            HeightRange::Other { .. } => panic!("expected block range"),
-        };
-        let response = match request.dataset {
+        let range = request.range.block_range().expect("expected block range");
+        let response = match request
+            .dataset_key
+            .legacy_dataset()
+            .expect("legacy dataset")
+        {
             Dataset::Blocks => self.fetch_blocks(range).map(|rows| {
                 ChainFetchResponse::new(
                     request.chain,
-                    Dataset::Blocks,
-                    HeightRange::Block(range),
+                    DatasetKey::evm_blocks(),
+                    LedgerRange::from_block_range(range),
                     request.selector,
-                    QueryRows::Blocks(rows),
+                    QueryRows::EvmBlocks(rows),
                 )
                 .with_provider_diagnostics(datalens_chain::ProviderDiagnostics {
                     calls: range.len().min(usize::MAX as u128) as usize,
@@ -741,10 +743,10 @@ impl ChainAdapter for MockSource {
                 self.fetch_logs(range, filter).map(|rows| {
                     ChainFetchResponse::new(
                         request.chain,
-                        Dataset::Logs,
-                        HeightRange::Block(range),
+                        DatasetKey::evm_logs(),
+                        LedgerRange::from_block_range(range),
                         request.selector,
-                        QueryRows::Logs(rows),
+                        QueryRows::EvmLogs(rows),
                     )
                     .with_provider_diagnostics(
                         datalens_chain::ProviderDiagnostics {
@@ -770,10 +772,13 @@ impl MockSource {
             .clone()
         {
             Some(ResponseMutation::Chain(chain)) => response.chain = chain,
-            Some(ResponseMutation::Dataset(dataset)) => response.dataset = dataset,
+            Some(ResponseMutation::Dataset(dataset)) => response.dataset_key = dataset,
             Some(ResponseMutation::Range(range)) => response.range = range,
             Some(ResponseMutation::Selector(selector)) => response.coverage_selector = selector,
-            Some(ResponseMutation::Rows(rows)) => response.rows = rows,
+            Some(ResponseMutation::Rows(rows)) => {
+                response.rows = datalens_core::DatasetRows::new(rows.dataset_key(), rows)
+                    .expect("matching rows")
+            }
             None => {}
         }
         response
