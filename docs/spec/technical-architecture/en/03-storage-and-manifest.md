@@ -127,9 +127,9 @@ empty coverage entry in the manifest, with row count `0` and no data object, so 
 range/filter does not need to be fetched again.
 
 If a non-empty result is still too small, the writer may keep accumulating adjacent ranges
-for the same dataset, coverage key, and schema version until it reaches the target object
-size or the maximum scan span. It should then write one immutable object for the combined
-range and record that exact combined coverage.
+for the same dataset, selector coverage shape, finality level, and range kind until it
+reaches the configured flush threshold. It should then delegate one immutable object write
+for the combined range to storage and record that exact combined coverage through storage.
 
 The first implementation uses `min_object_rows` as the primary sparse-result merge
 threshold and a conservative JSON-encoded row estimate for `target_object_bytes` before
@@ -143,19 +143,18 @@ The implementation should make the actual range sizing configurable and observab
 
 ## Write Sequence
 
-The writer should use a safe sequence:
+The writer coordinates this safe sequence, while storage owns object encoding, object key
+construction, object bytes, and manifest repository updates:
 
 1. Receive normalized fetched data for one planned fill segment.
 2. Verify the segment is within the adapter's safe/finalized height before any durable
    write or manifest update.
-3. Merge adjacent compatible segments when doing so improves object size and stays within
-   the configured maximum range.
-4. Build a deterministic logical chunk identity from dataset, coverage key, schema
-   version, and actual covered range.
-5. Write a data object when the segment has rows.
-6. Write only manifest empty coverage when the segment has no rows.
-7. Verify or trust the object write according to backend capabilities.
-8. Update the manifest coverage entry.
+3. Merge adjacent compatible segments when doing so improves object size.
+4. Ask storage to write a data object when the segment has rows.
+5. Ask storage to write only manifest empty coverage when the segment has no rows.
+6. Let storage verify or trust the object write according to backend capabilities.
+7. Let storage update the manifest coverage entry.
+8. Return object metadata, empty coverage, and skipped range summaries to the caller.
 9. Make the new coverage visible to future queries.
 
 If the object write fails, manifest coverage must not change. If the object write succeeds

@@ -106,25 +106,26 @@ coverage 记录。
 写一个很小的空 Parquet 文件。它应该在 Manifest 中记录一条行数为 `0`、没有数据对象的空覆盖
 记录，这样同一个范围和过滤条件下次不需要再次拉取。
 
-如果非空结果仍然太小，写入器可以继续累计相邻范围，但前提是数据集、覆盖 key 和 schema 版本
-都相同，并且累计后没有超过配置的最大扫描跨度。达到目标对象大小或最大跨度后，再写入一个
-不可变对象，并记录这个对象实际覆盖的合并范围。
+如果非空结果仍然太小，writer 可以继续累计相邻范围，但前提是数据集、selector 覆盖形态、
+finality level 和 range kind 都兼容。达到配置的 flush threshold 后，再把合并范围的一次不可变
+对象写入委托给 storage，并通过 storage 记录这个对象实际覆盖的合并范围。
 
 这意味着 `018000000-018099999` 不是通用规则，它只是范围 key 的示例。实现时应让真实范围大小
 可配置、可观测。
 
 ## 写入顺序
 
-写入器应使用安全顺序：
+writer 协调这条安全顺序；storage 拥有对象编码、object key 构造、对象字节和 Manifest
+repository 更新：
 
 1. 接收一个计划补齐片段的标准化拉取数据。
 2. 在任何持久化写入或 Manifest 更新前，验证该片段处于 adapter safe/finalized height 内。
-3. 在不超过最大范围配置的前提下，合并相邻且兼容的片段，以改善对象大小。
-4. 用数据集、覆盖 key、schema 版本和实际覆盖范围构建确定性的逻辑分片标识。
-5. 片段有数据行时，写入数据对象。
-6. 片段没有数据行时，只写入 Manifest 空覆盖记录。
-7. 根据后端能力验证或信任对象写入结果。
-8. 更新 Manifest 覆盖范围记录。
+3. 合并相邻且兼容的片段，以改善对象大小。
+4. 片段有数据行时，请 storage 写入数据对象。
+5. 片段没有数据行时，请 storage 只写入 Manifest empty coverage。
+6. 由 storage 根据后端能力验证或信任对象写入结果。
+7. 由 storage 更新 Manifest 覆盖范围记录。
+8. 把 object metadata、empty coverage 和 skipped range summary 返回给调用方。
 9. 让新的覆盖范围对后续查询可见。
 
 如果对象写入失败，Manifest 覆盖范围不能变化。如果对象写入成功但 Manifest 更新失败，重试

@@ -44,16 +44,20 @@ into the chain-neutral system.
 EVM-specific pagination, EVM response normalization, and EVM error interpretation. It
 should not decide storage policy or native API shape.
 
-`datalens-storage` owns object storage access, manifest reads and writes, durable chunk
-existence checks, and local scratch workspace behavior. It should be the only boundary
-that treats object storage as persistence authority.
+`datalens-storage` owns object storage access, object encoding, object keys, object bytes,
+manifest reads and writes, durable chunk existence checks, and local scratch workspace
+behavior. It should be the only boundary that treats object storage as persistence
+authority.
 
 `datalens-planner` owns query planning. It converts native requests into executable plans,
 validates ranges and capabilities, decides what datasets are required, and works with
 manifest coverage to identify missing work.
 
-`datalens-writer` owns chunk persistence. It receives normalized fetched data, writes
-objects, verifies write completion, and updates manifest coverage in a safe order.
+`datalens-writer` owns durable write policy and coordination. It receives normalized
+fetched segments, merges adjacent compatible sparse segments, delegates object and
+manifest writes to storage, records empty coverage when configured, tracks skipped ranges,
+and returns the storage metadata summary to the query flow. It must not own object
+encoding, object key layout, object store providers, or manifest repository details.
 
 `datalens-api` owns edge behavior: HTTP parsing, native API routes, authentication hooks,
 response streaming, and compatibility adapters. It translates at the edge before calling
@@ -72,7 +76,7 @@ The first concrete module interfaces should be small:
 - Adapter capability metadata in `datalens-chain`.
 - Storage trait shape in `datalens-storage`.
 - Planner input/output skeleton in `datalens-planner`.
-- Writer input/output skeleton in `datalens-writer`.
+- Durable writer coordinator input/output contracts in `datalens-writer`.
 - A minimal CLI or service binary that proves the crates compile together.
 
 ## Why The Boundaries Matter
