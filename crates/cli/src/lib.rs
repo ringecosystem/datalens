@@ -19,6 +19,7 @@ use datalens_storage::{
     DurableStorage, LocalObjectStore, LocalStorage, ManifestEntry, ManifestFinalityLevel,
     S3ObjectStore, UsageLedgerRepository, UsageLedgerStore,
 };
+use datalens_tron::{TronAdapter, TronHttpProvider};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -515,10 +516,10 @@ fn validate_applications(config: &DatalensConfig) -> Result<(), DatalensError> {
 
 fn validate_chain(name: &str, chain: &ChainConfig) -> Result<(), DatalensError> {
     let _identity = chain_identity(name, chain)?;
-    if !matches!(chain.kind.as_str(), "evm" | "solana") {
+    if !matches!(chain.kind.as_str(), "evm" | "solana" | "tron") {
         return Err(DatalensError::new(
             DatalensErrorKind::UnsupportedDataset,
-            "only evm and solana chains are supported",
+            "only evm, solana, and tron chains are supported",
         ));
     }
     if chain.rpc_urls.is_empty() || chain.rpc_urls.iter().any(|url| url.trim().is_empty()) {
@@ -527,7 +528,7 @@ fn validate_chain(name: &str, chain: &ChainConfig) -> Result<(), DatalensError> 
             format!("chain {name} must define at least one rpc URL"),
         ));
     }
-    if chain.kind == "solana" {
+    if matches!(chain.kind.as_str(), "solana" | "tron") {
         return Ok(());
     }
     if chain.datasets.blocks.max_batch_blocks == 0 {
@@ -593,6 +594,43 @@ pub fn doctor_chain_summary(
                 "instructions": {
                     "enabled": true,
                     "max_slot_range_len": chain.datasets.blocks.max_batch_blocks,
+                }
+            }
+        }));
+    }
+    if chain.kind == "tron" {
+        let source = TronAdapter::with_provider(
+            chain_identity(name, chain)?,
+            TronHttpProvider::new(chain.rpc_urls.first().cloned().unwrap_or_default()),
+        )
+        .with_max_block_range_len(chain.datasets.blocks.max_batch_blocks.max(1));
+        let safe_height = source.cache_safe_height().map_err(|error| {
+            DatalensError::new(
+                error.kind,
+                format!(
+                    "chain {name} cannot determine finalized Tron block for durable cache writes: {}",
+                    error.message
+                ),
+            )
+        })?;
+        return Ok(serde_json::json!({
+            "name": name,
+            "kind": chain.kind,
+            "chain_id": chain.chain_id,
+            "rpc_urls": chain.rpc_urls.iter().map(|url| redact_url(url)).collect::<Vec<_>>(),
+            "finality": {
+                "config": "tron_solidity_finalized",
+                "detected_height": safe_height.value,
+                "detected_kind": format!("{:?}", safe_height.finality),
+            },
+            "datasets": {
+                "blocks": {
+                    "enabled": chain.datasets.blocks.enabled,
+                    "max_batch_blocks": chain.datasets.blocks.max_batch_blocks,
+                },
+                "events": {
+                    "enabled": false,
+                    "reason": "unsupported by Tron MVP",
                 }
             }
         }));
@@ -723,6 +761,16 @@ fn build_service_registry(config: &DatalensConfig) -> Result<QueryServiceRegistr
                 )?;
                 registry = registry.with_service(service)?;
             }
+            "tron" => {
+                let service = build_tron_service_with_storage(
+                    storage.clone(),
+                    usage_ledger.clone(),
+                    config,
+                    chain_name.as_str(),
+                    chain,
+                )?;
+                registry = registry.with_service(service)?;
+            }
             _ => unreachable!("chain kind validated"),
         }
     }
@@ -787,6 +835,44 @@ fn build_solana_service_with_storage(
         SolanaHttpRpc::new(url.clone()),
     )
     .with_max_slot_range_len(chain.datasets.blocks.max_batch_blocks.max(1));
+    Ok(datalens_api::QueryService::new_with_metrics_config(
+        storage,
+        source,
+        config.planner.clone(),
+        config.writer.clone(),
+        chain_name.to_owned(),
+        chain.clone(),
+        config.metrics.clone(),
+    )?
+    .with_usage_ledger(
+        usage_ledger,
+        ApplicationIdentity::named(config.metrics.default_application.clone()),
+    ))
+}
+
+fn build_tron_service_with_storage(
+    storage: impl datalens_storage::StorageRepository + 'static,
+    usage_ledger: impl UsageLedgerRepository + 'static,
+    config: &DatalensConfig,
+    chain_name: &str,
+    chain: &ChainConfig,
+) -> Result<QueryService<TronAdapter<TronHttpProvider>>, DatalensError> {
+    log::info!(
+        "using chain {chain_name} kind={} chain_id={}",
+        chain.kind,
+        chain.chain_id
+    );
+    let url = chain.rpc_urls.first().ok_or_else(|| {
+        DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            format!("chain {chain_name} must define at least one rpc URL"),
+        )
+    })?;
+    let source = TronAdapter::with_provider(
+        chain_identity(chain_name, chain).expect("validated chain identity"),
+        TronHttpProvider::new(url.clone()),
+    )
+    .with_max_block_range_len(chain.datasets.blocks.max_batch_blocks.max(1));
     Ok(datalens_api::QueryService::new_with_metrics_config(
         storage,
         source,

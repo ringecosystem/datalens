@@ -18,6 +18,7 @@ datalens-metrics = { path = "../metrics" }
 datalens-planner = { path = "../planner" }
 datalens-solana = { path = "../solana" }
 datalens-storage = { path = "../storage" }
+datalens-tron = { path = "../tron" }
 datalens-writer = { path = "../writer" }
 figment.workspace = true
 log.workspace = true

@@ -635,6 +635,46 @@ fn test_validate_config_accepts_evm_and_solana_chains_together() {
 }
 
 #[test]
+fn test_validate_config_accepts_tron_chain() {
+    let config: DatalensConfig = toml::from_str(
+        r#"
+        [server]
+        bind = "127.0.0.1:8080"
+
+        [storage]
+        backend = "local"
+        root = ".datalens/storage"
+
+        [planner]
+        max_query_range_blocks = 100
+        default_chunk_range_blocks = 10
+
+        [writer]
+        target_object_bytes = 1024
+        min_object_rows = 1
+        record_empty_coverage = true
+
+        [chains.tron-mainnet]
+        kind = "tron"
+        chain_id = 728126428
+        rpc_urls = ["http://example.invalid/tron"]
+
+        [chains.tron-mainnet.datasets.blocks]
+        enabled = true
+        max_batch_blocks = 10
+
+        [chains.tron-mainnet.datasets.logs]
+        enabled = false
+        max_get_logs_range_blocks = 10
+        max_addresses_per_query = 1
+        "#,
+    )
+    .expect("config parses");
+
+    validate_config(&config).expect("Tron config is valid");
+}
+
+#[test]
 fn test_doctor_chain_summary_rejects_unknown_auto_finality_without_profile() {
     let (url, _requests) =
         start_rpc_server(vec![unsupported_tag_response(), unsupported_tag_response()]);

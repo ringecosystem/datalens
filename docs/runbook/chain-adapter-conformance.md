@@ -40,6 +40,10 @@ Verification: Run the adapter-specific conformance test plus `cargo test --works
 ## Current Implementation
 
 - `datalens-chain-conformance` owns the reusable assertion helpers and fixture model.
-- `crates/evm/tests/conformance.rs` is the first adapter adoption test.
+- `crates/evm/tests/conformance.rs` covers the EVM adapter.
+- `crates/solana/tests/conformance.rs` covers the Solana slot-based adapter.
+- `crates/tron/tests/conformance.rs` covers the Tron block-based MVP adapter.
 - The EVM fixture provider is local-only and serves JSON-RPC responses from a loopback
   test server.
+- Solana and Tron use deterministic in-memory fixture providers by default, so
+  conformance tests do not require public RPC access.
