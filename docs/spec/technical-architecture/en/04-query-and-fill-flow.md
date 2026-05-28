@@ -43,6 +43,15 @@ persists them, updates manifest coverage, and returns the response.
 The caller should not need to know which state happened except through optional metadata,
 latency, or observability. The result should have the same meaning.
 
+After the executor knows the query outcome, cache outcome, fill outcome, and row count, it
+should append an application usage ledger event when an application identity is available.
+The ledger event must use the registry-normalized application id supplied by the API or
+service context, not raw credentials. Full hits record `hit` cache and query outcomes.
+Partial hits record `partial_hit`. Misses that write rows record `filled` query outcome
+and `written` fill outcome. Misses that record empty coverage use `empty` query outcome
+and `empty_coverage_recorded` fill outcome. Provider and storage failures use the
+corresponding error outcomes and must not make incomplete responses look successful.
+
 The interval above safe/finalized height and up to latest height is outside first-stage
 durable cache semantics. Callers that need that interval must query RPC directly or use a
 future explicitly non-durable hot path. Hot data must not update durable manifest

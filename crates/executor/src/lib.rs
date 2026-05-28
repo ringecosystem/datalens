@@ -13,7 +13,10 @@ use datalens_metrics::{
 use datalens_planner::{
     CoverageSummary, FinalityPolicy, NativePlanner, NativePlannerConfig, NativeQueryInput,
 };
-use datalens_storage::StorageRepository;
+use datalens_storage::{
+    CacheOutcome as LedgerCacheOutcome, FillOutcome as LedgerFillOutcome,
+    QueryOutcome as LedgerQueryOutcome, StorageRepository, UsageLedgerEntry, UsageLedgerRepository,
+};
 use datalens_writer::{
     DurableWriteRequest, DurableWriteSegment, DurableWriter, DurableWriterConfig,
 };
@@ -40,11 +43,18 @@ pub struct NativeQueryExecutor<R, S> {
     planner: NativePlanner,
     writer: DurableWriter<R>,
     metrics: Option<ExecutorMetrics>,
+    usage_ledger: Option<ExecutorUsageLedger>,
 }
 
 #[derive(Clone)]
 struct ExecutorMetrics {
     recorder: Arc<MetricsRecorder>,
+    application: ApplicationIdentity,
+}
+
+#[derive(Clone)]
+struct ExecutorUsageLedger {
+    repository: Arc<dyn UsageLedgerRepository>,
     application: ApplicationIdentity,
 }
 
@@ -61,6 +71,7 @@ where
             planner: NativePlanner::new(config.planner),
             writer,
             metrics: None,
+            usage_ledger: None,
         }
     }
 
@@ -71,6 +82,18 @@ where
     ) -> Self {
         self.metrics = Some(ExecutorMetrics {
             recorder: Arc::new(recorder),
+            application,
+        });
+        self
+    }
+
+    pub fn with_usage_ledger(
+        mut self,
+        repository: impl UsageLedgerRepository + 'static,
+        application: ApplicationIdentity,
+    ) -> Self {
+        self.usage_ledger = Some(ExecutorUsageLedger {
+            repository: Arc::new(repository),
             application,
         });
         self
@@ -89,7 +112,8 @@ where
         application: Option<ApplicationIdentity>,
     ) -> Result<NativeQueryExecutionResult, DatalensError> {
         let start = Instant::now();
-        let labels = self.metrics_labels(&input, application);
+        let labels = self.metrics_labels(&input, application.clone());
+        let ledger_application = self.ledger_application(application);
         if let Some((recorder, labels)) = self.metrics_recorder(&labels) {
             recorder.set_latest_requested_block(labels, input.ledger_range.end());
         }
@@ -105,6 +129,15 @@ where
                 self.record_error(&labels, &error);
                 self.record_cache_coverage(&labels, CacheCoverageOutcome::Error);
                 self.record_query(&labels, QueryOutcome::Error, start);
+                self.record_usage(
+                    &ledger_application,
+                    &input,
+                    FinalityLevel::Safe,
+                    LedgerQueryOutcome::StorageError,
+                    LedgerCacheOutcome::Error,
+                    LedgerFillOutcome::NotAttempted,
+                    0,
+                )?;
                 return Err(error);
             }
         };
@@ -123,19 +156,37 @@ where
                 Err(error) => {
                     self.record_error(&labels, &error);
                     self.record_query(&labels, QueryOutcome::Error, start);
+                    self.record_usage(
+                        &ledger_application,
+                        &input,
+                        FinalityLevel::Safe,
+                        ledger_query_error(&error),
+                        ledger_cache_outcome(coverage_outcome),
+                        LedgerFillOutcome::NotAttempted,
+                        0,
+                    )?;
                     return Err(error);
                 }
             }
         };
         let plan = match self.planner.plan_with_coverage(
-            input,
+            input.clone(),
             &self.source.capabilities(),
-            durable_boundary,
+            durable_boundary.clone(),
             covered_ranges,
         ) {
             Ok(plan) => plan,
             Err(error) => {
                 self.record_query(&labels, QueryOutcome::Error, start);
+                self.record_usage(
+                    &ledger_application,
+                    &input,
+                    durable_boundary.finality,
+                    LedgerQueryOutcome::Error,
+                    ledger_cache_outcome(coverage_outcome),
+                    LedgerFillOutcome::NotAttempted,
+                    0,
+                )?;
                 return Err(error);
             }
         };
@@ -159,11 +210,27 @@ where
                 Err(error) => {
                     self.record_error(&labels, &error);
                     self.record_query(&labels, QueryOutcome::Error, start);
+                    self.record_usage_for_plan(
+                        &ledger_application,
+                        &plan,
+                        LedgerQueryOutcome::StorageError,
+                        ledger_cache_outcome(coverage_outcome),
+                        LedgerFillOutcome::NotAttempted,
+                        rows.row_count(),
+                    )?;
                     return Err(error);
                 }
             };
             if let Err(error) = rows.try_append(cached.into_rows()) {
                 self.record_query(&labels, QueryOutcome::Error, start);
+                self.record_usage_for_plan(
+                    &ledger_application,
+                    &plan,
+                    LedgerQueryOutcome::Error,
+                    ledger_cache_outcome(coverage_outcome),
+                    LedgerFillOutcome::NotAttempted,
+                    rows.row_count(),
+                )?;
                 return Err(error);
             }
         }
@@ -192,6 +259,14 @@ where
                     if let Err(error) = response.validate_for_request(&fetch_request) {
                         self.record_fill(&labels, FillOutcome::Error, fill_start);
                         self.record_query(&labels, QueryOutcome::Error, start);
+                        self.record_usage_for_plan(
+                            &ledger_application,
+                            &plan,
+                            LedgerQueryOutcome::Error,
+                            ledger_cache_outcome(coverage_outcome),
+                            LedgerFillOutcome::Error,
+                            rows.row_count(),
+                        )?;
                         return Err(error);
                     }
                     fill_row_count += response.rows.row_count();
@@ -208,6 +283,14 @@ where
                     self.record_error(&labels, &error);
                     self.record_fill(&labels, FillOutcome::Error, fill_start);
                     self.record_query(&labels, QueryOutcome::Error, start);
+                    self.record_usage_for_plan(
+                        &ledger_application,
+                        &plan,
+                        ledger_query_error(&error),
+                        ledger_cache_outcome(coverage_outcome),
+                        ledger_fill_error(&error),
+                        rows.row_count(),
+                    )?;
                     return Err(error);
                 }
             };
@@ -225,6 +308,14 @@ where
             if let Err(error) = rows.try_append(fetched.into_rows()) {
                 self.record_fill(&labels, FillOutcome::Error, fill_start);
                 self.record_query(&labels, QueryOutcome::Error, start);
+                self.record_usage_for_plan(
+                    &ledger_application,
+                    &plan,
+                    LedgerQueryOutcome::Error,
+                    ledger_cache_outcome(coverage_outcome),
+                    LedgerFillOutcome::Error,
+                    rows.row_count(),
+                )?;
                 return Err(error);
             }
         }
@@ -249,6 +340,14 @@ where
             self.record_error(&labels, &error);
             self.record_fill(&labels, FillOutcome::Error, fill_start);
             self.record_query(&labels, QueryOutcome::Error, start);
+            self.record_usage_for_plan(
+                &ledger_application,
+                &plan,
+                LedgerQueryOutcome::StorageError,
+                ledger_cache_outcome(coverage_outcome),
+                LedgerFillOutcome::StorageError,
+                rows.row_count(),
+            )?;
             return Err(error);
         }
         if cache_fill_attempted {
@@ -267,15 +366,32 @@ where
 
         rows.sort();
         let result = NativeQueryExecutionResult {
-            chain: plan.chain,
+            chain: plan.chain.clone(),
             dataset_key: plan.dataset_key.clone(),
-            ledger_range: plan.ledger_range,
-            cache: plan.coverage,
-            rows: DatasetRows::new(plan.dataset_key, rows)?,
+            ledger_range: plan.ledger_range.clone(),
+            cache: plan.coverage.clone(),
+            rows: DatasetRows::new(plan.dataset_key.clone(), rows)?,
         };
         let query_outcome = query_outcome(coverage_outcome, cache_fill_attempted, &result);
         self.record_query(&labels, query_outcome, start);
+        self.record_usage_for_plan(
+            &ledger_application,
+            &plan,
+            ledger_query_outcome(query_outcome),
+            ledger_cache_outcome(coverage_outcome),
+            ledger_fill_outcome(cache_fill_attempted, fill_row_count),
+            result.rows.row_count(),
+        )?;
         Ok(result)
+    }
+
+    fn ledger_application(
+        &self,
+        application: Option<ApplicationIdentity>,
+    ) -> Option<ApplicationIdentity> {
+        self.usage_ledger
+            .as_ref()
+            .map(|ledger| application.unwrap_or_else(|| ledger.application.clone()))
     }
 
     fn metrics_labels(
@@ -332,6 +448,120 @@ where
                 recorder.record_storage_error(&error_labels);
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_usage(
+        &self,
+        application: &Option<ApplicationIdentity>,
+        input: &NativeQueryInput,
+        finality_level: FinalityLevel,
+        query_outcome: LedgerQueryOutcome,
+        cache_outcome: LedgerCacheOutcome,
+        fill_outcome: LedgerFillOutcome,
+        row_count: usize,
+    ) -> Result<(), DatalensError> {
+        let Some(ledger) = &self.usage_ledger else {
+            return Ok(());
+        };
+        let application = application
+            .as_ref()
+            .unwrap_or(&ledger.application)
+            .as_str()
+            .to_owned();
+        ledger.repository.append(&UsageLedgerEntry::query_event(
+            application,
+            input.chain.clone(),
+            input.dataset_key.clone(),
+            &input.selector,
+            input.ledger_range.clone(),
+            finality_level,
+            query_outcome,
+            cache_outcome,
+            fill_outcome,
+            row_count,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_usage_for_plan(
+        &self,
+        application: &Option<ApplicationIdentity>,
+        plan: &datalens_planner::NativeQueryPlan,
+        query_outcome: LedgerQueryOutcome,
+        cache_outcome: LedgerCacheOutcome,
+        fill_outcome: LedgerFillOutcome,
+        row_count: usize,
+    ) -> Result<(), DatalensError> {
+        self.record_usage(
+            application,
+            &NativeQueryInput {
+                chain: plan.chain.clone(),
+                dataset_key: plan.dataset_key.clone(),
+                ledger_range: plan.ledger_range.clone(),
+                selector: plan.selector.clone(),
+                response_shape: plan.response_shape.clone(),
+                field_selection: plan.field_selection.clone(),
+            },
+            match &plan.finality_policy {
+                FinalityPolicy::DurableCache { boundary } => boundary.finality,
+            },
+            query_outcome,
+            cache_outcome,
+            fill_outcome,
+            row_count,
+        )
+    }
+}
+
+fn ledger_cache_outcome(outcome: CacheCoverageOutcome) -> LedgerCacheOutcome {
+    match outcome {
+        CacheCoverageOutcome::Hit => LedgerCacheOutcome::Hit,
+        CacheCoverageOutcome::Miss => LedgerCacheOutcome::Miss,
+        CacheCoverageOutcome::PartialHit => LedgerCacheOutcome::PartialHit,
+        CacheCoverageOutcome::Empty => LedgerCacheOutcome::Empty,
+        CacheCoverageOutcome::Error => LedgerCacheOutcome::Error,
+    }
+}
+
+fn ledger_query_outcome(outcome: QueryOutcome) -> LedgerQueryOutcome {
+    match outcome {
+        QueryOutcome::Hit => LedgerQueryOutcome::Hit,
+        QueryOutcome::Miss => LedgerQueryOutcome::Miss,
+        QueryOutcome::PartialHit => LedgerQueryOutcome::PartialHit,
+        QueryOutcome::Filled => LedgerQueryOutcome::Filled,
+        QueryOutcome::Empty => LedgerQueryOutcome::Empty,
+        QueryOutcome::Error => LedgerQueryOutcome::Error,
+    }
+}
+
+fn ledger_query_error(error: &DatalensError) -> LedgerQueryOutcome {
+    if is_provider_error(&error.kind) {
+        LedgerQueryOutcome::ProviderError
+    } else if is_storage_error(&error.kind) {
+        LedgerQueryOutcome::StorageError
+    } else {
+        LedgerQueryOutcome::Error
+    }
+}
+
+fn ledger_fill_error(error: &DatalensError) -> LedgerFillOutcome {
+    if is_provider_error(&error.kind) {
+        LedgerFillOutcome::ProviderError
+    } else if is_storage_error(&error.kind) {
+        LedgerFillOutcome::StorageError
+    } else {
+        LedgerFillOutcome::Error
+    }
+}
+
+fn ledger_fill_outcome(cache_fill_attempted: bool, fill_row_count: usize) -> LedgerFillOutcome {
+    if !cache_fill_attempted {
+        LedgerFillOutcome::NotAttempted
+    } else if fill_row_count == 0 {
+        LedgerFillOutcome::EmptyCoverageRecorded
+    } else {
+        LedgerFillOutcome::Written
     }
 }
 

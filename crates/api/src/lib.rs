@@ -17,7 +17,7 @@ use datalens_core::{
 use datalens_executor::{NativeQueryExecutionConfig, NativeQueryExecutor};
 use datalens_metrics::{ApplicationIdentity, MetricsRecorder};
 use datalens_planner::{NativePlannerConfig, NativeQueryInput};
-use datalens_storage::{S3ObjectStoreConfig, StorageRepository};
+use datalens_storage::{S3ObjectStoreConfig, StorageRepository, UsageLedgerRepository};
 use datalens_writer::DurableWriterConfig;
 use serde::{Deserialize, Serialize};
 
@@ -447,6 +447,15 @@ where
             .executor
             .with_metrics(metrics.clone(), ApplicationIdentity::unknown());
         self.metrics = Some(metrics);
+        self
+    }
+
+    pub fn with_usage_ledger(
+        mut self,
+        repository: impl UsageLedgerRepository + 'static,
+        application: ApplicationIdentity,
+    ) -> Self {
+        self.executor = self.executor.with_usage_ledger(repository, application);
         self
     }
 

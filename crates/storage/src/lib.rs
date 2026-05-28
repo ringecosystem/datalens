@@ -45,10 +45,15 @@ pub struct StorageDataObject {
 mod manifest;
 mod object_store;
 mod parquet_codec;
+mod usage_ledger;
 pub use manifest::{Manifest, ManifestEntry, ManifestFinalityLevel};
 pub use object_store::{
     LocalObjectStore, ObjectMetadata, ObjectStore, S3ObjectStore, S3ObjectStoreConfig,
     validate_object_key,
+};
+pub use usage_ledger::{
+    CacheOutcome, FillOutcome, QueryOutcome, UsageLedgerEntry, UsageLedgerRepository,
+    UsageLedgerStore,
 };
 
 #[derive(Clone, Debug)]
@@ -495,6 +500,32 @@ impl StorageRepository for Arc<dyn StorageRepository> {
         request: StorageWriteRequest<'_>,
     ) -> Result<StorageWriteOutcome, DatalensError> {
         self.as_ref().write_rows(request)
+    }
+}
+
+impl UsageLedgerRepository for Arc<dyn UsageLedgerRepository> {
+    fn append(&self, entry: &UsageLedgerEntry) -> Result<(), DatalensError> {
+        self.as_ref().append(entry)
+    }
+
+    fn read_application(
+        &self,
+        application_id: &str,
+    ) -> Result<Vec<UsageLedgerEntry>, DatalensError> {
+        self.as_ref().read_application(application_id)
+    }
+}
+
+impl UsageLedgerRepository for Box<dyn UsageLedgerRepository> {
+    fn append(&self, entry: &UsageLedgerEntry) -> Result<(), DatalensError> {
+        self.as_ref().append(entry)
+    }
+
+    fn read_application(
+        &self,
+        application_id: &str,
+    ) -> Result<Vec<UsageLedgerEntry>, DatalensError> {
+        self.as_ref().read_application(application_id)
     }
 }
 

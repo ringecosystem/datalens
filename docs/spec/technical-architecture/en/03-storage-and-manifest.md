@@ -90,6 +90,25 @@ Manifest coverage must not be used for non-durable hot query results. Empty cove
 the same finality requirement as data-object coverage: if the requested range is above the
 safe/finalized height, datalens must not write an empty coverage record.
 
+Application identity must not be part of the durable coverage key or data object key. The
+durable cache remains shared by chain, dataset, selector, range, encoding, and finality so
+two applications querying the same logical data can reuse the same stored object and
+manifest coverage.
+
+Application usage attribution belongs in a separate append-only usage ledger. The first
+ledger format is JSON Lines under object storage, partitioned by application id, chain,
+dataset, range kind, and Unix day. Ledger entries record the normalized application id,
+chain identity, dataset key, selector fingerprint and canonical key, requested range,
+finality, query outcome, cache outcome, fill outcome, row count, timestamp, and optional
+request or trace id. API keys, tokens, raw credentials, and untrusted authentication
+headers must not be stored in the ledger.
+
+Ledger events are durable audit and accounting facts, not manifest coverage. A ledger
+write must not change query result semantics or manifest coverage semantics, but a failed
+ledger write is a storage write failure for the query path because usage attribution is a
+durable accounting requirement. The first implementation is append-only: retries may add
+additional events unless a future request-id idempotency layer is added.
+
 The normal write path should not decompress an existing range chunk, append another
 contract's rows, recompress it, and overwrite the object. That would make concurrent fills
 hard to reason about and would turn every new filter into a read-modify-write operation.

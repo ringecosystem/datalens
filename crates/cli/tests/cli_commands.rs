@@ -14,6 +14,10 @@ use datalens_core::{
     BlockHeader, ChainFamily, ChainIdentity, DatasetKey, DatasetRows, LedgerRange, LogRecord,
     NetworkId, QueryRows,
 };
+use datalens_storage::{
+    CacheOutcome, FillOutcome, QueryOutcome, UsageLedgerEntry, UsageLedgerRepository,
+    UsageLedgerStore,
+};
 use datalens_storage::{LocalStorage, StorageWriteRequest};
 
 #[test]
@@ -129,6 +133,29 @@ fn test_inspect_coverage_accepts_config_path_after_subcommand() {
 }
 
 #[test]
+fn test_inspect_usage_accepts_application_and_config() {
+    let cli = Cli::parse_from([
+        "datalens",
+        "inspect",
+        "usage",
+        "--config",
+        "custom.toml",
+        "--application",
+        "analytics-api",
+    ]);
+
+    match cli.command {
+        Command::Inspect(InspectCommand {
+            command: InspectSubcommand::Usage(command),
+        }) => {
+            assert_eq!(command.config, "custom.toml");
+            assert_eq!(command.application, "analytics-api");
+        }
+        command => panic!("expected inspect usage command, got {command:?}"),
+    }
+}
+
+#[test]
 fn test_inspect_manifest_reads_local_storage_manifest() {
     let root = temp_storage_root("inspect-manifest");
     let storage = LocalStorage::new(&root);
@@ -200,6 +227,48 @@ fn test_inspect_manifest_is_stable_when_manifest_is_missing() {
     assert_eq!(output["status"], "ok");
     assert_eq!(output["manifest"]["entry_count"], 0);
     assert_eq!(output["manifest"]["entries"], json!([]));
+}
+
+#[test]
+fn test_inspect_usage_reads_application_ledger() {
+    let root = temp_storage_root("inspect-usage");
+    let config = write_config("inspect-usage", &root);
+    let ledger = UsageLedgerStore::new(datalens_storage::LocalObjectStore::new(&root));
+    let selector = DatasetSelector::all();
+    ledger
+        .append(&UsageLedgerEntry::query_event(
+            "analytics-api",
+            test_chain(),
+            DatasetKey::evm_blocks(),
+            &selector,
+            LedgerRange::blocks(30, 31).expect("valid range"),
+            FinalityLevel::Safe,
+            QueryOutcome::Filled,
+            CacheOutcome::Miss,
+            FillOutcome::Written,
+            2,
+        ))
+        .expect("append usage");
+
+    let output = inspect_summary(InspectCommand {
+        command: InspectSubcommand::Usage(InspectUsageCommand {
+            config,
+            application: "analytics-api".to_owned(),
+        }),
+    })
+    .expect("inspect usage");
+
+    assert_eq!(output["status"], "ok");
+    assert_eq!(output["usage"]["application"], "analytics-api");
+    assert_eq!(output["usage"]["event_count"], 1);
+    assert_eq!(
+        output["usage"]["events"][0]["dataset_key"]["name"],
+        "blocks"
+    );
+    assert_eq!(output["usage"]["events"][0]["range"]["start"], 30);
+    assert_eq!(output["usage"]["events"][0]["query_outcome"], "filled");
+    assert_eq!(output["usage"]["events"][0]["cache_outcome"], "miss");
+    assert_eq!(output["usage"]["events"][0]["fill_outcome"], "written");
 }
 
 #[test]
