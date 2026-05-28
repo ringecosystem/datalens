@@ -38,6 +38,14 @@ API 不应该直接调用存储层或链适配器。它先把原生请求交给�
 除了可选元数据、延迟或可观测性指标，调用方不需要知道发生了哪种状态。返回结果的语义应该
 一致。
 
+当 executor 已经知道 query outcome、cache outcome、fill outcome 和 row count 后，如果存在
+application identity，它应追加一条 application usage ledger event。Ledger event 必须使用 API
+或 service context 提供的 registry-normalized application id，不能使用原始凭证。完整命中记录
+`hit` cache 和 query outcome。部分命中记录 `partial_hit`。写入数据行的 miss 记录 `filled`
+query outcome 和 `written` fill outcome。记录 empty coverage 的 miss 使用 `empty` query
+outcome 和 `empty_coverage_recorded` fill outcome。Provider 和 storage 失败使用对应的 error
+outcome，并且不能让不完整响应看起来成功。
+
 safe/finalized height 到 latest height 之间的区间不属于第一阶段 durable cache 语义。需要这段
 区间的调用方应直接查询 RPC，或使用未来明确标记为 non-durable 的 hot path。Hot 数据不能更新
 durable Manifest 覆盖范围。

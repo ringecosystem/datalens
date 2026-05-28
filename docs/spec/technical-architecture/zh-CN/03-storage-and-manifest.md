@@ -85,6 +85,22 @@ Manifest 覆盖范围不能用于 non-durable hot query 结果。empty coverage 
 具有相同 finality 要求：如果请求范围超过 safe/finalized height，datalens 不能写入 empty
 coverage 记录。
 
+Application identity 不能成为 durable coverage key 或 data object key 的一部分。Durable cache
+继续按 chain、dataset、selector、range、encoding 和 finality 共享，这样两个 application 查询
+同一份逻辑数据时可以复用同一个已存储对象和 Manifest 覆盖范围。
+
+Application usage attribution 应写入独立的 append-only usage ledger。第一版 ledger 格式是对象
+存储中的 JSON Lines，并按 application id、chain、dataset、range kind 和 Unix day 分区。Ledger
+entry 记录标准化后的 application id、chain identity、dataset key、selector fingerprint 和
+canonical key、请求范围、finality、query outcome、cache outcome、fill outcome、row count、
+timestamp，以及可选 request id 或 trace id。API key、token、原始凭证和未受信任的认证 header
+不能写入 ledger。
+
+Ledger event 是持久审计和计量事实，不是 Manifest coverage。Ledger 写入不能改变查询结果语义
+或 Manifest coverage 语义；但 ledger 写入失败在查询路径上属于 storage write failure，因为
+usage attribution 是持久计量要求。第一版采用 append-only：除非未来增加 request-id 幂等层，
+否则 retry 可以追加多条 event。
+
 正常写入路径不应该把已有范围分片解压出来、追加另一个合约的数据、重新压缩并覆盖上传。那会
 让并发补齐很难推理，也会让每个新过滤条件都变成读改写操作。第一版实现应该写入不可变的逻辑
 分片，分片由数据集、覆盖 key、schema 版本和范围共同确定。后续可以做离线 compaction 来合并

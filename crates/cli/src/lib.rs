@@ -13,8 +13,10 @@ use datalens_core::{
     LogFilter, NetworkId,
 };
 use datalens_evm::{EvmAdapter, EvmAdapterMetadata, EvmFinalityPolicy, EvmRpcClient};
+use datalens_metrics::ApplicationIdentity;
 use datalens_storage::{
-    DurableStorage, LocalStorage, ManifestEntry, ManifestFinalityLevel, S3ObjectStore,
+    DurableStorage, LocalObjectStore, LocalStorage, ManifestEntry, ManifestFinalityLevel,
+    S3ObjectStore, UsageLedgerRepository, UsageLedgerStore,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -97,6 +99,16 @@ pub struct InspectCommand {
 pub enum InspectSubcommand {
     Manifest(ConfigCommand),
     Coverage(ConfigCommand),
+    Usage(InspectUsageCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct InspectUsageCommand {
+    #[arg(long, default_value = "datalens.toml")]
+    pub config: String,
+
+    #[arg(long)]
+    pub application: String,
 }
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -211,6 +223,7 @@ pub fn inspect_summary(command: InspectCommand) -> Result<serde_json::Value, Dat
     let config = load_config(&config_path)?;
     validate_config(&config)?;
     let storage = build_storage(&config)?;
+    let usage_ledger = build_usage_ledger(&config)?;
     let manifest = storage.manifest()?;
     let entries = manifest
         .entries
@@ -248,6 +261,20 @@ pub fn inspect_summary(command: InspectCommand) -> Result<serde_json::Value, Dat
                 },
             })
         }
+        InspectSubcommand::Usage(command) => {
+            let events = usage_ledger.read_application(&command.application)?;
+            serde_json::json!({
+                "status": "ok",
+                "read_only": true,
+                "config": config_path,
+                "storage": storage,
+                "usage": {
+                    "application": command.application,
+                    "event_count": events.len(),
+                    "events": events,
+                },
+            })
+        }
     };
     Ok(summary)
 }
@@ -256,6 +283,7 @@ fn inspect_config(command: &InspectSubcommand) -> &str {
     match command {
         InspectSubcommand::Manifest(command) => &command.config,
         InspectSubcommand::Coverage(command) => &command.config,
+        InspectSubcommand::Usage(command) => &command.config,
     }
 }
 
@@ -585,16 +613,28 @@ fn build_service(
     chain_name: &str,
     chain: &ChainConfig,
 ) -> Result<QueryService<EvmRpcClient>, DatalensError> {
-    build_service_with_storage(build_storage(config)?, config, chain_name, chain)
+    build_service_with_storage(
+        build_storage(config)?,
+        build_usage_ledger(config)?,
+        config,
+        chain_name,
+        chain,
+    )
 }
 
 fn build_service_registry(config: &DatalensConfig) -> Result<QueryServiceRegistry, DatalensError> {
     let storage: Arc<dyn datalens_storage::StorageRepository> = Arc::from(build_storage(config)?);
+    let usage_ledger: Arc<dyn UsageLedgerRepository> = Arc::from(build_usage_ledger(config)?);
     let mut registry =
         QueryServiceRegistry::new().with_application_registry(config.applications.clone())?;
     for (chain_name, chain) in &config.chains {
-        let service =
-            build_service_with_storage(storage.clone(), config, chain_name.as_str(), chain)?;
+        let service = build_service_with_storage(
+            storage.clone(),
+            usage_ledger.clone(),
+            config,
+            chain_name.as_str(),
+            chain,
+        )?;
         registry = registry.with_service(service)?;
     }
     Ok(registry)
@@ -602,6 +642,7 @@ fn build_service_registry(config: &DatalensConfig) -> Result<QueryServiceRegistr
 
 fn build_service_with_storage(
     storage: impl datalens_storage::StorageRepository + 'static,
+    usage_ledger: impl UsageLedgerRepository + 'static,
     config: &DatalensConfig,
     chain_name: &str,
     chain: &ChainConfig,
@@ -619,7 +660,7 @@ fn build_service_with_storage(
         chain.datasets.logs.max_get_logs_range_blocks,
         chain.datasets.logs.max_addresses_per_query,
     );
-    datalens_api::QueryService::new_with_metrics_config(
+    Ok(datalens_api::QueryService::new_with_metrics_config(
         storage,
         source,
         config.planner.clone(),
@@ -627,7 +668,11 @@ fn build_service_with_storage(
         chain_name.to_owned(),
         chain.clone(),
         config.metrics.clone(),
-    )
+    )?
+    .with_usage_ledger(
+        usage_ledger,
+        ApplicationIdentity::named(config.metrics.default_application.clone()),
+    ))
 }
 
 fn build_storage(
@@ -652,6 +697,39 @@ fn build_storage(
             })?;
             let store = S3ObjectStore::from_config(s3)?;
             Ok(Box::new(DurableStorage::from_object_store(store)))
+        }
+        _ => Err(DatalensError::new(
+            DatalensErrorKind::UnsupportedDataset,
+            "storage.backend must be local or s3",
+        )),
+    }
+}
+
+fn build_usage_ledger(
+    config: &DatalensConfig,
+) -> Result<Box<dyn UsageLedgerRepository>, DatalensError> {
+    match config.storage.backend.as_str() {
+        "local" => {
+            let local = config.storage.local.as_ref().ok_or_else(|| {
+                DatalensError::new(
+                    DatalensErrorKind::InvalidInput,
+                    "storage.local.root or legacy storage.root must be set",
+                )
+            })?;
+            Ok(Box::new(UsageLedgerStore::new(LocalObjectStore::new(
+                &local.root,
+            ))))
+        }
+        "s3" => {
+            let s3 = config.storage.s3.clone().ok_or_else(|| {
+                DatalensError::new(
+                    DatalensErrorKind::InvalidInput,
+                    "storage.s3 must be set when storage.backend is s3",
+                )
+            })?;
+            Ok(Box::new(UsageLedgerStore::new(S3ObjectStore::from_config(
+                s3,
+            )?)))
         }
         _ => Err(DatalensError::new(
             DatalensErrorKind::UnsupportedDataset,

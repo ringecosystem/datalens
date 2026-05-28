@@ -15,7 +15,9 @@ use datalens_executor::{NativeQueryExecutionConfig, NativeQueryExecutor};
 use datalens_metrics::{ApplicationIdentity, MetricsRecorder};
 use datalens_planner::{FieldSelection, NativePlannerConfig, NativeQueryInput, ResponseShape};
 use datalens_storage::{
-    LocalStorage, Manifest, StorageRepository, StorageWriteOutcome, StorageWriteRequest,
+    CacheOutcome, FillOutcome, LocalObjectStore, LocalStorage, Manifest, ObjectMetadata,
+    ObjectStore, QueryOutcome, StorageRepository, StorageWriteOutcome, StorageWriteRequest,
+    UsageLedgerRepository, UsageLedgerStore,
 };
 use datalens_writer::{DurableWriteRequest, DurableWriteSegment, DurableWriterConfig};
 
@@ -85,6 +87,101 @@ fn test_executor_miss_fetches_and_persists_through_writer() {
         vec![SourceCall::Blocks(BlockRange::expect_new(10, 11))]
     );
     assert_eq!(block_numbers(&second.rows), vec![10, 11]);
+}
+
+#[test]
+fn test_executor_writes_usage_ledger_for_cache_hit() {
+    let root = temp_storage_root("executor-ledger-hit");
+    let storage = LocalStorage::new(&root);
+    seed_blocks(&storage, 1, 2, vec![block(1, "0x01"), block(2, "0x02")]);
+    let ledger = UsageLedgerStore::new(LocalObjectStore::new(&root));
+    let source = MockSource::default();
+    let executor = executor(storage, source)
+        .with_usage_ledger(ledger.clone(), ApplicationIdentity::named("analytics-api"));
+
+    executor
+        .execute(blocks_input(1, 2))
+        .expect("cache hit succeeds");
+
+    let events = ledger
+        .read_application("analytics-api")
+        .expect("read application usage");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].application_id, "analytics-api");
+    assert_eq!(events[0].chain, ethereum_identity());
+    assert_eq!(events[0].dataset_key, DatasetKey::evm_blocks());
+    assert_eq!(events[0].range, LedgerRange::blocks(1, 2).unwrap());
+    assert_eq!(events[0].query_outcome, QueryOutcome::Hit);
+    assert_eq!(events[0].cache_outcome, CacheOutcome::Hit);
+    assert_eq!(events[0].fill_outcome, FillOutcome::NotAttempted);
+    assert_eq!(events[0].row_count, 2);
+}
+
+#[test]
+fn test_executor_writes_usage_ledger_for_miss_fill_and_empty_coverage() {
+    let root = temp_storage_root("executor-ledger-fill-empty");
+    let storage = LocalStorage::new(&root);
+    let ledger = UsageLedgerStore::new(LocalObjectStore::new(&root));
+    let source = MockSource::default().with_blocks(vec![block(10, "0x10")]);
+    let executor = executor(storage, source)
+        .with_usage_ledger(ledger.clone(), ApplicationIdentity::named("analytics-api"));
+
+    executor
+        .execute(blocks_input(10, 11))
+        .expect("miss fill succeeds");
+
+    let events = ledger
+        .read_application("analytics-api")
+        .expect("read application usage");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].query_outcome, QueryOutcome::Filled);
+    assert_eq!(events[0].cache_outcome, CacheOutcome::Miss);
+    assert_eq!(events[0].fill_outcome, FillOutcome::Written);
+    assert_eq!(events[0].row_count, 1);
+}
+
+#[test]
+fn test_executor_records_separate_usage_for_shared_durable_cache() {
+    let root = temp_storage_root("executor-ledger-shared-cache");
+    let storage = LocalStorage::new(&root);
+    let ledger = UsageLedgerStore::new(LocalObjectStore::new(&root));
+    let source = MockSource::default().with_blocks(vec![block(20, "0x20")]);
+
+    executor(storage.clone(), source.clone())
+        .with_usage_ledger(ledger.clone(), ApplicationIdentity::named("app-a"))
+        .execute(blocks_input(20, 20))
+        .expect("first application fills cache");
+    executor(storage.clone(), source.clone())
+        .with_usage_ledger(ledger.clone(), ApplicationIdentity::named("app-b"))
+        .execute(blocks_input(20, 20))
+        .expect("second application hits shared cache");
+
+    assert_eq!(
+        ledger.read_application("app-a").expect("read app-a usage")[0].fill_outcome,
+        FillOutcome::Written
+    );
+    assert_eq!(
+        ledger.read_application("app-b").expect("read app-b usage")[0].cache_outcome,
+        CacheOutcome::Hit
+    );
+    assert_eq!(storage.manifest().expect("manifest").entries.len(), 1);
+}
+
+#[test]
+fn test_executor_ledger_write_failure_blocks_successful_query() {
+    let storage = LocalStorage::new(temp_storage_root("executor-ledger-failure"));
+    seed_blocks(&storage, 1, 1, vec![block(1, "0x01")]);
+    let source = MockSource::default();
+    let executor = executor(storage, source).with_usage_ledger(
+        UsageLedgerStore::new(FailingPutObjectStore),
+        ApplicationIdentity::named("api"),
+    );
+
+    let error = executor
+        .execute(blocks_input(1, 1))
+        .expect_err("ledger failure blocks query");
+
+    assert_eq!(error.kind, DatalensErrorKind::StorageWriteFailure);
 }
 
 #[test]
@@ -443,6 +540,34 @@ struct FailingStorage {
 impl FailingStorage {
     fn new(kind: DatalensErrorKind) -> Self {
         Self { kind }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FailingPutObjectStore;
+
+impl ObjectStore for FailingPutObjectStore {
+    fn get(&self, _key: &str) -> Result<Vec<u8>, DatalensError> {
+        Ok(Vec::new())
+    }
+
+    fn put(&self, _key: &str, _bytes: &[u8]) -> Result<(), DatalensError> {
+        Err(DatalensError::new(
+            DatalensErrorKind::StorageWriteFailure,
+            "injected ledger write failure",
+        ))
+    }
+
+    fn exists(&self, _key: &str) -> Result<bool, DatalensError> {
+        Ok(false)
+    }
+
+    fn list(&self, _prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
+        Ok(Vec::new())
+    }
+
+    fn delete(&self, _key: &str) -> Result<(), DatalensError> {
+        Ok(())
     }
 }
 
