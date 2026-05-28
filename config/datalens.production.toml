@@ -1,0 +1,61 @@
+[server]
+bind = "0.0.0.0:3000"
+
+[storage]
+backend = "s3"
+
+[storage.s3]
+bucket = "${DATALENS_S3_BUCKET}"
+prefix = "${DATALENS_S3_PREFIX}"
+region = "${DATALENS_S3_REGION}"
+endpoint_url = "${DATALENS_S3_ENDPOINT_URL}"
+force_path_style = true
+
+[planner]
+max_query_range_blocks = 100000
+default_chunk_range_blocks = 10000
+
+[writer]
+target_object_bytes = 67108864
+min_object_rows = 1000
+record_empty_coverage = true
+
+[metrics]
+enabled = true
+default_application = "datalens"
+
+[applications]
+required = true
+
+[[applications.applications]]
+id = "public"
+name = "public"
+enabled = true
+display_name = "Public API"
+token = "${DATALENS_PUBLIC_APP_TOKEN}"
+chains = ["ethereum"]
+datasets = ["blocks", "logs"]
+
+[applications.applications.quota]
+max_query_range_blocks = 10000
+max_requests_per_minute = 120
+max_concurrent_requests = 8
+
+[chains.ethereum]
+kind = "evm"
+chain_id = 1
+rpc_urls = ["${DATALENS_ETHEREUM_RPC_URL}"]
+
+[chains.ethereum.finality]
+mode = "lag"
+safe_lag_blocks = 32
+finalized_lag_blocks = 96
+
+[chains.ethereum.datasets.blocks]
+enabled = true
+max_batch_blocks = 1000
+
+[chains.ethereum.datasets.logs]
+enabled = true
+max_get_logs_range_blocks = 10000
+max_addresses_per_query = 32
