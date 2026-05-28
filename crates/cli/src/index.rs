@@ -360,6 +360,7 @@ fn dataset_key(chain: &ChainConfig, dataset: &str) -> Result<DatasetKey, Datalen
         ("evm", "blocks") => Ok(DatasetKey::evm_blocks()),
         ("evm", "logs") => Ok(DatasetKey::evm_logs()),
         ("solana", "slots") => Ok(DatasetKey::solana_slots()),
+        ("solana", "blocks") => Ok(DatasetKey::solana_blocks()),
         ("solana", "transactions") => Ok(DatasetKey::solana_transactions()),
         ("solana", "instructions") => Ok(DatasetKey::solana_instructions()),
         ("solana", "account_updates") => Ok(DatasetKey::solana_account_updates()),

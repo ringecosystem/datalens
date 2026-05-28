@@ -155,24 +155,11 @@ where
             return self.verify_plan(&plan, accounting);
         }
 
-        let completed = if job.run_mode == IndexRunMode::Resume {
-            self.cursor_store
-                .load(&job.id)?
-                .map(|cursor| cursor.completed_ranges)
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
         let writer = DurableWriter::new(self.storage.clone(), self.writer_config.clone());
         let mut checkpoints = Vec::new();
         let mut queue = plan.chunks.iter().cloned().collect::<VecDeque<_>>();
 
         while let Some(chunk) = queue.pop_front() {
-            if completed.contains(&chunk.range) {
-                accounting.chunks_skipped += 1;
-                accounting.skipped_ranges += 1;
-                continue;
-            }
             let checkpoint = match self.execute_chunk(&job, &plan, &writer, chunk.clone()) {
                 Ok(checkpoint) => checkpoint,
                 Err(error)

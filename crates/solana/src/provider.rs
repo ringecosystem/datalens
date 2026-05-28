@@ -196,6 +196,7 @@ fn fixture_block(slot: u64, commitment: SolanaCommitment) -> Option<SolanaBlock>
                 ],
                 "program1111111111111111111111111111111111",
             )],
+            raw: json!({ "fixture_slot": slot }),
         }),
         12 => Some(SolanaBlock {
             slot,
@@ -209,6 +210,7 @@ fn fixture_block(slot: u64, commitment: SolanaCommitment) -> Option<SolanaBlock>
                 vec!["Other11111111111111111111111111111111111".to_owned()],
                 "otherprogram111111111111111111111111111111",
             )],
+            raw: json!({ "fixture_slot": slot }),
         }),
         14 => Some(SolanaBlock {
             slot,
@@ -218,6 +220,7 @@ fn fixture_block(slot: u64, commitment: SolanaCommitment) -> Option<SolanaBlock>
             parent_slot: 12,
             block_time: Some(1_700_000_014),
             transactions: Vec::new(),
+            raw: json!({ "fixture_slot": slot }),
         }),
         _ => None,
     }
@@ -278,6 +281,7 @@ fn parse_block(slot: u64, value: &Value) -> Result<SolanaBlock, DatalensError> {
             })?,
         block_time: value.get("blockTime").and_then(Value::as_u64),
         transactions,
+        raw: value.clone(),
     })
 }
 
@@ -318,12 +322,16 @@ fn parse_transaction(value: &Value) -> Result<SolanaTransaction, DatalensError> 
         })
         .transpose()?
         .unwrap_or_default();
+    let loaded_addresses = meta
+        .get("loadedAddresses")
+        .map(loaded_addresses)
+        .unwrap_or_default();
     Ok(SolanaTransaction {
         signature,
         fee: meta.get("fee").and_then(Value::as_u64).unwrap_or_default(),
         err: meta.get("err").filter(|value| !value.is_null()).cloned(),
         account_keys,
-        loaded_addresses: Vec::new(),
+        loaded_addresses,
         instructions,
         inner_instructions,
         raw: value.clone(),
@@ -347,6 +355,16 @@ fn parse_inner_instruction_group(
         index,
         instructions,
     })
+}
+
+fn loaded_addresses(value: &Value) -> Vec<String> {
+    ["writable", "readonly"]
+        .into_iter()
+        .filter_map(|field| value.get(field).and_then(Value::as_array))
+        .flat_map(|addresses| addresses.iter())
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect()
 }
 
 fn parse_instruction(value: &Value) -> Result<SolanaInstruction, DatalensError> {

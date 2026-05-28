@@ -1387,6 +1387,8 @@ dependencies = [
  "datalens-chain-conformance",
  "datalens-core",
  "datalens-executor",
+ "datalens-indexer",
+ "datalens-metrics",
  "datalens-planner",
  "datalens-storage",
  "datalens-writer",
