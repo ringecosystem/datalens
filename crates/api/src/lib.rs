@@ -312,6 +312,8 @@ pub mod config {
         #[serde(default)]
         pub metrics: MetricsConfig,
         #[serde(default)]
+        pub index: IndexConfig,
+        #[serde(default)]
         pub applications: ApplicationRegistryConfig,
         pub chains: BTreeMap<String, ChainConfig>,
     }
@@ -404,6 +406,52 @@ pub mod config {
         pub default_application: String,
     }
 
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    pub struct IndexConfig {
+        #[serde(default = "default_index_chunk_range")]
+        pub default_chunk_range: u64,
+        #[serde(default = "default_index_concurrency")]
+        pub max_concurrency: usize,
+        #[serde(default)]
+        pub retry: IndexRetryConfig,
+        #[serde(default = "default_index_finality")]
+        pub default_finality: String,
+        #[serde(default = "default_index_cursor_path")]
+        pub cursor_path: String,
+    }
+
+    impl Default for IndexConfig {
+        fn default() -> Self {
+            Self {
+                default_chunk_range: default_index_chunk_range(),
+                max_concurrency: default_index_concurrency(),
+                retry: IndexRetryConfig::default(),
+                default_finality: default_index_finality(),
+                cursor_path: default_index_cursor_path(),
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    pub struct IndexRetryConfig {
+        #[serde(default = "default_index_retry_attempts")]
+        pub max_attempts: u32,
+        #[serde(default = "default_index_initial_backoff_ms")]
+        pub initial_backoff_ms: u64,
+        #[serde(default = "default_index_max_backoff_ms")]
+        pub max_backoff_ms: u64,
+    }
+
+    impl Default for IndexRetryConfig {
+        fn default() -> Self {
+            Self {
+                max_attempts: default_index_retry_attempts(),
+                initial_backoff_ms: default_index_initial_backoff_ms(),
+                max_backoff_ms: default_index_max_backoff_ms(),
+            }
+        }
+    }
+
     impl Default for MetricsConfig {
         fn default() -> Self {
             Self {
@@ -419,6 +467,34 @@ pub mod config {
 
     fn default_metrics_application() -> String {
         "datalens".to_owned()
+    }
+
+    fn default_index_chunk_range() -> u64 {
+        1_000
+    }
+
+    fn default_index_concurrency() -> usize {
+        1
+    }
+
+    fn default_index_retry_attempts() -> u32 {
+        3
+    }
+
+    fn default_index_initial_backoff_ms() -> u64 {
+        250
+    }
+
+    fn default_index_max_backoff_ms() -> u64 {
+        30_000
+    }
+
+    fn default_index_finality() -> String {
+        "finalized".to_owned()
+    }
+
+    fn default_index_cursor_path() -> String {
+        ".datalens/index-cursors".to_owned()
     }
 
     #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

@@ -14,6 +14,7 @@ datalens-api = { path = "../api" }
 datalens-chain = { path = "../chain" }
 datalens-core = { path = "../core" }
 datalens-evm = { path = "../evm" }
+datalens-indexer = { path = "../indexer" }
 datalens-metrics = { path = "../metrics" }
 datalens-planner = { path = "../planner" }
 datalens-solana = { path = "../solana" }
