@@ -23,6 +23,7 @@ use datalens_core::{
     DatasetKey, LedgerRange, LogFilter, LogRecord, NetworkId, QueryFinalityRequirement, QueryRows,
 };
 use datalens_planner::{FieldSelection, NativeQueryInput, ResponseShape};
+use datalens_solana::{SolanaAdapter, solana_all_selector};
 use datalens_storage::{LocalStorage, StorageRepository};
 use tower::ServiceExt;
 
@@ -545,6 +546,72 @@ fn test_registry_shared_storage_keeps_manifest_isolated_by_chain_identity() {
     assert!(root.join("chains/evm/polygon/137/manifest.json").exists());
     assert!(root.join("chains/evm/ethereum/1/datasets").exists());
     assert!(root.join("chains/evm/polygon/137/datasets").exists());
+}
+
+#[test]
+fn test_registry_routes_evm_and_solana_native_queries_side_by_side() {
+    let root = temp_storage_root("registry-evm-solana");
+    let storage: Arc<dyn StorageRepository> = Arc::new(LocalStorage::new(&root));
+    let ethereum_source = MockSource::default()
+        .with_blocks(vec![block(1, "0x01")])
+        .with_chain(ethereum_identity());
+    let solana = SolanaAdapter::with_fixture_defaults();
+    let solana_chain = solana.capabilities().chain().clone();
+    let registry = QueryServiceRegistry::new()
+        .with_service(service_named(
+            storage.clone(),
+            ethereum_source.clone(),
+            "ethereum",
+            1,
+        ))
+        .expect("register ethereum")
+        .with_service(QueryService::new_named(
+            storage.clone(),
+            solana,
+            PlannerConfig {
+                max_query_range_blocks: 10,
+                default_chunk_range_blocks: 10,
+            },
+            WriterConfig {
+                target_object_bytes: 1024,
+                min_object_rows: 1,
+                record_empty_coverage: true,
+            },
+            "solana-mainnet-beta",
+            solana_chain_config(),
+        ))
+        .expect("register solana");
+
+    let ethereum = registry
+        .query(blocks_request_for(ethereum_identity(), 1, 1))
+        .expect("ethereum query succeeds");
+    let solana_response = registry
+        .query_native(NativeQueryInput {
+            chain: solana_chain,
+            dataset_key: DatasetKey::solana_slots(),
+            ledger_range: LedgerRange::slots(10, 12).expect("valid range"),
+            selector: solana_all_selector().expect("selector"),
+            response_shape: ResponseShape::NativeRows,
+            field_selection: FieldSelection::All,
+            finality: QueryFinalityRequirement::DurableOnly,
+        })
+        .expect("solana query succeeds");
+
+    assert_eq!(block_numbers(&ethereum), vec![1]);
+    let QueryRows::AdapterJson { rows, .. } = solana_response.rows.rows() else {
+        panic!("expected Solana adapter JSON rows");
+    };
+    assert_eq!(
+        rows.iter()
+            .map(|row| row["slot"].as_u64().expect("slot"))
+            .collect::<Vec<_>>(),
+        vec![10, 12]
+    );
+    assert!(root.join("chains/evm/ethereum/1/manifest.json").exists());
+    assert!(
+        root.join("chains/solana/solana-mainnet-beta/mainnet-beta/manifest.json")
+            .exists()
+    );
 }
 
 #[test]
@@ -1136,6 +1203,26 @@ fn chain_config(chain_id: u64) -> ChainConfig {
             },
             logs: LogsDatasetConfig {
                 enabled: true,
+                max_get_logs_range_blocks: 2,
+                max_addresses_per_query: 2,
+            },
+        },
+    }
+}
+
+fn solana_chain_config() -> ChainConfig {
+    ChainConfig {
+        kind: "solana".to_owned(),
+        chain_id: 0,
+        rpc_urls: vec!["http://example.invalid".to_owned()],
+        finality: datalens_api::config::FinalityConfig::Auto,
+        datasets: DatasetsConfig {
+            blocks: datalens_api::config::BlocksDatasetConfig {
+                enabled: false,
+                max_batch_blocks: 2,
+            },
+            logs: LogsDatasetConfig {
+                enabled: false,
                 max_get_logs_range_blocks: 2,
                 max_addresses_per_query: 2,
             },

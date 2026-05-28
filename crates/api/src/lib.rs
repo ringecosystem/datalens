@@ -933,6 +933,12 @@ trait RegisteredQueryService: Send + Sync {
         application: Option<ApplicationIdentity>,
     ) -> Result<LegacyEvmQueryResponse, DatalensError>;
 
+    fn query_native(
+        &self,
+        request: NativeQueryInput,
+        application: Option<ApplicationIdentity>,
+    ) -> Result<NativeQueryResponse, DatalensError>;
+
     fn metrics_text(&self) -> Option<Result<String, DatalensError>>;
 
     fn discovery(&self) -> Result<ChainDiscovery, DatalensError>;
@@ -948,6 +954,14 @@ where
         application: Option<ApplicationIdentity>,
     ) -> Result<LegacyEvmQueryResponse, DatalensError> {
         QueryService::query_with_application(self, request, application)
+    }
+
+    fn query_native(
+        &self,
+        request: NativeQueryInput,
+        application: Option<ApplicationIdentity>,
+    ) -> Result<NativeQueryResponse, DatalensError> {
+        QueryService::query_native_with_application(self, request, application)
     }
 
     fn metrics_text(&self) -> Option<Result<String, DatalensError>> {
@@ -1017,6 +1031,28 @@ impl QueryServiceRegistry {
             )
         })?;
         service.query(request, application)
+    }
+
+    pub fn query_native(
+        &self,
+        request: NativeQueryInput,
+    ) -> Result<NativeQueryResponse, DatalensError> {
+        self.query_native_with_application(request, None)
+    }
+
+    pub fn query_native_with_application(
+        &self,
+        request: NativeQueryInput,
+        application: Option<ApplicationIdentity>,
+    ) -> Result<NativeQueryResponse, DatalensError> {
+        let chain_name = request.chain.configured_name();
+        let service = self.services.get(chain_name).ok_or_else(|| {
+            DatalensError::new(
+                DatalensErrorKind::UnsupportedDataset,
+                format!("chain {chain_name} is not configured"),
+            )
+        })?;
+        service.query_native(request, application)
     }
 
     pub fn discovery(&self) -> Result<DiscoveryResponse, DatalensError> {

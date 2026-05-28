@@ -16,6 +16,7 @@ datalens-core = { path = "../core" }
 datalens-evm = { path = "../evm" }
 datalens-metrics = { path = "../metrics" }
 datalens-planner = { path = "../planner" }
+datalens-solana = { path = "../solana" }
 datalens-storage = { path = "../storage" }
 datalens-writer = { path = "../writer" }
 figment.workspace = true

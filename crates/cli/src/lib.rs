@@ -14,6 +14,7 @@ use datalens_core::{
 };
 use datalens_evm::{EvmAdapter, EvmAdapterMetadata, EvmFinalityPolicy, EvmRpcClient};
 use datalens_metrics::ApplicationIdentity;
+use datalens_solana::{SolanaAdapter, SolanaHttpRpc};
 use datalens_storage::{
     DurableStorage, LocalObjectStore, LocalStorage, ManifestEntry, ManifestFinalityLevel,
     S3ObjectStore, UsageLedgerRepository, UsageLedgerStore,
@@ -514,10 +515,10 @@ fn validate_applications(config: &DatalensConfig) -> Result<(), DatalensError> {
 
 fn validate_chain(name: &str, chain: &ChainConfig) -> Result<(), DatalensError> {
     let _identity = chain_identity(name, chain)?;
-    if chain.kind != "evm" {
+    if !matches!(chain.kind.as_str(), "evm" | "solana") {
         return Err(DatalensError::new(
             DatalensErrorKind::UnsupportedDataset,
-            "only evm chains are supported",
+            "only evm and solana chains are supported",
         ));
     }
     if chain.rpc_urls.is_empty() || chain.rpc_urls.iter().any(|url| url.trim().is_empty()) {
@@ -525,6 +526,9 @@ fn validate_chain(name: &str, chain: &ChainConfig) -> Result<(), DatalensError> 
             DatalensErrorKind::InvalidInput,
             format!("chain {name} must define at least one rpc URL"),
         ));
+    }
+    if chain.kind == "solana" {
+        return Ok(());
     }
     if chain.datasets.blocks.max_batch_blocks == 0 {
         return Err(DatalensError::new(
@@ -552,6 +556,47 @@ pub fn doctor_chain_summary(
     name: &str,
     chain: &ChainConfig,
 ) -> Result<serde_json::Value, DatalensError> {
+    if chain.kind == "solana" {
+        let source = SolanaAdapter::with_provider(
+            chain_identity(name, chain)?,
+            SolanaHttpRpc::new(chain.rpc_urls.first().cloned().unwrap_or_default()),
+        )
+        .with_max_slot_range_len(chain.datasets.blocks.max_batch_blocks.max(1));
+        let safe_height = source.cache_safe_height().map_err(|error| {
+            DatalensError::new(
+                error.kind,
+                format!(
+                    "chain {name} cannot determine finalized slot for durable cache writes: {}",
+                    error.message
+                ),
+            )
+        })?;
+        return Ok(serde_json::json!({
+            "name": name,
+            "kind": chain.kind,
+            "chain_id": chain.chain_id,
+            "rpc_urls": chain.rpc_urls.iter().map(|url| redact_url(url)).collect::<Vec<_>>(),
+            "finality": {
+                "config": "solana_finalized",
+                "detected_height": safe_height.value,
+                "detected_kind": format!("{:?}", safe_height.finality),
+            },
+            "datasets": {
+                "slots": {
+                    "enabled": true,
+                    "max_slot_range_len": chain.datasets.blocks.max_batch_blocks,
+                },
+                "transactions": {
+                    "enabled": true,
+                    "max_slot_range_len": chain.datasets.blocks.max_batch_blocks,
+                },
+                "instructions": {
+                    "enabled": true,
+                    "max_slot_range_len": chain.datasets.blocks.max_batch_blocks,
+                }
+            }
+        }));
+    }
     let source = EvmRpcClient::with_chain(
         chain.rpc_urls.clone(),
         chain_identity(name, chain)?,
@@ -636,7 +681,13 @@ fn build_service(
     chain_name: &str,
     chain: &ChainConfig,
 ) -> Result<QueryService<EvmRpcClient>, DatalensError> {
-    build_service_with_storage(
+    if chain.kind != "evm" {
+        return Err(DatalensError::new(
+            DatalensErrorKind::UnsupportedDataset,
+            "CLI legacy query commands only support evm chains",
+        ));
+    }
+    build_evm_service_with_storage(
         build_storage(config)?,
         build_usage_ledger(config)?,
         config,
@@ -651,19 +702,34 @@ fn build_service_registry(config: &DatalensConfig) -> Result<QueryServiceRegistr
     let mut registry =
         QueryServiceRegistry::new().with_application_registry(config.applications.clone())?;
     for (chain_name, chain) in &config.chains {
-        let service = build_service_with_storage(
-            storage.clone(),
-            usage_ledger.clone(),
-            config,
-            chain_name.as_str(),
-            chain,
-        )?;
-        registry = registry.with_service(service)?;
+        match chain.kind.as_str() {
+            "evm" => {
+                let service = build_evm_service_with_storage(
+                    storage.clone(),
+                    usage_ledger.clone(),
+                    config,
+                    chain_name.as_str(),
+                    chain,
+                )?;
+                registry = registry.with_service(service)?;
+            }
+            "solana" => {
+                let service = build_solana_service_with_storage(
+                    storage.clone(),
+                    usage_ledger.clone(),
+                    config,
+                    chain_name.as_str(),
+                    chain,
+                )?;
+                registry = registry.with_service(service)?;
+            }
+            _ => unreachable!("chain kind validated"),
+        }
     }
     Ok(registry)
 }
 
-fn build_service_with_storage(
+fn build_evm_service_with_storage(
     storage: impl datalens_storage::StorageRepository + 'static,
     usage_ledger: impl UsageLedgerRepository + 'static,
     config: &DatalensConfig,
@@ -683,6 +749,44 @@ fn build_service_with_storage(
         chain.datasets.logs.max_get_logs_range_blocks,
         chain.datasets.logs.max_addresses_per_query,
     );
+    Ok(datalens_api::QueryService::new_with_metrics_config(
+        storage,
+        source,
+        config.planner.clone(),
+        config.writer.clone(),
+        chain_name.to_owned(),
+        chain.clone(),
+        config.metrics.clone(),
+    )?
+    .with_usage_ledger(
+        usage_ledger,
+        ApplicationIdentity::named(config.metrics.default_application.clone()),
+    ))
+}
+
+fn build_solana_service_with_storage(
+    storage: impl datalens_storage::StorageRepository + 'static,
+    usage_ledger: impl UsageLedgerRepository + 'static,
+    config: &DatalensConfig,
+    chain_name: &str,
+    chain: &ChainConfig,
+) -> Result<QueryService<SolanaAdapter<SolanaHttpRpc>>, DatalensError> {
+    log::info!(
+        "using chain {chain_name} kind={} chain_id={}",
+        chain.kind,
+        chain.chain_id
+    );
+    let url = chain.rpc_urls.first().ok_or_else(|| {
+        DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            format!("chain {chain_name} must define at least one rpc URL"),
+        )
+    })?;
+    let source = SolanaAdapter::with_provider(
+        chain_identity(chain_name, chain).expect("validated chain identity"),
+        SolanaHttpRpc::new(url.clone()),
+    )
+    .with_max_slot_range_len(chain.datasets.blocks.max_batch_blocks.max(1));
     Ok(datalens_api::QueryService::new_with_metrics_config(
         storage,
         source,
@@ -865,11 +969,11 @@ fn query_config(command: &QuerySubcommand) -> &str {
 }
 
 fn chain_identity(name: &str, chain: &ChainConfig) -> Result<ChainIdentity, DatalensError> {
-    ChainIdentity::try_new(
-        ChainFamily::Evm,
-        name,
-        Some(NetworkId::numeric(chain.chain_id)),
-    )
+    let family = match chain.kind.as_str() {
+        "evm" => ChainFamily::Evm,
+        value => ChainFamily::try_other(value.to_owned())?,
+    };
+    ChainIdentity::try_new(family, name, Some(NetworkId::numeric(chain.chain_id)))
 }
 
 fn parse_bind(value: &str) -> Result<SocketAddr, DatalensError> {
