@@ -1272,6 +1272,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "datalens-chain-conformance"
+version = "0.1.0"
+dependencies = [
+ "datalens-chain",
+ "datalens-core",
+ "serde_json",
+]
+
+[[package]]
 name = "datalens-cli"
 version = "0.1.0"
 dependencies = [
@@ -1318,6 +1327,7 @@ name = "datalens-evm"
 version = "0.1.0"
 dependencies = [
  "datalens-chain",
+ "datalens-chain-conformance",
  "datalens-core",
  "log",
  "reqwest",
