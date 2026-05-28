@@ -14,7 +14,9 @@ use datalens_core::{
 use datalens_executor::{NativeQueryExecutionConfig, NativeQueryExecutor};
 use datalens_metrics::{ApplicationIdentity, MetricsRecorder};
 use datalens_planner::{FieldSelection, NativePlannerConfig, NativeQueryInput, ResponseShape};
-use datalens_storage::{LocalStorage, StorageRepository, StorageWriteOutcome, StorageWriteRequest};
+use datalens_storage::{
+    LocalStorage, Manifest, StorageRepository, StorageWriteOutcome, StorageWriteRequest,
+};
 use datalens_writer::{DurableWriteRequest, DurableWriteSegment, DurableWriterConfig};
 
 #[test]
@@ -396,6 +398,10 @@ impl CountingStorage {
 }
 
 impl StorageRepository for CountingStorage {
+    fn manifest(&self) -> Result<Manifest, DatalensError> {
+        self.inner.manifest()
+    }
+
     fn covered_ranges(
         &self,
         chain: &ChainIdentity,
@@ -441,6 +447,13 @@ impl FailingStorage {
 }
 
 impl StorageRepository for FailingStorage {
+    fn manifest(&self) -> Result<Manifest, DatalensError> {
+        Err(DatalensError::new(
+            self.kind.clone(),
+            "injected storage failure",
+        ))
+    }
+
     fn covered_ranges(
         &self,
         _chain: &ChainIdentity,

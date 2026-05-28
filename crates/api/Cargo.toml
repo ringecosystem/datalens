@@ -20,4 +20,4 @@ tokio.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
-tower = { version = "0.5.2", features = ["util"] }
+tower = { version = "0.5.3", features = ["util"] }
