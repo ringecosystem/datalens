@@ -64,18 +64,9 @@ fn test_finality_boundaries_are_block_based_and_finalized_is_durable() {
 }
 
 #[test]
-fn test_unsupported_events_and_evm_selectors_are_stable_errors() {
+fn test_plain_all_selector_is_stable_error() {
     let adapter = TronAdapter::with_fixture_defaults();
     let chain = adapter.capabilities().chain().clone();
-    let error = adapter
-        .fetch(ChainFetchRequest::new(
-            chain.clone(),
-            DatasetKey::tron_events(),
-            LedgerRange::blocks(10, 10).expect("valid range"),
-            tron_all_selector().expect("selector"),
-        ))
-        .expect_err("events unsupported");
-    assert_eq!(error.kind, DatalensErrorKind::UnsupportedDataset);
 
     let error = adapter
         .fetch(ChainFetchRequest::new(

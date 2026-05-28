@@ -102,6 +102,14 @@ impl DatasetKey {
         Self::try_new(ChainFamily::Other("tron".to_owned()), "blocks").unwrap()
     }
 
+    pub fn tron_transactions() -> Self {
+        Self::try_new(ChainFamily::Other("tron".to_owned()), "transactions").unwrap()
+    }
+
+    pub fn tron_transaction_infos() -> Self {
+        Self::try_new(ChainFamily::Other("tron".to_owned()), "transaction_infos").unwrap()
+    }
+
     pub fn tron_events() -> Self {
         Self::try_new(ChainFamily::Other("tron".to_owned()), "events").unwrap()
     }
