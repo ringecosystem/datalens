@@ -1,5 +1,9 @@
 //! Durable full-indexing runtime contract.
 
+mod runtime;
+
+pub use runtime::{InMemoryIndexCursorStore, IndexCursorRepository, IndexRuntime};
+
 use datalens_chain::{ChainHeight, DatasetSelector, FinalityLevel, HeightRangeKind};
 use datalens_core::{
     ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey, LedgerRange, missing_ranges,
@@ -54,8 +58,29 @@ pub struct IndexJob {
     pub chain: ChainIdentity,
     pub range: LedgerRange,
     pub dataset_selection: IndexDatasetSelection,
+    pub finality_requirement: IndexFinalityRequirement,
+    pub runtime_config: IndexRuntimeConfig,
     pub run_mode: IndexRunMode,
     pub retry_policy: IndexRetryPolicy,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IndexFinalityRequirement {
+    Safe,
+    Finalized,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IndexRuntimeConfig {
+    pub max_chunk_len: u64,
+}
+
+impl Default for IndexRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            max_chunk_len: 1_000,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -113,6 +138,7 @@ impl Default for IndexRetryPolicy {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IndexPlan {
     pub job: IndexJob,
+    pub planned_range: LedgerRange,
     pub finality_boundary: ChainHeight,
     pub durable_finality: FinalityLevel,
     pub retry_policy: IndexRetryPolicy,
@@ -129,7 +155,23 @@ impl IndexPlan {
         covered_ranges: Vec<LedgerRange>,
     ) -> Result<Self, DatalensError> {
         finality_boundary.validate_durable_writable()?;
-        validate_boundary_range(&job.range, &finality_boundary)?;
+        if job.range.kind() != finality_boundary.range_kind {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                "index range kind must match finality boundary range kind",
+            ));
+        }
+        if job.range.start() > finality_boundary.value {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                "index range starts after safe/finalized finality boundary",
+            ));
+        }
+        let planned_range = LedgerRange::try_new(
+            job.range.kind(),
+            job.range.start(),
+            job.range.end().min(finality_boundary.value),
+        )?;
 
         let datasets = job.dataset_selection.selected()?;
         let mut chunks = Vec::new();
@@ -139,7 +181,7 @@ impl IndexPlan {
         for dataset in datasets {
             let relevant_coverage = covered_ranges
                 .iter()
-                .filter_map(|range| range.intersection(&job.range))
+                .filter_map(|range| range.intersection(&planned_range))
                 .collect::<Vec<_>>();
 
             if job.run_mode == IndexRunMode::Verify {
@@ -160,7 +202,7 @@ impl IndexPlan {
                 }
             }));
 
-            let missing = missing_ranges(job.range.clone(), &relevant_coverage);
+            let missing = missing_ranges(planned_range.clone(), &relevant_coverage);
             let max_range_len = provider_limits
                 .iter()
                 .find(|limit| {
@@ -168,6 +210,7 @@ impl IndexPlan {
                 })
                 .map(|limit| limit.max_range_len)
                 .unwrap_or(u64::MAX)
+                .min(job.runtime_config.max_chunk_len.max(1))
                 .max(1);
             for range in missing {
                 for range in range.split(max_range_len)? {
@@ -186,6 +229,7 @@ impl IndexPlan {
             durable_finality: finality_boundary.finality,
             retry_policy: job.retry_policy.clone(),
             job,
+            planned_range,
             finality_boundary,
             chunks,
             skipped_ranges,
@@ -225,6 +269,14 @@ pub struct IndexVerificationRange {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IndexCursor {
     pub job_id: IndexJobId,
+    pub chain: ChainIdentity,
+    pub dataset_key: DatasetKey,
+    pub selector: DatasetSelector,
+    pub range_kind: HeightRangeKind,
+    pub next_height: u64,
+    pub completed_chunks: Vec<u64>,
+    pub completed_ranges: Vec<LedgerRange>,
+    pub failure_state: Option<IndexFailureState>,
     pub next_chunk_ordinal: u64,
     pub last_checkpointed_range: Option<LedgerRange>,
 }
@@ -233,6 +285,14 @@ impl IndexCursor {
     pub fn from_checkpoint(checkpoint: &IndexCheckpoint) -> Self {
         Self {
             job_id: checkpoint.job_id.clone(),
+            chain: checkpoint.chain.clone(),
+            dataset_key: checkpoint.chunk.dataset_key.clone(),
+            selector: checkpoint.chunk.selector.clone(),
+            range_kind: checkpoint.chunk.range.kind(),
+            next_height: checkpoint.chunk.range.end().saturating_add(1),
+            completed_chunks: vec![checkpoint.chunk.ordinal],
+            completed_ranges: vec![checkpoint.chunk.range.clone()],
+            failure_state: None,
             next_chunk_ordinal: checkpoint.chunk.ordinal + 1,
             last_checkpointed_range: Some(checkpoint.chunk.range.clone()),
         }
@@ -244,8 +304,16 @@ impl IndexCursor {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IndexFailureState {
+    pub chunk: IndexChunk,
+    pub error_kind: DatalensErrorKind,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IndexCheckpoint {
     pub job_id: IndexJobId,
+    pub chain: ChainIdentity,
     pub chunk: IndexChunk,
     pub durable_write: Option<IndexDurableWriteSummary>,
     pub provider_calls: u64,
@@ -278,28 +346,16 @@ pub enum IndexRunStatus {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct IndexAccounting {
+    pub chunks_planned: u64,
+    pub chunks_fetched: u64,
+    pub chunks_skipped: u64,
+    pub chunks_written: u64,
+    pub chunks_failed: u64,
+    pub provider_limit_splits: u64,
+    pub finality_capped_ranges: u64,
     pub provider_calls: u64,
     pub rows_written: usize,
     pub skipped_ranges: usize,
     pub retries: u64,
     pub failures: u64,
-}
-
-fn validate_boundary_range(
-    range: &LedgerRange,
-    finality_boundary: &ChainHeight,
-) -> Result<(), DatalensError> {
-    if range.kind() != finality_boundary.range_kind {
-        return Err(DatalensError::new(
-            DatalensErrorKind::InvalidInput,
-            "index range kind must match finality boundary range kind",
-        ));
-    }
-    if range.end() > finality_boundary.value {
-        return Err(DatalensError::new(
-            DatalensErrorKind::InvalidInput,
-            "index range exceeds safe/finalized finality boundary",
-        ));
-    }
-    Ok(())
 }

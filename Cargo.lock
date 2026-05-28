@@ -1358,6 +1358,8 @@ dependencies = [
  "datalens-chain",
  "datalens-core",
  "datalens-metrics",
+ "datalens-storage",
+ "datalens-writer",
 ]
 
 [[package]]
