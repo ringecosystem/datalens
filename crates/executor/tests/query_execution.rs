@@ -20,7 +20,9 @@ use datalens_storage::{
     ObjectStore, QueryOutcome, StorageRepository, StorageWriteOutcome, StorageWriteRequest,
     UsageLedgerRepository, UsageLedgerStore,
 };
-use datalens_writer::{DurableWriteRequest, DurableWriteSegment, DurableWriterConfig};
+use datalens_writer::{
+    DurableWriteRequest, DurableWriteSegment, DurableWriterConfig, WriteStagingConfig,
+};
 
 #[test]
 fn test_executor_cache_hit_reads_cache_without_fetch() {
@@ -91,6 +93,96 @@ fn test_executor_miss_fetches_and_persists_through_writer() {
 }
 
 #[test]
+fn test_executor_miss_returns_provider_rows_when_writer_stages_below_threshold() {
+    let storage = LocalStorage::new(temp_storage_root("executor-staged-miss"));
+    let source = MockSource::default().with_blocks(vec![block(10, "0x10")]);
+    let executor = NativeQueryExecutor::new(
+        storage.clone(),
+        source.clone(),
+        NativeQueryExecutionConfig {
+            planner: NativePlannerConfig {
+                max_query_range_len: 4,
+                default_chunk_range_len: 2,
+            },
+            writer: DurableWriterConfig {
+                target_object_bytes: 1024 * 1024,
+                min_object_rows: 3,
+                record_empty_coverage: true,
+                staging: WriteStagingConfig { enabled: true },
+            },
+        },
+    );
+
+    let first = executor
+        .execute(blocks_input(10, 10))
+        .expect("staged miss returns provider rows");
+    assert_eq!(block_numbers(&first.rows), vec![10]);
+    assert!(storage.manifest().expect("manifest").entries.is_empty());
+
+    let second = executor
+        .execute(blocks_input(10, 10))
+        .expect("durable planner still misses staged rows");
+    executor.flush_staged_writes().expect("flush staged writes");
+    let third = executor
+        .execute(blocks_input(10, 10))
+        .expect("flushed staged rows hit durable cache");
+
+    assert_eq!(block_numbers(&second.rows), vec![10]);
+    assert_eq!(
+        source.calls(),
+        vec![
+            SourceCall::Blocks(BlockRange::expect_new(10, 10)),
+            SourceCall::Blocks(BlockRange::expect_new(10, 10)),
+        ]
+    );
+    assert_eq!(
+        third.cache.hit_ranges,
+        vec![LedgerRange::blocks(10, 10).expect("valid range")]
+    );
+    assert_eq!(block_numbers(&third.rows), vec![10]);
+}
+
+#[test]
+fn test_executor_usage_ledger_separates_provider_fill_from_staged_write() {
+    let root = temp_storage_root("executor-ledger-staged");
+    let storage = LocalStorage::new(&root);
+    let ledger = UsageLedgerStore::new(LocalObjectStore::new(&root));
+    let source = MockSource::default().with_blocks(vec![block(10, "0x10")]);
+    let executor = NativeQueryExecutor::new(
+        storage,
+        source,
+        NativeQueryExecutionConfig {
+            planner: NativePlannerConfig {
+                max_query_range_len: 4,
+                default_chunk_range_len: 2,
+            },
+            writer: DurableWriterConfig {
+                target_object_bytes: 1024 * 1024,
+                min_object_rows: 3,
+                record_empty_coverage: true,
+                staging: WriteStagingConfig { enabled: true },
+            },
+        },
+    )
+    .with_usage_ledger(ledger.clone(), ApplicationIdentity::named("analytics-api"));
+
+    executor
+        .execute(blocks_input(10, 10))
+        .expect("staged miss succeeds");
+
+    let events = ledger
+        .read_application("analytics-api")
+        .expect("read application usage");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].fill_outcome, FillOutcome::LiveFetch);
+    assert_eq!(
+        events[0].durable_write_outcome,
+        datalens_storage::DurableWriteOutcome::Staged
+    );
+    assert_eq!(events[0].row_count, 1);
+}
+
+#[test]
 fn test_executor_writes_usage_ledger_for_cache_hit() {
     let root = temp_storage_root("executor-ledger-hit");
     let storage = LocalStorage::new(&root);
@@ -137,7 +229,11 @@ fn test_executor_writes_usage_ledger_for_miss_fill_and_empty_coverage() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].query_outcome, QueryOutcome::Filled);
     assert_eq!(events[0].cache_outcome, CacheOutcome::Miss);
-    assert_eq!(events[0].fill_outcome, FillOutcome::Written);
+    assert_eq!(events[0].fill_outcome, FillOutcome::LiveFetch);
+    assert_eq!(
+        events[0].durable_write_outcome,
+        datalens_storage::DurableWriteOutcome::Flushed
+    );
     assert_eq!(events[0].row_count, 1);
 }
 
@@ -159,7 +255,11 @@ fn test_executor_records_separate_usage_for_shared_durable_cache() {
 
     assert_eq!(
         ledger.read_application("app-a").expect("read app-a usage")[0].fill_outcome,
-        FillOutcome::Written
+        FillOutcome::LiveFetch
+    );
+    assert_eq!(
+        ledger.read_application("app-a").expect("read app-a usage")[0].durable_write_outcome,
+        datalens_storage::DurableWriteOutcome::Flushed
     );
     assert_eq!(
         ledger.read_application("app-b").expect("read app-b usage")[0].cache_outcome,
@@ -337,6 +437,9 @@ fn test_executor_records_metrics_for_cache_hit_and_fill_paths() {
         r#"datalens_fill_total{application="api",chain="ethereum",chain_kind="evm",dataset="blocks",outcome="filled"} 1"#
     ));
     assert!(output.contains(
+        r#"datalens_durable_write_total{application="api",chain="ethereum",chain_kind="evm",dataset="blocks",outcome="flushed"} 1"#
+    ));
+    assert!(output.contains(
         r#"datalens_application_chain_latest_requested_block{application="api",chain="ethereum",chain_kind="evm",dataset="blocks"} 4"#
     ));
     assert!(output.contains(
@@ -471,6 +574,7 @@ where
                 target_object_bytes: 1024,
                 min_object_rows: 1,
                 record_empty_coverage: true,
+                staging: Default::default(),
             },
         },
     )
@@ -624,6 +728,7 @@ fn seed_blocks(storage: &LocalStorage, start: u64, end: u64, blocks: Vec<BlockHe
             target_object_bytes: 1024,
             min_object_rows: 1,
             record_empty_coverage: true,
+            staging: Default::default(),
         },
     )
     .write(DurableWriteRequest {

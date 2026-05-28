@@ -576,6 +576,7 @@ fn test_registry_routes_evm_and_solana_native_queries_side_by_side() {
                 target_object_bytes: 1024,
                 min_object_rows: 1,
                 record_empty_coverage: true,
+                staging: Default::default(),
             },
             "solana-mainnet-beta",
             solana_chain_config(),
@@ -1000,6 +1001,7 @@ fn test_metrics_config_can_disable_recorder_initialization() {
             target_object_bytes: 1024,
             min_object_rows: 1,
             record_empty_coverage: true,
+            staging: Default::default(),
         },
         "ethereum",
         chain_config(1),
@@ -1082,6 +1084,7 @@ fn test_query_native_executes_non_evm_plan_without_legacy_route_validation() {
             target_object_bytes: 1024,
             min_object_rows: 1,
             record_empty_coverage: true,
+            staging: Default::default(),
         },
         "tron",
         ChainConfig {
@@ -1168,6 +1171,7 @@ fn service_named_with_datasets(
             target_object_bytes: 1024,
             min_object_rows: 1,
             record_empty_coverage: true,
+            staging: Default::default(),
         },
         chain_name,
         ChainConfig {

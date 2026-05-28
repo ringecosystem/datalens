@@ -56,6 +56,18 @@ pub enum FillOutcome {
     Error,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DurableWriteOutcome {
+    #[default]
+    NotAttempted,
+    Staged,
+    Flushed,
+    EmptyCoverageRecorded,
+    Skipped,
+    StorageError,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UsageLedgerEntry {
     pub application_id: String,
@@ -69,6 +81,8 @@ pub struct UsageLedgerEntry {
     pub query_outcome: QueryOutcome,
     pub cache_outcome: CacheOutcome,
     pub fill_outcome: FillOutcome,
+    #[serde(default)]
+    pub durable_write_outcome: DurableWriteOutcome,
     pub row_count: usize,
     pub timestamp_unix_seconds: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -103,6 +117,7 @@ impl UsageLedgerEntry {
             query_outcome,
             cache_outcome,
             fill_outcome,
+            durable_write_outcome: DurableWriteOutcome::NotAttempted,
             row_count,
             timestamp_unix_seconds: unix_seconds_now().unwrap_or_default(),
             request_id: None,
@@ -112,6 +127,11 @@ impl UsageLedgerEntry {
 
     pub fn with_requested_hot(mut self, requested_hot: bool) -> Self {
         self.requested_hot = requested_hot;
+        self
+    }
+
+    pub fn with_durable_write_outcome(mut self, outcome: DurableWriteOutcome) -> Self {
+        self.durable_write_outcome = outcome;
         self
     }
 

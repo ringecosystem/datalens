@@ -264,6 +264,7 @@ fn test_promotion_failure_does_not_mark_or_delete_hot_data() {
             target_object_bytes: 1024,
             min_object_rows: 1,
             record_empty_coverage: true,
+            staging: Default::default(),
         },
     )
     .with_metrics(recorder.clone(), ApplicationIdentity::named("system"));
@@ -311,6 +312,7 @@ where
             target_object_bytes: 1024,
             min_object_rows: 1,
             record_empty_coverage: true,
+            staging: Default::default(),
         },
     )
 }

@@ -23,6 +23,7 @@ fn test_tron_blocks_complete_fetch_query_cache_flow() {
                 target_object_bytes: 4096,
                 min_object_rows: 1,
                 record_empty_coverage: true,
+                staging: Default::default(),
             },
         },
     );

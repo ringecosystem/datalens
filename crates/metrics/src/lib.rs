@@ -201,6 +201,29 @@ impl FillOutcome {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DurableWriteOutcome {
+    NotAttempted,
+    Staged,
+    Flushed,
+    EmptyCoverageRecorded,
+    Skipped,
+    StorageError,
+}
+
+impl DurableWriteOutcome {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::NotAttempted => "not_attempted",
+            Self::Staged => "staged",
+            Self::Flushed => "flushed",
+            Self::EmptyCoverageRecorded => "empty_coverage_recorded",
+            Self::Skipped => "skipped",
+            Self::StorageError => "storage_error",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HotReorgOutcome {
     Detected,
     RollbackApplied,
@@ -310,6 +333,7 @@ pub struct MetricsRecorder {
     query_duration_seconds: HistogramVec,
     cache_coverage_total: CounterVec,
     fill_total: CounterVec,
+    durable_write_total: CounterVec,
     hot_reorg_total: CounterVec,
     hot_promotion_total: CounterVec,
     fill_duration_seconds: HistogramVec,
@@ -350,6 +374,13 @@ impl MetricsRecorder {
             Opts::new(
                 "datalens_fill_total",
                 "Datalens fill operations by outcome.",
+            ),
+            &["application", "chain", "chain_kind", "dataset", "outcome"],
+        )?;
+        let durable_write_total = CounterVec::new(
+            Opts::new(
+                "datalens_durable_write_total",
+                "Datalens durable write operations by outcome.",
             ),
             &["application", "chain", "chain_kind", "dataset", "outcome"],
         )?;
@@ -463,6 +494,7 @@ impl MetricsRecorder {
         registry.register(Box::new(query_duration_seconds.clone()))?;
         registry.register(Box::new(cache_coverage_total.clone()))?;
         registry.register(Box::new(fill_total.clone()))?;
+        registry.register(Box::new(durable_write_total.clone()))?;
         registry.register(Box::new(hot_reorg_total.clone()))?;
         registry.register(Box::new(hot_promotion_total.clone()))?;
         registry.register(Box::new(fill_duration_seconds.clone()))?;
@@ -483,6 +515,7 @@ impl MetricsRecorder {
             query_duration_seconds,
             cache_coverage_total,
             fill_total,
+            durable_write_total,
             hot_reorg_total,
             hot_promotion_total,
             fill_duration_seconds,
@@ -519,6 +552,12 @@ impl MetricsRecorder {
 
     pub fn record_fill(&self, labels: &MetricsLabels, outcome: FillOutcome) {
         self.fill_total
+            .with_label_values(&labels.query_label_values(outcome.as_str()))
+            .inc();
+    }
+
+    pub fn record_durable_write(&self, labels: &MetricsLabels, outcome: DurableWriteOutcome) {
+        self.durable_write_total
             .with_label_values(&labels.query_label_values(outcome.as_str()))
             .inc();
     }

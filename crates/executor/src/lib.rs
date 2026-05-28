@@ -12,16 +12,17 @@ use datalens_core::{
 };
 use datalens_metrics::HotPromotionOutcome as MetricsHotPromotionOutcome;
 use datalens_metrics::{
-    ApplicationIdentity, CacheCoverageOutcome, ErrorLabels, FillOutcome, MetricsLabels,
-    MetricsRecorder, QueryOutcome,
+    ApplicationIdentity, CacheCoverageOutcome, DurableWriteOutcome as MetricsDurableWriteOutcome,
+    ErrorLabels, FillOutcome, MetricsLabels, MetricsRecorder, QueryOutcome,
 };
 use datalens_planner::{
     CoverageSummary, FinalityPolicy, NativePlanner, NativePlannerConfig, NativeQueryInput,
 };
 use datalens_storage::{
-    CacheOutcome as LedgerCacheOutcome, FillOutcome as LedgerFillOutcome, HotCacheCandidateStatus,
-    HotCacheEntryMetadata, HotCacheFinalityStatus, HotCacheStorage,
-    QueryOutcome as LedgerQueryOutcome, StorageRepository, UsageLedgerEntry, UsageLedgerRepository,
+    CacheOutcome as LedgerCacheOutcome, DurableWriteOutcome as LedgerDurableWriteOutcome,
+    FillOutcome as LedgerFillOutcome, HotCacheCandidateStatus, HotCacheEntryMetadata,
+    HotCacheFinalityStatus, HotCacheStorage, QueryOutcome as LedgerQueryOutcome, StorageRepository,
+    UsageLedgerEntry, UsageLedgerRepository,
 };
 use datalens_writer::{
     DurableWriteRequest, DurableWriteResult, DurableWriteSegment, DurableWriter,
@@ -416,6 +417,10 @@ where
         self.execute_with_application(input, None)
     }
 
+    pub fn flush_staged_writes(&self) -> Result<DurableWriteResult, DatalensError> {
+        self.writer.flush()
+    }
+
     pub fn execute_with_application(
         &self,
         input: NativeQueryInput,
@@ -446,6 +451,7 @@ where
                     LedgerQueryOutcome::StorageError,
                     LedgerCacheOutcome::Error,
                     LedgerFillOutcome::NotAttempted,
+                    LedgerDurableWriteOutcome::NotAttempted,
                     0,
                 )?;
                 return Err(error);
@@ -473,6 +479,7 @@ where
                         ledger_query_error(&error),
                         ledger_cache_outcome(coverage_outcome),
                         LedgerFillOutcome::NotAttempted,
+                        LedgerDurableWriteOutcome::NotAttempted,
                         0,
                     )?;
                     return Err(error);
@@ -495,6 +502,7 @@ where
                     LedgerQueryOutcome::Error,
                     ledger_cache_outcome(coverage_outcome),
                     LedgerFillOutcome::NotAttempted,
+                    LedgerDurableWriteOutcome::NotAttempted,
                     0,
                 )?;
                 return Err(error);
@@ -526,6 +534,7 @@ where
                         LedgerQueryOutcome::StorageError,
                         ledger_cache_outcome(coverage_outcome),
                         LedgerFillOutcome::NotAttempted,
+                        LedgerDurableWriteOutcome::NotAttempted,
                         rows.row_count(),
                     )?;
                     return Err(error);
@@ -539,6 +548,7 @@ where
                     LedgerQueryOutcome::Error,
                     ledger_cache_outcome(coverage_outcome),
                     LedgerFillOutcome::NotAttempted,
+                    LedgerDurableWriteOutcome::NotAttempted,
                     rows.row_count(),
                 )?;
                 return Err(error);
@@ -575,6 +585,7 @@ where
                             LedgerQueryOutcome::Error,
                             ledger_cache_outcome(coverage_outcome),
                             LedgerFillOutcome::Error,
+                            LedgerDurableWriteOutcome::NotAttempted,
                             rows.row_count(),
                         )?;
                         return Err(error);
@@ -599,6 +610,7 @@ where
                         ledger_query_error(&error),
                         ledger_cache_outcome(coverage_outcome),
                         ledger_fill_error(&error),
+                        LedgerDurableWriteOutcome::NotAttempted,
                         rows.row_count(),
                     )?;
                     return Err(error);
@@ -624,6 +636,7 @@ where
                     LedgerQueryOutcome::Error,
                     ledger_cache_outcome(coverage_outcome),
                     LedgerFillOutcome::Error,
+                    LedgerDurableWriteOutcome::NotAttempted,
                     rows.row_count(),
                 )?;
                 return Err(error);
@@ -631,34 +644,42 @@ where
         }
 
         let cache_fill_attempted = !fetched_segments.is_empty();
-        if cache_fill_attempted
-            && let Err(error) = self.writer.write(DurableWriteRequest {
+        let mut durable_write_outcome = LedgerDurableWriteOutcome::NotAttempted;
+        if cache_fill_attempted {
+            let write_result = match self.writer.write(DurableWriteRequest {
                 chain: plan.chain.clone(),
                 dataset_key: plan.dataset_key.clone(),
                 selector: plan.selector.clone(),
                 finality_level,
                 segments: fetched_segments,
-            })
-        {
-            log::error!(
-                "cache write failed dataset={} range={}-{} kind={:?}",
-                plan.dataset_key.as_str(),
-                plan.ledger_range.start(),
-                plan.ledger_range.end(),
-                error.kind
-            );
-            self.record_error(&labels, &error);
-            self.record_fill(&labels, FillOutcome::Error, fill_start);
-            self.record_query(&labels, QueryOutcome::Error, start);
-            self.record_usage_for_plan(
-                &ledger_application,
-                &plan,
-                LedgerQueryOutcome::StorageError,
-                ledger_cache_outcome(coverage_outcome),
-                LedgerFillOutcome::StorageError,
-                rows.row_count(),
-            )?;
-            return Err(error);
+            }) {
+                Ok(write_result) => write_result,
+                Err(error) => {
+                    log::error!(
+                        "cache write failed dataset={} range={}-{} kind={:?}",
+                        plan.dataset_key.as_str(),
+                        plan.ledger_range.start(),
+                        plan.ledger_range.end(),
+                        error.kind
+                    );
+                    self.record_error(&labels, &error);
+                    self.record_fill(&labels, FillOutcome::Error, fill_start);
+                    self.record_durable_write(&labels, MetricsDurableWriteOutcome::StorageError);
+                    self.record_query(&labels, QueryOutcome::Error, start);
+                    self.record_usage_for_plan(
+                        &ledger_application,
+                        &plan,
+                        LedgerQueryOutcome::StorageError,
+                        ledger_cache_outcome(coverage_outcome),
+                        LedgerFillOutcome::StorageError,
+                        LedgerDurableWriteOutcome::StorageError,
+                        rows.row_count(),
+                    )?;
+                    return Err(error);
+                }
+            };
+            durable_write_outcome = ledger_durable_write_outcome(&write_result);
+            self.record_durable_write(&labels, metrics_durable_write_outcome(&write_result));
         }
         if cache_fill_attempted {
             let fill_outcome = if fill_row_count == 0 {
@@ -704,6 +725,7 @@ where
             ledger_query_outcome(query_outcome),
             ledger_cache_outcome(coverage_outcome),
             ledger_fill_outcome(cache_fill_attempted, fill_row_count),
+            durable_write_outcome,
             result.rows.row_count(),
         )?;
         Ok(result)
@@ -762,6 +784,16 @@ where
         }
     }
 
+    fn record_durable_write(
+        &self,
+        labels: &Option<MetricsLabels>,
+        outcome: MetricsDurableWriteOutcome,
+    ) {
+        if let Some((recorder, labels)) = self.metrics_recorder(labels) {
+            recorder.record_durable_write(labels, outcome);
+        }
+    }
+
     fn record_error(&self, labels: &Option<MetricsLabels>, error: &DatalensError) {
         if let Some((recorder, labels)) = self.metrics_recorder(labels) {
             let error_labels = ErrorLabels::from_labels(labels, error.kind.clone());
@@ -783,6 +815,7 @@ where
         query_outcome: LedgerQueryOutcome,
         cache_outcome: LedgerCacheOutcome,
         fill_outcome: LedgerFillOutcome,
+        durable_write_outcome: LedgerDurableWriteOutcome,
         row_count: usize,
     ) -> Result<(), DatalensError> {
         let Some(ledger) = &self.usage_ledger else {
@@ -806,7 +839,8 @@ where
                 fill_outcome,
                 row_count,
             )
-            .with_requested_hot(input.finality.allows_hot()),
+            .with_requested_hot(input.finality.allows_hot())
+            .with_durable_write_outcome(durable_write_outcome),
         )
     }
 
@@ -818,6 +852,7 @@ where
         query_outcome: LedgerQueryOutcome,
         cache_outcome: LedgerCacheOutcome,
         fill_outcome: LedgerFillOutcome,
+        durable_write_outcome: LedgerDurableWriteOutcome,
         row_count: usize,
     ) -> Result<(), DatalensError> {
         self.record_usage(
@@ -837,6 +872,7 @@ where
             query_outcome,
             cache_outcome,
             fill_outcome,
+            durable_write_outcome,
             row_count,
         )
     }
@@ -944,13 +980,39 @@ fn ledger_fill_error(error: &DatalensError) -> LedgerFillOutcome {
     }
 }
 
-fn ledger_fill_outcome(cache_fill_attempted: bool, fill_row_count: usize) -> LedgerFillOutcome {
+fn ledger_fill_outcome(cache_fill_attempted: bool, _fill_row_count: usize) -> LedgerFillOutcome {
     if !cache_fill_attempted {
         LedgerFillOutcome::NotAttempted
-    } else if fill_row_count == 0 {
-        LedgerFillOutcome::EmptyCoverageRecorded
     } else {
-        LedgerFillOutcome::Written
+        LedgerFillOutcome::LiveFetch
+    }
+}
+
+fn ledger_durable_write_outcome(result: &DurableWriteResult) -> LedgerDurableWriteOutcome {
+    if !result.data_objects.is_empty() {
+        LedgerDurableWriteOutcome::Flushed
+    } else if !result.empty_coverages.is_empty() {
+        LedgerDurableWriteOutcome::EmptyCoverageRecorded
+    } else if !result.staged_ranges.is_empty() {
+        LedgerDurableWriteOutcome::Staged
+    } else if !result.skipped_ranges.is_empty() {
+        LedgerDurableWriteOutcome::Skipped
+    } else {
+        LedgerDurableWriteOutcome::NotAttempted
+    }
+}
+
+fn metrics_durable_write_outcome(result: &DurableWriteResult) -> MetricsDurableWriteOutcome {
+    if !result.data_objects.is_empty() {
+        MetricsDurableWriteOutcome::Flushed
+    } else if !result.empty_coverages.is_empty() {
+        MetricsDurableWriteOutcome::EmptyCoverageRecorded
+    } else if !result.staged_ranges.is_empty() {
+        MetricsDurableWriteOutcome::Staged
+    } else if !result.skipped_ranges.is_empty() {
+        MetricsDurableWriteOutcome::Skipped
+    } else {
+        MetricsDurableWriteOutcome::NotAttempted
     }
 }
 

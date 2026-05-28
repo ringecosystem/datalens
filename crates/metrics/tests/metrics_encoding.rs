@@ -1,8 +1,8 @@
 use datalens_core::{ChainFamily, ChainIdentity, DatalensErrorKind, Dataset};
 use datalens_metrics::{
-    ApplicationIdentity, CacheCoverageOutcome, ErrorLabels, FillOutcome, HotReorgOutcome,
-    MetricsLabels, MetricsRecorder, QueryOutcome, WarmupFetchOutcome, WarmupTaskOutcome,
-    WarmupWriteOutcome,
+    ApplicationIdentity, CacheCoverageOutcome, DurableWriteOutcome, ErrorLabels, FillOutcome,
+    HotReorgOutcome, MetricsLabels, MetricsRecorder, QueryOutcome, WarmupFetchOutcome,
+    WarmupTaskOutcome, WarmupWriteOutcome,
 };
 
 #[test]
@@ -14,6 +14,7 @@ fn test_record_metrics_renders_prometheus_text_with_expected_labels() {
     recorder.observe_query_duration(&labels, 0.25);
     recorder.record_cache_coverage(&labels, CacheCoverageOutcome::PartialHit);
     recorder.record_fill(&labels, FillOutcome::Filled);
+    recorder.record_durable_write(&labels, DurableWriteOutcome::Staged);
     recorder.observe_fill_duration(&labels, 1.5);
     recorder.set_latest_requested_block(&labels, 42);
     recorder.set_latest_filled_block(&labels, 40);
@@ -38,6 +39,9 @@ fn test_record_metrics_renders_prometheus_text_with_expected_labels() {
     ));
     assert!(output.contains(
         r#"datalens_fill_total{application="indexer",chain="ethereum",chain_kind="evm",dataset="logs",outcome="filled"} 1"#
+    ));
+    assert!(output.contains(
+        r#"datalens_durable_write_total{application="indexer",chain="ethereum",chain_kind="evm",dataset="logs",outcome="staged"} 1"#
     ));
     assert!(output.contains("datalens_fill_duration_seconds"));
     assert!(output.contains(

@@ -39,6 +39,7 @@ fn workspace_exposes_architecture_boundaries() {
             target_object_bytes: 1024,
             min_object_rows: 1,
             record_empty_coverage: true,
+            staging: Default::default(),
         },
     );
     let _write_request = DurableWriteRequest {

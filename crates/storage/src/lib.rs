@@ -67,8 +67,8 @@ pub use object_store::{
     validate_object_key,
 };
 pub use usage_ledger::{
-    CacheOutcome, FillOutcome, QueryOutcome, UsageLedgerEntry, UsageLedgerRepository,
-    UsageLedgerStore,
+    CacheOutcome, DurableWriteOutcome, FillOutcome, QueryOutcome, UsageLedgerEntry,
+    UsageLedgerRepository, UsageLedgerStore,
 };
 
 #[derive(Clone, Debug)]

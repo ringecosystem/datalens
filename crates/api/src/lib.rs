@@ -396,6 +396,14 @@ pub mod config {
         pub target_object_bytes: u64,
         pub min_object_rows: usize,
         pub record_empty_coverage: bool,
+        #[serde(default)]
+        pub staging: WriterStagingConfig,
+    }
+
+    #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+    pub struct WriterStagingConfig {
+        #[serde(default)]
+        pub enabled: bool,
     }
 
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -813,6 +821,9 @@ where
                     target_object_bytes: writer.target_object_bytes,
                     min_object_rows: writer.min_object_rows,
                     record_empty_coverage: writer.record_empty_coverage,
+                    staging: datalens_writer::WriteStagingConfig {
+                        enabled: writer.staging.enabled,
+                    },
                 },
             },
         );
