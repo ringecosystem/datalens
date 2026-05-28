@@ -2,13 +2,55 @@ use std::path::PathBuf;
 
 use datalens_chain::{DatasetSelector, FinalityLevel};
 use datalens_core::{
-    BlockHeader, ChainFamily, ChainIdentity, DatasetKey, DatasetRows, LedgerRange, NetworkId,
-    QueryRows,
+    BlockHeader, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey,
+    DatasetRows, LedgerRange, NetworkId, QueryRows,
 };
 use datalens_storage::{
-    LocalStorage, MaintenanceCompactionConfig, MaintenanceIssueKind, MaintenanceOperationMode,
-    ObjectStore, StorageWriteRequest,
+    DurableStorage, LocalObjectStore, LocalStorage, MaintenanceCompactionConfig,
+    MaintenanceIssueKind, MaintenanceOperationMode, ObjectMetadata, ObjectStore,
+    StorageWriteRequest,
 };
+
+#[derive(Clone, Debug)]
+struct FailingDataObjectPutStore {
+    inner: LocalObjectStore,
+}
+
+impl FailingDataObjectPutStore {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            inner: LocalObjectStore::new(root),
+        }
+    }
+}
+
+impl ObjectStore for FailingDataObjectPutStore {
+    fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError> {
+        self.inner.get(key)
+    }
+
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
+        if key.contains("/datasets/") && (key.ends_with(".json") || key.ends_with(".parquet")) {
+            return Err(DatalensError::new(
+                DatalensErrorKind::StorageWriteFailure,
+                "injected data object write failure",
+            ));
+        }
+        self.inner.put(key, bytes)
+    }
+
+    fn exists(&self, key: &str) -> Result<bool, DatalensError> {
+        self.inner.exists(key)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
+        self.inner.list(prefix)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), DatalensError> {
+        self.inner.delete(key)
+    }
+}
 
 #[test]
 fn test_maintenance_check_reports_missing_object() {
@@ -94,6 +136,23 @@ fn test_compaction_candidates_only_include_compatible_adjacent_data_entries() {
     assert_eq!(candidate.range.start(), 10);
     assert_eq!(candidate.range.end(), 11);
     assert_eq!(candidate.finality_level.as_str(), "safe");
+}
+
+#[test]
+fn test_compaction_candidates_do_not_mix_selector_canonical_keys() {
+    let storage = LocalStorage::new(temp_storage_root("compaction-selector-canonical"));
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 14, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 15, FinalityLevel::Safe);
+
+    let mut manifest = read_manifest_json(&storage, &chain);
+    manifest["entries"][1]["selector_canonical_key"] =
+        serde_json::Value::String("selector-alias".to_owned());
+    write_manifest_json(&storage, &chain, manifest);
+
+    let report = storage.maintenance_report().expect("maintenance report");
+
+    assert!(report.compaction.candidates.is_empty());
 }
 
 #[test]
@@ -211,6 +270,36 @@ fn test_compaction_merges_adjacent_small_objects_and_retains_old_objects() {
     );
 }
 
+#[test]
+fn test_compaction_replacement_write_failure_leaves_old_manifest_readable() {
+    let storage = LocalStorage::new(temp_storage_root("failed-compaction-write"));
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 70, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 71, FinalityLevel::Safe);
+    let failing_storage =
+        DurableStorage::from_object_store(FailingDataObjectPutStore::new(storage.root().into()));
+
+    let error = failing_storage
+        .compact_small_objects(MaintenanceCompactionConfig {
+            min_object_bytes: u64::MAX,
+            max_merge_ranges: 8,
+        })
+        .expect_err("compaction replacement write failure");
+
+    assert_eq!(error.kind, DatalensErrorKind::StorageWriteFailure);
+    let manifest = storage.manifest().expect("manifest");
+    assert_eq!(manifest.entries.len(), 2);
+    let rows = storage
+        .read_rows(
+            &chain,
+            &DatasetKey::evm_blocks(),
+            &DatasetSelector::all(),
+            LedgerRange::blocks(70, 71).expect("range"),
+        )
+        .expect("old manifest entries remain readable");
+    assert_eq!(rows.row_count(), 2);
+}
+
 fn write_block_object(
     storage: &LocalStorage,
     chain: &ChainIdentity,
@@ -272,6 +361,16 @@ fn temp_storage_root(name: &str) -> PathBuf {
     ));
     std::fs::create_dir_all(&root).expect("create temp storage root");
     root
+}
+
+fn read_manifest_json(storage: &LocalStorage, chain: &ChainIdentity) -> serde_json::Value {
+    let bytes = std::fs::read(storage.manifest_path(chain)).expect("manifest bytes");
+    serde_json::from_slice(&bytes).expect("manifest json")
+}
+
+fn write_manifest_json(storage: &LocalStorage, chain: &ChainIdentity, manifest: serde_json::Value) {
+    let bytes = serde_json::to_vec_pretty(&manifest).expect("manifest bytes");
+    std::fs::write(storage.manifest_path(chain), bytes).expect("write manifest");
 }
 
 fn test_chain() -> ChainIdentity {
