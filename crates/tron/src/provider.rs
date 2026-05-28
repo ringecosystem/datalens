@@ -86,6 +86,17 @@ impl TronProvider for TronHttpProvider {
         parse_block(&value).map(Some)
     }
 
+    fn get_transaction_info_by_id(&self, tx_id: &str) -> Result<Option<Value>, DatalensError> {
+        let value = self.post(
+            &Self::path(TronFinality::Finalized, "gettransactioninfobyid"),
+            json!({ "value": tx_id }),
+        )?;
+        if value.as_object().is_some_and(serde_json::Map::is_empty) {
+            return Ok(None);
+        }
+        Ok(Some(value))
+    }
+
     fn provider_name(&self) -> &'static str {
         "tron-http"
     }
@@ -109,6 +120,33 @@ impl TronProvider for TronFixtureProviderRpc {
     ) -> Result<Option<TronBlock>, DatalensError> {
         Ok(match number {
             10..=14 => Some(fixture_block(number)),
+            _ => None,
+        })
+    }
+
+    fn get_transaction_info_by_id(&self, tx_id: &str) -> Result<Option<Value>, DatalensError> {
+        Ok(match tx_id {
+            "tron-tx-10" => Some(json!({
+                "id": "tron-tx-10",
+                "blockNumber": 10,
+                "blockTimeStamp": 1_700_000_010_u64,
+                "fee": 1_000_u64,
+                "receipt": {
+                    "result": "SUCCESS",
+                    "energy_usage_total": 12,
+                    "net_usage": 345,
+                },
+                "contractResult": ["00"],
+                "log": [{
+                    "address": "41abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+                    "topics": [
+                        "ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+                        "0000000000000000000000001111111111111111111111111111111111111111",
+                        "0000000000000000000000002222222222222222222222222222222222222222"
+                    ],
+                    "data": "0000000000000000000000000000000000000000000000000000000000000001"
+                }],
+            })),
             _ => None,
         })
     }
@@ -139,7 +177,22 @@ fn fixture_block(number: u64) -> TronBlock {
                 }
             },
             "transactions": if number == 10 {
-                json!([{ "txID": "tron-tx-10" }])
+                json!([{
+                    "txID": "tron-tx-10",
+                    "ret": [{ "contractRet": "SUCCESS" }],
+                    "raw_data": {
+                        "contract": [{
+                            "type": "TransferContract",
+                            "parameter": {
+                                "value": {
+                                    "owner_address": "TTronOwner11111111111111111111111111111",
+                                    "to_address": "TTronRecipient111111111111111111111111",
+                                    "amount": 1
+                                }
+                            }
+                        }]
+                    }
+                }])
             } else {
                 json!([])
             },
