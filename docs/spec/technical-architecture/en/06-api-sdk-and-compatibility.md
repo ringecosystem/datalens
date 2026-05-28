@@ -93,6 +93,16 @@ The default client behavior is service-client only:
 - `filter`: required for `logs`, absent or `null` for `blocks`.
 - `include_block`: retained as a compatibility field; first-version client requests use
   `false`.
+- `allow_hot`: explicit hot/latest gate. The default is `false`.
+- `finality`: requested query contract. The default is `durable_only`.
+  - `durable_only`: query only durable safe/finalized cache and durable provider fill.
+  - `safe_to_latest`: caller accepts mixed durable, hot, and provider latest segments.
+  - `latest_only`: caller accepts only latest-capable hot/provider behavior.
+
+Hot/latest behavior is never implicit. `safe_to_latest` and `latest_only` require
+`allow_hot: true`; otherwise the server returns `invalid_input`. Until a hot storage path
+exists, explicit hot requests return `unsupported_hot_query` before provider fetch or
+durable cache write.
 
 Logs filter fields:
 
@@ -108,7 +118,16 @@ Logs filter fields:
 - `range`: the inclusive requested block range.
 - `cache.hit_ranges`: inclusive block ranges served from durable cache.
 - `cache.missing_ranges`: inclusive block ranges not served from durable cache.
-- `rows`: `QueryRows`, sorted by dataset order before response.
+- `cache.durable_hit_ranges`: inclusive ranges served from durable cache.
+- `cache.hot_hit_ranges`: inclusive ranges served from hot cache.
+- `cache.provider_fill_ranges`: inclusive ranges returned by provider fetch for this
+  response.
+- `cache.promotion_pending_ranges`: inclusive hot/provider ranges not yet promoted to
+  durable cache.
+- `cache.segments[]`: ordered response segments with `range`, `source`, and `finality`.
+- `cache.segments[].source`: `durable`, `hot`, or `provider`.
+- `cache.segments[].finality`: `finalized`, `safe`, `unsafe`, or `latest`.
+- `rows`: `QueryRows`, sorted by dataset order and de-duplicated before response.
 - Empty results are represented by an empty `rows` array for the selected dataset.
 
 Client cache outcome helpers:
@@ -130,6 +149,8 @@ Error responses have the stable shape:
 - `error.message`: diagnostic message for operators and logs.
 
 SDK callers must branch on typed error kind, not on `error.message`.
+`unsupported_hot_query` means datalens cannot safely serve the requested hot/latest
+contract. It is distinct from a durable cache miss.
 
 ## Application Identity
 
@@ -144,6 +165,10 @@ Rules:
 - If the header is absent, the server uses its configured default metrics application.
 - Application identity is request metadata. It must not alter durable cache keys or
   object layout.
+- Application authentication, authorization, range quota, and hot-specific range quota
+  apply before hot query planning, hot cache access, provider fetch, or durable cache
+  write.
+- Usage ledger entries record whether the caller requested hot/latest data.
 
 ## Fallback Boundary
 
@@ -154,6 +179,9 @@ The fallback boundary is explicit:
 - `FallbackMode::Rpc` returns `UnsupportedFallback`.
 - Unsupported fallback must not send an HTTP query to datalens.
 - Unsupported fallback must not write durable cache.
+- If a future RPC fallback is configured, fallback/live rows must be marked with
+  `source: provider` and `finality: unsafe` or `latest`, and fallback must not write
+  durable cache.
 - Future hot query or RPC fallback must remain isolated from durable safe/finalized cache
   writes.
 

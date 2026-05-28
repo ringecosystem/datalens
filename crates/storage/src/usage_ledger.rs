@@ -65,6 +65,7 @@ pub struct UsageLedgerEntry {
     pub selector_canonical_key: String,
     pub range: LedgerRange,
     pub finality: String,
+    pub requested_hot: bool,
     pub query_outcome: QueryOutcome,
     pub cache_outcome: CacheOutcome,
     pub fill_outcome: FillOutcome,
@@ -98,6 +99,7 @@ impl UsageLedgerEntry {
             selector_canonical_key: selector.canonical_key(),
             range,
             finality: finality_name(finality).to_owned(),
+            requested_hot: matches!(finality, FinalityLevel::Latest),
             query_outcome,
             cache_outcome,
             fill_outcome,
@@ -106,6 +108,11 @@ impl UsageLedgerEntry {
             request_id: None,
             trace_id: None,
         }
+    }
+
+    pub fn with_requested_hot(mut self, requested_hot: bool) -> Self {
+        self.requested_hot = requested_hot;
+        self
     }
 
     pub fn with_request_id(mut self, request_id: impl Into<String>) -> Self {

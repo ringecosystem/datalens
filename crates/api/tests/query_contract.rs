@@ -16,7 +16,8 @@ use datalens_chain::{
 };
 use datalens_core::{
     BlockHeader, BlockRange, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, Dataset,
-    DatasetKey, LedgerRange, LogFilter, LogRecord, NetworkId, QueryRows,
+    DatasetKey, LedgerRange, LogFilter, LogRecord, NetworkId, QueryDataFinality,
+    QueryFinalityRequirement, QueryRows, QuerySegmentSource,
 };
 use datalens_planner::{FieldSelection, ResponseShape};
 use datalens_storage::LocalStorage;
@@ -32,6 +33,8 @@ fn test_client_query_request_json_matches_api_request_contract() {
             topics: vec![None, Some(vec![TOPIC_A.to_owned()])],
         }),
         include_block: false,
+        allow_hot: false,
+        finality: QueryFinalityRequirement::DurableOnly,
     };
 
     let api_request: LegacyEvmQueryRequest =
@@ -57,6 +60,15 @@ fn test_client_query_response_json_decodes_api_response_contract() {
         cache: datalens_api::CacheSummary {
             hit_ranges: vec![BlockRange::expect_new(10, 10)],
             missing_ranges: Vec::new(),
+            durable_hit_ranges: vec![BlockRange::expect_new(10, 10)],
+            hot_hit_ranges: Vec::new(),
+            provider_fill_ranges: Vec::new(),
+            promotion_pending_ranges: Vec::new(),
+            segments: vec![datalens_api::QuerySegment {
+                range: BlockRange::expect_new(10, 10),
+                source: QuerySegmentSource::Durable,
+                finality: QueryDataFinality::Safe,
+            }],
         },
         rows: QueryRows::EvmBlocks(vec![block(10, "0x10")]),
     };
@@ -85,6 +97,7 @@ fn test_legacy_blocks_request_maps_to_native_domain_input() {
     assert_eq!(input.selector, DatasetSelector::all());
     assert_eq!(input.response_shape, ResponseShape::LegacyEvmBlocks);
     assert_eq!(input.field_selection, FieldSelection::All);
+    assert_eq!(input.finality, QueryFinalityRequirement::DurableOnly);
 }
 
 #[test]
@@ -106,6 +119,46 @@ fn test_legacy_logs_request_maps_to_native_domain_input() {
     assert!(matches!(input.selector, DatasetSelector::EvmLogs(_)));
     assert_eq!(input.response_shape, ResponseShape::LegacyEvmLogs);
     assert_eq!(input.field_selection, FieldSelection::All);
+    assert_eq!(input.finality, QueryFinalityRequirement::DurableOnly);
+}
+
+#[test]
+fn test_legacy_request_rejects_latest_finality_without_allow_hot() {
+    let mut request = blocks_request(100, 101);
+    request.finality = QueryFinalityRequirement::SafeToLatest;
+
+    let error = legacy_evm_to_native_input(request).expect_err("allow_hot is required");
+
+    assert_eq!(error.kind, DatalensErrorKind::InvalidInput);
+    assert!(error.message.contains("allow_hot"));
+}
+
+#[test]
+fn test_legacy_request_maps_explicit_hot_contract_to_native_input() {
+    let mut request = blocks_request(100, 101);
+    request.allow_hot = true;
+    request.finality = QueryFinalityRequirement::SafeToLatest;
+
+    let input = legacy_evm_to_native_input(request).expect("hot request maps");
+
+    assert_eq!(input.finality, QueryFinalityRequirement::SafeToLatest);
+}
+
+#[test]
+fn test_query_service_returns_stable_unsupported_hot_query_error_without_fetch_or_cache_write() {
+    let root = temp_storage_root("unsupported-hot-query");
+    let source = MockSource::default().with_blocks(vec![block(100, "0x64")]);
+    let service = service(LocalStorage::new(&root), source.clone());
+    let mut request = blocks_request(100, 100);
+    request.allow_hot = true;
+    request.finality = QueryFinalityRequirement::SafeToLatest;
+
+    let error = service.query(request).expect_err("hot query unsupported");
+
+    assert_eq!(error.kind, DatalensErrorKind::UnsupportedHotQuery);
+    assert_eq!(source.calls(), Vec::<SourceCall>::new());
+    assert!(!root.join("chains/evm/ethereum/1/manifest.json").exists());
+    assert!(!root.join("chains/evm/ethereum/1/datasets").exists());
 }
 
 #[test]
@@ -121,6 +174,39 @@ fn test_api_error_mapping_uses_stable_response_codes() {
     );
     assert_eq!(body.error.kind, "provider_limit");
     assert_eq!(body.error.message, "mock provider limit");
+
+    let hot_body = api_error_body(DatalensError::new(
+        DatalensErrorKind::UnsupportedHotQuery,
+        "hot query is not supported",
+    ));
+    assert_eq!(
+        api_error_status(&DatalensErrorKind::UnsupportedHotQuery),
+        axum::http::StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert_eq!(hot_body.error.kind, "unsupported_hot_query");
+}
+
+#[test]
+fn test_query_response_marks_provider_fill_source_and_finality() {
+    let source = MockSource::default().with_blocks(vec![block(1, "0x01"), block(2, "0x02")]);
+    let service = service(
+        LocalStorage::new(temp_storage_root("response-provider-segment")),
+        source,
+    );
+
+    let response = service.query(blocks_request(1, 2)).expect("query succeeds");
+
+    assert_eq!(
+        response.cache.provider_fill_ranges,
+        vec![BlockRange::expect_new(1, 2)]
+    );
+    assert_eq!(response.cache.hot_hit_ranges, Vec::<BlockRange>::new());
+    assert_eq!(response.cache.segments.len(), 1);
+    assert_eq!(
+        response.cache.segments[0].source,
+        QuerySegmentSource::Provider
+    );
+    assert_eq!(response.cache.segments[0].finality, QueryDataFinality::Safe);
 }
 
 #[test]
@@ -349,6 +435,8 @@ fn blocks_request(from_block: u64, to_block: u64) -> LegacyEvmQueryRequest {
         range: BlockRange::expect_new(from_block, to_block),
         filter: None,
         include_block: false,
+        allow_hot: false,
+        finality: QueryFinalityRequirement::DurableOnly,
     }
 }
 
@@ -379,6 +467,8 @@ fn logs_request_with_topics(
                 .collect(),
         }),
         include_block: false,
+        allow_hot: false,
+        finality: QueryFinalityRequirement::DurableOnly,
     }
 }
 

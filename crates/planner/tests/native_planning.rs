@@ -4,6 +4,7 @@ use datalens_chain::{
 };
 use datalens_core::{
     ChainFamily, ChainIdentity, DatalensErrorKind, DatasetKey, LedgerRange, NetworkId,
+    QueryFinalityRequirement,
 };
 
 use datalens_planner::*;
@@ -21,6 +22,7 @@ fn test_native_query_input_is_planner_boundary() {
         .expect("valid selector"),
         response_shape: ResponseShape::LegacyEvmLogs,
         field_selection: FieldSelection::All,
+        finality: QueryFinalityRequirement::DurableOnly,
     };
 
     assert_eq!(input.chain, ethereum_identity());
@@ -42,6 +44,7 @@ fn test_native_planner_rejects_range_beyond_durable_boundary() {
         selector: datalens_chain::DatasetSelector::all(),
         response_shape: ResponseShape::LegacyEvmBlocks,
         field_selection: FieldSelection::All,
+        finality: QueryFinalityRequirement::DurableOnly,
     };
 
     let error = NativePlanner::new(NativePlannerConfig {
@@ -72,6 +75,7 @@ fn test_native_planner_builds_executable_plan_from_capabilities() {
         .expect("valid selector"),
         response_shape: ResponseShape::LegacyEvmLogs,
         field_selection: FieldSelection::All,
+        finality: QueryFinalityRequirement::DurableOnly,
     };
 
     let plan = NativePlanner::new(NativePlannerConfig {
@@ -322,6 +326,7 @@ fn blocks_input(start: u64, end: u64) -> NativeQueryInput {
         selector: datalens_chain::DatasetSelector::all(),
         response_shape: ResponseShape::LegacyEvmBlocks,
         field_selection: FieldSelection::All,
+        finality: QueryFinalityRequirement::DurableOnly,
     }
 }
 
@@ -337,6 +342,7 @@ fn logs_input(start: u64, end: u64) -> NativeQueryInput {
         .expect("valid selector"),
         response_shape: ResponseShape::LegacyEvmLogs,
         field_selection: FieldSelection::All,
+        finality: QueryFinalityRequirement::DurableOnly,
     }
 }
 

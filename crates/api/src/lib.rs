@@ -12,7 +12,8 @@ use axum::{
 use datalens_chain::ChainAdapter;
 use datalens_core::{
     BlockRange, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, Dataset, DatasetKey,
-    DatasetRows, LedgerRange, LogFilter, NetworkId, QueryRows,
+    DatasetRows, LedgerRange, LogFilter, NetworkId, QueryDataFinality, QueryFinalityRequirement,
+    QueryRows, QuerySegmentSource,
 };
 use datalens_executor::{NativeQueryExecutionConfig, NativeQueryExecutor};
 use datalens_metrics::{ApplicationIdentity, MetricsRecorder};
@@ -220,6 +221,17 @@ pub mod auth {
                 return Err(DatalensError::new(
                     DatalensErrorKind::RateLimited,
                     "application query range quota exceeded",
+                ));
+            }
+        }
+        if (request.allow_hot || request.finality.allows_hot())
+            && let Some(limit) = quota.max_hot_query_range_blocks
+        {
+            let requested = request.range.len();
+            if requested > u128::from(limit) {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::RateLimited,
+                    "application hot query range quota exceeded",
                 ));
             }
         }
@@ -439,6 +451,8 @@ pub mod config {
         #[serde(default)]
         pub max_query_range_blocks: Option<u64>,
         #[serde(default)]
+        pub max_hot_query_range_blocks: Option<u64>,
+        #[serde(default)]
         pub max_requests_per_minute: Option<u64>,
         #[serde(default)]
         pub max_concurrent_requests: Option<u64>,
@@ -534,12 +548,28 @@ pub struct LegacyEvmQueryRequest {
     pub filter: Option<LogFilter>,
     #[serde(default)]
     pub include_block: bool,
+    #[serde(default)]
+    pub allow_hot: bool,
+    #[serde(default)]
+    pub finality: QueryFinalityRequirement,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CacheSummary {
     pub hit_ranges: Vec<BlockRange>,
     pub missing_ranges: Vec<BlockRange>,
+    pub durable_hit_ranges: Vec<BlockRange>,
+    pub hot_hit_ranges: Vec<BlockRange>,
+    pub provider_fill_ranges: Vec<BlockRange>,
+    pub promotion_pending_ranges: Vec<BlockRange>,
+    pub segments: Vec<QuerySegment>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QuerySegment {
+    pub range: BlockRange,
+    pub source: QuerySegmentSource,
+    pub finality: QueryDataFinality,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -564,6 +594,18 @@ pub struct ChainDiscovery {
 pub fn legacy_evm_to_native_input(
     request: LegacyEvmQueryRequest,
 ) -> Result<NativeQueryInput, DatalensError> {
+    if request.finality.allows_hot() && !request.allow_hot {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "allow_hot must be true when requesting hot or latest data",
+        ));
+    }
+    let finality =
+        if request.allow_hot && matches!(request.finality, QueryFinalityRequirement::DurableOnly) {
+            QueryFinalityRequirement::SafeToLatest
+        } else {
+            request.finality
+        };
     let selector = match request.dataset {
         Dataset::Blocks => datalens_chain::DatasetSelector::all(),
         Dataset::Logs => {
@@ -585,6 +627,7 @@ pub fn legacy_evm_to_native_input(
         selector,
         response_shape,
         field_selection: datalens_planner::FieldSelection::All,
+        finality,
     })
 }
 
@@ -600,6 +643,11 @@ pub struct QueryService<S> {
 pub struct NativeCacheSummary {
     pub hit_ranges: Vec<LedgerRange>,
     pub missing_ranges: Vec<LedgerRange>,
+    pub durable_hit_ranges: Vec<LedgerRange>,
+    pub hot_hit_ranges: Vec<LedgerRange>,
+    pub provider_fill_ranges: Vec<LedgerRange>,
+    pub promotion_pending_ranges: Vec<LedgerRange>,
+    pub segments: Vec<datalens_core::QuerySegmentMetadata>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -744,6 +792,28 @@ where
             self.query_native_with_application(legacy_evm_to_native_input(request)?, application)?;
         let hit_ranges = legacy_block_ranges(&response.cache.hit_ranges)?;
         let misses = legacy_block_ranges(&response.cache.missing_ranges)?;
+        let durable_hit_ranges = legacy_block_ranges(&response.cache.durable_hit_ranges)?;
+        let hot_hit_ranges = legacy_block_ranges(&response.cache.hot_hit_ranges)?;
+        let provider_fill_ranges = legacy_block_ranges(&response.cache.provider_fill_ranges)?;
+        let promotion_pending_ranges =
+            legacy_block_ranges(&response.cache.promotion_pending_ranges)?;
+        let segments = response
+            .cache
+            .segments
+            .iter()
+            .map(|segment| {
+                Ok(QuerySegment {
+                    range: segment.range.block_range().ok_or_else(|| {
+                        DatalensError::new(
+                            DatalensErrorKind::Internal,
+                            "legacy response requires block segment ranges",
+                        )
+                    })?,
+                    source: segment.source,
+                    finality: segment.finality,
+                })
+            })
+            .collect::<Result<Vec<_>, DatalensError>>()?;
 
         Ok(LegacyEvmQueryResponse {
             chain: response.chain,
@@ -751,6 +821,11 @@ where
             cache: CacheSummary {
                 hit_ranges,
                 missing_ranges: misses,
+                durable_hit_ranges,
+                hot_hit_ranges,
+                provider_fill_ranges,
+                promotion_pending_ranges,
+                segments,
             },
             rows: response.rows.into_rows(),
         })
@@ -785,6 +860,11 @@ where
             cache: NativeCacheSummary {
                 hit_ranges: result.cache.hit_ranges,
                 missing_ranges: result.cache.missing_ranges,
+                durable_hit_ranges: result.cache.durable_hit_ranges,
+                hot_hit_ranges: result.cache.hot_hit_ranges,
+                provider_fill_ranges: result.cache.provider_fill_ranges,
+                promotion_pending_ranges: result.cache.promotion_pending_ranges,
+                segments: result.cache.segments,
             },
             rows: result.rows,
         })
@@ -1072,7 +1152,9 @@ pub fn api_error_status(kind: &DatalensErrorKind) -> StatusCode {
             StatusCode::BAD_REQUEST
         }
         DatalensErrorKind::Unauthorized => StatusCode::FORBIDDEN,
-        DatalensErrorKind::UnsupportedDataset => StatusCode::UNPROCESSABLE_ENTITY,
+        DatalensErrorKind::UnsupportedDataset | DatalensErrorKind::UnsupportedHotQuery => {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
         DatalensErrorKind::ProviderLimit | DatalensErrorKind::RateLimited => {
             StatusCode::TOO_MANY_REQUESTS
         }
@@ -1101,6 +1183,7 @@ fn api_error_kind(kind: &DatalensErrorKind) -> &'static str {
         DatalensErrorKind::InvalidRequest => "invalid_request",
         DatalensErrorKind::Unauthorized => "unauthorized",
         DatalensErrorKind::UnsupportedDataset => "unsupported_dataset",
+        DatalensErrorKind::UnsupportedHotQuery => "unsupported_hot_query",
         DatalensErrorKind::ProviderFailure => "provider_failure",
         DatalensErrorKind::ProviderLimit => "provider_limit",
         DatalensErrorKind::ProviderTimeout => "provider_timeout",
