@@ -13,4 +13,5 @@ Consequences: Short-lived implementation notes and phase summaries do not belong
 
 ## Current decisions
 
-- No topic-specific decisions exist yet.
+- [Non-EVM first adapter](non-evm-first-adapter.md): choose Solana before Tron and define
+  the Solana MVP adapter design for HBX-60.
