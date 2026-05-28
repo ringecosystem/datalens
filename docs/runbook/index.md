@@ -20,6 +20,7 @@ outputs.
 ## Current runbooks
 
 - `e2e-native-query-flow.md`: local validation for the initial native EVM block and
-  log query flow, including deterministic cache behavior checks.
+  log query flow, including deterministic cache behavior checks and the full durable
+  cache lifecycle E2E with optional RustFS/S3-compatible coverage.
 - `local-rustfs.md`: local RustFS object storage setup, bucket initialization, S3 test
   variables, stop, and cleanup commands.

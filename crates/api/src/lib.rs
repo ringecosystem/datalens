@@ -429,6 +429,14 @@ where
         })
     }
 
+    pub fn with_metrics(mut self, metrics: MetricsRecorder) -> Self {
+        self.executor = self
+            .executor
+            .with_metrics(metrics.clone(), ApplicationIdentity::unknown());
+        self.metrics = Some(metrics);
+        self
+    }
+
     pub fn chain_name(&self) -> &str {
         &self.chain_name
     }
