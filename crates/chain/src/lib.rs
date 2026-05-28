@@ -426,6 +426,22 @@ pub struct ChainFetchResponse {
     pub provider_diagnostics: ProviderDiagnostics,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CanonicalBlockRequest {
+    pub chain: ChainIdentity,
+    pub range_kind: HeightRangeKind,
+    pub height: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CanonicalBlock {
+    pub chain: ChainIdentity,
+    pub height: u64,
+    pub hash: String,
+    pub parent_hash: String,
+    pub finality: FinalityLevel,
+}
+
 impl ChainFetchResponse {
     pub fn try_new(
         chain: ChainIdentity,
@@ -564,6 +580,16 @@ pub trait ChainAdapter: Clone + Send + Sync + 'static {
         Err(DatalensError::new(
             DatalensErrorKind::UnsupportedDataset,
             "adapter does not expose finalized height",
+        ))
+    }
+
+    fn canonical_block(
+        &self,
+        _request: CanonicalBlockRequest,
+    ) -> Result<CanonicalBlock, DatalensError> {
+        Err(DatalensError::new(
+            DatalensErrorKind::UnsupportedDataset,
+            "adapter does not expose canonical block lookup",
         ))
     }
 

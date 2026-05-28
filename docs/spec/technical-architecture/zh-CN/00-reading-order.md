@@ -18,7 +18,8 @@ docs/spec/technical-architecture/
 │   ├── 03-storage-and-manifest.md
 │   ├── 04-query-and-fill-flow.md
 │   ├── 05-chain-adapters-and-evm.md
-│   └── 06-api-sdk-and-compatibility.md
+│   ├── 06-api-sdk-and-compatibility.md
+│   └── 07-hot-cache-layer.md
 └── zh-CN/
     ├── 00-reading-order.md
     ├── 01-project-direction.md
@@ -26,7 +27,8 @@ docs/spec/technical-architecture/
     ├── 03-storage-and-manifest.md
     ├── 04-query-and-fill-flow.md
     ├── 05-chain-adapters-and-evm.md
-    └── 06-api-sdk-and-compatibility.md
+    ├── 06-api-sdk-and-compatibility.md
+    └── 07-hot-cache-layer.md
 ```
 
 ## 阅读顺序
@@ -53,6 +55,10 @@ docs/spec/technical-architecture/
 
 6. `06-api-sdk-and-compatibility.md`
    说明用户如何通过原生 API、可选 SDK 帮助方法，以及后续兼容适配层使用 datalens。
+
+7. `07-hot-cache-layer.md`
+   说明 safe/finalized-to-latest 查询所需的 reorg-aware hot cache layer，并保持它与
+   durable Manifest coverage 分离。
 
 ## 如何使用这些文档
 
@@ -180,7 +186,23 @@ docs/spec/technical-architecture/
 
 完成标准是开发者可以更方便地集成 datalens，同时原生 API 仍是行为依据。
 
-## Stage 7 - Compatibility Adapters
+## Stage 7 - Reorg-Aware Hot Cache Layer
+
+只有 durable query/fill path 和 API contract 稳定后，才增加 latest-capable query behavior。
+
+预期工作：
+
+- 将请求拆成 durable、hot 和 live provider segments。
+- 增加与 durable Manifest 分离的 hot cache interfaces。
+- 通过具备能力的 chain adapters 暴露 canonical block lookup。
+- 为每个 response segment 返回 source 和 finality metadata。
+- 为 hot hit、hot miss、live fetch、reorg rollback 和 promotion 记录 metrics 与 usage ledger outcomes。
+- 对不满足 hot requirements 的 chain 或 adapter 返回稳定 unsupported errors。
+
+完成标准是 datalens 能定义并测试 latest-capable behavior，同时不允许 unsafe data 污染 durable
+cache coverage。
+
+## Stage 8 - Compatibility Adapters
 
 只有原生行为稳定之后，再增加网关兼容这类兼容适配层。
 
@@ -194,7 +216,7 @@ docs/spec/technical-architecture/
 
 完成标准是兼容能力作为适配层工作，而不是变成架构本身。
 
-## Stage 8 - Operations And Production Readiness
+## Stage 9 - Operations And Production Readiness
 
 将服务强化到真实部署可用。
 
@@ -209,7 +231,7 @@ docs/spec/technical-architecture/
 
 完成标准是 datalens 可以作为持久化历史缓存服务运维。
 
-## Stage 9 - Future Chain Families
+## Stage 10 - Future Chain Families
 
 只有在 EVM 已经证明链无关契约后，再增加 Tron、Solana 或其他适配器。
 

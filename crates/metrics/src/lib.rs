@@ -116,10 +116,16 @@ impl ErrorLabels {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QueryOutcome {
     Hit,
+    HotHit,
     Miss,
+    HotMiss,
     PartialHit,
+    Mixed,
     Filled,
     Empty,
+    ReorgRollback,
+    PromotionCompleted,
+    PromotionSkipped,
     Error,
 }
 
@@ -127,10 +133,16 @@ impl QueryOutcome {
     fn as_str(&self) -> &'static str {
         match self {
             Self::Hit => "hit",
+            Self::HotHit => "hot_hit",
             Self::Miss => "miss",
+            Self::HotMiss => "hot_miss",
             Self::PartialHit => "partial_hit",
+            Self::Mixed => "mixed",
             Self::Filled => "filled",
             Self::Empty => "empty",
+            Self::ReorgRollback => "reorg_rollback",
+            Self::PromotionCompleted => "promotion_completed",
+            Self::PromotionSkipped => "promotion_skipped",
             Self::Error => "error",
         }
     }
@@ -139,8 +151,11 @@ impl QueryOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CacheCoverageOutcome {
     Hit,
+    HotHit,
     Miss,
+    HotMiss,
     PartialHit,
+    Mixed,
     Empty,
     Error,
 }
@@ -149,8 +164,11 @@ impl CacheCoverageOutcome {
     fn as_str(&self) -> &'static str {
         match self {
             Self::Hit => "hit",
+            Self::HotHit => "hot_hit",
             Self::Miss => "miss",
+            Self::HotMiss => "hot_miss",
             Self::PartialHit => "partial_hit",
+            Self::Mixed => "mixed",
             Self::Empty => "empty",
             Self::Error => "error",
         }
@@ -160,7 +178,11 @@ impl CacheCoverageOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FillOutcome {
     Filled,
+    LiveFetch,
     Empty,
+    ReorgRollback,
+    PromotionWritten,
+    PromotionSkipped,
     Error,
 }
 
@@ -168,7 +190,11 @@ impl FillOutcome {
     fn as_str(&self) -> &'static str {
         match self {
             Self::Filled => "filled",
+            Self::LiveFetch => "live_fetch",
             Self::Empty => "empty",
+            Self::ReorgRollback => "reorg_rollback",
+            Self::PromotionWritten => "promotion_written",
+            Self::PromotionSkipped => "promotion_skipped",
             Self::Error => "error",
         }
     }

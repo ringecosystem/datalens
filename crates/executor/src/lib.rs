@@ -517,8 +517,11 @@ where
 fn ledger_cache_outcome(outcome: CacheCoverageOutcome) -> LedgerCacheOutcome {
     match outcome {
         CacheCoverageOutcome::Hit => LedgerCacheOutcome::Hit,
+        CacheCoverageOutcome::HotHit => LedgerCacheOutcome::HotHit,
         CacheCoverageOutcome::Miss => LedgerCacheOutcome::Miss,
+        CacheCoverageOutcome::HotMiss => LedgerCacheOutcome::HotMiss,
         CacheCoverageOutcome::PartialHit => LedgerCacheOutcome::PartialHit,
+        CacheCoverageOutcome::Mixed => LedgerCacheOutcome::Mixed,
         CacheCoverageOutcome::Empty => LedgerCacheOutcome::Empty,
         CacheCoverageOutcome::Error => LedgerCacheOutcome::Error,
     }
@@ -527,10 +530,16 @@ fn ledger_cache_outcome(outcome: CacheCoverageOutcome) -> LedgerCacheOutcome {
 fn ledger_query_outcome(outcome: QueryOutcome) -> LedgerQueryOutcome {
     match outcome {
         QueryOutcome::Hit => LedgerQueryOutcome::Hit,
+        QueryOutcome::HotHit => LedgerQueryOutcome::HotHit,
         QueryOutcome::Miss => LedgerQueryOutcome::Miss,
+        QueryOutcome::HotMiss => LedgerQueryOutcome::HotMiss,
         QueryOutcome::PartialHit => LedgerQueryOutcome::PartialHit,
+        QueryOutcome::Mixed => LedgerQueryOutcome::Mixed,
         QueryOutcome::Filled => LedgerQueryOutcome::Filled,
         QueryOutcome::Empty => LedgerQueryOutcome::Empty,
+        QueryOutcome::ReorgRollback => LedgerQueryOutcome::ReorgRollback,
+        QueryOutcome::PromotionCompleted => LedgerQueryOutcome::PromotionCompleted,
+        QueryOutcome::PromotionSkipped => LedgerQueryOutcome::PromotionSkipped,
         QueryOutcome::Error => LedgerQueryOutcome::Error,
     }
 }
@@ -585,10 +594,13 @@ fn query_outcome(
     match coverage_outcome {
         CacheCoverageOutcome::Hit if result.rows.row_count() == 0 => QueryOutcome::Empty,
         CacheCoverageOutcome::Hit => QueryOutcome::Hit,
+        CacheCoverageOutcome::HotHit => QueryOutcome::HotHit,
         CacheCoverageOutcome::PartialHit => QueryOutcome::PartialHit,
+        CacheCoverageOutcome::Mixed => QueryOutcome::Mixed,
         CacheCoverageOutcome::Miss if result.rows.row_count() == 0 => QueryOutcome::Empty,
         CacheCoverageOutcome::Miss if filled_cache => QueryOutcome::Filled,
         CacheCoverageOutcome::Miss => QueryOutcome::Miss,
+        CacheCoverageOutcome::HotMiss => QueryOutcome::HotMiss,
         CacheCoverageOutcome::Empty => QueryOutcome::Empty,
         CacheCoverageOutcome::Error => QueryOutcome::Error,
     }

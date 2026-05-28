@@ -35,6 +35,19 @@ impl ChainAdapter for EmptyAdapter {
         Ok(ChainHeight::block(10).with_finality(FinalityKind::Safe))
     }
 
+    fn canonical_block(
+        &self,
+        request: CanonicalBlockRequest,
+    ) -> Result<CanonicalBlock, DatalensError> {
+        Ok(CanonicalBlock {
+            chain: self.chain.clone(),
+            height: request.height,
+            hash: format!("0x{:064x}", request.height),
+            parent_hash: format!("0x{:064x}", request.height - 1),
+            finality: FinalityKind::Latest,
+        })
+    }
+
     fn fetch(&self, request: ChainFetchRequest) -> Result<ChainFetchResponse, DatalensError> {
         Ok(ChainFetchResponse::try_empty(
             request.chain,
@@ -133,6 +146,83 @@ fn test_fetch_request_response_and_capabilities_cover_query_cache_contract() {
     assert_eq!(response.coverage_selector.kind(), SelectorKind::EvmLogs);
     assert_eq!(response.source_metadata.provider, "mock");
     assert_eq!(response.provider_diagnostics.calls, 1);
+}
+
+#[test]
+fn test_canonical_block_lookup_contract_exposes_reorg_signals() {
+    let chain = ChainIdentity::try_new(ChainFamily::Evm, "ethereum", Some(NetworkId::numeric(1)))
+        .expect("valid chain");
+    let adapter = EmptyAdapter {
+        chain: chain.clone(),
+    };
+
+    let block = adapter
+        .canonical_block(CanonicalBlockRequest {
+            chain: chain.clone(),
+            range_kind: LedgerRangeKind::Block,
+            height: 12,
+        })
+        .expect("canonical block");
+
+    assert_eq!(block.chain, chain);
+    assert_eq!(block.height, 12);
+    assert_eq!(
+        block.hash,
+        "0x000000000000000000000000000000000000000000000000000000000000000c"
+    );
+    assert_eq!(
+        block.parent_hash,
+        "0x000000000000000000000000000000000000000000000000000000000000000b"
+    );
+    assert_eq!(block.finality, FinalityKind::Latest);
+}
+
+#[test]
+fn test_canonical_block_lookup_defaults_to_unsupported() {
+    let chain = ChainIdentity::try_new(ChainFamily::Evm, "ethereum", Some(NetworkId::numeric(1)))
+        .expect("valid chain");
+    let adapter = DefaultUnsupportedCanonicalAdapter {
+        chain: chain.clone(),
+    };
+
+    let error = adapter
+        .canonical_block(CanonicalBlockRequest {
+            chain,
+            range_kind: LedgerRangeKind::Block,
+            height: 12,
+        })
+        .expect_err("canonical block lookup is unsupported by default");
+
+    assert_eq!(error.kind, DatalensErrorKind::UnsupportedDataset);
+    assert!(error.message.contains("canonical block lookup"));
+}
+
+#[derive(Clone)]
+struct DefaultUnsupportedCanonicalAdapter {
+    chain: ChainIdentity,
+}
+
+impl ChainAdapter for DefaultUnsupportedCanonicalAdapter {
+    fn capabilities(&self) -> AdapterCapabilities {
+        AdapterCapabilities::new(self.chain.clone())
+    }
+
+    fn latest_height(&self) -> Result<ChainHeight, DatalensError> {
+        Ok(ChainHeight::block(12))
+    }
+
+    fn cache_safe_height(&self) -> Result<ChainHeight, DatalensError> {
+        Ok(ChainHeight::block(10).with_finality(FinalityKind::Safe))
+    }
+
+    fn fetch(&self, request: ChainFetchRequest) -> Result<ChainFetchResponse, DatalensError> {
+        ChainFetchResponse::try_empty(
+            request.chain,
+            request.dataset_key,
+            request.range,
+            request.selector,
+        )
+    }
 }
 
 #[test]
