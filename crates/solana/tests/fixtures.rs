@@ -81,6 +81,42 @@ fn test_program_selector_fetches_transactions_and_instructions() {
 }
 
 #[test]
+fn test_all_selector_fetches_account_balance_updates() {
+    let adapter = SolanaAdapter::with_fixture_defaults();
+    let response = adapter
+        .fetch(ChainFetchRequest::new(
+            adapter.capabilities().chain().clone(),
+            DatasetKey::solana_account_updates(),
+            LedgerRange::slots(10, 12).expect("valid range"),
+            solana_all_selector().expect("selector"),
+        ))
+        .expect("account updates");
+    let QueryRows::AdapterJson { rows, .. } = response.rows.rows() else {
+        panic!("expected account update JSON rows");
+    };
+
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[0]["slot"], 10);
+    assert_eq!(rows[0]["signature"], "sig-slot-10");
+    assert_eq!(
+        rows[0]["account"],
+        "Account111111111111111111111111111111111"
+    );
+    assert_eq!(rows[0]["account_index"], 0);
+    assert_eq!(rows[0]["update_kind"], "lamports");
+    assert_eq!(rows[0]["lamports_before"], 1_000_000);
+    assert_eq!(rows[0]["lamports_after"], 900_000);
+    assert_eq!(rows[0]["lamports_delta"], -100_000);
+    assert_eq!(rows[0]["source"], "getBlock.transaction.meta");
+    assert_eq!(rows[0]["selector_kind"], "solana_all");
+    assert_eq!(rows[0]["commitment"], "finalized");
+    assert_eq!(rows[1]["update_kind"], "spl_token");
+    assert_eq!(rows[1]["mint"], "TokenMint11111111111111111111111111111111");
+    assert_eq!(rows[1]["token_amount_before"], "10");
+    assert_eq!(rows[1]["token_amount_after"], "7");
+}
+
+#[test]
 fn test_address_selector_uses_stable_storage_safe_fingerprint() {
     let first =
         solana_address_selector(" Account111111111111111111111111111111111 ").expect("selector");

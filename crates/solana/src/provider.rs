@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 
 use crate::{
     SolanaBlock, SolanaCommitment, SolanaInnerInstructionGroup, SolanaInstruction, SolanaRpc,
-    SolanaTransaction,
+    SolanaTokenBalance, SolanaTransaction,
 };
 
 #[derive(Clone, Debug)]
@@ -237,6 +237,28 @@ fn fixture_transaction(
         err: None,
         account_keys,
         loaded_addresses: Vec::new(),
+        pre_balances: vec![1_000_000, 1],
+        post_balances: vec![900_000, 1],
+        pre_token_balances: vec![SolanaTokenBalance {
+            account_index: 0,
+            mint: "TokenMint11111111111111111111111111111111".to_owned(),
+            owner: Some("Owner1111111111111111111111111111111111".to_owned()),
+            program_id: Some("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_owned()),
+            amount: "10".to_owned(),
+            decimals: Some(0),
+            ui_amount_string: Some("10".to_owned()),
+            raw: json!({ "fixture": "pre-token-balance" }),
+        }],
+        post_token_balances: vec![SolanaTokenBalance {
+            account_index: 0,
+            mint: "TokenMint11111111111111111111111111111111".to_owned(),
+            owner: Some("Owner1111111111111111111111111111111111".to_owned()),
+            program_id: Some("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_owned()),
+            amount: "7".to_owned(),
+            decimals: Some(0),
+            ui_amount_string: Some("7".to_owned()),
+            raw: json!({ "fixture": "post-token-balance" }),
+        }],
         instructions: vec![SolanaInstruction {
             program_id: program_id.to_owned(),
             accounts: vec!["Account111111111111111111111111111111111".to_owned()],
@@ -326,12 +348,20 @@ fn parse_transaction(value: &Value) -> Result<SolanaTransaction, DatalensError> 
         .get("loadedAddresses")
         .map(loaded_addresses)
         .unwrap_or_default();
+    let pre_balances = u64_array(meta, "preBalances")?;
+    let post_balances = u64_array(meta, "postBalances")?;
+    let pre_token_balances = token_balances(meta, "preTokenBalances")?;
+    let post_token_balances = token_balances(meta, "postTokenBalances")?;
     Ok(SolanaTransaction {
         signature,
         fee: meta.get("fee").and_then(Value::as_u64).unwrap_or_default(),
         err: meta.get("err").filter(|value| !value.is_null()).cloned(),
         account_keys,
         loaded_addresses,
+        pre_balances,
+        post_balances,
+        pre_token_balances,
+        post_token_balances,
         instructions,
         inner_instructions,
         raw: value.clone(),
@@ -365,6 +395,70 @@ fn loaded_addresses(value: &Value) -> Vec<String> {
         .filter_map(Value::as_str)
         .map(str::to_owned)
         .collect()
+}
+
+fn u64_array(value: &Value, field: &str) -> Result<Vec<u64>, DatalensError> {
+    value
+        .get(field)
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .map(|value| {
+                    value.as_u64().ok_or_else(|| {
+                        DatalensError::new(
+                            DatalensErrorKind::ProviderFailure,
+                            format!("invalid Solana {field} value"),
+                        )
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_else(|| Ok(Vec::new()))
+}
+
+fn token_balances(value: &Value, field: &str) -> Result<Vec<SolanaTokenBalance>, DatalensError> {
+    value
+        .get(field)
+        .and_then(Value::as_array)
+        .map(|balances| {
+            balances
+                .iter()
+                .map(parse_token_balance)
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .unwrap_or_else(|| Ok(Vec::new()))
+}
+
+fn parse_token_balance(value: &Value) -> Result<SolanaTokenBalance, DatalensError> {
+    let ui_token_amount = value.get("uiTokenAmount").unwrap_or(&Value::Null);
+    Ok(SolanaTokenBalance {
+        account_index: value
+            .get("accountIndex")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                DatalensError::new(
+                    DatalensErrorKind::ProviderFailure,
+                    "missing token balance accountIndex",
+                )
+            })? as usize,
+        mint: string_field(value, "mint")?,
+        owner: value
+            .get("owner")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        program_id: value
+            .get("programId")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        amount: string_field(ui_token_amount, "amount")?,
+        decimals: ui_token_amount.get("decimals").and_then(Value::as_u64),
+        ui_amount_string: ui_token_amount
+            .get("uiAmountString")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        raw: value.clone(),
+    })
 }
 
 fn parse_instruction(value: &Value) -> Result<SolanaInstruction, DatalensError> {

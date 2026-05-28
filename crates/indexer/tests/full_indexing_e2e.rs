@@ -162,8 +162,8 @@ fn test_solana_full_indexing_backfills_skipped_slots_queries_verifies_and_reruns
         .expect("backfill");
 
     assert_eq!(backfill.status, IndexRunStatus::Completed);
-    assert_eq!(backfill.accounting.chunks_written, 6);
-    assert_eq!(backfill.accounting.rows_written, 5);
+    assert_eq!(backfill.accounting.chunks_written, 8);
+    assert_eq!(backfill.accounting.rows_written, 7);
     assert_queryable_counts(
         &storage,
         &chain,
@@ -184,9 +184,14 @@ fn test_solana_full_indexing_backfills_skipped_slots_queries_verifies_and_reruns
                 program_selector.clone(),
                 2,
             ),
+            (
+                DatasetKey::solana_account_updates(),
+                program_selector.clone(),
+                2,
+            ),
         ],
     );
-    assert_ledger_application_attribution(&ledger, 6);
+    assert_ledger_application_attribution(&ledger, 8);
     let metrics_text = metrics.encode().expect("metrics encode");
     assert!(metrics_text.contains("solana-mainnet-beta"));
     assert!(metrics_text.contains("solana.transactions"));
@@ -201,7 +206,7 @@ fn test_solana_full_indexing_backfills_skipped_slots_queries_verifies_and_reruns
         ))
         .expect("verify");
     assert_eq!(verify.accounting.chunks_written, 0);
-    assert_eq!(verify.accounting.chunks_fetched, 3);
+    assert_eq!(verify.accounting.chunks_fetched, 4);
 
     let rerun = runtime
         .run(solana_job(
@@ -213,7 +218,7 @@ fn test_solana_full_indexing_backfills_skipped_slots_queries_verifies_and_reruns
         ))
         .expect("idempotent rerun");
     assert_eq!(rerun.accounting.chunks_planned, 0);
-    assert_eq!(rerun.accounting.chunks_skipped, 3);
+    assert_eq!(rerun.accounting.chunks_skipped, 4);
 }
 
 #[test]
@@ -432,6 +437,10 @@ fn solana_job(
             },
             IndexDatasetRequest {
                 dataset_key: DatasetKey::solana_instructions(),
+                selector: program_selector.clone(),
+            },
+            IndexDatasetRequest {
+                dataset_key: DatasetKey::solana_account_updates(),
                 selector: program_selector,
             },
         ]),

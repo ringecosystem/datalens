@@ -68,14 +68,19 @@ The Solana MVP should expose these datasets:
 | `solana.slots` | `slot` | `AdapterJson` | `all` | One row per returned block slot. Include `slot`, `block_height`, `blockhash`, `previous_blockhash`, `parent_slot`, `block_time`, transaction count, and commitment used. |
 | `solana.transactions` | `slot` | `AdapterJson` | `solana_address`, `solana_program` | Rows are transaction summaries from `getBlock` or address-discovered signatures. Include signature, slot, block hash, err/status, fee, account keys, loaded addresses, and raw transaction JSON when needed. |
 | `solana.instructions` | `slot` | `AdapterJson` | `solana_program` | Rows flatten top-level and inner instructions. Include transaction signature, instruction index path, program id, account indexes/keys, data, and parsed JSON when the provider returns it. |
+| `solana.account_updates` | `slot` | `AdapterJson` | `all`, `solana_address`, `solana_program`, `solana_signature` | Rows are finalized balance updates reconstructed from `getBlock` transaction `meta.preBalances`, `meta.postBalances`, `meta.preTokenBalances`, and `meta.postTokenBalances`. Include slot, signature, transaction index, account index, account, update kind, before/after amounts, block hash, source, selector kind, and commitment. |
 
 Do not map Solana rows into `EvmBlocks` or `EvmLogs`. `EvmBlocks` assumes block numbers,
 and `EvmLogs` assumes EVM address/topic/data structure. Solana rows should use
 `QueryRows::AdapterJson` until a chain-neutral typed row model exists.
 
-Do not include `solana.account_updates` in the first MVP. Account updates are important
-for a future hot/live model, but the standard HTTP RPC path does not provide a simple
-bounded historical account-change stream comparable to block range scans.
+`solana.account_updates` is a balance-update dataset, not a complete account-data mutation
+feed. The authoritative durable source is finalized `getBlock` with full transaction
+details. Standard HTTP RPC metadata is sufficient for lamport and SPL-token balance
+updates because those before/after arrays are emitted per transaction; it is not
+sufficient for arbitrary account data, owner, executable, or rent epoch state changes.
+Those broader account-state updates require a separate provider or index source before
+they can be added to this dataset contract.
 
 ## Solana Selector Model
 
@@ -83,10 +88,10 @@ Use `DatasetSelector::Other` with stable adapter keys:
 
 | Selector kind | Canonical key shape | Applies to | Meaning |
 | --- | --- | --- | --- |
-| `solana_all` | `all` | `solana.slots` | Fetch every available block slot in the requested slot range. |
-| `solana_address` | `address/<base58-pubkey>` | `solana.transactions` | Discover finalized signatures referencing an account with `getSignaturesForAddress`, then fetch transaction details. |
-| `solana_program` | `program/<base58-pubkey>` | `solana.transactions`, `solana.instructions` | Match transactions or instructions whose account keys or instruction program id include the program. |
-| `solana_signature` | `signature/<base58-signature>` | `solana.transactions` | Optional test fixture selector for one known transaction; not required for broad range queries. |
+| `solana_all` | `all` | `solana.slots`, `solana.account_updates` | Fetch every available block slot or balance update in the requested slot range. |
+| `solana_address` | `address/<base58-pubkey>` | `solana.transactions`, `solana.account_updates` | For transactions, discover finalized signatures referencing an account with `getSignaturesForAddress`, then fetch transaction details. For account updates, match rows whose normalized account key equals the address. |
+| `solana_program` | `program/<base58-pubkey>` | `solana.transactions`, `solana.instructions`, `solana.account_updates` | Match transactions or instructions whose account keys or instruction program id include the program. For account updates, return balance rows from matching transactions. |
+| `solana_signature` | `signature/<base58-signature>` | `solana.transactions`, `solana.account_updates` | Match one known transaction signature. Useful for deterministic fixtures and narrow lookups, not broad range queries. |
 
 Selector fingerprints must be short digest keys derived from the canonical key. Raw
 addresses and signatures must not appear in metrics labels.

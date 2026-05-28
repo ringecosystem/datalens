@@ -375,6 +375,11 @@ where
             .datasets()
             .contains(&DatasetKey::solana_instructions())
     );
+    assert!(
+        capabilities
+            .datasets()
+            .contains(&DatasetKey::solana_account_updates())
+    );
 
     let slots = capabilities
         .dataset(&DatasetKey::solana_slots())
@@ -408,6 +413,17 @@ where
         AdapterKey::try_new("solana_program").expect("adapter key")
     )));
     assert!(instructions.ranges().contains(&HeightRangeKind::Slot));
+
+    let account_updates = capabilities
+        .dataset(&DatasetKey::solana_account_updates())
+        .expect("account updates capability");
+    assert!(account_updates.supports_selector(SelectorKind::Other(
+        AdapterKey::try_new("solana_all").expect("adapter key")
+    )));
+    assert!(account_updates.supports_selector(SelectorKind::Other(
+        AdapterKey::try_new("solana_address").expect("adapter key")
+    )));
+    assert!(account_updates.ranges().contains(&HeightRangeKind::Slot));
 }
 
 pub fn assert_solana_fetch_conformance<A>(adapter: &A, selector: DatasetSelector)

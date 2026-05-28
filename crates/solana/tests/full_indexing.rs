@@ -12,7 +12,7 @@ use datalens_metrics::ApplicationIdentity;
 use datalens_planner::{FieldSelection, NativePlannerConfig, NativeQueryInput, ResponseShape};
 use datalens_solana::{
     SolanaAdapter, SolanaBlock, SolanaCommitment, SolanaInnerInstructionGroup, SolanaInstruction,
-    SolanaRpc, SolanaTransaction,
+    SolanaRpc, SolanaTokenBalance, SolanaTransaction,
 };
 use datalens_storage::LocalStorage;
 use datalens_writer::DurableWriterConfig;
@@ -32,8 +32,8 @@ fn test_full_indexing_backfills_solana_durable_datasets_once_per_slot_chunk() {
         .expect("backfill Solana datasets");
 
     assert_eq!(result.status, IndexRunStatus::Completed);
-    assert_eq!(result.accounting.chunks_planned, 4);
-    assert_eq!(result.accounting.rows_written, 8);
+    assert_eq!(result.accounting.chunks_planned, 5);
+    assert_eq!(result.accounting.rows_written, 12);
     assert_eq!(provider.blocks_with_limit_calls(), 1);
     assert_eq!(provider.block_calls(), vec![10, 11, 12]);
 
@@ -83,6 +83,18 @@ fn test_full_indexing_backfills_solana_durable_datasets_once_per_slot_chunk() {
             .expect("read indexed instructions")
             .row_count(),
         2
+    );
+    assert_eq!(
+        storage
+            .read_rows(
+                adapter.capabilities().chain(),
+                &DatasetKey::solana_account_updates(),
+                &DatasetSelector::all(),
+                LedgerRange::slots(10, 12).expect("range"),
+            )
+            .expect("read indexed account updates")
+            .row_count(),
+        4
     );
 }
 
@@ -178,13 +190,13 @@ fn test_durable_query_reads_indexed_solana_data_without_provider_fill() {
 }
 
 #[test]
-fn test_solana_account_updates_remain_unsupported_until_source_model_exists() {
+fn test_solana_account_updates_are_supported_from_finalized_block_metadata() {
     let adapter = SolanaAdapter::with_provider(solana_chain(), CountingSolanaRpc::default());
     assert!(
         adapter
             .capabilities()
             .dataset(&DatasetKey::solana_account_updates())
-            .is_none()
+            .is_some()
     );
 }
 
@@ -354,6 +366,28 @@ fn solana_transaction(slot: u64) -> SolanaTransaction {
             program_id.clone(),
         ],
         loaded_addresses: vec!["Loaded1111111111111111111111111111111111".to_owned()],
+        pre_balances: vec![1_000_000, 1, 100_000],
+        post_balances: vec![900_000, 1, 100_000],
+        pre_token_balances: vec![SolanaTokenBalance {
+            account_index: 0,
+            mint: "TokenMint11111111111111111111111111111111".to_owned(),
+            owner: Some("Owner1111111111111111111111111111111111".to_owned()),
+            program_id: Some("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_owned()),
+            amount: "10".to_owned(),
+            decimals: Some(0),
+            ui_amount_string: Some("10".to_owned()),
+            raw: json!({ "fixture": "pre-token-balance" }),
+        }],
+        post_token_balances: vec![SolanaTokenBalance {
+            account_index: 0,
+            mint: "TokenMint11111111111111111111111111111111".to_owned(),
+            owner: Some("Owner1111111111111111111111111111111111".to_owned()),
+            program_id: Some("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_owned()),
+            amount: "7".to_owned(),
+            decimals: Some(0),
+            ui_amount_string: Some("7".to_owned()),
+            raw: json!({ "fixture": "post-token-balance" }),
+        }],
         instructions: vec![SolanaInstruction {
             program_id: program_id.clone(),
             accounts: vec!["Account111111111111111111111111111111111".to_owned()],
