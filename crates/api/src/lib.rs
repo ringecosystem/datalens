@@ -385,6 +385,10 @@ where
         })
     }
 
+    pub fn chain_name(&self) -> &str {
+        &self.chain_name
+    }
+
     pub fn query(
         &self,
         request: LegacyEvmQueryRequest,
@@ -551,54 +555,117 @@ where
     }
 }
 
-pub fn router<S>(service: QueryService<S>, chain_names: Vec<String>) -> Router
+trait RegisteredQueryService: Send + Sync {
+    fn query(
+        &self,
+        request: LegacyEvmQueryRequest,
+    ) -> Result<LegacyEvmQueryResponse, DatalensError>;
+
+    fn metrics_text(&self) -> Result<String, DatalensError>;
+}
+
+impl<S> RegisteredQueryService for QueryService<S>
 where
-    S: ChainAdapter,
+    S: ChainAdapter + 'static,
 {
+    fn query(
+        &self,
+        request: LegacyEvmQueryRequest,
+    ) -> Result<LegacyEvmQueryResponse, DatalensError> {
+        QueryService::query(self, request)
+    }
+
+    fn metrics_text(&self) -> Result<String, DatalensError> {
+        QueryService::metrics_text(self)
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct QueryServiceRegistry {
+    services: BTreeMap<String, Arc<dyn RegisteredQueryService>>,
+}
+
+impl QueryServiceRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_service<S>(mut self, service: QueryService<S>) -> Result<Self, DatalensError>
+    where
+        S: ChainAdapter + 'static,
+    {
+        let chain_name = service.chain_name().to_owned();
+        if self.services.contains_key(&chain_name) {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                format!("chain {chain_name} is already registered"),
+            ));
+        }
+        self.services.insert(chain_name, Arc::new(service));
+        Ok(self)
+    }
+
+    pub fn chain_names(&self) -> Vec<String> {
+        self.services.keys().cloned().collect()
+    }
+
+    pub fn query(
+        &self,
+        request: LegacyEvmQueryRequest,
+    ) -> Result<LegacyEvmQueryResponse, DatalensError> {
+        let chain_name = request.chain.configured_name();
+        let service = self.services.get(chain_name).ok_or_else(|| {
+            DatalensError::new(
+                DatalensErrorKind::UnsupportedDataset,
+                format!("chain {chain_name} is not configured"),
+            )
+        })?;
+        service.query(request)
+    }
+
+    pub fn metrics_text(&self) -> Result<String, DatalensError> {
+        for service in self.services.values() {
+            let metrics = service.metrics_text()?;
+            if !metrics.is_empty() {
+                return Ok(metrics);
+            }
+        }
+        Ok(String::new())
+    }
+}
+
+pub fn router(registry: QueryServiceRegistry) -> Router {
     Router::new()
         .route("/health", get(health))
-        .route("/metrics", get(metrics::<S>))
-        .route("/v1/chains", get(chains::<S>))
-        .route("/v1/query", post(query::<S>))
-        .with_state(AppState {
-            service,
-            chain_names,
-        })
+        .route("/metrics", get(metrics))
+        .route("/v1/chains", get(chains))
+        .route("/v1/query", post(query))
+        .with_state(AppState { registry })
 }
 
 #[derive(Clone)]
-struct AppState<S> {
-    service: QueryService<S>,
-    chain_names: Vec<String>,
+struct AppState {
+    registry: QueryServiceRegistry,
 }
 
 async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "status": "ok" }))
 }
 
-async fn chains<S>(State(state): State<AppState<S>>) -> Json<serde_json::Value>
-where
-    S: ChainAdapter,
-{
-    Json(serde_json::json!({ "chains": state.chain_names }))
+async fn chains(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "chains": state.registry.chain_names() }))
 }
 
-async fn metrics<S>(State(state): State<AppState<S>>) -> Result<String, ApiError>
-where
-    S: ChainAdapter,
-{
-    state.service.metrics_text().map_err(ApiError)
+async fn metrics(State(state): State<AppState>) -> Result<String, ApiError> {
+    state.registry.metrics_text().map_err(ApiError)
 }
 
-async fn query<S>(
-    State(state): State<AppState<S>>,
+async fn query(
+    State(state): State<AppState>,
     Json(request): Json<LegacyEvmQueryRequest>,
-) -> Result<Json<LegacyEvmQueryResponse>, ApiError>
-where
-    S: ChainAdapter,
-{
-    let service = state.service.clone();
-    tokio::task::spawn_blocking(move || service.query(request))
+) -> Result<Json<LegacyEvmQueryResponse>, ApiError> {
+    let registry = state.registry.clone();
+    tokio::task::spawn_blocking(move || registry.query(request))
         .await
         .map_err(|error| {
             ApiError(DatalensError::new(
@@ -686,17 +753,10 @@ fn api_error_kind(kind: &DatalensErrorKind) -> &'static str {
     }
 }
 
-pub async fn serve<S>(
-    bind: SocketAddr,
-    service: QueryService<S>,
-    chain_names: Vec<String>,
-) -> Result<(), std::io::Error>
-where
-    S: ChainAdapter,
-{
+pub async fn serve(bind: SocketAddr, registry: QueryServiceRegistry) -> Result<(), std::io::Error> {
     let listener = tokio::net::TcpListener::bind(bind).await?;
     log::info!("api listener bound to {bind}");
-    axum::serve(listener, router(service, chain_names)).await
+    axum::serve(listener, router(registry)).await
 }
 
 fn legacy_block_ranges(ranges: &[LedgerRange]) -> Result<Vec<BlockRange>, DatalensError> {

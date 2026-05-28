@@ -11,7 +11,7 @@ use datalens_api::config::{
     BlocksDatasetConfig, ChainConfig, DatasetsConfig, LogsDatasetConfig, PlannerConfig,
     WriterConfig,
 };
-use datalens_api::{LegacyEvmQueryRequest, QueryService, router};
+use datalens_api::{LegacyEvmQueryRequest, QueryService, QueryServiceRegistry, router};
 use datalens_chain::{
     AdapterCapabilities, ChainAdapter, ChainFetchRequest, ChainFetchResponse, ChainHeight,
     DatasetCapability, FinalityKind, HeightRangeKind, ProviderDiagnostics, SelectorKind,
@@ -95,7 +95,10 @@ async fn test_api_lifecycle_routes_expose_health_chains_query_and_metrics() {
         source.clone(),
     )
     .with_metrics(recorder);
-    let app = router(service, vec!["ethereum".to_owned(), "polygon".to_owned()]);
+    let registry = QueryServiceRegistry::new()
+        .with_service(service)
+        .expect("registry");
+    let app = router(registry);
 
     let health = app
         .clone()
@@ -119,10 +122,7 @@ async fn test_api_lifecycle_routes_expose_health_chains_query_and_metrics() {
         .expect("chains response");
     assert_eq!(chains.status(), StatusCode::OK);
     let chains_body = body_json(chains.into_body()).await;
-    assert_eq!(
-        chains_body["chains"],
-        serde_json::json!(["ethereum", "polygon"])
-    );
+    assert_eq!(chains_body["chains"], serde_json::json!(["ethereum"]));
 
     let query = app
         .clone()

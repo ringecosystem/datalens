@@ -3,10 +3,16 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use axum::{
+    body::{Body, to_bytes},
+    http::{Request, StatusCode},
+};
 use datalens_api::config::{
     ChainConfig, DatasetsConfig, LogsDatasetConfig, PlannerConfig, WriterConfig,
 };
-use datalens_api::{LegacyEvmQueryRequest, LegacyEvmQueryResponse, QueryService};
+use datalens_api::{
+    LegacyEvmQueryRequest, LegacyEvmQueryResponse, QueryService, QueryServiceRegistry, router,
+};
 use datalens_chain::{
     AdapterCapabilities, AdapterKey, ChainAdapter, ChainFetchRequest, ChainFetchResponse,
     ChainHeight, DatasetCapability, DatasetSelector, FinalityKind, HeightRangeKind, SelectorKind,
@@ -16,7 +22,8 @@ use datalens_core::{
     DatasetKey, LedgerRange, LogFilter, LogRecord, NetworkId, QueryRows,
 };
 use datalens_planner::{FieldSelection, NativeQueryInput, ResponseShape};
-use datalens_storage::LocalStorage;
+use datalens_storage::{LocalStorage, StorageRepository};
+use tower::ServiceExt;
 
 #[test]
 fn test_query_blocks_miss_persists_then_equivalent_hit_uses_cache() {
@@ -256,6 +263,238 @@ fn test_query_accepts_finalized_adapter_height_without_evm_specific_assumption()
 }
 
 #[test]
+fn test_registry_routes_legacy_query_to_requested_chain_service() {
+    let root = temp_storage_root("registry-route");
+    let storage: Arc<dyn StorageRepository> = Arc::new(LocalStorage::new(&root));
+    let ethereum_source = MockSource::default()
+        .with_blocks(vec![block(10, "0x0a")])
+        .with_chain(ethereum_identity());
+    let polygon_source = MockSource::default()
+        .with_blocks(vec![block(20, "0x14")])
+        .with_chain(polygon_identity());
+    let registry = QueryServiceRegistry::new()
+        .with_service(service_named(
+            storage.clone(),
+            ethereum_source.clone(),
+            "ethereum",
+            1,
+        ))
+        .expect("register ethereum")
+        .with_service(service_named(
+            storage.clone(),
+            polygon_source.clone(),
+            "polygon",
+            137,
+        ))
+        .expect("register polygon");
+
+    let ethereum = registry
+        .query(blocks_request_for(ethereum_identity(), 10, 10))
+        .expect("ethereum query succeeds");
+    let polygon = registry
+        .query(blocks_request_for(polygon_identity(), 20, 20))
+        .expect("polygon query succeeds");
+
+    assert_eq!(block_numbers(&ethereum), vec![10]);
+    assert_eq!(block_numbers(&polygon), vec![20]);
+    assert_eq!(
+        ethereum_source.calls(),
+        vec![SourceCall::Blocks(BlockRange::expect_new(10, 10))]
+    );
+    assert_eq!(
+        polygon_source.calls(),
+        vec![SourceCall::Blocks(BlockRange::expect_new(20, 20))]
+    );
+}
+
+#[test]
+fn test_registry_lists_only_registered_chains() {
+    let registry = QueryServiceRegistry::new()
+        .with_service(service_named(
+            LocalStorage::new(temp_storage_root("registry-list-ethereum")),
+            MockSource::default().with_chain(ethereum_identity()),
+            "ethereum",
+            1,
+        ))
+        .expect("register ethereum")
+        .with_service(service_named(
+            LocalStorage::new(temp_storage_root("registry-list-polygon")),
+            MockSource::default().with_chain(polygon_identity()),
+            "polygon",
+            137,
+        ))
+        .expect("register polygon");
+
+    assert_eq!(
+        registry.chain_names(),
+        vec!["ethereum".to_owned(), "polygon".to_owned()]
+    );
+}
+
+#[tokio::test]
+async fn test_chains_route_lists_registered_chains() {
+    let registry = QueryServiceRegistry::new()
+        .with_service(service_named(
+            LocalStorage::new(temp_storage_root("chains-route-ethereum")),
+            MockSource::default().with_chain(ethereum_identity()),
+            "ethereum",
+            1,
+        ))
+        .expect("register ethereum")
+        .with_service(service_named(
+            LocalStorage::new(temp_storage_root("chains-route-polygon")),
+            MockSource::default().with_chain(polygon_identity()),
+            "polygon",
+            137,
+        ))
+        .expect("register polygon");
+
+    let response = router(registry)
+        .oneshot(
+            Request::builder()
+                .uri("/v1/chains")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("route response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body bytes");
+    let value: serde_json::Value = serde_json::from_slice(&body).expect("json response");
+    assert_eq!(
+        value,
+        serde_json::json!({ "chains": ["ethereum", "polygon"] })
+    );
+}
+
+#[test]
+fn test_registry_rejects_unknown_chain_without_falling_back_to_first_service() {
+    let ethereum_source = MockSource::default()
+        .with_blocks(vec![block(10, "0x0a")])
+        .with_chain(ethereum_identity());
+    let registry = QueryServiceRegistry::new()
+        .with_service(service_named(
+            LocalStorage::new(temp_storage_root("registry-unknown")),
+            ethereum_source.clone(),
+            "ethereum",
+            1,
+        ))
+        .expect("register ethereum");
+
+    let error = registry
+        .query(blocks_request_for(polygon_identity(), 10, 10))
+        .expect_err("polygon is not registered");
+
+    assert_eq!(error.kind, DatalensErrorKind::UnsupportedDataset);
+    assert!(error.message.contains("polygon"));
+    assert_eq!(ethereum_source.calls(), Vec::<SourceCall>::new());
+}
+
+#[test]
+fn test_registry_dataset_disabled_is_scoped_to_target_chain() {
+    let root = temp_storage_root("registry-disabled-dataset");
+    let storage: Arc<dyn StorageRepository> = Arc::new(LocalStorage::new(&root));
+    let ethereum_source = MockSource::default()
+        .with_logs(vec![log(
+            10,
+            0,
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            vec![TOPIC_A],
+        )])
+        .with_chain(ethereum_identity());
+    let polygon_source = MockSource::default()
+        .with_logs(vec![log(
+            10,
+            0,
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            vec![TOPIC_A],
+        )])
+        .with_chain(polygon_identity());
+    let registry = QueryServiceRegistry::new()
+        .with_service(service_named_with_datasets(
+            storage.clone(),
+            ethereum_source.clone(),
+            "ethereum",
+            1,
+            true,
+            false,
+        ))
+        .expect("register ethereum")
+        .with_service(service_named(
+            storage.clone(),
+            polygon_source.clone(),
+            "polygon",
+            137,
+        ))
+        .expect("register polygon");
+
+    let ethereum_error = registry
+        .query(logs_request_for(
+            ethereum_identity(),
+            10,
+            10,
+            vec!["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        ))
+        .expect_err("ethereum logs are disabled");
+    let polygon = registry
+        .query(logs_request_for(
+            polygon_identity(),
+            10,
+            10,
+            vec!["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        ))
+        .expect("polygon logs are enabled");
+
+    assert_eq!(ethereum_error.kind, DatalensErrorKind::UnsupportedDataset);
+    assert_eq!(ethereum_source.calls(), Vec::<SourceCall>::new());
+    assert_eq!(log_indexes(&polygon), vec![0]);
+    assert_eq!(
+        polygon_source.calls(),
+        vec![SourceCall::Logs(BlockRange::expect_new(10, 10))]
+    );
+}
+
+#[test]
+fn test_registry_shared_storage_keeps_manifest_isolated_by_chain_identity() {
+    let root = temp_storage_root("registry-manifest-isolation");
+    let storage: Arc<dyn StorageRepository> = Arc::new(LocalStorage::new(&root));
+    let registry = QueryServiceRegistry::new()
+        .with_service(service_named(
+            storage.clone(),
+            MockSource::default()
+                .with_blocks(vec![block(1, "0x01")])
+                .with_chain(ethereum_identity()),
+            "ethereum",
+            1,
+        ))
+        .expect("register ethereum")
+        .with_service(service_named(
+            storage.clone(),
+            MockSource::default()
+                .with_blocks(vec![block(1, "0x89")])
+                .with_chain(polygon_identity()),
+            "polygon",
+            137,
+        ))
+        .expect("register polygon");
+
+    registry
+        .query(blocks_request_for(ethereum_identity(), 1, 1))
+        .expect("ethereum query succeeds");
+    registry
+        .query(blocks_request_for(polygon_identity(), 1, 1))
+        .expect("polygon query succeeds");
+
+    assert!(root.join("chains/evm/ethereum/1/manifest.json").exists());
+    assert!(root.join("chains/evm/polygon/137/manifest.json").exists());
+    assert!(root.join("chains/evm/ethereum/1/datasets").exists());
+    assert!(root.join("chains/evm/polygon/137/datasets").exists());
+}
+
+#[test]
 fn test_provider_limit_error_is_classified() {
     let source = MockSource::default().with_error(DatalensErrorKind::ProviderLimit);
     let root = temp_storage_root("provider-limit");
@@ -343,7 +582,27 @@ fn test_query_native_executes_non_evm_plan_without_legacy_route_validation() {
 }
 
 fn service(storage: LocalStorage, source: MockSource) -> QueryService<MockSource> {
-    QueryService::new(
+    service_named(storage, source, "ethereum", 1)
+}
+
+fn service_named(
+    storage: impl StorageRepository + 'static,
+    source: MockSource,
+    chain_name: &str,
+    chain_id: u64,
+) -> QueryService<MockSource> {
+    service_named_with_datasets(storage, source, chain_name, chain_id, true, true)
+}
+
+fn service_named_with_datasets(
+    storage: impl StorageRepository + 'static,
+    source: MockSource,
+    chain_name: &str,
+    chain_id: u64,
+    blocks_enabled: bool,
+    logs_enabled: bool,
+) -> QueryService<MockSource> {
+    QueryService::new_named(
         storage,
         source,
         PlannerConfig {
@@ -355,18 +614,19 @@ fn service(storage: LocalStorage, source: MockSource) -> QueryService<MockSource
             min_object_rows: 1,
             record_empty_coverage: true,
         },
+        chain_name,
         ChainConfig {
             kind: "evm".to_owned(),
-            chain_id: 1,
+            chain_id,
             rpc_urls: vec!["http://example.invalid".to_owned()],
             finality: datalens_api::config::FinalityConfig::Auto,
             datasets: DatasetsConfig {
                 blocks: datalens_api::config::BlocksDatasetConfig {
-                    enabled: true,
+                    enabled: blocks_enabled,
                     max_batch_blocks: 2,
                 },
                 logs: LogsDatasetConfig {
-                    enabled: true,
+                    enabled: logs_enabled,
                     max_get_logs_range_blocks: 2,
                     max_addresses_per_query: 2,
                 },
@@ -376,8 +636,16 @@ fn service(storage: LocalStorage, source: MockSource) -> QueryService<MockSource
 }
 
 fn blocks_request(from_block: u64, to_block: u64) -> LegacyEvmQueryRequest {
+    blocks_request_for(ethereum_identity(), from_block, to_block)
+}
+
+fn blocks_request_for(
+    chain: ChainIdentity,
+    from_block: u64,
+    to_block: u64,
+) -> LegacyEvmQueryRequest {
     LegacyEvmQueryRequest {
-        chain: ethereum_identity(),
+        chain,
         dataset: Dataset::Blocks,
         range: BlockRange::expect_new(from_block, to_block),
         filter: None,
@@ -386,7 +654,17 @@ fn blocks_request(from_block: u64, to_block: u64) -> LegacyEvmQueryRequest {
 }
 
 fn logs_request(from_block: u64, to_block: u64, addresses: Vec<&str>) -> LegacyEvmQueryRequest {
-    logs_request_with_topics(
+    logs_request_for(ethereum_identity(), from_block, to_block, addresses)
+}
+
+fn logs_request_for(
+    chain: ChainIdentity,
+    from_block: u64,
+    to_block: u64,
+    addresses: Vec<&str>,
+) -> LegacyEvmQueryRequest {
+    logs_request_with_topics_for(
+        chain,
         from_block,
         to_block,
         addresses,
@@ -400,8 +678,18 @@ fn logs_request_with_topics(
     addresses: Vec<&str>,
     topics: Vec<Option<Vec<&str>>>,
 ) -> LegacyEvmQueryRequest {
+    logs_request_with_topics_for(ethereum_identity(), from_block, to_block, addresses, topics)
+}
+
+fn logs_request_with_topics_for(
+    chain: ChainIdentity,
+    from_block: u64,
+    to_block: u64,
+    addresses: Vec<&str>,
+    topics: Vec<Option<Vec<&str>>>,
+) -> LegacyEvmQueryRequest {
     LegacyEvmQueryRequest {
-        chain: ethereum_identity(),
+        chain,
         dataset: Dataset::Logs,
         range: BlockRange::expect_new(from_block, to_block),
         filter: Some(LogFilter {
@@ -420,6 +708,11 @@ const TOPIC_B: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 
 fn ethereum_identity() -> ChainIdentity {
     ChainIdentity::try_new(ChainFamily::Evm, "ethereum", Some(NetworkId::numeric(1)))
+        .expect("valid chain identity")
+}
+
+fn polygon_identity() -> ChainIdentity {
+    ChainIdentity::try_new(ChainFamily::Evm, "polygon", Some(NetworkId::numeric(137)))
         .expect("valid chain identity")
 }
 

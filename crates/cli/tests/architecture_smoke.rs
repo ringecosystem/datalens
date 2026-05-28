@@ -60,3 +60,11 @@ fn workspace_exposes_architecture_boundaries() {
     let _compatibility_type_check =
         assert_compatibility::<datalens_api::compatibility::NativeCompatibility>;
 }
+
+#[test]
+fn serve_path_builds_registry_without_first_chain_selection() {
+    let source = include_str!("../src/lib.rs");
+
+    assert!(source.contains("build_service_registry(&config)?"));
+    assert!(!source.contains("fn first_chain("));
+}
