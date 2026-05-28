@@ -212,6 +212,93 @@ fn test_index_backfill_runs_fixture_runtime() {
 }
 
 #[test]
+fn test_index_backfill_persists_cursor_under_configured_cursor_path() {
+    let root = temp_storage_root("index-backfill-cursor");
+    let config = write_config("index-backfill-cursor", &root);
+    let adapter = IndexFixtureAdapter::default().with_blocks(vec![block(1), block(2), block(3)]);
+
+    let output = index_summary_with_adapter(
+        IndexWorkflowCommand::Backfill(IndexBackfillCommand {
+            common: index_common(config, 1, 3),
+            dry_run: false,
+        }),
+        adapter,
+    )
+    .expect("backfill");
+
+    let cursor_path = root.join("cursors");
+    assert_eq!(
+        output["cursor_path"],
+        cursor_path.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        cursor_path
+            .read_dir()
+            .expect("cursor dir")
+            .map(|entry| entry.expect("cursor entry").path())
+            .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn test_index_resume_uses_persisted_cursor_after_process_restart() {
+    let root = temp_storage_root("index-resume-cursor");
+    let config = write_config("index-resume-cursor", &root);
+    let first_adapter = IndexFixtureAdapter::default().with_blocks(vec![block(1), block(2)]);
+
+    index_summary_with_adapter(
+        IndexWorkflowCommand::Backfill(IndexBackfillCommand {
+            common: index_common(config.clone(), 1, 2),
+            dry_run: false,
+        }),
+        first_adapter,
+    )
+    .expect("backfill");
+
+    let resumed_adapter = IndexFixtureAdapter::default().with_blocks(vec![block(1), block(2)]);
+    let output = index_summary_with_adapter(
+        IndexWorkflowCommand::Resume(IndexResumeCommand {
+            common: index_common(config, 1, 2),
+            dry_run: false,
+        }),
+        resumed_adapter.clone(),
+    )
+    .expect("resume");
+
+    assert_eq!(output["accounting"]["chunks_planned"], 0);
+    assert_eq!(
+        resumed_adapter.calls(),
+        Vec::<IndexSourceCall>::new(),
+        "resume should skip manifest-covered chunks after a new CLI invocation"
+    );
+}
+
+#[test]
+fn test_index_verify_does_not_persist_cursor() {
+    let root = temp_storage_root("index-verify-cursor");
+    let storage = LocalStorage::new(&root);
+    write_block_coverage(&storage, 1, 2);
+    let config = write_config("index-verify-cursor", &root);
+    let adapter = IndexFixtureAdapter::default().with_blocks(vec![block(1), block(2)]);
+
+    index_summary_with_adapter(
+        IndexWorkflowCommand::Verify(IndexVerifyCommand {
+            common: index_common(config, 1, 2),
+            verify_only: true,
+        }),
+        adapter,
+    )
+    .expect("verify");
+
+    assert!(
+        !root.join("cursors").exists(),
+        "verify mode should not create cursor files"
+    );
+}
+
+#[test]
 fn test_index_verify_does_not_write_data() {
     let root = temp_storage_root("index-verify");
     let storage = LocalStorage::new(&root);

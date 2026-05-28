@@ -9,7 +9,7 @@ use datalens_core::{
 };
 use datalens_evm::EvmRpcClient;
 use datalens_indexer::{
-    InMemoryIndexCursorStore, IndexAccounting, IndexChunk, IndexDatasetProviderLimit,
+    FileIndexCursorStore, IndexAccounting, IndexChunk, IndexDatasetProviderLimit,
     IndexDatasetRequest, IndexDatasetSelection, IndexFinalityRequirement, IndexJob, IndexJobId,
     IndexPlan, IndexRetryPolicy, IndexRunMode, IndexRunResult, IndexRuntime, IndexRuntimeConfig,
     IndexSkippedRange, IndexVerificationRange,
@@ -252,7 +252,7 @@ where
     let runtime = IndexRuntime::new(
         adapter,
         storage,
-        InMemoryIndexCursorStore::default(),
+        FileIndexCursorStore::new(&config.index.cursor_path),
         DurableWriterConfig {
             target_object_bytes: config.writer.target_object_bytes,
             min_object_rows: config.writer.min_object_rows,
