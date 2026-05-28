@@ -1,8 +1,8 @@
-use std::net::SocketAddr;
+use std::{net::SocketAddr, sync::Arc};
 
 use clap::{Args, Parser, Subcommand};
 pub use datalens_api::config::{ChainConfig, DatalensConfig, FinalityConfig};
-use datalens_api::{LegacyEvmQueryRequest, QueryService};
+use datalens_api::{LegacyEvmQueryRequest, QueryService, QueryServiceRegistry};
 use datalens_chain::ChainAdapter;
 pub use datalens_core::DatalensErrorKind;
 use datalens_core::{
@@ -116,14 +116,13 @@ async fn serve_command(
     let config = load_config(&command.config)?;
     validate_config(&config)?;
     let bind = parse_bind(&config.server.bind)?;
-    let (chain_name, chain) = first_chain(&config)?;
-    let service = build_service(&config, chain_name, chain)?;
+    let registry = build_service_registry(&config)?;
 
     let adapter = EvmAdapter::new(EvmAdapterMetadata::default());
     let _capabilities = adapter.capabilities();
 
     log::info!("serving datalens API on {bind}");
-    datalens_api::serve(bind, service, config.chains.keys().cloned().collect()).await?;
+    datalens_api::serve(bind, registry).await?;
     Ok(())
 }
 
@@ -526,12 +525,31 @@ fn build_service(
     chain_name: &str,
     chain: &ChainConfig,
 ) -> Result<QueryService<EvmRpcClient>, DatalensError> {
+    build_service_with_storage(build_storage(config)?, config, chain_name, chain)
+}
+
+fn build_service_registry(config: &DatalensConfig) -> Result<QueryServiceRegistry, DatalensError> {
+    let storage: Arc<dyn datalens_storage::StorageRepository> = Arc::from(build_storage(config)?);
+    let mut registry = QueryServiceRegistry::new();
+    for (chain_name, chain) in &config.chains {
+        let service =
+            build_service_with_storage(storage.clone(), config, chain_name.as_str(), chain)?;
+        registry = registry.with_service(service)?;
+    }
+    Ok(registry)
+}
+
+fn build_service_with_storage(
+    storage: impl datalens_storage::StorageRepository + 'static,
+    config: &DatalensConfig,
+    chain_name: &str,
+    chain: &ChainConfig,
+) -> Result<QueryService<EvmRpcClient>, DatalensError> {
     log::info!(
         "using chain {chain_name} kind={} chain_id={}",
         chain.kind,
         chain.chain_id
     );
-    let storage = build_storage(config)?;
     let source = EvmRpcClient::with_chain(
         chain.rpc_urls.clone(),
         chain_identity(chain_name, chain).expect("validated chain identity"),
@@ -622,20 +640,6 @@ fn finality_summary(chain: &ChainConfig) -> serde_json::Value {
             "finalized_tag": finalized_tag,
         }),
     }
-}
-
-fn first_chain(config: &DatalensConfig) -> Result<(&str, &ChainConfig), DatalensError> {
-    config
-        .chains
-        .iter()
-        .next()
-        .map(|(name, chain)| (name.as_str(), chain))
-        .ok_or_else(|| {
-            DatalensError::new(
-                DatalensErrorKind::InvalidInput,
-                "config must define at least one chain",
-            )
-        })
 }
 
 fn configured_chain<'a>(
