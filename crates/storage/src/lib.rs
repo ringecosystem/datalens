@@ -42,10 +42,17 @@ pub struct StorageDataObject {
     pub written_at_unix_seconds: u64,
 }
 
+mod maintenance;
 mod manifest;
 mod object_store;
 mod parquet_codec;
 mod usage_ledger;
+pub use maintenance::{
+    CompactionCandidate, MaintenanceCheckReport, MaintenanceCompactionReport, MaintenanceIssue,
+    MaintenanceIssueKind, MaintenanceOperation, MaintenanceOperationMode, MaintenanceReport,
+    MaintenanceRetentionReport, MaintenanceUsageLedgerReport, RetentionPolicy,
+    UsageLedgerRollupModel,
+};
 pub use manifest::{Manifest, ManifestEntry, ManifestFinalityLevel};
 pub use object_store::{
     LocalObjectStore, ObjectMetadata, ObjectStore, S3ObjectStore, S3ObjectStoreConfig,

@@ -15,7 +15,7 @@ use datalens_core::{
     NetworkId, QueryRows,
 };
 use datalens_storage::{
-    CacheOutcome, FillOutcome, QueryOutcome, UsageLedgerEntry, UsageLedgerRepository,
+    CacheOutcome, FillOutcome, ObjectStore, QueryOutcome, UsageLedgerEntry, UsageLedgerRepository,
     UsageLedgerStore,
 };
 use datalens_storage::{LocalStorage, StorageWriteRequest};
@@ -156,6 +156,24 @@ fn test_inspect_usage_accepts_application_and_config() {
 }
 
 #[test]
+fn test_inspect_maintenance_accepts_config_path_after_subcommand() {
+    let cli = Cli::parse_from([
+        "datalens",
+        "inspect",
+        "maintenance",
+        "--config",
+        "custom.toml",
+    ]);
+
+    match cli.command {
+        Command::Inspect(InspectCommand {
+            command: InspectSubcommand::Maintenance(command),
+        }) => assert_eq!(command.config, "custom.toml"),
+        command => panic!("expected inspect maintenance command, got {command:?}"),
+    }
+}
+
+#[test]
 fn test_inspect_manifest_reads_local_storage_manifest() {
     let root = temp_storage_root("inspect-manifest");
     let storage = LocalStorage::new(&root);
@@ -269,6 +287,40 @@ fn test_inspect_usage_reads_application_ledger() {
     assert_eq!(output["usage"]["events"][0]["query_outcome"], "filled");
     assert_eq!(output["usage"]["events"][0]["cache_outcome"], "miss");
     assert_eq!(output["usage"]["events"][0]["fill_outcome"], "written");
+}
+
+#[test]
+fn test_inspect_maintenance_reports_stable_dry_run_json() {
+    let root = temp_storage_root("inspect-maintenance");
+    let storage = LocalStorage::new(&root);
+    let object_key = write_block_coverage(&storage, 40, 40);
+    storage
+        .object_store()
+        .delete(&object_key)
+        .expect("delete object");
+    let config = write_config("inspect-maintenance", &root);
+
+    let output = inspect_summary(InspectCommand {
+        command: InspectSubcommand::Maintenance(ConfigCommand { config }),
+    })
+    .expect("inspect maintenance");
+
+    assert_eq!(output["status"], "ok");
+    assert_eq!(output["read_only"], true);
+    assert_eq!(output["maintenance"]["mode"], "dry_run");
+    assert_eq!(output["maintenance"]["check"]["issue_count"], 1);
+    assert_eq!(
+        output["maintenance"]["check"]["issues"][0]["issue_kind"],
+        "missing_object"
+    );
+    assert_eq!(
+        output["maintenance"]["retention"]["policy"]["delete_current_manifest_objects"],
+        false
+    );
+    assert_eq!(
+        output["maintenance"]["usage_ledger"]["rollup_model"]["source"],
+        "append_only_jsonl_events"
+    );
 }
 
 #[test]
@@ -657,7 +709,7 @@ fn test_chain() -> ChainIdentity {
     ChainIdentity::expect_with_network_id(ChainFamily::Evm, "ethereum", NetworkId::numeric(1))
 }
 
-fn write_block_coverage(storage: &LocalStorage, start: u64, end: u64) {
+fn write_block_coverage(storage: &LocalStorage, start: u64, end: u64) -> String {
     let rows = DatasetRows::new(
         DatasetKey::evm_blocks(),
         QueryRows::EvmBlocks(vec![BlockHeader {
@@ -678,7 +730,10 @@ fn write_block_coverage(storage: &LocalStorage, start: u64, end: u64) {
             finality_level: FinalityLevel::Safe,
             record_empty_coverage: true,
         })
-        .expect("write block coverage");
+        .expect("write block coverage")
+        .data_object
+        .expect("data object")
+        .object_key
 }
 
 fn write_empty_log_coverage(storage: &LocalStorage, start: u64, end: u64) {

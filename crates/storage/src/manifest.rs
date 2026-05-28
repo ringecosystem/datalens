@@ -190,3 +190,12 @@ impl TryFrom<FinalityLevel> for ManifestFinalityLevel {
         }
     }
 }
+
+impl ManifestFinalityLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Safe => "safe",
+            Self::Finalized => "finalized",
+        }
+    }
+}
