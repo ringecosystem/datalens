@@ -638,6 +638,10 @@ pub fn doctor_chain_summary(
                     "enabled": true,
                     "max_slot_range_len": chain.datasets.blocks.max_batch_blocks,
                 },
+                "blocks": {
+                    "enabled": true,
+                    "max_slot_range_len": chain.datasets.blocks.max_batch_blocks,
+                },
                 "transactions": {
                     "enabled": true,
                     "max_slot_range_len": chain.datasets.blocks.max_batch_blocks,

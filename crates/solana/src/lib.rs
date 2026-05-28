@@ -1,5 +1,10 @@
 //! Solana chain-family adapter boundary.
 
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
+
 use datalens_chain::{
     AdapterCapabilities, AdapterKey, CanonicalBlock, CanonicalBlockRequest, ChainAdapter,
     ChainFetchRequest, ChainFetchResponse, ChainHeight, DatasetCapability, DatasetSelector,
@@ -21,6 +26,7 @@ const SOLANA_PROGRAM_KIND: &str = "solana_program";
 const SOLANA_SIGNATURE_KIND: &str = "solana_signature";
 const FINALIZED: SolanaCommitment = SolanaCommitment::Finalized;
 const LATEST: SolanaCommitment = SolanaCommitment::Processed;
+type FinalizedBlockCache = Arc<Mutex<HashMap<(u64, u64), Vec<SolanaBlock>>>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SolanaCommitment {
@@ -48,6 +54,7 @@ pub struct SolanaBlock {
     pub parent_slot: u64,
     pub block_time: Option<u64>,
     pub transactions: Vec<SolanaTransaction>,
+    pub raw: Value,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -100,6 +107,7 @@ pub struct SolanaAdapter<P> {
     chain: ChainIdentity,
     provider: P,
     max_slot_range_len: u64,
+    finalized_blocks: FinalizedBlockCache,
 }
 
 impl<P> SolanaAdapter<P>
@@ -111,6 +119,7 @@ where
             chain,
             provider,
             max_slot_range_len: 64,
+            finalized_blocks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -145,19 +154,35 @@ where
         &self,
         range: &LedgerRange,
     ) -> Result<(Vec<SolanaBlock>, usize), DatalensError> {
+        let cache_key = (range.start(), range.end());
+        if let Some(blocks) = self
+            .finalized_blocks
+            .lock()
+            .expect("Solana finalized block cache")
+            .get(&cache_key)
+            .cloned()
+        {
+            return Ok((blocks, 1));
+        }
+
         let slots = self.provider.get_blocks_with_limit(
             range.start(),
             range.len().min(u128::from(u64::MAX)) as u64,
             FINALIZED,
         )?;
         let mut blocks = Vec::new();
+        let mut provider_calls = 1;
         for slot in slots.into_iter().filter(|slot| range.contains(*slot)) {
+            provider_calls += 1;
             if let Some(block) = self.provider.get_block(slot, FINALIZED)? {
                 blocks.push(block);
             }
         }
         blocks.sort_by_key(|block| block.slot);
-        let provider_calls = blocks.len() + 1;
+        self.finalized_blocks
+            .lock()
+            .expect("Solana finalized block cache")
+            .insert(cache_key, blocks.clone());
         Ok((blocks, provider_calls))
     }
 
@@ -197,18 +222,17 @@ where
 {
     fn capabilities(&self) -> AdapterCapabilities {
         AdapterCapabilities::new(self.chain.clone())
-            .with_dataset_capability(
-                DatasetCapability::new(DatasetKey::solana_slots())
-                    .with_selector(SelectorKind::Other(adapter_key(SOLANA_ALL_KIND)))
-                    .with_range(HeightRangeKind::Slot)
-                    .with_max_range_len(self.max_slot_range_len)
-                    .with_empty_coverage(true)
-                    .with_finalized_height(true)
-                    .with_range_split(true)
-                    .with_reorg_signals(true),
-            )
+            .with_dataset_capability(solana_all_slot_capability(
+                DatasetKey::solana_slots(),
+                self.max_slot_range_len,
+            ))
+            .with_dataset_capability(solana_all_slot_capability(
+                DatasetKey::solana_blocks(),
+                self.max_slot_range_len,
+            ))
             .with_dataset_capability(
                 DatasetCapability::new(DatasetKey::solana_transactions())
+                    .with_selector(SelectorKind::All)
                     .with_selector(SelectorKind::Other(adapter_key(SOLANA_ADDRESS_KIND)))
                     .with_selector(SelectorKind::Other(adapter_key(SOLANA_PROGRAM_KIND)))
                     .with_selector(SelectorKind::Other(adapter_key(SOLANA_SIGNATURE_KIND)))
@@ -221,6 +245,7 @@ where
             )
             .with_dataset_capability(
                 DatasetCapability::new(DatasetKey::solana_instructions())
+                    .with_selector(SelectorKind::All)
                     .with_selector(SelectorKind::Other(adapter_key(SOLANA_PROGRAM_KIND)))
                     .with_range(HeightRangeKind::Slot)
                     .with_max_range_len(self.max_slot_range_len)
@@ -335,6 +360,7 @@ where
         let (blocks, provider_calls) = self.fetch_blocks_for_range(&range)?;
         let rows = match &request.dataset_key {
             dataset if *dataset == DatasetKey::solana_slots() => slot_rows(&blocks),
+            dataset if *dataset == DatasetKey::solana_blocks() => block_rows(&blocks),
             dataset if *dataset == DatasetKey::solana_transactions() => {
                 transaction_rows(&blocks, &request.selector)
             }
@@ -363,6 +389,21 @@ where
         .with_source_metadata(source_metadata)
         .with_provider_diagnostics(provider_diagnostics))
     }
+}
+
+fn solana_all_slot_capability(
+    dataset_key: DatasetKey,
+    max_slot_range_len: u64,
+) -> DatasetCapability {
+    DatasetCapability::new(dataset_key)
+        .with_selector(SelectorKind::Other(adapter_key(SOLANA_ALL_KIND)))
+        .with_selector(SelectorKind::All)
+        .with_range(HeightRangeKind::Slot)
+        .with_max_range_len(max_slot_range_len)
+        .with_empty_coverage(true)
+        .with_finalized_height(true)
+        .with_range_split(true)
+        .with_reorg_signals(true)
 }
 
 pub fn solana_all_selector() -> Result<DatasetSelector, DatalensError> {
@@ -457,6 +498,27 @@ fn slot_rows(blocks: &[SolanaBlock]) -> Vec<Value> {
         .collect()
 }
 
+fn block_rows(blocks: &[SolanaBlock]) -> Vec<Value> {
+    blocks
+        .iter()
+        .map(|block| {
+            json!({
+                "slot": block.slot,
+                "range_kind": "slot",
+                "block_height": block.block_height,
+                "blockhash": block.blockhash,
+                "previous_blockhash": block.previous_blockhash,
+                "parent_slot": block.parent_slot,
+                "block_time": block.block_time,
+                "transaction_count": block.transactions.len(),
+                "commitment": FINALIZED.as_str(),
+                "finality": "finalized",
+                "raw": block.raw,
+            })
+        })
+        .collect()
+}
+
 fn transaction_rows(blocks: &[SolanaBlock], selector: &DatasetSelector) -> Vec<Value> {
     let mut rows = Vec::new();
     for block in blocks {
@@ -484,14 +546,12 @@ fn transaction_rows(blocks: &[SolanaBlock], selector: &DatasetSelector) -> Vec<V
 }
 
 fn instruction_rows(blocks: &[SolanaBlock], selector: &DatasetSelector) -> Vec<Value> {
-    let Some(program_id) = selector_value(selector, SOLANA_PROGRAM_KIND, "program/") else {
-        return Vec::new();
-    };
+    let program_id = selector_value(selector, SOLANA_PROGRAM_KIND, "program/");
     let mut rows = Vec::new();
     for block in blocks {
         for transaction in &block.transactions {
             for (index, instruction) in transaction.instructions.iter().enumerate() {
-                if instruction.program_id == program_id {
+                if program_id.is_none_or(|program_id| instruction.program_id == program_id) {
                     rows.push(instruction_row(
                         block,
                         transaction,
@@ -502,7 +562,7 @@ fn instruction_rows(blocks: &[SolanaBlock], selector: &DatasetSelector) -> Vec<V
             }
             for group in &transaction.inner_instructions {
                 for (inner_index, instruction) in group.instructions.iter().enumerate() {
-                    if instruction.program_id == program_id {
+                    if program_id.is_none_or(|program_id| instruction.program_id == program_id) {
                         rows.push(instruction_row(
                             block,
                             transaction,
@@ -560,6 +620,7 @@ fn transaction_matches(transaction: &SolanaTransaction, selector: &DatasetSelect
         } if kind.as_str() == SOLANA_SIGNATURE_KIND => canonical_key
             .strip_prefix("signature/")
             .is_some_and(|signature| transaction.signature == signature),
+        DatasetSelector::All => true,
         _ => false,
     }
 }

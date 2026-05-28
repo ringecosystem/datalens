@@ -110,6 +110,10 @@ impl DatasetKey {
         Self::try_new(ChainFamily::Other("solana".to_owned()), "slots").unwrap()
     }
 
+    pub fn solana_blocks() -> Self {
+        Self::try_new(ChainFamily::Other("solana".to_owned()), "blocks").unwrap()
+    }
+
     pub fn solana_transactions() -> Self {
         Self::try_new(ChainFamily::Other("solana".to_owned()), "transactions").unwrap()
     }
