@@ -42,11 +42,16 @@ pub struct StorageDataObject {
     pub written_at_unix_seconds: u64,
 }
 
+mod hot_cache;
 mod maintenance;
 mod manifest;
 mod object_store;
 mod parquet_codec;
 mod usage_ledger;
+pub use hot_cache::{
+    HotBlockMetadata, HotCache, HotCacheConfig, HotEntryStatus, HotManifest, HotManifestEntry,
+    HotReorgOutcome, HotReorgReason, HotWriteOutcome, HotWriteRequest,
+};
 pub use maintenance::{
     CompactionCandidate, MaintenanceCheckReport, MaintenanceCompactionReport, MaintenanceIssue,
     MaintenanceIssueKind, MaintenanceOperation, MaintenanceOperationMode, MaintenanceReport,

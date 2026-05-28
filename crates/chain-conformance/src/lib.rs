@@ -102,6 +102,8 @@ where
     assert!(blocks.supports_empty_coverage());
     assert!(blocks.supports_range_split());
     assert!(blocks.supports_reorg_signals());
+    assert!(blocks.supports_canonical_block_lookup());
+    assert!(blocks.supports_latest_reorg_signal());
 
     let logs = capabilities
         .dataset(&DatasetKey::evm_logs())
@@ -115,6 +117,8 @@ where
     assert!(logs.supports_empty_coverage());
     assert!(logs.supports_range_split());
     assert!(logs.supports_reorg_signals());
+    assert!(logs.supports_canonical_block_lookup());
+    assert!(logs.supports_latest_reorg_signal());
 }
 
 pub fn assert_fetch_conformance<A>(adapter: &A, selector: DatasetSelector)

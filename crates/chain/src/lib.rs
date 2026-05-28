@@ -65,6 +65,8 @@ pub struct DatasetCapability {
     supports_provider_native_finality_tags: bool,
     supports_range_split: bool,
     supports_reorg_signals: bool,
+    supports_canonical_block_lookup: bool,
+    supports_latest_reorg_signal: bool,
 }
 
 impl DatasetCapability {
@@ -82,6 +84,8 @@ impl DatasetCapability {
             supports_provider_native_finality_tags: false,
             supports_range_split: false,
             supports_reorg_signals: false,
+            supports_canonical_block_lookup: false,
+            supports_latest_reorg_signal: false,
         }
     }
 
@@ -140,6 +144,18 @@ impl DatasetCapability {
 
     pub fn with_reorg_signals(mut self, supports_reorg_signals: bool) -> Self {
         self.supports_reorg_signals = supports_reorg_signals;
+        self.supports_canonical_block_lookup = supports_reorg_signals;
+        self.supports_latest_reorg_signal = supports_reorg_signals;
+        self
+    }
+
+    pub fn with_canonical_block_lookup(mut self, supports_canonical_block_lookup: bool) -> Self {
+        self.supports_canonical_block_lookup = supports_canonical_block_lookup;
+        self
+    }
+
+    pub fn with_latest_reorg_signal(mut self, supports_latest_reorg_signal: bool) -> Self {
+        self.supports_latest_reorg_signal = supports_latest_reorg_signal;
         self
     }
 
@@ -193,6 +209,14 @@ impl DatasetCapability {
 
     pub fn supports_reorg_signals(&self) -> bool {
         self.supports_reorg_signals
+    }
+
+    pub fn supports_canonical_block_lookup(&self) -> bool {
+        self.supports_canonical_block_lookup
+    }
+
+    pub fn supports_latest_reorg_signal(&self) -> bool {
+        self.supports_latest_reorg_signal
     }
 }
 
