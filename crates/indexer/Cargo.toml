@@ -8,3 +8,5 @@ version.workspace = true
 datalens-chain = { path = "../chain" }
 datalens-core = { path = "../core" }
 datalens-metrics = { path = "../metrics" }
+datalens-storage = { path = "../storage" }
+datalens-writer = { path = "../writer" }

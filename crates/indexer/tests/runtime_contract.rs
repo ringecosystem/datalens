@@ -14,6 +14,8 @@ fn test_index_job_contract_captures_chain_datasets_range_and_run_mode() {
             dataset_key: DatasetKey::evm_logs(),
             selector: DatasetSelector::all(),
         }]),
+        finality_requirement: IndexFinalityRequirement::Safe,
+        runtime_config: IndexRuntimeConfig::default(),
         run_mode: IndexRunMode::Backfill,
         retry_policy: IndexRetryPolicy::default(),
     };
@@ -40,6 +42,8 @@ fn test_index_plan_splits_dataset_ranges_by_provider_safe_chunk_limit() {
             dataset_key: DatasetKey::evm_blocks(),
             selector: DatasetSelector::all(),
         }]),
+        finality_requirement: IndexFinalityRequirement::Safe,
+        runtime_config: IndexRuntimeConfig::default(),
         run_mode: IndexRunMode::Backfill,
         retry_policy: IndexRetryPolicy {
             max_attempts: 3,
@@ -110,7 +114,7 @@ fn test_index_plan_rejects_latest_or_out_of_boundary_durable_ranges() {
 
     assert!(latest_error.message.contains("safe or finalized"));
 
-    let boundary_error = IndexPlan::try_new(
+    let capped_plan = IndexPlan::try_new(
         job,
         ChainHeight::block(9).with_finality(FinalityLevel::Safe),
         vec![IndexDatasetProviderLimit {
@@ -120,9 +124,12 @@ fn test_index_plan_rejects_latest_or_out_of_boundary_durable_ranges() {
         }],
         Vec::new(),
     )
-    .expect_err("unsafe requested range is rejected");
+    .expect("range is capped at finality boundary");
 
-    assert!(boundary_error.message.contains("finality boundary"));
+    assert_eq!(
+        capped_plan.planned_range,
+        LedgerRange::blocks(1, 9).expect("capped range")
+    );
 }
 
 #[test]
@@ -154,6 +161,7 @@ fn test_verify_mode_plans_coverage_checks_without_write_chunks() {
 fn test_cursor_checkpoint_and_run_result_are_accounting_not_coverage() {
     let checkpoint = IndexCheckpoint {
         job_id: IndexJobId::new("job-1").expect("valid job id"),
+        chain: ethereum_identity(),
         chunk: IndexChunk {
             ordinal: 7,
             dataset_key: DatasetKey::evm_blocks(),
@@ -191,6 +199,7 @@ fn test_cursor_checkpoint_and_run_result_are_accounting_not_coverage() {
             skipped_ranges: 1,
             retries: 0,
             failures: 0,
+            ..IndexAccounting::default()
         },
     };
 
@@ -209,6 +218,8 @@ fn block_job(start: u64, end: u64, run_mode: IndexRunMode) -> IndexJob {
             dataset_key: DatasetKey::evm_blocks(),
             selector: DatasetSelector::all(),
         }]),
+        finality_requirement: IndexFinalityRequirement::Safe,
+        runtime_config: IndexRuntimeConfig::default(),
         run_mode,
         retry_policy: IndexRetryPolicy::default(),
     }
