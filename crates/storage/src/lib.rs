@@ -47,6 +47,7 @@ mod maintenance;
 mod manifest;
 mod object_store;
 mod parquet_codec;
+mod read_through_cache;
 mod usage_ledger;
 pub use hot_cache::{
     HOT_CACHE_SCHEMA_VERSION, HotBlockMetadata, HotCache, HotCacheCandidateStatus,
@@ -66,6 +67,7 @@ pub use object_store::{
     LocalObjectStore, ObjectMetadata, ObjectStore, S3ObjectStore, S3ObjectStoreConfig,
     validate_object_key,
 };
+pub use read_through_cache::ReadThroughCacheConfig;
 pub use usage_ledger::{
     CacheOutcome, FillOutcome, QueryOutcome, UsageLedgerEntry, UsageLedgerRepository,
     UsageLedgerStore,
@@ -74,6 +76,7 @@ pub use usage_ledger::{
 #[derive(Clone, Debug)]
 pub struct DurableStorage<S> {
     object_store: S,
+    read_through_cache: read_through_cache::ReadThroughCache,
 }
 
 pub type LocalStorage = DurableStorage<LocalObjectStore>;
@@ -82,6 +85,9 @@ impl DurableStorage<LocalObjectStore> {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             object_store: LocalObjectStore::new(root),
+            read_through_cache: read_through_cache::ReadThroughCache::new(
+                ReadThroughCacheConfig::default(),
+            ),
         }
     }
 
@@ -99,7 +105,22 @@ where
     S: ObjectStore,
 {
     pub fn from_object_store(object_store: S) -> Self {
-        Self { object_store }
+        Self::from_object_store_with_read_through_cache_config(
+            object_store,
+            ReadThroughCacheConfig::default(),
+        )
+    }
+
+    pub fn from_object_store_with_read_through_cache_config(
+        object_store: S,
+        read_through_cache_config: ReadThroughCacheConfig,
+    ) -> Self {
+        Self {
+            object_store,
+            read_through_cache: read_through_cache::ReadThroughCache::new(
+                read_through_cache_config,
+            ),
+        }
     }
 
     pub fn object_store(&self) -> &S {
@@ -165,18 +186,26 @@ where
                     format!("manifest entry object not found {object_key}"),
                 ));
             }
-            let bytes = self.object_store.get(object_key)?;
-            verify_manifest_object_metadata(&entry, object_key, &bytes)?;
             let encoding = entry.object_encoding.unwrap_or_else(|| {
                 ObjectEncoding::from_object_key(object_key).unwrap_or(ObjectEncoding::Json)
             });
-            let mut object_rows = decode_object_rows(encoding, dataset_key.clone(), &bytes)
-                .map_err(|error| {
-                    DatalensError::new(
-                        DatalensErrorKind::StorageReadFailure,
-                        format!("decode cached object {object_key}: {}", error.message),
-                    )
-                })?;
+            let mut object_rows =
+                if let Some(rows) = self.read_through_cache.get(object_key, &entry, encoding) {
+                    rows
+                } else {
+                    let bytes = self.object_store.get(object_key)?;
+                    verify_manifest_object_metadata(&entry, object_key, &bytes)?;
+                    let object_rows = decode_object_rows(encoding, dataset_key.clone(), &bytes)
+                        .map_err(|error| {
+                            DatalensError::new(
+                                DatalensErrorKind::StorageReadFailure,
+                                format!("decode cached object {object_key}: {}", error.message),
+                            )
+                        })?;
+                    self.read_through_cache
+                        .put(object_key, &entry, encoding, object_rows.clone());
+                    object_rows
+                };
             object_rows = filter_rows(object_rows, range.clone());
             rows.try_append(object_rows.into_rows())?;
         }
@@ -544,7 +573,7 @@ impl UsageLedgerRepository for Box<dyn UsageLedgerRepository> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ObjectEncoding {
     Json,
