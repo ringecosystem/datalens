@@ -1,0 +1,43 @@
+[server]
+bind = "127.0.0.1:3000"
+
+[storage]
+backend = "local"
+
+[storage.local]
+root = ".tmp/datalens-local"
+
+[planner]
+max_query_range_blocks = 1000
+default_chunk_range_blocks = 100
+
+[writer]
+target_object_bytes = 16777216
+min_object_rows = 1000
+record_empty_coverage = true
+
+[metrics]
+enabled = true
+default_application = "local"
+
+[applications]
+required = false
+
+[chains.ethereum]
+kind = "evm"
+chain_id = 1
+rpc_urls = ["${DATALENS_ETHEREUM_RPC_URL}"]
+
+[chains.ethereum.finality]
+mode = "lag"
+safe_lag_blocks = 32
+finalized_lag_blocks = 96
+
+[chains.ethereum.datasets.blocks]
+enabled = true
+max_batch_blocks = 100
+
+[chains.ethereum.datasets.logs]
+enabled = true
+max_get_logs_range_blocks = 1000
+max_addresses_per_query = 16

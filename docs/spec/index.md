@@ -71,3 +71,6 @@ Then keep the body explicit:
 - Technical architecture reorg-aware hot cache plan:
   `docs/spec/technical-architecture/en/07-hot-cache-layer.md` and
   `docs/spec/technical-architecture/zh-CN/07-hot-cache-layer.md`
+- Production runtime packaging, configuration, endpoint, storage, operations, and release
+  boundary:
+  `docs/spec/production-runtime.md`

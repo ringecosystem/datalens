@@ -122,6 +122,63 @@ The first implementation should write immutable logical chunks keyed by dataset,
 key, schema version, and range. Later offline compaction may merge compatible chunks, but
 compaction is an optimization and must not be required for correctness.
 
+## Maintenance Boundary
+
+Durable storage maintenance is an explicit operator-triggered boundary. The first
+implementation does not run a background scheduler and does not silently rewrite or delete
+objects. Maintenance reports use stable JSON so CI and operations scripts can consume the
+same output for local and S3-compatible object stores.
+
+Maintenance operation types:
+
+| Operation | First behavior | Writes storage |
+| --- | --- | --- |
+| `inspect_check` | Parse manifests and validate referenced objects. | No |
+| `compact` | Report compatible compaction candidates. | No, dry-run only |
+| `repair` | Report damaged coverage and recommended repair inputs. | No |
+| `retention_prune` | Report retention policy and deletion candidates. | No, dry-run only |
+| `usage_ledger_rollup` | Define append-only ledger rollup boundary. | No, model only |
+
+The first CLI entry is `datalens inspect maintenance`. It is read-only and returns a
+`maintenance` object containing check issues, compaction candidates, retention dry-run
+state, and usage ledger rollup model. Future write operations must require an explicit
+execute mode; dry-run remains the default for object rewriting or deletion.
+
+Maintenance check must report:
+
+- Manifest JSON decode failures.
+- Manifest entry objects that do not exist.
+- Object size and checksum mismatch against manifest metadata.
+- Object decode failures.
+- Contradictory coverage, such as overlapping logical coverage with incompatible
+  finality or object encoding.
+
+Every issue should include the chain, dataset key, selector fingerprint, range, object key
+when available, issue kind, and message. Repair is report-only in the first version. It
+must not refetch RPC data, delete objects, delete manifest entries, or mark entries damaged
+without a future explicit repair command and user confirmation.
+
+Compaction candidates are compatible only when chain, dataset key, selector fingerprint,
+range kind, finality level, object encoding, and schema version are compatible. Empty
+coverage must not be converted into a data object. Compaction must preserve coverage
+semantics and query results. If future compaction writes an object, it must write the new
+object successfully before updating the manifest. Old object deletion is out of scope for
+the first version and must remain protected by dry-run or a separate execute workflow.
+
+Retention policy inputs may include chain, dataset key, range age, object age, usage
+ledger activity, application attribution, and storage size. Retention must not delete an
+object referenced by current manifest coverage. Deleting superseded or obsolete objects
+requires proof that no effective manifest entry references the object. Usage ledger
+activity may extend retention for recently used ranges, but ledger entries do not create
+manifest coverage and do not override the current-object protection rule.
+
+Usage ledger maintenance treats ledger JSON Lines as append-only audit and accounting
+events. Future rollups may aggregate by application, chain, dataset, selector, range,
+finality, and time partition. Ledger retention is related to durable data retention only
+as an input signal; pruning ledger events must not prune durable data by itself. Ledger
+entries and maintenance output must not include secrets, tokens, raw credentials, or raw
+authorization headers.
+
 ## Chunk Range Sizing
 
 Chunk ranges should not be a single global constant. The range size should be chosen per

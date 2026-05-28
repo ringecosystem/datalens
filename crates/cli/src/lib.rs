@@ -99,6 +99,7 @@ pub struct InspectCommand {
 pub enum InspectSubcommand {
     Manifest(ConfigCommand),
     Coverage(ConfigCommand),
+    Maintenance(ConfigCommand),
     Usage(InspectUsageCommand),
 }
 
@@ -222,27 +223,33 @@ pub fn inspect_summary(command: InspectCommand) -> Result<serde_json::Value, Dat
     let config_path = inspect_config(&command.command).to_owned();
     let config = load_config(&config_path)?;
     validate_config(&config)?;
-    let storage = build_storage(&config)?;
-    let usage_ledger = build_usage_ledger(&config)?;
-    let manifest = storage.manifest()?;
-    let entries = manifest
-        .entries
-        .iter()
-        .map(inspect_manifest_entry)
-        .collect::<Vec<_>>();
-    let storage = inspect_storage_summary(&config);
+    let storage_summary = inspect_storage_summary(&config);
     let summary = match command.command {
-        InspectSubcommand::Manifest(_) => serde_json::json!({
-            "status": "ok",
-            "read_only": true,
-            "config": config_path,
-            "storage": storage,
-            "manifest": {
-                "entry_count": entries.len(),
-                "entries": entries,
-            },
-        }),
+        InspectSubcommand::Manifest(_) => {
+            let manifest = build_storage(&config)?.manifest()?;
+            let entries = manifest
+                .entries
+                .iter()
+                .map(inspect_manifest_entry)
+                .collect::<Vec<_>>();
+            serde_json::json!({
+                "status": "ok",
+                "read_only": true,
+                "config": config_path,
+                "storage": storage_summary,
+                "manifest": {
+                    "entry_count": entries.len(),
+                    "entries": entries,
+                },
+            })
+        }
         InspectSubcommand::Coverage(_) => {
+            let manifest = build_storage(&config)?.manifest()?;
+            let entries = manifest
+                .entries
+                .iter()
+                .map(inspect_manifest_entry)
+                .collect::<Vec<_>>();
             let data_object_count = manifest
                 .entries
                 .iter()
@@ -252,7 +259,7 @@ pub fn inspect_summary(command: InspectCommand) -> Result<serde_json::Value, Dat
                 "status": "ok",
                 "read_only": true,
                 "config": config_path,
-                "storage": storage,
+                "storage": storage_summary,
                 "coverage": {
                     "entry_count": entries.len(),
                     "data_object_count": data_object_count,
@@ -261,13 +268,24 @@ pub fn inspect_summary(command: InspectCommand) -> Result<serde_json::Value, Dat
                 },
             })
         }
+        InspectSubcommand::Maintenance(_) => {
+            let maintenance = maintenance_report(&config)?;
+            serde_json::json!({
+                "status": "ok",
+                "read_only": true,
+                "config": config_path,
+                "storage": storage_summary,
+                "maintenance": maintenance,
+            })
+        }
         InspectSubcommand::Usage(command) => {
+            let usage_ledger = build_usage_ledger(&config)?;
             let events = usage_ledger.read_application(&command.application)?;
             serde_json::json!({
                 "status": "ok",
                 "read_only": true,
                 "config": config_path,
-                "storage": storage,
+                "storage": storage_summary,
                 "usage": {
                     "application": command.application,
                     "event_count": events.len(),
@@ -283,6 +301,7 @@ fn inspect_config(command: &InspectSubcommand) -> &str {
     match command {
         InspectSubcommand::Manifest(command) => &command.config,
         InspectSubcommand::Coverage(command) => &command.config,
+        InspectSubcommand::Maintenance(command) => &command.config,
         InspectSubcommand::Usage(command) => &command.config,
     }
 }
@@ -697,6 +716,35 @@ fn build_storage(
             })?;
             let store = S3ObjectStore::from_config(s3)?;
             Ok(Box::new(DurableStorage::from_object_store(store)))
+        }
+        _ => Err(DatalensError::new(
+            DatalensErrorKind::UnsupportedDataset,
+            "storage.backend must be local or s3",
+        )),
+    }
+}
+
+fn maintenance_report(
+    config: &DatalensConfig,
+) -> Result<datalens_storage::MaintenanceReport, DatalensError> {
+    match config.storage.backend.as_str() {
+        "local" => {
+            let local = config.storage.local.as_ref().ok_or_else(|| {
+                DatalensError::new(
+                    DatalensErrorKind::InvalidInput,
+                    "storage.local.root or legacy storage.root must be set",
+                )
+            })?;
+            LocalStorage::new(&local.root).maintenance_report()
+        }
+        "s3" => {
+            let s3 = config.storage.s3.clone().ok_or_else(|| {
+                DatalensError::new(
+                    DatalensErrorKind::InvalidInput,
+                    "storage.s3 must be set when storage.backend is s3",
+                )
+            })?;
+            DurableStorage::from_object_store(S3ObjectStore::from_config(s3)?).maintenance_report()
         }
         _ => Err(DatalensError::new(
             DatalensErrorKind::UnsupportedDataset,
