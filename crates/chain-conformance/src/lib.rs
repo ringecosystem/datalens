@@ -8,8 +8,8 @@ use std::{
 };
 
 use datalens_chain::{
-    ChainAdapter, ChainFetchRequest, DatasetSelector, FetchContext, FinalityKind, HeightRangeKind,
-    SelectorKind, validate_durable_range,
+    AdapterKey, ChainAdapter, ChainFetchRequest, DatasetSelector, FetchContext, FinalityKind,
+    HeightRangeKind, SelectorKind, validate_durable_range,
 };
 use datalens_core::{
     ChainFamily, ChainIdentity, DatalensErrorKind, DatasetKey, LedgerRange, LogFilter, NetworkId,
@@ -79,6 +79,46 @@ impl FixtureProvider {
 
     pub fn requests(&self) -> Vec<Value> {
         self.requests.lock().expect("requests").clone()
+    }
+}
+
+#[derive(Clone)]
+pub struct SolanaFixtureProvider {
+    chain: ChainIdentity,
+}
+
+impl SolanaFixtureProvider {
+    pub fn solana() -> Self {
+        Self {
+            chain: ChainIdentity::try_new(
+                ChainFamily::Other("solana".to_owned()),
+                "solana-mainnet-beta",
+                Some(NetworkId::textual("mainnet-beta").expect("valid network id")),
+            )
+            .expect("valid chain"),
+        }
+    }
+
+    pub fn chain(&self) -> ChainIdentity {
+        self.chain.clone()
+    }
+
+    pub fn all_selector(&self) -> DatasetSelector {
+        DatasetSelector::try_other(
+            AdapterKey::try_new("solana_all").expect("adapter key"),
+            "solana-all/all",
+            "all",
+        )
+        .expect("valid selector")
+    }
+
+    pub fn program_selector(&self) -> DatasetSelector {
+        DatasetSelector::try_other(
+            AdapterKey::try_new("solana_program").expect("adapter key"),
+            "solana-program/959c1dfe13b28404",
+            "program/program1111111111111111111111111111111111",
+        )
+        .expect("valid selector")
     }
 }
 
@@ -305,6 +345,221 @@ where
     );
     assert!(response.provider_diagnostics.calls > 0);
     assert_eq!(response.dataset_key, DatasetKey::evm_logs());
+    assert_eq!(
+        response.coverage_selector.canonical_key(),
+        request.selector.canonical_key()
+    );
+}
+
+pub fn assert_solana_capability_conformance<A>(adapter: &A, expected_chain: ChainIdentity)
+where
+    A: ChainAdapter,
+{
+    let capabilities = adapter.capabilities();
+    assert_eq!(capabilities.chain(), &expected_chain);
+    assert!(
+        capabilities
+            .datasets()
+            .contains(&DatasetKey::solana_slots())
+    );
+    assert!(
+        capabilities
+            .datasets()
+            .contains(&DatasetKey::solana_transactions())
+    );
+    assert!(
+        capabilities
+            .datasets()
+            .contains(&DatasetKey::solana_instructions())
+    );
+
+    let slots = capabilities
+        .dataset(&DatasetKey::solana_slots())
+        .expect("slots capability");
+    assert!(slots.supports_selector(SelectorKind::Other(
+        AdapterKey::try_new("solana_all").expect("adapter key")
+    )));
+    assert!(slots.ranges().contains(&HeightRangeKind::Slot));
+    assert_eq!(slots.max_range_len(), Some(64));
+    assert!(slots.supports_finalized_height());
+    assert!(!slots.supports_safe_height());
+    assert!(slots.supports_empty_coverage());
+    assert!(slots.supports_range_split());
+    assert!(slots.supports_reorg_signals());
+
+    let transactions = capabilities
+        .dataset(&DatasetKey::solana_transactions())
+        .expect("transactions capability");
+    assert!(transactions.supports_selector(SelectorKind::Other(
+        AdapterKey::try_new("solana_program").expect("adapter key")
+    )));
+    assert!(transactions.supports_selector(SelectorKind::Other(
+        AdapterKey::try_new("solana_address").expect("adapter key")
+    )));
+    assert!(transactions.ranges().contains(&HeightRangeKind::Slot));
+
+    let instructions = capabilities
+        .dataset(&DatasetKey::solana_instructions())
+        .expect("instructions capability");
+    assert!(instructions.supports_selector(SelectorKind::Other(
+        AdapterKey::try_new("solana_program").expect("adapter key")
+    )));
+    assert!(instructions.ranges().contains(&HeightRangeKind::Slot));
+}
+
+pub fn assert_solana_fetch_conformance<A>(adapter: &A, selector: DatasetSelector)
+where
+    A: ChainAdapter,
+{
+    let chain = adapter.capabilities().chain().clone();
+    let all_selector = SolanaFixtureProvider::solana().all_selector();
+    let slots_request = ChainFetchRequest::new(
+        chain.clone(),
+        DatasetKey::solana_slots(),
+        LedgerRange::slots(10, 12).expect("valid range"),
+        all_selector,
+    );
+    let slots = adapter.fetch(slots_request.clone()).expect("slots");
+    slots
+        .validate_for_request(&slots_request)
+        .expect("response matches request");
+    let QueryRows::AdapterJson { rows, .. } = slots.rows.rows() else {
+        panic!("expected Solana adapter JSON rows");
+    };
+    assert_eq!(
+        rows.iter()
+            .map(|row| row["slot"].as_u64().expect("slot"))
+            .collect::<Vec<_>>(),
+        [10, 12]
+    );
+    assert!(rows.iter().all(|row| row["range_kind"] == "slot"));
+    assert!(rows.iter().all(|row| row["commitment"] == "finalized"));
+    assert!(rows.iter().all(|row| row["blockhash"].is_string()));
+    assert!(rows.iter().all(|row| row["previous_blockhash"].is_string()));
+    assert!(rows.iter().all(|row| row["parent_slot"].is_u64()));
+
+    let transaction_request = ChainFetchRequest::new(
+        chain.clone(),
+        DatasetKey::solana_transactions(),
+        LedgerRange::slots(10, 12).expect("valid range"),
+        selector.clone(),
+    );
+    let transactions = adapter
+        .fetch(transaction_request.clone())
+        .expect("transactions");
+    transactions
+        .validate_for_request(&transaction_request)
+        .expect("response matches request");
+    let QueryRows::AdapterJson { rows, .. } = transactions.rows.rows() else {
+        panic!("expected Solana transaction rows");
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["slot"], 10);
+    assert_eq!(rows[0]["signature"], "sig-slot-10");
+
+    let empty_request = ChainFetchRequest::new(
+        chain.clone(),
+        DatasetKey::solana_transactions(),
+        LedgerRange::slots(12, 12).expect("valid range"),
+        selector.clone(),
+    );
+    let empty = adapter.fetch(empty_request.clone()).expect("empty");
+    empty
+        .validate_for_request(&empty_request)
+        .expect("empty response matches request");
+    assert_eq!(empty.rows.row_count(), 0);
+
+    let error = adapter
+        .fetch(ChainFetchRequest::new(
+            chain.clone(),
+            DatasetKey::evm_logs(),
+            LedgerRange::slots(10, 10).expect("valid range"),
+            selector.clone(),
+        ))
+        .expect_err("unsupported dataset");
+    assert_eq!(error.kind, DatalensErrorKind::UnsupportedDataset);
+
+    let error = adapter
+        .fetch(ChainFetchRequest::new(
+            chain,
+            DatasetKey::solana_slots(),
+            LedgerRange::blocks(10, 10).expect("valid range"),
+            selector,
+        ))
+        .expect_err("unsupported range");
+    assert_eq!(error.kind, DatalensErrorKind::UnsupportedDataset);
+}
+
+pub fn assert_solana_finality_conformance<A>(adapter: &A)
+where
+    A: ChainAdapter,
+{
+    let latest = adapter.latest_height().expect("latest slot");
+    let safe = adapter.cache_safe_height().expect("cache-safe slot");
+    let finalized = adapter.finalized_height().expect("finalized slot");
+
+    assert_eq!(latest.range_kind, HeightRangeKind::Slot);
+    assert_eq!(latest.value, 14);
+    assert_eq!(latest.finality, FinalityKind::Latest);
+    assert_eq!(safe.range_kind, HeightRangeKind::Slot);
+    assert_eq!(safe.value, 12);
+    assert_eq!(safe.finality, FinalityKind::Finalized);
+    assert_eq!(finalized, safe);
+    validate_durable_range(&LedgerRange::slots(10, safe.value).unwrap(), &safe)
+        .expect("finalized slot can authorize durable writes");
+}
+
+pub fn assert_solana_reorg_signal_conformance<A>(adapter: &A)
+where
+    A: ChainAdapter,
+{
+    let signal = adapter
+        .reorg_signal(HeightRangeKind::Slot, 12)
+        .expect("slot signal");
+    assert_eq!(signal.range_kind, HeightRangeKind::Slot);
+    assert_eq!(signal.height, 12);
+    assert_eq!(signal.hash, "slot-12-hash");
+    assert_eq!(signal.parent_hash, "slot-10-hash");
+    assert!(signal.timestamp.is_some());
+
+    let latest = adapter.latest_reorg_signal().expect("latest signal");
+    assert_eq!(latest.range_kind, HeightRangeKind::Slot);
+    assert_eq!(latest.height, 14);
+    assert_eq!(latest.hash, "slot-14-latest");
+
+    let error = adapter
+        .reorg_signal(HeightRangeKind::Block, 12)
+        .expect_err("unsupported block signal");
+    assert_eq!(error.kind, DatalensErrorKind::UnsupportedDataset);
+}
+
+pub fn assert_solana_metadata_conformance<A>(adapter: &A, selector: DatasetSelector)
+where
+    A: ChainAdapter,
+{
+    let chain = adapter.capabilities().chain().clone();
+    let request = ChainFetchRequest::new(
+        chain,
+        DatasetKey::solana_transactions(),
+        LedgerRange::slots(10, 12).expect("valid range"),
+        selector,
+    )
+    .with_context(FetchContext {
+        request_id: Some("conformance-request".to_owned()),
+        cache_write: true,
+    });
+    let response = adapter.fetch(request.clone()).expect("metadata response");
+
+    response
+        .validate_for_request(&request)
+        .expect("response matches request");
+    assert_eq!(response.source_metadata.provider, "solana-fixture");
+    assert_eq!(
+        response.source_metadata.request_id.as_deref(),
+        Some("conformance-request")
+    );
+    assert!(response.provider_diagnostics.calls > 0);
+    assert_eq!(response.dataset_key, DatasetKey::solana_transactions());
     assert_eq!(
         response.coverage_selector.canonical_key(),
         request.selector.canonical_key()

@@ -581,6 +581,60 @@ fn test_validate_config_keeps_legacy_storage_root_compatible() {
 }
 
 #[test]
+fn test_validate_config_accepts_evm_and_solana_chains_together() {
+    let config: DatalensConfig = toml::from_str(
+        r#"
+        [server]
+        bind = "127.0.0.1:8080"
+
+        [storage]
+        backend = "local"
+        root = ".datalens/storage"
+
+        [planner]
+        max_query_range_blocks = 100
+        default_chunk_range_blocks = 10
+
+        [writer]
+        target_object_bytes = 1024
+        min_object_rows = 1
+        record_empty_coverage = true
+
+        [chains.ethereum]
+        kind = "evm"
+        chain_id = 1
+        rpc_urls = ["http://example.invalid/ethereum"]
+
+        [chains.ethereum.datasets.blocks]
+        enabled = true
+        max_batch_blocks = 10
+
+        [chains.ethereum.datasets.logs]
+        enabled = true
+        max_get_logs_range_blocks = 10
+        max_addresses_per_query = 2
+
+        [chains.solana-mainnet-beta]
+        kind = "solana"
+        chain_id = 101
+        rpc_urls = ["http://example.invalid/solana"]
+
+        [chains.solana-mainnet-beta.datasets.blocks]
+        enabled = false
+        max_batch_blocks = 10
+
+        [chains.solana-mainnet-beta.datasets.logs]
+        enabled = false
+        max_get_logs_range_blocks = 10
+        max_addresses_per_query = 1
+        "#,
+    )
+    .expect("config parses");
+
+    validate_config(&config).expect("mixed EVM and Solana config is valid");
+}
+
+#[test]
 fn test_doctor_chain_summary_rejects_unknown_auto_finality_without_profile() {
     let (url, _requests) =
         start_rpc_server(vec![unsupported_tag_response(), unsupported_tag_response()]);

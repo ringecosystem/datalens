@@ -420,12 +420,35 @@ impl ReorgSignal {
             timestamp,
         }
     }
+
+    pub fn slot(
+        height: u64,
+        hash: impl Into<String>,
+        parent_hash: impl Into<String>,
+        timestamp: Option<u64>,
+    ) -> Self {
+        Self {
+            range_kind: HeightRangeKind::Slot,
+            height,
+            hash: hash.into(),
+            parent_hash: parent_hash.into(),
+            timestamp,
+        }
+    }
 }
 
 impl ChainHeight {
     pub fn block(value: u64) -> Self {
         Self {
             range_kind: HeightRangeKind::Block,
+            value,
+            finality: FinalityLevel::Latest,
+        }
+    }
+
+    pub fn slot(value: u64) -> Self {
+        Self {
+            range_kind: HeightRangeKind::Slot,
             value,
             finality: FinalityLevel::Latest,
         }
