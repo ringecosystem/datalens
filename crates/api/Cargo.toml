@@ -9,6 +9,7 @@ axum.workspace = true
 datalens-chain = { path = "../chain" }
 datalens-core = { path = "../core" }
 datalens-executor = { path = "../executor" }
+datalens-metrics = { path = "../metrics" }
 datalens-planner = { path = "../planner" }
 datalens-storage = { path = "../storage" }
 datalens-writer = { path = "../writer" }
@@ -17,3 +18,6 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 toml.workspace = true
+
+[dev-dependencies]
+tower = { version = "0.5.2", features = ["util"] }

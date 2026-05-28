@@ -12,6 +12,7 @@ use datalens_core::{
     DatasetKey, DatasetRows, LedgerRange, LogFilter, NetworkId, QueryRows,
 };
 use datalens_executor::{NativeQueryExecutionConfig, NativeQueryExecutor};
+use datalens_metrics::{ApplicationIdentity, MetricsRecorder};
 use datalens_planner::{FieldSelection, NativePlannerConfig, NativeQueryInput, ResponseShape};
 use datalens_storage::{LocalStorage, StorageRepository, StorageWriteOutcome, StorageWriteRequest};
 use datalens_writer::{DurableWriteRequest, DurableWriteSegment, DurableWriterConfig};
@@ -199,6 +200,94 @@ fn test_executor_partial_hit_reads_only_planned_read_segments() {
 }
 
 #[test]
+fn test_executor_records_metrics_for_cache_hit_and_fill_paths() {
+    let storage = LocalStorage::new(temp_storage_root("executor-metrics-hit-fill"));
+    seed_blocks(&storage, 1, 2, vec![block(1, "0x01"), block(2, "0x02")]);
+    let source = MockSource::default().with_blocks(vec![
+        block(1, "0x01"),
+        block(2, "0x02"),
+        block(3, "0x03"),
+        block(4, "0x04"),
+    ]);
+    let recorder = MetricsRecorder::new().expect("metrics recorder");
+    let executor = executor(storage, source.clone())
+        .with_metrics(recorder.clone(), ApplicationIdentity::named("api"));
+
+    executor
+        .execute(blocks_input(1, 2))
+        .expect("cache hit succeeds");
+    executor
+        .execute(blocks_input(1, 4))
+        .expect("partial fill succeeds");
+
+    let output = recorder.encode().expect("prometheus text");
+    assert!(output.contains(
+        r#"datalens_query_total{application="api",chain="ethereum",chain_kind="evm",dataset="blocks",outcome="hit"} 1"#
+    ));
+    assert!(output.contains(
+        r#"datalens_query_total{application="api",chain="ethereum",chain_kind="evm",dataset="blocks",outcome="partial_hit"} 1"#
+    ));
+    assert!(output.contains(
+        r#"datalens_cache_coverage_total{application="api",chain="ethereum",chain_kind="evm",dataset="blocks",outcome="hit"} 1"#
+    ));
+    assert!(output.contains(
+        r#"datalens_cache_coverage_total{application="api",chain="ethereum",chain_kind="evm",dataset="blocks",outcome="partial_hit"} 1"#
+    ));
+    assert!(output.contains(
+        r#"datalens_fill_total{application="api",chain="ethereum",chain_kind="evm",dataset="blocks",outcome="filled"} 1"#
+    ));
+    assert!(output.contains(
+        r#"datalens_application_chain_latest_requested_block{application="api",chain="ethereum",chain_kind="evm",dataset="blocks"} 4"#
+    ));
+    assert!(output.contains(
+        r#"datalens_application_chain_latest_filled_block{application="api",chain="ethereum",chain_kind="evm",dataset="blocks"} 4"#
+    ));
+}
+
+#[test]
+fn test_executor_records_provider_and_storage_errors_without_rewriting_errors() {
+    let provider_recorder = MetricsRecorder::new().expect("provider metrics recorder");
+    let provider_executor = executor(
+        LocalStorage::new(temp_storage_root("executor-provider-metrics")),
+        MockSource::default().with_error(DatalensErrorKind::ProviderLimit),
+    )
+    .with_metrics(provider_recorder.clone(), ApplicationIdentity::named("api"));
+
+    let provider_error = provider_executor
+        .execute(blocks_input(1, 1))
+        .expect_err("provider error is returned");
+
+    assert_eq!(provider_error.kind, DatalensErrorKind::ProviderLimit);
+    let provider_output = provider_recorder.encode().expect("prometheus text");
+    assert!(provider_output.contains(
+        r#"datalens_query_total{application="api",chain="ethereum",chain_kind="evm",dataset="blocks",outcome="error"} 1"#
+    ));
+    assert!(provider_output.contains(
+        r#"datalens_fill_total{application="api",chain="ethereum",chain_kind="evm",dataset="blocks",outcome="error"} 1"#
+    ));
+    assert!(provider_output.contains(
+        r#"datalens_provider_error_total{chain="ethereum",chain_kind="evm",dataset="blocks",error_kind="provider_limit"} 1"#
+    ));
+
+    let storage_recorder = MetricsRecorder::new().expect("storage metrics recorder");
+    let storage_executor = executor(
+        FailingStorage::new(DatalensErrorKind::StorageReadFailure),
+        MockSource::default(),
+    )
+    .with_metrics(storage_recorder.clone(), ApplicationIdentity::named("api"));
+
+    let storage_error = storage_executor
+        .execute(blocks_input(1, 1))
+        .expect_err("storage error is returned");
+
+    assert_eq!(storage_error.kind, DatalensErrorKind::StorageReadFailure);
+    let storage_output = storage_recorder.encode().expect("prometheus text");
+    assert!(storage_output.contains(
+        r#"datalens_storage_error_total{chain="ethereum",chain_kind="evm",dataset="blocks",error_kind="storage_read_failure"} 1"#
+    ));
+}
+
+#[test]
 fn test_executor_rejects_fetch_response_chain_mismatch_without_cache_write() {
     assert_response_mismatch_not_cached(
         "executor-chain-mismatch",
@@ -340,6 +429,55 @@ impl StorageRepository for CountingStorage {
     }
 }
 
+#[derive(Clone)]
+struct FailingStorage {
+    kind: DatalensErrorKind,
+}
+
+impl FailingStorage {
+    fn new(kind: DatalensErrorKind) -> Self {
+        Self { kind }
+    }
+}
+
+impl StorageRepository for FailingStorage {
+    fn covered_ranges(
+        &self,
+        _chain: &ChainIdentity,
+        _dataset_key: &DatasetKey,
+        _selector: &DatasetSelector,
+        _range: LedgerRange,
+    ) -> Result<Vec<LedgerRange>, DatalensError> {
+        Err(DatalensError::new(
+            self.kind.clone(),
+            "injected storage failure",
+        ))
+    }
+
+    fn read_rows(
+        &self,
+        _chain: &ChainIdentity,
+        _dataset_key: &DatasetKey,
+        _selector: &DatasetSelector,
+        _range: LedgerRange,
+    ) -> Result<DatasetRows, DatalensError> {
+        Err(DatalensError::new(
+            self.kind.clone(),
+            "injected storage failure",
+        ))
+    }
+
+    fn write_rows(
+        &self,
+        _request: StorageWriteRequest<'_>,
+    ) -> Result<StorageWriteOutcome, DatalensError> {
+        Err(DatalensError::new(
+            self.kind.clone(),
+            "injected storage failure",
+        ))
+    }
+}
+
 fn seed_blocks(storage: &LocalStorage, start: u64, end: u64, blocks: Vec<BlockHeader>) {
     datalens_writer::DurableWriter::new(
         storage.clone(),
@@ -418,6 +556,7 @@ struct MockSource {
     calls: Arc<Mutex<Vec<SourceCall>>>,
     response_mutation: Arc<Mutex<Option<ResponseMutation>>>,
     safe_height_error: Arc<Mutex<Option<DatalensErrorKind>>>,
+    error: Arc<Mutex<Option<DatalensErrorKind>>>,
 }
 
 impl Default for MockSource {
@@ -427,6 +566,7 @@ impl Default for MockSource {
             calls: Arc::new(Mutex::new(Vec::new())),
             response_mutation: Arc::new(Mutex::new(None)),
             safe_height_error: Arc::new(Mutex::new(None)),
+            error: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -450,6 +590,11 @@ impl MockSource {
             .safe_height_error
             .lock()
             .expect("safe height error lock") = Some(kind);
+        self
+    }
+
+    fn with_error(self, kind: DatalensErrorKind) -> Self {
+        *self.error.lock().expect("error lock") = Some(kind);
         self
     }
 
@@ -503,6 +648,9 @@ impl ChainAdapter for MockSource {
             .lock()
             .expect("calls lock")
             .push(SourceCall::Blocks(range));
+        if let Some(kind) = self.error.lock().expect("error lock").clone() {
+            return Err(DatalensError::new(kind, "injected provider failure"));
+        }
         let rows = self
             .blocks
             .lock()

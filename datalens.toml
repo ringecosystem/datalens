@@ -14,6 +14,10 @@ target_object_bytes = 67108864
 min_object_rows = 1000
 record_empty_coverage = true
 
+[metrics]
+enabled = true
+default_application = "datalens"
+
 [chains.ethereum]
 kind = "evm"
 chain_id = 1

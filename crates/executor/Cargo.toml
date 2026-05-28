@@ -7,6 +7,7 @@ version.workspace = true
 [dependencies]
 datalens-chain = { path = "../chain" }
 datalens-core = { path = "../core" }
+datalens-metrics = { path = "../metrics" }
 datalens-planner = { path = "../planner" }
 datalens-storage = { path = "../storage" }
 datalens-writer = { path = "../writer" }

@@ -15,6 +15,7 @@ use datalens_core::{
     LedgerRange, LogFilter, QueryRows,
 };
 use datalens_executor::{NativeQueryExecutionConfig, NativeQueryExecutor};
+use datalens_metrics::{ApplicationIdentity, MetricsRecorder};
 use datalens_planner::{NativePlannerConfig, NativeQueryInput};
 use datalens_storage::{S3ObjectStoreConfig, StorageRepository};
 use datalens_writer::DurableWriterConfig;
@@ -85,6 +86,8 @@ pub mod config {
         pub storage: StorageConfig,
         pub planner: PlannerConfig,
         pub writer: WriterConfig,
+        #[serde(default)]
+        pub metrics: MetricsConfig,
         pub chains: BTreeMap<String, ChainConfig>,
     }
 
@@ -169,6 +172,31 @@ pub mod config {
     }
 
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    pub struct MetricsConfig {
+        #[serde(default = "default_metrics_enabled")]
+        pub enabled: bool,
+        #[serde(default = "default_metrics_application")]
+        pub default_application: String,
+    }
+
+    impl Default for MetricsConfig {
+        fn default() -> Self {
+            Self {
+                enabled: default_metrics_enabled(),
+                default_application: default_metrics_application(),
+            }
+        }
+    }
+
+    fn default_metrics_enabled() -> bool {
+        true
+    }
+
+    fn default_metrics_application() -> String {
+        "datalens".to_owned()
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
     pub struct ChainConfig {
         pub kind: String,
         pub chain_id: u64,
@@ -241,7 +269,7 @@ pub mod config {
     }
 }
 
-use config::{ChainConfig, PlannerConfig, WriterConfig};
+use config::{ChainConfig, MetricsConfig, PlannerConfig, WriterConfig};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LegacyEvmQueryRequest {
@@ -299,6 +327,7 @@ pub struct QueryService<S> {
     executor: NativeQueryExecutor<Arc<dyn StorageRepository>, S>,
     chain_name: String,
     chain: ChainConfig,
+    metrics: Option<MetricsRecorder>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -338,8 +367,39 @@ where
         chain_name: impl Into<String>,
         chain: ChainConfig,
     ) -> Self {
+        Self::new_with_metrics_config(
+            storage,
+            source,
+            planner,
+            writer,
+            chain_name,
+            chain,
+            MetricsConfig::default(),
+        )
+        .expect("default metrics recorder initializes")
+    }
+
+    pub fn new_with_metrics_config(
+        storage: impl StorageRepository + 'static,
+        source: S,
+        planner: PlannerConfig,
+        writer: WriterConfig,
+        chain_name: impl Into<String>,
+        chain: ChainConfig,
+        metrics_config: MetricsConfig,
+    ) -> Result<Self, DatalensError> {
         let storage: Arc<dyn StorageRepository> = Arc::new(storage);
-        let executor = NativeQueryExecutor::new(
+        let recorder = if metrics_config.enabled {
+            Some(MetricsRecorder::new().map_err(|error| {
+                DatalensError::new(
+                    DatalensErrorKind::Internal,
+                    format!("initialize metrics recorder: {error}"),
+                )
+            })?)
+        } else {
+            None
+        };
+        let mut executor = NativeQueryExecutor::new(
             storage,
             source,
             NativeQueryExecutionConfig {
@@ -354,12 +414,19 @@ where
                 },
             },
         );
+        if let Some(recorder) = recorder.clone() {
+            executor = executor.with_metrics(
+                recorder,
+                ApplicationIdentity::named(metrics_config.default_application),
+            );
+        }
 
-        Self {
+        Ok(Self {
             executor,
             chain_name: chain_name.into(),
             chain,
-        }
+            metrics: recorder,
+        })
     }
 
     pub fn query(
@@ -417,6 +484,17 @@ where
         })
     }
 
+    pub fn metrics_text(&self) -> Option<Result<String, DatalensError>> {
+        self.metrics.as_ref().map(|recorder| {
+            recorder.encode().map_err(|error| {
+                DatalensError::new(
+                    DatalensErrorKind::Internal,
+                    format!("encode metrics: {error}"),
+                )
+            })
+        })
+    }
+
     fn validate_legacy_evm_route(
         &self,
         request: &LegacyEvmQueryRequest,
@@ -457,6 +535,7 @@ where
 {
     Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics::<S>))
         .route("/v1/chains", get(chains::<S>))
         .route("/v1/query", post(query::<S>))
         .with_state(AppState {
@@ -500,6 +579,24 @@ where
         })?
         .map(Json)
         .map_err(ApiError)
+}
+
+async fn metrics<S>(State(state): State<AppState<S>>) -> Result<Response, ApiError>
+where
+    S: ChainAdapter,
+{
+    match state.service.metrics_text() {
+        Some(Ok(text)) => Ok((
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; version=0.0.4",
+            )],
+            text,
+        )
+            .into_response()),
+        Some(Err(error)) => Err(ApiError(error)),
+        None => Ok(StatusCode::NOT_FOUND.into_response()),
+    }
 }
 
 struct ApiError(DatalensError);
