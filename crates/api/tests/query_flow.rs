@@ -8,7 +8,7 @@ use axum::{
     http::{Request, StatusCode},
 };
 use datalens_api::config::{
-    ChainConfig, DatasetsConfig, LogsDatasetConfig, PlannerConfig, WriterConfig,
+    ChainConfig, DatasetsConfig, LogsDatasetConfig, MetricsConfig, PlannerConfig, WriterConfig,
 };
 use datalens_api::{
     LegacyEvmQueryRequest, LegacyEvmQueryResponse, QueryService, QueryServiceRegistry, router,
@@ -511,6 +511,97 @@ fn test_provider_limit_error_is_classified() {
     assert!(!root.join("chains/evm/ethereum/1/manifest.json").exists());
 }
 
+#[tokio::test]
+async fn test_metrics_route_returns_prometheus_text_for_query_path() {
+    let storage = LocalStorage::new(temp_storage_root("metrics-route"));
+    let source = MockSource::default().with_blocks(vec![block(10, "0x10")]);
+    let service = service(storage, source);
+    let registry = QueryServiceRegistry::new()
+        .with_service(service)
+        .expect("register metrics service");
+    let router = datalens_api::router(registry);
+
+    let response = router
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/v1/query")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::to_vec(&blocks_request(10, 10)).expect("request body"),
+                ))
+                .expect("query request"),
+        )
+        .await
+        .expect("query response");
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+    let response = router
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::GET)
+                .uri("/metrics")
+                .body(axum::body::Body::empty())
+                .expect("metrics request"),
+        )
+        .await
+        .expect("metrics response");
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert_eq!(
+        response.headers().get(axum::http::header::CONTENT_TYPE),
+        Some(&axum::http::HeaderValue::from_static(
+            "text/plain; version=0.0.4"
+        ))
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("metrics body");
+    let text = std::str::from_utf8(&body).expect("utf8 metrics");
+    assert!(text.contains(
+        r#"datalens_query_total{application="datalens",chain="ethereum",chain_kind="evm",dataset="blocks",outcome="filled"} 1"#
+    ));
+    assert!(text.contains(
+        r#"datalens_cache_coverage_total{application="datalens",chain="ethereum",chain_kind="evm",dataset="blocks",outcome="miss"} 1"#
+    ));
+    assert!(text.contains(
+        r#"datalens_application_chain_latest_requested_block{application="datalens",chain="ethereum",chain_kind="evm",dataset="blocks"} 10"#
+    ));
+}
+
+#[test]
+fn test_metrics_config_can_disable_recorder_initialization() {
+    let storage = LocalStorage::new(temp_storage_root("metrics-disabled"));
+    let source = MockSource::default().with_blocks(vec![block(1, "0x01")]);
+    let service = QueryService::new_with_metrics_config(
+        storage,
+        source,
+        PlannerConfig {
+            max_query_range_blocks: 4,
+            default_chunk_range_blocks: 2,
+        },
+        WriterConfig {
+            target_object_bytes: 1024,
+            min_object_rows: 1,
+            record_empty_coverage: true,
+        },
+        "ethereum",
+        chain_config(1),
+        MetricsConfig {
+            enabled: false,
+            default_application: "disabled".to_owned(),
+        },
+    )
+    .expect("disabled metrics service builds");
+
+    let response = service.query(blocks_request(1, 1)).expect("query succeeds");
+
+    assert_eq!(block_numbers(&response), vec![1]);
+    assert!(service.metrics_text().is_none());
+}
+
 #[test]
 fn test_query_native_executes_non_evm_plan_without_legacy_route_validation() {
     let root = temp_storage_root("native-non-evm");
@@ -633,6 +724,26 @@ fn service_named_with_datasets(
             },
         },
     )
+}
+
+fn chain_config(chain_id: u64) -> ChainConfig {
+    ChainConfig {
+        kind: "evm".to_owned(),
+        chain_id,
+        rpc_urls: vec!["http://example.invalid".to_owned()],
+        finality: datalens_api::config::FinalityConfig::Auto,
+        datasets: DatasetsConfig {
+            blocks: datalens_api::config::BlocksDatasetConfig {
+                enabled: true,
+                max_batch_blocks: 2,
+            },
+            logs: LogsDatasetConfig {
+                enabled: true,
+                max_get_logs_range_blocks: 2,
+                max_addresses_per_query: 2,
+            },
+        },
+    }
 }
 
 fn blocks_request(from_block: u64, to_block: u64) -> LegacyEvmQueryRequest {

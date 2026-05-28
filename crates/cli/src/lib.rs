@@ -147,6 +147,10 @@ fn doctor_command(command: ConfigCommand) -> Result<(), Box<dyn std::error::Erro
         },
         "planner": config.planner,
         "writer": config.writer,
+        "metrics": {
+            "enabled": config.metrics.enabled,
+            "default_application": config.metrics.default_application,
+        },
         "chains": chains,
     });
     println!("{}", serde_json::to_string_pretty(&summary)?);
@@ -395,6 +399,12 @@ pub fn validate_config(config: &DatalensConfig) -> Result<(), DatalensError> {
             "writer.min_object_rows must be greater than zero",
         ));
     }
+    if config.metrics.enabled && config.metrics.default_application.trim().is_empty() {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "metrics.default_application must not be empty when metrics are enabled",
+        ));
+    }
     for (name, chain) in &config.chains {
         validate_chain(name, chain)?;
     }
@@ -558,14 +568,15 @@ fn build_service_with_storage(
         chain.datasets.logs.max_get_logs_range_blocks,
         chain.datasets.logs.max_addresses_per_query,
     );
-    Ok(datalens_api::QueryService::new_named(
+    datalens_api::QueryService::new_with_metrics_config(
         storage,
         source,
         config.planner.clone(),
         config.writer.clone(),
         chain_name.to_owned(),
         chain.clone(),
-    ))
+        config.metrics.clone(),
+    )
 }
 
 fn build_storage(

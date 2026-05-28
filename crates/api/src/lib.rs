@@ -15,10 +15,7 @@ use datalens_core::{
     LedgerRange, LogFilter, QueryRows,
 };
 use datalens_executor::{NativeQueryExecutionConfig, NativeQueryExecutor};
-use datalens_metrics::{
-    ApplicationIdentity, CacheCoverageOutcome, ErrorLabels, FillOutcome, MetricsLabels,
-    MetricsRecorder, QueryOutcome,
-};
+use datalens_metrics::{ApplicationIdentity, MetricsRecorder};
 use datalens_planner::{NativePlannerConfig, NativeQueryInput};
 use datalens_storage::{S3ObjectStoreConfig, StorageRepository};
 use datalens_writer::DurableWriterConfig;
@@ -89,6 +86,8 @@ pub mod config {
         pub storage: StorageConfig,
         pub planner: PlannerConfig,
         pub writer: WriterConfig,
+        #[serde(default)]
+        pub metrics: MetricsConfig,
         pub chains: BTreeMap<String, ChainConfig>,
     }
 
@@ -173,6 +172,31 @@ pub mod config {
     }
 
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    pub struct MetricsConfig {
+        #[serde(default = "default_metrics_enabled")]
+        pub enabled: bool,
+        #[serde(default = "default_metrics_application")]
+        pub default_application: String,
+    }
+
+    impl Default for MetricsConfig {
+        fn default() -> Self {
+            Self {
+                enabled: default_metrics_enabled(),
+                default_application: default_metrics_application(),
+            }
+        }
+    }
+
+    fn default_metrics_enabled() -> bool {
+        true
+    }
+
+    fn default_metrics_application() -> String {
+        "datalens".to_owned()
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
     pub struct ChainConfig {
         pub kind: String,
         pub chain_id: u64,
@@ -245,7 +269,7 @@ pub mod config {
     }
 }
 
-use config::{ChainConfig, PlannerConfig, WriterConfig};
+use config::{ChainConfig, MetricsConfig, PlannerConfig, WriterConfig};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LegacyEvmQueryRequest {
@@ -343,8 +367,39 @@ where
         chain_name: impl Into<String>,
         chain: ChainConfig,
     ) -> Self {
+        Self::new_with_metrics_config(
+            storage,
+            source,
+            planner,
+            writer,
+            chain_name,
+            chain,
+            MetricsConfig::default(),
+        )
+        .expect("default metrics recorder initializes")
+    }
+
+    pub fn new_with_metrics_config(
+        storage: impl StorageRepository + 'static,
+        source: S,
+        planner: PlannerConfig,
+        writer: WriterConfig,
+        chain_name: impl Into<String>,
+        chain: ChainConfig,
+        metrics_config: MetricsConfig,
+    ) -> Result<Self, DatalensError> {
         let storage: Arc<dyn StorageRepository> = Arc::new(storage);
-        let executor = NativeQueryExecutor::new(
+        let recorder = if metrics_config.enabled {
+            Some(MetricsRecorder::new().map_err(|error| {
+                DatalensError::new(
+                    DatalensErrorKind::Internal,
+                    format!("initialize metrics recorder: {error}"),
+                )
+            })?)
+        } else {
+            None
+        };
+        let mut executor = NativeQueryExecutor::new(
             storage,
             source,
             NativeQueryExecutionConfig {
@@ -359,30 +414,27 @@ where
                 },
             },
         );
+        if let Some(recorder) = recorder.clone() {
+            executor = executor.with_metrics(
+                recorder,
+                ApplicationIdentity::named(metrics_config.default_application),
+            );
+        }
 
-        Self {
+        Ok(Self {
             executor,
             chain_name: chain_name.into(),
             chain,
-            metrics: None,
-        }
+            metrics: recorder,
+        })
     }
 
     pub fn with_metrics(mut self, metrics: MetricsRecorder) -> Self {
+        self.executor = self
+            .executor
+            .with_metrics(metrics.clone(), ApplicationIdentity::unknown());
         self.metrics = Some(metrics);
         self
-    }
-
-    pub fn metrics_text(&self) -> Result<String, DatalensError> {
-        let Some(metrics) = &self.metrics else {
-            return Ok(String::new());
-        };
-        metrics.encode().map_err(|error| {
-            DatalensError::new(
-                DatalensErrorKind::Internal,
-                format!("encode metrics: {error}"),
-            )
-        })
     }
 
     pub fn chain_name(&self) -> &str {
@@ -393,7 +445,6 @@ where
         &self,
         request: LegacyEvmQueryRequest,
     ) -> Result<LegacyEvmQueryResponse, DatalensError> {
-        let labels = metrics_labels(&request);
         log::info!(
             "legacy evm query start chain={} dataset={} range={}-{}",
             request.chain.configured_name(),
@@ -403,22 +454,14 @@ where
         );
         if let Err(error) = self.validate_legacy_evm_route(&request) {
             log::warn!("query validation failed kind={:?}", error.kind);
-            self.record_query_error(&labels, &error.kind);
             return Err(error);
         }
         let response_range = request.range;
-        self.record_requested(&labels, response_range.to_block);
-        let response = match self.query_native(legacy_evm_to_native_input(request)?) {
-            Ok(response) => response,
-            Err(error) => {
-                self.record_query_error(&labels, &error.kind);
-                return Err(error);
-            }
-        };
+        let response = self.query_native(legacy_evm_to_native_input(request)?)?;
         let hit_ranges = legacy_block_ranges(&response.cache.hit_ranges)?;
         let misses = legacy_block_ranges(&response.cache.missing_ranges)?;
 
-        let response = LegacyEvmQueryResponse {
+        Ok(LegacyEvmQueryResponse {
             chain: response.chain,
             range: response_range,
             cache: CacheSummary {
@@ -426,9 +469,7 @@ where
                 missing_ranges: misses,
             },
             rows: response.rows.into_rows(),
-        };
-        self.record_query_success(&labels, &response);
-        Ok(response)
+        })
     }
 
     pub fn query_native(
@@ -452,6 +493,17 @@ where
                 missing_ranges: result.cache.missing_ranges,
             },
             rows: result.rows,
+        })
+    }
+
+    pub fn metrics_text(&self) -> Option<Result<String, DatalensError>> {
+        self.metrics.as_ref().map(|recorder| {
+            recorder.encode().map_err(|error| {
+                DatalensError::new(
+                    DatalensErrorKind::Internal,
+                    format!("encode metrics: {error}"),
+                )
+            })
         })
     }
 
@@ -487,72 +539,6 @@ where
             Dataset::Blocks => Ok(()),
         }
     }
-
-    fn record_requested(&self, labels: &MetricsLabels, block: u64) {
-        if let Some(metrics) = &self.metrics {
-            metrics.set_latest_requested_block(labels, block);
-        }
-    }
-
-    fn record_query_success(&self, labels: &MetricsLabels, response: &LegacyEvmQueryResponse) {
-        let Some(metrics) = &self.metrics else {
-            return;
-        };
-        let coverage = match (
-            response.cache.hit_ranges.is_empty(),
-            response.cache.missing_ranges.is_empty(),
-        ) {
-            (_, true) => CacheCoverageOutcome::Hit,
-            (true, false) => CacheCoverageOutcome::Miss,
-            (false, false) => CacheCoverageOutcome::PartialHit,
-        };
-        metrics.record_cache_coverage(labels, coverage);
-
-        if response.cache.missing_ranges.is_empty() {
-            metrics.record_query(labels, QueryOutcome::Hit);
-            return;
-        }
-
-        let latest_filled = response
-            .cache
-            .missing_ranges
-            .iter()
-            .map(|range| range.to_block)
-            .max()
-            .unwrap_or(response.range.to_block);
-        metrics.set_latest_filled_block(labels, latest_filled);
-        if response.rows.row_count() == 0 {
-            metrics.record_query(labels, QueryOutcome::Empty);
-            metrics.record_fill(labels, FillOutcome::Empty);
-        } else {
-            metrics.record_query(labels, QueryOutcome::Filled);
-            metrics.record_fill(labels, FillOutcome::Filled);
-        }
-    }
-
-    fn record_query_error(&self, labels: &MetricsLabels, kind: &DatalensErrorKind) {
-        let Some(metrics) = &self.metrics else {
-            return;
-        };
-        metrics.record_query(labels, QueryOutcome::Error);
-        match kind {
-            DatalensErrorKind::ProviderFailure
-            | DatalensErrorKind::ProviderLimit
-            | DatalensErrorKind::ProviderTimeout
-            | DatalensErrorKind::RateLimited => {
-                metrics.record_provider_error(&ErrorLabels::from_labels(labels, kind.clone()));
-            }
-            DatalensErrorKind::StorageReadFailure
-            | DatalensErrorKind::StorageWriteFailure
-            | DatalensErrorKind::ManifestUpdateFailure => {
-                metrics.record_storage_error(&ErrorLabels::from_labels(labels, kind.clone()));
-            }
-            DatalensErrorKind::InvalidInput
-            | DatalensErrorKind::InvalidRequest
-            | DatalensErrorKind::UnsupportedDataset
-            | DatalensErrorKind::Internal => {}
-        }
-    }
 }
 
 trait RegisteredQueryService: Send + Sync {
@@ -561,7 +547,7 @@ trait RegisteredQueryService: Send + Sync {
         request: LegacyEvmQueryRequest,
     ) -> Result<LegacyEvmQueryResponse, DatalensError>;
 
-    fn metrics_text(&self) -> Result<String, DatalensError>;
+    fn metrics_text(&self) -> Option<Result<String, DatalensError>>;
 }
 
 impl<S> RegisteredQueryService for QueryService<S>
@@ -575,7 +561,7 @@ where
         QueryService::query(self, request)
     }
 
-    fn metrics_text(&self) -> Result<String, DatalensError> {
+    fn metrics_text(&self) -> Option<Result<String, DatalensError>> {
         QueryService::metrics_text(self)
     }
 }
@@ -623,14 +609,20 @@ impl QueryServiceRegistry {
         service.query(request)
     }
 
-    pub fn metrics_text(&self) -> Result<String, DatalensError> {
+    pub fn metrics_text(&self) -> Option<Result<String, DatalensError>> {
+        let mut texts = Vec::new();
         for service in self.services.values() {
-            let metrics = service.metrics_text()?;
-            if !metrics.is_empty() {
-                return Ok(metrics);
+            match service.metrics_text() {
+                Some(Ok(text)) => texts.push(text),
+                Some(Err(error)) => return Some(Err(error)),
+                None => {}
             }
         }
-        Ok(String::new())
+        if texts.is_empty() {
+            None
+        } else {
+            Some(Ok(texts.join("\n")))
+        }
     }
 }
 
@@ -656,10 +648,6 @@ async fn chains(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({ "chains": state.registry.chain_names() }))
 }
 
-async fn metrics(State(state): State<AppState>) -> Result<String, ApiError> {
-    state.registry.metrics_text().map_err(ApiError)
-}
-
 async fn query(
     State(state): State<AppState>,
     Json(request): Json<LegacyEvmQueryRequest>,
@@ -677,12 +665,19 @@ async fn query(
         .map_err(ApiError)
 }
 
-fn metrics_labels(request: &LegacyEvmQueryRequest) -> MetricsLabels {
-    MetricsLabels::new(
-        ApplicationIdentity::unknown(),
-        request.chain.clone(),
-        request.dataset,
-    )
+async fn metrics(State(state): State<AppState>) -> Result<Response, ApiError> {
+    match state.registry.metrics_text() {
+        Some(Ok(text)) => Ok((
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; version=0.0.4",
+            )],
+            text,
+        )
+            .into_response()),
+        Some(Err(error)) => Err(ApiError(error)),
+        None => Ok(StatusCode::NOT_FOUND.into_response()),
+    }
 }
 
 struct ApiError(DatalensError);

@@ -1318,6 +1318,7 @@ version = "0.1.0"
 dependencies = [
  "datalens-chain",
  "datalens-core",
+ "datalens-metrics",
  "datalens-planner",
  "datalens-storage",
  "datalens-writer",
