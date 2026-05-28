@@ -134,15 +134,16 @@ Maintenance operation types:
 | Operation | First behavior | Writes storage |
 | --- | --- | --- |
 | `inspect_check` | Parse manifests and validate referenced objects. | No |
-| `compact` | Report compatible compaction candidates. | No, dry-run only |
+| `compact` | Report compatible compaction candidates; explicit execution may rewrite already committed small objects. | Execute only |
 | `repair` | Report damaged coverage and recommended repair inputs. | No |
 | `retention_prune` | Report retention policy and deletion candidates. | No, dry-run only |
 | `usage_ledger_rollup` | Define append-only ledger rollup boundary. | No, model only |
 
 The first CLI entry is `datalens inspect maintenance`. It is read-only and returns a
 `maintenance` object containing check issues, compaction candidates, retention dry-run
-state, and usage ledger rollup model. Future write operations must require an explicit
-execute mode; dry-run remains the default for object rewriting or deletion.
+state, and usage ledger rollup model. Write operations must require an explicit execute
+mode or direct operator call; dry-run remains the default for object rewriting or
+deletion.
 
 Maintenance check must report:
 
@@ -158,12 +159,19 @@ when available, issue kind, and message. Repair is report-only in the first vers
 must not refetch RPC data, delete objects, delete manifest entries, or mark entries damaged
 without a future explicit repair command and user confirmation.
 
-Compaction candidates are compatible only when chain, dataset key, selector fingerprint,
-range kind, finality level, object encoding, and schema version are compatible. Empty
-coverage must not be converted into a data object. Compaction must preserve coverage
-semantics and query results. If future compaction writes an object, it must write the new
-object successfully before updating the manifest. Old object deletion is out of scope for
-the first version and must remain protected by dry-run or a separate execute workflow.
+Compaction is a fallback maintenance path for already committed durable objects represented
+by manifest coverage. It must not be used as the normal answer to below-threshold query
+writes; the normal write path stages and flushes compatible rows before durable object
+commit. Compaction candidates are compatible only when chain, dataset key, selector
+fingerprint, selector canonical key, range kind, finality level, object encoding, and
+schema version are compatible. Application identity is not part of durable object identity
+in the current storage model, so it is not a compaction grouping key.
+
+Empty coverage must not be converted into a data object. Compaction must preserve coverage
+semantics and query results. Executed compaction must write the replacement object
+successfully before updating the manifest. Delayed or skipped deletion of replaced objects
+must not affect query correctness; old object deletion remains protected by dry-run or a
+separate execute workflow.
 
 Retention policy inputs may include chain, dataset key, range age, object age, usage
 ledger activity, application attribution, and storage size. Retention must not delete an

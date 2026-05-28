@@ -103,6 +103,7 @@ pub struct CompactionCandidate {
     pub chain: ChainIdentity,
     pub dataset_key: DatasetKey,
     pub selector_fingerprint: String,
+    pub selector_canonical_key: String,
     pub range_kind: String,
     pub finality_level: ManifestFinalityLevel,
     pub object_encoding: ObjectEncoding,
@@ -373,10 +374,7 @@ where
                 dataset_key: candidate.dataset_key.clone(),
                 range: candidate.range.clone(),
                 selector_fingerprint: candidate.selector_fingerprint.clone(),
-                selector_canonical_key: entries
-                    .first()
-                    .map(|entry| entry.selector_canonical_key.clone())
-                    .unwrap_or_else(|| candidate.selector_fingerprint.clone()),
+                selector_canonical_key: candidate.selector_canonical_key.clone(),
                 finality_level: candidate.finality_level,
                 object_key: Some(data_object.object_key),
                 object_encoding: Some(data_object.object_encoding),
@@ -526,6 +524,7 @@ fn candidate_entries(
             entry.chain == candidate.chain
                 && entry.dataset_key == candidate.dataset_key
                 && entry.selector_fingerprint == candidate.selector_fingerprint
+                && entry.selector_canonical_key == candidate.selector_canonical_key
                 && entry.range.kind() == candidate.range.kind()
                 && entry.finality_level == candidate.finality_level
                 && entry.object_encoding == Some(candidate.object_encoding)
@@ -583,6 +582,7 @@ fn push_candidate(
         chain: key.chain.clone(),
         dataset_key: key.dataset_key.clone(),
         selector_fingerprint: key.selector_fingerprint.clone(),
+        selector_canonical_key: key.selector_canonical_key.clone(),
         range_kind: range_kind_key(key.range_kind.clone()),
         finality_level: key.finality_level,
         object_encoding: key.object_encoding,
@@ -600,6 +600,7 @@ struct CompactionKey {
     chain: ChainIdentity,
     dataset_key: DatasetKey,
     selector_fingerprint: String,
+    selector_canonical_key: String,
     range_kind: LedgerRangeKind,
     finality_level: ManifestFinalityLevel,
     object_encoding: ObjectEncoding,
@@ -611,6 +612,7 @@ impl CompactionKey {
             chain: entry.chain.clone(),
             dataset_key: entry.dataset_key.clone(),
             selector_fingerprint: entry.selector_fingerprint.clone(),
+            selector_canonical_key: entry.selector_canonical_key.clone(),
             range_kind: entry.range.kind(),
             finality_level: entry.finality_level,
             object_encoding,
