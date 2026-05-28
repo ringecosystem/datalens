@@ -27,6 +27,9 @@ use datalens_storage::{
     ReadThroughCacheConfig, S3ObjectStore, S3ObjectStoreConfig, StorageRepository,
     StorageWriteOutcome, StorageWriteRequest,
 };
+use datalens_warmup::{
+    LocalWarmupRegistry, WarmupRuntime, WarmupRuntimeConfig, WarmupSchedulerConfig, WarmupTaskPool,
+};
 use tower::ServiceExt;
 
 #[test]
@@ -155,6 +158,178 @@ async fn test_api_lifecycle_routes_expose_health_chains_query_and_metrics() {
     assert!(body.contains(r#"chain="ethereum""#));
     assert!(body.contains(r#"chain_kind="evm""#));
     assert!(body.contains(r#"dataset="blocks""#));
+}
+
+#[tokio::test]
+async fn test_api_warmup_routes_manage_application_scoped_tasks() {
+    let root = temp_storage_root("api-warmup-routes");
+    let source = MockSource::default();
+    let service = service(LocalStorage::new(&root), source).with_warmup_pool(warmup_pool(&root));
+    let application_registry = datalens_api::config::ApplicationRegistryConfig {
+        required: true,
+        applications: vec![
+            application_config("app-a", "token-a"),
+            application_config("app-b", "token-b"),
+        ],
+    };
+    let registry = QueryServiceRegistry::new()
+        .with_application_registry(application_registry)
+        .expect("application registry")
+        .with_service(service)
+        .expect("registry");
+    let app = router(registry);
+
+    let submit = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/warmup/tasks")
+                .header("content-type", "application/json")
+                .header("x-datalens-application", "app-a")
+                .header("authorization", "Bearer token-a")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "chain": ethereum_identity(),
+                        "dataset": "logs",
+                        "range": BlockRange::expect_new(10, 12),
+                        "filter": logs_request(10, 12).filter,
+                        "mode": "fixed_range",
+                        "chunk_policy": {
+                            "max_range_len": 2
+                        }
+                    }))
+                    .expect("request json"),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("submit response");
+    assert_eq!(submit.status(), StatusCode::CREATED);
+    let submit_body = body_json(submit.into_body()).await;
+    let task_id = submit_body["task_id"].as_str().expect("task id").to_owned();
+    assert_eq!(submit_body["created"], true);
+
+    let list = app
+        .clone()
+        .oneshot(
+            Request::get("/v1/warmup/tasks")
+                .header("x-datalens-application", "app-a")
+                .header("authorization", "Bearer token-a")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("list response");
+    assert_eq!(list.status(), StatusCode::OK);
+    let list_body = body_json(list.into_body()).await;
+    assert_eq!(list_body["tasks"].as_array().expect("tasks").len(), 1);
+
+    let forbidden = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/v1/warmup/tasks/{task_id}/cancel"))
+                .header("x-datalens-application", "app-b")
+                .header("authorization", "Bearer token-b")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("forbidden response");
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+    let cancel = app
+        .oneshot(
+            Request::post(format!("/v1/warmup/tasks/{task_id}/cancel"))
+                .header("x-datalens-application", "app-a")
+                .header("authorization", "Bearer token-a")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("cancel response");
+    assert_eq!(cancel.status(), StatusCode::OK);
+    let cancel_body = body_json(cancel.into_body()).await;
+    assert_eq!(cancel_body["task"]["state"], "cancelled");
+}
+
+#[tokio::test]
+async fn test_api_warmup_run_once_writes_durable_coverage_that_query_hits() {
+    let root = temp_storage_root("api-warmup-run-once");
+    let source = MockSource::default();
+    let recorder = MetricsRecorder::new().expect("metrics recorder");
+    let service = service(LocalStorage::new(&root), source.clone())
+        .with_metrics(recorder.clone())
+        .with_warmup_pool(warmup_pool_with_metrics(&root, recorder));
+    let registry = QueryServiceRegistry::new()
+        .with_service(service)
+        .expect("registry");
+    let app = router(registry);
+
+    let submit = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/warmup/tasks")
+                .header("content-type", "application/json")
+                .header("x-datalens-application", "app-a")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "chain": ethereum_identity(),
+                        "dataset": "logs",
+                        "range": BlockRange::expect_new(20, 21),
+                        "filter": logs_request(20, 21).filter,
+                        "mode": "fixed_range"
+                    }))
+                    .expect("request json"),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("submit response");
+    assert_eq!(submit.status(), StatusCode::CREATED);
+
+    let run_once = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/warmup/run-once")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("run once response");
+    assert_eq!(run_once.status(), StatusCode::OK);
+
+    source.calls.lock().expect("calls").clear();
+    let query = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/query")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&logs_request(20, 21)).expect("request json"),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("query response");
+    assert_eq!(query.status(), StatusCode::OK);
+    assert_eq!(
+        source.calls(),
+        Vec::<SourceCall>::new(),
+        "query should hit warmup-created durable coverage"
+    );
+
+    let metrics = app
+        .oneshot(
+            Request::get("/metrics")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("metrics response");
+    assert_eq!(metrics.status(), StatusCode::OK);
+    let body = body_text(metrics.into_body()).await;
+    assert!(body.contains("datalens_warmup_task_total"));
+    assert!(body.contains("datalens_warmup_fetch_total"));
+    assert!(body.contains("datalens_warmup_write_total"));
 }
 
 #[test]
@@ -578,6 +753,64 @@ fn logs_request(from_block: u64, to_block: u64) -> LegacyEvmQueryRequest {
         include_block: false,
         allow_hot: false,
         finality: QueryFinalityRequirement::DurableOnly,
+    }
+}
+
+fn warmup_pool(
+    root: &std::path::Path,
+) -> WarmupTaskPool<MockSource, LocalStorage, LocalWarmupRegistry<LocalObjectStore>> {
+    warmup_pool_inner(root, None)
+}
+
+fn warmup_pool_with_metrics(
+    root: &std::path::Path,
+    recorder: MetricsRecorder,
+) -> WarmupTaskPool<MockSource, LocalStorage, LocalWarmupRegistry<LocalObjectStore>> {
+    warmup_pool_inner(root, Some(recorder))
+}
+
+fn warmup_pool_inner(
+    root: &std::path::Path,
+    recorder: Option<MetricsRecorder>,
+) -> WarmupTaskPool<MockSource, LocalStorage, LocalWarmupRegistry<LocalObjectStore>> {
+    let storage = LocalStorage::new(root);
+    let registry = LocalWarmupRegistry::new(LocalObjectStore::new(root.join("warmup-registry")));
+    let mut runtime = WarmupRuntime::new(
+        MockSource::default(),
+        storage,
+        registry,
+        datalens_writer::DurableWriterConfig {
+            target_object_bytes: 1024,
+            min_object_rows: 1,
+            record_empty_coverage: true,
+            staging: Default::default(),
+        },
+    )
+    .with_runtime_config(WarmupRuntimeConfig {
+        max_fetches_per_task_loop: 4,
+    });
+    if let Some(recorder) = recorder {
+        runtime = runtime.with_metrics(recorder);
+    }
+    WarmupTaskPool::new(
+        runtime,
+        WarmupSchedulerConfig {
+            max_global_concurrent_tasks: 1,
+            max_concurrent_tasks_per_chain: 1,
+        },
+    )
+}
+
+fn application_config(id: &str, token: &str) -> datalens_api::config::ApplicationConfig {
+    datalens_api::config::ApplicationConfig {
+        id: id.to_owned(),
+        name: id.to_owned(),
+        enabled: true,
+        display_name: None,
+        token: token.to_owned(),
+        chains: vec!["ethereum".to_owned()],
+        datasets: vec!["logs".to_owned()],
+        quota: None,
     }
 }
 

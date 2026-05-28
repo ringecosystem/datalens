@@ -1,10 +1,21 @@
 //! Edge API boundary for datalens.
 
-use std::{collections::BTreeMap, env, fs, net::SocketAddr, path::Path, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    env, fs,
+    net::SocketAddr,
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::Duration,
+};
 
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Path as AxumPath, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -19,6 +30,11 @@ use datalens_executor::{NativeQueryExecutionConfig, NativeQueryExecutor};
 use datalens_metrics::{ApplicationIdentity, MetricsRecorder};
 use datalens_planner::{NativePlannerConfig, NativeQueryInput};
 use datalens_storage::{S3ObjectStoreConfig, StorageRepository, UsageLedgerRepository};
+use datalens_warmup::{
+    WarmupChunkPolicy, WarmupRegistry, WarmupRetryPolicy, WarmupRunResult, WarmupSubmitOutcome,
+    WarmupSubmitRequest, WarmupTask, WarmupTaskFilter, WarmupTaskId, WarmupTaskMode,
+    WarmupTaskPool, WarmupTaskState,
+};
 use datalens_writer::{DurableWriteResult, DurableWriterConfig};
 use serde::{Deserialize, Serialize};
 
@@ -171,6 +187,93 @@ pub mod auth {
                 quota: application.quota.clone(),
             }))
         }
+
+        pub fn authenticate_warmup_headers(
+            &self,
+            headers: &HeaderMap,
+            chain: &str,
+            dataset: &str,
+        ) -> Result<Option<ApplicationContext>, DatalensError> {
+            if !self.required {
+                return Ok(None);
+            }
+            let application = self.authenticate_application_headers(headers)?;
+            authorize_application_dataset(application, chain, dataset)?;
+            Ok(Some(ApplicationContext {
+                id: application.id.clone(),
+                name: application.name.clone(),
+                display_name: application.display_name.clone(),
+                quota: application.quota.clone(),
+            }))
+        }
+
+        pub fn authenticate_task_headers(
+            &self,
+            headers: &HeaderMap,
+        ) -> Result<Option<ApplicationContext>, DatalensError> {
+            if !self.required {
+                return Ok(None);
+            }
+            let application = self.authenticate_application_headers(headers)?;
+            Ok(Some(ApplicationContext {
+                id: application.id.clone(),
+                name: application.name.clone(),
+                display_name: application.display_name.clone(),
+                quota: application.quota.clone(),
+            }))
+        }
+
+        fn authenticate_application_headers(
+            &self,
+            headers: &HeaderMap,
+        ) -> Result<&config::ApplicationConfig, DatalensError> {
+            let raw_application = headers
+                .get(APPLICATION_HEADER)
+                .ok_or_else(|| {
+                    DatalensError::new(
+                        DatalensErrorKind::AuthenticationFailed,
+                        "application identity is required",
+                    )
+                })?
+                .to_str()
+                .map_err(|_| {
+                    DatalensError::new(
+                        DatalensErrorKind::AuthenticationFailed,
+                        "application identity is invalid",
+                    )
+                })?;
+            let application_id = normalize_application_id(raw_application).map_err(|_| {
+                DatalensError::new(
+                    DatalensErrorKind::AuthenticationFailed,
+                    "application identity is invalid",
+                )
+            })?;
+            let application = self.applications.get(&application_id).ok_or_else(|| {
+                DatalensError::new(
+                    DatalensErrorKind::AuthenticationFailed,
+                    "application credentials are invalid",
+                )
+            })?;
+            let token = bearer_token(headers).ok_or_else(|| {
+                DatalensError::new(
+                    DatalensErrorKind::AuthenticationFailed,
+                    "application credentials are required",
+                )
+            })?;
+            if token != application.token {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::AuthenticationFailed,
+                    "application credentials are invalid",
+                ));
+            }
+            if !application.enabled {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::Unauthorized,
+                    "application is disabled",
+                ));
+            }
+            Ok(application)
+        }
     }
 
     fn bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -188,13 +291,21 @@ pub mod auth {
         request: &LegacyEvmQueryRequest,
     ) -> Result<(), DatalensError> {
         let chain = request.chain.configured_name();
+        let dataset = request.dataset.as_str();
+        authorize_application_dataset(application, chain, dataset)
+    }
+
+    fn authorize_application_dataset(
+        application: &config::ApplicationConfig,
+        chain: &str,
+        dataset: &str,
+    ) -> Result<(), DatalensError> {
         if !application.chains.iter().any(|allowed| allowed == chain) {
             return Err(DatalensError::new(
                 DatalensErrorKind::Unauthorized,
                 "application is not allowed to access this chain",
             ));
         }
-        let dataset = request.dataset.as_str();
         if !application
             .datasets
             .iter()
@@ -313,6 +424,8 @@ pub mod config {
         pub metrics: MetricsConfig,
         #[serde(default)]
         pub index: IndexConfig,
+        #[serde(default)]
+        pub warmup: WarmupConfig,
         #[serde(default)]
         pub applications: ApplicationRegistryConfig,
         pub chains: BTreeMap<String, ChainConfig>,
@@ -448,6 +561,38 @@ pub mod config {
     }
 
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    pub struct WarmupConfig {
+        #[serde(default)]
+        pub enabled: bool,
+        #[serde(default = "default_warmup_registry_path")]
+        pub registry_path: String,
+        #[serde(default = "default_warmup_scheduler_interval_ms")]
+        pub scheduler_interval_ms: u64,
+        #[serde(default = "default_warmup_max_global_tasks")]
+        pub max_global_tasks: usize,
+        #[serde(default = "default_warmup_max_per_chain_tasks")]
+        pub max_per_chain_tasks: usize,
+        #[serde(default = "default_warmup_max_fetches_per_loop")]
+        pub max_fetches_per_loop: u64,
+        #[serde(default = "default_warmup_flush_on_shutdown")]
+        pub flush_on_shutdown: bool,
+    }
+
+    impl Default for WarmupConfig {
+        fn default() -> Self {
+            Self {
+                enabled: false,
+                registry_path: default_warmup_registry_path(),
+                scheduler_interval_ms: default_warmup_scheduler_interval_ms(),
+                max_global_tasks: default_warmup_max_global_tasks(),
+                max_per_chain_tasks: default_warmup_max_per_chain_tasks(),
+                max_fetches_per_loop: default_warmup_max_fetches_per_loop(),
+                flush_on_shutdown: default_warmup_flush_on_shutdown(),
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
     pub struct IndexConfig {
         #[serde(default = "default_index_chunk_range")]
         pub default_chunk_range: u64,
@@ -508,6 +653,30 @@ pub mod config {
 
     fn default_metrics_application() -> String {
         "datalens".to_owned()
+    }
+
+    fn default_warmup_registry_path() -> String {
+        ".datalens/warmup".to_owned()
+    }
+
+    fn default_warmup_scheduler_interval_ms() -> u64 {
+        1_000
+    }
+
+    fn default_warmup_max_global_tasks() -> usize {
+        1
+    }
+
+    fn default_warmup_max_per_chain_tasks() -> usize {
+        1
+    }
+
+    fn default_warmup_max_fetches_per_loop() -> u64 {
+        1
+    }
+
+    fn default_warmup_flush_on_shutdown() -> bool {
+        true
     }
 
     fn default_index_chunk_range() -> u64 {
@@ -708,6 +877,83 @@ pub struct ChainDiscovery {
     pub datasets: Vec<Dataset>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WarmupSubmitApiRequest {
+    pub chain: ChainIdentity,
+    pub dataset: Dataset,
+    pub range: BlockRange,
+    pub filter: Option<LogFilter>,
+    #[serde(default = "default_warmup_api_mode")]
+    pub mode: WarmupTaskMode,
+    #[serde(default)]
+    pub chunk_policy: WarmupChunkPolicy,
+    #[serde(default)]
+    pub retry_policy: WarmupRetryPolicy,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WarmupSubmitApiResponse {
+    pub task_id: WarmupTaskId,
+    pub created: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WarmupTaskApiResponse {
+    pub task: WarmupTaskView,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WarmupTaskListApiResponse {
+    pub tasks: Vec<WarmupTaskView>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WarmupRunOnceApiResponse {
+    pub results: Vec<WarmupRunResult>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WarmupTaskView {
+    pub task_id: WarmupTaskId,
+    pub application_id: String,
+    pub chain: ChainIdentity,
+    pub dataset_key: DatasetKey,
+    pub range: BlockRange,
+    pub mode: WarmupTaskMode,
+    pub state: WarmupTaskState,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub last_error: Option<String>,
+    pub stats: datalens_warmup::WarmupStats,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize)]
+pub struct WarmupTaskListQuery {
+    pub chain: Option<String>,
+    pub state: Option<WarmupTaskState>,
+}
+
+fn default_warmup_api_mode() -> WarmupTaskMode {
+    WarmupTaskMode::FixedRange
+}
+
+fn warmup_task_view(task: WarmupTask) -> Result<WarmupTaskView, DatalensError> {
+    let range = BlockRange::try_new(task.start, task.end.unwrap_or(task.start))?;
+    Ok(WarmupTaskView {
+        task_id: task.task_id,
+        application_id: task.application_id,
+        chain: task.chain,
+        dataset_key: task.dataset_key,
+        range,
+        mode: task.mode,
+        state: task.state,
+        created_at: task.created_at,
+        updated_at: task.updated_at,
+        last_error: task.last_error,
+        stats: task.stats,
+    })
+}
+
 pub fn legacy_evm_to_native_input(
     request: LegacyEvmQueryRequest,
 ) -> Result<NativeQueryInput, DatalensError> {
@@ -766,6 +1012,7 @@ pub struct QueryService<S> {
     chain_name: String,
     chain: ChainConfig,
     metrics: Option<MetricsRecorder>,
+    warmup: Option<Arc<dyn RegisteredWarmupService>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -879,6 +1126,7 @@ where
             chain_name: chain_name.into(),
             chain,
             metrics: recorder,
+            warmup: None,
         })
     }
 
@@ -890,12 +1138,24 @@ where
         self
     }
 
+    pub fn metrics_recorder(&self) -> Option<MetricsRecorder> {
+        self.metrics.clone()
+    }
+
     pub fn with_usage_ledger(
         mut self,
         repository: impl UsageLedgerRepository + 'static,
         application: ApplicationIdentity,
     ) -> Self {
         self.executor = self.executor.with_usage_ledger(repository, application);
+        self
+    }
+
+    pub fn with_warmup_pool<P>(mut self, pool: P) -> Self
+    where
+        P: RegisteredWarmupService + 'static,
+    {
+        self.warmup = Some(Arc::new(pool));
         self
     }
 
@@ -1091,6 +1351,53 @@ trait RegisteredQueryService: Send + Sync {
     fn flush_staged_writes_for_shutdown(&self) -> Result<DurableWriteResult, DatalensError>;
 
     fn discovery(&self) -> Result<ChainDiscovery, DatalensError>;
+
+    fn warmup(&self) -> Option<Arc<dyn RegisteredWarmupService>>;
+}
+
+pub trait RegisteredWarmupService: Send + Sync {
+    fn submit(&self, request: WarmupSubmitRequest) -> Result<WarmupSubmitOutcome, DatalensError>;
+    fn get(&self, task_id: &WarmupTaskId) -> Result<Option<WarmupTask>, DatalensError>;
+    fn list(&self, filter: WarmupTaskFilter) -> Result<Vec<WarmupTask>, DatalensError>;
+    fn pause(&self, task_id: &WarmupTaskId) -> Result<(), DatalensError>;
+    fn cancel(&self, task_id: &WarmupTaskId) -> Result<(), DatalensError>;
+    fn retry_failed(&self, task_id: &WarmupTaskId) -> Result<(), DatalensError>;
+    fn run_available_once(&self) -> Result<Vec<WarmupRunResult>, DatalensError>;
+}
+
+impl<A, S, R> RegisteredWarmupService for WarmupTaskPool<A, S, R>
+where
+    A: ChainAdapter,
+    S: StorageRepository + Clone + 'static,
+    R: WarmupRegistry,
+{
+    fn submit(&self, request: WarmupSubmitRequest) -> Result<WarmupSubmitOutcome, DatalensError> {
+        WarmupTaskPool::submit(self, request)
+    }
+
+    fn get(&self, task_id: &WarmupTaskId) -> Result<Option<WarmupTask>, DatalensError> {
+        WarmupTaskPool::get(self, task_id)
+    }
+
+    fn list(&self, filter: WarmupTaskFilter) -> Result<Vec<WarmupTask>, DatalensError> {
+        WarmupTaskPool::list(self, filter)
+    }
+
+    fn pause(&self, task_id: &WarmupTaskId) -> Result<(), DatalensError> {
+        WarmupTaskPool::pause(self, task_id)
+    }
+
+    fn cancel(&self, task_id: &WarmupTaskId) -> Result<(), DatalensError> {
+        WarmupTaskPool::cancel(self, task_id)
+    }
+
+    fn retry_failed(&self, task_id: &WarmupTaskId) -> Result<(), DatalensError> {
+        WarmupTaskPool::retry_failed(self, task_id)
+    }
+
+    fn run_available_once(&self) -> Result<Vec<WarmupRunResult>, DatalensError> {
+        WarmupTaskPool::run_available_once(self)
+    }
 }
 
 impl<S> RegisteredQueryService for QueryService<S>
@@ -1123,6 +1430,10 @@ where
 
     fn discovery(&self) -> Result<ChainDiscovery, DatalensError> {
         QueryService::discovery(self)
+    }
+
+    fn warmup(&self) -> Option<Arc<dyn RegisteredWarmupService>> {
+        self.warmup.clone()
     }
 }
 
@@ -1226,6 +1537,145 @@ impl QueryServiceRegistry {
             .authenticate_headers(headers, request)
     }
 
+    fn authenticate_warmup_headers(
+        &self,
+        headers: &HeaderMap,
+        chain: &str,
+        dataset: &str,
+    ) -> Result<Option<ApplicationContext>, DatalensError> {
+        self.application_registry
+            .authenticate_warmup_headers(headers, chain, dataset)
+    }
+
+    fn authenticate_task_headers(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<Option<ApplicationContext>, DatalensError> {
+        self.application_registry.authenticate_task_headers(headers)
+    }
+
+    pub fn submit_warmup_task(
+        &self,
+        request: WarmupSubmitRequest,
+    ) -> Result<WarmupSubmitOutcome, DatalensError> {
+        let service = self.warmup_service_for_chain(request.chain.configured_name())?;
+        service.submit(request)
+    }
+
+    pub fn get_warmup_task(
+        &self,
+        task_id: &WarmupTaskId,
+    ) -> Result<Option<WarmupTask>, DatalensError> {
+        for service in self.services.values() {
+            let Some(warmup) = service.warmup() else {
+                continue;
+            };
+            if let Some(task) = warmup.get(task_id)? {
+                return Ok(Some(task));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn list_warmup_tasks(
+        &self,
+        filter: WarmupTaskFilter,
+    ) -> Result<Vec<WarmupTask>, DatalensError> {
+        let mut tasks = Vec::new();
+        for service in self.services.values() {
+            let Some(warmup) = service.warmup() else {
+                continue;
+            };
+            tasks.extend(warmup.list(filter.clone())?);
+        }
+        tasks.sort_by(|left, right| left.task_id.as_str().cmp(right.task_id.as_str()));
+        Ok(tasks)
+    }
+
+    pub fn pause_warmup_task(&self, task_id: &WarmupTaskId) -> Result<WarmupTask, DatalensError> {
+        self.mutate_warmup_task(task_id, WarmupMutation::Pause)
+    }
+
+    pub fn cancel_warmup_task(&self, task_id: &WarmupTaskId) -> Result<WarmupTask, DatalensError> {
+        self.mutate_warmup_task(task_id, WarmupMutation::Cancel)
+    }
+
+    pub fn retry_warmup_task(&self, task_id: &WarmupTaskId) -> Result<WarmupTask, DatalensError> {
+        self.mutate_warmup_task(task_id, WarmupMutation::Retry)
+    }
+
+    pub fn run_warmup_once(&self) -> Result<Vec<WarmupRunResult>, DatalensError> {
+        let mut results = Vec::new();
+        for service in self.services.values() {
+            let Some(warmup) = service.warmup() else {
+                continue;
+            };
+            results.extend(warmup.run_available_once()?);
+        }
+        Ok(results)
+    }
+
+    pub fn start_warmup_scheduler(&self, interval: Duration) -> WarmupSchedulerHandle {
+        let registry = self.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let scheduler_stop = stop.clone();
+        let handle = thread::spawn(move || {
+            while !scheduler_stop.load(Ordering::Relaxed) {
+                if let Err(error) = registry.run_warmup_once() {
+                    log::warn!("warmup scheduler tick failed kind={:?}", error.kind);
+                }
+                thread::sleep(interval);
+            }
+        });
+        WarmupSchedulerHandle {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn warmup_service_for_chain(
+        &self,
+        chain_name: &str,
+    ) -> Result<Arc<dyn RegisteredWarmupService>, DatalensError> {
+        self.services
+            .get(chain_name)
+            .and_then(|service| service.warmup())
+            .ok_or_else(|| {
+                DatalensError::new(
+                    DatalensErrorKind::UnsupportedDataset,
+                    format!("warmup is not configured for chain {chain_name}"),
+                )
+            })
+    }
+
+    fn mutate_warmup_task(
+        &self,
+        task_id: &WarmupTaskId,
+        mutation: WarmupMutation,
+    ) -> Result<WarmupTask, DatalensError> {
+        let task = self.get_warmup_task(task_id)?.ok_or_else(|| {
+            DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                format!("warmup task {} not found", task_id.as_str()),
+            )
+        })?;
+        let service = self.warmup_service_for_chain(task.chain.configured_name())?;
+        match mutation {
+            WarmupMutation::Pause => service.pause(task_id)?,
+            WarmupMutation::Cancel => service.cancel(task_id)?,
+            WarmupMutation::Retry => service.retry_failed(task_id)?,
+        }
+        service.get(task_id)?.ok_or_else(|| {
+            DatalensError::new(
+                DatalensErrorKind::Internal,
+                format!(
+                    "warmup task {} disappeared after mutation",
+                    task_id.as_str()
+                ),
+            )
+        })
+    }
+
     pub fn metrics_text(&self) -> Option<Result<String, DatalensError>> {
         let mut texts = Vec::new();
         for service in self.services.values() {
@@ -1252,6 +1702,40 @@ impl QueryServiceRegistry {
     }
 }
 
+#[derive(Clone, Copy)]
+enum WarmupMutation {
+    Pause,
+    Cancel,
+    Retry,
+}
+
+pub struct WarmupSchedulerHandle {
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl WarmupSchedulerHandle {
+    pub fn shutdown(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take()
+            && let Err(error) = handle.join()
+        {
+            log::warn!("warmup scheduler thread join failed: {error:?}");
+        }
+    }
+}
+
+impl Drop for WarmupSchedulerHandle {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take()
+            && let Err(error) = handle.join()
+        {
+            log::warn!("warmup scheduler thread join failed: {error:?}");
+        }
+    }
+}
+
 pub fn router(registry: QueryServiceRegistry) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -1259,6 +1743,12 @@ pub fn router(registry: QueryServiceRegistry) -> Router {
         .route("/v1/chains", get(chains))
         .route("/v1/discovery", get(discovery))
         .route("/v1/query", post(query))
+        .route("/v1/warmup/tasks", post(warmup_submit).get(warmup_list))
+        .route("/v1/warmup/tasks/{task_id}", get(warmup_get))
+        .route("/v1/warmup/tasks/{task_id}/pause", post(warmup_pause))
+        .route("/v1/warmup/tasks/{task_id}/cancel", post(warmup_cancel))
+        .route("/v1/warmup/tasks/{task_id}/retry", post(warmup_retry))
+        .route("/v1/warmup/run-once", post(warmup_run_once))
         .with_state(AppState { registry })
 }
 
@@ -1301,6 +1791,259 @@ async fn query(
         })?
         .map(Json)
         .map_err(ApiError)
+}
+
+async fn warmup_submit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<WarmupSubmitApiRequest>,
+) -> Result<Response, ApiError> {
+    let registry = state.registry.clone();
+    let application_context = registry
+        .authenticate_warmup_headers(
+            &headers,
+            request.chain.configured_name(),
+            request.dataset.as_str(),
+        )
+        .map_err(ApiError)?;
+    let application_id = application_context
+        .map(|application| application.id)
+        .or_else(|| application_id_from_headers(&headers))
+        .unwrap_or_else(|| "unknown".to_owned());
+    let request = warmup_submit_request(application_id, request).map_err(ApiError)?;
+    let outcome = tokio::task::spawn_blocking(move || registry.submit_warmup_task(request))
+        .await
+        .map_err(|error| {
+            ApiError(DatalensError::new(
+                DatalensErrorKind::Internal,
+                format!("warmup submit task failed: {error}"),
+            ))
+        })?
+        .map_err(ApiError)?;
+    let status = if outcome.created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    Ok((
+        status,
+        Json(WarmupSubmitApiResponse {
+            task_id: outcome.task_id,
+            created: outcome.created,
+        }),
+    )
+        .into_response())
+}
+
+async fn warmup_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<WarmupTaskListQuery>,
+) -> Result<Json<WarmupTaskListApiResponse>, ApiError> {
+    let registry = state.registry.clone();
+    let application_context = registry
+        .authenticate_task_headers(&headers)
+        .map_err(ApiError)?;
+    let application_id = application_context
+        .map(|application| application.id)
+        .or_else(|| application_id_from_headers(&headers));
+    let filter = WarmupTaskFilter {
+        application_id,
+        chain_key: query.chain,
+        state: query.state,
+    };
+    let tasks = tokio::task::spawn_blocking(move || registry.list_warmup_tasks(filter))
+        .await
+        .map_err(|error| {
+            ApiError(DatalensError::new(
+                DatalensErrorKind::Internal,
+                format!("warmup list task failed: {error}"),
+            ))
+        })?
+        .map_err(ApiError)?
+        .into_iter()
+        .map(warmup_task_view)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(ApiError)?;
+    Ok(Json(WarmupTaskListApiResponse { tasks }))
+}
+
+async fn warmup_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(task_id): AxumPath<String>,
+) -> Result<Json<WarmupTaskApiResponse>, ApiError> {
+    let task_id = WarmupTaskId::new(task_id).map_err(ApiError)?;
+    let task = load_authorized_warmup_task(state.registry.clone(), &headers, task_id).await?;
+    Ok(Json(WarmupTaskApiResponse {
+        task: warmup_task_view(task).map_err(ApiError)?,
+    }))
+}
+
+async fn warmup_pause(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(task_id): AxumPath<String>,
+) -> Result<Json<WarmupTaskApiResponse>, ApiError> {
+    mutate_authorized_warmup_task(state.registry, headers, task_id, WarmupMutation::Pause).await
+}
+
+async fn warmup_cancel(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(task_id): AxumPath<String>,
+) -> Result<Json<WarmupTaskApiResponse>, ApiError> {
+    mutate_authorized_warmup_task(state.registry, headers, task_id, WarmupMutation::Cancel).await
+}
+
+async fn warmup_retry(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(task_id): AxumPath<String>,
+) -> Result<Json<WarmupTaskApiResponse>, ApiError> {
+    mutate_authorized_warmup_task(state.registry, headers, task_id, WarmupMutation::Retry).await
+}
+
+async fn warmup_run_once(
+    State(state): State<AppState>,
+) -> Result<Json<WarmupRunOnceApiResponse>, ApiError> {
+    let registry = state.registry.clone();
+    let results = tokio::task::spawn_blocking(move || registry.run_warmup_once())
+        .await
+        .map_err(|error| {
+            ApiError(DatalensError::new(
+                DatalensErrorKind::Internal,
+                format!("warmup run-once task failed: {error}"),
+            ))
+        })?
+        .map_err(ApiError)?;
+    Ok(Json(WarmupRunOnceApiResponse { results }))
+}
+
+async fn load_authorized_warmup_task(
+    registry: QueryServiceRegistry,
+    headers: &HeaderMap,
+    task_id: WarmupTaskId,
+) -> Result<WarmupTask, ApiError> {
+    let application_context = registry
+        .authenticate_task_headers(headers)
+        .map_err(ApiError)?;
+    let task = tokio::task::spawn_blocking(move || {
+        registry.get_warmup_task(&task_id)?.ok_or_else(|| {
+            DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                format!("warmup task {} not found", task_id.as_str()),
+            )
+        })
+    })
+    .await
+    .map_err(|error| {
+        ApiError(DatalensError::new(
+            DatalensErrorKind::Internal,
+            format!("warmup get task failed: {error}"),
+        ))
+    })?
+    .map_err(ApiError)?;
+    authorize_warmup_task_application(
+        &task,
+        application_context
+            .map(|application| application.id)
+            .or_else(|| application_id_from_headers(headers)),
+    )?;
+    Ok(task)
+}
+
+async fn mutate_authorized_warmup_task(
+    registry: QueryServiceRegistry,
+    headers: HeaderMap,
+    task_id: String,
+    mutation: WarmupMutation,
+) -> Result<Json<WarmupTaskApiResponse>, ApiError> {
+    let task_id = WarmupTaskId::new(task_id).map_err(ApiError)?;
+    let task = load_authorized_warmup_task(registry.clone(), &headers, task_id.clone()).await?;
+    let application_context = registry
+        .authenticate_task_headers(&headers)
+        .map_err(ApiError)?;
+    authorize_warmup_task_application(
+        &task,
+        application_context
+            .map(|application| application.id)
+            .or_else(|| application_id_from_headers(&headers)),
+    )?;
+    let task = tokio::task::spawn_blocking(move || match mutation {
+        WarmupMutation::Pause => registry.pause_warmup_task(&task_id),
+        WarmupMutation::Cancel => registry.cancel_warmup_task(&task_id),
+        WarmupMutation::Retry => registry.retry_warmup_task(&task_id),
+    })
+    .await
+    .map_err(|error| {
+        ApiError(DatalensError::new(
+            DatalensErrorKind::Internal,
+            format!("warmup mutate task failed: {error}"),
+        ))
+    })?
+    .map_err(ApiError)?;
+    Ok(Json(WarmupTaskApiResponse {
+        task: warmup_task_view(task).map_err(ApiError)?,
+    }))
+}
+
+fn warmup_submit_request(
+    application_id: String,
+    request: WarmupSubmitApiRequest,
+) -> Result<WarmupSubmitRequest, DatalensError> {
+    let selector = match request.dataset {
+        Dataset::Logs => {
+            let filter = request.filter.ok_or_else(|| {
+                DatalensError::new(
+                    DatalensErrorKind::InvalidInput,
+                    "logs warmup requires filter",
+                )
+            })?;
+            datalens_chain::DatasetSelector::try_evm_logs(filter)?
+        }
+        Dataset::Blocks | Dataset::Transactions | Dataset::Receipts => {
+            return Err(DatalensError::new(
+                DatalensErrorKind::UnsupportedDataset,
+                "warmup MVP supports logs only",
+            ));
+        }
+    };
+    Ok(WarmupSubmitRequest {
+        application_id,
+        chain: request.chain,
+        dataset_key: DatasetKey::from(request.dataset),
+        selector,
+        range_kind: datalens_core::LedgerRangeKind::Block,
+        start: request.range.from_block,
+        end: Some(request.range.to_block),
+        mode: request.mode,
+        chunk_policy: WarmupChunkPolicy {
+            max_range_len: request.chunk_policy.max_range_len.max(1),
+            target_rows_hint: request.chunk_policy.target_rows_hint,
+        },
+        retry_policy: WarmupRetryPolicy {
+            max_attempts: request.retry_policy.max_attempts.max(1),
+            initial_backoff_ms: request.retry_policy.initial_backoff_ms,
+            max_backoff_ms: request.retry_policy.max_backoff_ms,
+        },
+    })
+}
+
+fn authorize_warmup_task_application(
+    task: &WarmupTask,
+    application_id: Option<String>,
+) -> Result<(), ApiError> {
+    let Some(application_id) = application_id else {
+        return Ok(());
+    };
+    if application_id != task.application_id {
+        return Err(ApiError(DatalensError::new(
+            DatalensErrorKind::Unauthorized,
+            "application is not allowed to mutate another application's warmup task",
+        )));
+    }
+    Ok(())
 }
 
 async fn metrics(State(state): State<AppState>) -> Result<Response, ApiError> {
@@ -1437,6 +2180,13 @@ fn application_from_headers(headers: &HeaderMap) -> Option<ApplicationIdentity> 
         .get(APPLICATION_IDENTITY_HEADER)
         .and_then(|value| value.to_str().ok())
         .map(|value| ApplicationIdentity::from_optional(Some(value)))
+}
+
+fn application_id_from_headers(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(APPLICATION_IDENTITY_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| auth::normalize_application_id(value).ok())
 }
 
 fn chain_family(kind: &str) -> Result<ChainFamily, DatalensError> {

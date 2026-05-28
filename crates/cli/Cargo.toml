@@ -20,6 +20,7 @@ datalens-planner = { path = "../planner" }
 datalens-solana = { path = "../solana" }
 datalens-storage = { path = "../storage" }
 datalens-tron = { path = "../tron" }
+datalens-warmup = { path = "../warmup" }
 datalens-writer = { path = "../writer" }
 figment.workspace = true
 log.workspace = true
