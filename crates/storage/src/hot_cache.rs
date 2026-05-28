@@ -562,6 +562,26 @@ where
         Ok(HotCacheCleanupReport { deleted_entries })
     }
 
+    pub fn mark_promoted(
+        &self,
+        metadata_keys: &[String],
+        promoted_at_unix_seconds: u64,
+    ) -> Result<(), DatalensError> {
+        for metadata_key in metadata_keys {
+            let mut entry = self.read_metadata(metadata_key)?;
+            entry.promoted_at_unix_seconds = Some(promoted_at_unix_seconds);
+            entry.eligible_for_promotion = false;
+            let bytes = serde_json::to_vec_pretty(&entry).map_err(|error| {
+                DatalensError::new(
+                    DatalensErrorKind::Internal,
+                    format!("encode promoted hot cache metadata: {error}"),
+                )
+            })?;
+            self.object_store.put(metadata_key, &bytes)?;
+        }
+        Ok(())
+    }
+
     fn demote_active_candidates(
         &self,
         logical_prefix: &str,
@@ -630,6 +650,8 @@ pub struct HotCacheEntryMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_branch: Option<String>,
     pub eligible_for_promotion: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promoted_at_unix_seconds: Option<u64>,
     pub schema_version: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub object_encoding: Option<ObjectEncoding>,
@@ -677,12 +699,6 @@ impl HotCacheEntryMetadata {
             return Err(DatalensError::new(
                 DatalensErrorKind::StorageReadFailure,
                 "hot cache metadata query finality does not match finality status",
-            ));
-        }
-        if self.row_count == 0 {
-            return Err(DatalensError::new(
-                DatalensErrorKind::StorageReadFailure,
-                "hot cache data object metadata must have row_count greater than zero",
             ));
         }
         if self.checksum_algorithm != "sha256" {

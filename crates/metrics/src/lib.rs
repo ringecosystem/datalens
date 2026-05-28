@@ -223,6 +223,25 @@ impl HotReorgOutcome {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HotPromotionOutcome {
+    Attempted,
+    Promoted,
+    Skipped,
+    Failed,
+}
+
+impl HotPromotionOutcome {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Attempted => "attempted",
+            Self::Promoted => "promoted",
+            Self::Skipped => "skipped",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct MetricsRecorder {
     registry: Registry,
@@ -231,6 +250,7 @@ pub struct MetricsRecorder {
     cache_coverage_total: CounterVec,
     fill_total: CounterVec,
     hot_reorg_total: CounterVec,
+    hot_promotion_total: CounterVec,
     fill_duration_seconds: HistogramVec,
     provider_error_total: CounterVec,
     storage_error_total: CounterVec,
@@ -270,6 +290,13 @@ impl MetricsRecorder {
             Opts::new(
                 "datalens_hot_reorg_total",
                 "Datalens hot cache reorg events by outcome.",
+            ),
+            &["application", "chain", "chain_kind", "dataset", "outcome"],
+        )?;
+        let hot_promotion_total = CounterVec::new(
+            Opts::new(
+                "datalens_hot_promotion_total",
+                "Datalens hot cache promotion events by outcome.",
             ),
             &["application", "chain", "chain_kind", "dataset", "outcome"],
         )?;
@@ -314,6 +341,7 @@ impl MetricsRecorder {
         registry.register(Box::new(cache_coverage_total.clone()))?;
         registry.register(Box::new(fill_total.clone()))?;
         registry.register(Box::new(hot_reorg_total.clone()))?;
+        registry.register(Box::new(hot_promotion_total.clone()))?;
         registry.register(Box::new(fill_duration_seconds.clone()))?;
         registry.register(Box::new(provider_error_total.clone()))?;
         registry.register(Box::new(storage_error_total.clone()))?;
@@ -327,6 +355,7 @@ impl MetricsRecorder {
             cache_coverage_total,
             fill_total,
             hot_reorg_total,
+            hot_promotion_total,
             fill_duration_seconds,
             provider_error_total,
             storage_error_total,
@@ -361,6 +390,17 @@ impl MetricsRecorder {
 
     pub fn record_hot_reorg(&self, labels: &MetricsLabels, outcome: HotReorgOutcome, count: u64) {
         self.hot_reorg_total
+            .with_label_values(&labels.query_label_values(outcome.as_str()))
+            .inc_by(count as f64);
+    }
+
+    pub fn record_hot_promotion(
+        &self,
+        labels: &MetricsLabels,
+        outcome: HotPromotionOutcome,
+        count: u64,
+    ) {
+        self.hot_promotion_total
             .with_label_values(&labels.query_label_values(outcome.as_str()))
             .inc_by(count as f64);
     }

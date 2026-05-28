@@ -575,6 +575,7 @@ fn hot_metadata(
         candidate_status,
         active_branch: Some("branch-a".to_owned()),
         eligible_for_promotion: false,
+        promoted_at_unix_seconds: None,
         schema_version: String::new(),
         object_encoding: None,
         object_key: String::new(),
