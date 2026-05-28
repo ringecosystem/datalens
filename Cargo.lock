@@ -1359,8 +1359,11 @@ dependencies = [
  "datalens-chain",
  "datalens-core",
  "datalens-metrics",
+ "datalens-solana",
  "datalens-storage",
+ "datalens-tron",
  "datalens-writer",
+ "serde_json",
 ]
 
 [[package]]
