@@ -1566,6 +1566,9 @@ impl ChainAdapter for MockSource {
                     ))
                 })
             }
+            Some(Dataset::Transactions) | Some(Dataset::Receipts) => {
+                unreachable!("query flow fixtures only request blocks or logs")
+            }
             None => {
                 self.calls
                     .lock()

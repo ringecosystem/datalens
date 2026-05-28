@@ -4,8 +4,8 @@ use datalens_chain::DatasetSelector;
 use datalens_chain::FinalityLevel;
 use datalens_core::{
     BlockHeader, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey,
-    DatasetRows, LedgerRange, LedgerRangeKind, LogFilter, LogRecord, NetworkId, QueryRows,
-    missing_ranges,
+    DatasetRows, EvmReceipt, EvmTransaction, LedgerRange, LedgerRangeKind, LogFilter, LogRecord,
+    NetworkId, QueryRows, missing_ranges,
 };
 
 use datalens_storage::*;
@@ -724,6 +724,91 @@ fn test_evm_logs_rows_write_parquet_and_read_back() {
         .read_rows(&chain, &DatasetKey::evm_logs(), &selector, range)
         .expect("read rows");
     assert_eq!(read, rows);
+}
+
+#[test]
+fn test_evm_transactions_and_receipts_write_parquet_and_read_back() {
+    let storage = LocalStorage::new(temp_storage_root("evm-durable-dataset-roundtrip"));
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let range = LedgerRange::blocks(10, 10).expect("valid range");
+
+    let transactions = DatasetRows::new(
+        DatasetKey::evm_transactions(),
+        QueryRows::EvmTransactions(vec![EvmTransaction {
+            hash: "0xtx10".to_owned(),
+            block_number: 10,
+            block_hash: "0xblock10".to_owned(),
+            transaction_index: 0,
+            from: "0x1111111111111111111111111111111111111111".to_owned(),
+            to: Some("0x2222222222222222222222222222222222222222".to_owned()),
+            value: "0x1".to_owned(),
+            input: "0x".to_owned(),
+            nonce: 1,
+            gas: 21_000,
+            gas_price: Some("0x3b9aca00".to_owned()),
+            max_fee_per_gas: Some("0x77359400".to_owned()),
+            max_priority_fee_per_gas: Some("0x59682f00".to_owned()),
+            transaction_type: Some("0x2".to_owned()),
+        }]),
+    )
+    .expect("transaction rows");
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_transactions(),
+            selector: &selector,
+            range: range.clone(),
+            rows: &transactions,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write transactions");
+    assert_eq!(
+        storage
+            .read_rows(
+                &chain,
+                &DatasetKey::evm_transactions(),
+                &selector,
+                range.clone()
+            )
+            .expect("read transactions"),
+        transactions
+    );
+
+    let receipts = DatasetRows::new(
+        DatasetKey::evm_receipts(),
+        QueryRows::EvmReceipts(vec![EvmReceipt {
+            transaction_hash: "0xtx10".to_owned(),
+            block_number: 10,
+            block_hash: "0xblock10".to_owned(),
+            transaction_index: 0,
+            status: Some(1),
+            gas_used: 21_000,
+            cumulative_gas_used: 21_000,
+            effective_gas_price: Some("0x3b9aca00".to_owned()),
+            contract_address: None,
+            logs_bloom: Some(format!("0x{}", "0".repeat(512))),
+        }]),
+    )
+    .expect("receipt rows");
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_receipts(),
+            selector: &selector,
+            range: range.clone(),
+            rows: &receipts,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write receipts");
+    assert_eq!(
+        storage
+            .read_rows(&chain, &DatasetKey::evm_receipts(), &selector, range)
+            .expect("read receipts"),
+        receipts
+    );
 }
 
 #[test]

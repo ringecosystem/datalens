@@ -587,6 +587,9 @@ impl ChainAdapter for MockSource {
                     warnings: Vec::new(),
                 }))
             }
+            Some(Dataset::Transactions) | Some(Dataset::Receipts) => {
+                unreachable!("lifecycle fixtures only request blocks or logs")
+            }
             None => unreachable!("only EVM datasets are used in lifecycle tests"),
         }
     }

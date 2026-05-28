@@ -1028,6 +1028,8 @@ fn storage_key_segment(value: &str) -> String {
 fn empty_rows(dataset_key: DatasetKey) -> Result<DatasetRows, DatalensError> {
     let rows = match dataset_key.legacy_dataset() {
         Some(datalens_core::Dataset::Blocks) => QueryRows::EvmBlocks(Vec::new()),
+        Some(datalens_core::Dataset::Transactions) => QueryRows::EvmTransactions(Vec::new()),
+        Some(datalens_core::Dataset::Receipts) => QueryRows::EvmReceipts(Vec::new()),
         Some(datalens_core::Dataset::Logs) => QueryRows::EvmLogs(Vec::new()),
         None => QueryRows::AdapterJson {
             dataset_key: dataset_key.clone(),

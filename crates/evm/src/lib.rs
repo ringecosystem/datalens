@@ -7,7 +7,8 @@ use datalens_chain::{
 };
 use datalens_core::{
     BlockHeader, BlockRange, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, Dataset,
-    DatasetKey, EvmLogFilter, LedgerRange, LogFilter, LogRecord, NetworkId, QueryRows, TopicFilter,
+    DatasetKey, EvmLogFilter, EvmReceipt, EvmTransaction, LedgerRange, LogFilter, LogRecord,
+    NetworkId, QueryRows, TopicFilter,
 };
 use reqwest::blocking::Client;
 use serde_json::{Value, json};
@@ -156,6 +157,47 @@ impl EvmRpcClient {
         Ok(blocks)
     }
 
+    pub fn fetch_transactions(
+        &self,
+        range: BlockRange,
+    ) -> Result<Vec<EvmTransaction>, DatalensError> {
+        let mut rows = Vec::new();
+        for block in self.fetch_full_blocks(range)? {
+            let block_number = hex_u64_field(&block, "number")?;
+            let block_hash = string_field(&block, "hash")?;
+            let transactions = block
+                .get("transactions")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    DatalensError::new(
+                        DatalensErrorKind::ProviderFailure,
+                        "missing full block transactions",
+                    )
+                })?;
+            for transaction in transactions {
+                rows.push(parse_transaction(transaction, block_number, &block_hash)?);
+            }
+        }
+        rows.sort_by_key(|row| (row.block_number, row.transaction_index));
+        Ok(rows)
+    }
+
+    pub fn fetch_receipts(&self, range: BlockRange) -> Result<Vec<EvmReceipt>, DatalensError> {
+        let mut rows = Vec::new();
+        for transaction in self.fetch_transactions(range)? {
+            let result = self.call("eth_getTransactionReceipt", json!([transaction.hash]))?;
+            let Some(receipt) = result else {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::ProviderFailure,
+                    "provider returned null receipt",
+                ));
+            };
+            rows.push(parse_receipt(&receipt)?);
+        }
+        rows.sort_by_key(|row| (row.block_number, row.transaction_index));
+        Ok(rows)
+    }
+
     pub fn fetch_logs(
         &self,
         range: BlockRange,
@@ -286,7 +328,38 @@ impl ChainAdapter for EvmRpcClient {
                     .with_reorg_signals(true),
             )
             .with_dataset_capability(
+                DatasetCapability::new(Dataset::Transactions)
+                    .with_selector(SelectorKind::All)
+                    .with_range(HeightRangeKind::Block)
+                    .with_max_range_len(self.max_block_batch_blocks)
+                    .with_empty_coverage(true)
+                    .with_safe_height(true)
+                    .with_finalized_height(true)
+                    .with_provider_native_finality_tags(matches!(
+                        self.finality_policy,
+                        EvmFinalityPolicy::Auto | EvmFinalityPolicy::RpcTags { .. }
+                    ))
+                    .with_range_split(true)
+                    .with_reorg_signals(true),
+            )
+            .with_dataset_capability(
+                DatasetCapability::new(Dataset::Receipts)
+                    .with_selector(SelectorKind::All)
+                    .with_range(HeightRangeKind::Block)
+                    .with_max_range_len(self.max_block_batch_blocks)
+                    .with_empty_coverage(true)
+                    .with_safe_height(true)
+                    .with_finalized_height(true)
+                    .with_provider_native_finality_tags(matches!(
+                        self.finality_policy,
+                        EvmFinalityPolicy::Auto | EvmFinalityPolicy::RpcTags { .. }
+                    ))
+                    .with_range_split(true)
+                    .with_reorg_signals(true),
+            )
+            .with_dataset_capability(
                 DatasetCapability::new(Dataset::Logs)
+                    .with_selector(SelectorKind::All)
                     .with_selector(SelectorKind::EvmLogs)
                     .with_range(HeightRangeKind::Block)
                     .with_max_range_len(self.max_get_logs_range_blocks)
@@ -481,6 +554,27 @@ impl ChainAdapter for EvmRpcClient {
                 QueryRows::EvmBlocks(self.fetch_blocks(range)?),
                 range.len().min(usize::MAX as u128) as usize,
             ),
+            (dataset, DatasetSelector::All) if *dataset == DatasetKey::evm_transactions() => (
+                QueryRows::EvmTransactions(self.fetch_transactions(range)?),
+                range.len().min(usize::MAX as u128) as usize,
+            ),
+            (dataset, DatasetSelector::All) if *dataset == DatasetKey::evm_receipts() => {
+                let receipts = self.fetch_receipts(range)?;
+                let provider_calls = range.len().min(usize::MAX as u128) as usize + receipts.len();
+                (QueryRows::EvmReceipts(receipts), provider_calls)
+            }
+            (dataset, DatasetSelector::All) if *dataset == DatasetKey::evm_logs() => {
+                // Full durable log indexing uses eth_getLogs so query-driven log fills and
+                // backfills share one provider source.
+                let filter = EvmLogFilter::try_from(LogFilter {
+                    addresses: Vec::new(),
+                    topics: Vec::new(),
+                })?;
+                let mut logs = self.fetch_evm_logs(range, &filter)?;
+                logs.retain(|log| range.contains(log.block_number));
+                logs.sort_by_key(|log| (log.block_number, log.transaction_index, log.log_index));
+                (QueryRows::EvmLogs(logs), 1)
+            }
             (dataset, DatasetSelector::EvmLogs(filter)) if *dataset == DatasetKey::evm_logs() => {
                 let mut logs = self.fetch_evm_logs(range, filter)?;
                 logs.retain(|log| range.contains(log.block_number));
@@ -491,6 +585,18 @@ impl ChainAdapter for EvmRpcClient {
                 return Err(DatalensError::new(
                     DatalensErrorKind::UnsupportedDataset,
                     "blocks require all selector",
+                ));
+            }
+            (dataset, _) if *dataset == DatasetKey::evm_transactions() => {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::UnsupportedDataset,
+                    "transactions require all selector",
+                ));
+            }
+            (dataset, _) if *dataset == DatasetKey::evm_receipts() => {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::UnsupportedDataset,
+                    "receipts require all selector",
                 ));
             }
             (dataset, _) if *dataset == DatasetKey::evm_logs() => {
@@ -527,6 +633,24 @@ impl ChainAdapter for EvmRpcClient {
 }
 
 impl EvmRpcClient {
+    fn fetch_full_blocks(&self, range: BlockRange) -> Result<Vec<Value>, DatalensError> {
+        let mut blocks = Vec::new();
+        for number in range.from_block..=range.to_block {
+            let result = self.call(
+                "eth_getBlockByNumber",
+                json!([format!("0x{number:x}"), true]),
+            )?;
+            let Some(block) = result else {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::ProviderFailure,
+                    format!("provider returned null block for {number}"),
+                ));
+            };
+            blocks.push(block);
+        }
+        Ok(blocks)
+    }
+
     fn fetch_block_by_tag(&self, tag: &str) -> Result<BlockHeader, DatalensError> {
         let result = self.call("eth_getBlockByNumber", json!([tag, false]))?;
         let Some(block) = result else {
@@ -581,6 +705,46 @@ impl EvmRpcClient {
             "lag finality policy must define safe_lag_blocks or finalized_lag_blocks",
         ))
     }
+}
+
+pub fn parse_transaction(
+    transaction: &Value,
+    fallback_block_number: u64,
+    fallback_block_hash: &str,
+) -> Result<EvmTransaction, DatalensError> {
+    Ok(EvmTransaction {
+        hash: string_field(transaction, "hash")?,
+        block_number: optional_hex_u64_field(transaction, "blockNumber")?
+            .unwrap_or(fallback_block_number),
+        block_hash: optional_string_field(transaction, "blockHash")?
+            .unwrap_or_else(|| fallback_block_hash.to_owned()),
+        transaction_index: hex_u64_field(transaction, "transactionIndex")?,
+        from: string_field(transaction, "from")?,
+        to: optional_string_field(transaction, "to")?,
+        value: string_field(transaction, "value")?,
+        input: string_field(transaction, "input")?,
+        nonce: hex_u64_field(transaction, "nonce")?,
+        gas: hex_u64_field(transaction, "gas")?,
+        gas_price: optional_string_field(transaction, "gasPrice")?,
+        max_fee_per_gas: optional_string_field(transaction, "maxFeePerGas")?,
+        max_priority_fee_per_gas: optional_string_field(transaction, "maxPriorityFeePerGas")?,
+        transaction_type: optional_string_field(transaction, "type")?,
+    })
+}
+
+pub fn parse_receipt(receipt: &Value) -> Result<EvmReceipt, DatalensError> {
+    Ok(EvmReceipt {
+        transaction_hash: string_field(receipt, "transactionHash")?,
+        block_number: hex_u64_field(receipt, "blockNumber")?,
+        block_hash: string_field(receipt, "blockHash")?,
+        transaction_index: hex_u64_field(receipt, "transactionIndex")?,
+        status: optional_hex_u64_field(receipt, "status")?,
+        gas_used: hex_u64_field(receipt, "gasUsed")?,
+        cumulative_gas_used: hex_u64_field(receipt, "cumulativeGasUsed")?,
+        effective_gas_price: optional_string_field(receipt, "effectiveGasPrice")?,
+        contract_address: optional_string_field(receipt, "contractAddress")?,
+        logs_bloom: optional_string_field(receipt, "logsBloom")?,
+    })
 }
 
 pub fn parse_log_record(log: &Value) -> Result<LogRecord, DatalensError> {
@@ -728,6 +892,17 @@ fn string_field(value: &Value, field: &str) -> Result<String, DatalensError> {
         })
 }
 
+fn optional_string_field(value: &Value, field: &str) -> Result<Option<String>, DatalensError> {
+    match value.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text.to_owned())),
+        _ => Err(DatalensError::new(
+            DatalensErrorKind::ProviderFailure,
+            format!("missing or invalid {field}"),
+        )),
+    }
+}
+
 fn hex_u64_field(value: &Value, field: &str) -> Result<u64, DatalensError> {
     let text = string_field(value, field)?;
     u64::from_str_radix(text.trim_start_matches("0x"), 16).map_err(|error| {
@@ -736,4 +911,17 @@ fn hex_u64_field(value: &Value, field: &str) -> Result<u64, DatalensError> {
             format!("invalid hex field {field}: {error}"),
         )
     })
+}
+
+fn optional_hex_u64_field(value: &Value, field: &str) -> Result<Option<u64>, DatalensError> {
+    optional_string_field(value, field)?
+        .map(|text| {
+            u64::from_str_radix(text.trim_start_matches("0x"), 16).map_err(|error| {
+                DatalensError::new(
+                    DatalensErrorKind::ProviderFailure,
+                    format!("invalid hex field {field}: {error}"),
+                )
+            })
+        })
+        .transpose()
 }

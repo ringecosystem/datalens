@@ -13,6 +13,38 @@ pub struct BlockHeader {
     pub timestamp: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EvmTransaction {
+    pub hash: String,
+    pub block_number: u64,
+    pub block_hash: String,
+    pub transaction_index: u64,
+    pub from: String,
+    pub to: Option<String>,
+    pub value: String,
+    pub input: String,
+    pub nonce: u64,
+    pub gas: u64,
+    pub gas_price: Option<String>,
+    pub max_fee_per_gas: Option<String>,
+    pub max_priority_fee_per_gas: Option<String>,
+    pub transaction_type: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EvmReceipt {
+    pub transaction_hash: String,
+    pub block_number: u64,
+    pub block_hash: String,
+    pub transaction_index: u64,
+    pub status: Option<u64>,
+    pub gas_used: u64,
+    pub cumulative_gas_used: u64,
+    pub effective_gas_price: Option<String>,
+    pub contract_address: Option<String>,
+    pub logs_bloom: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct RawLogRecord {
     block_number: u64,
@@ -220,6 +252,10 @@ impl TopicFilter {
 pub enum QueryRows {
     #[serde(rename = "blocks", alias = "evm_blocks")]
     EvmBlocks(Vec<BlockHeader>),
+    #[serde(rename = "transactions", alias = "evm_transactions")]
+    EvmTransactions(Vec<EvmTransaction>),
+    #[serde(rename = "receipts", alias = "evm_receipts")]
+    EvmReceipts(Vec<EvmReceipt>),
     #[serde(rename = "logs", alias = "evm_logs")]
     EvmLogs(Vec<LogRecord>),
     AdapterJson {
@@ -232,6 +268,8 @@ impl QueryRows {
     pub fn dataset_key(&self) -> DatasetKey {
         match self {
             Self::EvmBlocks(_) => DatasetKey::evm_blocks(),
+            Self::EvmTransactions(_) => DatasetKey::evm_transactions(),
+            Self::EvmReceipts(_) => DatasetKey::evm_receipts(),
             Self::EvmLogs(_) => DatasetKey::evm_logs(),
             Self::AdapterJson { dataset_key, .. } => dataset_key.clone(),
         }
@@ -240,6 +278,8 @@ impl QueryRows {
     pub fn row_count(&self) -> usize {
         match self {
             Self::EvmBlocks(rows) => rows.len(),
+            Self::EvmTransactions(rows) => rows.len(),
+            Self::EvmReceipts(rows) => rows.len(),
             Self::EvmLogs(rows) => rows.len(),
             Self::AdapterJson { rows, .. } => rows.len(),
         }
@@ -248,6 +288,14 @@ impl QueryRows {
     pub fn try_append(&mut self, other: QueryRows) -> Result<(), DatalensError> {
         match (self, other) {
             (Self::EvmBlocks(left), Self::EvmBlocks(mut right)) => {
+                left.append(&mut right);
+                Ok(())
+            }
+            (Self::EvmTransactions(left), Self::EvmTransactions(mut right)) => {
+                left.append(&mut right);
+                Ok(())
+            }
+            (Self::EvmReceipts(left), Self::EvmReceipts(mut right)) => {
                 left.append(&mut right);
                 Ok(())
             }
@@ -280,6 +328,14 @@ impl QueryRows {
             Self::EvmBlocks(rows) => {
                 rows.sort_by_key(|row| row.number);
                 rows.dedup_by_key(|row| row.number);
+            }
+            Self::EvmTransactions(rows) => {
+                rows.sort_by_key(|row| (row.block_number, row.transaction_index));
+                rows.dedup_by_key(|row| (row.block_number, row.transaction_index));
+            }
+            Self::EvmReceipts(rows) => {
+                rows.sort_by_key(|row| (row.block_number, row.transaction_index));
+                rows.dedup_by_key(|row| (row.block_number, row.transaction_index));
             }
             Self::EvmLogs(rows) => {
                 rows.sort_by_key(|row| (row.block_number, row.log_index));

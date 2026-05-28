@@ -32,6 +32,8 @@ impl DatasetId {
 #[serde(rename_all = "snake_case")]
 pub enum Dataset {
     Blocks,
+    Transactions,
+    Receipts,
     Logs,
 }
 
@@ -39,6 +41,8 @@ impl Dataset {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Blocks => "blocks",
+            Self::Transactions => "transactions",
+            Self::Receipts => "receipts",
             Self::Logs => "logs",
         }
     }
@@ -86,6 +90,14 @@ impl DatasetKey {
         Self::from(Dataset::Logs)
     }
 
+    pub fn evm_transactions() -> Self {
+        Self::from(Dataset::Transactions)
+    }
+
+    pub fn evm_receipts() -> Self {
+        Self::from(Dataset::Receipts)
+    }
+
     pub fn tron_blocks() -> Self {
         Self::try_new(ChainFamily::Other("tron".to_owned()), "blocks").unwrap()
     }
@@ -125,6 +137,8 @@ impl DatasetKey {
     pub fn legacy_dataset(&self) -> Option<Dataset> {
         match (self.family(), self.name().as_str()) {
             (ChainFamily::Evm, "blocks") => Some(Dataset::Blocks),
+            (ChainFamily::Evm, "transactions") => Some(Dataset::Transactions),
+            (ChainFamily::Evm, "receipts") => Some(Dataset::Receipts),
             (ChainFamily::Evm, "logs") => Some(Dataset::Logs),
             _ => None,
         }
@@ -135,6 +149,8 @@ impl From<Dataset> for DatasetKey {
     fn from(dataset: Dataset) -> Self {
         match dataset {
             Dataset::Blocks => Self::try_new(ChainFamily::Evm, "blocks").unwrap(),
+            Dataset::Transactions => Self::try_new(ChainFamily::Evm, "transactions").unwrap(),
+            Dataset::Receipts => Self::try_new(ChainFamily::Evm, "receipts").unwrap(),
             Dataset::Logs => Self::try_new(ChainFamily::Evm, "logs").unwrap(),
         }
     }

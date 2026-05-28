@@ -684,6 +684,12 @@ pub fn legacy_evm_to_native_input(
         };
     let selector = match request.dataset {
         Dataset::Blocks => datalens_chain::DatasetSelector::all(),
+        Dataset::Transactions | Dataset::Receipts => {
+            return Err(DatalensError::new(
+                DatalensErrorKind::UnsupportedDataset,
+                "legacy EVM query route does not support transactions or receipts",
+            ));
+        }
         Dataset::Logs => {
             let filter = request.filter.ok_or_else(|| {
                 DatalensError::new(DatalensErrorKind::InvalidInput, "logs require filter")
@@ -693,6 +699,12 @@ pub fn legacy_evm_to_native_input(
     };
     let response_shape = match request.dataset {
         Dataset::Blocks => datalens_planner::ResponseShape::LegacyEvmBlocks,
+        Dataset::Transactions | Dataset::Receipts => {
+            return Err(DatalensError::new(
+                DatalensErrorKind::UnsupportedDataset,
+                "legacy EVM query route does not support transactions or receipts",
+            ));
+        }
         Dataset::Logs => datalens_planner::ResponseShape::LegacyEvmLogs,
     };
 
@@ -997,6 +1009,10 @@ where
             Dataset::Logs => request.filter.as_ref().map(|_| ()).ok_or_else(|| {
                 DatalensError::new(DatalensErrorKind::InvalidInput, "logs require filter")
             }),
+            Dataset::Transactions | Dataset::Receipts => Err(DatalensError::new(
+                DatalensErrorKind::UnsupportedDataset,
+                "legacy EVM query route does not support transactions or receipts",
+            )),
             Dataset::Blocks => Ok(()),
         }
     }
