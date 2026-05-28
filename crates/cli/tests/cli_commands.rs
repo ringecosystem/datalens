@@ -305,6 +305,117 @@ fn test_validate_config_accepts_s3_compatible_storage_backend() {
 }
 
 #[test]
+fn test_validate_config_accepts_application_registry() {
+    let config = toml::from_str::<DatalensConfig>(
+        r#"
+        [server]
+        bind = "127.0.0.1:8080"
+
+        [storage]
+        backend = "local"
+        root = "/tmp/datalens"
+
+        [planner]
+        max_query_range_blocks = 100
+        default_chunk_range_blocks = 10
+
+        [writer]
+        target_object_bytes = 1024
+        min_object_rows = 1
+        record_empty_coverage = true
+
+        [applications]
+        required = true
+
+        [[applications.applications]]
+        id = "Indexer_App"
+        name = "Indexer_App"
+        enabled = true
+        token = "secret-token"
+        chains = ["ethereum"]
+        datasets = ["blocks"]
+
+        [applications.applications.quota]
+        max_query_range_blocks = 10
+        max_requests_per_minute = 60
+        max_concurrent_requests = 1
+
+        [chains.ethereum]
+        kind = "evm"
+        chain_id = 1
+        rpc_urls = ["http://example.invalid"]
+
+        [chains.ethereum.datasets.blocks]
+        enabled = true
+        max_batch_blocks = 10
+
+        [chains.ethereum.datasets.logs]
+        enabled = true
+        max_get_logs_range_blocks = 10
+        max_addresses_per_query = 1
+        "#,
+    )
+    .expect("config parses");
+
+    validate_config(&config).expect("application registry is valid");
+}
+
+#[test]
+fn test_validate_config_rejects_invalid_application_boundary_without_leaking_token() {
+    let config = toml::from_str::<DatalensConfig>(
+        r#"
+        [server]
+        bind = "127.0.0.1:8080"
+
+        [storage]
+        backend = "local"
+        root = "/tmp/datalens"
+
+        [planner]
+        max_query_range_blocks = 100
+        default_chunk_range_blocks = 10
+
+        [writer]
+        target_object_bytes = 1024
+        min_object_rows = 1
+        record_empty_coverage = true
+
+        [applications]
+        required = true
+
+        [[applications.applications]]
+        id = "../bad"
+        name = "../bad"
+        enabled = true
+        token = "secret-token"
+        chains = ["ethereum"]
+        datasets = ["blocks"]
+
+        [chains.ethereum]
+        kind = "evm"
+        chain_id = 1
+        rpc_urls = ["http://example.invalid"]
+
+        [chains.ethereum.datasets.blocks]
+        enabled = true
+        max_batch_blocks = 10
+
+        [chains.ethereum.datasets.logs]
+        enabled = true
+        max_get_logs_range_blocks = 10
+        max_addresses_per_query = 1
+        "#,
+    )
+    .expect("config parses");
+
+    let error = validate_config(&config).expect_err("invalid app rejected");
+
+    assert_eq!(error.kind, DatalensErrorKind::InvalidInput);
+    assert!(error.message.contains("application id"));
+    assert!(!error.message.contains("secret-token"));
+}
+
+#[test]
 fn test_validate_config_keeps_legacy_storage_root_compatible() {
     let config = toml::from_str::<DatalensConfig>(
         r#"

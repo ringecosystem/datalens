@@ -340,8 +340,10 @@ impl MetricsRecorder {
 
 fn error_kind_label(kind: &DatalensErrorKind) -> &'static str {
     match kind {
+        DatalensErrorKind::AuthenticationFailed => "authentication_failed",
         DatalensErrorKind::InvalidInput => "invalid_input",
         DatalensErrorKind::InvalidRequest => "invalid_request",
+        DatalensErrorKind::Unauthorized => "unauthorized",
         DatalensErrorKind::UnsupportedDataset => "unsupported_dataset",
         DatalensErrorKind::ProviderFailure => "provider_failure",
         DatalensErrorKind::ProviderLimit => "provider_limit",
