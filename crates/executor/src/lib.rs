@@ -80,8 +80,16 @@ where
         &self,
         input: NativeQueryInput,
     ) -> Result<NativeQueryExecutionResult, DatalensError> {
+        self.execute_with_application(input, None)
+    }
+
+    pub fn execute_with_application(
+        &self,
+        input: NativeQueryInput,
+        application: Option<ApplicationIdentity>,
+    ) -> Result<NativeQueryExecutionResult, DatalensError> {
         let start = Instant::now();
-        let labels = self.metrics_labels(&input);
+        let labels = self.metrics_labels(&input, application);
         if let Some((recorder, labels)) = self.metrics_recorder(&labels) {
             recorder.set_latest_requested_block(labels, input.ledger_range.end());
         }
@@ -270,10 +278,14 @@ where
         Ok(result)
     }
 
-    fn metrics_labels(&self, input: &NativeQueryInput) -> Option<MetricsLabels> {
+    fn metrics_labels(
+        &self,
+        input: &NativeQueryInput,
+        application: Option<ApplicationIdentity>,
+    ) -> Option<MetricsLabels> {
         self.metrics.as_ref().map(|metrics| {
             MetricsLabels::from_dataset_key(
-                metrics.application.clone(),
+                application.unwrap_or_else(|| metrics.application.clone()),
                 input.chain.clone(),
                 input.dataset_key.clone(),
             )

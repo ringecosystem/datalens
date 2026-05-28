@@ -5,14 +5,14 @@ use std::{collections::BTreeMap, env, fs, net::SocketAddr, path::Path, sync::Arc
 use axum::{
     Json, Router,
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use datalens_chain::ChainAdapter;
 use datalens_core::{
-    BlockRange, ChainIdentity, DatalensError, DatalensErrorKind, Dataset, DatasetKey, DatasetRows,
-    LedgerRange, LogFilter, QueryRows,
+    BlockRange, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, Dataset, DatasetKey,
+    DatasetRows, LedgerRange, LogFilter, NetworkId, QueryRows,
 };
 use datalens_executor::{NativeQueryExecutionConfig, NativeQueryExecutor};
 use datalens_metrics::{ApplicationIdentity, MetricsRecorder};
@@ -271,6 +271,8 @@ pub mod config {
 
 use config::{ChainConfig, MetricsConfig, PlannerConfig, WriterConfig};
 
+pub const APPLICATION_IDENTITY_HEADER: &str = "x-datalens-application";
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LegacyEvmQueryRequest {
     pub chain: ChainIdentity,
@@ -293,6 +295,17 @@ pub struct LegacyEvmQueryResponse {
     pub range: BlockRange,
     pub cache: CacheSummary,
     pub rows: QueryRows,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DiscoveryResponse {
+    pub chains: Vec<ChainDiscovery>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ChainDiscovery {
+    pub identity: ChainIdentity,
+    pub datasets: Vec<Dataset>,
 }
 
 pub fn legacy_evm_to_native_input(
@@ -445,6 +458,14 @@ where
         &self,
         request: LegacyEvmQueryRequest,
     ) -> Result<LegacyEvmQueryResponse, DatalensError> {
+        self.query_with_application(request, None)
+    }
+
+    pub fn query_with_application(
+        &self,
+        request: LegacyEvmQueryRequest,
+        application: Option<ApplicationIdentity>,
+    ) -> Result<LegacyEvmQueryResponse, DatalensError> {
         log::info!(
             "legacy evm query start chain={} dataset={} range={}-{}",
             request.chain.configured_name(),
@@ -457,7 +478,8 @@ where
             return Err(error);
         }
         let response_range = request.range;
-        let response = self.query_native(legacy_evm_to_native_input(request)?)?;
+        let response =
+            self.query_native_with_application(legacy_evm_to_native_input(request)?, application)?;
         let hit_ranges = legacy_block_ranges(&response.cache.hit_ranges)?;
         let misses = legacy_block_ranges(&response.cache.missing_ranges)?;
 
@@ -476,6 +498,14 @@ where
         &self,
         native_input: NativeQueryInput,
     ) -> Result<NativeQueryResponse, DatalensError> {
+        self.query_native_with_application(native_input, None)
+    }
+
+    pub fn query_native_with_application(
+        &self,
+        native_input: NativeQueryInput,
+        application: Option<ApplicationIdentity>,
+    ) -> Result<NativeQueryResponse, DatalensError> {
         log::info!(
             "native query start chain={} dataset={} range={}-{}",
             native_input.chain.configured_name(),
@@ -483,7 +513,9 @@ where
             native_input.ledger_range.start(),
             native_input.ledger_range.end()
         );
-        let result = self.executor.execute(native_input)?;
+        let result = self
+            .executor
+            .execute_with_application(native_input, application)?;
         Ok(NativeQueryResponse {
             chain: result.chain,
             dataset_key: result.dataset_key,
@@ -504,6 +536,17 @@ where
                     format!("encode metrics: {error}"),
                 )
             })
+        })
+    }
+
+    pub fn discovery(&self) -> Result<ChainDiscovery, DatalensError> {
+        Ok(ChainDiscovery {
+            identity: ChainIdentity::try_new(
+                chain_family(&self.chain.kind)?,
+                self.chain_name.clone(),
+                Some(NetworkId::numeric(self.chain.chain_id)),
+            )?,
+            datasets: enabled_datasets(&self.chain),
         })
     }
 
@@ -545,9 +588,12 @@ trait RegisteredQueryService: Send + Sync {
     fn query(
         &self,
         request: LegacyEvmQueryRequest,
+        application: Option<ApplicationIdentity>,
     ) -> Result<LegacyEvmQueryResponse, DatalensError>;
 
     fn metrics_text(&self) -> Option<Result<String, DatalensError>>;
+
+    fn discovery(&self) -> Result<ChainDiscovery, DatalensError>;
 }
 
 impl<S> RegisteredQueryService for QueryService<S>
@@ -557,12 +603,17 @@ where
     fn query(
         &self,
         request: LegacyEvmQueryRequest,
+        application: Option<ApplicationIdentity>,
     ) -> Result<LegacyEvmQueryResponse, DatalensError> {
-        QueryService::query(self, request)
+        QueryService::query_with_application(self, request, application)
     }
 
     fn metrics_text(&self) -> Option<Result<String, DatalensError>> {
         QueryService::metrics_text(self)
+    }
+
+    fn discovery(&self) -> Result<ChainDiscovery, DatalensError> {
+        QueryService::discovery(self)
     }
 }
 
@@ -599,6 +650,14 @@ impl QueryServiceRegistry {
         &self,
         request: LegacyEvmQueryRequest,
     ) -> Result<LegacyEvmQueryResponse, DatalensError> {
+        self.query_with_application(request, None)
+    }
+
+    pub fn query_with_application(
+        &self,
+        request: LegacyEvmQueryRequest,
+        application: Option<ApplicationIdentity>,
+    ) -> Result<LegacyEvmQueryResponse, DatalensError> {
         let chain_name = request.chain.configured_name();
         let service = self.services.get(chain_name).ok_or_else(|| {
             DatalensError::new(
@@ -606,7 +665,16 @@ impl QueryServiceRegistry {
                 format!("chain {chain_name} is not configured"),
             )
         })?;
-        service.query(request)
+        service.query(request, application)
+    }
+
+    pub fn discovery(&self) -> Result<DiscoveryResponse, DatalensError> {
+        let chains = self
+            .services
+            .values()
+            .map(|service| service.discovery())
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(DiscoveryResponse { chains })
     }
 
     pub fn metrics_text(&self) -> Option<Result<String, DatalensError>> {
@@ -631,6 +699,7 @@ pub fn router(registry: QueryServiceRegistry) -> Router {
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .route("/v1/chains", get(chains))
+        .route("/v1/discovery", get(discovery))
         .route("/v1/query", post(query))
         .with_state(AppState { registry })
 }
@@ -648,12 +717,18 @@ async fn chains(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({ "chains": state.registry.chain_names() }))
 }
 
+async fn discovery(State(state): State<AppState>) -> Result<Json<DiscoveryResponse>, ApiError> {
+    state.registry.discovery().map(Json).map_err(ApiError)
+}
+
 async fn query(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<LegacyEvmQueryRequest>,
 ) -> Result<Json<LegacyEvmQueryResponse>, ApiError> {
     let registry = state.registry.clone();
-    tokio::task::spawn_blocking(move || registry.query(request))
+    let application = application_from_headers(&headers);
+    tokio::task::spawn_blocking(move || registry.query_with_application(request, application))
         .await
         .map_err(|error| {
             ApiError(DatalensError::new(
@@ -766,4 +841,29 @@ fn legacy_block_ranges(ranges: &[LedgerRange]) -> Result<Vec<BlockRange>, Datale
             })
         })
         .collect()
+}
+
+fn application_from_headers(headers: &HeaderMap) -> Option<ApplicationIdentity> {
+    headers
+        .get(APPLICATION_IDENTITY_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| ApplicationIdentity::from_optional(Some(value)))
+}
+
+fn chain_family(kind: &str) -> Result<ChainFamily, DatalensError> {
+    match kind {
+        "evm" => Ok(ChainFamily::Evm),
+        value => ChainFamily::try_other(value.to_owned()),
+    }
+}
+
+fn enabled_datasets(chain: &ChainConfig) -> Vec<Dataset> {
+    let mut datasets = Vec::new();
+    if chain.datasets.blocks.enabled {
+        datasets.push(Dataset::Blocks);
+    }
+    if chain.datasets.logs.enabled {
+        datasets.push(Dataset::Logs);
+    }
+    datasets
 }

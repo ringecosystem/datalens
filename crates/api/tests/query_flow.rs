@@ -370,6 +370,58 @@ async fn test_chains_route_lists_registered_chains() {
     );
 }
 
+#[tokio::test]
+async fn test_discovery_route_lists_chain_identities_and_enabled_datasets() {
+    let registry = QueryServiceRegistry::new()
+        .with_service(service_named_with_datasets(
+            LocalStorage::new(temp_storage_root("discovery-ethereum")),
+            MockSource::default().with_chain(ethereum_identity()),
+            "ethereum",
+            1,
+            true,
+            false,
+        ))
+        .expect("register ethereum")
+        .with_service(service_named(
+            LocalStorage::new(temp_storage_root("discovery-polygon")),
+            MockSource::default().with_chain(polygon_identity()),
+            "polygon",
+            137,
+        ))
+        .expect("register polygon");
+
+    let response = router(registry)
+        .oneshot(
+            Request::builder()
+                .uri("/v1/discovery")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("route response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body bytes");
+    let value: serde_json::Value = serde_json::from_slice(&body).expect("json response");
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "chains": [
+                {
+                    "identity": ethereum_identity(),
+                    "datasets": ["blocks"]
+                },
+                {
+                    "identity": polygon_identity(),
+                    "datasets": ["blocks", "logs"]
+                }
+            ]
+        })
+    );
+}
+
 #[test]
 fn test_registry_rejects_unknown_chain_without_falling_back_to_first_service() {
     let ethereum_source = MockSource::default()
@@ -568,6 +620,54 @@ async fn test_metrics_route_returns_prometheus_text_for_query_path() {
     ));
     assert!(text.contains(
         r#"datalens_application_chain_latest_requested_block{application="datalens",chain="ethereum",chain_kind="evm",dataset="blocks"} 10"#
+    ));
+}
+
+#[tokio::test]
+async fn test_query_route_uses_application_identity_header_for_metrics() {
+    let storage = LocalStorage::new(temp_storage_root("metrics-application-header"));
+    let source = MockSource::default().with_blocks(vec![block(10, "0x10")]);
+    let service = service(storage, source);
+    let registry = QueryServiceRegistry::new()
+        .with_service(service)
+        .expect("register metrics service");
+    let router = datalens_api::router(registry);
+
+    let response = router
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/v1/query")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header("x-datalens-application", "wallet-search")
+                .body(axum::body::Body::from(
+                    serde_json::to_vec(&blocks_request(10, 10)).expect("request body"),
+                ))
+                .expect("query request"),
+        )
+        .await
+        .expect("query response");
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+    let response = router
+        .oneshot(
+            axum::http::Request::builder()
+                .method(axum::http::Method::GET)
+                .uri("/metrics")
+                .body(axum::body::Body::empty())
+                .expect("metrics request"),
+        )
+        .await
+        .expect("metrics response");
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("metrics body");
+    let text = std::str::from_utf8(&body).expect("utf8 metrics");
+    assert!(text.contains(
+        r#"datalens_query_total{application="wallet-search",chain="ethereum",chain_kind="evm",dataset="blocks",outcome="filled"} 1"#
     ));
 }
 
