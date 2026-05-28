@@ -1,6 +1,9 @@
 use std::{collections::HashMap, sync::Arc, thread, time::Duration};
 
-use datalens_chain::{ChainAdapter, ChainFetchRequest, FinalityLevel, validate_durable_range};
+use datalens_chain::{
+    ChainAdapter, ChainFetchRequest, DatasetCapability, DatasetSelector, FinalityLevel,
+    SelectorKind, validate_durable_range,
+};
 use datalens_core::{
     DatalensError, DatalensErrorKind, DatasetKey, DatasetRows, LedgerRange, missing_ranges,
 };
@@ -101,6 +104,7 @@ where
         &self,
         request: crate::WarmupSubmitRequest,
     ) -> Result<crate::WarmupSubmitOutcome, DatalensError> {
+        validate_request(&request, &self.runtime.adapter)?;
         self.runtime.registry.submit(request)
     }
 
@@ -499,7 +503,7 @@ where
         );
         metrics.record_warmup_fetch(
             &labels,
-            "evm_logs",
+            &selector_label(&task.selector),
             if rows_written == 0 {
                 WarmupFetchOutcome::Empty
             } else {
@@ -528,7 +532,11 @@ where
         let Some(metrics) = &self.metrics else {
             return;
         };
-        metrics.record_warmup_provider_error(&metrics_labels(task), "evm_logs", error.kind.clone());
+        metrics.record_warmup_provider_error(
+            &metrics_labels(task),
+            &selector_label(&task.selector),
+            error.kind.clone(),
+        );
     }
 }
 
@@ -541,36 +549,97 @@ fn validate_task<A>(task: &WarmupTask, adapter: &A) -> Result<(), DatalensError>
 where
     A: ChainAdapter,
 {
+    validate_capability(
+        &task.chain,
+        &task.dataset_key,
+        &task.selector,
+        task.range_kind.clone(),
+        adapter,
+    )
+}
+
+fn validate_request<A>(
+    request: &crate::WarmupSubmitRequest,
+    adapter: &A,
+) -> Result<(), DatalensError>
+where
+    A: ChainAdapter,
+{
+    validate_capability(
+        &request.chain,
+        &request.dataset_key,
+        &request.selector,
+        request.range_kind.clone(),
+        adapter,
+    )
+}
+
+fn validate_capability<A>(
+    chain: &datalens_core::ChainIdentity,
+    dataset_key: &DatasetKey,
+    selector: &DatasetSelector,
+    range_kind: datalens_core::LedgerRangeKind,
+    adapter: &A,
+) -> Result<(), DatalensError>
+where
+    A: ChainAdapter,
+{
     let capabilities = adapter.capabilities();
-    if capabilities.chain() != &task.chain {
+    if capabilities.chain() != chain {
         return Err(DatalensError::new(
             DatalensErrorKind::InvalidInput,
             "warmup task chain does not match adapter capabilities",
         ));
     }
-    if task.dataset_key != DatasetKey::evm_logs() {
-        return Err(DatalensError::new(
-            DatalensErrorKind::UnsupportedDataset,
-            "warmup MVP supports evm.logs only",
-        ));
-    }
-    let capability = capabilities.dataset(&task.dataset_key).ok_or_else(|| {
+    let capability = capabilities.dataset(dataset_key).ok_or_else(|| {
         DatalensError::new(
             DatalensErrorKind::UnsupportedDataset,
             "adapter does not support warmup dataset",
         )
     })?;
-    if !capability.supports_selector(task.selector.kind()) {
+    if !capability.supports_selector(selector.kind()) {
         return Err(DatalensError::new(
             DatalensErrorKind::UnsupportedDataset,
             "adapter does not support warmup selector",
         ));
     }
-    if !capability.ranges().contains(&task.range_kind) {
+    if !capability.ranges().contains(&range_kind) {
         return Err(DatalensError::new(
             DatalensErrorKind::UnsupportedDataset,
             "adapter does not support warmup range kind",
         ));
+    }
+    if !capability.supports_safe_height() && !capability.supports_finalized_height() {
+        return Err(DatalensError::new(
+            DatalensErrorKind::UnsupportedDataset,
+            "adapter dataset does not expose safe or finalized height for durable cache",
+        ));
+    }
+    validate_selector_limits(selector, capability)?;
+    Ok(())
+}
+
+fn validate_selector_limits(
+    selector: &DatasetSelector,
+    capability: &DatasetCapability,
+) -> Result<(), DatalensError> {
+    if let DatasetSelector::EvmLogs(filter) = selector {
+        if let Some(max_addresses) = capability.max_addresses_per_query()
+            && filter.addresses().len() > max_addresses
+        {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                "too many log addresses",
+            ));
+        }
+        if let Some(max_topics) = capability.max_topics_per_query()
+            && filter.topics().len() > max_topics
+        {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                "too many log topic slots",
+            ));
+        }
     }
     Ok(())
 }
@@ -614,6 +683,14 @@ fn metrics_labels(task: &WarmupTask) -> MetricsLabels {
         task.chain.clone(),
         task.dataset_key.clone(),
     )
+}
+
+fn selector_label(selector: &DatasetSelector) -> String {
+    match selector.kind() {
+        SelectorKind::All => "all".to_owned(),
+        SelectorKind::EvmLogs => "evm_logs".to_owned(),
+        SelectorKind::Other(kind) => kind.as_str().to_owned(),
+    }
 }
 
 fn missing_task(task_id: &WarmupTaskId) -> DatalensError {

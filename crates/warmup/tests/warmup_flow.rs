@@ -14,9 +14,11 @@ use datalens_core::{
     QueryRows,
 };
 use datalens_executor::{NativeQueryExecutionConfig, NativeQueryExecutor};
-use datalens_metrics::ApplicationIdentity;
+use datalens_metrics::{ApplicationIdentity, MetricsRecorder};
 use datalens_planner::{FieldSelection, NativePlannerConfig, NativeQueryInput, ResponseShape};
+use datalens_solana::{SolanaAdapter, solana_all_selector};
 use datalens_storage::{LocalObjectStore, LocalStorage};
+use datalens_tron::{TronAdapter, tron_all_selector};
 use datalens_warmup::{
     LocalWarmupRegistry, WarmupChunkPolicy, WarmupRetryPolicy, WarmupRunStatus, WarmupRuntime,
     WarmupRuntimeConfig, WarmupSchedulerConfig, WarmupSubmitRequest, WarmupTaskMode,
@@ -76,6 +78,214 @@ fn test_warmup_fetches_evm_logs_in_chunks_and_writes_durable_cache() {
     assert_eq!(task.state, WarmupTaskState::Completed);
     assert_eq!(task.stats.rows_fetched, 3);
     assert_eq!(task.stats.provider_calls, 3);
+}
+
+#[test]
+fn test_warmup_fetches_solana_slots_and_writes_durable_cache() {
+    let storage = LocalStorage::new(temp_root("solana-storage"));
+    let registry = LocalWarmupRegistry::new(object_store("solana-registry"));
+    let adapter = SolanaAdapter::with_fixture_defaults();
+    let chain = adapter.capabilities().chain().clone();
+    let selector = solana_all_selector().expect("selector");
+    let runtime = WarmupRuntime::new(adapter, storage.clone(), registry.clone(), writer_config());
+    let task_id = registry
+        .submit(WarmupSubmitRequest {
+            application_id: "app-a".to_owned(),
+            chain: chain.clone(),
+            dataset_key: DatasetKey::solana_slots(),
+            selector: selector.clone(),
+            range_kind: LedgerRangeKind::Slot,
+            start: 10,
+            end: Some(12),
+            mode: WarmupTaskMode::FixedRange,
+            chunk_policy: WarmupChunkPolicy {
+                max_range_len: 3,
+                target_rows_hint: None,
+            },
+            retry_policy: WarmupRetryPolicy::default(),
+        })
+        .unwrap()
+        .task_id;
+
+    let result = runtime.run_task_once(&task_id).expect("warmup run");
+
+    assert_eq!(result.status, WarmupRunStatus::Completed);
+    assert_eq!(result.rows_fetched, 2);
+    assert_eq!(
+        storage
+            .covered_ranges(
+                &chain,
+                &DatasetKey::solana_slots(),
+                &selector,
+                LedgerRange::slots(10, 12).unwrap(),
+            )
+            .unwrap(),
+        vec![LedgerRange::slots(10, 12).unwrap()]
+    );
+}
+
+#[test]
+fn test_warmup_metrics_use_dataset_and_selector_labels() {
+    let storage = LocalStorage::new(temp_root("solana-metrics-storage"));
+    let registry = LocalWarmupRegistry::new(object_store("solana-metrics-registry"));
+    let adapter = SolanaAdapter::with_fixture_defaults();
+    let chain = adapter.capabilities().chain().clone();
+    let selector = solana_all_selector().expect("selector");
+    let metrics = MetricsRecorder::new().expect("metrics recorder");
+    let runtime = WarmupRuntime::new(adapter, storage, registry.clone(), writer_config())
+        .with_metrics(metrics.clone());
+    let task_id = registry
+        .submit(WarmupSubmitRequest {
+            application_id: "app-a".to_owned(),
+            chain,
+            dataset_key: DatasetKey::solana_slots(),
+            selector,
+            range_kind: LedgerRangeKind::Slot,
+            start: 10,
+            end: Some(12),
+            mode: WarmupTaskMode::FixedRange,
+            chunk_policy: WarmupChunkPolicy {
+                max_range_len: 3,
+                target_rows_hint: None,
+            },
+            retry_policy: WarmupRetryPolicy::default(),
+        })
+        .unwrap()
+        .task_id;
+
+    runtime.run_task_once(&task_id).expect("warmup run");
+
+    let output = metrics.encode().expect("metrics text");
+    assert!(output.contains(
+        r#"datalens_warmup_fetch_total{application="app-a",chain="solana-mainnet-beta",chain_kind="solana",dataset="solana.slots",outcome="fetched",selector_kind="solana_all"} 1"#
+    ));
+}
+
+#[test]
+fn test_warmup_fetches_tron_blocks_and_writes_durable_cache() {
+    let storage = LocalStorage::new(temp_root("tron-storage"));
+    let registry = LocalWarmupRegistry::new(object_store("tron-registry"));
+    let adapter = TronAdapter::with_fixture_defaults();
+    let chain = adapter.capabilities().chain().clone();
+    let selector = tron_all_selector().expect("selector");
+    let runtime = WarmupRuntime::new(adapter, storage.clone(), registry.clone(), writer_config());
+    let task_id = registry
+        .submit(WarmupSubmitRequest {
+            application_id: "app-a".to_owned(),
+            chain: chain.clone(),
+            dataset_key: DatasetKey::tron_blocks(),
+            selector: selector.clone(),
+            range_kind: LedgerRangeKind::Block,
+            start: 10,
+            end: Some(12),
+            mode: WarmupTaskMode::FixedRange,
+            chunk_policy: WarmupChunkPolicy {
+                max_range_len: 3,
+                target_rows_hint: None,
+            },
+            retry_policy: WarmupRetryPolicy::default(),
+        })
+        .unwrap()
+        .task_id;
+
+    let result = runtime.run_task_once(&task_id).expect("warmup run");
+
+    assert_eq!(result.status, WarmupRunStatus::Completed);
+    assert_eq!(result.rows_fetched, 3);
+    assert_eq!(
+        storage
+            .covered_ranges(
+                &chain,
+                &DatasetKey::tron_blocks(),
+                &selector,
+                LedgerRange::blocks(10, 12).unwrap(),
+            )
+            .unwrap(),
+        vec![LedgerRange::blocks(10, 12).unwrap()]
+    );
+}
+
+#[test]
+fn test_submit_rejects_unsupported_selector_before_provider_fetch() {
+    let storage = LocalStorage::new(temp_root("submit-validation-storage"));
+    let registry = LocalWarmupRegistry::new(object_store("submit-validation-registry"));
+    let adapter = TronAdapter::with_fixture_defaults();
+    let chain = adapter.capabilities().chain().clone();
+    let pool = WarmupTaskPool::new(
+        WarmupRuntime::new(adapter, storage, registry.clone(), writer_config()),
+        WarmupSchedulerConfig::default(),
+    );
+
+    let error = pool
+        .submit(WarmupSubmitRequest {
+            application_id: "app-a".to_owned(),
+            chain,
+            dataset_key: DatasetKey::tron_blocks(),
+            selector: DatasetSelector::all(),
+            range_kind: LedgerRangeKind::Block,
+            start: 10,
+            end: Some(10),
+            mode: WarmupTaskMode::FixedRange,
+            chunk_policy: WarmupChunkPolicy::default(),
+            retry_policy: WarmupRetryPolicy::default(),
+        })
+        .expect_err("unsupported selector");
+
+    assert_eq!(error.kind, DatalensErrorKind::UnsupportedDataset);
+    assert!(registry.list(Default::default()).unwrap().is_empty());
+}
+
+#[test]
+fn test_persisted_generic_selectors_reload_correctly() {
+    let registry = LocalWarmupRegistry::new(object_store("generic-selector-registry"));
+    let tron_selector = tron_all_selector().expect("selector");
+    let tron_chain = TronAdapter::with_fixture_defaults()
+        .capabilities()
+        .chain()
+        .clone();
+    let all_selector_task = registry
+        .submit(WarmupSubmitRequest {
+            application_id: "app-a".to_owned(),
+            chain: chain(),
+            dataset_key: DatasetKey::evm_logs(),
+            selector: DatasetSelector::all(),
+            range_kind: LedgerRangeKind::Block,
+            start: 1,
+            end: Some(1),
+            mode: WarmupTaskMode::FixedRange,
+            chunk_policy: WarmupChunkPolicy::default(),
+            retry_policy: WarmupRetryPolicy::default(),
+        })
+        .unwrap()
+        .task_id;
+    let other_selector_task = registry
+        .submit(WarmupSubmitRequest {
+            application_id: "app-a".to_owned(),
+            chain: tron_chain,
+            dataset_key: DatasetKey::tron_blocks(),
+            selector: tron_selector.clone(),
+            range_kind: LedgerRangeKind::Block,
+            start: 10,
+            end: Some(10),
+            mode: WarmupTaskMode::FixedRange,
+            chunk_policy: WarmupChunkPolicy::default(),
+            retry_policy: WarmupRetryPolicy::default(),
+        })
+        .unwrap()
+        .task_id;
+
+    assert_eq!(
+        registry.get(&all_selector_task).unwrap().unwrap().selector,
+        DatasetSelector::all()
+    );
+    assert_eq!(
+        registry
+            .get(&other_selector_task)
+            .unwrap()
+            .unwrap()
+            .selector,
+        tron_selector
+    );
 }
 
 #[test]

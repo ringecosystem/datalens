@@ -214,24 +214,6 @@ fn validate_submit(request: &WarmupSubmitRequest) -> Result<(), DatalensError> {
             "warmup application id must not be empty",
         ));
     }
-    if request.dataset_key != DatasetKey::evm_logs() {
-        return Err(DatalensError::new(
-            DatalensErrorKind::UnsupportedDataset,
-            "warmup MVP supports evm.logs only",
-        ));
-    }
-    if !matches!(request.selector, DatasetSelector::EvmLogs(_)) {
-        return Err(DatalensError::new(
-            DatalensErrorKind::UnsupportedDataset,
-            "warmup MVP supports EVM log selectors only",
-        ));
-    }
-    if request.range_kind != LedgerRangeKind::Block {
-        return Err(DatalensError::new(
-            DatalensErrorKind::InvalidInput,
-            "EVM logs warmup range kind must be block",
-        ));
-    }
     if let Some(end) = request.end
         && request.start > end
     {

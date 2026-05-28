@@ -1,4 +1,4 @@
-use datalens_chain::DatasetSelector;
+use datalens_chain::{AdapterKey, DatasetSelector};
 use datalens_core::{DatalensError, DatalensErrorKind, EvmLogFilter};
 use datalens_storage::ObjectStore;
 use serde::{Deserialize, Serialize};
@@ -229,19 +229,32 @@ struct StoredWarmupTask {
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
 enum StoredSelector {
+    All,
     EvmLogs(EvmLogFilter),
+    Other(StoredOtherSelector),
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredOtherSelector {
+    kind: String,
+    fingerprint: String,
+    canonical_key: String,
 }
 
 impl StoredWarmupTask {
     fn from_task(task: &WarmupTask) -> Result<Self, DatalensError> {
         let selector = match &task.selector {
+            DatasetSelector::All => StoredSelector::All,
             DatasetSelector::EvmLogs(filter) => StoredSelector::EvmLogs(filter.clone()),
-            _ => {
-                return Err(DatalensError::new(
-                    DatalensErrorKind::UnsupportedDataset,
-                    "warmup persistence supports EVM log selectors only",
-                ));
-            }
+            DatasetSelector::Other {
+                kind,
+                fingerprint,
+                canonical_key,
+            } => StoredSelector::Other(StoredOtherSelector {
+                kind: kind.as_str().to_owned(),
+                fingerprint: fingerprint.clone(),
+                canonical_key: canonical_key.clone(),
+            }),
         };
         Ok(Self {
             task_id: task.task_id.clone(),
@@ -264,11 +277,17 @@ impl StoredWarmupTask {
         })
     }
 
-    fn into_task(self) -> WarmupTask {
+    fn into_task(self) -> Result<WarmupTask, DatalensError> {
         let selector = match self.selector {
+            StoredSelector::All => DatasetSelector::All,
             StoredSelector::EvmLogs(filter) => DatasetSelector::EvmLogs(filter),
+            StoredSelector::Other(selector) => DatasetSelector::try_other(
+                AdapterKey::try_new(selector.kind)?,
+                selector.fingerprint,
+                selector.canonical_key,
+            )?,
         };
-        WarmupTask {
+        Ok(WarmupTask {
             task_id: self.task_id,
             application_id: self.application_id,
             chain: self.chain,
@@ -286,7 +305,7 @@ impl StoredWarmupTask {
             last_error: self.last_error,
             stats: self.stats,
             dedupe_key: self.dedupe_key,
-        }
+        })
     }
 }
 
@@ -309,7 +328,13 @@ fn cursor_key(task_id: &WarmupTaskId) -> String {
 
 fn decode_task(bytes: &[u8]) -> Result<WarmupTask, DatalensError> {
     serde_json::from_slice::<StoredWarmupTask>(bytes)
-        .map(StoredWarmupTask::into_task)
+        .map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::StorageReadFailure,
+                format!("decode warmup task: {error}"),
+            )
+        })?
+        .into_task()
         .map_err(|error| {
             DatalensError::new(
                 DatalensErrorKind::StorageReadFailure,
