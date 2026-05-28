@@ -9,7 +9,8 @@ use datalens_chain::{
 };
 use datalens_core::{
     BlockHeader, BlockRange, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, Dataset,
-    DatasetKey, DatasetRows, LedgerRange, LogFilter, NetworkId, QueryRows,
+    DatasetKey, DatasetRows, LedgerRange, LogFilter, NetworkId, QueryFinalityRequirement,
+    QueryRows,
 };
 use datalens_executor::{NativeQueryExecutionConfig, NativeQueryExecutor};
 use datalens_metrics::{ApplicationIdentity, MetricsRecorder};
@@ -647,6 +648,7 @@ fn blocks_input(start: u64, end: u64) -> NativeQueryInput {
         selector: DatasetSelector::all(),
         response_shape: ResponseShape::LegacyEvmBlocks,
         field_selection: FieldSelection::All,
+        finality: QueryFinalityRequirement::DurableOnly,
     }
 }
 

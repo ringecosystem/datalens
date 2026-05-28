@@ -186,6 +186,8 @@ fn query_command(command: QueryCommand) -> Result<(), Box<dyn std::error::Error 
             range: BlockRange::try_new(command.from_block, command.to_block)?,
             filter: None,
             include_block: false,
+            allow_hot: false,
+            finality: datalens_core::QueryFinalityRequirement::DurableOnly,
         },
         QuerySubcommand::Logs(command) => {
             let filter = LogFilter {
@@ -203,6 +205,8 @@ fn query_command(command: QueryCommand) -> Result<(), Box<dyn std::error::Error 
                 range: BlockRange::try_new(command.from_block, command.to_block)?,
                 filter: Some(filter),
                 include_block: false,
+                allow_hot: false,
+                finality: datalens_core::QueryFinalityRequirement::DurableOnly,
             }
         }
     };

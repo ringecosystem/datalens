@@ -2,7 +2,10 @@
 
 use std::{collections::BTreeMap, error::Error, fmt};
 
-use datalens_core::{BlockRange, ChainIdentity, DatalensError, Dataset, LogFilter, QueryRows};
+use datalens_core::{
+    BlockRange, ChainIdentity, DatalensError, Dataset, LogFilter, QueryDataFinality,
+    QueryFinalityRequirement, QueryRows, QuerySegmentSource,
+};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 pub const APPLICATION_IDENTITY_HEADER: &str = "x-datalens-application";
@@ -61,6 +64,25 @@ where
             range,
             filter: None,
             include_block: false,
+            allow_hot: false,
+            finality: QueryFinalityRequirement::DurableOnly,
+        })
+    }
+
+    pub fn query_blocks_with_options(
+        &self,
+        chain: ChainIdentity,
+        range: BlockRange,
+        options: QueryOptions,
+    ) -> Result<QueryResponse, ClientError> {
+        self.query(QueryRequest {
+            chain,
+            dataset: Dataset::Blocks,
+            range,
+            filter: None,
+            include_block: false,
+            allow_hot: options.allow_hot,
+            finality: options.finality,
         })
     }
 
@@ -76,6 +98,8 @@ where
             range,
             filter: Some(filter),
             include_block: false,
+            allow_hot: false,
+            finality: QueryFinalityRequirement::DurableOnly,
         })
     }
 
@@ -196,6 +220,14 @@ pub struct QueryRequest {
     pub range: BlockRange,
     pub filter: Option<LogFilter>,
     pub include_block: bool,
+    pub allow_hot: bool,
+    pub finality: QueryFinalityRequirement,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct QueryOptions {
+    pub allow_hot: bool,
+    pub finality: QueryFinalityRequirement,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -210,6 +242,16 @@ pub struct QueryResponse {
 pub struct CacheSummary {
     pub hit_ranges: Vec<BlockRange>,
     pub missing_ranges: Vec<BlockRange>,
+    #[serde(default)]
+    pub durable_hit_ranges: Vec<BlockRange>,
+    #[serde(default)]
+    pub hot_hit_ranges: Vec<BlockRange>,
+    #[serde(default)]
+    pub provider_fill_ranges: Vec<BlockRange>,
+    #[serde(default)]
+    pub promotion_pending_ranges: Vec<BlockRange>,
+    #[serde(default)]
+    pub segments: Vec<QuerySegment>,
 }
 
 impl CacheSummary {
@@ -221,6 +263,13 @@ impl CacheSummary {
             (true, true) => CacheOutcome::Empty,
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QuerySegment {
+    pub range: BlockRange,
+    pub source: QuerySegmentSource,
+    pub finality: QueryDataFinality,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -306,6 +355,7 @@ pub enum ApiErrorKind {
     InvalidInput,
     InvalidRequest,
     UnsupportedDataset,
+    UnsupportedHotQuery,
     ProviderFailure,
     ProviderLimit,
     ProviderTimeout,
@@ -359,6 +409,7 @@ fn api_error_kind(kind: &str) -> ApiErrorKind {
         "invalid_input" => ApiErrorKind::InvalidInput,
         "invalid_request" => ApiErrorKind::InvalidRequest,
         "unsupported_dataset" => ApiErrorKind::UnsupportedDataset,
+        "unsupported_hot_query" => ApiErrorKind::UnsupportedHotQuery,
         "provider_failure" => ApiErrorKind::ProviderFailure,
         "provider_limit" => ApiErrorKind::ProviderLimit,
         "provider_timeout" => ApiErrorKind::ProviderTimeout,

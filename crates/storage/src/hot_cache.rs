@@ -408,7 +408,7 @@ where
             selector_fingerprint: selector.fingerprint(),
             selector_canonical_key: selector.canonical_key(),
             range: Some(range),
-            source: QuerySegmentSource::HotCache,
+            source: QuerySegmentSource::Hot,
             query_finality: metadata.finality_status.query_finality(),
             ..metadata
         };
@@ -689,10 +689,10 @@ impl HotCacheEntryMetadata {
                 ),
             ));
         }
-        if self.source != QuerySegmentSource::HotCache {
+        if self.source != QuerySegmentSource::Hot {
             return Err(DatalensError::new(
                 DatalensErrorKind::StorageReadFailure,
-                "hot cache metadata source must be hot_cache",
+                "hot cache metadata source must be hot",
             ));
         }
         if self.query_finality != self.finality_status.query_finality() {

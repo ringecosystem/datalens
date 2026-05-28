@@ -8,7 +8,7 @@ use datalens_chain::{
 };
 use datalens_core::{
     ChainIdentity, DatalensError, DatalensErrorKind, Dataset, DatasetKey, DatasetRows, LedgerRange,
-    QueryRows, missing_ranges,
+    QueryDataFinality, QueryRows, QuerySegmentMetadata, QuerySegmentSource, missing_ranges,
 };
 use datalens_metrics::HotPromotionOutcome as MetricsHotPromotionOutcome;
 use datalens_metrics::{
@@ -675,11 +675,25 @@ where
         }
 
         rows.sort();
+        let mut cache = plan.coverage.clone();
+        cache.provider_fill_ranges = plan
+            .fetch_tasks
+            .iter()
+            .map(|task| task.range.clone())
+            .collect();
+        cache.segments.extend(plan.fetch_tasks.iter().map(|task| {
+            QuerySegmentMetadata::new(
+                task.range.clone(),
+                QuerySegmentSource::Provider,
+                query_data_finality(finality_level),
+            )
+        }));
+
         let result = NativeQueryExecutionResult {
             chain: plan.chain.clone(),
             dataset_key: plan.dataset_key.clone(),
             ledger_range: plan.ledger_range.clone(),
-            cache: plan.coverage.clone(),
+            cache,
             rows: DatasetRows::new(plan.dataset_key.clone(), rows)?,
         };
         let query_outcome = query_outcome(coverage_outcome, cache_fill_attempted, &result);
@@ -779,18 +793,21 @@ where
             .unwrap_or(&ledger.application)
             .as_str()
             .to_owned();
-        ledger.repository.append(&UsageLedgerEntry::query_event(
-            application,
-            input.chain.clone(),
-            input.dataset_key.clone(),
-            &input.selector,
-            input.ledger_range.clone(),
-            finality_level,
-            query_outcome,
-            cache_outcome,
-            fill_outcome,
-            row_count,
-        ))
+        ledger.repository.append(
+            &UsageLedgerEntry::query_event(
+                application,
+                input.chain.clone(),
+                input.dataset_key.clone(),
+                &input.selector,
+                input.ledger_range.clone(),
+                finality_level,
+                query_outcome,
+                cache_outcome,
+                fill_outcome,
+                row_count,
+            )
+            .with_requested_hot(input.finality.allows_hot()),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -812,6 +829,7 @@ where
                 selector: plan.selector.clone(),
                 response_shape: plan.response_shape.clone(),
                 field_selection: plan.field_selection.clone(),
+                finality: plan.requested_finality,
             },
             match &plan.finality_policy {
                 FinalityPolicy::DurableCache { boundary } => boundary.finality,
@@ -821,6 +839,14 @@ where
             fill_outcome,
             row_count,
         )
+    }
+}
+
+fn query_data_finality(finality: FinalityLevel) -> QueryDataFinality {
+    match finality {
+        FinalityLevel::Finalized => QueryDataFinality::Finalized,
+        FinalityLevel::Safe | FinalityLevel::ChainSpecific(_) => QueryDataFinality::Safe,
+        FinalityLevel::Latest => QueryDataFinality::Latest,
     }
 }
 

@@ -20,7 +20,7 @@ use datalens_chain::{
 };
 use datalens_core::{
     BlockHeader, BlockRange, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, Dataset,
-    DatasetKey, LedgerRange, LogFilter, LogRecord, NetworkId, QueryRows,
+    DatasetKey, LedgerRange, LogFilter, LogRecord, NetworkId, QueryFinalityRequirement, QueryRows,
 };
 use datalens_planner::{FieldSelection, NativeQueryInput, ResponseShape};
 use datalens_storage::{LocalStorage, StorageRepository};
@@ -792,18 +792,34 @@ async fn test_application_allowlist_and_quota_rejections_happen_before_fetch_or_
     let root = temp_storage_root("app-authz-quota");
     let source = MockSource::default().with_blocks(vec![block(10, "0x10"), block(11, "0x11")]);
     let registry = QueryServiceRegistry::new()
-        .with_application_registry(application_registry(vec![application(
-            "logs-only",
-            true,
-            "secret-token",
-            vec!["ethereum"],
-            vec!["logs"],
-            Some(ApplicationQuotaConfig {
-                max_query_range_blocks: Some(1),
-                max_requests_per_minute: Some(60),
-                max_concurrent_requests: Some(1),
-            }),
-        )]))
+        .with_application_registry(application_registry(vec![
+            application(
+                "logs-only",
+                true,
+                "secret-token",
+                vec!["ethereum"],
+                vec!["logs"],
+                Some(ApplicationQuotaConfig {
+                    max_query_range_blocks: Some(1),
+                    max_hot_query_range_blocks: None,
+                    max_requests_per_minute: Some(60),
+                    max_concurrent_requests: Some(1),
+                }),
+            ),
+            application(
+                "hot-logs",
+                true,
+                "hot-token",
+                vec!["ethereum"],
+                vec!["logs"],
+                Some(ApplicationQuotaConfig {
+                    max_query_range_blocks: Some(4),
+                    max_hot_query_range_blocks: Some(1),
+                    max_requests_per_minute: Some(60),
+                    max_concurrent_requests: Some(1),
+                }),
+            ),
+        ]))
         .expect("application registry")
         .with_service(service(LocalStorage::new(&root), source.clone()))
         .expect("register service");
@@ -819,6 +835,7 @@ async fn test_application_allowlist_and_quota_rejections_happen_before_fetch_or_
         .await
         .expect("unauthorized dataset response");
     let quota_limited = app
+        .clone()
         .oneshot(query_http_request(
             logs_request(10, 11, vec!["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]),
             Some("logs-only"),
@@ -826,9 +843,21 @@ async fn test_application_allowlist_and_quota_rejections_happen_before_fetch_or_
         ))
         .await
         .expect("quota response");
+    let mut hot_request = logs_request(10, 11, vec!["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]);
+    hot_request.allow_hot = true;
+    hot_request.finality = QueryFinalityRequirement::SafeToLatest;
+    let hot_quota_limited = app
+        .oneshot(query_http_request(
+            hot_request,
+            Some("hot-logs"),
+            Some("Bearer hot-token"),
+        ))
+        .await
+        .expect("hot quota response");
 
     assert_eq!(unauthorized_dataset.status(), StatusCode::FORBIDDEN);
     assert_eq!(quota_limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(hot_quota_limited.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(source.calls(), Vec::<SourceCall>::new());
     assert!(!root.join("chains/evm/ethereum/1/manifest.json").exists());
 }
@@ -1018,6 +1047,7 @@ fn test_query_native_executes_non_evm_plan_without_legacy_route_validation() {
         .expect("valid selector"),
         response_shape: ResponseShape::NativeRows,
         field_selection: FieldSelection::All,
+        finality: QueryFinalityRequirement::DurableOnly,
     };
 
     let response = service.query_native(input).expect("native query succeeds");
@@ -1128,6 +1158,8 @@ fn blocks_request_for(
         range: BlockRange::expect_new(from_block, to_block),
         filter: None,
         include_block: false,
+        allow_hot: false,
+        finality: QueryFinalityRequirement::DurableOnly,
     }
 }
 
@@ -1178,6 +1210,8 @@ fn logs_request_with_topics_for(
                 .collect(),
         }),
         include_block: false,
+        allow_hot: false,
+        finality: QueryFinalityRequirement::DurableOnly,
     }
 }
 

@@ -113,11 +113,33 @@ fn test_usage_ledger_serializes_hot_cache_reorg_and_promotion_outcomes() {
     let encoded = serde_json::to_string(&entry).expect("encode usage entry");
 
     assert!(encoded.contains(r#""finality":"latest""#));
+    assert!(encoded.contains(r#""requested_hot":true"#));
     assert!(encoded.contains(r#""query_outcome":"hot_hit""#));
     assert!(encoded.contains(r#""cache_outcome":"hot_hit""#));
     assert!(encoded.contains(r#""fill_outcome":"live_fetch""#));
     assert_eq!(QueryOutcome::ReorgRollback, QueryOutcome::ReorgRollback);
     assert_eq!(FillOutcome::PromotionWritten, FillOutcome::PromotionWritten);
+}
+
+#[test]
+fn test_usage_ledger_serializes_default_durable_only_request_contract() {
+    let selector = DatasetSelector::all();
+    let entry = UsageLedgerEntry::query_event(
+        "analytics-api",
+        test_chain(),
+        DatasetKey::evm_blocks(),
+        &selector,
+        LedgerRange::blocks(1, 1).expect("valid range"),
+        FinalityLevel::Safe,
+        QueryOutcome::Hit,
+        CacheOutcome::Hit,
+        FillOutcome::NotAttempted,
+        1,
+    );
+
+    let encoded = serde_json::to_string(&entry).expect("encode usage entry");
+
+    assert!(encoded.contains(r#""requested_hot":false"#));
 }
 
 fn temp_storage_root(name: &str) -> PathBuf {

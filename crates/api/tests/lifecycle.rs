@@ -18,7 +18,7 @@ use datalens_chain::{
 };
 use datalens_core::{
     BlockHeader, BlockRange, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, Dataset,
-    DatasetKey, LedgerRange, LogFilter, NetworkId, QueryRows,
+    DatasetKey, LedgerRange, LogFilter, NetworkId, QueryFinalityRequirement, QueryRows,
 };
 use datalens_metrics::MetricsRecorder;
 use datalens_storage::{
@@ -364,6 +364,8 @@ fn blocks_request(from_block: u64, to_block: u64) -> LegacyEvmQueryRequest {
         range: BlockRange::expect_new(from_block, to_block),
         filter: None,
         include_block: false,
+        allow_hot: false,
+        finality: QueryFinalityRequirement::DurableOnly,
     }
 }
 
@@ -377,6 +379,8 @@ fn logs_request(from_block: u64, to_block: u64) -> LegacyEvmQueryRequest {
             topics: Vec::new(),
         }),
         include_block: false,
+        allow_hot: false,
+        finality: QueryFinalityRequirement::DurableOnly,
     }
 }
 

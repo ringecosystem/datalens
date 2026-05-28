@@ -6,7 +6,8 @@ use datalens_chain::{
 };
 use datalens_core::{
     ChainIdentity, CoverageLevel, DatalensError, DatalensErrorKind, DatasetId, DatasetKey,
-    LedgerRange, TimeRange, missing_ranges,
+    LedgerRange, QueryDataFinality, QueryFinalityRequirement, QuerySegmentMetadata,
+    QuerySegmentSource, TimeRange, missing_ranges,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -63,6 +64,7 @@ pub struct NativeQueryInput {
     pub selector: DatasetSelector,
     pub response_shape: ResponseShape,
     pub field_selection: FieldSelection,
+    pub finality: QueryFinalityRequirement,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -110,6 +112,11 @@ pub struct CoverageSummary {
     pub status: QueryPlanStatus,
     pub hit_ranges: Vec<LedgerRange>,
     pub missing_ranges: Vec<LedgerRange>,
+    pub durable_hit_ranges: Vec<LedgerRange>,
+    pub hot_hit_ranges: Vec<LedgerRange>,
+    pub provider_fill_ranges: Vec<LedgerRange>,
+    pub promotion_pending_ranges: Vec<LedgerRange>,
+    pub segments: Vec<QuerySegmentMetadata>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -131,6 +138,7 @@ pub struct NativeQueryPlan {
     pub selector: DatasetSelector,
     pub response_shape: ResponseShape,
     pub field_selection: FieldSelection,
+    pub requested_finality: QueryFinalityRequirement,
     pub range_split: RangeSplitStrategy,
     pub capability_requirements: Vec<AdapterCapabilityRequirement>,
     pub finality_policy: FinalityPolicy,
@@ -184,6 +192,11 @@ impl NativePlanner {
             return Err(DatalensError::new(
                 DatalensErrorKind::InvalidInput,
                 "query range exceeds planner.max_query_range_blocks",
+            ));
+        }
+        if input.finality.allows_hot() {
+            return Err(DatalensError::unsupported_hot_query(
+                "hot query is not supported by this datalens API",
             ));
         }
         validate_durable_range(&input.ledger_range, &durable_boundary)?;
@@ -257,6 +270,16 @@ impl NativePlanner {
             })
             .collect();
 
+        let finality = match durable_boundary.finality {
+            datalens_chain::FinalityLevel::Finalized => QueryDataFinality::Finalized,
+            _ => QueryDataFinality::Safe,
+        };
+        let segments = hit_ranges
+            .iter()
+            .cloned()
+            .map(|range| QuerySegmentMetadata::new(range, QuerySegmentSource::Durable, finality))
+            .collect::<Vec<_>>();
+
         Ok(NativeQueryPlan {
             chain: input.chain,
             dataset_key: input.dataset_key.clone(),
@@ -264,6 +287,7 @@ impl NativePlanner {
             selector: input.selector,
             response_shape: input.response_shape,
             field_selection: input.field_selection,
+            requested_finality: input.finality,
             range_split: RangeSplitStrategy::MaxLedgerSpan {
                 max_len,
                 supports_adapter_split: dataset_capability.supports_range_split(),
@@ -278,8 +302,13 @@ impl NativePlanner {
             },
             coverage: CoverageSummary {
                 status,
-                hit_ranges,
-                missing_ranges: miss_ranges,
+                hit_ranges: hit_ranges.clone(),
+                missing_ranges: miss_ranges.clone(),
+                durable_hit_ranges: hit_ranges,
+                hot_hit_ranges: Vec::new(),
+                provider_fill_ranges: Vec::new(),
+                promotion_pending_ranges: Vec::new(),
+                segments,
             },
             read_segments,
             fetch_tasks,

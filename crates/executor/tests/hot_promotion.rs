@@ -362,7 +362,7 @@ fn hot_metadata(height: u64, block_hash: &str, parent_hash: &str) -> HotCacheEnt
         selector_fingerprint: String::new(),
         selector_canonical_key: String::new(),
         range: None,
-        source: datalens_core::QuerySegmentSource::HotCache,
+        source: datalens_core::QuerySegmentSource::Hot,
         query_finality: QueryDataFinality::Unsafe,
     }
 }

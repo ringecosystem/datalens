@@ -9,6 +9,7 @@ pub enum DatalensErrorKind {
     InvalidRequest,
     Unauthorized,
     UnsupportedDataset,
+    UnsupportedHotQuery,
     ProviderFailure,
     ProviderLimit,
     ProviderTimeout,
@@ -53,6 +54,10 @@ impl DatalensError {
 
     pub fn unsupported(message: impl Into<String>) -> Self {
         Self::new(DatalensErrorKind::UnsupportedDataset, message)
+    }
+
+    pub fn unsupported_hot_query(message: impl Into<String>) -> Self {
+        Self::new(DatalensErrorKind::UnsupportedHotQuery, message)
     }
 
     pub fn provider_limit(message: impl Into<String>) -> Self {

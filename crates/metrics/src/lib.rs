@@ -450,6 +450,7 @@ fn error_kind_label(kind: &DatalensErrorKind) -> &'static str {
         DatalensErrorKind::InvalidRequest => "invalid_request",
         DatalensErrorKind::Unauthorized => "unauthorized",
         DatalensErrorKind::UnsupportedDataset => "unsupported_dataset",
+        DatalensErrorKind::UnsupportedHotQuery => "unsupported_hot_query",
         DatalensErrorKind::ProviderFailure => "provider_failure",
         DatalensErrorKind::ProviderLimit => "provider_limit",
         DatalensErrorKind::ProviderTimeout => "provider_timeout",

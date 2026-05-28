@@ -277,8 +277,14 @@ impl QueryRows {
 
     pub fn sort(&mut self) {
         match self {
-            Self::EvmBlocks(rows) => rows.sort_by_key(|row| row.number),
-            Self::EvmLogs(rows) => rows.sort_by_key(|row| (row.block_number, row.log_index)),
+            Self::EvmBlocks(rows) => {
+                rows.sort_by_key(|row| row.number);
+                rows.dedup_by_key(|row| row.number);
+            }
+            Self::EvmLogs(rows) => {
+                rows.sort_by_key(|row| (row.block_number, row.log_index));
+                rows.dedup_by_key(|row| (row.block_number, row.log_index));
+            }
             Self::AdapterJson { .. } => {}
         }
     }

@@ -1,6 +1,6 @@
 use datalens_core::{
-    BlockRange, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, Dataset, DatasetId,
-    EvmLogFilter, LogFilter, LogRecord, NetworkId, QueryDataFinality, QueryRows,
+    BlockHeader, BlockRange, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, Dataset,
+    DatasetId, EvmLogFilter, LogFilter, LogRecord, NetworkId, QueryDataFinality, QueryRows,
     QuerySegmentMetadata, QuerySegmentSource, TimeRange, TopicFilter,
 };
 
@@ -161,26 +161,43 @@ fn test_missing_ranges_handles_unsorted_and_mixed_kind_coverage() {
 fn test_query_segment_metadata_marks_source_and_finality() {
     let durable = QuerySegmentMetadata::new(
         datalens_core::LedgerRange::blocks(1, 10).expect("valid range"),
-        QuerySegmentSource::DurableCache,
+        QuerySegmentSource::Durable,
         QueryDataFinality::Finalized,
     );
     let hot = QuerySegmentMetadata::new(
         datalens_core::LedgerRange::blocks(11, 12).expect("valid range"),
-        QuerySegmentSource::HotCache,
+        QuerySegmentSource::Hot,
         QueryDataFinality::Unsafe,
     );
     let live = QuerySegmentMetadata::new(
         datalens_core::LedgerRange::blocks(13, 13).expect("valid range"),
-        QuerySegmentSource::LiveProvider,
+        QuerySegmentSource::Provider,
         QueryDataFinality::Latest,
     );
 
-    assert_eq!(durable.source.as_str(), "durable_cache");
+    assert_eq!(durable.source.as_str(), "durable");
     assert_eq!(durable.finality.as_str(), "finalized");
-    assert_eq!(hot.source.as_str(), "hot_cache");
+    assert_eq!(hot.source.as_str(), "hot");
     assert_eq!(hot.finality.as_str(), "unsafe");
-    assert_eq!(live.source.as_str(), "live_provider");
+    assert_eq!(live.source.as_str(), "provider");
     assert_eq!(live.finality.as_str(), "latest");
+}
+
+#[test]
+fn test_query_rows_sort_deduplicates_blocks_and_logs_stably() {
+    let mut blocks =
+        QueryRows::EvmBlocks(vec![block(2, "0x02"), block(1, "0x01"), block(2, "0x02")]);
+    blocks.sort();
+
+    assert_eq!(
+        blocks,
+        QueryRows::EvmBlocks(vec![block(1, "0x01"), block(2, "0x02")])
+    );
+
+    let mut logs = QueryRows::EvmLogs(vec![log(2, 1), log(1, 0), log(2, 1)]);
+    logs.sort();
+
+    assert_eq!(logs, QueryRows::EvmLogs(vec![log(1, 0), log(2, 1)]));
 }
 
 #[test]
@@ -558,6 +575,7 @@ fn test_error_retryability_is_explicit_for_every_variant() {
         (DatalensErrorKind::InvalidInput, false),
         (DatalensErrorKind::InvalidRequest, false),
         (DatalensErrorKind::UnsupportedDataset, false),
+        (DatalensErrorKind::UnsupportedHotQuery, false),
         (DatalensErrorKind::ProviderFailure, true),
         (DatalensErrorKind::ProviderLimit, false),
         (DatalensErrorKind::ProviderTimeout, true),
@@ -570,6 +588,29 @@ fn test_error_retryability_is_explicit_for_every_variant() {
 
     for (kind, retryable) in cases {
         assert_eq!(kind.is_retryable(), retryable, "{kind:?}");
+    }
+}
+
+fn block(number: u64, hash: &str) -> BlockHeader {
+    BlockHeader {
+        number,
+        hash: hash.to_owned(),
+        parent_hash: format!("{hash}-parent"),
+        timestamp: number,
+    }
+}
+
+fn log(block_number: u64, log_index: u64) -> LogRecord {
+    LogRecord {
+        block_number,
+        block_hash: format!("0xblock-{block_number}"),
+        transaction_hash: format!("0xtx-{block_number}-{log_index}"),
+        transaction_index: 0,
+        log_index,
+        address: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        topics: Vec::new(),
+        data: "0x".to_owned(),
+        removed: false,
     }
 }
 

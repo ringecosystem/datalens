@@ -378,7 +378,7 @@ fn test_hot_metadata_contains_reorg_and_promotion_fields() {
     assert_eq!(metadata.active_branch.as_deref(), Some("branch-a"));
     assert!(!metadata.eligible_for_promotion);
     assert_eq!(metadata.schema_version, "hot-cache-v1");
-    assert_eq!(metadata.source, datalens_core::QuerySegmentSource::HotCache);
+    assert_eq!(metadata.source, datalens_core::QuerySegmentSource::Hot);
     assert_eq!(metadata.query_finality, QueryDataFinality::Unsafe);
 }
 
@@ -585,7 +585,7 @@ fn hot_metadata(
         selector_fingerprint: String::new(),
         selector_canonical_key: String::new(),
         range: None,
-        source: datalens_core::QuerySegmentSource::HotCache,
+        source: datalens_core::QuerySegmentSource::Hot,
         query_finality: QueryDataFinality::Unsafe,
     }
 }
