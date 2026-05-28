@@ -21,6 +21,7 @@ Depends on:
 Verification:
 
 - Required PR readiness command: `just e2e`
+- Full durable cache lifecycle command: `just e2e-lifecycle`
 - Required workspace gates: `just fmt-check` and `just check`
 
 ## CI-Suitable Validation
@@ -64,6 +65,71 @@ Local artifacts:
 
 - Deterministic tests write under OS temporary directories named `datalens-*`.
 - They do not require manual cleanup after a normal successful run.
+
+## Full Durable Cache Lifecycle Validation
+
+Run this when a change touches API routing, CLI inspect output, metrics, storage
+isolation, or S3-compatible storage behavior:
+
+```sh
+just e2e-lifecycle
+```
+
+`just e2e-lifecycle` keeps `just e2e` as the first step, then adds:
+
+```sh
+cargo test -p datalens-api --test lifecycle
+cargo test -p datalens-cli --test cli_commands test_inspect
+cargo test -p datalens-metrics --test metrics_encoding
+```
+
+Default deterministic lifecycle coverage:
+
+| Scenario | Validation |
+| --- | --- |
+| API health and chain registry | In-process router validates `GET /health`, `GET /v1/chains`, and `POST /v1/query`. |
+| API metrics | `GET /metrics` returns Prometheus text with `application`, `chain`, `chain_kind`, and `dataset` labels. |
+| Block miss/fill/hit | First `blocks` query fetches and writes durable cache; equivalent second query is a full hit and does not call the provider. |
+| Empty logs coverage | Empty `logs` query records empty coverage, writes no data object, and equivalent second query is a full hit. |
+| Metrics lifecycle | Miss/fill, full hit, cache coverage, fill, latest requested block, latest filled block, and provider error counters are validated. |
+| Multi-chain isolation | `ethereum` and `polygon` use separate mock sources and write separate chain manifest paths for the same range and dataset. |
+| Unknown chain | Querying a chain outside the configured service route returns `UnsupportedDataset` instead of falling back to another chain. |
+| CLI inspect | `datalens inspect manifest` and `datalens inspect coverage` command tests validate object key, row count, size, checksum, checksum algorithm, written time, range, dataset, selector, finality, and empty/data coverage fields. |
+
+The full lifecycle test suite is deterministic by default. It uses in-process mock
+sources and local temporary storage, and does not require Docker, public RPC, or real
+secrets.
+
+## Optional RustFS/S3-Compatible Lifecycle
+
+The S3-compatible lifecycle path is included in `cargo test -p datalens-api --test
+lifecycle`, but it only runs when explicitly enabled:
+
+```sh
+export DATALENS_RUN_S3_TESTS=1
+export DATALENS_S3_ENDPOINT_URL=http://localhost:9000
+export DATALENS_S3_BUCKET=datalens
+export DATALENS_S3_PREFIX=dev
+export DATALENS_S3_REGION=auto
+export DATALENS_S3_FORCE_PATH_STYLE=true
+export AWS_ACCESS_KEY_ID=datalens-dev
+export AWS_SECRET_ACCESS_KEY=datalens-dev-secret
+export AWS_REGION=auto
+
+just e2e-lifecycle
+```
+
+Start local RustFS first by following `docs/runbook/local-rustfs.md`.
+
+S3-compatible lifecycle coverage:
+
+| Scenario | Validation |
+| --- | --- |
+| Explicit opt-in | Without `DATALENS_RUN_S3_TESTS=1`, the S3-compatible test returns early and the command remains stable in ordinary CI. |
+| Dedicated prefix | Each run creates a unique child prefix under `DATALENS_S3_PREFIX`. |
+| S3 miss/fill/hit | First `blocks` query writes manifest and data object through the S3-compatible backend; equivalent second query is a full hit and does not call the provider. |
+| S3 inspectable manifest | Manifest entries include chain identity, dataset key, row count, object key, object size, checksum, and checksum algorithm. |
+| Cleanup boundary | Cleanup deletes only objects listed under the test prefix; it does not delete buckets or unrelated prefixes. |
 
 ## Local Manual HTTP Smoke
 

@@ -1251,6 +1251,7 @@ dependencies = [
  "datalens-chain",
  "datalens-core",
  "datalens-executor",
+ "datalens-metrics",
  "datalens-planner",
  "datalens-storage",
  "datalens-writer",
@@ -1259,6 +1260,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "toml",
+ "tower",
 ]
 
 [[package]]
