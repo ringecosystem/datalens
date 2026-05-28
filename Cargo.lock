@@ -1294,6 +1294,7 @@ dependencies = [
  "datalens-planner",
  "datalens-solana",
  "datalens-storage",
+ "datalens-tron",
  "datalens-writer",
  "figment",
  "log",
@@ -1400,6 +1401,24 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "tokio",
+]
+
+[[package]]
+name = "datalens-tron"
+version = "0.1.0"
+dependencies = [
+ "datalens-chain",
+ "datalens-chain-conformance",
+ "datalens-core",
+ "datalens-executor",
+ "datalens-planner",
+ "datalens-storage",
+ "datalens-writer",
+ "log",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
 ]
 
 [[package]]

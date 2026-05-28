@@ -12,6 +12,7 @@ members = [
   "crates/planner",
   "crates/solana",
   "crates/storage",
+  "crates/tron",
   "crates/writer",
 ]
 resolver = "3"
