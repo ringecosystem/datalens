@@ -15,6 +15,7 @@ use datalens_storage::{
 use datalens_writer::{
     DurableWriteRequest, DurableWriteSegment, DurableWriter, DurableWriterConfig,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::{
     WarmupCheckpoint, WarmupCursor, WarmupRegistry, WarmupTask, WarmupTaskId, WarmupTaskMode,
@@ -49,7 +50,8 @@ impl Default for WarmupRuntimeConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum WarmupRunStatus {
     Completed,
     Partial,
@@ -57,7 +59,7 @@ pub enum WarmupRunStatus {
     Stopped,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WarmupRunResult {
     pub status: WarmupRunStatus,
     pub fetched_ranges: u64,

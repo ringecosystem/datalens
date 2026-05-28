@@ -12,6 +12,7 @@ datalens-executor = { path = "../executor" }
 datalens-metrics = { path = "../metrics" }
 datalens-planner = { path = "../planner" }
 datalens-storage = { path = "../storage" }
+datalens-warmup = { path = "../warmup" }
 datalens-writer = { path = "../writer" }
 log.workspace = true
 serde.workspace = true

@@ -59,7 +59,9 @@ impl WarmupTaskState {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WarmupChunkPolicy {
+    #[serde(default = "default_warmup_chunk_max_range_len")]
     pub max_range_len: u64,
+    #[serde(default)]
     pub target_rows_hint: Option<usize>,
 }
 
@@ -74,8 +76,11 @@ impl Default for WarmupChunkPolicy {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WarmupRetryPolicy {
+    #[serde(default = "default_warmup_retry_max_attempts")]
     pub max_attempts: u32,
+    #[serde(default = "default_warmup_retry_initial_backoff_ms")]
     pub initial_backoff_ms: u64,
+    #[serde(default = "default_warmup_retry_max_backoff_ms")]
     pub max_backoff_ms: u64,
 }
 
@@ -87,6 +92,22 @@ impl Default for WarmupRetryPolicy {
             max_backoff_ms: 30_000,
         }
     }
+}
+
+fn default_warmup_chunk_max_range_len() -> u64 {
+    1_000
+}
+
+fn default_warmup_retry_max_attempts() -> u32 {
+    3
+}
+
+fn default_warmup_retry_initial_backoff_ms() -> u64 {
+    250
+}
+
+fn default_warmup_retry_max_backoff_ms() -> u64 {
+    30_000
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

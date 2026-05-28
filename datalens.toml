@@ -28,6 +28,15 @@ max_staged_bytes = 134217728
 enabled = true
 default_application = "datalens"
 
+[warmup]
+enabled = false
+registry_path = ".datalens/warmup"
+scheduler_interval_ms = 1000
+max_global_tasks = 1
+max_per_chain_tasks = 1
+max_fetches_per_loop = 1
+flush_on_shutdown = true
+
 [applications]
 required = true
 

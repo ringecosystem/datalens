@@ -17,9 +17,12 @@ use datalens_metrics::ApplicationIdentity;
 use datalens_solana::{SolanaAdapter, SolanaHttpRpc};
 use datalens_storage::{
     DurableStorage, LocalObjectStore, LocalStorage, ManifestEntry, ManifestFinalityLevel,
-    S3ObjectStore, UsageLedgerRepository, UsageLedgerStore,
+    ObjectMetadata, ObjectStore, S3ObjectStore, UsageLedgerRepository, UsageLedgerStore,
 };
 use datalens_tron::{TronAdapter, TronHttpProvider};
+use datalens_warmup::{
+    LocalWarmupRegistry, WarmupRuntime, WarmupRuntimeConfig, WarmupSchedulerConfig, WarmupTaskPool,
+};
 use tracing_subscriber::EnvFilter;
 
 mod index;
@@ -141,12 +144,24 @@ async fn serve_command(
     validate_config(&config)?;
     let bind = parse_bind(&config.server.bind)?;
     let registry = build_service_registry(&config)?;
+    let warmup_scheduler = if config.warmup.enabled {
+        Some(
+            registry.start_warmup_scheduler(std::time::Duration::from_millis(
+                config.warmup.scheduler_interval_ms,
+            )),
+        )
+    } else {
+        None
+    };
 
     let adapter = EvmAdapter::new(EvmAdapterMetadata::default());
     let _capabilities = adapter.capabilities();
 
     log::info!("serving datalens API on {bind}");
     datalens_api::serve(bind, registry).await?;
+    if let Some(scheduler) = warmup_scheduler {
+        scheduler.shutdown();
+    }
     Ok(())
 }
 
@@ -172,6 +187,7 @@ fn doctor_command(command: ConfigCommand) -> Result<(), Box<dyn std::error::Erro
         "planner": config.planner,
         "writer": config.writer,
         "index": config.index,
+        "warmup": config.warmup,
         "metrics": {
             "enabled": config.metrics.enabled,
             "default_application": config.metrics.default_application,
@@ -469,6 +485,7 @@ pub fn validate_config(config: &DatalensConfig) -> Result<(), DatalensError> {
         ));
     }
     validate_index_config(config)?;
+    validate_warmup_config(config)?;
     validate_applications(config)?;
     for (name, chain) in &config.chains {
         validate_chain(name, chain)?;
@@ -511,6 +528,43 @@ fn validate_index_config(config: &DatalensConfig) -> Result<(), DatalensError> {
         return Err(DatalensError::new(
             DatalensErrorKind::InvalidInput,
             "index.cursor_path must not be empty",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_warmup_config(config: &DatalensConfig) -> Result<(), DatalensError> {
+    if !config.warmup.enabled {
+        return Ok(());
+    }
+    if config.warmup.registry_path.trim().is_empty() {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "warmup.registry_path must not be empty when warmup is enabled",
+        ));
+    }
+    if config.warmup.scheduler_interval_ms == 0 {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "warmup.scheduler_interval_ms must be greater than zero",
+        ));
+    }
+    if config.warmup.max_global_tasks == 0 {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "warmup.max_global_tasks must be greater than zero",
+        ));
+    }
+    if config.warmup.max_per_chain_tasks == 0 {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "warmup.max_per_chain_tasks must be greater than zero",
+        ));
+    }
+    if config.warmup.max_fetches_per_loop == 0 {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "warmup.max_fetches_per_loop must be greater than zero",
         ));
     }
     Ok(())
@@ -780,13 +834,9 @@ fn build_service(
             "CLI legacy query commands only support evm chains",
         ));
     }
-    build_evm_service_with_storage(
-        build_storage(config)?,
-        build_usage_ledger(config)?,
-        config,
-        chain_name,
-        chain,
-    )
+    let storage: Arc<dyn datalens_storage::StorageRepository> = Arc::from(build_storage(config)?);
+    let usage_ledger: Arc<dyn UsageLedgerRepository> = Arc::from(build_usage_ledger(config)?);
+    build_evm_service_with_storage(storage, usage_ledger, config, chain_name, chain)
 }
 
 fn build_service_registry(config: &DatalensConfig) -> Result<QueryServiceRegistry, DatalensError> {
@@ -833,8 +883,8 @@ fn build_service_registry(config: &DatalensConfig) -> Result<QueryServiceRegistr
 }
 
 fn build_evm_service_with_storage(
-    storage: impl datalens_storage::StorageRepository + 'static,
-    usage_ledger: impl UsageLedgerRepository + 'static,
+    storage: impl datalens_storage::StorageRepository + Clone + 'static,
+    usage_ledger: impl UsageLedgerRepository + Clone + 'static,
     config: &DatalensConfig,
     chain_name: &str,
     chain: &ChainConfig,
@@ -852,9 +902,9 @@ fn build_evm_service_with_storage(
         chain.datasets.logs.max_get_logs_range_blocks,
         chain.datasets.logs.max_addresses_per_query,
     );
-    Ok(datalens_api::QueryService::new_with_metrics_config(
-        storage,
-        source,
+    let mut service = datalens_api::QueryService::new_with_metrics_config(
+        storage.clone(),
+        source.clone(),
         config.planner.clone(),
         config.writer.clone(),
         chain_name.to_owned(),
@@ -864,12 +914,35 @@ fn build_evm_service_with_storage(
     .with_usage_ledger(
         usage_ledger,
         ApplicationIdentity::named(config.metrics.default_application.clone()),
-    ))
+    );
+    if config.warmup.enabled {
+        let mut runtime = WarmupRuntime::new(
+            source,
+            storage,
+            build_warmup_registry(config)?,
+            durable_writer_config(&config.writer),
+        )
+        .with_runtime_config(WarmupRuntimeConfig {
+            max_fetches_per_task_loop: config.warmup.max_fetches_per_loop,
+        })
+        .with_usage_ledger(build_usage_ledger(config)?);
+        if let Some(recorder) = service.metrics_recorder() {
+            runtime = runtime.with_metrics(recorder);
+        }
+        service = service.with_warmup_pool(WarmupTaskPool::new(
+            runtime,
+            WarmupSchedulerConfig {
+                max_global_concurrent_tasks: config.warmup.max_global_tasks,
+                max_concurrent_tasks_per_chain: config.warmup.max_per_chain_tasks,
+            },
+        ));
+    }
+    Ok(service)
 }
 
 fn build_solana_service_with_storage(
-    storage: impl datalens_storage::StorageRepository + 'static,
-    usage_ledger: impl UsageLedgerRepository + 'static,
+    storage: impl datalens_storage::StorageRepository + Clone + 'static,
+    usage_ledger: impl UsageLedgerRepository + Clone + 'static,
     config: &DatalensConfig,
     chain_name: &str,
     chain: &ChainConfig,
@@ -906,8 +979,8 @@ fn build_solana_service_with_storage(
 }
 
 fn build_tron_service_with_storage(
-    storage: impl datalens_storage::StorageRepository + 'static,
-    usage_ledger: impl UsageLedgerRepository + 'static,
+    storage: impl datalens_storage::StorageRepository + Clone + 'static,
+    usage_ledger: impl UsageLedgerRepository + Clone + 'static,
     config: &DatalensConfig,
     chain_name: &str,
     chain: &ChainConfig,
@@ -1032,6 +1105,104 @@ fn build_usage_ledger(
             DatalensErrorKind::UnsupportedDataset,
             "storage.backend must be local or s3",
         )),
+    }
+}
+
+#[derive(Clone)]
+enum WarmupRegistryObjectStore {
+    Local(LocalObjectStore),
+    S3(S3ObjectStore),
+}
+
+impl ObjectStore for WarmupRegistryObjectStore {
+    fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError> {
+        match self {
+            Self::Local(store) => store.get(key),
+            Self::S3(store) => store.get(key),
+        }
+    }
+
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
+        match self {
+            Self::Local(store) => store.put(key, bytes),
+            Self::S3(store) => store.put(key, bytes),
+        }
+    }
+
+    fn exists(&self, key: &str) -> Result<bool, DatalensError> {
+        match self {
+            Self::Local(store) => store.exists(key),
+            Self::S3(store) => store.exists(key),
+        }
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
+        match self {
+            Self::Local(store) => store.list(prefix),
+            Self::S3(store) => store.list(prefix),
+        }
+    }
+
+    fn delete(&self, key: &str) -> Result<(), DatalensError> {
+        match self {
+            Self::Local(store) => store.delete(key),
+            Self::S3(store) => store.delete(key),
+        }
+    }
+}
+
+fn build_warmup_registry(
+    config: &DatalensConfig,
+) -> Result<LocalWarmupRegistry<WarmupRegistryObjectStore>, DatalensError> {
+    match config.storage.backend.as_str() {
+        "local" => Ok(LocalWarmupRegistry::new(WarmupRegistryObjectStore::Local(
+            LocalObjectStore::new(&config.warmup.registry_path),
+        ))),
+        "s3" => {
+            let mut s3 = config.storage.s3.clone().ok_or_else(|| {
+                DatalensError::new(
+                    DatalensErrorKind::InvalidInput,
+                    "storage.s3 must be set when storage.backend is s3",
+                )
+            })?;
+            let registry_path = config.warmup.registry_path.trim().trim_matches('/');
+            s3.prefix = match (s3.prefix.as_deref(), registry_path.is_empty()) {
+                (Some(prefix), false) if !prefix.trim().is_empty() => Some(format!(
+                    "{}/{registry_path}",
+                    prefix.trim().trim_matches('/')
+                )),
+                (_, false) => Some(registry_path.to_owned()),
+                (Some(prefix), true) => Some(prefix.to_owned()),
+                (None, true) => None,
+            };
+            Ok(LocalWarmupRegistry::new(WarmupRegistryObjectStore::S3(
+                S3ObjectStore::from_config(s3)?,
+            )))
+        }
+        _ => Err(DatalensError::new(
+            DatalensErrorKind::UnsupportedDataset,
+            "storage.backend must be local or s3",
+        )),
+    }
+}
+
+fn durable_writer_config(
+    config: &datalens_api::config::WriterConfig,
+) -> datalens_writer::DurableWriterConfig {
+    datalens_writer::DurableWriterConfig {
+        target_object_bytes: config.target_object_bytes,
+        min_object_rows: config.min_object_rows,
+        record_empty_coverage: config.record_empty_coverage,
+        staging: datalens_writer::WriteStagingConfig {
+            enabled: config.staging.enabled,
+            min_rows: config.staging.min_rows,
+            target_object_bytes: config.staging.target_object_bytes,
+            max_staged_ranges: config.staging.max_staged_ranges,
+            max_staged_rows: config.staging.max_staged_rows,
+            max_staged_age_ms: config.staging.max_staged_age_ms,
+            flush_on_shutdown: config.staging.flush_on_shutdown,
+            max_staged_bytes: config.staging.max_staged_bytes,
+        },
     }
 }
 
