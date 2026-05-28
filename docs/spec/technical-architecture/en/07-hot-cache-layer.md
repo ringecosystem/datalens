@@ -86,6 +86,70 @@ For block-height chains, the minimum metadata is:
 - `finality`.
 - Dataset key, selector fingerprint, and normalized range.
 
+## Storage And Key Model
+
+Hot cache storage uses a namespace that is separate from durable cache storage:
+
+```text
+hot-cache/chains/<chain-kind>/<chain-name>/<network-id>/ranges/<range-kind>/<start>-<end>/datasets/<dataset-key>/<schema-version>/<selector-fingerprint>/height-<height>/<block-hash>/<block-hash>.rows.<encoding-extension>
+hot-cache/chains/<chain-kind>/<chain-name>/<network-id>/ranges/<range-kind>/<start>-<end>/datasets/<dataset-key>/<schema-version>/<selector-fingerprint>/height-<height>/<block-hash>/<block-hash>.metadata.json
+```
+
+The durable namespace remains `chains/...` and the durable manifest remains
+`chains/<chain>/manifest.json`. Hot cache writes must not write durable manifests, durable
+empty coverage, or durable object keys. A cleanup or rollback operation in the hot layer
+may delete only keys under `hot-cache/`.
+
+The hot key model deliberately does not include application identity. Hot cache objects
+are shared for the same chain identity, dataset key, selector fingerprint, range kind,
+range, schema version, height, and block hash. Application identity remains an API,
+quota, metrics, and usage attribution boundary unless a later design explicitly adds
+per-application hot cache isolation.
+
+The first implementation stores hot rows and metadata through the same `ObjectStore`
+interface as durable storage. Local development uses an independent local store rooted at
+the configured hot cache path. S3-compatible deployments use the same object-store
+contract with a dedicated bucket or prefix such as `hot-cache/`; the required isolation is
+the key prefix and manifest rule, not a local-only filesystem assumption.
+
+`schema-version` is `hot-cache-v1` in the first model. The metadata also records object
+encoding, so a future reader can reject unsupported schema or encoding combinations
+instead of silently decoding incompatible objects.
+
+## Metadata And Candidate Semantics
+
+Each `.metadata.json` sidecar records:
+
+- Chain identity, dataset key, selector fingerprint, selector canonical key, and range.
+- Block hash, parent hash, height, observed Unix timestamp, and source provider.
+- Finality status as `finalized`, `safe`, `unsafe`, or `latest`.
+- Row count, object size, SHA-256 checksum, object key, metadata key, schema version, and
+  object encoding.
+- Candidate status as `active`, `candidate`, or `stale`.
+- Optional active branch id.
+- Promotion eligibility.
+- Query segment metadata values `source = hot_cache` and matching query finality.
+
+When the same logical chain/dataset/selector/range/height is written with a different
+block hash, the hot layer keeps both candidates. If the new write is marked `active`, any
+previous active candidate for that logical key is demoted to `candidate`; no durable
+coverage changes. This preserves enough state to compare candidate hashes during reorg
+detection while keeping read selection deterministic.
+
+Hot reads return rows plus the hot metadata used to select those rows. The first read
+selection returns only active candidates for the requested chain, dataset, selector,
+range kind, and height window. If metadata is missing, has an unsupported schema version,
+or has checksum/size mismatch, the read fails as a storage read failure rather than
+returning unmarked stale rows.
+
+## Retention Boundary
+
+Hot cache data is bounded by an explicit retention policy. The first local backend
+implements age-based cleanup over `observed_at_unix_seconds`, with an option to preserve
+active candidates even when older candidates are pruned. Cleanup deletes the row object
+and metadata sidecar for expired hot entries only. It must never delete durable objects,
+durable manifests, or usage ledger entries.
+
 The chain adapter boundary must expose canonical block lookup for adapters that support
 hot cache. The shared contract is `canonical_block(CanonicalBlockRequest) ->
 CanonicalBlock`. An adapter that cannot answer canonical hash queries must return

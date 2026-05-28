@@ -1,7 +1,7 @@
 use datalens_core::{ChainFamily, ChainIdentity, DatalensErrorKind, Dataset};
 use datalens_metrics::{
-    ApplicationIdentity, CacheCoverageOutcome, ErrorLabels, FillOutcome, MetricsLabels,
-    MetricsRecorder, QueryOutcome,
+    ApplicationIdentity, CacheCoverageOutcome, ErrorLabels, FillOutcome, HotReorgOutcome,
+    MetricsLabels, MetricsRecorder, QueryOutcome,
 };
 
 #[test]
@@ -108,6 +108,32 @@ fn test_hot_cache_metrics_have_distinct_outcome_labels() {
     ));
     assert!(output.contains(
         r#"datalens_fill_total{application="indexer",chain="ethereum",chain_kind="evm",dataset="logs",outcome="promotion_written"} 1"#
+    ));
+}
+
+#[test]
+fn test_hot_reorg_metrics_record_detection_rollback_stale_and_refetch_outcomes() {
+    let recorder = MetricsRecorder::new().expect("metrics recorder");
+    let labels = labels(Some("indexer"));
+
+    recorder.record_hot_reorg(&labels, HotReorgOutcome::Detected, 1);
+    recorder.record_hot_reorg(&labels, HotReorgOutcome::RollbackApplied, 1);
+    recorder.record_hot_reorg(&labels, HotReorgOutcome::StaleEntry, 3);
+    recorder.record_hot_reorg(&labels, HotReorgOutcome::RefetchSucceeded, 1);
+
+    let output = recorder.encode().expect("prometheus text");
+
+    assert!(output.contains(
+        r#"datalens_hot_reorg_total{application="indexer",chain="ethereum",chain_kind="evm",dataset="logs",outcome="detected"} 1"#
+    ));
+    assert!(output.contains(
+        r#"datalens_hot_reorg_total{application="indexer",chain="ethereum",chain_kind="evm",dataset="logs",outcome="rollback_applied"} 1"#
+    ));
+    assert!(output.contains(
+        r#"datalens_hot_reorg_total{application="indexer",chain="ethereum",chain_kind="evm",dataset="logs",outcome="stale_entry"} 3"#
+    ));
+    assert!(output.contains(
+        r#"datalens_hot_reorg_total{application="indexer",chain="ethereum",chain_kind="evm",dataset="logs",outcome="refetch_succeeded"} 1"#
     ));
 }
 
