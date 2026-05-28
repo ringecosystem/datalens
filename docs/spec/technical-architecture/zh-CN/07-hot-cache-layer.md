@@ -72,6 +72,60 @@ invalid-input 或 unsupported error，不能静默变成 mixed hot response。
 - `finality`。
 - Dataset key、selector fingerprint、normalized range。
 
+## Storage And Key Model
+
+hot cache storage 使用与 durable cache storage 分离的 namespace：
+
+```text
+hot-cache/chains/<chain-kind>/<chain-name>/<network-id>/ranges/<range-kind>/<start>-<end>/datasets/<dataset-key>/<schema-version>/<selector-fingerprint>/height-<height>/<block-hash>/<block-hash>.rows.<encoding-extension>
+hot-cache/chains/<chain-kind>/<chain-name>/<network-id>/ranges/<range-kind>/<start>-<end>/datasets/<dataset-key>/<schema-version>/<selector-fingerprint>/height-<height>/<block-hash>/<block-hash>.metadata.json
+```
+
+durable namespace 仍是 `chains/...`，durable Manifest 仍是 `chains/<chain>/manifest.json`。
+hot cache write 不能写 durable Manifest、durable empty coverage 或 durable object key。hot layer 的 cleanup
+或 rollback 只能删除 `hot-cache/` 下的 key。
+
+hot key model 默认不包含 application identity。同一 chain identity、dataset key、selector fingerprint、
+range kind、range、schema version、height 和 block hash 的 hot cache object 由所有 application 共享。
+application identity 仍属于 API、quota、metrics 和 usage attribution boundary，除非后续设计明确加入
+per-application hot cache isolation。
+
+第一版 implementation 通过与 durable storage 相同的 `ObjectStore` interface 保存 hot rows 和 metadata。
+local development 使用以 configured hot cache path 为 root 的独立 local store。S3-compatible deployment 使用同一
+object-store contract，并配置 dedicated bucket 或类似 `hot-cache/` 的 prefix；required isolation 来自 key
+prefix 和 Manifest rule，而不是 local-only filesystem assumption。
+
+第一版 `schema-version` 是 `hot-cache-v1`。metadata 同时记录 object encoding，让未来 reader 可以拒绝
+unsupported schema 或 encoding combination，而不是静默 decode incompatible objects。
+
+## Metadata And Candidate Semantics
+
+每个 `.metadata.json` sidecar 记录：
+
+- Chain identity、dataset key、selector fingerprint、selector canonical key 和 range。
+- Block hash、parent hash、height、observed Unix timestamp 和 source provider。
+- Finality status：`finalized`、`safe`、`unsafe` 或 `latest`。
+- Row count、object size、SHA-256 checksum、object key、metadata key、schema version 和 object encoding。
+- Candidate status：`active`、`candidate` 或 `stale`。
+- Optional active branch id。
+- Promotion eligibility。
+- Query segment metadata values：`source = hot_cache` 和 matching query finality。
+
+同一 logical chain/dataset/selector/range/height 以不同 block hash 重复写入时，hot layer 保留多个
+candidate。如果新写入标记为 `active`，同一 logical key 下先前的 active candidate 会被降级为
+`candidate`；durable coverage 不会变化。这样 reorg detection 可以比较 candidate hashes，同时 read selection
+保持 deterministic。
+
+hot read 返回 rows 以及选择这些 rows 使用的 hot metadata。第一版 read selection 只返回 requested chain、
+dataset、selector、range kind 和 height window 内的 active candidates。metadata 缺失、schema version
+unsupported 或 checksum/size mismatch 时，read 必须以 storage read failure 失败，不能返回未标记的 stale rows。
+
+## Retention Boundary
+
+hot cache data 受显式 retention policy 限制。第一版 local backend 基于 `observed_at_unix_seconds` 做 age-based
+cleanup，并支持保留 active candidates，即使较旧 candidate 被 prune。cleanup 只删除 expired hot entry 的 row
+object 和 metadata sidecar。它绝不能删除 durable object、durable Manifest 或 usage ledger entry。
+
 支持 hot cache 的 chain adapter 必须暴露 canonical block lookup。共享 contract 是
 `canonical_block(CanonicalBlockRequest) -> CanonicalBlock`。不能回答 canonical hash query 的 adapter
 必须返回 `UnsupportedDataset`，hot path 必须拒绝 latest-capable query，不能把它伪装成 hot cache miss。
