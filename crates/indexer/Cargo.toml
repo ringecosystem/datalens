@@ -1,0 +1,10 @@
+[package]
+name = "datalens-indexer"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+datalens-chain = { path = "../chain" }
+datalens-core = { path = "../core" }
+datalens-metrics = { path = "../metrics" }

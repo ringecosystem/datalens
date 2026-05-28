@@ -1352,6 +1352,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "datalens-indexer"
+version = "0.1.0"
+dependencies = [
+ "datalens-chain",
+ "datalens-core",
+ "datalens-metrics",
+]
+
+[[package]]
 name = "datalens-metrics"
 version = "0.1.0"
 dependencies = [

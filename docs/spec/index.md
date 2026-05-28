@@ -74,3 +74,5 @@ Then keep the body explicit:
 - Production runtime packaging, configuration, endpoint, storage, operations, and release
   boundary:
   `docs/spec/production-runtime.md`
+- Durable full-indexing runtime contract:
+  `docs/spec/durable-indexing-runtime.md`
