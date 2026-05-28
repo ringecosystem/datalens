@@ -8,6 +8,7 @@ use datalens_core::{
 use datalens_storage::{LocalStorage, ManifestFinalityLevel, ObjectEncoding};
 use datalens_writer::{
     DurableWriteRequest, DurableWriteSegment, DurableWriter, DurableWriterConfig,
+    WriteStagingConfig,
 };
 
 #[test]
@@ -19,6 +20,7 @@ fn test_writer_persists_single_non_empty_segment() {
             target_object_bytes: 1024,
             min_object_rows: 1,
             record_empty_coverage: true,
+            staging: Default::default(),
         },
     );
     let chain = test_chain();
@@ -71,6 +73,7 @@ fn test_writer_records_empty_coverage_without_data_object() {
             target_object_bytes: 1024,
             min_object_rows: 1,
             record_empty_coverage: true,
+            staging: Default::default(),
         },
     );
     let chain = test_chain();
@@ -114,6 +117,7 @@ fn test_writer_merges_adjacent_sparse_segments_by_min_rows() {
             target_object_bytes: 1024 * 1024,
             min_object_rows: 3,
             record_empty_coverage: true,
+            staging: Default::default(),
         },
     );
 
@@ -164,6 +168,7 @@ fn test_writer_continues_merging_after_min_rows_until_target_bytes() {
             target_object_bytes: 1024 * 1024,
             min_object_rows: 2,
             record_empty_coverage: true,
+            staging: Default::default(),
         },
     );
 
@@ -207,6 +212,7 @@ fn test_writer_flushes_before_merge_when_target_bytes_reached() {
             target_object_bytes: 1,
             min_object_rows: 3,
             record_empty_coverage: true,
+            staging: Default::default(),
         },
     );
 
@@ -242,6 +248,7 @@ fn test_writer_does_not_merge_non_adjacent_or_empty_segments_into_data_object() 
             target_object_bytes: 1024 * 1024,
             min_object_rows: 3,
             record_empty_coverage: true,
+            staging: Default::default(),
         },
     );
 
@@ -284,6 +291,7 @@ fn test_writer_does_not_merge_different_range_kinds() {
             target_object_bytes: 1024 * 1024,
             min_object_rows: 3,
             record_empty_coverage: true,
+            staging: Default::default(),
         },
     );
 
@@ -319,6 +327,7 @@ fn test_writer_repeated_logical_shard_is_idempotent() {
             target_object_bytes: 1024,
             min_object_rows: 1,
             record_empty_coverage: true,
+            staging: Default::default(),
         },
     );
     let request = DurableWriteRequest {
@@ -337,6 +346,72 @@ fn test_writer_repeated_logical_shard_is_idempotent() {
 
     assert_eq!(first.data_objects, second.data_objects);
     assert_eq!(storage.manifest().expect("manifest").entries.len(), 1);
+}
+
+#[test]
+fn test_writer_stages_non_empty_segment_below_min_rows_without_manifest_coverage() {
+    let storage = LocalStorage::new(temp_storage_root("stages-below-min"));
+    let writer = DurableWriter::new(
+        storage.clone(),
+        DurableWriterConfig {
+            target_object_bytes: 1024 * 1024,
+            min_object_rows: 3,
+            record_empty_coverage: true,
+            staging: WriteStagingConfig { enabled: true },
+        },
+    );
+    let range = LedgerRange::blocks(1, 1).expect("valid range");
+
+    let result = writer
+        .write(DurableWriteRequest {
+            chain: test_chain(),
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: DatasetSelector::all(),
+            finality_level: FinalityLevel::Safe,
+            segments: vec![DurableWriteSegment {
+                range: range.clone(),
+                rows: block_rows(vec![block(1)]),
+            }],
+        })
+        .expect("stage write");
+
+    assert_eq!(result.staged_ranges, vec![range]);
+    assert!(result.data_objects.is_empty());
+    assert!(storage.manifest().expect("manifest").entries.is_empty());
+}
+
+#[test]
+fn test_writer_flush_persists_staged_segments_as_durable_coverage() {
+    let storage = LocalStorage::new(temp_storage_root("flush-staged"));
+    let writer = DurableWriter::new(
+        storage.clone(),
+        DurableWriterConfig {
+            target_object_bytes: 1024 * 1024,
+            min_object_rows: 3,
+            record_empty_coverage: true,
+            staging: WriteStagingConfig { enabled: true },
+        },
+    );
+
+    writer
+        .write(DurableWriteRequest {
+            chain: test_chain(),
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: DatasetSelector::all(),
+            finality_level: FinalityLevel::Safe,
+            segments: vec![DurableWriteSegment {
+                range: LedgerRange::blocks(1, 1).expect("valid range"),
+                rows: block_rows(vec![block(1)]),
+            }],
+        })
+        .expect("stage write");
+    let result = writer.flush().expect("flush staged writes");
+
+    assert_eq!(result.data_objects.len(), 1);
+    assert_eq!(
+        storage.manifest().expect("manifest").entries[0].range,
+        LedgerRange::blocks(1, 1).expect("valid range")
+    );
 }
 
 fn temp_storage_root(name: &str) -> PathBuf {

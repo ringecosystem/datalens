@@ -257,6 +257,9 @@ where
             target_object_bytes: config.writer.target_object_bytes,
             min_object_rows: config.writer.min_object_rows,
             record_empty_coverage: config.writer.record_empty_coverage,
+            staging: datalens_writer::WriteStagingConfig {
+                enabled: config.writer.staging.enabled,
+            },
         },
     )
     .with_usage_ledger(build_usage_ledger(&config)?);

@@ -69,8 +69,8 @@ pub use object_store::{
 };
 pub use read_through_cache::ReadThroughCacheConfig;
 pub use usage_ledger::{
-    CacheOutcome, FillOutcome, QueryOutcome, UsageLedgerEntry, UsageLedgerRepository,
-    UsageLedgerStore,
+    CacheOutcome, DurableWriteOutcome, FillOutcome, QueryOutcome, UsageLedgerEntry,
+    UsageLedgerRepository, UsageLedgerStore,
 };
 
 #[derive(Clone, Debug)]

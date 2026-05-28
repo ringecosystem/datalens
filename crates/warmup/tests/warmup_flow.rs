@@ -302,6 +302,7 @@ fn writer_config() -> DurableWriterConfig {
         target_object_bytes: 1_000_000,
         min_object_rows: 10,
         record_empty_coverage: true,
+        staging: Default::default(),
     }
 }
 

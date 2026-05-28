@@ -354,6 +354,7 @@ fn test_query_delegates_log_address_limit_to_planner_capabilities() {
             target_object_bytes: 1024,
             min_object_rows: 1,
             record_empty_coverage: true,
+            staging: Default::default(),
         },
         chain_config(1),
     );
@@ -403,6 +404,7 @@ fn service(storage: LocalStorage, source: MockSource) -> QueryService<MockSource
             target_object_bytes: 1024,
             min_object_rows: 1,
             record_empty_coverage: true,
+            staging: Default::default(),
         },
         chain_config(2),
     )

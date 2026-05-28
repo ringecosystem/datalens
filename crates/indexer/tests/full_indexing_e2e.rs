@@ -283,6 +283,7 @@ where
             target_object_bytes: 1024,
             min_object_rows: 1,
             record_empty_coverage: true,
+            staging: Default::default(),
         },
     )
 }
@@ -478,6 +479,7 @@ fn seed_evm_blocks(storage: &LocalStorage, start: u64, end: u64, blocks: Vec<Blo
             target_object_bytes: 1024,
             min_object_rows: 1,
             record_empty_coverage: true,
+            staging: Default::default(),
         },
     )
     .write(datalens_writer::DurableWriteRequest {
