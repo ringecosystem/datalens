@@ -56,10 +56,10 @@ pub use hot_cache::{
     HotReorgReason, HotWriteOutcome, HotWriteRequest, LocalHotCacheStorage,
 };
 pub use maintenance::{
-    CompactionCandidate, MaintenanceCheckReport, MaintenanceCompactionReport, MaintenanceIssue,
-    MaintenanceIssueKind, MaintenanceOperation, MaintenanceOperationMode, MaintenanceReport,
-    MaintenanceRetentionReport, MaintenanceUsageLedgerReport, RetentionPolicy,
-    UsageLedgerRollupModel,
+    CompactionCandidate, MaintenanceCheckReport, MaintenanceCompactionConfig,
+    MaintenanceCompactionReport, MaintenanceIssue, MaintenanceIssueKind, MaintenanceOperation,
+    MaintenanceOperationMode, MaintenanceReport, MaintenanceRetentionReport,
+    MaintenanceUsageLedgerReport, RetentionPolicy, UsageLedgerRollupModel,
 };
 pub use manifest::{Manifest, ManifestEntry, ManifestFinalityLevel};
 pub use object_store::{

@@ -156,6 +156,49 @@ fn test_writer_merges_adjacent_sparse_segments_by_min_rows() {
 }
 
 #[test]
+fn test_writer_continues_merging_after_min_rows_until_target_bytes() {
+    let storage = LocalStorage::new(temp_storage_root("merge-past-min-rows"));
+    let writer = DurableWriter::new(
+        storage.clone(),
+        DurableWriterConfig {
+            target_object_bytes: 1024 * 1024,
+            min_object_rows: 2,
+            record_empty_coverage: true,
+        },
+    );
+
+    let result = writer
+        .write(DurableWriteRequest {
+            chain: test_chain(),
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: DatasetSelector::all(),
+            finality_level: FinalityLevel::Safe,
+            segments: vec![
+                DurableWriteSegment {
+                    range: LedgerRange::blocks(1, 1).expect("valid range"),
+                    rows: block_rows(vec![block(1)]),
+                },
+                DurableWriteSegment {
+                    range: LedgerRange::blocks(2, 2).expect("valid range"),
+                    rows: block_rows(vec![block(2)]),
+                },
+                DurableWriteSegment {
+                    range: LedgerRange::blocks(3, 3).expect("valid range"),
+                    rows: block_rows(vec![block(3)]),
+                },
+            ],
+        })
+        .expect("durable write");
+
+    assert_eq!(result.data_objects.len(), 1);
+    assert_eq!(
+        result.data_objects[0].range,
+        LedgerRange::blocks(1, 3).expect("valid range")
+    );
+    assert_eq!(result.data_objects[0].row_count, 3);
+}
+
+#[test]
 fn test_writer_flushes_before_merge_when_target_bytes_reached() {
     let storage = LocalStorage::new(temp_storage_root("target-bytes"));
     let writer = DurableWriter::new(

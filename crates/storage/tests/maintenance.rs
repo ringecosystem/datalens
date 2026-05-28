@@ -6,7 +6,8 @@ use datalens_core::{
     QueryRows,
 };
 use datalens_storage::{
-    LocalStorage, MaintenanceIssueKind, MaintenanceOperationMode, ObjectStore, StorageWriteRequest,
+    LocalStorage, MaintenanceCompactionConfig, MaintenanceIssueKind, MaintenanceOperationMode,
+    ObjectStore, StorageWriteRequest,
 };
 
 #[test]
@@ -132,6 +133,82 @@ fn test_retention_dry_run_protects_current_manifest_objects() {
     );
     assert!(report.retention.delete_candidates.is_empty());
     assert_eq!(before, after);
+}
+
+#[test]
+fn test_compaction_merges_adjacent_small_objects_and_retains_old_objects() {
+    let storage = LocalStorage::new(temp_storage_root("execute-compaction"));
+    let chain = test_chain();
+    let first_object = write_block_object(&storage, &chain, 50, FinalityLevel::Safe);
+    let second_object = write_block_object(&storage, &chain, 51, FinalityLevel::Safe);
+    let before = storage.object_store().list("chains").expect("before list");
+
+    let report = storage
+        .compact_small_objects(MaintenanceCompactionConfig {
+            min_object_bytes: u64::MAX,
+            max_merge_ranges: 8,
+        })
+        .expect("compact small objects");
+
+    assert!(!report.read_only);
+    assert_eq!(report.candidates.len(), 1);
+    assert_eq!(report.compacted_objects, 1);
+    assert_eq!(report.compacted_rows, 2);
+
+    let manifest = storage.manifest().expect("manifest");
+    assert_eq!(manifest.entries.len(), 1);
+    assert_eq!(
+        manifest.entries[0].range,
+        LedgerRange::blocks(50, 51).expect("range")
+    );
+    assert_eq!(manifest.entries[0].row_count, 2);
+    assert_ne!(
+        manifest.entries[0].object_key.as_deref(),
+        Some(first_object.as_str())
+    );
+    assert_ne!(
+        manifest.entries[0].object_key.as_deref(),
+        Some(second_object.as_str())
+    );
+
+    assert!(
+        storage
+            .object_store()
+            .exists(&first_object)
+            .expect("first exists")
+    );
+    assert!(
+        storage
+            .object_store()
+            .exists(&second_object)
+            .expect("second exists")
+    );
+    assert!(
+        storage
+            .object_store()
+            .list("chains")
+            .expect("after list")
+            .len()
+            > before.len()
+    );
+
+    let rows = storage
+        .read_rows(
+            &chain,
+            &DatasetKey::evm_blocks(),
+            &DatasetSelector::all(),
+            LedgerRange::blocks(50, 51).expect("range"),
+        )
+        .expect("read compacted rows");
+    assert_eq!(rows.row_count(), 2);
+    assert!(
+        storage
+            .maintenance_report()
+            .expect("maintenance")
+            .check
+            .issues
+            .is_empty()
+    );
 }
 
 fn write_block_object(
