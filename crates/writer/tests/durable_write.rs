@@ -1,13 +1,22 @@
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use datalens_chain::{DatasetSelector, FinalityLevel};
 use datalens_core::{
-    BlockHeader, ChainFamily, ChainIdentity, DatasetKey, DatasetRows, LedgerRange, LogRecord,
-    NetworkId, QueryRows,
+    BlockHeader, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey,
+    DatasetRows, LedgerRange, LogRecord, NetworkId, QueryRows,
 };
-use datalens_storage::{LocalStorage, ManifestFinalityLevel, ObjectEncoding};
+use datalens_storage::{
+    LocalStorage, Manifest, ManifestFinalityLevel, ObjectEncoding, StorageRepository,
+    StorageWriteOutcome, StorageWriteRequest,
+};
 use datalens_writer::{
-    DurableWriteRequest, DurableWriteSegment, DurableWriter, DurableWriterConfig,
+    DurableWriteRequest, DurableWriteSegment, DurableWriter, DurableWriterConfig, WriteFlushReason,
     WriteStagingConfig,
 };
 
@@ -357,7 +366,10 @@ fn test_writer_stages_non_empty_segment_below_min_rows_without_manifest_coverage
             target_object_bytes: 1024 * 1024,
             min_object_rows: 3,
             record_empty_coverage: true,
-            staging: WriteStagingConfig { enabled: true },
+            staging: WriteStagingConfig {
+                enabled: true,
+                ..Default::default()
+            },
         },
     );
     let range = LedgerRange::blocks(1, 1).expect("valid range");
@@ -389,7 +401,10 @@ fn test_writer_flush_persists_staged_segments_as_durable_coverage() {
             target_object_bytes: 1024 * 1024,
             min_object_rows: 3,
             record_empty_coverage: true,
-            staging: WriteStagingConfig { enabled: true },
+            staging: WriteStagingConfig {
+                enabled: true,
+                ..Default::default()
+            },
         },
     );
 
@@ -412,6 +427,236 @@ fn test_writer_flush_persists_staged_segments_as_durable_coverage() {
         storage.manifest().expect("manifest").entries[0].range,
         LedgerRange::blocks(1, 1).expect("valid range")
     );
+}
+
+#[test]
+fn test_writer_flushes_staged_segments_for_configured_rows_threshold() {
+    let storage = LocalStorage::new(temp_storage_root("staging-rows-threshold"));
+    let writer = DurableWriter::new(
+        storage.clone(),
+        DurableWriterConfig {
+            target_object_bytes: 1024 * 1024,
+            min_object_rows: 100,
+            record_empty_coverage: true,
+            staging: WriteStagingConfig {
+                enabled: true,
+                min_rows: Some(2),
+                ..Default::default()
+            },
+        },
+    );
+
+    let result = writer
+        .write(DurableWriteRequest {
+            chain: test_chain(),
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: DatasetSelector::all(),
+            finality_level: FinalityLevel::Safe,
+            segments: vec![
+                DurableWriteSegment {
+                    range: LedgerRange::blocks(1, 1).expect("valid range"),
+                    rows: block_rows(vec![block(1)]),
+                },
+                DurableWriteSegment {
+                    range: LedgerRange::blocks(2, 2).expect("valid range"),
+                    rows: block_rows(vec![block(2)]),
+                },
+            ],
+        })
+        .expect("flush by rows threshold");
+
+    assert_eq!(result.flush_reason, Some(WriteFlushReason::RowsThreshold));
+    assert_eq!(result.data_objects.len(), 1);
+    assert_eq!(storage.manifest().expect("manifest").entries.len(), 1);
+}
+
+#[test]
+fn test_writer_flushes_staged_segments_for_range_count_threshold() {
+    let storage = LocalStorage::new(temp_storage_root("staging-range-threshold"));
+    let writer = DurableWriter::new(
+        storage.clone(),
+        DurableWriterConfig {
+            target_object_bytes: 1024 * 1024,
+            min_object_rows: 100,
+            record_empty_coverage: true,
+            staging: WriteStagingConfig {
+                enabled: true,
+                max_staged_ranges: Some(2),
+                ..Default::default()
+            },
+        },
+    );
+
+    writer
+        .write(DurableWriteRequest {
+            chain: test_chain(),
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: DatasetSelector::all(),
+            finality_level: FinalityLevel::Safe,
+            segments: vec![DurableWriteSegment {
+                range: LedgerRange::blocks(1, 1).expect("valid range"),
+                rows: block_rows(vec![block(1)]),
+            }],
+        })
+        .expect("stage first range");
+    let result = writer
+        .write(DurableWriteRequest {
+            chain: test_chain(),
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: DatasetSelector::all(),
+            finality_level: FinalityLevel::Safe,
+            segments: vec![DurableWriteSegment {
+                range: LedgerRange::blocks(2, 2).expect("valid range"),
+                rows: block_rows(vec![block(2)]),
+            }],
+        })
+        .expect("flush by range count");
+
+    assert_eq!(result.flush_reason, Some(WriteFlushReason::RangeThreshold));
+    assert_eq!(result.data_objects.len(), 1);
+}
+
+#[test]
+fn test_writer_flushes_staged_segments_for_bytes_threshold() {
+    let storage = LocalStorage::new(temp_storage_root("staging-bytes-threshold"));
+    let writer = DurableWriter::new(
+        storage,
+        DurableWriterConfig {
+            target_object_bytes: 1024 * 1024,
+            min_object_rows: 100,
+            record_empty_coverage: true,
+            staging: WriteStagingConfig {
+                enabled: true,
+                target_object_bytes: Some(1),
+                ..Default::default()
+            },
+        },
+    );
+
+    let result = writer
+        .write(DurableWriteRequest {
+            chain: test_chain(),
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: DatasetSelector::all(),
+            finality_level: FinalityLevel::Safe,
+            segments: vec![DurableWriteSegment {
+                range: LedgerRange::blocks(1, 1).expect("valid range"),
+                rows: block_rows(vec![block(1)]),
+            }],
+        })
+        .expect("flush by bytes");
+
+    assert_eq!(result.flush_reason, Some(WriteFlushReason::BytesThreshold));
+    assert_eq!(result.data_objects.len(), 1);
+}
+
+#[test]
+fn test_writer_flushes_staged_segments_for_age_threshold() {
+    let storage = LocalStorage::new(temp_storage_root("staging-age-threshold"));
+    let writer = DurableWriter::new(
+        storage,
+        DurableWriterConfig {
+            target_object_bytes: 1024 * 1024,
+            min_object_rows: 100,
+            record_empty_coverage: true,
+            staging: WriteStagingConfig {
+                enabled: true,
+                max_staged_age_ms: Some(0),
+                ..Default::default()
+            },
+        },
+    );
+
+    let result = writer
+        .write(DurableWriteRequest {
+            chain: test_chain(),
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: DatasetSelector::all(),
+            finality_level: FinalityLevel::Safe,
+            segments: vec![DurableWriteSegment {
+                range: LedgerRange::blocks(1, 1).expect("valid range"),
+                rows: block_rows(vec![block(1)]),
+            }],
+        })
+        .expect("flush by age");
+
+    assert_eq!(result.flush_reason, Some(WriteFlushReason::AgeThreshold));
+    assert_eq!(result.data_objects.len(), 1);
+}
+
+#[test]
+fn test_writer_flushes_staged_segments_for_shutdown_when_enabled() {
+    let storage = LocalStorage::new(temp_storage_root("staging-shutdown"));
+    let writer = DurableWriter::new(
+        storage,
+        DurableWriterConfig {
+            target_object_bytes: 1024 * 1024,
+            min_object_rows: 100,
+            record_empty_coverage: true,
+            staging: WriteStagingConfig {
+                enabled: true,
+                flush_on_shutdown: true,
+                ..Default::default()
+            },
+        },
+    );
+
+    writer
+        .write(DurableWriteRequest {
+            chain: test_chain(),
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: DatasetSelector::all(),
+            finality_level: FinalityLevel::Safe,
+            segments: vec![DurableWriteSegment {
+                range: LedgerRange::blocks(1, 1).expect("valid range"),
+                rows: block_rows(vec![block(1)]),
+            }],
+        })
+        .expect("stage write");
+    let result = writer.flush_for_shutdown().expect("shutdown flush");
+
+    assert_eq!(result.flush_reason, Some(WriteFlushReason::Shutdown));
+    assert_eq!(result.data_objects.len(), 1);
+}
+
+#[test]
+fn test_writer_retains_staged_segments_when_manual_flush_fails() {
+    let storage = ToggleFailStorage::new(LocalStorage::new(temp_storage_root("staging-retry")));
+    let writer = DurableWriter::new(
+        storage.clone(),
+        DurableWriterConfig {
+            target_object_bytes: 1024 * 1024,
+            min_object_rows: 100,
+            record_empty_coverage: true,
+            staging: WriteStagingConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        },
+    );
+
+    writer
+        .write(DurableWriteRequest {
+            chain: test_chain(),
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: DatasetSelector::all(),
+            finality_level: FinalityLevel::Safe,
+            segments: vec![DurableWriteSegment {
+                range: LedgerRange::blocks(1, 1).expect("valid range"),
+                rows: block_rows(vec![block(1)]),
+            }],
+        })
+        .expect("stage write");
+
+    storage.set_fail_writes(true);
+    let error = writer.flush().expect_err("flush fails");
+    assert_eq!(error.kind, DatalensErrorKind::StorageWriteFailure);
+    assert!(storage.manifest().expect("manifest").entries.is_empty());
+
+    storage.set_fail_writes(false);
+    let retry = writer.flush().expect("retry retained staged write");
+    assert_eq!(retry.flush_reason, Some(WriteFlushReason::Manual));
+    assert_eq!(retry.data_objects.len(), 1);
 }
 
 fn temp_storage_root(name: &str) -> PathBuf {
@@ -445,4 +690,63 @@ fn block_rows(rows: Vec<BlockHeader>) -> DatasetRows {
 
 fn log_rows(rows: Vec<LogRecord>) -> DatasetRows {
     DatasetRows::new(DatasetKey::evm_logs(), QueryRows::EvmLogs(rows)).expect("dataset rows")
+}
+
+#[derive(Clone)]
+struct ToggleFailStorage {
+    inner: LocalStorage,
+    fail_writes: Arc<AtomicBool>,
+}
+
+impl ToggleFailStorage {
+    fn new(inner: LocalStorage) -> Self {
+        Self {
+            inner,
+            fail_writes: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn set_fail_writes(&self, fail: bool) {
+        self.fail_writes.store(fail, Ordering::SeqCst);
+    }
+}
+
+impl StorageRepository for ToggleFailStorage {
+    fn manifest(&self) -> Result<Manifest, DatalensError> {
+        self.inner.manifest()
+    }
+
+    fn covered_ranges(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+    ) -> Result<Vec<LedgerRange>, DatalensError> {
+        self.inner
+            .covered_ranges(chain, dataset_key, selector, range)
+    }
+
+    fn read_rows(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+    ) -> Result<DatasetRows, DatalensError> {
+        self.inner.read_rows(chain, dataset_key, selector, range)
+    }
+
+    fn write_rows(
+        &self,
+        request: StorageWriteRequest<'_>,
+    ) -> Result<StorageWriteOutcome, DatalensError> {
+        if self.fail_writes.load(Ordering::SeqCst) {
+            return Err(DatalensError::new(
+                DatalensErrorKind::StorageWriteFailure,
+                "injected durable write failure",
+            ));
+        }
+        self.inner.write_rows(request)
+    }
 }

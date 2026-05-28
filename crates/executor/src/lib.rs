@@ -421,6 +421,10 @@ where
         self.writer.flush()
     }
 
+    pub fn flush_staged_writes_for_shutdown(&self) -> Result<DurableWriteResult, DatalensError> {
+        self.writer.flush_for_shutdown()
+    }
+
     pub fn execute_with_application(
         &self,
         input: NativeQueryInput,

@@ -19,7 +19,7 @@ use datalens_executor::{NativeQueryExecutionConfig, NativeQueryExecutor};
 use datalens_metrics::{ApplicationIdentity, MetricsRecorder};
 use datalens_planner::{NativePlannerConfig, NativeQueryInput};
 use datalens_storage::{S3ObjectStoreConfig, StorageRepository, UsageLedgerRepository};
-use datalens_writer::DurableWriterConfig;
+use datalens_writer::{DurableWriteResult, DurableWriterConfig};
 use serde::{Deserialize, Serialize};
 
 pub mod auth {
@@ -400,10 +400,43 @@ pub mod config {
         pub staging: WriterStagingConfig,
     }
 
-    #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
     pub struct WriterStagingConfig {
         #[serde(default)]
         pub enabled: bool,
+        #[serde(default)]
+        pub min_rows: Option<usize>,
+        #[serde(default)]
+        pub target_object_bytes: Option<u64>,
+        #[serde(default)]
+        pub max_staged_ranges: Option<usize>,
+        #[serde(default)]
+        pub max_staged_rows: Option<usize>,
+        #[serde(default)]
+        pub max_staged_age_ms: Option<u64>,
+        #[serde(default = "default_flush_on_shutdown")]
+        pub flush_on_shutdown: bool,
+        #[serde(default)]
+        pub max_staged_bytes: Option<u64>,
+    }
+
+    impl Default for WriterStagingConfig {
+        fn default() -> Self {
+            Self {
+                enabled: false,
+                min_rows: None,
+                target_object_bytes: None,
+                max_staged_ranges: None,
+                max_staged_rows: None,
+                max_staged_age_ms: None,
+                flush_on_shutdown: true,
+                max_staged_bytes: None,
+            }
+        }
+    }
+
+    fn default_flush_on_shutdown() -> bool {
+        true
     }
 
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -823,6 +856,13 @@ where
                     record_empty_coverage: writer.record_empty_coverage,
                     staging: datalens_writer::WriteStagingConfig {
                         enabled: writer.staging.enabled,
+                        min_rows: writer.staging.min_rows,
+                        target_object_bytes: writer.staging.target_object_bytes,
+                        max_staged_ranges: writer.staging.max_staged_ranges,
+                        max_staged_rows: writer.staging.max_staged_rows,
+                        max_staged_age_ms: writer.staging.max_staged_age_ms,
+                        flush_on_shutdown: writer.staging.flush_on_shutdown,
+                        max_staged_bytes: writer.staging.max_staged_bytes,
                     },
                 },
             },
@@ -980,6 +1020,10 @@ where
         })
     }
 
+    pub fn flush_staged_writes_for_shutdown(&self) -> Result<DurableWriteResult, DatalensError> {
+        self.executor.flush_staged_writes_for_shutdown()
+    }
+
     pub fn discovery(&self) -> Result<ChainDiscovery, DatalensError> {
         Ok(ChainDiscovery {
             identity: ChainIdentity::try_new(
@@ -1044,6 +1088,8 @@ trait RegisteredQueryService: Send + Sync {
 
     fn metrics_text(&self) -> Option<Result<String, DatalensError>>;
 
+    fn flush_staged_writes_for_shutdown(&self) -> Result<DurableWriteResult, DatalensError>;
+
     fn discovery(&self) -> Result<ChainDiscovery, DatalensError>;
 }
 
@@ -1069,6 +1115,10 @@ where
 
     fn metrics_text(&self) -> Option<Result<String, DatalensError>> {
         QueryService::metrics_text(self)
+    }
+
+    fn flush_staged_writes_for_shutdown(&self) -> Result<DurableWriteResult, DatalensError> {
+        QueryService::flush_staged_writes_for_shutdown(self)
     }
 
     fn discovery(&self) -> Result<ChainDiscovery, DatalensError> {
@@ -1190,6 +1240,15 @@ impl QueryServiceRegistry {
         } else {
             Some(Ok(texts.join("\n")))
         }
+    }
+
+    pub fn flush_staged_writes_for_shutdown(
+        &self,
+    ) -> Result<Vec<DurableWriteResult>, DatalensError> {
+        self.services
+            .values()
+            .map(|service| service.flush_staged_writes_for_shutdown())
+            .collect()
     }
 }
 
@@ -1337,7 +1396,26 @@ fn api_error_kind(kind: &DatalensErrorKind) -> &'static str {
 pub async fn serve(bind: SocketAddr, registry: QueryServiceRegistry) -> Result<(), std::io::Error> {
     let listener = tokio::net::TcpListener::bind(bind).await?;
     log::info!("api listener bound to {bind}");
-    axum::serve(listener, router(registry)).await
+    let shutdown_registry = registry.clone();
+    axum::serve(listener, router(registry))
+        .with_graceful_shutdown(async {
+            if let Err(error) = tokio::signal::ctrl_c().await {
+                log::error!("failed to listen for shutdown signal: {error}");
+            }
+        })
+        .await?;
+    shutdown_registry
+        .flush_staged_writes_for_shutdown()
+        .map(|results| {
+            let flushed_objects = results
+                .iter()
+                .map(|result| result.data_objects.len())
+                .sum::<usize>();
+            if flushed_objects > 0 {
+                log::info!("flushed {flushed_objects} staged durable objects during shutdown");
+            }
+        })
+        .map_err(|error| std::io::Error::other(error.to_string()))
 }
 
 fn legacy_block_ranges(ranges: &[LedgerRange]) -> Result<Vec<BlockRange>, DatalensError> {

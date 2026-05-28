@@ -14,6 +14,16 @@ target_object_bytes = 67108864
 min_object_rows = 1000
 record_empty_coverage = true
 
+[writer.staging]
+enabled = true
+min_rows = 1000
+target_object_bytes = 67108864
+max_staged_ranges = 32
+max_staged_rows = 10000
+max_staged_age_ms = 60000
+flush_on_shutdown = true
+max_staged_bytes = 134217728
+
 [metrics]
 enabled = true
 default_application = "datalens"

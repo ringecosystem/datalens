@@ -426,6 +426,64 @@ fn test_validate_config_accepts_s3_compatible_storage_backend() {
 }
 
 #[test]
+fn test_config_parses_writer_staging_thresholds() {
+    let config = toml::from_str::<DatalensConfig>(
+        r#"
+        [server]
+        bind = "127.0.0.1:8080"
+
+        [storage]
+        backend = "local"
+        root = ".datalens/storage"
+
+        [planner]
+        max_query_range_blocks = 100
+        default_chunk_range_blocks = 10
+
+        [writer]
+        target_object_bytes = 1024
+        min_object_rows = 10
+        record_empty_coverage = true
+
+        [writer.staging]
+        enabled = true
+        min_rows = 20
+        target_object_bytes = 2048
+        max_staged_ranges = 4
+        max_staged_rows = 100
+        max_staged_age_ms = 5000
+        flush_on_shutdown = true
+        max_staged_bytes = 4096
+
+        [chains.private]
+        kind = "evm"
+        chain_id = 31337
+        rpc_urls = ["http://example.invalid"]
+
+        [chains.private.datasets.blocks]
+        enabled = true
+        max_batch_blocks = 10
+
+        [chains.private.datasets.logs]
+        enabled = true
+        max_get_logs_range_blocks = 10
+        max_addresses_per_query = 2
+        "#,
+    )
+    .expect("config parses");
+
+    assert!(config.writer.staging.enabled);
+    assert_eq!(config.writer.staging.min_rows, Some(20));
+    assert_eq!(config.writer.staging.target_object_bytes, Some(2048));
+    assert_eq!(config.writer.staging.max_staged_ranges, Some(4));
+    assert_eq!(config.writer.staging.max_staged_rows, Some(100));
+    assert_eq!(config.writer.staging.max_staged_age_ms, Some(5000));
+    assert!(config.writer.staging.flush_on_shutdown);
+    assert_eq!(config.writer.staging.max_staged_bytes, Some(4096));
+    validate_config(&config).expect("staging config is valid");
+}
+
+#[test]
 fn test_validate_config_accepts_application_registry() {
     let config = toml::from_str::<DatalensConfig>(
         r#"
