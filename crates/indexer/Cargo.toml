@@ -10,8 +10,9 @@ datalens-core = { path = "../core" }
 datalens-metrics = { path = "../metrics" }
 datalens-storage = { path = "../storage" }
 datalens-writer = { path = "../writer" }
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 datalens-solana = { path = "../solana" }
 datalens-tron = { path = "../tron" }
-serde_json = { workspace = true }

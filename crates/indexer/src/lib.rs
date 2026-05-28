@@ -1,7 +1,9 @@
 //! Durable full-indexing runtime contract.
 
+mod cursor;
 mod runtime;
 
+pub use cursor::FileIndexCursorStore;
 pub use runtime::{InMemoryIndexCursorStore, IndexCursorRepository, IndexRuntime};
 
 use datalens_chain::{ChainHeight, DatasetSelector, FinalityLevel, HeightRangeKind};
