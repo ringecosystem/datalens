@@ -242,6 +242,67 @@ impl HotPromotionOutcome {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WarmupTaskOutcome {
+    Submitted,
+    Running,
+    Completed,
+    Paused,
+    Cancelled,
+    Failed,
+}
+
+impl WarmupTaskOutcome {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Submitted => "submitted",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Paused => "paused",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WarmupFetchOutcome {
+    Fetched,
+    Empty,
+    Skipped,
+    Error,
+}
+
+impl WarmupFetchOutcome {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Fetched => "fetched",
+            Self::Empty => "empty",
+            Self::Skipped => "skipped",
+            Self::Error => "error",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WarmupWriteOutcome {
+    Written,
+    EmptyCoverageRecorded,
+    Skipped,
+    Error,
+}
+
+impl WarmupWriteOutcome {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Written => "written",
+            Self::EmptyCoverageRecorded => "empty_coverage_recorded",
+            Self::Skipped => "skipped",
+            Self::Error => "error",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct MetricsRecorder {
     registry: Registry,
@@ -256,6 +317,12 @@ pub struct MetricsRecorder {
     storage_error_total: CounterVec,
     latest_requested_block: GaugeVec,
     latest_filled_block: GaugeVec,
+    warmup_task_total: CounterVec,
+    warmup_fetch_total: CounterVec,
+    warmup_write_total: CounterVec,
+    warmup_rows_total: CounterVec,
+    warmup_provider_error_total: CounterVec,
+    warmup_current_height: GaugeVec,
 }
 
 impl MetricsRecorder {
@@ -335,6 +402,62 @@ impl MetricsRecorder {
             ),
             &["application", "chain", "chain_kind", "dataset"],
         )?;
+        let warmup_task_total = CounterVec::new(
+            Opts::new(
+                "datalens_warmup_task_total",
+                "Datalens warmup tasks by outcome.",
+            ),
+            &["application", "chain", "chain_kind", "dataset", "outcome"],
+        )?;
+        let warmup_fetch_total = CounterVec::new(
+            Opts::new(
+                "datalens_warmup_fetch_total",
+                "Datalens warmup fetches by selector kind and outcome.",
+            ),
+            &[
+                "application",
+                "chain",
+                "chain_kind",
+                "dataset",
+                "selector_kind",
+                "outcome",
+            ],
+        )?;
+        let warmup_write_total = CounterVec::new(
+            Opts::new(
+                "datalens_warmup_write_total",
+                "Datalens warmup durable writes by outcome.",
+            ),
+            &["application", "chain", "chain_kind", "dataset", "outcome"],
+        )?;
+        let warmup_rows_total = CounterVec::new(
+            Opts::new(
+                "datalens_warmup_rows_total",
+                "Datalens warmup rows fetched.",
+            ),
+            &["application", "chain", "chain_kind", "dataset"],
+        )?;
+        let warmup_provider_error_total = CounterVec::new(
+            Opts::new(
+                "datalens_warmup_provider_error_total",
+                "Datalens warmup provider errors by selector kind and stable error kind.",
+            ),
+            &[
+                "application",
+                "chain",
+                "chain_kind",
+                "dataset",
+                "selector_kind",
+                "error_kind",
+            ],
+        )?;
+        let warmup_current_height = GaugeVec::new(
+            Opts::new(
+                "datalens_warmup_current_height",
+                "Current warmup height by application, chain, and dataset.",
+            ),
+            &["application", "chain", "chain_kind", "dataset"],
+        )?;
 
         registry.register(Box::new(query_total.clone()))?;
         registry.register(Box::new(query_duration_seconds.clone()))?;
@@ -347,6 +470,12 @@ impl MetricsRecorder {
         registry.register(Box::new(storage_error_total.clone()))?;
         registry.register(Box::new(latest_requested_block.clone()))?;
         registry.register(Box::new(latest_filled_block.clone()))?;
+        registry.register(Box::new(warmup_task_total.clone()))?;
+        registry.register(Box::new(warmup_fetch_total.clone()))?;
+        registry.register(Box::new(warmup_write_total.clone()))?;
+        registry.register(Box::new(warmup_rows_total.clone()))?;
+        registry.register(Box::new(warmup_provider_error_total.clone()))?;
+        registry.register(Box::new(warmup_current_height.clone()))?;
 
         Ok(Self {
             registry,
@@ -361,6 +490,12 @@ impl MetricsRecorder {
             storage_error_total,
             latest_requested_block,
             latest_filled_block,
+            warmup_task_total,
+            warmup_fetch_total,
+            warmup_write_total,
+            warmup_rows_total,
+            warmup_provider_error_total,
+            warmup_current_height,
         })
     }
 
@@ -435,12 +570,96 @@ impl MetricsRecorder {
             .set(block as f64);
     }
 
+    pub fn record_warmup_task(&self, labels: &MetricsLabels, outcome: WarmupTaskOutcome) {
+        self.warmup_task_total
+            .with_label_values(&labels.query_label_values(outcome.as_str()))
+            .inc();
+    }
+
+    pub fn record_warmup_fetch(
+        &self,
+        labels: &MetricsLabels,
+        selector_kind: &str,
+        outcome: WarmupFetchOutcome,
+    ) {
+        self.warmup_fetch_total
+            .with_label_values(&warmup_selector_label_values(
+                labels,
+                selector_kind,
+                outcome.as_str(),
+            ))
+            .inc();
+    }
+
+    pub fn record_warmup_write(&self, labels: &MetricsLabels, outcome: WarmupWriteOutcome) {
+        self.warmup_write_total
+            .with_label_values(&labels.query_label_values(outcome.as_str()))
+            .inc();
+    }
+
+    pub fn record_warmup_rows(&self, labels: &MetricsLabels, rows: u64) {
+        self.warmup_rows_total
+            .with_label_values(&labels.label_values())
+            .inc_by(rows as f64);
+    }
+
+    pub fn record_warmup_provider_error(
+        &self,
+        labels: &MetricsLabels,
+        selector_kind: &str,
+        error_kind: DatalensErrorKind,
+    ) {
+        self.warmup_provider_error_total
+            .with_label_values(&warmup_error_label_values(
+                labels,
+                selector_kind,
+                error_kind_label(&error_kind),
+            ))
+            .inc();
+    }
+
+    pub fn set_warmup_current_height(&self, labels: &MetricsLabels, height: u64) {
+        self.warmup_current_height
+            .with_label_values(&labels.label_values())
+            .set(height as f64);
+    }
+
     pub fn encode(&self) -> Result<String, prometheus::Error> {
         let families = self.registry.gather();
         let mut output = String::new();
         TextEncoder::new().encode_utf8(&families, &mut output)?;
         Ok(output)
     }
+}
+
+fn warmup_selector_label_values<'a>(
+    labels: &'a MetricsLabels,
+    selector_kind: &'a str,
+    outcome: &'a str,
+) -> [&'a str; 6] {
+    [
+        labels.application.as_str(),
+        &labels.chain,
+        &labels.chain_kind,
+        &labels.dataset,
+        selector_kind,
+        outcome,
+    ]
+}
+
+fn warmup_error_label_values<'a>(
+    labels: &'a MetricsLabels,
+    selector_kind: &'a str,
+    error_kind: &'a str,
+) -> [&'a str; 6] {
+    [
+        labels.application.as_str(),
+        &labels.chain,
+        &labels.chain_kind,
+        &labels.dataset,
+        selector_kind,
+        error_kind,
+    ]
 }
 
 fn error_kind_label(kind: &DatalensErrorKind) -> &'static str {

@@ -1441,6 +1441,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "datalens-warmup"
+version = "0.1.0"
+dependencies = [
+ "datalens-chain",
+ "datalens-core",
+ "datalens-executor",
+ "datalens-metrics",
+ "datalens-planner",
+ "datalens-storage",
+ "datalens-writer",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "datalens-writer"
 version = "0.1.0"
 dependencies = [

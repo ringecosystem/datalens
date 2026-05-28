@@ -1,7 +1,8 @@
 use datalens_core::{ChainFamily, ChainIdentity, DatalensErrorKind, Dataset};
 use datalens_metrics::{
     ApplicationIdentity, CacheCoverageOutcome, ErrorLabels, FillOutcome, HotReorgOutcome,
-    MetricsLabels, MetricsRecorder, QueryOutcome,
+    MetricsLabels, MetricsRecorder, QueryOutcome, WarmupFetchOutcome, WarmupTaskOutcome,
+    WarmupWriteOutcome,
 };
 
 #[test]
@@ -50,6 +51,40 @@ fn test_record_metrics_renders_prometheus_text_with_expected_labels() {
     ));
     assert!(output.contains(
         r#"datalens_application_chain_latest_filled_block{application="indexer",chain="ethereum",chain_kind="evm",dataset="logs"} 40"#
+    ));
+}
+
+#[test]
+fn test_warmup_metrics_have_distinct_series_and_outcomes() {
+    let recorder = MetricsRecorder::new().expect("metrics recorder");
+    let labels = labels(Some("warmup-app"));
+
+    recorder.record_warmup_task(&labels, WarmupTaskOutcome::Completed);
+    recorder.record_warmup_fetch(&labels, "evm_logs", WarmupFetchOutcome::Fetched);
+    recorder.record_warmup_write(&labels, WarmupWriteOutcome::Written);
+    recorder.record_warmup_rows(&labels, 7);
+    recorder.record_warmup_provider_error(&labels, "evm_logs", DatalensErrorKind::ProviderLimit);
+    recorder.set_warmup_current_height(&labels, 123);
+
+    let output = recorder.encode().expect("prometheus text");
+
+    assert!(output.contains(
+        r#"datalens_warmup_task_total{application="warmup-app",chain="ethereum",chain_kind="evm",dataset="logs",outcome="completed"} 1"#
+    ));
+    assert!(output.contains(
+        r#"datalens_warmup_fetch_total{application="warmup-app",chain="ethereum",chain_kind="evm",dataset="logs",outcome="fetched",selector_kind="evm_logs"} 1"#
+    ));
+    assert!(output.contains(
+        r#"datalens_warmup_write_total{application="warmup-app",chain="ethereum",chain_kind="evm",dataset="logs",outcome="written"} 1"#
+    ));
+    assert!(output.contains(
+        r#"datalens_warmup_rows_total{application="warmup-app",chain="ethereum",chain_kind="evm",dataset="logs"} 7"#
+    ));
+    assert!(output.contains(
+        r#"datalens_warmup_provider_error_total{application="warmup-app",chain="ethereum",chain_kind="evm",dataset="logs",error_kind="provider_limit",selector_kind="evm_logs"} 1"#
+    ));
+    assert!(output.contains(
+        r#"datalens_warmup_current_height{application="warmup-app",chain="ethereum",chain_kind="evm",dataset="logs"} 123"#
     ));
 }
 
