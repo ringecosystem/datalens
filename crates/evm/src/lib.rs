@@ -1,8 +1,9 @@
 //! EVM chain-family adapter boundary.
 
 use datalens_chain::{
-    AdapterCapabilities, ChainAdapter, ChainFetchRequest, ChainFetchResponse, ChainHeight,
-    DatasetCapability, DatasetSelector, FinalityKind, HeightRangeKind, ReorgSignal, SelectorKind,
+    AdapterCapabilities, CanonicalBlock, CanonicalBlockRequest, ChainAdapter, ChainFetchRequest,
+    ChainFetchResponse, ChainHeight, DatasetCapability, DatasetSelector, FinalityKind,
+    HeightRangeKind, ReorgSignal, SelectorKind,
 };
 use datalens_core::{
     BlockHeader, BlockRange, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, Dataset,
@@ -368,6 +369,32 @@ impl ChainAdapter for EvmRpcClient {
                 self.finality_tag_height(finalized_tag, FinalityKind::Finalized)
             }
         }
+    }
+
+    fn canonical_block(
+        &self,
+        request: CanonicalBlockRequest,
+    ) -> Result<CanonicalBlock, DatalensError> {
+        if request.chain != self.chain {
+            return Err(DatalensError::new(
+                DatalensErrorKind::UnsupportedDataset,
+                "request chain is not supported by adapter",
+            ));
+        }
+        if request.range_kind != HeightRangeKind::Block {
+            return Err(DatalensError::new(
+                DatalensErrorKind::UnsupportedDataset,
+                "only block canonical lookup is supported",
+            ));
+        }
+        let block = self.fetch_block_by_tag(&format!("0x{:x}", request.height))?;
+        Ok(CanonicalBlock {
+            chain: request.chain,
+            height: block.number,
+            hash: block.hash,
+            parent_hash: block.parent_hash,
+            finality: FinalityKind::Latest,
+        })
     }
 
     fn reorg_signal(

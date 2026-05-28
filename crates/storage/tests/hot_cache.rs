@@ -1,15 +1,245 @@
 use std::path::PathBuf;
 
-use datalens_chain::{DatasetSelector, FinalityLevel};
+use datalens_chain::{
+    AdapterCapabilities, DatasetCapability, DatasetSelector, FinalityLevel, ReorgSignal,
+};
 use datalens_core::{
-    BlockHeader, ChainFamily, ChainIdentity, DatasetKey, DatasetRows, LedgerRange, NetworkId,
-    QueryDataFinality, QueryRows,
+    BlockHeader, ChainFamily, ChainIdentity, DatalensErrorKind, DatasetKey, DatasetRows,
+    LedgerRange, LedgerRangeKind, NetworkId, QueryDataFinality, QueryRows,
 };
 use datalens_storage::{
-    HotCacheCandidateStatus, HotCacheEntryMetadata, HotCacheFinalityStatus,
-    HotCacheRetentionPolicy, HotCacheStorage, HotCacheWriteRequest, LocalHotCacheStorage,
+    HotCache, HotCacheCandidateStatus, HotCacheConfig, HotCacheEntryMetadata,
+    HotCacheFinalityStatus, HotCacheRetentionPolicy, HotCacheStorage, HotCacheWriteRequest,
+    HotEntryStatus, HotReorgReason, HotWriteRequest, LocalHotCacheStorage, LocalObjectStore,
     LocalStorage, ObjectStore, StorageWriteRequest,
 };
+
+#[test]
+fn test_hot_write_with_continuous_parent_hash_does_not_rollback() {
+    let cache = hot_cache("continuous-parent");
+    let chain = test_chain();
+
+    let first = cache
+        .write_rows(HotWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &DatasetSelector::all(),
+            range: blocks(10, 10),
+            rows: &block_rows(&[(10, "0x0a", "0x09")]),
+            reorg_signals: &[signal(10, "0x0a", "0x09")],
+        })
+        .expect("write first hot block");
+    let second = cache
+        .write_rows(HotWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &DatasetSelector::all(),
+            range: blocks(11, 11),
+            rows: &block_rows(&[(11, "0x0b", "0x0a")]),
+            reorg_signals: &[signal(11, "0x0b", "0x0a")],
+        })
+        .expect("write continuous hot block");
+
+    assert!(first.reorg.is_none());
+    assert!(second.reorg.is_none());
+    assert_eq!(cache.manifest(&chain).expect("manifest").entries.len(), 2);
+}
+
+#[test]
+fn test_parent_mismatch_triggers_reorg_detection_and_marks_old_entries_stale() {
+    let cache = hot_cache("parent-mismatch");
+    let chain = test_chain();
+
+    cache
+        .write_rows(HotWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &DatasetSelector::all(),
+            range: blocks(10, 11),
+            rows: &block_rows(&[(10, "0x0a", "0x09"), (11, "0x0b", "0x0a")]),
+            reorg_signals: &[signal(10, "0x0a", "0x09"), signal(11, "0x0b", "0x0a")],
+        })
+        .expect("seed hot range");
+
+    let outcome = cache
+        .write_rows(HotWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &DatasetSelector::all(),
+            range: blocks(12, 12),
+            rows: &block_rows(&[(12, "0x0c", "0xdead")]),
+            reorg_signals: &[signal(12, "0x0c", "0xdead")],
+        })
+        .expect("write reorged block");
+
+    let reorg = outcome.reorg.expect("reorg detected");
+    assert_eq!(reorg.reason, HotReorgReason::ParentMismatch);
+    assert_eq!(reorg.rollback_height, 12);
+    assert_eq!(reorg.stale_entries, 0);
+}
+
+#[test]
+fn test_same_height_different_hash_triggers_conflict_and_hides_stale_hot_rows() {
+    let cache = hot_cache("same-height-conflict");
+    let chain = test_chain();
+
+    cache
+        .write_rows(HotWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &DatasetSelector::all(),
+            range: blocks(10, 10),
+            rows: &block_rows(&[(10, "0xold", "0x09")]),
+            reorg_signals: &[signal(10, "0xold", "0x09")],
+        })
+        .expect("seed old candidate");
+
+    let outcome = cache
+        .write_rows(HotWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &DatasetSelector::all(),
+            range: blocks(10, 10),
+            rows: &block_rows(&[(10, "0xnew", "0x08")]),
+            reorg_signals: &[signal(10, "0xnew", "0x08")],
+        })
+        .expect("write canonical replacement");
+
+    let reorg = outcome.reorg.expect("conflict detected");
+    assert_eq!(reorg.reason, HotReorgReason::SameHeightDifferentHash);
+    assert_eq!(reorg.rollback_height, 10);
+    assert_eq!(reorg.stale_entries, 1);
+
+    let rows = cache
+        .read_rows(
+            &chain,
+            &DatasetKey::evm_blocks(),
+            &DatasetSelector::all(),
+            blocks(10, 10),
+        )
+        .expect("read active hot rows");
+    let QueryRows::EvmBlocks(rows) = rows.rows() else {
+        panic!("expected block rows");
+    };
+    assert_eq!(
+        rows.iter().map(|row| row.hash.as_str()).collect::<Vec<_>>(),
+        ["0xnew"]
+    );
+
+    let manifest = cache.manifest(&chain).expect("manifest");
+    assert_eq!(
+        manifest
+            .entries
+            .iter()
+            .filter(|entry| entry.status == HotEntryStatus::Stale)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn test_hot_rollback_does_not_modify_durable_manifest() {
+    let root = temp_storage_root("durable-untouched");
+    let durable = LocalStorage::new(&root);
+    let cache = HotCache::new(LocalObjectStore::new(&root), HotCacheConfig::default());
+    let chain = test_chain();
+
+    durable
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &DatasetSelector::all(),
+            range: blocks(1, 1),
+            rows: &block_rows(&[(1, "0x01", "0x00")]),
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write durable row");
+    let before = durable.manifest().expect("durable manifest before");
+
+    cache
+        .write_rows(HotWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &DatasetSelector::all(),
+            range: blocks(10, 10),
+            rows: &block_rows(&[(10, "0xold", "0x09")]),
+            reorg_signals: &[signal(10, "0xold", "0x09")],
+        })
+        .expect("seed hot");
+    cache
+        .write_rows(HotWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &DatasetSelector::all(),
+            range: blocks(10, 10),
+            rows: &block_rows(&[(10, "0xnew", "0x08")]),
+            reorg_signals: &[signal(10, "0xnew", "0x08")],
+        })
+        .expect("trigger hot rollback");
+
+    assert_eq!(durable.manifest().expect("durable manifest after"), before);
+}
+
+#[test]
+fn test_unsupported_adapter_returns_explicit_hot_query_error() {
+    let capabilities = AdapterCapabilities::new(test_chain()).with_dataset_capability(
+        DatasetCapability::new(DatasetKey::evm_blocks())
+            .with_selector(datalens_chain::SelectorKind::All)
+            .with_range(LedgerRangeKind::Block),
+    );
+
+    let error = HotCache::<LocalObjectStore>::validate_adapter_support(
+        &capabilities,
+        &DatasetKey::evm_blocks(),
+    )
+    .expect_err("unsupported hot query");
+
+    assert_eq!(error.kind, DatalensErrorKind::UnsupportedDataset);
+    assert!(error.message.contains("hot cache reorg detection"));
+}
+
+#[test]
+fn test_reorg_deeper_than_configured_window_returns_explicit_error() {
+    let cache = HotCache::new(
+        LocalObjectStore::new(temp_storage_root("window")),
+        HotCacheConfig { reorg_window: 1 },
+    );
+    let chain = test_chain();
+
+    cache
+        .write_rows(HotWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &DatasetSelector::all(),
+            range: blocks(10, 12),
+            rows: &block_rows(&[
+                (10, "0x0a", "0x09"),
+                (11, "0x0b", "0x0a"),
+                (12, "0x0c", "0x0b"),
+            ]),
+            reorg_signals: &[
+                signal(10, "0x0a", "0x09"),
+                signal(11, "0x0b", "0x0a"),
+                signal(12, "0x0c", "0x0b"),
+            ],
+        })
+        .expect("seed hot range");
+
+    let error = cache
+        .write_rows(HotWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &DatasetSelector::all(),
+            range: blocks(10, 10),
+            rows: &block_rows(&[(10, "0xnew", "0x08")]),
+            reorg_signals: &[signal(10, "0xnew", "0x08")],
+        })
+        .expect_err("reorg too deep");
+
+    assert_eq!(error.kind, DatalensErrorKind::ProviderLimit);
+    assert!(error.message.contains("hot reorg window"));
+}
 
 #[test]
 fn test_hot_object_key_is_separate_from_durable_object_key() {
@@ -18,7 +248,7 @@ fn test_hot_object_key_is_separate_from_durable_object_key() {
     let chain = test_chain();
     let selector = DatasetSelector::all();
     let range = LedgerRange::blocks(10, 10).expect("valid range");
-    let rows = block_rows(10, "0xaaa", "0xparent");
+    let rows = single_block_rows(10, "0xaaa", "0xparent");
 
     let hot_outcome = hot
         .write_rows(HotCacheWriteRequest {
@@ -67,7 +297,7 @@ fn test_same_height_different_hash_candidates_are_expressed() {
         dataset_key: DatasetKey::evm_blocks(),
         selector: &selector,
         range: range.clone(),
-        rows: &block_rows(20, "0xaaa", "0xparent"),
+        rows: &single_block_rows(20, "0xaaa", "0xparent"),
         metadata: hot_metadata(20, "0xaaa", "0xparent", HotCacheCandidateStatus::Active),
     })
     .expect("write first candidate");
@@ -77,7 +307,7 @@ fn test_same_height_different_hash_candidates_are_expressed() {
         dataset_key: DatasetKey::evm_blocks(),
         selector: &selector,
         range: range.clone(),
-        rows: &block_rows(20, "0xbbb", "0xother-parent"),
+        rows: &single_block_rows(20, "0xbbb", "0xother-parent"),
         metadata: hot_metadata(
             20,
             "0xbbb",
@@ -126,7 +356,7 @@ fn test_hot_metadata_contains_reorg_and_promotion_fields() {
             dataset_key: DatasetKey::evm_blocks(),
             selector: &selector,
             range: range.clone(),
-            rows: &block_rows(30, "0xccc", "0xbbb"),
+            rows: &single_block_rows(30, "0xccc", "0xbbb"),
             metadata: hot_metadata(30, "0xccc", "0xbbb", HotCacheCandidateStatus::Active),
         })
         .expect("write hot rows");
@@ -174,7 +404,7 @@ fn test_hot_read_write_does_not_change_durable_manifest() {
         dataset_key: DatasetKey::evm_blocks(),
         selector: &selector,
         range: range.clone(),
-        rows: &block_rows(40, "0xddd", "0xccc"),
+        rows: &single_block_rows(40, "0xddd", "0xccc"),
         metadata: hot_metadata(40, "0xddd", "0xccc", HotCacheCandidateStatus::Active),
     })
     .expect("write hot rows");
@@ -220,7 +450,7 @@ fn test_retention_cleanup_prunes_expired_non_active_candidates() {
             dataset_key: DatasetKey::evm_blocks(),
             selector: &selector,
             range: range.clone(),
-            rows: &block_rows(50, "0xeee", "0xddd"),
+            rows: &single_block_rows(50, "0xeee", "0xddd"),
             metadata: HotCacheEntryMetadata {
                 observed_at_unix_seconds: 1_000,
                 candidate_status: HotCacheCandidateStatus::Candidate,
@@ -234,7 +464,7 @@ fn test_retention_cleanup_prunes_expired_non_active_candidates() {
             dataset_key: DatasetKey::evm_blocks(),
             selector: &selector,
             range: range.clone(),
-            rows: &block_rows(50, "0xfff", "0xddd"),
+            rows: &single_block_rows(50, "0xfff", "0xddd"),
             metadata: hot_metadata(50, "0xfff", "0xddd", HotCacheCandidateStatus::Active),
         })
         .expect("write active candidate");
@@ -272,6 +502,13 @@ fn test_retention_cleanup_prunes_expired_non_active_candidates() {
     );
 }
 
+fn hot_cache(name: &str) -> HotCache<LocalObjectStore> {
+    HotCache::new(
+        LocalObjectStore::new(temp_storage_root(name)),
+        HotCacheConfig::default(),
+    )
+}
+
 fn temp_storage_root(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!(
         "datalens-hot-cache-{name}-{}",
@@ -285,20 +522,37 @@ fn temp_storage_root(name: &str) -> PathBuf {
 }
 
 fn test_chain() -> ChainIdentity {
-    ChainIdentity::expect_with_network_id(ChainFamily::Evm, "ethereum", NetworkId::numeric(1))
+    ChainIdentity::try_new(ChainFamily::Evm, "ethereum", Some(NetworkId::numeric(1)))
+        .expect("valid chain identity")
 }
 
-fn block_rows(number: u64, hash: &str, parent_hash: &str) -> DatasetRows {
+fn blocks(start: u64, end: u64) -> LedgerRange {
+    LedgerRange::blocks(start, end).expect("valid block range")
+}
+
+fn signal(height: u64, hash: &str, parent_hash: &str) -> ReorgSignal {
+    ReorgSignal::block(height, hash, parent_hash, None)
+}
+
+fn block_rows(rows: &[(u64, &str, &str)]) -> DatasetRows {
     DatasetRows::new(
         DatasetKey::evm_blocks(),
-        QueryRows::EvmBlocks(vec![BlockHeader {
-            number,
-            hash: hash.to_owned(),
-            parent_hash: parent_hash.to_owned(),
-            timestamp: number,
-        }]),
+        QueryRows::EvmBlocks(
+            rows.iter()
+                .map(|(number, hash, parent_hash)| BlockHeader {
+                    number: *number,
+                    hash: (*hash).to_owned(),
+                    parent_hash: (*parent_hash).to_owned(),
+                    timestamp: *number,
+                })
+                .collect(),
+        ),
     )
     .expect("dataset rows")
+}
+
+fn single_block_rows(number: u64, hash: &str, parent_hash: &str) -> DatasetRows {
+    block_rows(&[(number, hash, parent_hash)])
 }
 
 fn hot_metadata(

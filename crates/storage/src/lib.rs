@@ -49,9 +49,11 @@ mod object_store;
 mod parquet_codec;
 mod usage_ledger;
 pub use hot_cache::{
-    HOT_CACHE_SCHEMA_VERSION, HotCacheCandidateStatus, HotCacheCleanupReport,
-    HotCacheEntryMetadata, HotCacheFinalityStatus, HotCacheReadOutcome, HotCacheRetentionPolicy,
-    HotCacheStorage, HotCacheWriteOutcome, HotCacheWriteRequest, LocalHotCacheStorage,
+    HOT_CACHE_SCHEMA_VERSION, HotBlockMetadata, HotCache, HotCacheCandidateStatus,
+    HotCacheCleanupReport, HotCacheConfig, HotCacheEntryMetadata, HotCacheFinalityStatus,
+    HotCacheReadOutcome, HotCacheRetentionPolicy, HotCacheStorage, HotCacheWriteOutcome,
+    HotCacheWriteRequest, HotEntryStatus, HotManifest, HotManifestEntry, HotReorgOutcome,
+    HotReorgReason, HotWriteOutcome, HotWriteRequest, LocalHotCacheStorage,
 };
 pub use maintenance::{
     CompactionCandidate, MaintenanceCheckReport, MaintenanceCompactionReport, MaintenanceIssue,

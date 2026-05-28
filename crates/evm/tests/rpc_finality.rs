@@ -5,10 +5,14 @@ use std::{
     thread,
 };
 
-use datalens_chain::{ChainAdapter, ChainFetchRequest, ChainHeight, DatasetSelector, FinalityKind};
+use datalens_chain::{
+    CanonicalBlockRequest, ChainAdapter, ChainFetchRequest, ChainHeight, DatasetSelector,
+    FinalityKind,
+};
 use datalens_core::NetworkId;
 use datalens_core::{
     BlockRange, ChainFamily, ChainIdentity, DatalensErrorKind, DatasetKey, LedgerRange,
+    LedgerRangeKind,
 };
 use serde_json::{Value, json};
 
@@ -262,6 +266,48 @@ fn test_safe_height_uses_manual_lag_override_without_rpc_finality_tags() {
 fn test_height_from_latest_lag_applies_lag_without_underflow() {
     assert_eq!(height_from_latest_lag(100, 12), 88);
     assert_eq!(height_from_latest_lag(10, 12), 0);
+}
+
+#[test]
+fn test_canonical_block_fetches_provider_hash_at_height() {
+    let (url, requests) = start_rpc_server(vec![json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "number": "0x0a",
+            "hash": "0xblock",
+            "parentHash": "0xparent",
+            "timestamp": "0x01"
+        }
+    })]);
+    let client = EvmRpcClient::with_chain(
+        vec![url],
+        ethereum_identity(),
+        EvmFinalityPolicy::Lag {
+            safe_lag_blocks: Some(2),
+            finalized_lag_blocks: Some(4),
+        },
+        10,
+        10,
+        10,
+    );
+
+    let block = client
+        .canonical_block(CanonicalBlockRequest {
+            chain: ethereum_identity(),
+            range_kind: LedgerRangeKind::Block,
+            height: 10,
+        })
+        .expect("canonical block");
+
+    assert_eq!(block.chain, ethereum_identity());
+    assert_eq!(block.height, 10);
+    assert_eq!(block.hash, "0xblock");
+    assert_eq!(block.parent_hash, "0xparent");
+    assert_eq!(block.finality, FinalityKind::Latest);
+    let requests = requests.lock().expect("requests");
+    assert_eq!(requests[0]["method"], "eth_getBlockByNumber");
+    assert_eq!(requests[0]["params"][0], "0xa");
 }
 
 fn ethereum_identity() -> ChainIdentity {
