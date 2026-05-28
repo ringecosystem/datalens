@@ -1,11 +1,15 @@
 use std::collections::BTreeSet;
 
-use datalens_core::{ChainIdentity, DatalensError, DatasetKey, LedgerRange, LedgerRangeKind};
+use datalens_core::{
+    ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey, DatasetRows, LedgerRange,
+    LedgerRangeKind,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     DurableStorage, Manifest, ManifestEntry, ManifestFinalityLevel, ObjectEncoding, ObjectStore,
-    checksum_hex, decode_object_rows, range_kind_key, verify_manifest_object_metadata,
+    StorageDataObject, checksum_hex, decode_object_rows, encode_object_rows, object_key,
+    range_kind_key, unix_seconds_now, verify_manifest_object_metadata,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -75,6 +79,23 @@ pub enum MaintenanceIssueKind {
 pub struct MaintenanceCompactionReport {
     pub read_only: bool,
     pub candidates: Vec<CompactionCandidate>,
+    pub compacted_objects: usize,
+    pub compacted_rows: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MaintenanceCompactionConfig {
+    pub min_object_bytes: u64,
+    pub max_merge_ranges: usize,
+}
+
+impl Default for MaintenanceCompactionConfig {
+    fn default() -> Self {
+        Self {
+            min_object_bytes: u64::MAX,
+            max_merge_ranges: 32,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -151,7 +172,7 @@ where
         issues.extend(self.check_entries(&entries)?);
         issues.extend(contradictory_coverage_issues(&entries));
 
-        let candidates = compaction_candidates(&entries);
+        let candidates = compaction_candidates(&entries, MaintenanceCompactionConfig::default());
         let protected_current_objects = current_object_keys(&entries);
         let delete_candidates = self.retention_delete_candidates(&protected_current_objects)?;
 
@@ -172,6 +193,8 @@ where
             compaction: MaintenanceCompactionReport {
                 read_only: true,
                 candidates,
+                compacted_objects: 0,
+                compacted_rows: 0,
             },
             retention: MaintenanceRetentionReport {
                 mode: MaintenanceOperationMode::DryRun,
@@ -191,6 +214,50 @@ where
                     secrets_policy: "ledger and maintenance output must not include credentials, tokens, or raw authorization headers".to_owned(),
                 },
             },
+        })
+    }
+
+    pub fn compact_small_objects(
+        &self,
+        config: MaintenanceCompactionConfig,
+    ) -> Result<MaintenanceCompactionReport, DatalensError> {
+        let mut manifest = Manifest::default();
+        for object in self.object_store().list("chains")? {
+            if object.key.ends_with("/manifest.json") {
+                let bytes = self.object_store().get(&object.key)?;
+                let mut chain_manifest: Manifest =
+                    serde_json::from_slice(&bytes).map_err(|error| {
+                        DatalensError::new(
+                            DatalensErrorKind::StorageReadFailure,
+                            format!("decode manifest {}: {error}", object.key),
+                        )
+                    })?;
+                manifest.entries.append(&mut chain_manifest.entries);
+            }
+        }
+
+        let candidates = compaction_candidates(&manifest.entries, config);
+        let mut compacted_objects = 0usize;
+        let mut compacted_rows = 0usize;
+
+        for candidate in &candidates {
+            let mut chain_manifest = self.manifest_for_chain(&candidate.chain)?;
+            let entries = candidate_entries(&chain_manifest.entries, candidate);
+            if entries.len() != candidate.entry_count {
+                continue;
+            }
+            let compacted = self.write_compacted_object(candidate, &entries)?;
+            compacted_rows += compacted.row_count;
+            compacted_objects += 1;
+            replace_compacted_entries(&mut chain_manifest, &entries, compacted.entry);
+            self.write_manifest(&candidate.chain, &chain_manifest)?;
+        }
+
+        Ok(MaintenanceCompactionReport {
+            read_only: false,
+            candidates,
+            compacted_objects,
+            compacted_rows,
         })
     }
 
@@ -245,6 +312,81 @@ where
             .collect::<Vec<_>>();
         candidates.sort();
         Ok(candidates)
+    }
+
+    fn write_compacted_object(
+        &self,
+        candidate: &CompactionCandidate,
+        entries: &[ManifestEntry],
+    ) -> Result<CompactedObject, DatalensError> {
+        let mut rows = crate::empty_rows(candidate.dataset_key.clone())?.into_rows();
+        for entry in entries {
+            let Some(object_key) = entry.object_key.as_deref() else {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::Internal,
+                    "compaction candidate includes empty coverage",
+                ));
+            };
+            let bytes = self.object_store().get(object_key)?;
+            verify_manifest_object_metadata(entry, object_key, &bytes)?;
+            let mut object_rows = decode_object_rows(
+                candidate.object_encoding,
+                candidate.dataset_key.clone(),
+                &bytes,
+            )
+            .map_err(|error| {
+                DatalensError::new(
+                    DatalensErrorKind::StorageReadFailure,
+                    format!(
+                        "decode compacted source object {object_key}: {}",
+                        error.message
+                    ),
+                )
+            })?;
+            object_rows = crate::filter_rows(object_rows, entry.range.clone());
+            rows.try_append(object_rows.into_rows())?;
+        }
+        rows.sort();
+        let rows = DatasetRows::new(candidate.dataset_key.clone(), rows)?;
+        let bytes = encode_object_rows(candidate.object_encoding, &rows)?;
+        let object_key = object_key(
+            &candidate.chain,
+            &candidate.dataset_key,
+            candidate.range.clone(),
+            &candidate.selector_fingerprint,
+            candidate.object_encoding,
+        );
+        let data_object = StorageDataObject {
+            object_key: object_key.clone(),
+            object_encoding: candidate.object_encoding,
+            row_count: rows.row_count(),
+            object_size_bytes: bytes.len() as u64,
+            checksum: checksum_hex(&bytes),
+            checksum_algorithm: "sha256".to_owned(),
+            written_at_unix_seconds: unix_seconds_now()?,
+        };
+        self.object_store().put(&object_key, &bytes)?;
+        Ok(CompactedObject {
+            row_count: rows.row_count(),
+            entry: ManifestEntry {
+                chain: candidate.chain.clone(),
+                dataset_key: candidate.dataset_key.clone(),
+                range: candidate.range.clone(),
+                selector_fingerprint: candidate.selector_fingerprint.clone(),
+                selector_canonical_key: entries
+                    .first()
+                    .map(|entry| entry.selector_canonical_key.clone())
+                    .unwrap_or_else(|| candidate.selector_fingerprint.clone()),
+                finality_level: candidate.finality_level,
+                object_key: Some(data_object.object_key),
+                object_encoding: Some(data_object.object_encoding),
+                row_count: data_object.row_count,
+                object_size_bytes: Some(data_object.object_size_bytes),
+                checksum: Some(data_object.checksum),
+                checksum_algorithm: Some(data_object.checksum_algorithm),
+                written_at_unix_seconds: Some(data_object.written_at_unix_seconds),
+            },
+        })
     }
 }
 
@@ -320,7 +462,10 @@ fn contradictory_coverage_issues(entries: &[ManifestEntry]) -> Vec<MaintenanceIs
     issues
 }
 
-fn compaction_candidates(entries: &[ManifestEntry]) -> Vec<CompactionCandidate> {
+fn compaction_candidates(
+    entries: &[ManifestEntry],
+    config: MaintenanceCompactionConfig,
+) -> Vec<CompactionCandidate> {
     let mut groups: Vec<(CompactionKey, Vec<&ManifestEntry>)> = Vec::new();
     for entry in entries {
         let (Some(object_key), Some(object_encoding)) = (&entry.object_key, entry.object_encoding)
@@ -328,6 +473,12 @@ fn compaction_candidates(entries: &[ManifestEntry]) -> Vec<CompactionCandidate> 
             continue;
         };
         if object_key.is_empty() {
+            continue;
+        }
+        if entry
+            .object_size_bytes
+            .is_some_and(|size| size >= config.min_object_bytes)
+        {
             continue;
         }
         let key = CompactionKey::from_entry(entry, object_encoding);
@@ -344,8 +495,9 @@ fn compaction_candidates(entries: &[ManifestEntry]) -> Vec<CompactionCandidate> 
         let mut run = Vec::new();
         for entry in entries {
             if run.last().is_none_or(|last: &&ManifestEntry| {
-                entry.range.start() <= last.range.end().saturating_add(1)
-            }) {
+                entry.range.start() == last.range.end().saturating_add(1)
+            }) && run.len() < config.max_merge_ranges.max(2)
+            {
                 run.push(entry);
             } else {
                 push_candidate(&mut candidates, &key, &run);
@@ -356,6 +508,56 @@ fn compaction_candidates(entries: &[ManifestEntry]) -> Vec<CompactionCandidate> 
         push_candidate(&mut candidates, &key, &run);
     }
     candidates
+}
+
+#[derive(Clone, Debug)]
+struct CompactedObject {
+    row_count: usize,
+    entry: ManifestEntry,
+}
+
+fn candidate_entries(
+    entries: &[ManifestEntry],
+    candidate: &CompactionCandidate,
+) -> Vec<ManifestEntry> {
+    let mut entries = entries
+        .iter()
+        .filter(|entry| {
+            entry.chain == candidate.chain
+                && entry.dataset_key == candidate.dataset_key
+                && entry.selector_fingerprint == candidate.selector_fingerprint
+                && entry.range.kind() == candidate.range.kind()
+                && entry.finality_level == candidate.finality_level
+                && entry.object_encoding == Some(candidate.object_encoding)
+                && entry.object_key.as_ref().is_some_and(|object_key| {
+                    candidate
+                        .object_keys
+                        .iter()
+                        .any(|candidate_key| candidate_key == object_key)
+                })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| (entry.range.start(), entry.range.end()));
+    entries
+}
+
+fn replace_compacted_entries(
+    manifest: &mut Manifest,
+    compacted_entries: &[ManifestEntry],
+    compacted_entry: ManifestEntry,
+) {
+    manifest.entries.retain(|entry| {
+        !compacted_entries.iter().any(|compacted| {
+            entry.chain == compacted.chain
+                && entry.dataset_key == compacted.dataset_key
+                && entry.selector_fingerprint == compacted.selector_fingerprint
+                && entry.range == compacted.range
+                && entry.finality_level == compacted.finality_level
+                && entry.object_key == compacted.object_key
+        })
+    });
+    manifest.upsert(compacted_entry);
 }
 
 fn push_candidate(

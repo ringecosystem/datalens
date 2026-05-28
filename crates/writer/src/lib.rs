@@ -202,10 +202,12 @@ fn should_merge(
     {
         return Ok(false);
     }
-    if current.rows.row_count() >= config.min_object_rows() {
+    if estimated_object_bytes(&current.rows)? >= config.target_object_bytes() {
         return Ok(false);
     }
-    if estimated_object_bytes(&current.rows)? >= config.target_object_bytes() {
+    if current.rows.row_count() >= config.min_object_rows()
+        && estimated_object_bytes_after_merge(current, next)? > config.target_object_bytes()
+    {
         return Ok(false);
     }
     Ok(true)
@@ -244,4 +246,15 @@ fn estimated_object_bytes(rows: &DatasetRows) -> Result<u64, DatalensError> {
                 )
             }),
     }
+}
+
+fn estimated_object_bytes_after_merge(
+    current: &DurableWriteSegment,
+    next: &DurableWriteSegment,
+) -> Result<u64, DatalensError> {
+    let dataset_key = current.rows.dataset_key().clone();
+    let mut rows = current.rows.clone().into_rows();
+    rows.try_append(next.rows.clone().into_rows())?;
+    rows.sort();
+    estimated_object_bytes(&DatasetRows::new(dataset_key, rows)?)
 }
