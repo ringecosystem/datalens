@@ -2,7 +2,7 @@
 
 use datalens_chain::{
     AdapterCapabilities, ChainAdapter, ChainFetchRequest, ChainFetchResponse, ChainHeight,
-    DatasetCapability, DatasetSelector, FinalityKind, HeightRangeKind, SelectorKind,
+    DatasetCapability, DatasetSelector, FinalityKind, HeightRangeKind, ReorgSignal, SelectorKind,
 };
 use datalens_core::{
     BlockHeader, BlockRange, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, Dataset,
@@ -281,7 +281,8 @@ impl ChainAdapter for EvmRpcClient {
                         self.finality_policy,
                         EvmFinalityPolicy::Auto | EvmFinalityPolicy::RpcTags { .. }
                     ))
-                    .with_range_split(true),
+                    .with_range_split(true)
+                    .with_reorg_signals(true),
             )
             .with_dataset_capability(
                 DatasetCapability::new(Dataset::Logs)
@@ -296,7 +297,8 @@ impl ChainAdapter for EvmRpcClient {
                         self.finality_policy,
                         EvmFinalityPolicy::Auto | EvmFinalityPolicy::RpcTags { .. }
                     ))
-                    .with_range_split(true),
+                    .with_range_split(true)
+                    .with_reorg_signals(true),
             )
     }
 
@@ -368,6 +370,36 @@ impl ChainAdapter for EvmRpcClient {
         }
     }
 
+    fn reorg_signal(
+        &self,
+        range_kind: HeightRangeKind,
+        height: u64,
+    ) -> Result<ReorgSignal, DatalensError> {
+        if range_kind != HeightRangeKind::Block {
+            return Err(DatalensError::new(
+                DatalensErrorKind::UnsupportedDataset,
+                "only block reorg signals are supported",
+            ));
+        }
+        let block = self.fetch_block_by_tag(&format!("0x{height:x}"))?;
+        Ok(ReorgSignal::block(
+            block.number,
+            block.hash,
+            block.parent_hash,
+            Some(block.timestamp),
+        ))
+    }
+
+    fn latest_reorg_signal(&self) -> Result<ReorgSignal, DatalensError> {
+        let block = self.fetch_block_by_tag("latest")?;
+        Ok(ReorgSignal::block(
+            block.number,
+            block.hash,
+            block.parent_hash,
+            Some(block.timestamp),
+        ))
+    }
+
     fn fetch(&self, request: ChainFetchRequest) -> Result<ChainFetchResponse, DatalensError> {
         if request.chain != self.chain {
             return Err(DatalensError::new(
@@ -381,13 +413,52 @@ impl ChainAdapter for EvmRpcClient {
                 "only block ranges are supported",
             )
         })?;
+        let capability = self
+            .capabilities()
+            .dataset(&request.dataset_key)
+            .cloned()
+            .ok_or_else(|| {
+                DatalensError::new(
+                    DatalensErrorKind::UnsupportedDataset,
+                    "dataset is not supported by EVM adapter",
+                )
+            })?;
+        if let Some(max_range_len) = capability.max_range_len()
+            && range.len() > u128::from(max_range_len)
+        {
+            return Err(DatalensError::new(
+                DatalensErrorKind::ProviderLimit,
+                "request range exceeds EVM provider range limit",
+            ));
+        }
+        if let DatasetSelector::EvmLogs(filter) = &request.selector {
+            if let Some(max_addresses) = capability.max_addresses_per_query()
+                && filter.addresses().len() > max_addresses
+            {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::ProviderLimit,
+                    "request address count exceeds EVM provider limit",
+                ));
+            }
+            if let Some(max_topics) = capability.max_topics_per_query()
+                && filter.topics().len() > max_topics
+            {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::ProviderLimit,
+                    "request topic count exceeds EVM provider limit",
+                ));
+            }
+        }
         let (rows, provider_calls) = match (&request.dataset_key, &request.selector) {
             (dataset, DatasetSelector::All) if *dataset == DatasetKey::evm_blocks() => (
                 QueryRows::EvmBlocks(self.fetch_blocks(range)?),
                 range.len().min(usize::MAX as u128) as usize,
             ),
             (dataset, DatasetSelector::EvmLogs(filter)) if *dataset == DatasetKey::evm_logs() => {
-                (QueryRows::EvmLogs(self.fetch_evm_logs(range, filter)?), 1)
+                let mut logs = self.fetch_evm_logs(range, filter)?;
+                logs.retain(|log| range.contains(log.block_number));
+                logs.sort_by_key(|log| (log.block_number, log.transaction_index, log.log_index));
+                (QueryRows::EvmLogs(logs), 1)
             }
             (dataset, _) if *dataset == DatasetKey::evm_blocks() => {
                 return Err(DatalensError::new(
@@ -408,6 +479,7 @@ impl ChainAdapter for EvmRpcClient {
                 ));
             }
         };
+        let request_id = request.context.request_id.clone();
         Ok(ChainFetchResponse::try_new(
             request.chain,
             request.dataset_key,
@@ -415,6 +487,10 @@ impl ChainAdapter for EvmRpcClient {
             request.selector,
             rows,
         )?
+        .with_source_metadata(datalens_chain::SourceMetadata {
+            provider: "evm-rpc".to_owned(),
+            request_id,
+        })
         .with_provider_diagnostics(datalens_chain::ProviderDiagnostics {
             calls: provider_calls,
             rows_scanned: 0,
@@ -424,6 +500,22 @@ impl ChainAdapter for EvmRpcClient {
 }
 
 impl EvmRpcClient {
+    fn fetch_block_by_tag(&self, tag: &str) -> Result<BlockHeader, DatalensError> {
+        let result = self.call("eth_getBlockByNumber", json!([tag, false]))?;
+        let Some(block) = result else {
+            return Err(DatalensError::new(
+                DatalensErrorKind::UnsupportedDataset,
+                format!("provider returned no block for tag {tag}"),
+            ));
+        };
+        Ok(BlockHeader {
+            number: hex_u64_field(&block, "number")?,
+            hash: string_field(&block, "hash")?,
+            parent_hash: string_field(&block, "parentHash")?,
+            timestamp: hex_u64_field(&block, "timestamp")?,
+        })
+    }
+
     fn rpc_finality_height(
         &self,
         finalized_tag: &str,

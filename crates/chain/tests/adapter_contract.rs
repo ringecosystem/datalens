@@ -329,6 +329,31 @@ fn test_other_finality_cannot_authorize_durable_cache_write() {
 }
 
 #[test]
+fn test_default_unsupported_finality_and_reorg_methods_are_stable() {
+    let chain = ChainIdentity::try_new(ChainFamily::Evm, "ethereum", Some(NetworkId::numeric(1)))
+        .expect("valid chain");
+    let adapter = EmptyAdapter { chain };
+
+    let finalized = adapter
+        .finalized_height()
+        .expect_err("finalized unsupported by default");
+    assert_eq!(finalized.kind, DatalensErrorKind::UnsupportedDataset);
+
+    let historical_signal = adapter
+        .reorg_signal(HeightRangeKind::Block, 10)
+        .expect_err("historical signal unsupported by default");
+    assert_eq!(
+        historical_signal.kind,
+        DatalensErrorKind::UnsupportedDataset
+    );
+
+    let latest_signal = adapter
+        .latest_reorg_signal()
+        .expect_err("latest signal unsupported by default");
+    assert_eq!(latest_signal.kind, DatalensErrorKind::UnsupportedDataset);
+}
+
+#[test]
 fn test_other_selector_and_range_kinds_are_owned_stable_and_storage_safe() {
     let first = AdapterKey::try_new("solana-accounts").expect("valid key");
     let second = AdapterKey::try_new("solana-accounts").expect("valid key");

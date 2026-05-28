@@ -64,6 +64,7 @@ pub struct DatasetCapability {
     supports_finalized_height: bool,
     supports_provider_native_finality_tags: bool,
     supports_range_split: bool,
+    supports_reorg_signals: bool,
 }
 
 impl DatasetCapability {
@@ -80,6 +81,7 @@ impl DatasetCapability {
             supports_finalized_height: false,
             supports_provider_native_finality_tags: false,
             supports_range_split: false,
+            supports_reorg_signals: false,
         }
     }
 
@@ -136,6 +138,11 @@ impl DatasetCapability {
         self
     }
 
+    pub fn with_reorg_signals(mut self, supports_reorg_signals: bool) -> Self {
+        self.supports_reorg_signals = supports_reorg_signals;
+        self
+    }
+
     pub fn dataset(&self) -> &DatasetKey {
         &self.dataset
     }
@@ -182,6 +189,10 @@ impl DatasetCapability {
 
     pub fn supports_range_split(&self) -> bool {
         self.supports_range_split
+    }
+
+    pub fn supports_reorg_signals(&self) -> bool {
+        self.supports_reorg_signals
     }
 }
 
@@ -359,6 +370,32 @@ pub struct ChainHeight {
     pub range_kind: HeightRangeKind,
     pub value: u64,
     pub finality: FinalityLevel,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReorgSignal {
+    pub range_kind: HeightRangeKind,
+    pub height: u64,
+    pub hash: String,
+    pub parent_hash: String,
+    pub timestamp: Option<u64>,
+}
+
+impl ReorgSignal {
+    pub fn block(
+        height: u64,
+        hash: impl Into<String>,
+        parent_hash: impl Into<String>,
+        timestamp: Option<u64>,
+    ) -> Self {
+        Self {
+            range_kind: HeightRangeKind::Block,
+            height,
+            hash: hash.into(),
+            parent_hash: parent_hash.into(),
+            timestamp,
+        }
+    }
 }
 
 impl ChainHeight {
@@ -590,6 +627,24 @@ pub trait ChainAdapter: Clone + Send + Sync + 'static {
         Err(DatalensError::new(
             DatalensErrorKind::UnsupportedDataset,
             "adapter does not expose canonical block lookup",
+        ))
+    }
+
+    fn reorg_signal(
+        &self,
+        _range_kind: HeightRangeKind,
+        _height: u64,
+    ) -> Result<ReorgSignal, DatalensError> {
+        Err(DatalensError::new(
+            DatalensErrorKind::UnsupportedDataset,
+            "adapter does not expose reorg signals",
+        ))
+    }
+
+    fn latest_reorg_signal(&self) -> Result<ReorgSignal, DatalensError> {
+        Err(DatalensError::new(
+            DatalensErrorKind::UnsupportedDataset,
+            "adapter does not expose latest reorg signal",
         ))
     }
 
