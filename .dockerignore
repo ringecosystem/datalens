@@ -1,0 +1,13 @@
+.git
+.gitignore
+.env
+.env.*
+.tmp
+target
+tests/fixtures
+**/tests/fixtures
+*.pem
+*.key
+*.tar
+*.tgz
+*.zip

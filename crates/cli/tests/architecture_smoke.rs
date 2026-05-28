@@ -68,3 +68,35 @@ fn serve_path_builds_registry_without_first_chain_selection() {
     assert!(source.contains("build_service_registry(&config)?"));
     assert!(!source.contains("fn first_chain("));
 }
+
+#[test]
+fn production_boundary_artifacts_are_declared() {
+    let dockerfile = include_str!("../../../Dockerfile");
+    let dockerignore = include_str!("../../../.dockerignore");
+    let production_config = include_str!("../../../config/datalens.production.toml");
+    let production_spec = include_str!("../../../docs/spec/production-runtime.md");
+    let production_runbook = include_str!("../../../docs/runbook/production.md");
+    let justfile = include_str!("../../../Justfile");
+
+    assert!(dockerfile.contains("cargo build --locked --release --package datalens-cli"));
+    assert!(dockerfile.contains("COPY --from=builder /app/target/release/datalens"));
+    assert!(dockerfile.contains("USER datalens"));
+    assert!(dockerignore.contains(".env"));
+    assert!(dockerignore.contains("tests/fixtures"));
+    assert!(dockerignore.contains(".tmp"));
+
+    assert!(production_config.contains("rpc_urls = [\"${DATALENS_ETHEREUM_RPC_URL}\"]"));
+    assert!(production_config.contains("token = \"${DATALENS_PUBLIC_APP_TOKEN}\""));
+    assert!(production_config.contains("bucket = \"${DATALENS_S3_BUCKET}\""));
+    assert!(production_config.contains("prefix = \"${DATALENS_S3_PREFIX}\""));
+
+    assert!(production_spec.contains("Production release artifact"));
+    assert!(production_spec.contains("inspect and maintenance writes"));
+    assert!(production_runbook.contains("just release-check"));
+    assert!(
+        production_runbook.contains("datalens doctor --config config/datalens.production.toml")
+    );
+    assert!(justfile.contains("release-check:"));
+    assert!(justfile.contains("container-smoke:"));
+    assert!(justfile.contains("config-doctor-smoke:"));
+}

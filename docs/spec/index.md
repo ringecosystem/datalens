@@ -68,3 +68,6 @@ Then keep the body explicit:
 - Technical architecture API, SDK, and compatibility plan:
   `docs/spec/technical-architecture/en/06-api-sdk-and-compatibility.md` and
   `docs/spec/technical-architecture/zh-CN/06-api-sdk-and-compatibility.md`
+- Production runtime packaging, configuration, endpoint, storage, operations, and release
+  boundary:
+  `docs/spec/production-runtime.md`

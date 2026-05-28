@@ -24,3 +24,5 @@ outputs.
   cache lifecycle E2E with optional RustFS/S3-compatible coverage.
 - `local-rustfs.md`: local RustFS object storage setup, bucket initialization, S3 test
   variables, stop, and cleanup commands.
+- `production.md`: production-shaped binary/container build, config doctor, runtime
+  endpoint smoke, backup/restore, and release gate commands.
