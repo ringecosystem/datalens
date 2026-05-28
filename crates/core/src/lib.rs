@@ -22,4 +22,4 @@ pub use query::{
     BlockHeader, DatasetRows, EvmLogFilter, LogFilter, LogRecord, QueryRows, TopicFilter,
 };
 pub use range::{BlockRange, LedgerRange, LedgerRangeKind, TimeRange, missing_ranges};
-pub use result::ResultEnvelope;
+pub use result::{QueryDataFinality, QuerySegmentMetadata, QuerySegmentSource, ResultEnvelope};

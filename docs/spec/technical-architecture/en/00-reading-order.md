@@ -20,7 +20,8 @@ docs/spec/technical-architecture/
 │   ├── 03-storage-and-manifest.md
 │   ├── 04-query-and-fill-flow.md
 │   ├── 05-chain-adapters-and-evm.md
-│   └── 06-api-sdk-and-compatibility.md
+│   ├── 06-api-sdk-and-compatibility.md
+│   └── 07-hot-cache-layer.md
 └── zh-CN/
     ├── 00-reading-order.md
     ├── 01-project-direction.md
@@ -28,7 +29,8 @@ docs/spec/technical-architecture/
     ├── 03-storage-and-manifest.md
     ├── 04-query-and-fill-flow.md
     ├── 05-chain-adapters-and-evm.md
-    └── 06-api-sdk-and-compatibility.md
+    ├── 06-api-sdk-and-compatibility.md
+    └── 07-hot-cache-layer.md
 ```
 
 ## Reading Sequence
@@ -57,6 +59,10 @@ docs/spec/technical-architecture/
 6. `06-api-sdk-and-compatibility.md`
    explains how users interact with datalens through native APIs, optional SDK helpers,
    and later compatibility adapters such as SQD Gateway-compatible surfaces.
+
+7. `07-hot-cache-layer.md`
+   explains the reorg-aware hot cache layer for safe/finalized-to-latest queries, and
+   keeps it separate from durable manifest coverage.
 
 ## How To Use These Documents
 
@@ -195,7 +201,25 @@ Expected work:
 Done means a developer can integrate with datalens ergonomically while the native API
 remains the source of truth.
 
-## Stage 7 - Compatibility Adapters
+## Stage 7 - Reorg-Aware Hot Cache Layer
+
+Add latest-capable query behavior only after the durable query/fill path and API contract
+are stable.
+
+Expected work:
+
+- Split requests into durable, hot, and live provider segments.
+- Add hot cache interfaces separate from durable manifests.
+- Expose canonical block lookup through capable chain adapters.
+- Return source and finality metadata for each response segment.
+- Record metrics and usage ledger outcomes for hot hit, hot miss, live fetch, reorg
+  rollback, and promotion.
+- Return stable unsupported errors for chains or adapters without hot requirements.
+
+Done means datalens can define and test latest-capable behavior without allowing unsafe
+data to pollute durable cache coverage.
+
+## Stage 8 - Compatibility Adapters
 
 Only after native behavior is stable, add compatibility surfaces such as SQD Gateway
 compatibility.
@@ -210,7 +234,7 @@ Expected work:
 
 Done means compatibility works as an adapter, not as the architecture.
 
-## Stage 8 - Operations And Production Readiness
+## Stage 9 - Operations And Production Readiness
 
 Harden the service for real deployments.
 
@@ -226,7 +250,7 @@ Expected work:
 
 Done means datalens can be operated as a persistent historical cache service.
 
-## Stage 9 - Future Chain Families
+## Stage 10 - Future Chain Families
 
 Add Tron, Solana, or other adapters only after EVM has proven the chain-neutral contract.
 

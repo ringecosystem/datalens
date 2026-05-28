@@ -85,6 +85,32 @@ fn test_metrics_labels_do_not_include_filter_values() {
     assert!(!output.contains("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
 }
 
+#[test]
+fn test_hot_cache_metrics_have_distinct_outcome_labels() {
+    let recorder = MetricsRecorder::new().expect("metrics recorder");
+    let labels = labels(Some("indexer"));
+
+    recorder.record_query(&labels, QueryOutcome::HotHit);
+    recorder.record_cache_coverage(&labels, CacheCoverageOutcome::HotMiss);
+    recorder.record_fill(&labels, FillOutcome::LiveFetch);
+    recorder.record_fill(&labels, FillOutcome::PromotionWritten);
+
+    let output = recorder.encode().expect("prometheus text");
+
+    assert!(output.contains(
+        r#"datalens_query_total{application="indexer",chain="ethereum",chain_kind="evm",dataset="logs",outcome="hot_hit"} 1"#
+    ));
+    assert!(output.contains(
+        r#"datalens_cache_coverage_total{application="indexer",chain="ethereum",chain_kind="evm",dataset="logs",outcome="hot_miss"} 1"#
+    ));
+    assert!(output.contains(
+        r#"datalens_fill_total{application="indexer",chain="ethereum",chain_kind="evm",dataset="logs",outcome="live_fetch"} 1"#
+    ));
+    assert!(output.contains(
+        r#"datalens_fill_total{application="indexer",chain="ethereum",chain_kind="evm",dataset="logs",outcome="promotion_written"} 1"#
+    ));
+}
+
 fn labels(application: Option<&str>) -> MetricsLabels {
     MetricsLabels::new(
         ApplicationIdentity::from_optional(application),

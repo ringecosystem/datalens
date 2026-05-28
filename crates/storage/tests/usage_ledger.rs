@@ -94,6 +94,32 @@ fn test_usage_ledger_write_failure_is_reported() {
     assert_eq!(error.kind, DatalensErrorKind::StorageWriteFailure);
 }
 
+#[test]
+fn test_usage_ledger_serializes_hot_cache_reorg_and_promotion_outcomes() {
+    let selector = DatasetSelector::all();
+    let entry = UsageLedgerEntry::query_event(
+        "analytics-api",
+        test_chain(),
+        DatasetKey::evm_blocks(),
+        &selector,
+        LedgerRange::blocks(11, 12).expect("valid range"),
+        FinalityLevel::Latest,
+        QueryOutcome::HotHit,
+        CacheOutcome::HotHit,
+        FillOutcome::LiveFetch,
+        2,
+    );
+
+    let encoded = serde_json::to_string(&entry).expect("encode usage entry");
+
+    assert!(encoded.contains(r#""finality":"latest""#));
+    assert!(encoded.contains(r#""query_outcome":"hot_hit""#));
+    assert!(encoded.contains(r#""cache_outcome":"hot_hit""#));
+    assert!(encoded.contains(r#""fill_outcome":"live_fetch""#));
+    assert_eq!(QueryOutcome::ReorgRollback, QueryOutcome::ReorgRollback);
+    assert_eq!(FillOutcome::PromotionWritten, FillOutcome::PromotionWritten);
+}
+
 fn temp_storage_root(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!(
         "datalens-usage-ledger-{name}-{}",

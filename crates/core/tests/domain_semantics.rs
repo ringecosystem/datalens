@@ -1,6 +1,7 @@
 use datalens_core::{
     BlockRange, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, Dataset, DatasetId,
-    EvmLogFilter, LogFilter, LogRecord, NetworkId, QueryRows, TimeRange, TopicFilter,
+    EvmLogFilter, LogFilter, LogRecord, NetworkId, QueryDataFinality, QueryRows,
+    QuerySegmentMetadata, QuerySegmentSource, TimeRange, TopicFilter,
 };
 
 #[test]
@@ -154,6 +155,32 @@ fn test_missing_ranges_handles_unsorted_and_mixed_kind_coverage() {
             datalens_core::LedgerRange::blocks(8, 8).expect("valid range"),
         ]
     );
+}
+
+#[test]
+fn test_query_segment_metadata_marks_source_and_finality() {
+    let durable = QuerySegmentMetadata::new(
+        datalens_core::LedgerRange::blocks(1, 10).expect("valid range"),
+        QuerySegmentSource::DurableCache,
+        QueryDataFinality::Finalized,
+    );
+    let hot = QuerySegmentMetadata::new(
+        datalens_core::LedgerRange::blocks(11, 12).expect("valid range"),
+        QuerySegmentSource::HotCache,
+        QueryDataFinality::Unsafe,
+    );
+    let live = QuerySegmentMetadata::new(
+        datalens_core::LedgerRange::blocks(13, 13).expect("valid range"),
+        QuerySegmentSource::LiveProvider,
+        QueryDataFinality::Latest,
+    );
+
+    assert_eq!(durable.source.as_str(), "durable_cache");
+    assert_eq!(durable.finality.as_str(), "finalized");
+    assert_eq!(hot.source.as_str(), "hot_cache");
+    assert_eq!(hot.finality.as_str(), "unsafe");
+    assert_eq!(live.source.as_str(), "live_provider");
+    assert_eq!(live.finality.as_str(), "latest");
 }
 
 #[test]
