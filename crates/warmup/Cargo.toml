@@ -16,3 +16,5 @@ serde_json.workspace = true
 [dev-dependencies]
 datalens-executor = { path = "../executor" }
 datalens-planner = { path = "../planner" }
+datalens-solana = { path = "../solana" }
+datalens-tron = { path = "../tron" }
