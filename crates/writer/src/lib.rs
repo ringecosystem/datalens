@@ -231,15 +231,17 @@ fn merge_segments(
 
 fn estimated_object_bytes(rows: &DatasetRows) -> Result<u64, DatalensError> {
     match rows.rows() {
-        QueryRows::EvmBlocks(_) | QueryRows::EvmLogs(_) | QueryRows::AdapterJson { .. } => {
-            serde_json::to_vec(rows)
-                .map(|bytes| bytes.len() as u64)
-                .map_err(|error| {
-                    DatalensError::new(
-                        DatalensErrorKind::Internal,
-                        format!("estimate durable object bytes: {error}"),
-                    )
-                })
-        }
+        QueryRows::EvmBlocks(_)
+        | QueryRows::EvmTransactions(_)
+        | QueryRows::EvmReceipts(_)
+        | QueryRows::EvmLogs(_)
+        | QueryRows::AdapterJson { .. } => serde_json::to_vec(rows)
+            .map(|bytes| bytes.len() as u64)
+            .map_err(|error| {
+                DatalensError::new(
+                    DatalensErrorKind::Internal,
+                    format!("estimate durable object bytes: {error}"),
+                )
+            }),
     }
 }

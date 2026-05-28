@@ -5,7 +5,10 @@ use std::{
     time::Duration,
 };
 
-use datalens_chain::{ChainAdapter, ChainFetchRequest, FinalityLevel, validate_durable_range};
+use datalens_chain::{
+    ChainAdapter, ChainFetchRequest, DatasetSelector, FinalityLevel, SelectorKind,
+    validate_durable_range,
+};
 use datalens_core::{DatalensError, DatalensErrorKind};
 use datalens_metrics::{
     CacheCoverageOutcome as MetricsCacheCoverageOutcome, FillOutcome as MetricsFillOutcome,
@@ -20,10 +23,10 @@ use datalens_writer::{
 };
 
 use crate::{
-    IndexAccounting, IndexCheckpoint, IndexChunk, IndexCursor, IndexDatasetProviderLimit,
-    IndexDatasetRequest, IndexDurableWriteSummary, IndexFailureState, IndexFinalityRequirement,
-    IndexJob, IndexJobId, IndexPlan, IndexRetryPolicy, IndexRunMode, IndexRunResult,
-    IndexRunStatus,
+    IndexAccounting, IndexCheckpoint, IndexChunk, IndexCursor, IndexDatasetCoverage,
+    IndexDatasetProviderLimit, IndexDatasetRequest, IndexDurableWriteSummary, IndexFailureState,
+    IndexFinalityRequirement, IndexJob, IndexJobId, IndexPlan, IndexRetryPolicy, IndexRunMode,
+    IndexRunResult, IndexRunStatus,
 };
 
 pub trait IndexCursorRepository: Clone + Send + Sync + 'static {
@@ -109,20 +112,33 @@ where
                 "index job chain does not match adapter capabilities",
             ));
         }
-        let datasets = job.dataset_selection.selected()?.to_vec();
+        let datasets = resolve_datasets(&job, &capabilities)?;
+        let plan_job = IndexJob {
+            dataset_selection: crate::IndexDatasetSelection::Selected(datasets.clone()),
+            ..job.clone()
+        };
         let mut covered_ranges = Vec::new();
         for dataset in &datasets {
-            covered_ranges.extend(self.storage.covered_ranges(
-                &job.chain,
-                &dataset.dataset_key,
-                &dataset.selector,
-                job.range.clone(),
-            )?);
+            covered_ranges.extend(
+                self.storage
+                    .covered_ranges(
+                        &job.chain,
+                        &dataset.dataset_key,
+                        &dataset.selector,
+                        job.range.clone(),
+                    )?
+                    .into_iter()
+                    .map(|range| IndexDatasetCoverage {
+                        dataset_key: dataset.dataset_key.clone(),
+                        selector: dataset.selector.clone(),
+                        range,
+                    }),
+            );
         }
         let provider_limits =
             provider_limits(&capabilities, &datasets, job.runtime_config.max_chunk_len);
-        let plan = IndexPlan::try_new(
-            job.clone(),
+        let plan = IndexPlan::try_new_with_dataset_coverage(
+            plan_job,
             finality_boundary,
             provider_limits,
             covered_ranges,
@@ -462,6 +478,42 @@ fn provider_limits(
         })
         .flatten()
         .collect()
+}
+
+fn resolve_datasets(
+    job: &IndexJob,
+    capabilities: &datalens_chain::AdapterCapabilities,
+) -> Result<Vec<IndexDatasetRequest>, DatalensError> {
+    match &job.dataset_selection {
+        crate::IndexDatasetSelection::Selected(datasets) if datasets.is_empty() => {
+            Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                "index dataset selection must not be empty",
+            ))
+        }
+        crate::IndexDatasetSelection::Selected(datasets) => Ok(datasets.clone()),
+        crate::IndexDatasetSelection::AllSupported => capabilities
+            .dataset_capabilities()
+            .iter()
+            .map(|capability| {
+                let selector = if capability.supports_selector(SelectorKind::All) {
+                    DatasetSelector::all()
+                } else {
+                    return Err(DatalensError::new(
+                        DatalensErrorKind::UnsupportedDataset,
+                        format!(
+                            "dataset {} cannot be selected by all-supported indexing",
+                            capability.dataset().as_str()
+                        ),
+                    ));
+                };
+                Ok(IndexDatasetRequest {
+                    dataset_key: capability.dataset().clone(),
+                    selector,
+                })
+            })
+            .collect(),
+    }
 }
 
 fn split_len(len: u128) -> u64 {

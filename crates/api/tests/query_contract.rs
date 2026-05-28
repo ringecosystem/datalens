@@ -683,6 +683,9 @@ impl ChainAdapter for MockSource {
                     warnings: Vec::new(),
                 }))
             }),
+            Dataset::Transactions | Dataset::Receipts => {
+                unreachable!("legacy query contract fixtures only request blocks or logs")
+            }
             Dataset::Logs => {
                 let filter = match &request.selector {
                     DatasetSelector::EvmLogs(filter) => filter,

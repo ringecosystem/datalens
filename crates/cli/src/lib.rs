@@ -493,7 +493,10 @@ fn validate_applications(config: &DatalensConfig) -> Result<(), DatalensError> {
             ));
         }
         for dataset in &application.datasets {
-            if !matches!(dataset.as_str(), "blocks" | "logs") {
+            if !matches!(
+                dataset.as_str(),
+                "blocks" | "transactions" | "receipts" | "logs"
+            ) {
                 return Err(DatalensError::new(
                     DatalensErrorKind::InvalidInput,
                     format!("application {application_id} references unknown dataset {dataset}"),

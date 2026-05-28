@@ -1016,6 +1016,8 @@ fn boundary_for_cached_hit(range: &LedgerRange) -> ChainHeight {
 fn empty_query_rows(dataset_key: &DatasetKey) -> QueryRows {
     match dataset_key.legacy_dataset() {
         Some(Dataset::Blocks) => QueryRows::EvmBlocks(Vec::new()),
+        Some(Dataset::Transactions) => QueryRows::EvmTransactions(Vec::new()),
+        Some(Dataset::Receipts) => QueryRows::EvmReceipts(Vec::new()),
         Some(Dataset::Logs) => QueryRows::EvmLogs(Vec::new()),
         None => QueryRows::AdapterJson {
             dataset_key: dataset_key.clone(),

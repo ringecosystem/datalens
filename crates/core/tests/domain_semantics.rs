@@ -1,7 +1,7 @@
 use datalens_core::{
     BlockHeader, BlockRange, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, Dataset,
-    DatasetId, EvmLogFilter, LogFilter, LogRecord, NetworkId, QueryDataFinality, QueryRows,
-    QuerySegmentMetadata, QuerySegmentSource, TimeRange, TopicFilter,
+    DatasetId, EvmLogFilter, EvmReceipt, EvmTransaction, LogFilter, LogRecord, NetworkId,
+    QueryDataFinality, QueryRows, QuerySegmentMetadata, QuerySegmentSource, TimeRange, TopicFilter,
 };
 
 #[test]
@@ -70,6 +70,14 @@ fn test_dataset_key_has_builtin_chain_neutral_ids() {
         "evm.blocks"
     );
     assert_eq!(datalens_core::DatasetKey::evm_logs().as_str(), "evm.logs");
+    assert_eq!(
+        datalens_core::DatasetKey::evm_transactions().as_str(),
+        "evm.transactions"
+    );
+    assert_eq!(
+        datalens_core::DatasetKey::evm_receipts().as_str(),
+        "evm.receipts"
+    );
     assert_eq!(
         datalens_core::DatasetKey::tron_blocks().as_str(),
         "tron.blocks"
@@ -198,6 +206,26 @@ fn test_query_rows_sort_deduplicates_blocks_and_logs_stably() {
     logs.sort();
 
     assert_eq!(logs, QueryRows::EvmLogs(vec![log(1, 0), log(2, 1)]));
+
+    let mut transactions = QueryRows::EvmTransactions(vec![
+        transaction(2, 1),
+        transaction(1, 0),
+        transaction(2, 1),
+    ]);
+    transactions.sort();
+
+    assert_eq!(
+        transactions,
+        QueryRows::EvmTransactions(vec![transaction(1, 0), transaction(2, 1)])
+    );
+
+    let mut receipts = QueryRows::EvmReceipts(vec![receipt(2, 1), receipt(1, 0), receipt(2, 1)]);
+    receipts.sort();
+
+    assert_eq!(
+        receipts,
+        QueryRows::EvmReceipts(vec![receipt(1, 0), receipt(2, 1)])
+    );
 }
 
 #[test]
@@ -611,6 +639,40 @@ fn log(block_number: u64, log_index: u64) -> LogRecord {
         topics: Vec::new(),
         data: "0x".to_owned(),
         removed: false,
+    }
+}
+
+fn transaction(block_number: u64, transaction_index: u64) -> EvmTransaction {
+    EvmTransaction {
+        hash: format!("0xtx-{block_number}-{transaction_index}"),
+        block_number,
+        block_hash: format!("0xblock-{block_number}"),
+        transaction_index,
+        from: "0x1111111111111111111111111111111111111111".to_owned(),
+        to: Some("0x2222222222222222222222222222222222222222".to_owned()),
+        value: "0x1".to_owned(),
+        input: "0x".to_owned(),
+        nonce: 7,
+        gas: 21_000,
+        gas_price: Some("0x3b9aca00".to_owned()),
+        max_fee_per_gas: None,
+        max_priority_fee_per_gas: None,
+        transaction_type: Some("0x2".to_owned()),
+    }
+}
+
+fn receipt(block_number: u64, transaction_index: u64) -> EvmReceipt {
+    EvmReceipt {
+        transaction_hash: format!("0xtx-{block_number}-{transaction_index}"),
+        block_number,
+        block_hash: format!("0xblock-{block_number}"),
+        transaction_index,
+        status: Some(1),
+        gas_used: 21_000,
+        cumulative_gas_used: 21_000,
+        effective_gas_price: Some("0x3b9aca00".to_owned()),
+        contract_address: None,
+        logs_bloom: Some(format!("0x{}", "0".repeat(512))),
     }
 }
 

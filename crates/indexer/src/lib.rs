@@ -154,6 +154,30 @@ impl IndexPlan {
         provider_limits: Vec<IndexDatasetProviderLimit>,
         covered_ranges: Vec<LedgerRange>,
     ) -> Result<Self, DatalensError> {
+        let covered_ranges = job
+            .dataset_selection
+            .selected()?
+            .iter()
+            .flat_map(|dataset| {
+                covered_ranges
+                    .iter()
+                    .cloned()
+                    .map(|range| IndexDatasetCoverage {
+                        dataset_key: dataset.dataset_key.clone(),
+                        selector: dataset.selector.clone(),
+                        range,
+                    })
+            })
+            .collect();
+        Self::try_new_with_dataset_coverage(job, finality_boundary, provider_limits, covered_ranges)
+    }
+
+    pub fn try_new_with_dataset_coverage(
+        job: IndexJob,
+        finality_boundary: ChainHeight,
+        provider_limits: Vec<IndexDatasetProviderLimit>,
+        covered_ranges: Vec<IndexDatasetCoverage>,
+    ) -> Result<Self, DatalensError> {
         finality_boundary.validate_durable_writable()?;
         if job.range.kind() != finality_boundary.range_kind {
             return Err(DatalensError::new(
@@ -181,6 +205,11 @@ impl IndexPlan {
         for dataset in datasets {
             let relevant_coverage = covered_ranges
                 .iter()
+                .filter(|coverage| {
+                    coverage.dataset_key == dataset.dataset_key
+                        && coverage.selector == dataset.selector
+                })
+                .map(|coverage| &coverage.range)
                 .filter_map(|range| range.intersection(&planned_range))
                 .collect::<Vec<_>>();
 
@@ -236,6 +265,13 @@ impl IndexPlan {
             verification_ranges,
         })
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IndexDatasetCoverage {
+    pub dataset_key: DatasetKey,
+    pub selector: DatasetSelector,
+    pub range: LedgerRange,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

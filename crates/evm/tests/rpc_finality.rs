@@ -83,6 +83,55 @@ fn test_parse_log_record_rejects_invalid_provider_hex_values() {
 }
 
 #[test]
+fn test_parse_transaction_and_receipt_capture_durable_index_fields() {
+    let transaction = parse_transaction(
+        &json!({
+            "hash": "0xtx",
+            "blockNumber": "0xa",
+            "blockHash": "0xblock",
+            "transactionIndex": "0x1",
+            "from": "0x1111111111111111111111111111111111111111",
+            "to": null,
+            "value": "0x2",
+            "input": "0x1234",
+            "nonce": "0x3",
+            "gas": "0x5208",
+            "gasPrice": "0x3b9aca00",
+            "maxFeePerGas": "0x77359400",
+            "maxPriorityFeePerGas": "0x59682f00",
+            "type": "0x2"
+        }),
+        10,
+        "0xblock",
+    )
+    .expect("transaction");
+
+    assert_eq!(transaction.block_number, 10);
+    assert_eq!(transaction.transaction_index, 1);
+    assert_eq!(transaction.to, None);
+    assert_eq!(transaction.gas, 21_000);
+
+    let receipt = parse_receipt(&json!({
+        "transactionHash": "0xtx",
+        "blockNumber": "0xa",
+        "blockHash": "0xblock",
+        "transactionIndex": "0x1",
+        "status": "0x1",
+        "gasUsed": "0x5208",
+        "cumulativeGasUsed": "0x5208",
+        "effectiveGasPrice": "0x3b9aca00",
+        "contractAddress": null,
+        "logsBloom": "0x00"
+    }))
+    .expect("receipt");
+
+    assert_eq!(receipt.transaction_hash, "0xtx");
+    assert_eq!(receipt.status, Some(1));
+    assert_eq!(receipt.contract_address, None);
+    assert_eq!(receipt.gas_used, 21_000);
+}
+
+#[test]
 fn test_fetch_rejects_chain_mismatch_before_provider_call() {
     let client = EvmRpcClient::with_chain(
         Vec::new(),

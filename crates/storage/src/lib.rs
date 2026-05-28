@@ -758,9 +758,12 @@ fn intersect(left: LedgerRange, right: LedgerRange) -> Option<LedgerRange> {
 
 fn object_encoding_for_dataset(dataset_key: &DatasetKey) -> ObjectEncoding {
     match dataset_key.legacy_dataset() {
-        Some(datalens_core::Dataset::Blocks | datalens_core::Dataset::Logs) => {
-            ObjectEncoding::ParquetV1
-        }
+        Some(
+            datalens_core::Dataset::Blocks
+            | datalens_core::Dataset::Transactions
+            | datalens_core::Dataset::Receipts
+            | datalens_core::Dataset::Logs,
+        ) => ObjectEncoding::ParquetV1,
         None => ObjectEncoding::Json,
     }
 }
@@ -799,6 +802,8 @@ fn decode_object_rows(
 fn empty_rows(dataset_key: DatasetKey) -> Result<DatasetRows, DatalensError> {
     let rows = match dataset_key.legacy_dataset() {
         Some(datalens_core::Dataset::Blocks) => QueryRows::EvmBlocks(Vec::new()),
+        Some(datalens_core::Dataset::Transactions) => QueryRows::EvmTransactions(Vec::new()),
+        Some(datalens_core::Dataset::Receipts) => QueryRows::EvmReceipts(Vec::new()),
         Some(datalens_core::Dataset::Logs) => QueryRows::EvmLogs(Vec::new()),
         None => QueryRows::AdapterJson {
             dataset_key: dataset_key.clone(),
@@ -817,6 +822,16 @@ fn filter_rows(rows: DatasetRows, range: LedgerRange) -> DatasetRows {
         QueryRows::EvmBlocks(rows) => QueryRows::EvmBlocks(
             rows.into_iter()
                 .filter(|row| block_range.contains(row.number))
+                .collect(),
+        ),
+        QueryRows::EvmTransactions(rows) => QueryRows::EvmTransactions(
+            rows.into_iter()
+                .filter(|row| block_range.contains(row.block_number))
+                .collect(),
+        ),
+        QueryRows::EvmReceipts(rows) => QueryRows::EvmReceipts(
+            rows.into_iter()
+                .filter(|row| block_range.contains(row.block_number))
                 .collect(),
         ),
         QueryRows::EvmLogs(rows) => QueryRows::EvmLogs(
