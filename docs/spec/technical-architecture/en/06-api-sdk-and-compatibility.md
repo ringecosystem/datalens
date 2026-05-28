@@ -19,6 +19,26 @@ than copying another gateway's schema:
 The native API should map cleanly onto the planner. It should not require API handlers to
 know object storage details or EVM RPC details.
 
+## Application Boundary
+
+The native HTTP API authenticates applications before query execution when
+`applications.required = true` in configuration.
+
+- Application identity is passed with `x-datalens-application`.
+- Credentials are passed with `Authorization: Bearer <token>`.
+- The configured application id/name is normalized to lowercase ASCII with only
+  letters, digits, dot, underscore, and hyphen.
+- Missing, unknown, invalid, or disabled applications fail before provider fetch or
+  durable cache writes.
+- Application allowlists are first-stage authorization: each application lists allowed
+  `chains` and `datasets`.
+- Quota configuration is first-stage request validation. `max_query_range_blocks` is
+  enforced before execution; `max_requests_per_minute` and `max_concurrent_requests`
+  are parsed as registry boundaries for later runtime limiting.
+
+Metrics labels must use the normalized registry application id, never the raw header
+value. Authentication tokens must not appear in logs or API error responses.
+
 ## SDK Role
 
 The SDK is a convenience layer. It can provide typed requests, pagination helpers, retry
