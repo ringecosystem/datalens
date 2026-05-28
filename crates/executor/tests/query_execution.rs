@@ -108,7 +108,10 @@ fn test_executor_miss_returns_provider_rows_when_writer_stages_below_threshold()
                 target_object_bytes: 1024 * 1024,
                 min_object_rows: 3,
                 record_empty_coverage: true,
-                staging: WriteStagingConfig { enabled: true },
+                staging: WriteStagingConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
             },
         },
     );
@@ -160,7 +163,10 @@ fn test_executor_usage_ledger_separates_provider_fill_from_staged_write() {
                 target_object_bytes: 1024 * 1024,
                 min_object_rows: 3,
                 record_empty_coverage: true,
-                staging: WriteStagingConfig { enabled: true },
+                staging: WriteStagingConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
             },
         },
     )

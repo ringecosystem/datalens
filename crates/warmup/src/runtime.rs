@@ -244,6 +244,7 @@ where
             && result.fetched_ranges < self.runtime_config.max_fetches_per_task_loop.max(1)
         {
             if self.should_stop(task_id)? {
+                writer.flush_for_shutdown()?;
                 result.status = WarmupRunStatus::Stopped;
                 return Ok(result);
             }
@@ -341,11 +342,13 @@ where
         task.stats.rows_fetched += result.rows_fetched;
         task.touch(unix_seconds_now()?);
         if next <= target_end {
+            writer.flush_for_shutdown()?;
             task.state = WarmupTaskState::Queued;
             result.status = WarmupRunStatus::Partial;
             self.registry.save_task(&task)?;
             return Ok(result);
         }
+        writer.flush_for_shutdown()?;
         self.finish_or_stop(task, result)
     }
 

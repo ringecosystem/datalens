@@ -1,6 +1,9 @@
 //! Writer boundary for normalized chunk persistence.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use datalens_chain::{DatasetSelector, FinalityLevel};
 use datalens_core::{
@@ -17,9 +20,31 @@ pub struct DurableWriterConfig {
     pub staging: WriteStagingConfig,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WriteStagingConfig {
     pub enabled: bool,
+    pub min_rows: Option<usize>,
+    pub target_object_bytes: Option<u64>,
+    pub max_staged_ranges: Option<usize>,
+    pub max_staged_rows: Option<usize>,
+    pub max_staged_age_ms: Option<u64>,
+    pub flush_on_shutdown: bool,
+    pub max_staged_bytes: Option<u64>,
+}
+
+impl Default for WriteStagingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_rows: None,
+            target_object_bytes: None,
+            max_staged_ranges: None,
+            max_staged_rows: None,
+            max_staged_age_ms: None,
+            flush_on_shutdown: true,
+            max_staged_bytes: None,
+        }
+    }
 }
 
 impl DurableWriterConfig {
@@ -29,6 +54,20 @@ impl DurableWriterConfig {
 
     fn min_object_rows(&self) -> usize {
         self.min_object_rows.max(1)
+    }
+
+    fn staging_min_rows(&self) -> usize {
+        self.staging
+            .min_rows
+            .unwrap_or(self.min_object_rows())
+            .max(1)
+    }
+
+    fn staging_target_object_bytes(&self) -> u64 {
+        self.staging
+            .target_object_bytes
+            .unwrap_or(self.target_object_bytes())
+            .max(1)
     }
 }
 
@@ -53,6 +92,17 @@ pub struct DurableWriteResult {
     pub empty_coverages: Vec<LedgerRange>,
     pub skipped_ranges: Vec<LedgerRange>,
     pub staged_ranges: Vec<LedgerRange>,
+    pub flush_reason: Option<WriteFlushReason>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WriteFlushReason {
+    RowsThreshold,
+    BytesThreshold,
+    RangeThreshold,
+    AgeThreshold,
+    Manual,
+    Shutdown,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -93,6 +143,20 @@ where
     }
 
     pub fn flush(&self) -> Result<DurableWriteResult, DatalensError> {
+        self.flush_with_reason(WriteFlushReason::Manual)
+    }
+
+    pub fn flush_for_shutdown(&self) -> Result<DurableWriteResult, DatalensError> {
+        if !self.config.staging.enabled || !self.config.staging.flush_on_shutdown {
+            return Ok(DurableWriteResult::default());
+        }
+        self.flush_with_reason(WriteFlushReason::Shutdown)
+    }
+
+    fn flush_with_reason(
+        &self,
+        reason: WriteFlushReason,
+    ) -> Result<DurableWriteResult, DatalensError> {
         let staged = {
             let mut staged = self
                 .staged
@@ -100,7 +164,22 @@ where
                 .map_err(|_| DatalensError::internal("durable writer staging lock poisoned"))?;
             std::mem::take(&mut *staged)
         };
-        self.flush_staged(staged)
+        if staged.is_empty() {
+            return Ok(DurableWriteResult::default());
+        }
+        match self.flush_staged(staged.clone(), reason) {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                let mut current = self
+                    .staged
+                    .lock()
+                    .map_err(|_| DatalensError::internal("durable writer staging lock poisoned"))?;
+                let mut retained = staged;
+                retained.append(&mut *current);
+                *current = retained;
+                Err(error)
+            }
+        }
     }
 
     fn ingest(&self, request: DurableWriteRequest) -> Result<DurableWriteResult, DatalensError> {
@@ -126,6 +205,7 @@ where
                     dataset_key: dataset_key.clone(),
                     selector: selector.clone(),
                     finality_level,
+                    staged_at: Instant::now(),
                     segment,
                 });
             }
@@ -141,27 +221,44 @@ where
             })?);
         }
 
-        let staged = {
+        let (staged, reason) = {
             let mut staged = self
                 .staged
                 .lock()
                 .map_err(|_| DatalensError::internal("durable writer staging lock poisoned"))?;
             staged.extend(staged_segments);
-            if !staged_ready(&self.config, &staged)? {
+            let Some(reason) = staged_ready(&self.config, &staged)? else {
                 result.staged_ranges.extend(staged_ranges);
                 return Ok(result);
-            }
-            std::mem::take(&mut *staged)
+            };
+            (std::mem::take(&mut *staged), reason)
         };
-        result.extend(self.flush_staged(staged)?);
+        match self.flush_staged(staged.clone(), reason) {
+            Ok(flush_result) => result.extend(flush_result),
+            Err(error) => {
+                let mut current = self
+                    .staged
+                    .lock()
+                    .map_err(|_| DatalensError::internal("durable writer staging lock poisoned"))?;
+                let mut retained = staged;
+                retained.append(&mut *current);
+                *current = retained;
+                return Err(error);
+            }
+        }
         Ok(result)
     }
 
-    fn flush_staged(&self, staged: Vec<StagedWrite>) -> Result<DurableWriteResult, DatalensError> {
+    fn flush_staged(
+        &self,
+        staged: Vec<StagedWrite>,
+        reason: WriteFlushReason,
+    ) -> Result<DurableWriteResult, DatalensError> {
         let mut result = DurableWriteResult::default();
         let mut remaining = staged;
 
-        while let Some(first) = remaining.pop() {
+        while !remaining.is_empty() {
+            let first = remaining.remove(0);
             let mut segments = vec![first.segment];
             let mut index = 0;
             while index < remaining.len() {
@@ -184,6 +281,12 @@ where
             })?);
         }
 
+        if !result.data_objects.is_empty()
+            || !result.empty_coverages.is_empty()
+            || !result.skipped_ranges.is_empty()
+        {
+            result.flush_reason = Some(reason);
+        }
         Ok(result)
     }
 
@@ -249,6 +352,7 @@ struct StagedWrite {
     dataset_key: DatasetKey,
     selector: DatasetSelector,
     finality_level: FinalityLevel,
+    staged_at: Instant,
     segment: DurableWriteSegment,
 }
 
@@ -258,26 +362,60 @@ impl DurableWriteResult {
         self.empty_coverages.extend(other.empty_coverages);
         self.skipped_ranges.extend(other.skipped_ranges);
         self.staged_ranges.extend(other.staged_ranges);
+        if other.flush_reason.is_some() {
+            self.flush_reason = other.flush_reason;
+        }
     }
 }
 
 fn staged_ready(
     config: &DurableWriterConfig,
     staged: &[StagedWrite],
-) -> Result<bool, DatalensError> {
+) -> Result<Option<WriteFlushReason>, DatalensError> {
     let row_count = staged
         .iter()
         .map(|write| write.segment.rows.row_count())
         .sum::<usize>();
-    if row_count >= config.min_object_rows() {
-        return Ok(true);
+    if row_count >= config.staging_min_rows()
+        || config
+            .staging
+            .max_staged_rows
+            .is_some_and(|max_rows| row_count >= max_rows.max(1))
+    {
+        return Ok(Some(WriteFlushReason::RowsThreshold));
     }
+    let mut staged_bytes = 0_u64;
     for write in staged {
-        if estimated_object_bytes(&write.segment.rows)? >= config.target_object_bytes() {
-            return Ok(true);
+        let object_bytes = estimated_object_bytes(&write.segment.rows)?;
+        staged_bytes = staged_bytes.saturating_add(object_bytes);
+        if object_bytes >= config.staging_target_object_bytes() {
+            return Ok(Some(WriteFlushReason::BytesThreshold));
         }
     }
-    Ok(false)
+    if config
+        .staging
+        .max_staged_bytes
+        .is_some_and(|max_bytes| staged_bytes >= max_bytes.max(1))
+    {
+        return Ok(Some(WriteFlushReason::BytesThreshold));
+    }
+    if config
+        .staging
+        .max_staged_ranges
+        .is_some_and(|max_ranges| staged.len() >= max_ranges.max(1))
+    {
+        return Ok(Some(WriteFlushReason::RangeThreshold));
+    }
+    if let Some(max_age_ms) = config.staging.max_staged_age_ms {
+        let max_age = Duration::from_millis(max_age_ms);
+        if staged
+            .iter()
+            .any(|write| write.staged_at.elapsed() >= max_age)
+        {
+            return Ok(Some(WriteFlushReason::AgeThreshold));
+        }
+    }
+    Ok(None)
 }
 
 struct WriteContext<'a, R> {

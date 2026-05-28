@@ -259,6 +259,13 @@ where
             record_empty_coverage: config.writer.record_empty_coverage,
             staging: datalens_writer::WriteStagingConfig {
                 enabled: config.writer.staging.enabled,
+                min_rows: config.writer.staging.min_rows,
+                target_object_bytes: config.writer.staging.target_object_bytes,
+                max_staged_ranges: config.writer.staging.max_staged_ranges,
+                max_staged_rows: config.writer.staging.max_staged_rows,
+                max_staged_age_ms: config.writer.staging.max_staged_age_ms,
+                flush_on_shutdown: config.writer.staging.flush_on_shutdown,
+                max_staged_bytes: config.writer.staging.max_staged_bytes,
             },
         },
     )

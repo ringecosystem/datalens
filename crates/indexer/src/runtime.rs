@@ -207,6 +207,8 @@ where
             checkpoints.push(checkpoint);
         }
 
+        writer.flush_for_shutdown()?;
+
         Ok(IndexRunResult {
             job_id: job.id,
             mode: job.run_mode,
