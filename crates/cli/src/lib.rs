@@ -22,6 +22,10 @@ use datalens_storage::{
 use datalens_tron::{TronAdapter, TronHttpProvider};
 use tracing_subscriber::EnvFilter;
 
+mod index;
+
+pub use index::*;
+
 #[derive(Debug, Parser)]
 #[command(name = "datalens", arg_required_else_help = true)]
 pub struct Cli {
@@ -35,6 +39,7 @@ pub enum Command {
     Doctor(ConfigCommand),
     Query(QueryCommand),
     Inspect(InspectCommand),
+    Index(IndexCommand),
 }
 
 #[derive(Debug, Args)]
@@ -122,6 +127,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Command::Doctor(command) => doctor_command(command)?,
         Command::Query(command) => query_command(command)?,
         Command::Inspect(command) => inspect_command(command)?,
+        Command::Index(command) => index_command(command)?,
     }
     Ok(())
 }
@@ -165,6 +171,7 @@ fn doctor_command(command: ConfigCommand) -> Result<(), Box<dyn std::error::Erro
         },
         "planner": config.planner,
         "writer": config.writer,
+        "index": config.index,
         "metrics": {
             "enabled": config.metrics.enabled,
             "default_application": config.metrics.default_application,
@@ -461,9 +468,50 @@ pub fn validate_config(config: &DatalensConfig) -> Result<(), DatalensError> {
             "metrics.default_application must not be empty when metrics are enabled",
         ));
     }
+    validate_index_config(config)?;
     validate_applications(config)?;
     for (name, chain) in &config.chains {
         validate_chain(name, chain)?;
+    }
+    Ok(())
+}
+
+fn validate_index_config(config: &DatalensConfig) -> Result<(), DatalensError> {
+    if config.index.default_chunk_range == 0 {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "index.default_chunk_range must be greater than zero",
+        ));
+    }
+    if config.index.max_concurrency == 0 {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "index.max_concurrency must be greater than zero",
+        ));
+    }
+    if config.index.retry.max_attempts == 0 {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "index.retry.max_attempts must be greater than zero",
+        ));
+    }
+    if config.index.retry.max_backoff_ms < config.index.retry.initial_backoff_ms {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "index.retry.max_backoff_ms must be greater than or equal to index.retry.initial_backoff_ms",
+        ));
+    }
+    if !matches!(config.index.default_finality.as_str(), "safe" | "finalized") {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "index.default_finality must be safe or finalized",
+        ));
+    }
+    if config.index.cursor_path.trim().is_empty() {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "index.cursor_path must not be empty",
+        ));
     }
     Ok(())
 }

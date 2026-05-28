@@ -1290,6 +1290,7 @@ dependencies = [
  "datalens-chain",
  "datalens-core",
  "datalens-evm",
+ "datalens-indexer",
  "datalens-metrics",
  "datalens-planner",
  "datalens-solana",
