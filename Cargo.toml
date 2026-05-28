@@ -8,6 +8,7 @@ members = [
   "crates/core",
   "crates/evm",
   "crates/executor",
+  "crates/indexer",
   "crates/metrics",
   "crates/planner",
   "crates/solana",
