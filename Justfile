@@ -16,6 +16,9 @@ e2e:
 e2e-lifecycle:
   cargo test -p datalens-api --test query_flow
   cargo test -p datalens-api --test lifecycle
+  cargo test -p datalens-executor --test query_execution
+  cargo test -p datalens-warmup --test warmup_flow
+  cargo test -p datalens-storage --test read_through_cache
   cargo test -p datalens-cli --test cli_commands test_inspect
   cargo test -p datalens-metrics --test metrics_encoding
 

@@ -646,14 +646,20 @@ where
         let cache_fill_attempted = !fetched_segments.is_empty();
         let mut durable_write_outcome = LedgerDurableWriteOutcome::NotAttempted;
         if cache_fill_attempted {
-            let write_result = match self.writer.write(DurableWriteRequest {
+            match self.writer.write(DurableWriteRequest {
                 chain: plan.chain.clone(),
                 dataset_key: plan.dataset_key.clone(),
                 selector: plan.selector.clone(),
                 finality_level,
                 segments: fetched_segments,
             }) {
-                Ok(write_result) => write_result,
+                Ok(write_result) => {
+                    durable_write_outcome = ledger_durable_write_outcome(&write_result);
+                    self.record_durable_write(
+                        &labels,
+                        metrics_durable_write_outcome(&write_result),
+                    );
+                }
                 Err(error) => {
                     log::error!(
                         "cache write failed dataset={} range={}-{} kind={:?}",
@@ -663,23 +669,10 @@ where
                         error.kind
                     );
                     self.record_error(&labels, &error);
-                    self.record_fill(&labels, FillOutcome::Error, fill_start);
                     self.record_durable_write(&labels, MetricsDurableWriteOutcome::StorageError);
-                    self.record_query(&labels, QueryOutcome::Error, start);
-                    self.record_usage_for_plan(
-                        &ledger_application,
-                        &plan,
-                        LedgerQueryOutcome::StorageError,
-                        ledger_cache_outcome(coverage_outcome),
-                        LedgerFillOutcome::StorageError,
-                        LedgerDurableWriteOutcome::StorageError,
-                        rows.row_count(),
-                    )?;
-                    return Err(error);
+                    durable_write_outcome = LedgerDurableWriteOutcome::StorageError;
                 }
             };
-            durable_write_outcome = ledger_durable_write_outcome(&write_result);
-            self.record_durable_write(&labels, metrics_durable_write_outcome(&write_result));
         }
         if cache_fill_attempted {
             let fill_outcome = if fill_row_count == 0 {

@@ -79,6 +79,9 @@ just e2e-lifecycle
 
 ```sh
 cargo test -p datalens-api --test lifecycle
+cargo test -p datalens-executor --test query_execution
+cargo test -p datalens-warmup --test warmup_flow
+cargo test -p datalens-storage --test read_through_cache
 cargo test -p datalens-cli --test cli_commands test_inspect
 cargo test -p datalens-metrics --test metrics_encoding
 ```
@@ -90,6 +93,10 @@ Default deterministic lifecycle coverage:
 | API health and chain registry | In-process router validates `GET /health`, `GET /v1/chains`, and `POST /v1/query`. |
 | API metrics | `GET /metrics` returns Prometheus text with `application`, `chain`, `chain_kind`, and `dataset` labels. |
 | Block miss/fill/hit | First `blocks` query fetches and writes durable cache; equivalent second query is a full hit and does not call the provider. |
+| Staged query fill and flush | Below-threshold provider fills return rows without manifest coverage, repeated fills remain provider-backed until `flush_staged_writes`, and the flushed range becomes a durable hit. |
+| Durable write failure recovery | Provider rows still return when a durable write fails, and the failed write does not create manifest coverage or data objects. |
+| Warmup durable writer path | Warmup tasks fetch chain chunks, pass `DurableWriteSegment` values through `DurableWriter`, checkpoint progress, and produce coverage that later query execution can hit without provider fetches. |
+| Read-through cache | Query lifecycle and storage tests prove durable hits read through manifest-backed objects and a second compatible read can use `ReadThroughCache` without another object fetch. |
 | Empty logs coverage | Empty `logs` query records empty coverage, writes no data object, and equivalent second query is a full hit. |
 | Metrics lifecycle | Miss/fill, full hit, cache coverage, fill, latest requested block, latest filled block, and provider error counters are validated. |
 | Multi-chain isolation | `ethereum` and `polygon` use separate mock sources and write separate chain manifest paths for the same range and dataset. |
