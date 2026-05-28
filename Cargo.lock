@@ -1251,6 +1251,7 @@ dependencies = [
  "datalens-chain",
  "datalens-core",
  "datalens-executor",
+ "datalens-metrics",
  "datalens-planner",
  "datalens-storage",
  "datalens-writer",

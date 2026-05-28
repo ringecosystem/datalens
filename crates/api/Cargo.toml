@@ -9,6 +9,7 @@ axum.workspace = true
 datalens-chain = { path = "../chain" }
 datalens-core = { path = "../core" }
 datalens-executor = { path = "../executor" }
+datalens-metrics = { path = "../metrics" }
 datalens-planner = { path = "../planner" }
 datalens-storage = { path = "../storage" }
 datalens-writer = { path = "../writer" }
@@ -19,4 +20,4 @@ tokio.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
-tower = { version = "0.5.3", features = ["util"] }
+tower.workspace = true
