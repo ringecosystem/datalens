@@ -3,6 +3,7 @@ members = [
   "crates/api",
   "crates/chain",
   "crates/cli",
+  "crates/client",
   "crates/core",
   "crates/evm",
   "crates/executor",

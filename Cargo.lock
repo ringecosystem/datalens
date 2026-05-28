@@ -1249,6 +1249,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "datalens-chain",
+ "datalens-client",
  "datalens-core",
  "datalens-executor",
  "datalens-metrics",
@@ -1289,6 +1290,16 @@ dependencies = [
  "toml",
  "tracing-log",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "datalens-client"
+version = "0.1.0"
+dependencies = [
+ "datalens-core",
+ "reqwest",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
