@@ -370,6 +370,8 @@ where
 }
 
 pub trait StorageRepository: Send + Sync {
+    fn manifest(&self) -> Result<Manifest, DatalensError>;
+
     fn covered_ranges(
         &self,
         chain: &ChainIdentity,
@@ -396,6 +398,10 @@ impl<S> StorageRepository for DurableStorage<S>
 where
     S: ObjectStore + 'static,
 {
+    fn manifest(&self) -> Result<Manifest, DatalensError> {
+        Self::manifest(self)
+    }
+
     fn covered_ranges(
         &self,
         chain: &ChainIdentity,
@@ -425,6 +431,10 @@ where
 }
 
 impl StorageRepository for Box<dyn StorageRepository> {
+    fn manifest(&self) -> Result<Manifest, DatalensError> {
+        self.as_ref().manifest()
+    }
+
     fn covered_ranges(
         &self,
         chain: &ChainIdentity,
@@ -455,6 +465,10 @@ impl StorageRepository for Box<dyn StorageRepository> {
 }
 
 impl StorageRepository for Arc<dyn StorageRepository> {
+    fn manifest(&self) -> Result<Manifest, DatalensError> {
+        self.as_ref().manifest()
+    }
+
     fn covered_ranges(
         &self,
         chain: &ChainIdentity,
