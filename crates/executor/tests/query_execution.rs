@@ -269,6 +269,30 @@ fn test_executor_records_separate_usage_for_shared_durable_cache() {
 }
 
 #[test]
+fn test_executor_returns_provider_rows_when_durable_write_fails_without_coverage() {
+    let root = temp_storage_root("executor-write-failure-provider-rows");
+    let storage = FailingWriteStorage::new(LocalStorage::new(&root));
+    let source = MockSource::default().with_blocks(vec![block(10, "0x10")]);
+    let executor = executor(storage, source.clone());
+
+    let result = executor
+        .execute(blocks_input(10, 10))
+        .expect("provider rows are returned despite durable write failure");
+
+    assert_eq!(block_numbers(&result.rows), vec![10]);
+    assert_eq!(
+        result.cache.missing_ranges,
+        vec![LedgerRange::blocks(10, 10).expect("valid range")]
+    );
+    assert_eq!(
+        source.calls(),
+        vec![SourceCall::Blocks(BlockRange::expect_new(10, 10))]
+    );
+    assert!(!root.join("chains/evm/ethereum/1/manifest.json").exists());
+    assert!(!root.join("chains/evm/ethereum/1/datasets").exists());
+}
+
+#[test]
 fn test_executor_ledger_write_failure_blocks_successful_query() {
     let storage = LocalStorage::new(temp_storage_root("executor-ledger-failure"));
     seed_blocks(&storage, 1, 1, vec![block(1, "0x01")]);
@@ -634,6 +658,54 @@ impl StorageRepository for CountingStorage {
         request: StorageWriteRequest<'_>,
     ) -> Result<StorageWriteOutcome, DatalensError> {
         self.inner.write_rows(request)
+    }
+}
+
+#[derive(Clone)]
+struct FailingWriteStorage {
+    inner: LocalStorage,
+}
+
+impl FailingWriteStorage {
+    fn new(inner: LocalStorage) -> Self {
+        Self { inner }
+    }
+}
+
+impl StorageRepository for FailingWriteStorage {
+    fn manifest(&self) -> Result<Manifest, DatalensError> {
+        self.inner.manifest()
+    }
+
+    fn covered_ranges(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+    ) -> Result<Vec<LedgerRange>, DatalensError> {
+        self.inner
+            .covered_ranges(chain, dataset_key, selector, range)
+    }
+
+    fn read_rows(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+    ) -> Result<DatasetRows, DatalensError> {
+        self.inner.read_rows(chain, dataset_key, selector, range)
+    }
+
+    fn write_rows(
+        &self,
+        _request: StorageWriteRequest<'_>,
+    ) -> Result<StorageWriteOutcome, DatalensError> {
+        Err(DatalensError::new(
+            DatalensErrorKind::StorageWriteFailure,
+            "injected durable write failure",
+        ))
     }
 }
 

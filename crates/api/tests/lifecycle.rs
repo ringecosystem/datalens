@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -22,7 +23,9 @@ use datalens_core::{
 };
 use datalens_metrics::MetricsRecorder;
 use datalens_storage::{
-    DurableStorage, LocalStorage, ObjectStore, S3ObjectStore, S3ObjectStoreConfig,
+    DurableStorage, LocalObjectStore, LocalStorage, Manifest, ObjectMetadata, ObjectStore,
+    ReadThroughCacheConfig, S3ObjectStore, S3ObjectStoreConfig, StorageRepository,
+    StorageWriteOutcome, StorageWriteRequest,
 };
 use tower::ServiceExt;
 
@@ -239,6 +242,98 @@ fn test_empty_logs_lifecycle_records_empty_coverage_without_data_object_and_hits
 }
 
 #[test]
+fn test_local_lifecycle_returns_provider_rows_when_durable_write_fails_without_coverage() {
+    let root = temp_storage_root("write-failure-provider-rows");
+    let source = MockSource::default().with_blocks(vec![block(65)]);
+    let service = QueryService::new_named(
+        FailingWriteStorage::new(LocalStorage::new(&root)),
+        source.clone(),
+        PlannerConfig {
+            max_query_range_blocks: 8,
+            default_chunk_range_blocks: 4,
+        },
+        WriterConfig {
+            target_object_bytes: 1024,
+            min_object_rows: 1,
+            record_empty_coverage: true,
+            staging: Default::default(),
+        },
+        "ethereum",
+        chain_config(1),
+    );
+
+    let response = service
+        .query(blocks_request(65, 65))
+        .expect("provider rows are returned despite durable write failure");
+
+    assert_eq!(block_numbers(&response), vec![65]);
+    assert_eq!(
+        response.cache.missing_ranges,
+        vec![BlockRange::expect_new(65, 65)]
+    );
+    assert_eq!(
+        source.calls(),
+        vec![SourceCall::Blocks(BlockRange::expect_new(65, 65))]
+    );
+    assert!(!root.join("chains/evm/ethereum/1/manifest.json").exists());
+    assert!(!root.join("chains/evm/ethereum/1/datasets").exists());
+}
+
+#[test]
+fn test_local_lifecycle_durable_hit_reads_through_cache_after_manifest_coverage() {
+    let root = temp_storage_root("read-through-lifecycle");
+    let store = CountingObjectStore::new(root);
+    let storage = DurableStorage::from_object_store_with_read_through_cache_config(
+        store.clone(),
+        ReadThroughCacheConfig::enabled(16),
+    );
+    let source = MockSource::default().with_blocks(vec![block(70), block(71)]);
+    let service = QueryService::new_named(
+        storage.clone(),
+        source.clone(),
+        PlannerConfig {
+            max_query_range_blocks: 8,
+            default_chunk_range_blocks: 4,
+        },
+        WriterConfig {
+            target_object_bytes: 1024,
+            min_object_rows: 1,
+            record_empty_coverage: true,
+            staging: Default::default(),
+        },
+        "ethereum",
+        chain_config(1),
+    );
+    let request = blocks_request(70, 71);
+
+    let first = service.query(request.clone()).expect("miss fills cache");
+    let object_key = storage
+        .manifest()
+        .expect("manifest")
+        .entries
+        .into_iter()
+        .find_map(|entry| entry.object_key)
+        .expect("object key");
+    let second = service.query(request.clone()).expect("first durable hit");
+    let third = service.query(request).expect("second durable hit");
+
+    assert_eq!(
+        first.cache.missing_ranges,
+        vec![BlockRange::expect_new(70, 71)]
+    );
+    assert_eq!(
+        second.cache.hit_ranges,
+        vec![BlockRange::expect_new(70, 71)]
+    );
+    assert_eq!(third.cache.hit_ranges, vec![BlockRange::expect_new(70, 71)]);
+    assert_eq!(
+        source.calls(),
+        vec![SourceCall::Blocks(BlockRange::expect_new(70, 71))]
+    );
+    assert_eq!(store.read_count(&object_key), 1);
+}
+
+#[test]
 fn test_s3_lifecycle_is_gated_and_uses_dedicated_prefix() {
     let Some(config) = s3_test_config() else {
         return;
@@ -294,6 +389,106 @@ fn test_s3_lifecycle_is_gated_and_uses_dedicated_prefix() {
     assert_eq!(entry.checksum_algorithm.as_deref(), Some("sha256"));
 
     cleanup_s3_prefix(&store);
+}
+
+#[derive(Clone, Debug)]
+struct CountingObjectStore {
+    inner: LocalObjectStore,
+    reads: Arc<Mutex<BTreeMap<String, usize>>>,
+}
+
+impl CountingObjectStore {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            inner: LocalObjectStore::new(root),
+            reads: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    fn read_count(&self, key: &str) -> usize {
+        *self
+            .reads
+            .lock()
+            .expect("read counts")
+            .get(key)
+            .unwrap_or(&0)
+    }
+}
+
+impl ObjectStore for CountingObjectStore {
+    fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError> {
+        *self
+            .reads
+            .lock()
+            .expect("read counts")
+            .entry(key.to_owned())
+            .or_default() += 1;
+        self.inner.get(key)
+    }
+
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
+        self.inner.put(key, bytes)
+    }
+
+    fn exists(&self, key: &str) -> Result<bool, DatalensError> {
+        self.inner.exists(key)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
+        self.inner.list(prefix)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), DatalensError> {
+        self.inner.delete(key)
+    }
+}
+
+#[derive(Clone)]
+struct FailingWriteStorage {
+    inner: LocalStorage,
+}
+
+impl FailingWriteStorage {
+    fn new(inner: LocalStorage) -> Self {
+        Self { inner }
+    }
+}
+
+impl StorageRepository for FailingWriteStorage {
+    fn manifest(&self) -> Result<Manifest, DatalensError> {
+        self.inner.manifest()
+    }
+
+    fn covered_ranges(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &datalens_chain::DatasetSelector,
+        range: LedgerRange,
+    ) -> Result<Vec<LedgerRange>, DatalensError> {
+        self.inner
+            .covered_ranges(chain, dataset_key, selector, range)
+    }
+
+    fn read_rows(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &datalens_chain::DatasetSelector,
+        range: LedgerRange,
+    ) -> Result<datalens_core::DatasetRows, DatalensError> {
+        self.inner.read_rows(chain, dataset_key, selector, range)
+    }
+
+    fn write_rows(
+        &self,
+        _request: StorageWriteRequest<'_>,
+    ) -> Result<StorageWriteOutcome, DatalensError> {
+        Err(DatalensError::new(
+            DatalensErrorKind::StorageWriteFailure,
+            "injected durable write failure",
+        ))
+    }
 }
 
 async fn body_json(body: Body) -> serde_json::Value {
@@ -402,6 +597,13 @@ fn block(number: u64) -> BlockHeader {
         hash: format!("0x{number:02x}"),
         parent_hash: format!("0x{number:02x}-parent"),
         timestamp: number * 10,
+    }
+}
+
+fn block_numbers(response: &datalens_api::LegacyEvmQueryResponse) -> Vec<u64> {
+    match &response.rows {
+        QueryRows::EvmBlocks(rows) => rows.iter().map(|row| row.number).collect(),
+        _ => panic!("expected block rows"),
     }
 }
 
