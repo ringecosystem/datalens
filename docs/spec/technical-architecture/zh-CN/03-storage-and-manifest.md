@@ -34,6 +34,11 @@ chains/evm/darwinia/datasets/evm.blocks/parquet-v1/block/all/000000000-000099999
 
 布局使用 `chain-kind`，这样未来 `tron` 或 `solana` 适配器不需要塞进 EVM-only namespace。
 
+Application identity 不属于第一阶段 durable object 或 manifest coverage key。相同 chain、
+dataset、selector、range 和 finality 的请求共享 cache object。Application 边界用于
+authentication、authorization、quota validation、metrics，以及未来审计或归因；per-application
+durable object layout 需要单独的 storage design。
+
 `range-key` 只是对象标识中的范围部分。对于 EVM 区块号范围，`018000000-018099999` 表示
 区块 `18,000,000` 到 `18,099,999`，补零是为了让对象列表按字典序排序时也符合区块顺序。
 它不表示 datalens 已经完整覆盖这个区块范围里的所有数据集或所有合约。

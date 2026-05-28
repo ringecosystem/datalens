@@ -17,6 +17,25 @@
 原生 API 应该能干净映射到规划器。API handlers 不应该需要知道对象存储细节或 EVM RPC
 细节。
 
+## Application 边界
+
+当配置中 `applications.required = true` 时，原生 HTTP API 必须在查询执行前完成
+application 认证。
+
+- Application identity 通过 `x-datalens-application` 传递。
+- 凭据通过 `Authorization: Bearer <token>` 传递。
+- 配置中的 application id/name 会规范化为 lowercase ASCII，只允许 letters、digits、dot、
+  underscore 和 hyphen。
+- 缺失、未知、无效或禁用的 application 必须在 provider fetch 或 durable cache write 前失败。
+- Application allowlist 是第一版授权边界：每个 application 声明允许访问的 `chains` 和
+  `datasets`。
+- Quota 配置是第一版 request validation。`max_query_range_blocks` 在执行前强制检查；
+  `max_requests_per_minute` 和 `max_concurrent_requests` 先作为 registry 边界解析，后续再接入
+  runtime limiting。
+
+Metrics labels 必须使用 registry 规范化后的 application id，不能使用原始 header 值。
+Authentication token 不能出现在日志或 API error response 中。
+
 ## SDK 角色
 
 SDK 是便捷层。它可以提供类型化请求、分页帮助方法、重试帮助方法、认证帮助方法，以及给

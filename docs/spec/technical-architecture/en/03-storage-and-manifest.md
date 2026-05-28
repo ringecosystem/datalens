@@ -39,6 +39,12 @@ chains/evm/darwinia/datasets/evm.blocks/parquet-v1/block/all/000000000-000099999
 The layout uses `chain-kind` so future `tron` or `solana` adapters do not need to fit
 inside an EVM-only namespace.
 
+Application identity is not part of the first-stage durable object or manifest coverage
+key. Applications share cache objects for the same chain, dataset, selector, range, and
+finality. The application boundary is used for authentication, authorization, quota
+validation, metrics, and future audit or attribution; per-application durable object
+layout requires a separate storage design.
+
 `range-key` is only the range portion of the object identity. For EVM block-number ranges,
 `018000000-018099999` means blocks `18,000,000` through `18,099,999`, padded so object
 listing remains sortable. It does not mean datalens has complete coverage for every

@@ -18,6 +18,22 @@ record_empty_coverage = true
 enabled = true
 default_application = "datalens"
 
+[applications]
+required = true
+
+[[applications.applications]]
+id = "default"
+name = "default"
+enabled = true
+token = "${DATALENS_DEFAULT_APPLICATION_TOKEN}"
+chains = ["ethereum"]
+datasets = ["blocks", "logs"]
+
+[applications.applications.quota]
+max_query_range_blocks = 100000
+max_requests_per_minute = 60
+max_concurrent_requests = 4
+
 [chains.ethereum]
 kind = "evm"
 chain_id = 1

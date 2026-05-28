@@ -22,9 +22,27 @@ use datalens_writer::DurableWriterConfig;
 use serde::{Deserialize, Serialize};
 
 pub mod auth {
+    use super::*;
+
+    pub const APPLICATION_HEADER: &str = "x-datalens-application";
+
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub struct AuthContext {
         pub subject: Option<String>,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct ApplicationContext {
+        pub id: String,
+        pub name: String,
+        pub display_name: Option<String>,
+        pub quota: Option<config::ApplicationQuotaConfig>,
+    }
+
+    impl ApplicationContext {
+        pub fn metrics_identity(&self) -> ApplicationIdentity {
+            ApplicationIdentity::named(self.id.clone())
+        }
     }
 
     pub trait AuthenticationHook {
@@ -38,6 +56,199 @@ pub mod auth {
         fn authenticate(&self) -> AuthContext {
             AuthContext { subject: None }
         }
+    }
+
+    #[derive(Clone, Debug, Default)]
+    pub struct ApplicationRegistry {
+        required: bool,
+        applications: BTreeMap<String, config::ApplicationConfig>,
+    }
+
+    impl ApplicationRegistry {
+        pub fn disabled() -> Self {
+            Self::default()
+        }
+
+        pub fn from_config(
+            config: config::ApplicationRegistryConfig,
+        ) -> Result<Self, DatalensError> {
+            let mut applications = BTreeMap::new();
+            for mut application in config.applications {
+                application.id = normalize_application_id(&application.id)?;
+                application.name = normalize_application_id(&application.name)?;
+                if application.token.trim().is_empty() {
+                    return Err(DatalensError::new(
+                        DatalensErrorKind::InvalidInput,
+                        format!("application {} token must not be empty", application.id),
+                    ));
+                }
+                if applications
+                    .insert(application.id.clone(), application)
+                    .is_some()
+                {
+                    return Err(DatalensError::new(
+                        DatalensErrorKind::InvalidInput,
+                        "application id is registered more than once",
+                    ));
+                }
+            }
+            if config.required && applications.is_empty() {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::InvalidInput,
+                    "applications registry must contain at least one application when required",
+                ));
+            }
+            Ok(Self {
+                required: config.required,
+                applications,
+            })
+        }
+
+        pub fn required(&self) -> bool {
+            self.required
+        }
+
+        pub fn authenticate_headers(
+            &self,
+            headers: &HeaderMap,
+            request: &LegacyEvmQueryRequest,
+        ) -> Result<Option<ApplicationContext>, DatalensError> {
+            if !self.required {
+                return Ok(None);
+            }
+            let raw_application = headers
+                .get(APPLICATION_HEADER)
+                .ok_or_else(|| {
+                    DatalensError::new(
+                        DatalensErrorKind::AuthenticationFailed,
+                        "application identity is required",
+                    )
+                })?
+                .to_str()
+                .map_err(|_| {
+                    DatalensError::new(
+                        DatalensErrorKind::AuthenticationFailed,
+                        "application identity is invalid",
+                    )
+                })?;
+            let application_id = normalize_application_id(raw_application).map_err(|_| {
+                DatalensError::new(
+                    DatalensErrorKind::AuthenticationFailed,
+                    "application identity is invalid",
+                )
+            })?;
+            let application = self.applications.get(&application_id).ok_or_else(|| {
+                DatalensError::new(
+                    DatalensErrorKind::AuthenticationFailed,
+                    "application credentials are invalid",
+                )
+            })?;
+            let token = bearer_token(headers).ok_or_else(|| {
+                DatalensError::new(
+                    DatalensErrorKind::AuthenticationFailed,
+                    "application credentials are required",
+                )
+            })?;
+            if token != application.token {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::AuthenticationFailed,
+                    "application credentials are invalid",
+                ));
+            }
+            if !application.enabled {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::Unauthorized,
+                    "application is disabled",
+                ));
+            }
+            authorize_application(application, request)?;
+            enforce_quota(application, request)?;
+            Ok(Some(ApplicationContext {
+                id: application.id.clone(),
+                name: application.name.clone(),
+                display_name: application.display_name.clone(),
+                quota: application.quota.clone(),
+            }))
+        }
+    }
+
+    fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+        let value = headers
+            .get(axum::http::header::AUTHORIZATION)?
+            .to_str()
+            .ok()?;
+        value
+            .strip_prefix("Bearer ")
+            .filter(|token| !token.trim().is_empty())
+    }
+
+    fn authorize_application(
+        application: &config::ApplicationConfig,
+        request: &LegacyEvmQueryRequest,
+    ) -> Result<(), DatalensError> {
+        let chain = request.chain.configured_name();
+        if !application.chains.iter().any(|allowed| allowed == chain) {
+            return Err(DatalensError::new(
+                DatalensErrorKind::Unauthorized,
+                "application is not allowed to access this chain",
+            ));
+        }
+        let dataset = request.dataset.as_str();
+        if !application
+            .datasets
+            .iter()
+            .any(|allowed| allowed == dataset)
+        {
+            return Err(DatalensError::new(
+                DatalensErrorKind::Unauthorized,
+                "application is not allowed to access this dataset",
+            ));
+        }
+        Ok(())
+    }
+
+    fn enforce_quota(
+        application: &config::ApplicationConfig,
+        request: &LegacyEvmQueryRequest,
+    ) -> Result<(), DatalensError> {
+        let Some(quota) = &application.quota else {
+            return Ok(());
+        };
+        if let Some(limit) = quota.max_query_range_blocks {
+            let requested = request.range.len();
+            if requested > u128::from(limit) {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::RateLimited,
+                    "application query range quota exceeded",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn normalize_application_id(value: &str) -> Result<String, DatalensError> {
+        let normalized = value.trim().to_ascii_lowercase();
+        if normalized.is_empty()
+            || normalized.starts_with('.')
+            || normalized.ends_with('.')
+            || normalized.contains('/')
+            || normalized.contains('\\')
+            || normalized.len() > 64
+        {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                "application id must be 1-64 characters using lowercase letters, digits, dot, underscore, or hyphen",
+            ));
+        }
+        if !normalized.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+        }) {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                "application id must be 1-64 characters using lowercase letters, digits, dot, underscore, or hyphen",
+            ));
+        }
+        Ok(normalized)
     }
 }
 
@@ -88,6 +299,8 @@ pub mod config {
         pub writer: WriterConfig,
         #[serde(default)]
         pub metrics: MetricsConfig,
+        #[serde(default)]
+        pub applications: ApplicationRegistryConfig,
         pub chains: BTreeMap<String, ChainConfig>,
     }
 
@@ -196,6 +409,45 @@ pub mod config {
         "datalens".to_owned()
     }
 
+    #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+    pub struct ApplicationRegistryConfig {
+        #[serde(default)]
+        pub required: bool,
+        #[serde(default)]
+        pub applications: Vec<ApplicationConfig>,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    pub struct ApplicationConfig {
+        pub id: String,
+        pub name: String,
+        #[serde(default = "default_application_enabled")]
+        pub enabled: bool,
+        #[serde(default)]
+        pub display_name: Option<String>,
+        pub token: String,
+        #[serde(default)]
+        pub chains: Vec<String>,
+        #[serde(default)]
+        pub datasets: Vec<String>,
+        #[serde(default)]
+        pub quota: Option<ApplicationQuotaConfig>,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    pub struct ApplicationQuotaConfig {
+        #[serde(default)]
+        pub max_query_range_blocks: Option<u64>,
+        #[serde(default)]
+        pub max_requests_per_minute: Option<u64>,
+        #[serde(default)]
+        pub max_concurrent_requests: Option<u64>,
+    }
+
+    fn default_application_enabled() -> bool {
+        true
+    }
+
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
     pub struct ChainConfig {
         pub kind: String,
@@ -269,6 +521,7 @@ pub mod config {
     }
 }
 
+use auth::{ApplicationContext, ApplicationRegistry};
 use config::{ChainConfig, MetricsConfig, PlannerConfig, WriterConfig};
 
 pub const APPLICATION_IDENTITY_HEADER: &str = "x-datalens-application";
@@ -629,6 +882,7 @@ where
 #[derive(Clone, Default)]
 pub struct QueryServiceRegistry {
     services: BTreeMap<String, Arc<dyn RegisteredQueryService>>,
+    application_registry: ApplicationRegistry,
 }
 
 impl QueryServiceRegistry {
@@ -648,6 +902,14 @@ impl QueryServiceRegistry {
             ));
         }
         self.services.insert(chain_name, Arc::new(service));
+        Ok(self)
+    }
+
+    pub fn with_application_registry(
+        mut self,
+        config: config::ApplicationRegistryConfig,
+    ) -> Result<Self, DatalensError> {
+        self.application_registry = ApplicationRegistry::from_config(config)?;
         Ok(self)
     }
 
@@ -684,6 +946,15 @@ impl QueryServiceRegistry {
             .map(|service| service.discovery())
             .collect::<Result<Vec<_>, _>>()?;
         Ok(DiscoveryResponse { chains })
+    }
+
+    fn authenticate_headers(
+        &self,
+        headers: &HeaderMap,
+        request: &LegacyEvmQueryRequest,
+    ) -> Result<Option<ApplicationContext>, DatalensError> {
+        self.application_registry
+            .authenticate_headers(headers, request)
     }
 
     pub fn metrics_text(&self) -> Option<Result<String, DatalensError>> {
@@ -736,7 +1007,12 @@ async fn query(
     Json(request): Json<LegacyEvmQueryRequest>,
 ) -> Result<Json<LegacyEvmQueryResponse>, ApiError> {
     let registry = state.registry.clone();
-    let application = application_from_headers(&headers);
+    let application_context = registry
+        .authenticate_headers(&headers, &request)
+        .map_err(ApiError)?;
+    let application = application_context
+        .map(|application| application.metrics_identity())
+        .or_else(|| application_from_headers(&headers));
     tokio::task::spawn_blocking(move || registry.query_with_application(request, application))
         .await
         .map_err(|error| {
@@ -791,9 +1067,11 @@ pub struct ApiErrorDetail {
 
 pub fn api_error_status(kind: &DatalensErrorKind) -> StatusCode {
     match kind {
+        DatalensErrorKind::AuthenticationFailed => StatusCode::UNAUTHORIZED,
         DatalensErrorKind::InvalidInput | DatalensErrorKind::InvalidRequest => {
             StatusCode::BAD_REQUEST
         }
+        DatalensErrorKind::Unauthorized => StatusCode::FORBIDDEN,
         DatalensErrorKind::UnsupportedDataset => StatusCode::UNPROCESSABLE_ENTITY,
         DatalensErrorKind::ProviderLimit | DatalensErrorKind::RateLimited => {
             StatusCode::TOO_MANY_REQUESTS
@@ -818,8 +1096,10 @@ pub fn api_error_body(error: DatalensError) -> ApiErrorBody {
 
 fn api_error_kind(kind: &DatalensErrorKind) -> &'static str {
     match kind {
+        DatalensErrorKind::AuthenticationFailed => "authentication_failed",
         DatalensErrorKind::InvalidInput => "invalid_input",
         DatalensErrorKind::InvalidRequest => "invalid_request",
+        DatalensErrorKind::Unauthorized => "unauthorized",
         DatalensErrorKind::UnsupportedDataset => "unsupported_dataset",
         DatalensErrorKind::ProviderFailure => "provider_failure",
         DatalensErrorKind::ProviderLimit => "provider_limit",

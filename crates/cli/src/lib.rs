@@ -2,7 +2,10 @@ use std::{net::SocketAddr, sync::Arc};
 
 use clap::{Args, Parser, Subcommand};
 pub use datalens_api::config::{ChainConfig, DatalensConfig, FinalityConfig};
-use datalens_api::{LegacyEvmQueryRequest, QueryService, QueryServiceRegistry};
+use datalens_api::{
+    LegacyEvmQueryRequest, QueryService, QueryServiceRegistry,
+    auth::{ApplicationRegistry, normalize_application_id},
+};
 use datalens_chain::ChainAdapter;
 pub use datalens_core::DatalensErrorKind;
 use datalens_core::{
@@ -433,8 +436,55 @@ pub fn validate_config(config: &DatalensConfig) -> Result<(), DatalensError> {
             "metrics.default_application must not be empty when metrics are enabled",
         ));
     }
+    validate_applications(config)?;
     for (name, chain) in &config.chains {
         validate_chain(name, chain)?;
+    }
+    Ok(())
+}
+
+fn validate_applications(config: &DatalensConfig) -> Result<(), DatalensError> {
+    ApplicationRegistry::from_config(config.applications.clone())?;
+    for application in &config.applications.applications {
+        let application_id = normalize_application_id(&application.id)?;
+        if application.chains.is_empty() {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                format!("application {application_id} must allow at least one chain"),
+            ));
+        }
+        for chain in &application.chains {
+            if !config.chains.contains_key(chain) {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::InvalidInput,
+                    format!("application {application_id} references unknown chain {chain}"),
+                ));
+            }
+        }
+        if application.datasets.is_empty() {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                format!("application {application_id} must allow at least one dataset"),
+            ));
+        }
+        for dataset in &application.datasets {
+            if !matches!(dataset.as_str(), "blocks" | "logs") {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::InvalidInput,
+                    format!("application {application_id} references unknown dataset {dataset}"),
+                ));
+            }
+        }
+        if let Some(quota) = &application.quota
+            && (matches!(quota.max_query_range_blocks, Some(0))
+                || matches!(quota.max_requests_per_minute, Some(0))
+                || matches!(quota.max_concurrent_requests, Some(0)))
+        {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                format!("application {application_id} quota limits must be greater than zero"),
+            ));
+        }
     }
     Ok(())
 }
@@ -575,7 +625,8 @@ fn build_service(
 fn build_service_registry(config: &DatalensConfig) -> Result<QueryServiceRegistry, DatalensError> {
     let storage: Arc<dyn datalens_storage::StorageRepository> = Arc::from(build_storage(config)?);
     let usage_ledger: Arc<dyn UsageLedgerRepository> = Arc::from(build_usage_ledger(config)?);
-    let mut registry = QueryServiceRegistry::new();
+    let mut registry =
+        QueryServiceRegistry::new().with_application_registry(config.applications.clone())?;
     for (chain_name, chain) in &config.chains {
         let service = build_service_with_storage(
             storage.clone(),
