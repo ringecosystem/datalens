@@ -1,6 +1,6 @@
 use async_graphql::{
-    Context, EmptySubscription, Error, ErrorExtensions, ID, InputObject, Json, Object, Schema,
-    SimpleObject, http::GraphiQLSource,
+    Context, EmptySubscription, Error, ErrorExtensions, ID, Json, Object, Schema, SimpleObject,
+    http::GraphiQLSource,
 };
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 use axum::{
@@ -11,22 +11,16 @@ use axum::{
 use datalens_core::{
     ChainIdentity, DatalensError, DatalensErrorKind, DatasetRows, LedgerRangeKind,
 };
-use datalens_warmup::{
-    WarmupChunkPolicy, WarmupRetryPolicy, WarmupRunResult, WarmupTaskFilter, WarmupTaskId,
-};
-use serde::{Deserialize, Serialize};
+use datalens_warmup::{WarmupRunResult, WarmupTaskFilter, WarmupTaskId};
+use serde::Serialize;
 
 use crate::{
     contract::error::{api_error_kind, api_error_status},
     contract::{
         discovery::{ChainDiscovery, DiscoveryResponse},
-        query::{
-            FieldSelectionApi, QueryApiRequest, QueryApiResponse, QueryCacheApi, QueryRangeApi,
-            QuerySelectorApi,
-        },
+        query::{QueryApiResponse, QueryCacheApi, QueryRangeApi},
         warmup::{
-            WarmupDatasetKeyApi, WarmupRunOnceApiResponse, WarmupSelectorApiRequest,
-            WarmupSubmitApiRequest, WarmupSubmitApiResponse, WarmupTaskView, warmup_task_view,
+            WarmupRunOnceApiResponse, WarmupSubmitApiResponse, WarmupTaskView, warmup_task_view,
         },
     },
     http::{
@@ -35,6 +29,10 @@ use crate::{
     },
     service::registry::QueryServiceRegistry,
 };
+
+mod input;
+
+use input::{QueryInput, WarmupSubmitInput, WarmupTaskFilterInput};
 
 pub(crate) type DatalensGraphqlSchema = Schema<QueryRoot, MutationRoot, EmptySubscription>;
 
@@ -217,81 +215,6 @@ impl MutationRoot {
         let registry = registry(ctx)?.clone();
         let results = spawn_graphql_blocking(move || registry.run_warmup_once()).await?;
         Ok(WarmupRunOnceApiResponse { results }.into())
-    }
-}
-
-#[derive(InputObject)]
-pub(crate) struct QueryInput {
-    chain: Json<ChainIdentity>,
-    dataset_key: String,
-    selector: Json<QuerySelectorApi>,
-    range: Json<QueryRangeApi>,
-    finality: Option<String>,
-    fields: Option<Json<FieldSelectionApi>>,
-}
-
-impl QueryInput {
-    fn into_request(self) -> async_graphql::Result<QueryApiRequest> {
-        Ok(QueryApiRequest {
-            chain: self.chain.0,
-            dataset_key: self.dataset_key,
-            selector: self.selector.0,
-            range: self.range.0,
-            finality: parse_optional_json_value(self.finality, "durable_only")?,
-            fields: self.fields.map(|fields| fields.0).unwrap_or_default(),
-        })
-    }
-}
-
-#[derive(InputObject)]
-pub(crate) struct WarmupSubmitInput {
-    chain: Json<ChainIdentity>,
-    dataset_key: Json<WarmupDatasetKeyApi>,
-    selector: Json<WarmupSelectorApiRequest>,
-    range_kind: Json<LedgerRangeKind>,
-    start: u64,
-    end: Option<u64>,
-    mode: Option<String>,
-    chunk_policy: Option<Json<WarmupChunkPolicy>>,
-    retry_policy: Option<Json<WarmupRetryPolicy>>,
-}
-
-impl WarmupSubmitInput {
-    fn into_request(self) -> async_graphql::Result<WarmupSubmitApiRequest> {
-        Ok(WarmupSubmitApiRequest {
-            chain: self.chain.0,
-            dataset_key: self.dataset_key.0,
-            selector: self.selector.0,
-            range_kind: self.range_kind.0,
-            start: self.start,
-            end: self.end,
-            mode: parse_optional_json_value(self.mode, "fixed_range")?,
-            chunk_policy: self
-                .chunk_policy
-                .map(|chunk_policy| chunk_policy.0)
-                .unwrap_or_default(),
-            retry_policy: self
-                .retry_policy
-                .map(|retry_policy| retry_policy.0)
-                .unwrap_or_default(),
-        })
-    }
-}
-
-#[derive(InputObject)]
-pub(crate) struct WarmupTaskFilterInput {
-    application_id: Option<String>,
-    chain: Option<String>,
-    state: Option<String>,
-}
-
-impl WarmupTaskFilterInput {
-    fn into_filter(self) -> async_graphql::Result<WarmupTaskFilter> {
-        Ok(WarmupTaskFilter {
-            application_id: self.application_id,
-            chain_key: self.chain,
-            state: self.state.map(parse_json_value).transpose()?,
-        })
     }
 }
 
@@ -508,25 +431,6 @@ fn graphql_error(error: DatalensError) -> Error {
     Error::new(error.message).extend_with(move |_error, extension| {
         extension.set("kind", api_error_kind(&kind));
         extension.set("status", i32::from(status));
-    })
-}
-
-fn parse_optional_json_value<T>(value: Option<String>, default: &str) -> async_graphql::Result<T>
-where
-    T: for<'de> Deserialize<'de>,
-{
-    parse_json_value(value.unwrap_or_else(|| default.to_owned()))
-}
-
-fn parse_json_value<T>(value: String) -> async_graphql::Result<T>
-where
-    T: for<'de> Deserialize<'de>,
-{
-    serde_json::from_value(serde_json::Value::String(value)).map_err(|error| {
-        graphql_error(DatalensError::new(
-            DatalensErrorKind::InvalidInput,
-            format!("invalid enum value: {error}"),
-        ))
     })
 }
 
