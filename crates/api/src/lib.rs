@@ -878,34 +878,13 @@ pub struct ChainDiscovery {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
-#[serde(untagged)]
-pub enum WarmupSubmitApiRequest {
-    Native(WarmupNativeSubmitApiRequest),
-    LegacyEvmLogs(WarmupLegacyEvmLogsSubmitApiRequest),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
-pub struct WarmupNativeSubmitApiRequest {
+pub struct WarmupSubmitApiRequest {
     pub chain: ChainIdentity,
     pub dataset_key: WarmupDatasetKeyApi,
     pub selector: WarmupSelectorApiRequest,
     pub range_kind: LedgerRangeKind,
     pub start: u64,
     pub end: Option<u64>,
-    #[serde(default = "default_warmup_api_mode")]
-    pub mode: WarmupTaskMode,
-    #[serde(default)]
-    pub chunk_policy: WarmupChunkPolicy,
-    #[serde(default)]
-    pub retry_policy: WarmupRetryPolicy,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
-pub struct WarmupLegacyEvmLogsSubmitApiRequest {
-    pub chain: ChainIdentity,
-    pub dataset: Dataset,
-    pub range: BlockRange,
-    pub filter: Option<LogFilter>,
     #[serde(default = "default_warmup_api_mode")]
     pub mode: WarmupTaskMode,
     #[serde(default)]
@@ -925,9 +904,7 @@ pub enum WarmupDatasetKeyApi {
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum WarmupSelectorApiRequest {
     All,
-    EvmLogs {
-        filter: LogFilter,
-    },
+    EvmLogs(LogFilter),
     Other {
         kind: String,
         fingerprint: String,
@@ -1003,7 +980,7 @@ impl WarmupSelectorApiRequest {
     fn into_selector(self) -> Result<DatasetSelector, DatalensError> {
         match self {
             Self::All => Ok(DatasetSelector::all()),
-            Self::EvmLogs { filter } => DatasetSelector::try_evm_logs(filter),
+            Self::EvmLogs(filter) => DatasetSelector::try_evm_logs(filter),
             Self::Other {
                 kind,
                 fingerprint,
@@ -1015,17 +992,11 @@ impl WarmupSelectorApiRequest {
 
 impl WarmupSubmitApiRequest {
     fn chain(&self) -> &ChainIdentity {
-        match self {
-            Self::Native(request) => &request.chain,
-            Self::LegacyEvmLogs(request) => &request.chain,
-        }
+        &self.chain
     }
 
     fn dataset_for_auth(&self) -> Result<String, DatalensError> {
-        match self {
-            Self::Native(request) => Ok(request.dataset_key.dataset_key()?.as_str().to_owned()),
-            Self::LegacyEvmLogs(request) => Ok(request.dataset.as_str().to_owned()),
-        }
+        Ok(self.dataset_key.dataset_key()?.as_str().to_owned())
     }
 }
 
@@ -2156,20 +2127,6 @@ fn warmup_submit_request(
     application_id: String,
     request: WarmupSubmitApiRequest,
 ) -> Result<WarmupSubmitRequest, DatalensError> {
-    match request {
-        WarmupSubmitApiRequest::Native(request) => {
-            native_warmup_submit_request(application_id, request)
-        }
-        WarmupSubmitApiRequest::LegacyEvmLogs(request) => {
-            legacy_warmup_submit_request(application_id, request)
-        }
-    }
-}
-
-fn native_warmup_submit_request(
-    application_id: String,
-    request: WarmupNativeSubmitApiRequest,
-) -> Result<WarmupSubmitRequest, DatalensError> {
     Ok(WarmupSubmitRequest {
         application_id,
         chain: request.chain,
@@ -2178,48 +2135,6 @@ fn native_warmup_submit_request(
         range_kind: request.range_kind,
         start: request.start,
         end: request.end,
-        mode: request.mode,
-        chunk_policy: WarmupChunkPolicy {
-            max_range_len: request.chunk_policy.max_range_len.max(1),
-            target_rows_hint: request.chunk_policy.target_rows_hint,
-        },
-        retry_policy: WarmupRetryPolicy {
-            max_attempts: request.retry_policy.max_attempts.max(1),
-            initial_backoff_ms: request.retry_policy.initial_backoff_ms,
-            max_backoff_ms: request.retry_policy.max_backoff_ms,
-        },
-    })
-}
-
-fn legacy_warmup_submit_request(
-    application_id: String,
-    request: WarmupLegacyEvmLogsSubmitApiRequest,
-) -> Result<WarmupSubmitRequest, DatalensError> {
-    let selector = match request.dataset {
-        Dataset::Logs => {
-            let filter = request.filter.ok_or_else(|| {
-                DatalensError::new(
-                    DatalensErrorKind::InvalidInput,
-                    "logs warmup requires filter",
-                )
-            })?;
-            datalens_chain::DatasetSelector::try_evm_logs(filter)?
-        }
-        Dataset::Blocks | Dataset::Transactions | Dataset::Receipts => {
-            return Err(DatalensError::new(
-                DatalensErrorKind::UnsupportedDataset,
-                "legacy EVM warmup submit supports logs only",
-            ));
-        }
-    };
-    Ok(WarmupSubmitRequest {
-        application_id,
-        chain: request.chain,
-        dataset_key: DatasetKey::from(request.dataset),
-        selector,
-        range_kind: datalens_core::LedgerRangeKind::Block,
-        start: request.range.from_block,
-        end: Some(request.range.to_block),
         mode: request.mode,
         chunk_policy: WarmupChunkPolicy {
             max_range_len: request.chunk_policy.max_range_len.max(1),
