@@ -1,21 +1,18 @@
 //! Edge API boundary for datalens.
 
 pub mod auth;
-pub mod compatibility;
 pub mod config;
 pub mod contract;
 pub mod graphql;
 pub mod http;
-pub mod native;
 pub mod service;
-pub mod streaming;
 
 pub use contract::{
     discovery::{ChainDiscovery, DiscoveryResponse},
     error::{ApiErrorBody, ApiErrorDetail, api_error_body, api_error_status},
     query::{
-        CacheSummary, FieldSelectionApi, QueryApiRequest, QueryApiResponse, QueryCacheApi,
-        QueryRangeApi, QuerySegment, QuerySegmentApi, QuerySelectorApi,
+        FieldSelectionApi, QueryApiRequest, QueryApiResponse, QueryCacheApi, QueryRangeApi,
+        QuerySegmentApi, QuerySelectorApi,
     },
     warmup::{
         WarmupDatasetKeyApi, WarmupRunOnceApiResponse, WarmupSelectorApiRequest,
