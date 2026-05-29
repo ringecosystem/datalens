@@ -97,8 +97,16 @@ pub struct AdapterCapabilityRequirement {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FinalityPolicy {
-    DurableCache { boundary: ChainHeight },
-    HotReadThrough { latest: ChainHeight },
+    DurableCache {
+        boundary: ChainHeight,
+    },
+    HotReadThrough {
+        latest: ChainHeight,
+    },
+    MixedReadThrough {
+        durable_boundary: ChainHeight,
+        latest: ChainHeight,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -189,6 +197,23 @@ impl NativePlanner {
         durable_boundary: ChainHeight,
         covered_ranges: Vec<LedgerRange>,
     ) -> Result<NativeQueryPlan, DatalensError> {
+        self.plan_with_live_coverage(
+            input,
+            capabilities,
+            durable_boundary.clone(),
+            durable_boundary,
+            covered_ranges,
+        )
+    }
+
+    pub fn plan_with_live_coverage(
+        &self,
+        input: NativeQueryInput,
+        capabilities: &AdapterCapabilities,
+        durable_boundary: ChainHeight,
+        latest: ChainHeight,
+        covered_ranges: Vec<LedgerRange>,
+    ) -> Result<NativeQueryPlan, DatalensError> {
         if input.ledger_range.len() > u128::from(self.config.max_query_range_len) {
             return Err(DatalensError::new(
                 DatalensErrorKind::InvalidInput,
@@ -237,8 +262,8 @@ impl NativePlanner {
             .min(self.config.default_chunk_range_len)
             .max(1);
 
-        if input.finality.allows_hot() {
-            validate_hot_range(&input.ledger_range, &durable_boundary)?;
+        if matches!(input.finality, QueryFinalityRequirement::LatestOnly) {
+            validate_hot_range(&input.ledger_range, &latest)?;
             let ledger_range = input.ledger_range.clone();
             let fetch_tasks = input
                 .ledger_range
@@ -267,9 +292,7 @@ impl NativePlanner {
                     selector: selector_kind,
                     range_kind,
                 }],
-                finality_policy: FinalityPolicy::HotReadThrough {
-                    latest: durable_boundary,
-                },
+                finality_policy: FinalityPolicy::HotReadThrough { latest },
                 coverage: CoverageSummary {
                     status: QueryPlanStatus::Miss,
                     hit_ranges: Vec::new(),
@@ -278,9 +301,150 @@ impl NativePlanner {
                     hot_hit_ranges: Vec::new(),
                     provider_fill_ranges: Vec::new(),
                     promotion_pending_ranges: Vec::new(),
-                    segments: Vec::new(),
+                    segments: fetch_tasks
+                        .iter()
+                        .cloned()
+                        .map(|task| {
+                            QuerySegmentMetadata::new(
+                                task.range,
+                                QuerySegmentSource::Provider,
+                                QueryDataFinality::Latest,
+                            )
+                        })
+                        .collect(),
                 },
                 read_segments: Vec::new(),
+                fetch_tasks,
+            });
+        }
+
+        if matches!(input.finality, QueryFinalityRequirement::SafeToLatest) {
+            validate_hot_range(&input.ledger_range, &latest)?;
+            validate_durable_boundary(&input.ledger_range, &durable_boundary)?;
+
+            let durable_range = capped_range(
+                &input.ledger_range,
+                input.ledger_range.start(),
+                durable_boundary.value,
+            )?;
+            let hot_range = if input.ledger_range.end() > durable_boundary.value {
+                capped_range(
+                    &input.ledger_range,
+                    input
+                        .ledger_range
+                        .start()
+                        .max(durable_boundary.value.saturating_add(1)),
+                    input.ledger_range.end(),
+                )?
+            } else {
+                None
+            };
+
+            let hit_ranges = durable_range
+                .as_ref()
+                .map(|durable_range| {
+                    covered_ranges
+                        .into_iter()
+                        .filter_map(|range| range.intersection(durable_range))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let durable_miss_ranges = durable_range
+                .clone()
+                .map(|durable_range| missing_ranges(durable_range, &hit_ranges))
+                .unwrap_or_default();
+            let hot_ranges = hot_range.into_iter().collect::<Vec<_>>();
+            let miss_ranges = durable_miss_ranges
+                .iter()
+                .cloned()
+                .chain(hot_ranges.iter().cloned())
+                .collect::<Vec<_>>();
+            let status = match (hit_ranges.is_empty(), miss_ranges.is_empty()) {
+                (_, true) => QueryPlanStatus::FullHit,
+                (true, false) => QueryPlanStatus::Miss,
+                (false, false) => QueryPlanStatus::PartialHit,
+            };
+            let read_segments = hit_ranges
+                .iter()
+                .cloned()
+                .map(|range| DurableReadSegment { range })
+                .collect();
+            let durable_fetch_tasks = durable_miss_ranges
+                .iter()
+                .map(|range| range.split(max_len))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
+                .map(|range| DurableFetchTask {
+                    range,
+                    cache_write: true,
+                });
+            let hot_fetch_tasks = hot_ranges
+                .iter()
+                .map(|range| range.split(max_len))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
+                .map(|range| DurableFetchTask {
+                    range,
+                    cache_write: false,
+                });
+            let fetch_tasks = durable_fetch_tasks
+                .chain(hot_fetch_tasks)
+                .collect::<Vec<_>>();
+
+            let durable_finality = durable_query_finality(&durable_boundary);
+            let mut segments = hit_ranges
+                .iter()
+                .cloned()
+                .map(|range| {
+                    QuerySegmentMetadata::new(range, QuerySegmentSource::Durable, durable_finality)
+                })
+                .collect::<Vec<_>>();
+            segments.extend(fetch_tasks.iter().cloned().map(|task| {
+                QuerySegmentMetadata::new(
+                    task.range,
+                    QuerySegmentSource::Provider,
+                    if task.cache_write {
+                        durable_finality
+                    } else {
+                        QueryDataFinality::Latest
+                    },
+                )
+            }));
+
+            return Ok(NativeQueryPlan {
+                chain: input.chain,
+                dataset_key: input.dataset_key.clone(),
+                ledger_range: input.ledger_range,
+                selector: input.selector,
+                response_shape: input.response_shape,
+                field_selection: input.field_selection,
+                requested_finality: input.finality,
+                range_split: RangeSplitStrategy::MaxLedgerSpan {
+                    max_len,
+                    supports_adapter_split: dataset_capability.supports_range_split(),
+                },
+                capability_requirements: vec![AdapterCapabilityRequirement {
+                    dataset_key: input.dataset_key,
+                    selector: selector_kind,
+                    range_kind,
+                }],
+                finality_policy: FinalityPolicy::MixedReadThrough {
+                    durable_boundary,
+                    latest,
+                },
+                coverage: CoverageSummary {
+                    status,
+                    hit_ranges: hit_ranges.clone(),
+                    missing_ranges: miss_ranges,
+                    durable_hit_ranges: hit_ranges,
+                    hot_hit_ranges: Vec::new(),
+                    provider_fill_ranges: Vec::new(),
+                    promotion_pending_ranges: Vec::new(),
+                    segments,
+                },
+                read_segments,
                 fetch_tasks,
             });
         }
@@ -302,7 +466,7 @@ impl NativePlanner {
             .cloned()
             .map(|range| DurableReadSegment { range })
             .collect();
-        let fetch_tasks = miss_ranges
+        let fetch_tasks: Vec<DurableFetchTask> = miss_ranges
             .iter()
             .map(|range| range.split(max_len))
             .collect::<Result<Vec<_>, _>>()?
@@ -314,15 +478,15 @@ impl NativePlanner {
             })
             .collect();
 
-        let finality = match durable_boundary.finality {
-            datalens_chain::FinalityLevel::Finalized => QueryDataFinality::Finalized,
-            _ => QueryDataFinality::Safe,
-        };
-        let segments = hit_ranges
+        let finality = durable_query_finality(&durable_boundary);
+        let mut segments = hit_ranges
             .iter()
             .cloned()
             .map(|range| QuerySegmentMetadata::new(range, QuerySegmentSource::Durable, finality))
             .collect::<Vec<_>>();
+        segments.extend(fetch_tasks.iter().cloned().map(|task| {
+            QuerySegmentMetadata::new(task.range, QuerySegmentSource::Provider, finality)
+        }));
 
         Ok(NativeQueryPlan {
             chain: input.chain,
@@ -360,6 +524,30 @@ impl NativePlanner {
     }
 }
 
+fn capped_range(
+    range: &LedgerRange,
+    start: u64,
+    end: u64,
+) -> Result<Option<LedgerRange>, DatalensError> {
+    if start > range.end() || end < range.start() || start > end {
+        return Ok(None);
+    }
+    LedgerRange::try_new(range.kind(), start.max(range.start()), end.min(range.end())).map(Some)
+}
+
+fn validate_durable_boundary(
+    range: &LedgerRange,
+    durable_boundary: &ChainHeight,
+) -> Result<(), DatalensError> {
+    if range.kind() != durable_boundary.range_kind {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "range kind does not match adapter safe/finalized height kind",
+        ));
+    }
+    durable_boundary.validate_durable_cache_safe()
+}
+
 fn validate_hot_range(
     range: &LedgerRange,
     latest_height: &ChainHeight,
@@ -381,6 +569,13 @@ fn validate_hot_range(
         ));
     }
     Ok(())
+}
+
+fn durable_query_finality(boundary: &ChainHeight) -> QueryDataFinality {
+    match boundary.finality {
+        datalens_chain::FinalityLevel::Finalized => QueryDataFinality::Finalized,
+        _ => QueryDataFinality::Safe,
+    }
 }
 
 fn validate_selector_limits(

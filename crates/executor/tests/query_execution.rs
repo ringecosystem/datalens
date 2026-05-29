@@ -244,28 +244,30 @@ fn test_executor_writes_usage_ledger_for_miss_fill_and_empty_coverage() {
 }
 
 #[test]
-fn test_executor_hot_read_through_fetches_latest_without_durable_write() {
+fn test_executor_latest_only_fetches_latest_without_durable_read_or_write() {
     let root = temp_storage_root("executor-hot-read-through");
     let storage = LocalStorage::new(&root);
+    seed_blocks(&storage, 99, 99, vec![block(99, "0x63")]);
+    let counting_storage = CountingStorage::new(storage);
     let ledger = UsageLedgerStore::new(LocalObjectStore::new(&root));
     let source = MockSource::default().with_blocks(vec![block(100, "0x64")]);
-    let executor = executor(storage, source.clone())
+    let executor = executor(counting_storage.clone(), source.clone())
         .with_usage_ledger(ledger.clone(), ApplicationIdentity::named("analytics-api"));
-    let mut input = blocks_input(100, 100);
-    input.finality = QueryFinalityRequirement::SafeToLatest;
+    let mut input = blocks_input(99, 100);
+    input.finality = QueryFinalityRequirement::LatestOnly;
 
     let result = executor.execute(input).expect("hot read-through succeeds");
 
     assert_eq!(block_numbers(&result.rows), vec![100]);
     assert_eq!(
         result.cache.missing_ranges,
-        vec![LedgerRange::blocks(100, 100).expect("valid range")]
+        vec![LedgerRange::blocks(99, 100).expect("valid range")]
     );
     assert_eq!(result.cache.durable_hit_ranges, Vec::<LedgerRange>::new());
     assert_eq!(result.cache.hot_hit_ranges, Vec::<LedgerRange>::new());
     assert_eq!(
         result.cache.provider_fill_ranges,
-        vec![LedgerRange::blocks(100, 100).expect("valid range")]
+        vec![LedgerRange::blocks(99, 100).expect("valid range")]
     );
     assert_eq!(result.cache.segments.len(), 1);
     assert_eq!(
@@ -275,9 +277,10 @@ fn test_executor_hot_read_through_fetches_latest_without_durable_write() {
     assert_eq!(result.cache.segments[0].finality, QueryDataFinality::Latest);
     assert_eq!(
         source.calls(),
-        vec![SourceCall::Blocks(BlockRange::expect_new(100, 100))]
+        vec![SourceCall::Blocks(BlockRange::expect_new(99, 100))]
     );
-    assert!(!root.join("chains/evm/ethereum/1/manifest.json").exists());
+    assert_eq!(counting_storage.read_ranges(), Vec::<LedgerRange>::new());
+    assert!(root.join("chains/evm/ethereum/1/manifest.json").exists());
 
     let events = ledger
         .read_application("analytics-api")
@@ -291,6 +294,87 @@ fn test_executor_hot_read_through_fetches_latest_without_durable_write() {
         events[0].durable_write_outcome,
         datalens_storage::DurableWriteOutcome::NotAttempted
     );
+}
+
+#[test]
+fn test_executor_safe_to_latest_reads_durable_cache_and_fetches_hot_tail() {
+    let root = temp_storage_root("executor-safe-to-latest-mixed");
+    let storage = LocalStorage::new(&root);
+    seed_blocks(&storage, 1, 2, vec![block(1, "0x01"), block(2, "0x02")]);
+    let ledger = UsageLedgerStore::new(LocalObjectStore::new(&root));
+    let source = MockSource::default()
+        .with_safe_height(3)
+        .with_latest_height(4)
+        .with_blocks(vec![block(3, "0x03"), block(4, "0x04")]);
+    let executor = executor(storage.clone(), source.clone())
+        .with_usage_ledger(ledger.clone(), ApplicationIdentity::named("analytics-api"));
+    let mut input = blocks_input(1, 4);
+    input.finality = QueryFinalityRequirement::SafeToLatest;
+
+    let result = executor.execute(input).expect("mixed query succeeds");
+
+    assert_eq!(block_numbers(&result.rows), vec![1, 2, 3, 4]);
+    assert_eq!(
+        result.cache.durable_hit_ranges,
+        vec![LedgerRange::blocks(1, 2).expect("valid range")]
+    );
+    assert_eq!(
+        result.cache.missing_ranges,
+        vec![
+            LedgerRange::blocks(3, 3).expect("valid range"),
+            LedgerRange::blocks(4, 4).expect("valid range"),
+        ]
+    );
+    assert_eq!(
+        result.cache.provider_fill_ranges,
+        vec![
+            LedgerRange::blocks(3, 3).expect("valid range"),
+            LedgerRange::blocks(4, 4).expect("valid range"),
+        ]
+    );
+    assert_eq!(result.cache.segments.len(), 3);
+    assert_eq!(result.cache.segments[0].source, QuerySegmentSource::Durable);
+    assert_eq!(result.cache.segments[0].finality, QueryDataFinality::Safe);
+    assert_eq!(
+        result.cache.segments[1].source,
+        QuerySegmentSource::Provider
+    );
+    assert_eq!(result.cache.segments[1].finality, QueryDataFinality::Safe);
+    assert_eq!(
+        result.cache.segments[2].source,
+        QuerySegmentSource::Provider
+    );
+    assert_eq!(result.cache.segments[2].finality, QueryDataFinality::Latest);
+    assert_eq!(
+        source.calls(),
+        vec![
+            SourceCall::Blocks(BlockRange::expect_new(3, 3)),
+            SourceCall::Blocks(BlockRange::expect_new(4, 4)),
+        ]
+    );
+
+    let second = executor
+        .execute(blocks_input(3, 3))
+        .expect("safe gap was durable-written");
+    assert_eq!(block_numbers(&second.rows), vec![3]);
+    assert_eq!(
+        storage
+            .covered_ranges(
+                &ethereum_identity(),
+                &DatasetKey::evm_blocks(),
+                &DatasetSelector::all(),
+                LedgerRange::blocks(4, 4).expect("valid range"),
+            )
+            .expect("covered ranges"),
+        Vec::<LedgerRange>::new()
+    );
+
+    let events = ledger
+        .read_application("analytics-api")
+        .expect("read application usage");
+    assert_eq!(events[0].query_outcome, QueryOutcome::Mixed);
+    assert_eq!(events[0].cache_outcome, CacheOutcome::Mixed);
+    assert_eq!(events[0].fill_outcome, FillOutcome::LiveFetch);
 }
 
 #[test]
@@ -927,6 +1011,8 @@ enum SourceCall {
 struct MockSource {
     blocks: Arc<Mutex<Vec<BlockHeader>>>,
     calls: Arc<Mutex<Vec<SourceCall>>>,
+    latest_height: Arc<Mutex<u64>>,
+    safe_height: Arc<Mutex<u64>>,
     response_mutation: Arc<Mutex<Option<ResponseMutation>>>,
     safe_height_error: Arc<Mutex<Option<DatalensErrorKind>>>,
     error: Arc<Mutex<Option<DatalensErrorKind>>>,
@@ -937,6 +1023,8 @@ impl Default for MockSource {
         Self {
             blocks: Arc::new(Mutex::new(Vec::new())),
             calls: Arc::new(Mutex::new(Vec::new())),
+            latest_height: Arc::new(Mutex::new(100)),
+            safe_height: Arc::new(Mutex::new(100)),
             response_mutation: Arc::new(Mutex::new(None)),
             safe_height_error: Arc::new(Mutex::new(None)),
             error: Arc::new(Mutex::new(None)),
@@ -955,6 +1043,16 @@ impl MockSource {
             .response_mutation
             .lock()
             .expect("response mutation lock") = Some(mutation);
+        self
+    }
+
+    fn with_latest_height(self, height: u64) -> Self {
+        *self.latest_height.lock().expect("latest height lock") = height;
+        self
+    }
+
+    fn with_safe_height(self, height: u64) -> Self {
+        *self.safe_height.lock().expect("safe height lock") = height;
         self
     }
 
@@ -1000,7 +1098,9 @@ impl ChainAdapter for MockSource {
     }
 
     fn latest_height(&self) -> Result<ChainHeight, DatalensError> {
-        Ok(ChainHeight::block(100))
+        Ok(ChainHeight::block(
+            *self.latest_height.lock().expect("latest height lock"),
+        ))
     }
 
     fn cache_safe_height(&self) -> Result<ChainHeight, DatalensError> {
@@ -1012,7 +1112,10 @@ impl ChainAdapter for MockSource {
         {
             return Err(DatalensError::new(kind, "injected safe height failure"));
         }
-        Ok(ChainHeight::block(100).with_finality(FinalityKind::Safe))
+        Ok(
+            ChainHeight::block(*self.safe_height.lock().expect("safe height lock"))
+                .with_finality(FinalityKind::Safe),
+        )
     }
 
     fn fetch(&self, request: ChainFetchRequest) -> Result<ChainFetchResponse, DatalensError> {
