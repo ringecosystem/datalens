@@ -9,8 +9,8 @@ use datalens_chain::{
 };
 use datalens_core::{
     BlockHeader, BlockRange, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, Dataset,
-    DatasetKey, DatasetRows, LedgerRange, LogFilter, NetworkId, QueryFinalityRequirement,
-    QueryRows,
+    DatasetKey, DatasetRows, LedgerRange, LogFilter, NetworkId, QueryDataFinality,
+    QueryFinalityRequirement, QueryRows, QuerySegmentSource,
 };
 use datalens_executor::{NativeQueryExecutionConfig, NativeQueryExecutor};
 use datalens_metrics::{ApplicationIdentity, MetricsRecorder};
@@ -241,6 +241,56 @@ fn test_executor_writes_usage_ledger_for_miss_fill_and_empty_coverage() {
         datalens_storage::DurableWriteOutcome::Flushed
     );
     assert_eq!(events[0].row_count, 1);
+}
+
+#[test]
+fn test_executor_hot_read_through_fetches_latest_without_durable_write() {
+    let root = temp_storage_root("executor-hot-read-through");
+    let storage = LocalStorage::new(&root);
+    let ledger = UsageLedgerStore::new(LocalObjectStore::new(&root));
+    let source = MockSource::default().with_blocks(vec![block(100, "0x64")]);
+    let executor = executor(storage, source.clone())
+        .with_usage_ledger(ledger.clone(), ApplicationIdentity::named("analytics-api"));
+    let mut input = blocks_input(100, 100);
+    input.finality = QueryFinalityRequirement::SafeToLatest;
+
+    let result = executor.execute(input).expect("hot read-through succeeds");
+
+    assert_eq!(block_numbers(&result.rows), vec![100]);
+    assert_eq!(
+        result.cache.missing_ranges,
+        vec![LedgerRange::blocks(100, 100).expect("valid range")]
+    );
+    assert_eq!(result.cache.durable_hit_ranges, Vec::<LedgerRange>::new());
+    assert_eq!(result.cache.hot_hit_ranges, Vec::<LedgerRange>::new());
+    assert_eq!(
+        result.cache.provider_fill_ranges,
+        vec![LedgerRange::blocks(100, 100).expect("valid range")]
+    );
+    assert_eq!(result.cache.segments.len(), 1);
+    assert_eq!(
+        result.cache.segments[0].source,
+        QuerySegmentSource::Provider
+    );
+    assert_eq!(result.cache.segments[0].finality, QueryDataFinality::Latest);
+    assert_eq!(
+        source.calls(),
+        vec![SourceCall::Blocks(BlockRange::expect_new(100, 100))]
+    );
+    assert!(!root.join("chains/evm/ethereum/1/manifest.json").exists());
+
+    let events = ledger
+        .read_application("analytics-api")
+        .expect("read application usage");
+    assert_eq!(events.len(), 1);
+    assert!(events[0].requested_hot);
+    assert_eq!(events[0].query_outcome, QueryOutcome::HotMiss);
+    assert_eq!(events[0].cache_outcome, CacheOutcome::HotMiss);
+    assert_eq!(events[0].fill_outcome, FillOutcome::LiveFetch);
+    assert_eq!(
+        events[0].durable_write_outcome,
+        datalens_storage::DurableWriteOutcome::NotAttempted
+    );
 }
 
 #[test]

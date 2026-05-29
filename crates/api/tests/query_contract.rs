@@ -145,18 +145,40 @@ fn test_legacy_request_maps_explicit_hot_contract_to_native_input() {
 }
 
 #[test]
-fn test_query_service_returns_stable_unsupported_hot_query_error_without_fetch_or_cache_write() {
-    let root = temp_storage_root("unsupported-hot-query");
+fn test_query_service_supports_explicit_hot_read_through_without_durable_cache_write() {
+    let root = temp_storage_root("hot-read-through");
     let source = MockSource::default().with_blocks(vec![block(100, "0x64")]);
     let service = service(LocalStorage::new(&root), source.clone());
     let mut request = blocks_request(100, 100);
     request.allow_hot = true;
     request.finality = QueryFinalityRequirement::SafeToLatest;
 
-    let error = service.query(request).expect_err("hot query unsupported");
+    let response = service.query(request).expect("hot query succeeds");
 
-    assert_eq!(error.kind, DatalensErrorKind::UnsupportedHotQuery);
-    assert_eq!(source.calls(), Vec::<SourceCall>::new());
+    assert_eq!(
+        response.cache.provider_fill_ranges,
+        vec![BlockRange::expect_new(100, 100)]
+    );
+    assert_eq!(
+        response.cache.missing_ranges,
+        vec![BlockRange::expect_new(100, 100)]
+    );
+    assert_eq!(response.cache.durable_hit_ranges, Vec::<BlockRange>::new());
+    assert_eq!(response.cache.hot_hit_ranges, Vec::<BlockRange>::new());
+    assert_eq!(response.cache.segments.len(), 1);
+    assert_eq!(
+        response.cache.segments[0].source,
+        QuerySegmentSource::Provider
+    );
+    assert_eq!(
+        response.cache.segments[0].finality,
+        QueryDataFinality::Latest
+    );
+    assert_eq!(query_row_block_numbers(&response.rows), vec![100]);
+    assert_eq!(
+        source.calls(),
+        vec![SourceCall::Blocks(BlockRange::expect_new(100, 100))]
+    );
     assert!(!root.join("chains/evm/ethereum/1/manifest.json").exists());
     assert!(!root.join("chains/evm/ethereum/1/datasets").exists());
 }

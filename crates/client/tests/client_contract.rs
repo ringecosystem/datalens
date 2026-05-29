@@ -52,17 +52,29 @@ fn test_query_blocks_serializes_api_request_and_application_header() {
 #[test]
 fn test_query_blocks_with_hot_options_serializes_explicit_hot_contract() {
     let transport = RecordingTransport::new(HttpResponse::json(
-        422,
+        200,
         serde_json::json!({
-            "error": {
-                "kind": "unsupported_hot_query",
-                "message": "hot query is not supported"
-            }
+            "chain": ethereum_identity(),
+            "range": { "from_block": 100, "to_block": 101 },
+            "cache": {
+                "hit_ranges": [],
+                "missing_ranges": [{ "from_block": 100, "to_block": 101 }],
+                "durable_hit_ranges": [],
+                "hot_hit_ranges": [],
+                "provider_fill_ranges": [{ "from_block": 100, "to_block": 101 }],
+                "promotion_pending_ranges": [],
+                "segments": [{
+                    "range": { "from_block": 100, "to_block": 101 },
+                    "source": "provider",
+                    "finality": "latest"
+                }]
+            },
+            "rows": { "dataset": "blocks", "rows": [] }
         }),
     ));
     let client = client(transport.clone(), Some("wallet-search"));
 
-    let error = client
+    let response = client
         .query_blocks_with_options(
             ethereum_identity(),
             BlockRange::expect_new(100, 101),
@@ -71,9 +83,20 @@ fn test_query_blocks_with_hot_options_serializes_explicit_hot_contract() {
                 finality: QueryFinalityRequirement::SafeToLatest,
             },
         )
-        .expect_err("hot query is unsupported by this server");
+        .expect("hot query decodes");
 
-    assert_eq!(error.api_kind(), Some(ApiErrorKind::UnsupportedHotQuery));
+    assert_eq!(
+        response.cache.provider_fill_ranges,
+        vec![BlockRange::expect_new(100, 101)]
+    );
+    assert_eq!(
+        response.cache.segments[0].source,
+        QuerySegmentSource::Provider
+    );
+    assert_eq!(
+        response.cache.segments[0].finality,
+        QueryDataFinality::Latest
+    );
     let request = transport.only_request();
     assert_eq!(
         request.body,

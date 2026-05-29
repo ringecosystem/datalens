@@ -98,6 +98,7 @@ pub struct AdapterCapabilityRequirement {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FinalityPolicy {
     DurableCache { boundary: ChainHeight },
+    HotReadThrough { latest: ChainHeight },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -194,13 +195,6 @@ impl NativePlanner {
                 "query range exceeds planner.max_query_range_blocks",
             ));
         }
-        if input.finality.allows_hot() {
-            return Err(DatalensError::unsupported_hot_query(
-                "hot query is not supported by this datalens API",
-            ));
-        }
-        validate_durable_range(&input.ledger_range, &durable_boundary)?;
-
         if capabilities.chain() != &input.chain {
             return Err(DatalensError::new(
                 DatalensErrorKind::UnsupportedDataset,
@@ -242,6 +236,56 @@ impl NativePlanner {
             .unwrap_or(u64::MAX)
             .min(self.config.default_chunk_range_len)
             .max(1);
+
+        if input.finality.allows_hot() {
+            validate_hot_range(&input.ledger_range, &durable_boundary)?;
+            let ledger_range = input.ledger_range.clone();
+            let fetch_tasks = input
+                .ledger_range
+                .split(max_len)?
+                .into_iter()
+                .map(|range| DurableFetchTask {
+                    range,
+                    cache_write: false,
+                })
+                .collect::<Vec<_>>();
+
+            return Ok(NativeQueryPlan {
+                chain: input.chain,
+                dataset_key: input.dataset_key.clone(),
+                ledger_range: input.ledger_range.clone(),
+                selector: input.selector,
+                response_shape: input.response_shape,
+                field_selection: input.field_selection,
+                requested_finality: input.finality,
+                range_split: RangeSplitStrategy::MaxLedgerSpan {
+                    max_len,
+                    supports_adapter_split: dataset_capability.supports_range_split(),
+                },
+                capability_requirements: vec![AdapterCapabilityRequirement {
+                    dataset_key: input.dataset_key,
+                    selector: selector_kind,
+                    range_kind,
+                }],
+                finality_policy: FinalityPolicy::HotReadThrough {
+                    latest: durable_boundary,
+                },
+                coverage: CoverageSummary {
+                    status: QueryPlanStatus::Miss,
+                    hit_ranges: Vec::new(),
+                    missing_ranges: vec![ledger_range],
+                    durable_hit_ranges: Vec::new(),
+                    hot_hit_ranges: Vec::new(),
+                    provider_fill_ranges: Vec::new(),
+                    promotion_pending_ranges: Vec::new(),
+                    segments: Vec::new(),
+                },
+                read_segments: Vec::new(),
+                fetch_tasks,
+            });
+        }
+
+        validate_durable_range(&input.ledger_range, &durable_boundary)?;
 
         let hit_ranges = covered_ranges
             .into_iter()
@@ -314,6 +358,29 @@ impl NativePlanner {
             fetch_tasks,
         })
     }
+}
+
+fn validate_hot_range(
+    range: &LedgerRange,
+    latest_height: &ChainHeight,
+) -> Result<(), DatalensError> {
+    if range.kind() != latest_height.range_kind {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "range kind does not match adapter latest height kind",
+        ));
+    }
+    if range.end() > latest_height.value {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            format!(
+                "range exceeds adapter latest height: requested end {}, latest height {}",
+                range.end(),
+                latest_height.value
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_selector_limits(

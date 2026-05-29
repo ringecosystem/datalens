@@ -432,9 +432,12 @@ where
     ) -> Result<NativeQueryExecutionResult, DatalensError> {
         let start = Instant::now();
         let labels = self.metrics_labels(&input, application.clone());
-        let ledger_application = self.ledger_application(application);
+        let ledger_application = self.ledger_application(application.clone());
         if let Some((recorder, labels)) = self.metrics_recorder(&labels) {
             recorder.set_latest_requested_block(labels, input.ledger_range.end());
+        }
+        if input.finality.allows_hot() {
+            return self.execute_hot_read_through(input, application, start, labels);
         }
 
         let covered_ranges = match self.storage.covered_ranges(
@@ -561,6 +564,7 @@ where
 
         let finality_level = match &plan.finality_policy {
             FinalityPolicy::DurableCache { boundary } => boundary.finality,
+            FinalityPolicy::HotReadThrough { latest } => latest.finality,
         };
         let mut fetched_segments = Vec::new();
         let mut fill_row_count = 0usize;
@@ -728,6 +732,160 @@ where
         Ok(result)
     }
 
+    fn execute_hot_read_through(
+        &self,
+        input: NativeQueryInput,
+        application: Option<ApplicationIdentity>,
+        start: Instant,
+        labels: Option<MetricsLabels>,
+    ) -> Result<NativeQueryExecutionResult, DatalensError> {
+        let ledger_application = self.ledger_application(application);
+        let latest = match self.source.latest_height() {
+            Ok(latest) => latest,
+            Err(error) => {
+                self.record_error(&labels, &error);
+                self.record_cache_coverage(&labels, CacheCoverageOutcome::Error);
+                self.record_query(&labels, QueryOutcome::Error, start);
+                self.record_usage(
+                    &ledger_application,
+                    &input,
+                    FinalityLevel::Latest,
+                    ledger_query_error(&error),
+                    LedgerCacheOutcome::Error,
+                    LedgerFillOutcome::NotAttempted,
+                    LedgerDurableWriteOutcome::NotAttempted,
+                    0,
+                )?;
+                return Err(error);
+            }
+        };
+        let plan = match self.planner.plan_with_coverage(
+            input.clone(),
+            &self.source.capabilities(),
+            latest,
+            Vec::new(),
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.record_query(&labels, QueryOutcome::Error, start);
+                self.record_usage(
+                    &ledger_application,
+                    &input,
+                    FinalityLevel::Latest,
+                    LedgerQueryOutcome::Error,
+                    LedgerCacheOutcome::HotMiss,
+                    LedgerFillOutcome::NotAttempted,
+                    LedgerDurableWriteOutcome::NotAttempted,
+                    0,
+                )?;
+                return Err(error);
+            }
+        };
+
+        self.record_cache_coverage(&labels, CacheCoverageOutcome::HotMiss);
+        let fill_start = Instant::now();
+        let mut rows = empty_query_rows(&plan.dataset_key);
+        for task in &plan.fetch_tasks {
+            let fetch_request = ChainFetchRequest::new(
+                plan.chain.clone(),
+                plan.dataset_key.clone(),
+                task.range.clone(),
+                plan.selector.clone(),
+            )
+            .with_context(FetchContext {
+                request_id: None,
+                cache_write: false,
+            });
+            let fetched = match self.source.fetch(fetch_request.clone()) {
+                Ok(response) => {
+                    if let Err(error) = response.validate_for_request(&fetch_request) {
+                        self.record_fill(&labels, FillOutcome::Error, fill_start);
+                        self.record_query(&labels, QueryOutcome::Error, start);
+                        self.record_usage_for_plan(
+                            &ledger_application,
+                            &plan,
+                            LedgerQueryOutcome::Error,
+                            LedgerCacheOutcome::HotMiss,
+                            LedgerFillOutcome::Error,
+                            LedgerDurableWriteOutcome::NotAttempted,
+                            rows.row_count(),
+                        )?;
+                        return Err(error);
+                    }
+                    response.rows
+                }
+                Err(error) => {
+                    self.record_error(&labels, &error);
+                    self.record_fill(&labels, FillOutcome::Error, fill_start);
+                    self.record_query(&labels, QueryOutcome::Error, start);
+                    self.record_usage_for_plan(
+                        &ledger_application,
+                        &plan,
+                        ledger_query_error(&error),
+                        LedgerCacheOutcome::HotMiss,
+                        ledger_fill_error(&error),
+                        LedgerDurableWriteOutcome::NotAttempted,
+                        rows.row_count(),
+                    )?;
+                    return Err(error);
+                }
+            };
+            if let Err(error) = rows.try_append(fetched.into_rows()) {
+                self.record_fill(&labels, FillOutcome::Error, fill_start);
+                self.record_query(&labels, QueryOutcome::Error, start);
+                self.record_usage_for_plan(
+                    &ledger_application,
+                    &plan,
+                    LedgerQueryOutcome::Error,
+                    LedgerCacheOutcome::HotMiss,
+                    LedgerFillOutcome::Error,
+                    LedgerDurableWriteOutcome::NotAttempted,
+                    rows.row_count(),
+                )?;
+                return Err(error);
+            }
+        }
+
+        self.record_fill(&labels, FillOutcome::LiveFetch, fill_start);
+        if let Some((recorder, labels)) = self.metrics_recorder(&labels) {
+            recorder.set_latest_filled_block(labels, plan.ledger_range.end());
+        }
+
+        rows.sort();
+        let mut cache = plan.coverage.clone();
+        cache.provider_fill_ranges = plan
+            .fetch_tasks
+            .iter()
+            .map(|task| task.range.clone())
+            .collect();
+        cache.segments.extend(plan.fetch_tasks.iter().map(|task| {
+            QuerySegmentMetadata::new(
+                task.range.clone(),
+                QuerySegmentSource::Provider,
+                QueryDataFinality::Latest,
+            )
+        }));
+
+        let result = NativeQueryExecutionResult {
+            chain: plan.chain.clone(),
+            dataset_key: plan.dataset_key.clone(),
+            ledger_range: plan.ledger_range.clone(),
+            cache,
+            rows: DatasetRows::new(plan.dataset_key.clone(), rows)?,
+        };
+        self.record_query(&labels, QueryOutcome::HotMiss, start);
+        self.record_usage_for_plan(
+            &ledger_application,
+            &plan,
+            LedgerQueryOutcome::HotMiss,
+            LedgerCacheOutcome::HotMiss,
+            LedgerFillOutcome::LiveFetch,
+            LedgerDurableWriteOutcome::NotAttempted,
+            result.rows.row_count(),
+        )?;
+        Ok(result)
+    }
+
     fn ledger_application(
         &self,
         application: Option<ApplicationIdentity>,
@@ -865,6 +1023,7 @@ where
             },
             match &plan.finality_policy {
                 FinalityPolicy::DurableCache { boundary } => boundary.finality,
+                FinalityPolicy::HotReadThrough { latest } => latest.finality,
             },
             query_outcome,
             cache_outcome,
