@@ -5,15 +5,17 @@ control the internal architecture.
 
 ## Native Service API
 
-The native API is the primary service contract. It should expose datalens concepts rather
-than copying another gateway's schema:
+The native edge query is the product contract. It exposes datalens concepts rather than
+copying another gateway's schema:
 
-- Chain kind and chain name.
-- Dataset selection.
-- Range selection.
-- Filters and predicates.
-- Field selection.
-- Safe/finalized height policy.
+- `chain`: `ChainIdentity`, including chain family, configured chain name, and optional
+  network id.
+- `dataset_key`: chain-qualified native dataset key such as `evm.blocks`,
+  `solana.slots`, or `tron.blocks`.
+- `selector`: dataset selector such as `all`, `evm_logs`, or an adapter-native selector.
+- `range`: typed ledger range such as block, slot, or height with inclusive start/end.
+- `finality`: `QueryFinalityRequirement`.
+- `fields`: `all` or an include list.
 - Optional metadata about cache hit, partial hit, or fill behavior.
 
 The native API should map cleanly onto the planner. It should not require API handlers to
@@ -70,12 +72,13 @@ Production dependencies:
 The client crate must not depend on executor, storage, writer, or API server runtime
 construction crates.
 
-The default client behavior is service-client only:
+The default client behavior is service-client only and uses the same native request shape
+as the edge:
 
 - `DatalensClient::query_blocks` sends a JSON request to `POST /v1/query` with
-  `dataset: "blocks"`.
+  `dataset_key: "evm.blocks"` and `selector: { "kind": "all" }`.
 - `DatalensClient::query_logs` sends a JSON request to `POST /v1/query` with
-  `dataset: "logs"`.
+  `dataset_key: "evm.logs"` and `selector: { "kind": "evm_logs", ... }`.
 - `DatalensClient::discover` reads `GET /v1/discovery`.
 - The client must not call executor, storage, writer, chain adapters, or RPC providers
   directly.
@@ -95,25 +98,34 @@ scalars where that preserves the native shape for GraphQL clients.
   - `family` is the chain family, such as `Evm`.
   - `configured_name` is the configured service chain name, such as `ethereum`.
   - `network_id` identifies the upstream network when available.
-- `dataset`: `blocks` or `logs`.
-- `range`: inclusive `from_block` and `to_block`.
-- `filter`: required for `logs`, absent or `null` for `blocks`.
-- `include_block`: retained as a compatibility field; first-version client requests use
-  `false`.
-- `allow_hot`: explicit hot/latest gate. The default is `false`.
-- `finality`: requested query contract. The default is `durable_only`.
+- `dataset_key`: native dataset key in `family.name` form.
+- `selector`: dataset selector.
+  - `{ "kind": "all" }` selects whole-range datasets.
+  - `{ "kind": "evm_logs", "value": { ... } }` selects EVM logs by address/topic
+    filter.
+  - `{ "kind": "other", "value": { "kind": "...", "fingerprint": "...",
+    "canonical_key": "..." } }` carries adapter-native selectors without changing the
+    core contract.
+- `range`: inclusive typed ledger range.
+  - `{ "kind": "block", "start": 1, "end": 2 }`.
+  - `{ "kind": "slot", "start": 1, "end": 2 }`.
+  - `{ "kind": "height", "start": 1, "end": 2 }`.
+- `finality`: requested `QueryFinalityRequirement`. The default is `durable_only`.
   - `durable_only`: query only durable safe/finalized cache and durable provider fill.
   - `safe_to_latest`: caller accepts mixed durable, hot, and provider latest segments.
   - `latest_only`: caller accepts only latest-capable hot/provider behavior.
+- `fields`: requested `FieldSelection`. The default is `all`; include lists use
+  `{ "include": ["field_name"] }`.
 
-Hot/latest behavior is never implicit. `safe_to_latest` and `latest_only` require
-`allow_hot: true`; otherwise the server returns `invalid_input`. `safe_to_latest` splits
-safe/finalized durable coverage from the latest-capable tail where the adapter can serve
-it. `latest_only` uses the live provider read-through path and does not read from or
-write to durable cache. If an adapter cannot safely serve the requested hot/latest
-contract, the server returns `unsupported_hot_query` before durable cache write.
+Hot/latest behavior is never implicit and has no separate transport gate.
+`QueryFinalityRequirement` is the gate: `durable_only` stays on the durable
+safe/finalized path, `safe_to_latest` splits safe/finalized durable coverage from the
+latest-capable tail where the adapter can serve it, and `latest_only` uses the live
+provider read-through path without reading from or writing to durable cache. If an
+adapter cannot safely serve the requested hot/latest contract, the server returns
+`unsupported_hot_query` before durable cache write.
 
-Logs filter fields:
+EVM logs selector value fields:
 
 - `addresses`: empty means any address.
 - `topics`: ordered topic positions.
@@ -124,6 +136,7 @@ Logs filter fields:
 `POST /v1/query` response fields:
 
 - `chain`: the resolved `ChainIdentity`.
+- `dataset_key`: the native dataset key.
 - `range`: the inclusive requested block range.
 - `cache.hit_ranges`: inclusive block ranges served from durable cache.
 - `cache.missing_ranges`: inclusive block ranges not served from durable cache.
@@ -182,9 +195,9 @@ Rules:
 - If the header is absent, the server uses its configured default metrics application.
 - Application identity is request metadata. It must not alter durable cache keys or
   object layout.
-- Application authentication, authorization, range quota, and hot-specific range quota
-  apply before hot query planning, hot cache access, provider fetch, or durable cache
-  write.
+- Application authentication, authorization, range quota, and finality-specific range
+  quota apply before hot query planning, hot cache access, provider fetch, or durable
+  cache write.
 - Usage ledger entries record whether the caller requested hot/latest data.
 
 ## Fallback Boundary
@@ -203,11 +216,12 @@ The fallback boundary is explicit:
 - Service-side hot/latest read-through and any future client-side RPC fallback must
   remain isolated from durable safe/finalized cache writes.
 
-## Compatibility Adapters
+## Future Compatibility Adapter Surface
 
-Compatibility adapters should be edge adapters. SQD Gateway-compatible behavior can be
-implemented later by translating incoming SQD-shaped requests into native datalens
-requests, then reshaping native responses into the expected compatibility response.
+Compatibility adapters are future edge adapters, not current API architecture.
+SQD Gateway-compatible behavior can be implemented later by translating incoming
+SQD-shaped requests into native datalens requests, then mapping native responses into the
+external protocol's response shape at the edge.
 
 Compatibility must not define:
 
@@ -216,6 +230,7 @@ Compatibility must not define:
 - Chunk storage format.
 - Chain adapter interfaces.
 - Planner behavior.
+- Current SDK behavior.
 
 This separation lets datalens serve multiple caller types without storing the same
 historical data in many caller-specific formats.
