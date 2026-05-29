@@ -74,6 +74,9 @@ pub struct WarmupRunResult {
 }
 
 #[derive(Clone)]
+/// Warmup runtime that pre-fills safe/finalized durable coverage for submitted
+/// application-owned tasks. It skips manifest-covered ranges, fetches only
+/// missing gaps, and records cursor progress after durable write success.
 pub struct WarmupRuntime<A, S, R> {
     adapter: A,
     storage: S,
@@ -85,6 +88,8 @@ pub struct WarmupRuntime<A, S, R> {
 }
 
 #[derive(Clone)]
+/// Scheduler facade that limits concurrent warmup work globally and per chain.
+/// The pool owns task selection; the runtime owns fetch/write/cursor semantics.
 pub struct WarmupTaskPool<A, S, R> {
     runtime: WarmupRuntime<A, S, R>,
     config: WarmupSchedulerConfig,
@@ -269,6 +274,9 @@ where
             )?;
             let missing = missing_ranges(chunk.clone(), &covered);
             if missing.is_empty() {
+                // Cursor progress follows manifest coverage here: if the chunk
+                // is already covered, advancing the cursor records skipped work
+                // without creating new durable authority.
                 cursor.mark_committed(chunk.clone(), unix_seconds_now()?);
                 self.registry.save_cursor(&cursor)?;
                 next = cursor.next;
@@ -321,6 +329,9 @@ where
                     WarmupWriteOutcome::Written
                 },
             );
+            // Commit the cursor only after the durable writer accepts the
+            // segment. If staging is enabled, the final shutdown flush below
+            // makes staged rows visible before the task leaves this run.
             cursor.mark_committed(chunk.clone(), unix_seconds_now()?);
             self.registry.save_cursor(&cursor)?;
             self.append_usage(&task, &chunk, safe_height.finality, rows_fetched)?;
@@ -447,6 +458,8 @@ where
         error: &DatalensError,
     ) -> Result<(), DatalensError> {
         let now = unix_seconds_now()?;
+        // Failure cursors point back at the failed range so retry/repair modes
+        // restart from the first uncommitted gap rather than from the next chunk.
         cursor.mark_failure(
             range,
             cursor.current_attempt.saturating_add(1),

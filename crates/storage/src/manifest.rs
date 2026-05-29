@@ -5,6 +5,9 @@ use serde::{Deserialize, Deserializer, Serialize, de::Error};
 use crate::{ObjectEncoding, range_kind_key, validate_object_key};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+/// Durable coverage authority for one or more chains. Query planners and
+/// warmup/index runtimes use manifest entries, not cursors or usage records, to
+/// decide whether a range is durably covered.
 pub struct Manifest {
     #[serde(default)]
     pub entries: Vec<ManifestEntry>,
@@ -53,6 +56,9 @@ impl Manifest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+/// One logical durable coverage record. Entries with no object key represent
+/// provider-confirmed empty coverage; entries with an object key must carry full
+/// object metadata so reads can validate stored bytes.
 pub struct ManifestEntry {
     pub chain: ChainIdentity,
     pub dataset_key: DatasetKey,
@@ -191,6 +197,9 @@ fn required_data_object_metadata<T>(value: Option<T>, field: &str) -> Result<T, 
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Finality levels permitted in durable manifest coverage. Latest and
+/// chain-specific finality values are rejected before a manifest entry can be
+/// written.
 pub enum ManifestFinalityLevel {
     Safe,
     Finalized,

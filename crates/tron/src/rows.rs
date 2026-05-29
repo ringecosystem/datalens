@@ -214,6 +214,8 @@ where
                 let mut pages = 0;
                 let mut seen_fingerprints = HashSet::new();
                 loop {
+                    // Pagination is capped and fingerprint loops are rejected so
+                    // a TronGrid query cannot run forever or duplicate coverage.
                     let page = self
                         .provider
                         .get_contract_events(TronContractEventRequest {
@@ -291,6 +293,8 @@ fn contract_event_row(event: TronContractEvent) -> Value {
 }
 
 pub(crate) fn should_fallback_from_contract_events(error: &DatalensError) -> bool {
+    // Do not fallback on arbitrary provider failures: only errors that still
+    // allow an equivalent finalized block scan should leave the optimized path.
     match error.kind {
         DatalensErrorKind::AuthenticationFailed
         | DatalensErrorKind::Unauthorized

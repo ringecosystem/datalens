@@ -3,6 +3,9 @@ use std::{error::Error, fmt};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Stable error categories used by APIs, metrics, retries, and usage ledger
+/// records. Variants distinguish caller/auth failures from provider and storage
+/// failures so retry and attribution decisions do not parse message text.
 pub enum DatalensErrorKind {
     AuthenticationFailed,
     InvalidInput,

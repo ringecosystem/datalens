@@ -14,6 +14,9 @@ pub struct AuthContext {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Authenticated application context carried from edge routes into metrics,
+/// usage ledger attribution, and warmup ownership checks. Authentication proves
+/// the token; authorization and quota checks are route-specific.
 pub struct ApplicationContext {
     pub id: String,
     pub name: String,
@@ -41,6 +44,9 @@ impl AuthenticationHook for NoAuthentication {
 }
 
 #[derive(Clone, Debug, Default)]
+/// Registry-backed application authentication and authorization boundary for
+/// edge APIs. It normalizes application ids before lookup so headers, metrics,
+/// and warmup task ownership use the same stable identity.
 pub struct ApplicationRegistry {
     required: bool,
     applications: BTreeMap<String, config::ApplicationConfig>,
@@ -356,6 +362,8 @@ fn enforce_native_query_quota(
 }
 
 pub fn normalize_application_id(value: &str) -> Result<String, DatalensError> {
+    // Application ids are used as metrics labels and warmup ownership keys, so
+    // normalization is intentionally stricter than display names.
     let normalized = value.trim().to_ascii_lowercase();
     if normalized.is_empty()
         || normalized.starts_with('.')

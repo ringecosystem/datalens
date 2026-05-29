@@ -11,6 +11,9 @@ use std::{
 use crate::read_through_cache;
 
 #[derive(Debug)]
+/// Storage write request for one durable coverage segment. The caller must pass
+/// only safe/finalized finality; storage enforces that before writing an object
+/// key or empty coverage entry.
 pub struct StorageWriteRequest<'a> {
     pub chain: &'a ChainIdentity,
     pub dataset_key: DatasetKey,
@@ -71,6 +74,9 @@ pub use crate::usage_ledger::{
 };
 
 #[derive(Clone, Debug)]
+/// Durable object repository plus an in-process read-through cache. The
+/// read-through cache only memoizes decoded objects for reads; it is separate
+/// from writer staging and is never a source of manifest coverage.
 pub struct DurableStorage<S> {
     object_store: S,
     read_through_cache: read_through_cache::ReadThroughCache,
@@ -131,6 +137,9 @@ where
         selector: &DatasetSelector,
         range: LedgerRange,
     ) -> Result<Vec<LedgerRange>, DatalensError> {
+        // Manifest entries are the sole coverage authority. Empty coverage and
+        // data-object coverage both count here because both were provider
+        // confirmed before entering the manifest.
         let selector_fingerprint = selector.fingerprint();
         let mut ranges = self
             .manifest_for_chain(chain)?
@@ -280,6 +289,8 @@ where
                 &range,
                 finality_level,
             ) {
+                // Object keys are deterministic for a logical coverage segment;
+                // an existing valid object is reused instead of rewriting bytes.
                 validate_existing_data_object(existing, &data_object)?;
                 if existing.object_size_bytes.is_some()
                     && existing.checksum.is_some()
@@ -395,6 +406,8 @@ where
         chain: &ChainIdentity,
         manifest: &Manifest,
     ) -> Result<(), DatalensError> {
+        // Never publish a manifest that references a missing object; once
+        // written, the manifest is what readers and planners trust.
         for entry in &manifest.entries {
             if let Some(object_key) = &entry.object_key
                 && !self.object_store.exists(object_key)?

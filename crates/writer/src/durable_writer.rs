@@ -11,6 +11,9 @@ use datalens_core::{
 use datalens_storage::{StorageDataObject, StorageRepository, StorageWriteRequest};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Durable writer policy for object sizing and optional staging. Staging is a
+/// write-side buffer only; manifest coverage is created by `write_direct` after
+/// rows are flushed to durable storage.
 pub struct DurableWriterConfig {
     pub target_object_bytes: u64,
     pub min_object_rows: usize,
@@ -19,6 +22,9 @@ pub struct DurableWriterConfig {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Thresholds for holding small non-empty writes until they can form larger
+/// durable objects. Empty coverage is never staged because it is metadata-only
+/// authority and should become visible immediately when enabled.
 pub struct WriteStagingConfig {
     pub enabled: bool,
     pub min_rows: Option<usize>,
@@ -115,6 +121,9 @@ pub struct DurableDataObject {
 }
 
 #[derive(Clone)]
+/// Converts safe/finalized fetched segments into durable storage coverage.
+/// The writer may stage non-empty rows, but callers should treat returned
+/// `staged_ranges` as not yet visible in manifest coverage.
 pub struct DurableWriter<R> {
     storage: R,
     config: DurableWriterConfig,
@@ -195,6 +204,8 @@ where
 
         for segment in segments {
             if segment.rows.row_count() == 0 {
+                // Empty coverage has no data object to compact, and delaying it
+                // would make the manifest under-report provider-confirmed gaps.
                 direct_segments.push(segment);
             } else {
                 staged_ranges.push(segment.range.clone());
@@ -234,6 +245,8 @@ where
         match self.flush_staged(staged.clone(), reason) {
             Ok(flush_result) => result.extend(flush_result),
             Err(error) => {
+                // Put failed flush work back in front of newer staged writes so
+                // retries preserve the original durable write ordering.
                 let mut current = self
                     .staged
                     .lock()
@@ -259,6 +272,8 @@ where
             let first = remaining.remove(0);
             let mut segments = vec![first.segment];
             let mut index = 0;
+            // A flush may contain many applications or selectors; only merge
+            // segments that would share the same manifest key namespace.
             while index < remaining.len() {
                 if remaining[index].chain == first.chain
                     && remaining[index].dataset_key == first.dataset_key

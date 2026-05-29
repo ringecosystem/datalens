@@ -30,6 +30,9 @@ use crate::{
 };
 
 pub trait IndexCursorRepository: Clone + Send + Sync + 'static {
+    /// Load resumable progress for an index job. Cursors are operational
+    /// checkpoints only; durable data authority still comes from manifest
+    /// coverage.
     fn load(&self, job_id: &IndexJobId) -> Result<Option<IndexCursor>, DatalensError>;
     fn save(&self, cursor: &IndexCursor) -> Result<(), DatalensError>;
 }
@@ -59,6 +62,9 @@ impl IndexCursorRepository for InMemoryIndexCursorStore {
 }
 
 #[derive(Clone)]
+/// Durable index runtime for backfill, repair, retry, and verify workflows.
+/// It uses cursor checkpoints to resume work, but always consults manifest
+/// coverage before planning writes.
 pub struct IndexRuntime<A, S, C> {
     adapter: A,
     storage: S,
@@ -119,6 +125,8 @@ where
         };
         let mut covered_ranges = Vec::new();
         for dataset in &datasets {
+            // Planning is anchored to durable manifest coverage, not cursor
+            // progress, so a stale or lost cursor cannot claim data exists.
             covered_ranges.extend(
                 self.storage
                     .covered_ranges(
@@ -165,6 +173,8 @@ where
                 Err(error)
                     if error.kind == DatalensErrorKind::ProviderLimit && chunk.range.len() > 1 =>
                 {
+                    // Provider limits are repaired by splitting the current
+                    // chunk; durable validation still runs on each child range.
                     accounting.provider_limit_splits += 1;
                     let mut split = chunk.range.split(split_len(chunk.range.len()))?;
                     split.reverse();
@@ -298,6 +308,8 @@ where
         plan: &IndexPlan,
         mut accounting: IndexAccounting,
     ) -> Result<IndexRunResult, DatalensError> {
+        // Verify mode reads planned coverage and never writes or advances
+        // cursors; it checks durable objects behind the manifest.
         for range in &plan.verification_ranges {
             let dataset = plan
                 .job

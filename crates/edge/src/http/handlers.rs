@@ -48,6 +48,8 @@ pub(crate) async fn query(
 ) -> Result<Json<QueryApiResponse>, ApiError> {
     let registry = state.registry.clone();
     let dataset = request.dataset_for_auth().map_err(ApiError)?;
+    // Authentication identifies the caller; authorization and quota checks bind
+    // that identity to the requested chain, dataset, range, and finality.
     let application_context = registry
         .authenticate_headers(
             &headers,
@@ -61,6 +63,8 @@ pub(crate) async fn query(
         .map(|application| application.metrics_identity())
         .or_else(|| application_from_headers(&headers));
     let native_input = request.into_native_input().map_err(ApiError)?;
+    // The blocking native executor is shared with GraphQL; both API surfaces
+    // pass the same application identity into metrics and the usage ledger.
     tokio::task::spawn_blocking(move || {
         registry
             .query_native_with_application(native_input, application)
@@ -87,6 +91,8 @@ pub(crate) async fn warmup_submit(
     let application_context = registry
         .authenticate_warmup_headers(&headers, request.chain().configured_name(), &dataset)
         .map_err(ApiError)?;
+    // Warmup task ownership is stored as the normalized application id, not the
+    // bearer subject, so later list/mutate checks can use the same route policy.
     let application_id = application_context
         .map(|application| application.id)
         .or_else(|| application_id_from_headers(&headers))

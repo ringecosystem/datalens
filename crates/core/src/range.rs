@@ -55,6 +55,9 @@ struct RawBlockRange {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "RawBlockRange")]
+/// Inclusive EVM-style block range. A constructed value is never empty, so
+/// callers can use `len` and split operations without separately handling
+/// zero-width ranges.
 pub struct BlockRange {
     pub from_block: u64,
     pub to_block: u64,
@@ -190,6 +193,9 @@ struct RawLedgerRange {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "RawLedgerRange")]
+/// Inclusive range tagged with the chain's native height domain, such as block,
+/// slot, or height. Range arithmetic only intersects or subtracts values with
+/// the same kind so block coverage cannot satisfy slot or height requests.
 pub struct LedgerRange {
     kind: LedgerRangeKind,
     start: u64,
@@ -324,6 +330,9 @@ impl LedgerRange {
 }
 
 pub fn missing_ranges(range: LedgerRange, covered: &[LedgerRange]) -> Vec<LedgerRange> {
+    // Normalize the coverage set before walking it; manifest entries may be
+    // unsorted or overlap, but the returned gaps must be monotonic and within
+    // the requested range.
     let mut covered = covered
         .iter()
         .filter_map(|covered_range| covered_range.intersection(&range))

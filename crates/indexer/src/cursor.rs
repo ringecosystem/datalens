@@ -19,6 +19,9 @@ use crate::{
 const FILE_CURSOR_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Debug)]
+/// File-backed index cursor store. Cursor files are crash-resume state only and
+/// are written atomically, but they are not evidence of durable dataset
+/// coverage.
 pub struct FileIndexCursorStore {
     root: Arc<PathBuf>,
 }
