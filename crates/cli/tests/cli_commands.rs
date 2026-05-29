@@ -1,6 +1,7 @@
 use std::{
     io::{Read, Write},
     net::TcpListener,
+    process::Command as ProcessCommand,
     sync::{Arc, Mutex},
     thread,
 };
@@ -769,6 +770,39 @@ fn test_doctor_chain_summary_rejects_unknown_auto_finality_without_profile() {
     assert!(error.message.contains("durable cache writes"));
 }
 
+#[test]
+fn test_production_config_doctor_smoke_uses_nonsecret_environment() {
+    let (url, _requests) = start_rpc_server(vec![json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": "0x100"
+    })]);
+
+    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_datalens"))
+        .args(["doctor", "--config", "config/datalens.production.toml"])
+        .current_dir(workspace_root())
+        .env("DATALENS_ETHEREUM_RPC_URL", url)
+        .env("DATALENS_S3_BUCKET", "datalens-production")
+        .env("DATALENS_S3_PREFIX", "datalens")
+        .env("DATALENS_S3_REGION", "auto")
+        .env("DATALENS_S3_ENDPOINT_URL", "https://s3.example.invalid")
+        .env("DATALENS_PUBLIC_APP_TOKEN", "replace-with-secret")
+        .env("AWS_ACCESS_KEY_ID", "replace-with-secret")
+        .env("AWS_SECRET_ACCESS_KEY", "replace-with-secret")
+        .output()
+        .expect("run doctor binary");
+
+    assert!(
+        output.status.success(),
+        "doctor failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: Value = serde_json::from_slice(&output.stdout).expect("doctor JSON");
+    assert_eq!(summary["status"], "ok");
+    assert_eq!(summary["chains"][0]["finality"]["detected_height"], 160);
+}
+
 fn unsupported_tag_response() -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -821,6 +855,14 @@ fn temp_storage_root(name: &str) -> std::path::PathBuf {
     ));
     std::fs::create_dir_all(&root).expect("create temp storage root");
     root
+}
+
+fn workspace_root() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("workspace root")
+        .to_path_buf()
 }
 
 fn write_config(name: &str, storage_root: &std::path::Path) -> String {
