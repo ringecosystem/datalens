@@ -38,7 +38,7 @@ just e2e
 `just e2e` runs:
 
 ```sh
-cargo test -p datalens-api --test query_flow
+cargo test -p datalens-edge --test query_flow
 ```
 
 This deterministic test suite uses an in-process mock source and local temporary storage.
@@ -79,7 +79,7 @@ just e2e-lifecycle
 `just e2e-lifecycle` keeps `just e2e` as the first step, then adds:
 
 ```sh
-cargo test -p datalens-api --test lifecycle
+cargo test -p datalens-edge --test lifecycle
 cargo test -p datalens-executor --test query_execution
 cargo test -p datalens-warmup --test warmup_flow
 cargo test -p datalens-storage --test read_through_cache
@@ -111,7 +111,7 @@ secrets.
 
 ## Optional RustFS/S3-Compatible Lifecycle
 
-The S3-compatible lifecycle path is included in `cargo test -p datalens-api --test
+The S3-compatible lifecycle path is included in `cargo test -p datalens-edge --test
 lifecycle`, but it only runs when explicitly enabled:
 
 ```sh

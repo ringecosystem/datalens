@@ -3,13 +3,6 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use datalens_api::config::{
-    ChainConfig, DatasetsConfig, LogsDatasetConfig, PlannerConfig, WriterConfig,
-};
-use datalens_api::{
-    LegacyEvmQueryRequest, LegacyEvmQueryResponse, QueryService, api_error_body, api_error_status,
-    legacy_evm_to_native_input,
-};
 use datalens_chain::{
     AdapterCapabilities, ChainAdapter, ChainFetchRequest, ChainFetchResponse, ChainHeight,
     DatasetCapability, DatasetSelector, FinalityKind, HeightRangeKind, SelectorKind,
@@ -18,6 +11,13 @@ use datalens_core::{
     BlockHeader, BlockRange, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, Dataset,
     DatasetKey, LedgerRange, LogFilter, LogRecord, NetworkId, QueryDataFinality,
     QueryFinalityRequirement, QueryRows, QuerySegmentSource,
+};
+use datalens_edge::config::{
+    ChainConfig, DatasetsConfig, LogsDatasetConfig, PlannerConfig, WriterConfig,
+};
+use datalens_edge::{
+    LegacyEvmQueryRequest, LegacyEvmQueryResponse, QueryService, api_error_body, api_error_status,
+    legacy_evm_to_native_input,
 };
 use datalens_planner::{FieldSelection, ResponseShape};
 use datalens_storage::LocalStorage;
@@ -57,14 +57,14 @@ fn test_client_query_response_json_decodes_api_response_contract() {
     let api_response = LegacyEvmQueryResponse {
         chain: ethereum_identity(),
         range: BlockRange::expect_new(10, 10),
-        cache: datalens_api::CacheSummary {
+        cache: datalens_edge::CacheSummary {
             hit_ranges: vec![BlockRange::expect_new(10, 10)],
             missing_ranges: Vec::new(),
             durable_hit_ranges: vec![BlockRange::expect_new(10, 10)],
             hot_hit_ranges: Vec::new(),
             provider_fill_ranges: Vec::new(),
             promotion_pending_ranges: Vec::new(),
-            segments: vec![datalens_api::QuerySegment {
+            segments: vec![datalens_edge::QuerySegment {
                 range: BlockRange::expect_new(10, 10),
                 source: QuerySegmentSource::Durable,
                 finality: QueryDataFinality::Safe,
@@ -437,9 +437,9 @@ fn chain_config(max_addresses_per_query: usize) -> ChainConfig {
         kind: "evm".to_owned(),
         chain_id: 1,
         rpc_urls: vec!["http://example.invalid".to_owned()],
-        finality: datalens_api::config::FinalityConfig::Auto,
+        finality: datalens_edge::config::FinalityConfig::Auto,
         datasets: DatasetsConfig {
-            blocks: datalens_api::config::BlocksDatasetConfig {
+            blocks: datalens_edge::config::BlocksDatasetConfig {
                 enabled: true,
                 max_batch_blocks: 2,
             },

@@ -1,9 +1,9 @@
-use datalens_api::{auth::AuthenticationHook, compatibility::CompatibilityAdapter};
 use datalens_chain::{AdapterCapabilities, ChainAdapter};
 use datalens_core::{
     ChainFamily, ChainIdentity, CoverageLevel, DatasetId, DatasetKey, DatasetRows, LedgerRange,
     QueryRows, ResultEnvelope, TimeRange,
 };
+use datalens_edge::{auth::AuthenticationHook, compatibility::CompatibilityAdapter};
 use datalens_evm::EvmAdapterMetadata;
 use datalens_planner::{PlanRequest, PlanStatus};
 use datalens_writer::{
@@ -57,9 +57,9 @@ fn workspace_exposes_architecture_boundaries() {
 
     let _chain_adapter_type_check = assert_chain_adapter::<datalens_evm::EvmAdapter>;
     let _storage_type_check = assert_storage_repository::<datalens_storage::LocalStorage>;
-    let _auth_hook_type_check = assert_auth_hook::<datalens_api::auth::NoAuthentication>;
+    let _auth_hook_type_check = assert_auth_hook::<datalens_edge::auth::NoAuthentication>;
     let _compatibility_type_check =
-        assert_compatibility::<datalens_api::compatibility::NativeCompatibility>;
+        assert_compatibility::<datalens_edge::compatibility::NativeCompatibility>;
 }
 
 #[test]

@@ -7,7 +7,7 @@ fn test_logging_dependencies_are_declared_in_expected_crates() {
     assert!(workspace.contains("tracing-log = "));
     assert!(workspace.contains("tracing-subscriber = "));
 
-    assert_manifest_has_dependency("crates/api/Cargo.toml", "log.workspace = true");
+    assert_manifest_has_dependency("crates/edge/Cargo.toml", "log.workspace = true");
     assert_manifest_has_dependency("crates/storage/Cargo.toml", "log.workspace = true");
     assert_manifest_has_dependency("crates/evm/Cargo.toml", "log.workspace = true");
     assert_manifest_has_dependency("crates/cli/Cargo.toml", "log.workspace = true");
@@ -30,7 +30,7 @@ fn test_cli_owns_tracing_backed_log_output() {
 #[test]
 fn test_library_code_uses_log_facade_without_initializing_tracing() {
     for path in [
-        "crates/api/src/lib.rs",
+        "crates/edge/src/lib.rs",
         "crates/storage/src/lib.rs",
         "crates/evm/src/lib.rs",
     ] {

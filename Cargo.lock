@@ -1244,30 +1244,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "datalens-api"
-version = "0.1.0"
-dependencies = [
- "axum",
- "datalens-chain",
- "datalens-client",
- "datalens-core",
- "datalens-executor",
- "datalens-metrics",
- "datalens-planner",
- "datalens-solana",
- "datalens-storage",
- "datalens-tron",
- "datalens-warmup",
- "datalens-writer",
- "log",
- "serde",
- "serde_json",
- "tokio",
- "toml",
- "tower",
-]
-
-[[package]]
 name = "datalens-chain"
 version = "0.1.0"
 dependencies = [
@@ -1288,9 +1264,9 @@ name = "datalens-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
- "datalens-api",
  "datalens-chain",
  "datalens-core",
+ "datalens-edge",
  "datalens-evm",
  "datalens-indexer",
  "datalens-metrics",
@@ -1327,6 +1303,30 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "toml",
+]
+
+[[package]]
+name = "datalens-edge"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "datalens-chain",
+ "datalens-client",
+ "datalens-core",
+ "datalens-executor",
+ "datalens-metrics",
+ "datalens-planner",
+ "datalens-solana",
+ "datalens-storage",
+ "datalens-tron",
+ "datalens-warmup",
+ "datalens-writer",
+ "log",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "tower",
 ]
 
 [[package]]

@@ -59,7 +59,7 @@ manifest writes to storage, records empty coverage when configured, tracks skipp
 and returns the storage metadata summary to the query flow. It must not own object
 encoding, object key layout, object store providers, or manifest repository details.
 
-`datalens-api` owns edge behavior: HTTP parsing, native API routes, authentication hooks,
+`datalens-edge` owns edge behavior: HTTP parsing, native API routes, authentication hooks,
 response streaming, and compatibility adapters. It translates at the edge before calling
 the planner and reshapes responses at the edge after native response assembly.
 
