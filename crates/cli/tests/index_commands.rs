@@ -99,6 +99,8 @@ fn test_index_config_loads_defaults_and_limits() {
 
         [storage]
         backend = "local"
+
+        [storage.local]
         root = "/tmp/datalens"
 
         [planner]
@@ -332,6 +334,8 @@ fn test_validate_config_rejects_unsafe_index_finality() {
 
         [storage]
         backend = "local"
+
+        [storage.local]
         root = "/tmp/datalens"
 
         [planner]
@@ -413,6 +417,8 @@ fn write_config(name: &str, storage_root: &std::path::Path) -> String {
 
             [storage]
             backend = "local"
+
+            [storage.local]
             root = "{}"
 
             [planner]
