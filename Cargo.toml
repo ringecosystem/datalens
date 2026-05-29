@@ -29,6 +29,8 @@ alloy = { version = "2.0.5", default-features = false, features = ["reqwest-rust
 arrow = "58.3.0"
 aws-sdk-s3 = "1.133.0"
 axum = "0.8.9"
+async-graphql = "7.2.1"
+async-graphql-axum = "7.2.1"
 clap = { version = "4.6.1", features = ["derive"] }
 figment = "0.10.19"
 log = "0.4.30"

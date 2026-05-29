@@ -5,6 +5,8 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
+async-graphql.workspace = true
+async-graphql-axum.workspace = true
 axum.workspace = true
 datalens-chain = { path = "../chain" }
 datalens-core = { path = "../core" }
