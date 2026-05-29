@@ -3,14 +3,17 @@
 use std::{collections::BTreeMap, error::Error, fmt};
 
 use datalens_core::{
-    BlockRange, ChainIdentity, DatalensError, DatalensErrorKind, Dataset, DatasetKey, DatasetRows,
-    LedgerRange, LedgerRangeKind, LogFilter, QueryDataFinality, QueryFinalityRequirement,
-    QuerySegmentSource,
+    BlockRange, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, Dataset, DatasetKey,
+    DatasetRows, LedgerRange, LedgerRangeKind, LogFilter, QueryDataFinality,
+    QueryFinalityRequirement, QuerySegmentSource,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::DeserializeOwned};
 
 pub const APPLICATION_IDENTITY_HEADER: &str = "x-datalens-application";
 const DEFAULT_APPLICATION: &str = "unknown";
+
+mod selectors;
+pub use selectors::TronEventSelector;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DatalensClientConfig {
@@ -59,6 +62,15 @@ where
         chain: ChainIdentity,
         range: BlockRange,
     ) -> Result<QueryResponse, ClientError> {
+        self.query_evm_blocks(chain, range)
+    }
+
+    pub fn query_evm_blocks(
+        &self,
+        chain: ChainIdentity,
+        range: BlockRange,
+    ) -> Result<QueryResponse, ClientError> {
+        validate_evm_chain(&chain, "query_evm_blocks")?;
         self.query(QueryRequest {
             chain,
             dataset_key: DatasetKey::evm_blocks(),
@@ -75,6 +87,16 @@ where
         range: BlockRange,
         options: QueryOptions,
     ) -> Result<QueryResponse, ClientError> {
+        self.query_evm_blocks_with_options(chain, range, options)
+    }
+
+    pub fn query_evm_blocks_with_options(
+        &self,
+        chain: ChainIdentity,
+        range: BlockRange,
+        options: QueryOptions,
+    ) -> Result<QueryResponse, ClientError> {
+        validate_evm_chain(&chain, "query_evm_blocks_with_options")?;
         self.query(QueryRequest {
             chain,
             dataset_key: DatasetKey::evm_blocks(),
@@ -91,6 +113,16 @@ where
         range: BlockRange,
         filter: LogFilter,
     ) -> Result<QueryResponse, ClientError> {
+        self.query_evm_logs(chain, range, filter)
+    }
+
+    pub fn query_evm_logs(
+        &self,
+        chain: ChainIdentity,
+        range: BlockRange,
+        filter: LogFilter,
+    ) -> Result<QueryResponse, ClientError> {
+        validate_evm_chain(&chain, "query_evm_logs")?;
         self.query(QueryRequest {
             chain,
             dataset_key: DatasetKey::evm_logs(),
@@ -111,6 +143,16 @@ where
             FallbackMode::None => Err(ClientError::UnsupportedFallback),
             FallbackMode::Rpc => Err(ClientError::UnsupportedFallback),
         }
+    }
+
+    pub fn query_dataset(
+        &self,
+        chain: ChainIdentity,
+        dataset_key: DatasetKey,
+        range: LedgerRange,
+        selector: QuerySelector,
+    ) -> Result<QueryResponse, ClientError> {
+        self.query(QueryRequest::new(chain, dataset_key, range).with_selector(selector))
     }
 
     pub fn query(&self, request: QueryRequest) -> Result<QueryResponse, ClientError> {
@@ -450,6 +492,7 @@ pub enum FallbackMode {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClientError {
     InvalidConfig(String),
+    InvalidInput(String),
     Encode(String),
     Decode(String),
     Transport(String),
@@ -485,6 +528,7 @@ impl fmt::Display for ClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidConfig(message)
+            | Self::InvalidInput(message)
             | Self::Encode(message)
             | Self::Decode(message)
             | Self::Transport(message) => f.write_str(message),
@@ -526,6 +570,15 @@ struct ApiErrorBody {
 struct ApiErrorDetail {
     kind: String,
     message: String,
+}
+
+fn validate_evm_chain(chain: &ChainIdentity, helper: &str) -> Result<(), ClientError> {
+    if matches!(chain.family_ref(), ChainFamily::Evm) {
+        return Ok(());
+    }
+    Err(ClientError::InvalidInput(format!(
+        "{helper} only supports EVM chains; use query_dataset for non-EVM datasets"
+    )))
 }
 
 fn serialize_dataset_key<S>(dataset_key: &DatasetKey, serializer: S) -> Result<S::Ok, S::Error>

@@ -1,9 +1,9 @@
 use std::sync::{Arc, Mutex};
 
 use datalens_client::{
-    APPLICATION_IDENTITY_HEADER, ApiErrorKind, CacheOutcome, ChainDiscovery, DatalensClient,
-    DatalensClientConfig, FallbackMode, HttpRequest, HttpResponse, HttpTransport, QueryOptions,
-    QueryRequest, QueryResponse, QuerySelector,
+    APPLICATION_IDENTITY_HEADER, ApiErrorKind, CacheOutcome, ChainDiscovery, ClientError,
+    DatalensClient, DatalensClientConfig, FallbackMode, HttpRequest, HttpResponse, HttpTransport,
+    QueryOptions, QueryRequest, QueryResponse, QuerySelector, TronEventSelector,
 };
 use datalens_core::{
     BlockHeader, BlockRange, ChainFamily, ChainIdentity, Dataset, DatasetKey, DatasetRows,
@@ -122,6 +122,158 @@ fn test_query_blocks_with_hot_options_serializes_explicit_hot_contract() {
             "finality": "safe_to_latest",
             "fields": "all"
         })
+    );
+}
+
+#[test]
+fn test_evm_query_helpers_reject_non_evm_chains_before_sending_request() {
+    let transport = RecordingTransport::new(HttpResponse::json(
+        200,
+        serde_json::json!({ "unexpected": true }),
+    ));
+    let client = client(transport.clone(), Some("indexer"));
+
+    let error = client
+        .query_blocks(solana_identity(), BlockRange::expect_new(10, 12))
+        .expect_err("non-EVM blocks helper is invalid");
+
+    assert!(matches!(error, ClientError::InvalidInput(message) if message.contains("EVM")));
+    assert!(transport.requests().is_empty());
+
+    let error = client
+        .query_logs(
+            tron_identity(),
+            BlockRange::expect_new(10, 12),
+            LogFilter {
+                addresses: Vec::new(),
+                topics: Vec::new(),
+            },
+        )
+        .expect_err("non-EVM logs helper is invalid");
+
+    assert!(matches!(error, ClientError::InvalidInput(message) if message.contains("EVM")));
+    assert!(transport.requests().is_empty());
+}
+
+#[test]
+fn test_query_dataset_serializes_explicit_dataset_range_and_selector() {
+    let transport = RecordingTransport::new(HttpResponse::json(
+        200,
+        serde_json::json!({
+            "chain": tron_identity(),
+            "dataset_key": "tron.events",
+            "range": { "kind": "block", "start": 1000, "end": 1001 },
+            "cache": {
+                "hit_ranges": [],
+                "missing_ranges": [{ "kind": "block", "start": 1000, "end": 1001 }]
+            },
+            "rows": dataset_rows_json(
+                DatasetKey::tron_events(),
+                QueryRows::AdapterJson {
+                    dataset_key: DatasetKey::tron_events(),
+                    rows: Vec::new(),
+                }
+            )
+        }),
+    ));
+    let client = client(transport.clone(), Some("ormp"));
+
+    client
+        .query_dataset(
+            tron_identity(),
+            DatasetKey::tron_events(),
+            LedgerRange::blocks(1000, 1001).expect("range"),
+            QuerySelector::tron_contract_event(
+                "0x0000000000000000000000000000000000000000",
+                "Transfer",
+            )
+            .expect("selector"),
+        )
+        .expect("tron query decodes");
+
+    assert_eq!(
+        transport.only_request().body,
+        serde_json::json!({
+            "chain": tron_identity(),
+            "dataset_key": "tron.events",
+            "selector": {
+                "kind": "other",
+                "value": {
+                    "kind": "tron_events",
+                    "fingerprint": "tron-events/6fc306e8d91c62c5c6efcf12",
+                    "canonical_key": "contracts/410000000000000000000000000000000000000000/events/Transfer"
+                }
+            },
+            "range": { "kind": "block", "start": 1000, "end": 1001 },
+            "finality": "durable_only",
+            "fields": "all"
+        })
+    );
+}
+
+#[test]
+fn test_solana_selector_helpers_match_adapter_contract() {
+    assert_eq!(
+        QuerySelector::solana_all(),
+        QuerySelector::other("solana_all", "solana-all/all", "all")
+    );
+    assert_eq!(
+        QuerySelector::solana_address(" 11111111111111111111111111111111 ").expect("address"),
+        QuerySelector::other(
+            "solana_address",
+            "solana-address/8a83665f3798727f",
+            "address/11111111111111111111111111111111"
+        )
+    );
+    assert_eq!(
+        QuerySelector::solana_program("So11111111111111111111111111111111111111112")
+            .expect("program"),
+        QuerySelector::other(
+            "solana_program",
+            "solana-program/d77cf5c8a1c79d6b",
+            "program/So11111111111111111111111111111111111111112"
+        )
+    );
+    assert_eq!(
+        QuerySelector::solana_signature("5Nf6zKzExample1111111111111111111111111111111111")
+            .expect("signature"),
+        QuerySelector::other(
+            "solana_signature",
+            "solana-signature/47c263cfea835908",
+            "signature/5Nf6zKzExample1111111111111111111111111111111111"
+        )
+    );
+}
+
+#[test]
+fn test_tron_selector_helpers_match_adapter_contract() {
+    assert_eq!(
+        QuerySelector::tron_all(),
+        QuerySelector::other("tron_all", "tron-all/all", "all")
+    );
+    assert_eq!(
+        QuerySelector::tron_contract("0x0000000000000000000000000000000000000000")
+            .expect("contract"),
+        QuerySelector::other(
+            "tron_events",
+            "tron-events/501adaf4d004cec3d56317e1",
+            "contracts/410000000000000000000000000000000000000000/events/all"
+        )
+    );
+    assert_eq!(
+        QuerySelector::tron_event(TronEventSelector {
+            contract_addresses: vec![
+                "0x0000000000000000000000000000000000000000".to_owned(),
+                "410000000000000000000000000000000000000000".to_owned(),
+            ],
+            event_names: vec!["Transfer".to_owned(), "Transfer".to_owned()],
+        })
+        .expect("event selector"),
+        QuerySelector::other(
+            "tron_events",
+            "tron-events/6fc306e8d91c62c5c6efcf12",
+            "contracts/410000000000000000000000000000000000000000/events/Transfer"
+        )
     );
 }
 
