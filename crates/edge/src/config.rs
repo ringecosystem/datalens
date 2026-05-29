@@ -47,7 +47,8 @@ pub struct ServerConfig {
     pub bind: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StorageConfig {
     pub backend: String,
     #[serde(default)]
@@ -56,37 +57,8 @@ pub struct StorageConfig {
     pub s3: Option<S3ObjectStoreConfig>,
 }
 
-#[derive(Deserialize)]
-struct RawStorageConfig {
-    backend: String,
-    #[serde(default)]
-    root: Option<String>,
-    #[serde(default)]
-    local: Option<LocalStorageConfig>,
-    #[serde(default)]
-    s3: Option<S3ObjectStoreConfig>,
-}
-
-impl<'de> Deserialize<'de> for StorageConfig {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let raw = RawStorageConfig::deserialize(deserializer)?;
-        let local = match (raw.local, raw.root) {
-            (Some(local), _) => Some(local),
-            (None, Some(root)) => Some(LocalStorageConfig { root }),
-            (None, None) => None,
-        };
-        Ok(Self {
-            backend: raw.backend,
-            local,
-            s3: raw.s3,
-        })
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LocalStorageConfig {
     pub root: String,
 }
