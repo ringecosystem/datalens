@@ -150,7 +150,12 @@ Client cache outcome helpers:
 
 - `chains`: ordered chain discovery entries.
 - `chains[].identity`: `ChainIdentity` with family, configured name, and network id.
-- `chains[].datasets`: enabled first-version datasets, currently `blocks` and `logs`.
+- `chains[].datasets`: native dataset capability entries.
+- `chains[].datasets[].dataset_key`: chain-qualified native dataset key such as
+  `evm.blocks`, `solana.slots`, or `tron.blocks`.
+- `chains[].datasets[].range_kinds`: supported ledger range kind descriptors.
+- `chains[].datasets[].selectors`: supported selector kind names.
+- `chains[].datasets[].enabled`: whether the dataset is enabled at the edge boundary.
 
 Error responses have the stable shape:
 

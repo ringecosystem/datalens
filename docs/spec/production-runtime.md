@@ -67,8 +67,8 @@ release gates.
   serve requests.
 - `GET /metrics` is the Prometheus scrape endpoint. It returns Prometheus text format
   with content type `text/plain; version=0.0.4` when metrics are enabled.
-- `GET /v1/chains` and `GET /v1/discovery` expose configured chain and dataset
-  discovery.
+- `GET /v1/chains` and `GET /v1/discovery` expose configured chain discovery and
+  native dataset capability discovery.
 - `POST /v1/query` is the REST query transport. It executes the native query contract.
 - `POST /graphql` is the GraphQL query and warmup transport when
   `edge.graphql.enabled = true`.
