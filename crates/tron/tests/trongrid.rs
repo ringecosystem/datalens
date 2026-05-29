@@ -5,7 +5,7 @@ use std::{
     thread,
 };
 
-use datalens_core::LedgerRange;
+use datalens_core::{DatalensErrorKind, LedgerRange};
 use datalens_tron::{
     TronContractEventRequest, TronHttpProvider, TronProvider, normalize_tron_contract_address,
 };
@@ -111,6 +111,30 @@ fn test_trongrid_contract_events_response_is_normalized() {
     assert_eq!(page.events[0].transaction_id.as_deref(), Some("tx-1"));
     assert_eq!(page.events[0].block_number, 123);
     assert!(page.events[0].confirmed);
+}
+
+#[test]
+fn test_trongrid_contract_events_malformed_response_is_invalid_request() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let server = TestServer::spawn(seen, r#"{"meta":{}}"#, "HTTP/1.1 200 OK");
+    let provider = TronHttpProvider::new("http://unused")
+        .with_trongrid(server.url(), Some("secret-key".to_owned()));
+
+    let error = provider
+        .get_contract_events(TronContractEventRequest {
+            contract_address: normalize_tron_contract_address(
+                "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            )
+            .expect("address"),
+            event_name: Some("Transfer".to_owned()),
+            range: LedgerRange::blocks(10, 12).expect("range"),
+            only_confirmed: true,
+            limit: 50,
+            fingerprint: None,
+        })
+        .expect_err("malformed response should stay visible");
+
+    assert_eq!(error.kind, DatalensErrorKind::InvalidRequest);
 }
 
 struct TestServer {

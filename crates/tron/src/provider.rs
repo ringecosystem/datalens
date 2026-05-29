@@ -184,7 +184,7 @@ impl TronProvider for TronHttpProvider {
         let status = response.status();
         let body: Value = response.json().map_err(|error| {
             DatalensError::new(
-                DatalensErrorKind::ProviderFailure,
+                DatalensErrorKind::InvalidRequest,
                 format!("decode TronGrid contract events response: {error}"),
             )
         })?;
@@ -397,7 +397,7 @@ fn encode_query_component(value: &str) -> String {
 fn parse_contract_event_page(value: &Value) -> Result<TronContractEventPage, DatalensError> {
     let data = value.get("data").and_then(Value::as_array).ok_or_else(|| {
         DatalensError::new(
-            DatalensErrorKind::ProviderFailure,
+            DatalensErrorKind::InvalidRequest,
             "TronGrid contract events response missing data array",
         )
     })?;
@@ -427,7 +427,7 @@ fn parse_contract_event(value: &Value) -> Result<TronContractEvent, DatalensErro
         .transpose()?
         .ok_or_else(|| {
             DatalensError::new(
-                DatalensErrorKind::ProviderFailure,
+                DatalensErrorKind::InvalidRequest,
                 "TronGrid contract event missing contract_address",
             )
         })?;
@@ -437,7 +437,7 @@ fn parse_contract_event(value: &Value) -> Result<TronContractEvent, DatalensErro
         .and_then(Value::as_u64)
         .ok_or_else(|| {
             DatalensError::new(
-                DatalensErrorKind::ProviderFailure,
+                DatalensErrorKind::InvalidRequest,
                 "TronGrid contract event missing block_number",
             )
         })?;
