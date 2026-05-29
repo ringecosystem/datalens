@@ -16,8 +16,9 @@ use datalens_edge::config::{
     ChainConfig, DatasetsConfig, LogsDatasetConfig, PlannerConfig, WriterConfig,
 };
 use datalens_edge::{
-    LegacyEvmQueryRequest, LegacyEvmQueryResponse, QueryService, api_error_body, api_error_status,
-    legacy_evm_to_native_input,
+    FieldSelectionApi, LegacyEvmQueryRequest, LegacyEvmQueryResponse, NativeQueryResponse,
+    QueryApiRequest, QueryApiResponse, QueryRangeApi, QuerySelectorApi, QueryService,
+    api_error_body, api_error_status, legacy_evm_to_native_input,
 };
 use datalens_planner::{FieldSelection, ResponseShape};
 use datalens_storage::LocalStorage;
@@ -142,6 +143,231 @@ fn test_legacy_request_maps_explicit_hot_contract_to_native_input() {
     let input = legacy_evm_to_native_input(request).expect("hot request maps");
 
     assert_eq!(input.finality, QueryFinalityRequirement::SafeToLatest);
+}
+
+#[test]
+fn test_native_api_evm_blocks_request_maps_to_native_input() {
+    let request = QueryApiRequest {
+        chain: ethereum_identity(),
+        dataset_key: "evm.blocks".to_owned(),
+        selector: QuerySelectorApi::All,
+        range: QueryRangeApi::Block { start: 10, end: 12 },
+        finality: QueryFinalityRequirement::DurableOnly,
+        fields: FieldSelectionApi::All,
+    };
+
+    let input = request.into_native_input().expect("native request maps");
+
+    assert_eq!(input.chain, ethereum_identity());
+    assert_eq!(input.dataset_key, DatasetKey::evm_blocks());
+    assert_eq!(
+        input.ledger_range,
+        LedgerRange::blocks(10, 12).expect("range")
+    );
+    assert_eq!(input.selector, DatasetSelector::all());
+    assert_eq!(input.response_shape, ResponseShape::NativeRows);
+    assert_eq!(input.field_selection, FieldSelection::All);
+    assert_eq!(input.finality, QueryFinalityRequirement::DurableOnly);
+}
+
+#[test]
+fn test_native_api_evm_logs_request_maps_to_native_input() {
+    let request: QueryApiRequest = serde_json::from_value(serde_json::json!({
+        "chain": ethereum_identity(),
+        "dataset_key": "evm.logs",
+        "selector": {
+            "kind": "evm_logs",
+            "value": {
+                "addresses": ["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+                "topics": [null, [TOPIC_A]]
+            }
+        },
+        "range": { "kind": "block", "start": 20, "end": 21 },
+        "finality": "safe_to_latest",
+        "fields": "all"
+    }))
+    .expect("request json");
+
+    let input = request.into_native_input().expect("native request maps");
+
+    assert_eq!(input.dataset_key, DatasetKey::evm_logs());
+    assert_eq!(
+        input.ledger_range,
+        LedgerRange::blocks(20, 21).expect("range")
+    );
+    assert!(matches!(input.selector, DatasetSelector::EvmLogs(_)));
+    assert_eq!(input.finality, QueryFinalityRequirement::SafeToLatest);
+}
+
+#[test]
+fn test_native_api_solana_slots_request_maps_to_native_input() {
+    let request = QueryApiRequest {
+        chain: ChainIdentity::try_new(
+            ChainFamily::Other("solana".to_owned()),
+            "mainnet",
+            Some(NetworkId::textual("mainnet-beta").expect("network id")),
+        )
+        .expect("valid chain"),
+        dataset_key: "solana.slots".to_owned(),
+        selector: QuerySelectorApi::Other {
+            kind: "solana_all".to_owned(),
+            fingerprint: "solana-all/all".to_owned(),
+            canonical_key: "all".to_owned(),
+        },
+        range: QueryRangeApi::Slot {
+            start: 100,
+            end: 102,
+        },
+        finality: QueryFinalityRequirement::DurableOnly,
+        fields: FieldSelectionApi::All,
+    };
+
+    let input = request.into_native_input().expect("native request maps");
+
+    assert_eq!(input.dataset_key, DatasetKey::solana_slots());
+    assert_eq!(
+        input.ledger_range,
+        LedgerRange::slots(100, 102).expect("range")
+    );
+    assert!(matches!(input.selector, DatasetSelector::Other { .. }));
+}
+
+#[test]
+fn test_native_api_tron_blocks_request_maps_to_native_input() {
+    let request = QueryApiRequest {
+        chain: ChainIdentity::try_new(
+            ChainFamily::Other("tron".to_owned()),
+            "mainnet",
+            Some(NetworkId::numeric(728126428)),
+        )
+        .expect("valid chain"),
+        dataset_key: "tron.blocks".to_owned(),
+        selector: QuerySelectorApi::Other {
+            kind: "tron_all".to_owned(),
+            fingerprint: "tron-all/all".to_owned(),
+            canonical_key: "all".to_owned(),
+        },
+        range: QueryRangeApi::Block { start: 30, end: 31 },
+        finality: QueryFinalityRequirement::LatestOnly,
+        fields: FieldSelectionApi::All,
+    };
+
+    let input = request.into_native_input().expect("native request maps");
+
+    assert_eq!(input.dataset_key, DatasetKey::tron_blocks());
+    assert_eq!(
+        input.ledger_range,
+        LedgerRange::blocks(30, 31).expect("range")
+    );
+    assert_eq!(input.finality, QueryFinalityRequirement::LatestOnly);
+}
+
+#[test]
+fn test_native_api_request_rejects_invalid_dataset_key() {
+    let request = QueryApiRequest {
+        chain: ethereum_identity(),
+        dataset_key: "logs".to_owned(),
+        selector: QuerySelectorApi::All,
+        range: QueryRangeApi::Block { start: 1, end: 1 },
+        finality: QueryFinalityRequirement::DurableOnly,
+        fields: FieldSelectionApi::All,
+    };
+
+    let error = request
+        .into_native_input()
+        .expect_err("invalid dataset key");
+
+    assert_eq!(error.kind, DatalensErrorKind::InvalidInput);
+    assert!(error.message.contains("dataset_key"));
+}
+
+#[test]
+fn test_native_api_request_rejects_invalid_range_kind() {
+    let error = serde_json::from_value::<QueryApiRequest>(serde_json::json!({
+        "chain": ethereum_identity(),
+        "dataset_key": "evm.blocks",
+        "selector": { "kind": "all" },
+        "range": { "kind": "epoch", "start": 1, "end": 1 },
+        "finality": "durable_only",
+        "fields": "all"
+    }))
+    .expect_err("invalid range kind");
+
+    assert!(error.to_string().contains("unknown variant"));
+}
+
+#[test]
+fn test_native_api_request_rejects_unsupported_selector() {
+    let error = serde_json::from_value::<QueryApiRequest>(serde_json::json!({
+        "chain": ethereum_identity(),
+        "dataset_key": "evm.blocks",
+        "selector": { "kind": "logs" },
+        "range": { "kind": "block", "start": 1, "end": 1 },
+        "finality": "durable_only",
+        "fields": "all"
+    }))
+    .expect_err("unsupported selector kind");
+
+    assert!(error.to_string().contains("unknown variant"));
+}
+
+#[test]
+fn test_native_api_finality_values_map_without_allow_hot() {
+    for (value, expected) in [
+        ("durable_only", QueryFinalityRequirement::DurableOnly),
+        ("safe_to_latest", QueryFinalityRequirement::SafeToLatest),
+        ("latest_only", QueryFinalityRequirement::LatestOnly),
+    ] {
+        let request: QueryApiRequest = serde_json::from_value(serde_json::json!({
+            "chain": ethereum_identity(),
+            "dataset_key": "evm.blocks",
+            "selector": { "kind": "all" },
+            "range": { "kind": "block", "start": 1, "end": 1 },
+            "finality": value,
+            "fields": "all"
+        }))
+        .expect("request json");
+
+        assert_eq!(
+            request
+                .into_native_input()
+                .expect("native request maps")
+                .finality,
+            expected
+        );
+    }
+}
+
+#[test]
+fn test_native_api_response_uses_ledger_ranges_and_dataset_rows() {
+    let response = QueryApiResponse::from(NativeQueryResponse {
+        chain: ethereum_identity(),
+        dataset_key: DatasetKey::evm_blocks(),
+        ledger_range: LedgerRange::blocks(10, 10).expect("range"),
+        cache: datalens_edge::NativeCacheSummary {
+            hit_ranges: vec![LedgerRange::blocks(10, 10).expect("range")],
+            missing_ranges: Vec::new(),
+            durable_hit_ranges: vec![LedgerRange::blocks(10, 10).expect("range")],
+            hot_hit_ranges: Vec::new(),
+            provider_fill_ranges: Vec::new(),
+            promotion_pending_ranges: Vec::new(),
+            segments: Vec::new(),
+        },
+        rows: datalens_core::DatasetRows::new(
+            DatasetKey::evm_blocks(),
+            QueryRows::EvmBlocks(vec![block(10, "0x10")]),
+        )
+        .expect("rows"),
+    });
+
+    let json = serde_json::to_value(response).expect("response json");
+
+    assert_eq!(json["dataset_key"], "evm.blocks");
+    assert_eq!(
+        json["range"],
+        serde_json::json!({ "kind": "block", "start": 10, "end": 10 })
+    );
+    assert_eq!(json["rows"]["dataset_key"]["name"], "blocks");
 }
 
 #[test]
