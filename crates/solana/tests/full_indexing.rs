@@ -9,7 +9,7 @@ use datalens_indexer::{
     IndexRuntimeConfig,
 };
 use datalens_metrics::ApplicationIdentity;
-use datalens_planner::{FieldSelection, NativePlannerConfig, NativeQueryInput, ResponseShape};
+use datalens_planner::{FieldSelection, NativePlannerConfig, NativeQueryInput};
 use datalens_solana::{
     SolanaAdapter, SolanaBlock, SolanaCommitment, SolanaInnerInstructionGroup, SolanaInstruction,
     SolanaRpc, SolanaTokenBalance, SolanaTransaction,
@@ -177,7 +177,6 @@ fn test_durable_query_reads_indexed_solana_data_without_provider_fill() {
             dataset_key: DatasetKey::solana_transactions(),
             ledger_range: LedgerRange::slots(10, 12).expect("range"),
             selector: DatasetSelector::all(),
-            response_shape: ResponseShape::NativeRows,
             field_selection: FieldSelection::All,
             finality: datalens_core::QueryFinalityRequirement::DurableOnly,
         })

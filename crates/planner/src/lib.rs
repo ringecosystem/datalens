@@ -62,16 +62,8 @@ pub struct NativeQueryInput {
     pub dataset_key: DatasetKey,
     pub ledger_range: LedgerRange,
     pub selector: DatasetSelector,
-    pub response_shape: ResponseShape,
     pub field_selection: FieldSelection,
     pub finality: QueryFinalityRequirement,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ResponseShape {
-    LegacyEvmBlocks,
-    LegacyEvmLogs,
-    NativeRows,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -145,7 +137,6 @@ pub struct NativeQueryPlan {
     pub dataset_key: DatasetKey,
     pub ledger_range: LedgerRange,
     pub selector: DatasetSelector,
-    pub response_shape: ResponseShape,
     pub field_selection: FieldSelection,
     pub requested_finality: QueryFinalityRequirement,
     pub range_split: RangeSplitStrategy,
@@ -280,7 +271,6 @@ impl NativePlanner {
                 dataset_key: input.dataset_key.clone(),
                 ledger_range: input.ledger_range.clone(),
                 selector: input.selector,
-                response_shape: input.response_shape,
                 field_selection: input.field_selection,
                 requested_finality: input.finality,
                 range_split: RangeSplitStrategy::MaxLedgerSpan {
@@ -418,7 +408,6 @@ impl NativePlanner {
                 dataset_key: input.dataset_key.clone(),
                 ledger_range: input.ledger_range,
                 selector: input.selector,
-                response_shape: input.response_shape,
                 field_selection: input.field_selection,
                 requested_finality: input.finality,
                 range_split: RangeSplitStrategy::MaxLedgerSpan {
@@ -493,7 +482,6 @@ impl NativePlanner {
             dataset_key: input.dataset_key.clone(),
             ledger_range: input.ledger_range,
             selector: input.selector,
-            response_shape: input.response_shape,
             field_selection: input.field_selection,
             requested_finality: input.finality,
             range_split: RangeSplitStrategy::MaxLedgerSpan {

@@ -10,18 +10,20 @@ use axum::{
 };
 use datalens_chain::{
     AdapterCapabilities, ChainAdapter, ChainFetchRequest, ChainFetchResponse, ChainHeight,
-    DatasetCapability, FinalityKind, HeightRangeKind, ProviderDiagnostics, SelectorKind,
+    DatasetCapability, DatasetSelector, FinalityKind, HeightRangeKind, ProviderDiagnostics,
+    SelectorKind,
 };
 use datalens_core::{
     BlockHeader, BlockRange, ChainFamily, ChainIdentity, DatalensError, Dataset, DatasetKey,
-    LogFilter, NetworkId, QueryFinalityRequirement, QueryRows,
+    LedgerRange, LogFilter, NetworkId, QueryFinalityRequirement, QueryRows, TopicFilter,
 };
 use datalens_edge::{
-    LegacyEvmQueryRequest, QueryService, QueryServiceRegistry,
+    QueryService, QueryServiceRegistry,
     config::{DatalensConfig, WriterConfig},
     router,
 };
 use datalens_metrics::MetricsRecorder;
+use datalens_planner::{FieldSelection, NativeQueryInput};
 use datalens_storage::{
     DurableStorage, LocalObjectStore, LocalStorage, ObjectMetadata, ObjectStore,
     ReadThroughCacheConfig,
@@ -67,12 +69,12 @@ async fn test_production_readiness_validates_service_staging_warmup_metrics_and_
     let service = service.with_warmup_pool(warmup_pool(&root, &config.writer, metrics));
 
     let staged = service
-        .query(blocks_request(10, 10))
+        .query_native(blocks_request(10, 10))
         .expect("staging boundary returns provider rows");
     assert_eq!(block_numbers(&staged), vec![10]);
     assert_eq!(
         staged.cache.missing_ranges,
-        vec![BlockRange::expect_new(10, 10)]
+        vec![LedgerRange::blocks(10, 10).expect("range")]
     );
     assert!(
         storage.manifest().expect("manifest").entries.is_empty(),
@@ -90,23 +92,23 @@ async fn test_production_readiness_validates_service_staging_warmup_metrics_and_
         .expect("flushed data object key");
 
     let first_hit = service
-        .query(blocks_request(10, 10))
+        .query_native(blocks_request(10, 10))
         .expect("durable boundary serves flushed rows");
     let second_hit = service
-        .query(blocks_request(10, 10))
+        .query_native(blocks_request(10, 10))
         .expect("read-through boundary serves cached object bytes");
     assert_eq!(
         first_hit.cache.durable_hit_ranges,
-        vec![BlockRange::expect_new(10, 10)]
+        vec![LedgerRange::blocks(10, 10).expect("range")]
     );
     assert_eq!(
         second_hit.cache.durable_hit_ranges,
-        vec![BlockRange::expect_new(10, 10)]
+        vec![LedgerRange::blocks(10, 10).expect("range")]
     );
     assert_eq!(store.read_count(&object_key), 1);
 
     let flushed = service
-        .query(blocks_request(12, 14))
+        .query_native(blocks_request(12, 14))
         .expect("writer boundary flushes when staged rows reach threshold");
     assert_eq!(block_numbers(&flushed), vec![12, 13, 14]);
     assert!(
@@ -120,8 +122,7 @@ async fn test_production_readiness_validates_service_staging_warmup_metrics_and_
     );
 
     let hot = service
-        .query(LegacyEvmQueryRequest {
-            allow_hot: true,
+        .query_native(NativeQueryInput {
             finality: QueryFinalityRequirement::LatestOnly,
             ..blocks_request(90, 90)
         })
@@ -129,7 +130,7 @@ async fn test_production_readiness_validates_service_staging_warmup_metrics_and_
     assert_eq!(block_numbers(&hot), vec![90]);
     assert_eq!(
         hot.cache.provider_fill_ranges,
-        vec![BlockRange::expect_new(90, 90)]
+        vec![LedgerRange::blocks(90, 90).expect("range")]
     );
     assert!(hot.cache.durable_hit_ranges.is_empty());
 
@@ -150,7 +151,7 @@ async fn test_production_readiness_validates_service_staging_warmup_metrics_and_
                         "dataset_key": "evm.logs",
                         "selector": {
                             "kind": "evm_logs",
-                            "value": logs_request(20, 21).filter
+                            "value": evm_logs_selector_value(&logs_request(20, 21))
                         },
                         "range_kind": { "kind": "block" },
                         "start": 20,
@@ -353,32 +354,28 @@ impl ChainAdapter for MockSource {
 
     fn fetch(&self, request: ChainFetchRequest) -> Result<ChainFetchResponse, DatalensError> {
         let range = request.range.block_range().expect("block range");
-        match request.dataset_key.legacy_dataset() {
-            Some(Dataset::Blocks) => {
-                self.calls
-                    .lock()
-                    .expect("calls")
-                    .push(SourceCall::Blocks(range));
-                let rows = self
-                    .blocks
-                    .lock()
-                    .expect("blocks")
-                    .iter()
-                    .filter(|block| range.contains(block.number))
-                    .cloned()
-                    .collect();
-                response(request, QueryRows::EvmBlocks(rows))
-            }
-            Some(Dataset::Logs) => {
-                self.calls
-                    .lock()
-                    .expect("calls")
-                    .push(SourceCall::Logs(range));
-                response(request, QueryRows::EvmLogs(Vec::new()))
-            }
-            Some(Dataset::Transactions) | Some(Dataset::Receipts) | None => {
-                unreachable!("production-readiness fixture only serves EVM blocks and logs")
-            }
+        if request.dataset_key == DatasetKey::evm_blocks() {
+            self.calls
+                .lock()
+                .expect("calls")
+                .push(SourceCall::Blocks(range));
+            let rows = self
+                .blocks
+                .lock()
+                .expect("blocks")
+                .iter()
+                .filter(|block| range.contains(block.number))
+                .cloned()
+                .collect();
+            response(request, QueryRows::EvmBlocks(rows))
+        } else if request.dataset_key == DatasetKey::evm_logs() {
+            self.calls
+                .lock()
+                .expect("calls")
+                .push(SourceCall::Logs(range));
+            response(request, QueryRows::EvmLogs(Vec::new()))
+        } else {
+            unreachable!("production-readiness fixture only serves EVM blocks and logs")
         }
     }
 }
@@ -454,57 +451,86 @@ fn warmup_pool(
     )
 }
 
-fn blocks_request(from_block: u64, to_block: u64) -> LegacyEvmQueryRequest {
-    LegacyEvmQueryRequest {
+fn blocks_request(from_block: u64, to_block: u64) -> NativeQueryInput {
+    NativeQueryInput {
         chain: ethereum_identity(),
-        dataset: Dataset::Blocks,
-        range: BlockRange::expect_new(from_block, to_block),
-        filter: None,
-        include_block: false,
-        allow_hot: false,
+        dataset_key: DatasetKey::evm_blocks(),
+        ledger_range: LedgerRange::blocks(from_block, to_block).expect("valid range"),
+        selector: DatasetSelector::all(),
+        field_selection: FieldSelection::All,
         finality: QueryFinalityRequirement::DurableOnly,
     }
 }
 
-fn logs_request(from_block: u64, to_block: u64) -> LegacyEvmQueryRequest {
-    LegacyEvmQueryRequest {
+fn logs_request(from_block: u64, to_block: u64) -> NativeQueryInput {
+    NativeQueryInput {
         chain: ethereum_identity(),
-        dataset: Dataset::Logs,
-        range: BlockRange::expect_new(from_block, to_block),
-        filter: Some(LogFilter {
+        dataset_key: DatasetKey::evm_logs(),
+        ledger_range: LedgerRange::blocks(from_block, to_block).expect("valid range"),
+        selector: DatasetSelector::try_evm_logs(LogFilter {
             addresses: vec!["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()],
             topics: Vec::new(),
-        }),
-        include_block: false,
-        allow_hot: false,
+        })
+        .expect("valid logs selector"),
+        field_selection: FieldSelection::All,
         finality: QueryFinalityRequirement::DurableOnly,
     }
 }
 
-fn query_body(request: LegacyEvmQueryRequest) -> Vec<u8> {
-    let selector = match request.dataset {
-        Dataset::Blocks => serde_json::json!({ "kind": "all" }),
-        Dataset::Logs => serde_json::json!({
+fn query_body(request: NativeQueryInput) -> Vec<u8> {
+    let selector = match &request.selector {
+        DatasetSelector::All => serde_json::json!({ "kind": "all" }),
+        DatasetSelector::EvmLogs(filter) => serde_json::json!({
             "kind": "evm_logs",
-            "value": request.filter.expect("logs request filter")
+            "value": evm_log_filter_value(filter)
         }),
-        Dataset::Transactions | Dataset::Receipts => {
-            panic!("test helper only supports blocks and logs")
-        }
+        DatasetSelector::Other {
+            kind,
+            fingerprint,
+            canonical_key,
+        } => serde_json::json!({
+            "kind": "other",
+            "value": {
+                "kind": kind.as_str(),
+                "fingerprint": fingerprint,
+                "canonical_key": canonical_key
+            }
+        }),
     };
     serde_json::to_vec(&serde_json::json!({
         "chain": request.chain,
-        "dataset_key": DatasetKey::from(request.dataset).as_str(),
+        "dataset_key": request.dataset_key.as_str(),
         "selector": selector,
         "range": {
             "kind": "block",
-            "start": request.range.from_block,
-            "end": request.range.to_block
+            "start": request.ledger_range.start(),
+            "end": request.ledger_range.end()
         },
         "finality": request.finality,
         "fields": "all"
     }))
     .expect("query request json")
+}
+
+fn evm_logs_selector_value(request: &NativeQueryInput) -> serde_json::Value {
+    match &request.selector {
+        DatasetSelector::EvmLogs(filter) => evm_log_filter_value(filter),
+        _ => panic!("expected evm logs selector"),
+    }
+}
+
+fn evm_log_filter_value(filter: &datalens_core::EvmLogFilter) -> serde_json::Value {
+    serde_json::json!({
+        "addresses": filter.addresses(),
+        "topics": filter
+            .topics()
+            .iter()
+            .map(|topic| match topic {
+                TopicFilter::Wildcard => serde_json::Value::Null,
+                TopicFilter::AnyOf(values) => serde_json::json!(values),
+            })
+            .collect::<Vec<_>>()
+    })
 }
 
 fn ethereum_identity() -> ChainIdentity {
@@ -521,8 +547,8 @@ fn block(number: u64) -> BlockHeader {
     }
 }
 
-fn block_numbers(response: &datalens_edge::LegacyEvmQueryResponse) -> Vec<u64> {
-    match &response.rows {
+fn block_numbers(response: &datalens_edge::NativeQueryResponse) -> Vec<u64> {
+    match response.rows.rows() {
         QueryRows::EvmBlocks(rows) => rows.iter().map(|row| row.number).collect(),
         _ => panic!("expected block rows"),
     }

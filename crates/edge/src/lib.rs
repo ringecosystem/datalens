@@ -24,7 +24,7 @@ use datalens_chain::{AdapterKey, ChainAdapter, DatasetSelector};
 use datalens_core::{
     BlockRange, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, Dataset, DatasetKey,
     DatasetRows, LedgerRange, LedgerRangeKind, LogFilter, NetworkId, QueryDataFinality,
-    QueryFinalityRequirement, QueryRows, QuerySegmentSource,
+    QueryFinalityRequirement, QuerySegmentSource,
 };
 use datalens_executor::{NativeQueryExecutionConfig, NativeQueryExecutor};
 use datalens_metrics::{ApplicationIdentity, MetricsRecorder};
@@ -466,8 +466,7 @@ pub mod streaming {
 
 pub mod contract {
     pub use super::{
-        CacheSummary, ChainDiscovery, DiscoveryResponse, LegacyEvmQueryRequest,
-        LegacyEvmQueryResponse, NativeCacheSummary, NativeQueryResponse, QuerySegment,
+        ChainDiscovery, DiscoveryResponse, NativeCacheSummary, NativeQueryResponse,
         WarmupDatasetKeyApi, WarmupRunOnceApiResponse, WarmupSelectorApiRequest,
         WarmupSubmitApiRequest, WarmupSubmitApiResponse, WarmupTaskApiResponse,
         WarmupTaskListApiResponse, WarmupTaskListQuery, WarmupTaskView,
@@ -478,7 +477,6 @@ pub mod service {
     pub use super::{
         LifecycleShutdown, NoopLifecycleShutdown, QueryService, QueryServiceRegistry,
         RegisteredWarmupService, ServiceLifecycle, WarmupSchedulerHandle,
-        legacy_evm_to_native_input,
     };
 }
 
@@ -931,20 +929,6 @@ use config::{ChainConfig, MetricsConfig, PlannerConfig, WriterConfig};
 pub const APPLICATION_IDENTITY_HEADER: &str = "x-datalens-application";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct LegacyEvmQueryRequest {
-    pub chain: ChainIdentity,
-    pub dataset: Dataset,
-    pub range: BlockRange,
-    pub filter: Option<LogFilter>,
-    #[serde(default)]
-    pub include_block: bool,
-    #[serde(default)]
-    pub allow_hot: bool,
-    #[serde(default)]
-    pub finality: QueryFinalityRequirement,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CacheSummary {
     pub hit_ranges: Vec<BlockRange>,
     pub missing_ranges: Vec<BlockRange>,
@@ -960,14 +944,6 @@ pub struct QuerySegment {
     pub range: BlockRange,
     pub source: QuerySegmentSource,
     pub finality: QueryDataFinality,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct LegacyEvmQueryResponse {
-    pub chain: ChainIdentity,
-    pub range: BlockRange,
-    pub cache: CacheSummary,
-    pub rows: QueryRows,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1177,7 +1153,6 @@ impl QueryApiRequest {
             dataset_key: parse_dataset_key(&self.dataset_key)?,
             ledger_range: self.range.into_ledger_range()?,
             selector: self.selector.into_selector()?,
-            response_shape: datalens_planner::ResponseShape::NativeRows,
             field_selection: self.fields.into_field_selection(),
             finality: self.finality,
         })
@@ -1378,58 +1353,6 @@ fn warmup_task_view(task: WarmupTask) -> Result<WarmupTaskView, DatalensError> {
     })
 }
 
-pub fn legacy_evm_to_native_input(
-    request: LegacyEvmQueryRequest,
-) -> Result<NativeQueryInput, DatalensError> {
-    if request.finality.allows_hot() && !request.allow_hot {
-        return Err(DatalensError::new(
-            DatalensErrorKind::InvalidInput,
-            "allow_hot must be true when requesting hot or latest data",
-        ));
-    }
-    let finality =
-        if request.allow_hot && matches!(request.finality, QueryFinalityRequirement::DurableOnly) {
-            QueryFinalityRequirement::SafeToLatest
-        } else {
-            request.finality
-        };
-    let selector = match request.dataset {
-        Dataset::Blocks => datalens_chain::DatasetSelector::all(),
-        Dataset::Transactions | Dataset::Receipts => {
-            return Err(DatalensError::new(
-                DatalensErrorKind::UnsupportedDataset,
-                "legacy EVM query route does not support transactions or receipts",
-            ));
-        }
-        Dataset::Logs => {
-            let filter = request.filter.ok_or_else(|| {
-                DatalensError::new(DatalensErrorKind::InvalidInput, "logs require filter")
-            })?;
-            datalens_chain::DatasetSelector::try_evm_logs(filter)?
-        }
-    };
-    let response_shape = match request.dataset {
-        Dataset::Blocks => datalens_planner::ResponseShape::LegacyEvmBlocks,
-        Dataset::Transactions | Dataset::Receipts => {
-            return Err(DatalensError::new(
-                DatalensErrorKind::UnsupportedDataset,
-                "legacy EVM query route does not support transactions or receipts",
-            ));
-        }
-        Dataset::Logs => datalens_planner::ResponseShape::LegacyEvmLogs,
-    };
-
-    Ok(NativeQueryInput {
-        chain: request.chain,
-        dataset_key: DatasetKey::from(request.dataset),
-        ledger_range: LedgerRange::from_block_range(request.range),
-        selector,
-        response_shape,
-        field_selection: datalens_planner::FieldSelection::All,
-        finality,
-    })
-}
-
 #[derive(Clone)]
 pub struct QueryService<S> {
     executor: NativeQueryExecutor<Arc<dyn StorageRepository>, S>,
@@ -1587,73 +1510,6 @@ where
         &self.chain_name
     }
 
-    pub fn query(
-        &self,
-        request: LegacyEvmQueryRequest,
-    ) -> Result<LegacyEvmQueryResponse, DatalensError> {
-        self.query_with_application(request, None)
-    }
-
-    pub fn query_with_application(
-        &self,
-        request: LegacyEvmQueryRequest,
-        application: Option<ApplicationIdentity>,
-    ) -> Result<LegacyEvmQueryResponse, DatalensError> {
-        log::info!(
-            "legacy evm query start chain={} dataset={} range={}-{}",
-            request.chain.configured_name(),
-            request.dataset.as_str(),
-            request.range.from_block,
-            request.range.to_block
-        );
-        if let Err(error) = self.validate_legacy_evm_route(&request) {
-            log::warn!("query validation failed kind={:?}", error.kind);
-            return Err(error);
-        }
-        let response_range = request.range;
-        let response =
-            self.query_native_with_application(legacy_evm_to_native_input(request)?, application)?;
-        let hit_ranges = legacy_block_ranges(&response.cache.hit_ranges)?;
-        let misses = legacy_block_ranges(&response.cache.missing_ranges)?;
-        let durable_hit_ranges = legacy_block_ranges(&response.cache.durable_hit_ranges)?;
-        let hot_hit_ranges = legacy_block_ranges(&response.cache.hot_hit_ranges)?;
-        let provider_fill_ranges = legacy_block_ranges(&response.cache.provider_fill_ranges)?;
-        let promotion_pending_ranges =
-            legacy_block_ranges(&response.cache.promotion_pending_ranges)?;
-        let segments = response
-            .cache
-            .segments
-            .iter()
-            .map(|segment| {
-                Ok(QuerySegment {
-                    range: segment.range.block_range().ok_or_else(|| {
-                        DatalensError::new(
-                            DatalensErrorKind::Internal,
-                            "legacy response requires block segment ranges",
-                        )
-                    })?,
-                    source: segment.source,
-                    finality: segment.finality,
-                })
-            })
-            .collect::<Result<Vec<_>, DatalensError>>()?;
-
-        Ok(LegacyEvmQueryResponse {
-            chain: response.chain,
-            range: response_range,
-            cache: CacheSummary {
-                hit_ranges,
-                missing_ranges: misses,
-                durable_hit_ranges,
-                hot_hit_ranges,
-                provider_fill_ranges,
-                promotion_pending_ranges,
-                segments,
-            },
-            rows: response.rows.into_rows(),
-        })
-    }
-
     pub fn query_native(
         &self,
         native_input: NativeQueryInput,
@@ -1666,6 +1522,10 @@ where
         native_input: NativeQueryInput,
         application: Option<ApplicationIdentity>,
     ) -> Result<NativeQueryResponse, DatalensError> {
+        if let Err(error) = self.validate_native_query_route(&native_input) {
+            log::warn!("query validation failed kind={:?}", error.kind);
+            return Err(error);
+        }
         log::info!(
             "native query start chain={} dataset={} range={}-{}",
             native_input.chain.configured_name(),
@@ -1719,51 +1579,41 @@ where
         })
     }
 
-    fn validate_legacy_evm_route(
-        &self,
-        request: &LegacyEvmQueryRequest,
-    ) -> Result<(), DatalensError> {
-        if request.chain.configured_name() != self.chain_name {
+    fn validate_native_query_route(&self, input: &NativeQueryInput) -> Result<(), DatalensError> {
+        if input.chain.configured_name() != self.chain_name {
             return Err(DatalensError::new(
                 DatalensErrorKind::UnsupportedDataset,
                 "chain is not configured",
             ));
         }
-        if self.chain.kind != "evm" {
+        let chain_family = chain_family(&self.chain.kind)?;
+        if input.chain.family_ref() != &chain_family || input.dataset_key.family() != &chain_family
+        {
             return Err(DatalensError::new(
                 DatalensErrorKind::UnsupportedDataset,
-                "only evm chains are supported",
+                "query chain and dataset must match the configured chain kind",
             ));
         }
-
-        match request.dataset {
-            Dataset::Blocks if !self.chain.datasets.blocks.enabled => Err(DatalensError::new(
-                DatalensErrorKind::UnsupportedDataset,
-                "blocks dataset is disabled",
-            )),
-            Dataset::Logs if !self.chain.datasets.logs.enabled => Err(DatalensError::new(
-                DatalensErrorKind::UnsupportedDataset,
-                "logs dataset is disabled",
-            )),
-            Dataset::Logs => request.filter.as_ref().map(|_| ()).ok_or_else(|| {
-                DatalensError::new(DatalensErrorKind::InvalidInput, "logs require filter")
-            }),
-            Dataset::Transactions | Dataset::Receipts => Err(DatalensError::new(
-                DatalensErrorKind::UnsupportedDataset,
-                "legacy EVM query route does not support transactions or receipts",
-            )),
-            Dataset::Blocks => Ok(()),
+        if self.chain.kind == "evm" {
+            if input.dataset_key == DatasetKey::evm_blocks() && !self.chain.datasets.blocks.enabled
+            {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::UnsupportedDataset,
+                    "blocks dataset is disabled",
+                ));
+            }
+            if input.dataset_key == DatasetKey::evm_logs() && !self.chain.datasets.logs.enabled {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::UnsupportedDataset,
+                    "logs dataset is disabled",
+                ));
+            }
         }
+        Ok(())
     }
 }
 
 trait RegisteredQueryService: Send + Sync {
-    fn query(
-        &self,
-        request: LegacyEvmQueryRequest,
-        application: Option<ApplicationIdentity>,
-    ) -> Result<LegacyEvmQueryResponse, DatalensError>;
-
     fn query_native(
         &self,
         request: NativeQueryInput,
@@ -1828,14 +1678,6 @@ impl<S> RegisteredQueryService for QueryService<S>
 where
     S: ChainAdapter + 'static,
 {
-    fn query(
-        &self,
-        request: LegacyEvmQueryRequest,
-        application: Option<ApplicationIdentity>,
-    ) -> Result<LegacyEvmQueryResponse, DatalensError> {
-        QueryService::query_with_application(self, request, application)
-    }
-
     fn query_native(
         &self,
         request: NativeQueryInput,
@@ -1897,28 +1739,6 @@ impl QueryServiceRegistry {
 
     pub fn chain_names(&self) -> Vec<String> {
         self.services.keys().cloned().collect()
-    }
-
-    pub fn query(
-        &self,
-        request: LegacyEvmQueryRequest,
-    ) -> Result<LegacyEvmQueryResponse, DatalensError> {
-        self.query_with_application(request, None)
-    }
-
-    pub fn query_with_application(
-        &self,
-        request: LegacyEvmQueryRequest,
-        application: Option<ApplicationIdentity>,
-    ) -> Result<LegacyEvmQueryResponse, DatalensError> {
-        let chain_name = request.chain.configured_name();
-        let service = self.services.get(chain_name).ok_or_else(|| {
-            DatalensError::new(
-                DatalensErrorKind::UnsupportedDataset,
-                format!("chain {chain_name} is not configured"),
-            )
-        })?;
-        service.query(request, application)
     }
 
     pub fn query_native(
@@ -2680,20 +2500,6 @@ fn flush_registry_staged_writes_for_shutdown(
             }
         })
         .map_err(|error| std::io::Error::other(error.to_string()))
-}
-
-fn legacy_block_ranges(ranges: &[LedgerRange]) -> Result<Vec<BlockRange>, DatalensError> {
-    ranges
-        .iter()
-        .map(|range| {
-            range.block_range().ok_or_else(|| {
-                DatalensError::new(
-                    DatalensErrorKind::Internal,
-                    "native plan returned non-block range for legacy evm response",
-                )
-            })
-        })
-        .collect()
 }
 
 fn application_from_headers(headers: &HeaderMap) -> Option<ApplicationIdentity> {

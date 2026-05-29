@@ -14,7 +14,7 @@ use datalens_edge::{
 };
 use datalens_evm::{EvmAdapter, EvmAdapterMetadata, EvmFinalityPolicy, EvmRpcClient};
 use datalens_metrics::ApplicationIdentity;
-use datalens_planner::{FieldSelection, NativeQueryInput, ResponseShape};
+use datalens_planner::{FieldSelection, NativeQueryInput};
 use datalens_solana::{SolanaAdapter, SolanaHttpRpc};
 use datalens_storage::{
     DurableStorage, LocalObjectStore, LocalStorage, ManifestEntry, ManifestFinalityLevel,
@@ -213,7 +213,6 @@ fn query_command(command: QueryCommand) -> Result<(), Box<dyn std::error::Error 
             dataset_key: DatasetKey::evm_blocks(),
             ledger_range: LedgerRange::blocks(command.from_block, command.to_block)?,
             selector: datalens_chain::DatasetSelector::all(),
-            response_shape: ResponseShape::NativeRows,
             field_selection: FieldSelection::All,
             finality: datalens_core::QueryFinalityRequirement::DurableOnly,
         },
@@ -232,7 +231,6 @@ fn query_command(command: QueryCommand) -> Result<(), Box<dyn std::error::Error 
                 dataset_key: DatasetKey::evm_logs(),
                 ledger_range: LedgerRange::blocks(command.from_block, command.to_block)?,
                 selector: datalens_chain::DatasetSelector::try_evm_logs(filter)?,
-                response_shape: ResponseShape::NativeRows,
                 field_selection: FieldSelection::All,
                 finality: datalens_core::QueryFinalityRequirement::DurableOnly,
             }
@@ -834,7 +832,7 @@ fn build_service(
     if chain.kind != "evm" {
         return Err(DatalensError::new(
             DatalensErrorKind::UnsupportedDataset,
-            "CLI legacy query commands only support evm chains",
+            "CLI query commands only support evm chains",
         ));
     }
     let storage: Arc<dyn datalens_storage::StorageRepository> = Arc::from(build_storage(config)?);
