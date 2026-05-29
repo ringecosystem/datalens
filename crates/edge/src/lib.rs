@@ -1,6 +1,7 @@
 //! Edge API boundary for datalens.
 
 pub mod auth;
+mod chain_family;
 pub mod config;
 pub mod contract;
 pub mod graphql;
@@ -32,13 +33,6 @@ pub use service::{
     registry::QueryServiceRegistry,
 };
 
-pub const APPLICATION_IDENTITY_HEADER: &str = "x-datalens-application";
+pub(crate) use chain_family::chain_family;
 
-pub(crate) fn chain_family(
-    kind: &str,
-) -> Result<datalens_core::ChainFamily, datalens_core::DatalensError> {
-    match kind {
-        "evm" => Ok(datalens_core::ChainFamily::Evm),
-        value => datalens_core::ChainFamily::try_other(value.to_owned()),
-    }
-}
+pub const APPLICATION_IDENTITY_HEADER: &str = "x-datalens-application";

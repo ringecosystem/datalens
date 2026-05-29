@@ -3,7 +3,7 @@ use datalens_core::{DatalensError, DatalensErrorKind};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::{
+use crate::adapter::{
     FINALIZED, SOLANA_ADDRESS_KIND, SOLANA_ALL_KIND, SOLANA_PROGRAM_KIND, SOLANA_SIGNATURE_KIND,
     SolanaBlock, SolanaInstruction, SolanaTokenBalance, SolanaTransaction,
     SolanaTransactionWithSlot,

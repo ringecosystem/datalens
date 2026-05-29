@@ -4,7 +4,7 @@ use datalens_chain::{ChainFetchRequest, DatasetSelector};
 use datalens_core::{DatalensError, DatalensErrorKind, LedgerRange};
 use serde_json::{Value, json};
 
-use super::{
+use crate::adapter::{
     TRON_EVENTS_KIND, TronAdapter, TronBlock, TronContractEvent, TronContractEventRequest,
     TronEventFilter, TronProvider, normalize_tron_contract_address,
 };
