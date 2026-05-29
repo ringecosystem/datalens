@@ -71,9 +71,9 @@ release gates.
   discovery.
 - `POST /v1/query` is the REST query transport. It executes the native query contract.
 - `POST /graphql` is the GraphQL query and warmup transport when
-  `api.graphql.enabled = true`.
+  `edge.graphql.enabled = true`.
 - `GET /graphql/playground` exposes GraphiQL when GraphQL and
-  `api.graphql.playground_enabled` are both enabled.
+  `edge.graphql.playground_enabled` are both enabled.
 - REST and GraphQL query operations must expose equivalent query capability over the
   same native contract. GraphQL may reshape inputs and outputs for GraphQL clients, but
   it must not introduce a separate query planner, storage contract, or dataset
