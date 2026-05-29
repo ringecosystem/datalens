@@ -24,6 +24,7 @@ use datalens_edge::{NativeQueryResponse, QueryService, QueryServiceRegistry, rou
 use datalens_planner::{FieldSelection, NativeQueryInput};
 use datalens_solana::{SolanaAdapter, solana_all_selector};
 use datalens_storage::{LocalStorage, StorageRepository};
+use datalens_tron::TronAdapter;
 use tower::ServiceExt;
 
 #[test]
@@ -382,7 +383,7 @@ async fn test_chains_route_lists_registered_chains() {
 }
 
 #[tokio::test]
-async fn test_discovery_route_lists_chain_identities_and_enabled_datasets() {
+async fn test_discovery_route_lists_chain_identities_and_native_dataset_capabilities() {
     let registry = QueryServiceRegistry::new()
         .with_service(service_named_with_datasets(
             LocalStorage::new(temp_storage_root("discovery-ethereum")),
@@ -393,13 +394,40 @@ async fn test_discovery_route_lists_chain_identities_and_enabled_datasets() {
             false,
         ))
         .expect("register ethereum")
-        .with_service(service_named(
-            LocalStorage::new(temp_storage_root("discovery-polygon")),
-            MockSource::default().with_chain(polygon_identity()),
-            "polygon",
-            137,
+        .with_service(QueryService::new_named(
+            LocalStorage::new(temp_storage_root("discovery-solana")),
+            SolanaAdapter::with_fixture_defaults(),
+            planner_config(),
+            writer_config(),
+            "solana-mainnet-beta",
+            solana_chain_config(),
         ))
-        .expect("register polygon");
+        .expect("register solana")
+        .with_service(QueryService::new_named(
+            LocalStorage::new(temp_storage_root("discovery-tron")),
+            TronAdapter::with_fixture_defaults(),
+            planner_config(),
+            writer_config(),
+            "tron-mainnet",
+            ChainConfig {
+                kind: "tron".to_owned(),
+                chain_id: 1,
+                rpc_urls: vec!["http://example.invalid".to_owned()],
+                finality: datalens_edge::config::FinalityConfig::Auto,
+                datasets: DatasetsConfig {
+                    blocks: datalens_edge::config::BlocksDatasetConfig {
+                        enabled: false,
+                        max_batch_blocks: 2,
+                    },
+                    logs: LogsDatasetConfig {
+                        enabled: false,
+                        max_get_logs_range_blocks: 2,
+                        max_addresses_per_query: 2,
+                    },
+                },
+            },
+        ))
+        .expect("register tron");
 
     let response = router(registry)
         .oneshot(
@@ -422,11 +450,78 @@ async fn test_discovery_route_lists_chain_identities_and_enabled_datasets() {
             "chains": [
                 {
                     "identity": ethereum_identity(),
-                    "datasets": ["blocks"]
+                    "datasets": [
+                        {
+                            "dataset_key": "evm.blocks",
+                            "range_kinds": [{"kind": "block"}],
+                            "selectors": ["all"],
+                            "enabled": true
+                        }
+                    ]
                 },
                 {
-                    "identity": polygon_identity(),
-                    "datasets": ["blocks", "logs"]
+                    "identity": solana_identity(),
+                    "datasets": [
+                        {
+                            "dataset_key": "solana.slots",
+                            "range_kinds": [{"kind": "slot"}],
+                            "selectors": ["solana_all", "all"],
+                            "enabled": true
+                        },
+                        {
+                            "dataset_key": "solana.blocks",
+                            "range_kinds": [{"kind": "slot"}],
+                            "selectors": ["solana_all", "all"],
+                            "enabled": true
+                        },
+                        {
+                            "dataset_key": "solana.transactions",
+                            "range_kinds": [{"kind": "slot"}],
+                            "selectors": ["all", "solana_address", "solana_program", "solana_signature"],
+                            "enabled": true
+                        },
+                        {
+                            "dataset_key": "solana.instructions",
+                            "range_kinds": [{"kind": "slot"}],
+                            "selectors": ["all", "solana_program"],
+                            "enabled": true
+                        },
+                        {
+                            "dataset_key": "solana.account_updates",
+                            "range_kinds": [{"kind": "slot"}],
+                            "selectors": ["all", "solana_all", "solana_address", "solana_program", "solana_signature"],
+                            "enabled": true
+                        }
+                    ]
+                },
+                {
+                    "identity": tron_mainnet_identity(),
+                    "datasets": [
+                        {
+                            "dataset_key": "tron.blocks",
+                            "range_kinds": [{"kind": "block"}],
+                            "selectors": ["tron_all"],
+                            "enabled": true
+                        },
+                        {
+                            "dataset_key": "tron.transactions",
+                            "range_kinds": [{"kind": "block"}],
+                            "selectors": ["tron_all"],
+                            "enabled": true
+                        },
+                        {
+                            "dataset_key": "tron.transaction_infos",
+                            "range_kinds": [{"kind": "block"}],
+                            "selectors": ["tron_all"],
+                            "enabled": true
+                        },
+                        {
+                            "dataset_key": "tron.events",
+                            "range_kinds": [{"kind": "block"}],
+                            "selectors": ["tron_all"],
+                            "enabled": true
+                        }
+                    ]
                 }
             ]
         })
@@ -1286,6 +1381,22 @@ fn solana_chain_config() -> ChainConfig {
     }
 }
 
+fn planner_config() -> PlannerConfig {
+    PlannerConfig {
+        max_query_range_blocks: 4,
+        default_chunk_range_blocks: 2,
+    }
+}
+
+fn writer_config() -> WriterConfig {
+    WriterConfig {
+        target_object_bytes: 1024,
+        min_object_rows: 1,
+        record_empty_coverage: true,
+        staging: Default::default(),
+    }
+}
+
 fn blocks_request(from_block: u64, to_block: u64) -> NativeQueryInput {
     blocks_request_for(ethereum_identity(), from_block, to_block)
 }
@@ -1366,11 +1477,29 @@ fn polygon_identity() -> ChainIdentity {
         .expect("valid chain identity")
 }
 
+fn solana_identity() -> ChainIdentity {
+    ChainIdentity::try_new(
+        ChainFamily::Other("solana".to_owned()),
+        "solana-mainnet-beta",
+        Some(NetworkId::textual("mainnet-beta").expect("valid network")),
+    )
+    .expect("valid chain identity")
+}
+
 fn tron_identity() -> ChainIdentity {
     ChainIdentity::try_new(
         ChainFamily::Other("tron".to_owned()),
         "tron",
         Some(NetworkId::numeric(1)),
+    )
+    .expect("valid chain identity")
+}
+
+fn tron_mainnet_identity() -> ChainIdentity {
+    ChainIdentity::try_new(
+        ChainFamily::Other("tron".to_owned()),
+        "tron-mainnet",
+        Some(NetworkId::textual("mainnet").expect("valid network")),
     )
     .expect("valid chain identity")
 }

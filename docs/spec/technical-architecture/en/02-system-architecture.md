@@ -13,9 +13,10 @@ ranges, persists the fill, and streams a response.
 The canonical flow is:
 
 1. SDK/API request enters the edge.
-2. Edge validation checks transport-level correctness.
-3. Compatibility translation converts external vocabulary into native datalens vocabulary
-   when needed.
+2. Edge validation checks transport-level correctness and converts REST or GraphQL input
+   into the native query contract.
+3. Future compatibility adapters may translate external vocabulary into native datalens
+   vocabulary before this point; they are not part of the current first-class API flow.
 4. Query planner builds an executable plan.
 5. Storage reads manifest coverage.
 6. Planner classifies ranges as covered, partially covered, or missing.
@@ -28,7 +29,7 @@ The canonical flow is:
 
 The implementation may pipeline these operations for performance, but the observable
 meaning should stay the same. Missing data must not be marked covered before it is durably
-written. Compatibility output must not leak into the core storage model.
+written. Future adapter output must not leak into the core storage model.
 
 ## Crate And Module Boundaries
 
@@ -63,9 +64,10 @@ encoding, object key layout, object store providers, or manifest repository deta
 GraphiQL, metrics, discovery, warmup task operations, authentication, application
 authorization, quota checks, service registry routing, and native query entrypoints. REST
 and GraphQL query surfaces expose equivalent query capability over the same native
-contract; transport handlers reshape requests and responses but must not define separate
-planner, storage, or dataset semantics. The edge translates at the boundary before
-calling the planner and reshapes responses after native response assembly.
+contract: `chain`, `dataset_key`, `selector`, `range`, `finality`, and `fields`.
+Transport handlers reshape requests and responses but must not define separate planner,
+storage, or dataset semantics. The edge translates at the boundary before calling the
+planner and reshapes responses after native response assembly.
 
 ## What This Step Implements First
 

@@ -67,17 +67,17 @@ release gates.
   serve requests.
 - `GET /metrics` is the Prometheus scrape endpoint. It returns Prometheus text format
   with content type `text/plain; version=0.0.4` when metrics are enabled.
-- `GET /v1/chains` and `GET /v1/discovery` expose configured chain and dataset
-  discovery.
+- `GET /v1/chains` and `GET /v1/discovery` expose configured chain discovery and
+  native dataset capability discovery.
 - `POST /v1/query` is the REST query transport. It executes the native query contract.
 - `POST /graphql` is the GraphQL query and warmup transport when
   `edge.graphql.enabled = true`.
 - `GET /graphql/playground` exposes GraphiQL when GraphQL and
   `edge.graphql.playground_enabled` are both enabled.
 - REST and GraphQL query operations must expose equivalent query capability over the
-  same native contract. GraphQL may reshape inputs and outputs for GraphQL clients, but
-  it must not introduce a separate query planner, storage contract, or dataset
-  vocabulary.
+  same native contract: `chain`, `dataset_key`, `selector`, `range`, `finality`, and
+  `fields`. GraphQL may reshape inputs and outputs for GraphQL clients, but it must not
+  introduce a separate query planner, storage contract, or dataset vocabulary.
 - Warmup task submission, listing, mutation, and run-once routes are edge operations over
   the warmup service registry. They share the same application authentication and
   authorization boundary as query routes.

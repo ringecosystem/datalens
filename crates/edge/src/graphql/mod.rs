@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     contract::error::{api_error_kind, api_error_status},
     contract::{
-        discovery::{ChainDiscovery, DiscoveryResponse},
+        discovery::{ChainDiscovery, DatasetDiscovery, DiscoveryResponse},
         query::{
             FieldSelectionApi, QueryApiRequest, QueryApiResponse, QueryCacheApi, QueryRangeApi,
             QuerySelectorApi,
@@ -311,18 +311,33 @@ impl From<DiscoveryResponse> for Discovery {
 #[derive(SimpleObject)]
 pub(crate) struct ChainDiscoveryGraphql {
     identity: Json<ChainIdentity>,
-    datasets: Vec<String>,
+    datasets: Vec<DatasetDiscoveryGraphql>,
 }
 
 impl From<ChainDiscovery> for ChainDiscoveryGraphql {
     fn from(discovery: ChainDiscovery) -> Self {
         Self {
             identity: Json(discovery.identity),
-            datasets: discovery
-                .datasets
-                .into_iter()
-                .map(|dataset| dataset.as_str().to_owned())
-                .collect(),
+            datasets: discovery.datasets.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[derive(SimpleObject)]
+pub(crate) struct DatasetDiscoveryGraphql {
+    dataset_key: String,
+    range_kinds: Json<Vec<LedgerRangeKind>>,
+    selectors: Vec<String>,
+    enabled: bool,
+}
+
+impl From<DatasetDiscovery> for DatasetDiscoveryGraphql {
+    fn from(discovery: DatasetDiscovery) -> Self {
+        Self {
+            dataset_key: discovery.dataset_key,
+            range_kinds: Json(discovery.range_kinds),
+            selectors: discovery.selectors,
+            enabled: discovery.enabled,
         }
     }
 }

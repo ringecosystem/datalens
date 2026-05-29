@@ -250,11 +250,16 @@ Choose a small bounded range that the configured provider can serve:
 curl -sS -X POST "$DATALENS_E2E_BASE_URL/v1/query" \
   -H 'content-type: application/json' \
   -d '{
-    "chain": "ethereum",
-    "dataset": "blocks",
-    "range": { "from_block": 1, "to_block": 2 },
-    "filter": null,
-    "include_block": false
+    "chain": {
+      "family": "Evm",
+      "configured_name": "ethereum",
+      "network_id": { "kind": "numeric", "value": 1 }
+    },
+    "dataset_key": "evm.blocks",
+    "selector": { "kind": "all" },
+    "range": { "kind": "block", "start": 1, "end": 2 },
+    "finality": "durable_only",
+    "fields": "all"
   }'
 ```
 
@@ -264,22 +269,30 @@ Expected key fields:
 
 ```json
 {
-  "chain": "ethereum",
-  "range": { "from_block": 1, "to_block": 2 },
+  "chain": {
+    "family": "Evm",
+    "configured_name": "ethereum",
+    "network_id": { "kind": "numeric", "value": 1 }
+  },
+  "dataset_key": "evm.blocks",
+  "range": { "kind": "block", "start": 1, "end": 2 },
   "cache": {
     "hit_ranges": [],
-    "missing_ranges": [{ "from_block": 1, "to_block": 2 }]
+    "missing_ranges": [{ "kind": "block", "start": 1, "end": 2 }]
   },
   "rows": {
-    "dataset": "blocks",
-    "rows": [
-      {
-        "number": 1,
-        "hash": "0x...",
-        "parent_hash": "0x...",
-        "timestamp": 0
-      }
-    ]
+    "dataset_key": "evm.blocks",
+    "rows": {
+      "dataset": "blocks",
+      "rows": [
+        {
+          "number": 1,
+          "hash": "0x...",
+          "parent_hash": "0x...",
+          "timestamp": 0
+        }
+      ]
+    }
   }
 }
 ```
@@ -297,7 +310,7 @@ Expected cache fields:
 ```json
 {
   "cache": {
-    "hit_ranges": [{ "from_block": 1, "to_block": 2 }],
+    "hit_ranges": [{ "kind": "block", "start": 1, "end": 2 }],
     "missing_ranges": []
   }
 }
@@ -318,19 +331,27 @@ Choose an address and topic known to exist in the fixture or provider range:
 curl -sS -X POST "$DATALENS_E2E_BASE_URL/v1/query" \
   -H 'content-type: application/json' \
   -d '{
-    "chain": "ethereum",
-    "dataset": "logs",
-    "range": { "from_block": 1, "to_block": 2 },
-    "filter": {
-      "addresses": ["0x0000000000000000000000000000000000000000"],
-      "topics": [
-        ["0x0000000000000000000000000000000000000000000000000000000000000000"],
-        null,
-        null,
-        null
-      ]
+    "chain": {
+      "family": "Evm",
+      "configured_name": "ethereum",
+      "network_id": { "kind": "numeric", "value": 1 }
     },
-    "include_block": false
+    "dataset_key": "evm.logs",
+    "selector": {
+      "kind": "evm_logs",
+      "value": {
+        "addresses": ["0x0000000000000000000000000000000000000000"],
+        "topics": [
+          ["0x0000000000000000000000000000000000000000000000000000000000000000"],
+          null,
+          null,
+          null
+        ]
+      }
+    },
+    "range": { "kind": "block", "start": 1, "end": 2 },
+    "finality": "durable_only",
+    "fields": "all"
   }'
 ```
 
@@ -341,20 +362,23 @@ Expected key fields for non-empty results:
 ```json
 {
   "rows": {
-    "dataset": "logs",
-    "rows": [
-      {
-        "block_number": 1,
-        "block_hash": "0x...",
-        "transaction_hash": "0x...",
-        "transaction_index": 0,
-        "log_index": 0,
-        "address": "0x...",
-        "topics": ["0x..."],
-        "data": "0x...",
-        "removed": false
-      }
-    ]
+    "dataset_key": "evm.logs",
+    "rows": {
+      "dataset": "logs",
+      "rows": [
+        {
+          "block_number": 1,
+          "block_hash": "0x...",
+          "transaction_hash": "0x...",
+          "transaction_index": 0,
+          "log_index": 0,
+          "address": "0x...",
+          "topics": ["0x..."],
+          "data": "0x...",
+          "removed": false
+        }
+      ]
+    }
   }
 }
 ```
@@ -375,7 +399,7 @@ Expected cache fields:
 ```json
 {
   "cache": {
-    "hit_ranges": [{ "from_block": 1, "to_block": 2 }],
+    "hit_ranges": [{ "kind": "block", "start": 1, "end": 2 }],
     "missing_ranges": []
   }
 }
@@ -392,14 +416,22 @@ Query a range and filter that should return no logs:
 curl -sS -X POST "$DATALENS_E2E_BASE_URL/v1/query" \
   -H 'content-type: application/json' \
   -d '{
-    "chain": "ethereum",
-    "dataset": "logs",
-    "range": { "from_block": 3, "to_block": 4 },
-    "filter": {
-      "addresses": ["0x0000000000000000000000000000000000000001"],
-      "topics": [null, null, null, null]
+    "chain": {
+      "family": "Evm",
+      "configured_name": "ethereum",
+      "network_id": { "kind": "numeric", "value": 1 }
     },
-    "include_block": false
+    "dataset_key": "evm.logs",
+    "selector": {
+      "kind": "evm_logs",
+      "value": {
+        "addresses": ["0x0000000000000000000000000000000000000001"],
+        "topics": [null, null, null, null]
+      }
+    },
+    "range": { "kind": "block", "start": 3, "end": 4 },
+    "finality": "durable_only",
+    "fields": "all"
   }'
 ```
 
@@ -410,8 +442,11 @@ Expected response shape:
 ```json
 {
   "rows": {
-    "dataset": "logs",
-    "rows": []
+    "dataset_key": "evm.logs",
+    "rows": {
+      "dataset": "logs",
+      "rows": []
+    }
   }
 }
 ```
@@ -438,11 +473,16 @@ Seed cache with a smaller range:
 curl -sS -X POST "$DATALENS_E2E_BASE_URL/v1/query" \
   -H 'content-type: application/json' \
   -d '{
-    "chain": "ethereum",
-    "dataset": "blocks",
-    "range": { "from_block": 5, "to_block": 6 },
-    "filter": null,
-    "include_block": false
+    "chain": {
+      "family": "Evm",
+      "configured_name": "ethereum",
+      "network_id": { "kind": "numeric", "value": 1 }
+    },
+    "dataset_key": "evm.blocks",
+    "selector": { "kind": "all" },
+    "range": { "kind": "block", "start": 5, "end": 6 },
+    "finality": "durable_only",
+    "fields": "all"
   }'
 ```
 
@@ -452,11 +492,16 @@ Then query a larger overlapping range:
 curl -sS -X POST "$DATALENS_E2E_BASE_URL/v1/query" \
   -H 'content-type: application/json' \
   -d '{
-    "chain": "ethereum",
-    "dataset": "blocks",
-    "range": { "from_block": 5, "to_block": 8 },
-    "filter": null,
-    "include_block": false
+    "chain": {
+      "family": "Evm",
+      "configured_name": "ethereum",
+      "network_id": { "kind": "numeric", "value": 1 }
+    },
+    "dataset_key": "evm.blocks",
+    "selector": { "kind": "all" },
+    "range": { "kind": "block", "start": 5, "end": 8 },
+    "finality": "durable_only",
+    "fields": "all"
   }'
 ```
 
@@ -465,8 +510,8 @@ Expected cache fields:
 ```json
 {
   "cache": {
-    "hit_ranges": [{ "from_block": 5, "to_block": 6 }],
-    "missing_ranges": [{ "from_block": 7, "to_block": 8 }]
+    "hit_ranges": [{ "kind": "block", "start": 5, "end": 6 }],
+    "missing_ranges": [{ "kind": "block", "start": 7, "end": 8 }]
   }
 }
 ```
@@ -481,11 +526,16 @@ Invalid chain:
 curl -sS -i -X POST "$DATALENS_E2E_BASE_URL/v1/query" \
   -H 'content-type: application/json' \
   -d '{
-    "chain": "not-configured",
-    "dataset": "blocks",
-    "range": { "from_block": 1, "to_block": 1 },
-    "filter": null,
-    "include_block": false
+    "chain": {
+      "family": "Evm",
+      "configured_name": "not-configured",
+      "network_id": { "kind": "numeric", "value": 1 }
+    },
+    "dataset_key": "evm.blocks",
+    "selector": { "kind": "all" },
+    "range": { "kind": "block", "start": 1, "end": 1 },
+    "finality": "durable_only",
+    "fields": "all"
   }'
 ```
 
@@ -499,11 +549,16 @@ Range above configured limit:
 curl -sS -i -X POST "$DATALENS_E2E_BASE_URL/v1/query" \
   -H 'content-type: application/json' \
   -d '{
-    "chain": "ethereum",
-    "dataset": "blocks",
-    "range": { "from_block": 1, "to_block": 99 },
-    "filter": null,
-    "include_block": false
+    "chain": {
+      "family": "Evm",
+      "configured_name": "ethereum",
+      "network_id": { "kind": "numeric", "value": 1 }
+    },
+    "dataset_key": "evm.blocks",
+    "selector": { "kind": "all" },
+    "range": { "kind": "block", "start": 1, "end": 99 },
+    "finality": "durable_only",
+    "fields": "all"
   }'
 ```
 
@@ -517,18 +572,25 @@ Unsupported dataset:
 curl -sS -i -X POST "$DATALENS_E2E_BASE_URL/v1/query" \
   -H 'content-type: application/json' \
   -d '{
-    "chain": "ethereum",
-    "dataset": "transactions",
-    "range": { "from_block": 1, "to_block": 1 },
-    "filter": null,
-    "include_block": false
+    "chain": {
+      "family": "Evm",
+      "configured_name": "ethereum",
+      "network_id": { "kind": "numeric", "value": 1 }
+    },
+    "dataset_key": "evm.transactions",
+    "selector": { "kind": "all" },
+    "range": { "kind": "block", "start": 1, "end": 1 },
+    "finality": "durable_only",
+    "fields": "all"
   }'
 ```
 
 Expected status: `400`.
 
-Expected response: JSON deserialization failure before the request reaches query
-planning. Native support is currently limited to `blocks` and `logs`.
+Expected error kind: `UnsupportedDataset`.
+
+Native EVM query support in this manual smoke path is currently limited to `evm.blocks`
+and `evm.logs`.
 
 Provider failure:
 
