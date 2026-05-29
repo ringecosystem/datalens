@@ -43,7 +43,7 @@ container-smoke:
   docker run --rm datalens:smoke --help
 
 config-doctor-smoke:
-  cargo run -p datalens-cli -- doctor --config config/datalens.production.toml
+  cargo test -p datalens-cli --test cli_commands test_production_config_doctor_smoke_uses_nonsecret_environment
 
 release-check:
   just fmt-check

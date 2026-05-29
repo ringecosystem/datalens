@@ -119,11 +119,11 @@ pub struct InspectUsageCommand {
     pub application: String,
 }
 
-pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Serve(command) => serve_command(command).await?,
+        Command::Serve(command) => serve_command(command)?,
         Command::Doctor(command) => doctor_command(command)?,
         Command::Query(command) => query_command(command)?,
         Command::Inspect(command) => inspect_command(command)?,
@@ -132,9 +132,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Ok(())
 }
 
-async fn serve_command(
-    command: ConfigCommand,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn serve_command(command: ConfigCommand) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging()?;
     log::info!("starting datalens");
     let config = load_config(&command.config)?;
@@ -156,10 +154,14 @@ async fn serve_command(
 
     log::info!("serving datalens edge on {bind}");
     let lifecycle = datalens_edge::ServiceLifecycle::new_with_edge_config(registry, config.edge);
+    let runtime = tokio::runtime::Runtime::new()?;
     if let Some(scheduler) = warmup_scheduler {
-        datalens_edge::serve_lifecycle(bind, lifecycle.with_warmup_scheduler(scheduler)).await?;
+        runtime.block_on(datalens_edge::serve_lifecycle(
+            bind,
+            lifecycle.with_warmup_scheduler(scheduler),
+        ))?;
     } else {
-        datalens_edge::serve_lifecycle(bind, lifecycle).await?;
+        runtime.block_on(datalens_edge::serve_lifecycle(bind, lifecycle))?;
     }
     Ok(())
 }
