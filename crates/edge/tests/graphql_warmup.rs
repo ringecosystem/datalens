@@ -24,11 +24,11 @@ async fn test_graphql_warmup_submit_list_and_cancel_task() {
         "#,
         serde_json::json!({
             "input": {
-                "chain": ethereum_identity(),
-                "datasetKey": "evm.logs",
+                "chain": ethereum_chain_input(),
+                "datasetKey": dataset_key_input("evm", "logs"),
                 "selector": {
                     "kind": "evm_logs",
-                    "value": {
+                    "evmLogs": {
                         "addresses": ["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
                         "topics": []
                     }
@@ -37,7 +37,7 @@ async fn test_graphql_warmup_submit_list_and_cancel_task() {
                 "start": 20,
                 "end": 21,
                 "mode": "fixed_range",
-                "chunkPolicy": { "max_range_len": 2 }
+                "chunkPolicy": { "maxRangeLen": 2 }
             }
         }),
     )

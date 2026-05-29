@@ -182,6 +182,14 @@ pub(crate) fn ethereum_identity() -> ChainIdentity {
         .expect("valid chain")
 }
 
+pub(crate) fn ethereum_chain_input() -> serde_json::Value {
+    serde_json::json!({
+        "family": { "kind": "evm" },
+        "configuredName": "ethereum",
+        "networkId": { "numeric": 1 }
+    })
+}
+
 pub(crate) fn solana_identity() -> ChainIdentity {
     ChainIdentity::try_new(
         ChainFamily::Other("solana".to_owned()),
@@ -189,6 +197,48 @@ pub(crate) fn solana_identity() -> ChainIdentity {
         Some(NetworkId::textual("mainnet-beta").expect("valid network")),
     )
     .expect("valid chain")
+}
+
+pub(crate) fn solana_chain_input() -> serde_json::Value {
+    serde_json::json!({
+        "family": { "kind": "other", "other": "solana" },
+        "configuredName": "solana-mainnet-beta",
+        "networkId": { "textual": "mainnet-beta" }
+    })
+}
+
+pub(crate) fn tron_chain_input() -> serde_json::Value {
+    serde_json::json!({
+        "family": { "kind": "other", "other": "tron" },
+        "configuredName": "tron-mainnet",
+        "networkId": { "textual": "mainnet" }
+    })
+}
+
+pub(crate) fn dataset_key_input(family: &str, name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "family": family,
+        "name": name
+    })
+}
+
+pub(crate) fn assert_input_field_type(
+    parent: &serde_json::Value,
+    field_name: &str,
+    expected_type: &str,
+) {
+    let field = parent["inputFields"]
+        .as_array()
+        .expect("input fields")
+        .iter()
+        .find(|field| field["name"] == field_name)
+        .unwrap_or_else(|| panic!("missing input field {field_name}"));
+    let field_type = &field["type"];
+    let type_name = field_type["name"]
+        .as_str()
+        .or_else(|| field_type["ofType"]["name"].as_str())
+        .expect("field type name");
+    assert_eq!(type_name, expected_type, "{field_name} type");
 }
 
 pub(crate) fn block(number: u64, hash: &str) -> BlockHeader {

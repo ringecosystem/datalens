@@ -128,12 +128,12 @@ async fn test_graphql_native_evm_blocks_and_logs_query_match_rest_contract() {
         "#,
         serde_json::json!({
             "input": {
-                "chain": ethereum_identity(),
-                "datasetKey": "evm.blocks",
+                "chain": ethereum_chain_input(),
+                "datasetKey": dataset_key_input("evm", "blocks"),
                 "selector": { "kind": "all" },
                 "range": { "kind": "block", "start": 10, "end": 10 },
                 "finality": "durable_only",
-                "fields": "all"
+                "fields": {}
             }
         }),
     )
@@ -167,18 +167,18 @@ async fn test_graphql_native_evm_blocks_and_logs_query_match_rest_contract() {
         "#,
         serde_json::json!({
             "input": {
-                "chain": ethereum_identity(),
-                "datasetKey": "evm.logs",
+                "chain": ethereum_chain_input(),
+                "datasetKey": dataset_key_input("evm", "logs"),
                 "selector": {
                     "kind": "evm_logs",
-                    "value": {
+                    "evmLogs": {
                         "addresses": ["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
                         "topics": []
                     }
                 },
                 "range": { "kind": "block", "start": 20, "end": 21 },
                 "finality": "durable_only",
-                "fields": "all"
+                "fields": {}
             }
         }),
     )
@@ -228,19 +228,19 @@ async fn test_graphql_native_solana_query_uses_native_contract() {
         "#,
         serde_json::json!({
             "input": {
-                "chain": solana_identity(),
-                "datasetKey": "solana.slots",
+                "chain": solana_chain_input(),
+                "datasetKey": dataset_key_input("solana", "slots"),
                 "selector": {
                     "kind": "other",
-                    "value": {
+                    "other": {
                         "kind": "solana_all",
                         "fingerprint": "solana-all/all",
-                        "canonical_key": "all"
+                        "canonicalKey": "all"
                     }
                 },
                 "range": { "kind": "slot", "start": 10, "end": 12 },
                 "finality": "durable_only",
-                "fields": "all"
+                "fields": {}
             }
         }),
     )
@@ -254,6 +254,65 @@ async fn test_graphql_native_solana_query_uses_native_contract() {
     );
     assert_eq!(
         body["data"]["query"]["rows"]["rows"]["rows"]["rows"][0]["slot"],
+        10
+    );
+}
+
+#[tokio::test]
+async fn test_graphql_native_tron_blocks_query_uses_typed_inputs() {
+    let root = temp_storage_root("gql-tron");
+    let tron = TronAdapter::with_fixture_defaults();
+    let registry = QueryServiceRegistry::new()
+        .with_service(QueryService::new_named(
+            LocalStorage::new(&root),
+            tron,
+            planner_config(),
+            writer_config(),
+            "tron-mainnet",
+            non_evm_chain_config("tron"),
+        ))
+        .expect("register tron");
+    let app = router(registry);
+
+    let body = graphql_json(
+        app,
+        r#"
+        query($input: QueryInput!) {
+          query(input: $input) {
+            datasetKey
+            range
+            rows
+          }
+        }
+        "#,
+        serde_json::json!({
+            "input": {
+                "chain": tron_chain_input(),
+                "datasetKey": dataset_key_input("tron", "blocks"),
+                "selector": {
+                    "kind": "other",
+                    "other": {
+                        "kind": "tron_all",
+                        "fingerprint": "tron-all/all",
+                        "canonicalKey": "all"
+                    }
+                },
+                "range": { "kind": "block", "start": 10, "end": 12 },
+                "finality": "durable_only",
+                "fields": {}
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(body["errors"], serde_json::Value::Null);
+    assert_eq!(body["data"]["query"]["datasetKey"], "tron.blocks");
+    assert_eq!(
+        body["data"]["query"]["range"],
+        serde_json::json!({ "kind": "block", "start": 10, "end": 12 })
+    );
+    assert_eq!(
+        body["data"]["query"]["rows"]["rows"]["rows"]["rows"][0]["number"],
         10
     );
 }
@@ -286,8 +345,8 @@ async fn test_graphql_query_records_metrics_with_application_header() {
                         "#,
                         "variables": {
                             "input": {
-                                "chain": ethereum_identity(),
-                                "datasetKey": "evm.blocks",
+                                "chain": ethereum_chain_input(),
+                                "datasetKey": dataset_key_input("evm", "blocks"),
                                 "selector": { "kind": "all" },
                                 "range": { "kind": "block", "start": 10, "end": 10 }
                             }
@@ -339,8 +398,8 @@ async fn test_graphql_errors_include_stable_extensions() {
         "#,
         serde_json::json!({
             "input": {
-                "chain": ethereum_identity(),
-                "datasetKey": "bad-key",
+                "chain": ethereum_chain_input(),
+                "datasetKey": { "family": "bad", "name": "" },
                 "selector": { "kind": "all" },
                 "range": { "kind": "block", "start": 1, "end": 1 }
             }
@@ -350,4 +409,87 @@ async fn test_graphql_errors_include_stable_extensions() {
 
     assert_eq!(body["errors"][0]["extensions"]["kind"], "invalid_input");
     assert_eq!(body["errors"][0]["extensions"]["status"], 400);
+}
+
+#[tokio::test]
+async fn test_graphql_schema_exposes_typed_request_inputs() {
+    let registry = QueryServiceRegistry::new()
+        .with_service(service(
+            LocalStorage::new(temp_storage_root("gql-schema")),
+            MockSource::default(),
+        ))
+        .expect("register service");
+    let app = router(registry);
+
+    let body = graphql_json(
+        app,
+        r#"
+        query {
+          __type(name: "QueryInput") {
+            inputFields {
+              name
+              type {
+                kind
+                name
+                ofType {
+                  kind
+                  name
+                }
+              }
+            }
+          }
+          selector: __type(name: "QuerySelectorInput") {
+            inputFields {
+              name
+            }
+          }
+          warmup: __type(name: "WarmupSubmitInput") {
+            inputFields {
+              name
+              type {
+                kind
+                name
+                ofType {
+                  kind
+                  name
+                }
+              }
+            }
+          }
+        }
+        "#,
+        serde_json::json!({}),
+    )
+    .await;
+
+    assert_eq!(body["errors"], serde_json::Value::Null);
+    assert_input_field_type(&body["data"]["__type"], "chain", "ChainIdentityInput");
+    assert_input_field_type(&body["data"]["__type"], "datasetKey", "DatasetKeyInput");
+    assert_input_field_type(&body["data"]["__type"], "selector", "QuerySelectorInput");
+    assert_input_field_type(&body["data"]["__type"], "range", "QueryRangeInput");
+    assert_input_field_type(&body["data"]["__type"], "fields", "FieldSelectionInput");
+    assert!(
+        body["data"]["selector"]["inputFields"]
+            .as_array()
+            .expect("selector input fields")
+            .iter()
+            .any(|field| field["name"] == "evmLogs")
+    );
+    assert_input_field_type(
+        &body["data"]["warmup"],
+        "datasetKey",
+        "WarmupDatasetKeyInput",
+    );
+    assert_input_field_type(&body["data"]["warmup"], "selector", "WarmupSelectorInput");
+    assert_input_field_type(&body["data"]["warmup"], "rangeKind", "RangeKindInput");
+    assert_input_field_type(
+        &body["data"]["warmup"],
+        "chunkPolicy",
+        "WarmupChunkPolicyInput",
+    );
+    assert_input_field_type(
+        &body["data"]["warmup"],
+        "retryPolicy",
+        "WarmupRetryPolicyInput",
+    );
 }
