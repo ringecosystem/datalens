@@ -23,7 +23,7 @@ pub use provider::{TronFixtureProviderRpc, TronHttpProvider};
 use rows::{
     NormalizedTronEventFilter, TronTransactionInfo, TronTransactionRef, block_rows, event_rows,
     hex_prefix, should_fallback_from_contract_events, transaction_info_rows, transaction_refs,
-    transaction_rows,
+    transaction_rows, validate_block_scan_event_filter,
 };
 
 const TRON_ALL_KIND: &str = "tron_all";
@@ -422,9 +422,15 @@ where
                     .with_source_metadata(source_metadata)
                     .with_provider_diagnostics(provider_diagnostics));
                 }
-                Err(error) if should_fallback_from_contract_events(error.kind.clone()) => {}
+                Err(error) if should_fallback_from_contract_events(&error) => {}
                 Err(error) => return Err(error),
             }
+        }
+
+        if request.dataset_key == DatasetKey::tron_events()
+            && matches!(request.selector.kind(), SelectorKind::Other(kind) if kind.as_str() == TRON_EVENTS_KIND)
+        {
+            validate_block_scan_event_filter(&request.selector)?;
         }
 
         let (blocks, provider_calls) = self.fetch_blocks_for_range(&range)?;
