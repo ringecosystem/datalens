@@ -158,9 +158,11 @@ async fn serve_command(
     let _capabilities = adapter.capabilities();
 
     log::info!("serving datalens API on {bind}");
-    datalens_api::serve(bind, registry).await?;
+    let lifecycle = datalens_api::ServiceLifecycle::new(registry);
     if let Some(scheduler) = warmup_scheduler {
-        scheduler.shutdown();
+        datalens_api::serve_lifecycle(bind, lifecycle.with_warmup_scheduler(scheduler)).await?;
+    } else {
+        datalens_api::serve_lifecycle(bind, lifecycle).await?;
     }
     Ok(())
 }

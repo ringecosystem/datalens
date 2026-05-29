@@ -10,9 +10,11 @@ use axum::{
 };
 use datalens_api::config::{
     BlocksDatasetConfig, ChainConfig, DatasetsConfig, LogsDatasetConfig, PlannerConfig,
-    WriterConfig,
+    WriterConfig, WriterStagingConfig,
 };
-use datalens_api::{LegacyEvmQueryRequest, QueryService, QueryServiceRegistry, router};
+use datalens_api::{
+    LegacyEvmQueryRequest, QueryService, QueryServiceRegistry, ServiceLifecycle, router,
+};
 use datalens_chain::{
     AdapterCapabilities, ChainAdapter, ChainFetchRequest, ChainFetchResponse, ChainHeight,
     DatasetCapability, FinalityKind, HeightRangeKind, ProviderDiagnostics, SelectorKind,
@@ -330,6 +332,75 @@ async fn test_api_warmup_run_once_writes_durable_coverage_that_query_hits() {
     assert!(body.contains("datalens_warmup_task_total"));
     assert!(body.contains("datalens_warmup_fetch_total"));
     assert!(body.contains("datalens_warmup_write_total"));
+}
+
+#[tokio::test]
+async fn test_service_lifecycle_stops_scheduler_before_shutdown_flush() {
+    let root = temp_storage_root("api-lifecycle-scheduler-before-flush");
+    let storage = LocalStorage::new(&root);
+    let source = MockSource::default().with_blocks(vec![block(10)]);
+    let service = QueryService::new(
+        storage.clone(),
+        source,
+        PlannerConfig {
+            max_query_range_blocks: 8,
+            default_chunk_range_blocks: 4,
+        },
+        WriterConfig {
+            target_object_bytes: 1024,
+            min_object_rows: 3,
+            record_empty_coverage: true,
+            staging: WriterStagingConfig {
+                enabled: true,
+                min_rows: Some(3),
+                target_object_bytes: None,
+                max_staged_ranges: None,
+                max_staged_rows: None,
+                max_staged_age_ms: None,
+                flush_on_shutdown: true,
+                max_staged_bytes: None,
+            },
+        },
+        chain_config(1),
+    );
+    let registry = QueryServiceRegistry::new()
+        .with_service(service)
+        .expect("registry");
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let scheduler = ControlledShutdownScheduler {
+        registry: registry.clone(),
+        events: events.clone(),
+    };
+
+    ServiceLifecycle::new(registry.clone())
+        .with_warmup_scheduler(scheduler)
+        .shutdown()
+        .expect("shutdown lifecycle");
+
+    assert_eq!(
+        *events.lock().expect("events"),
+        vec!["scheduler_shutdown".to_owned()]
+    );
+    let manifest = storage.manifest().expect("manifest after shutdown");
+    assert_eq!(
+        manifest.entries.len(),
+        1,
+        "scheduler-created staged rows should be flushed during final shutdown flush"
+    );
+    let hit = registry
+        .query(blocks_request(10, 10))
+        .expect("query hits flushed scheduler rows");
+    assert_eq!(
+        hit.cache.durable_hit_ranges,
+        vec![BlockRange::expect_new(10, 10)]
+    );
+    let flush = registry
+        .flush_staged_writes_for_shutdown()
+        .expect("second shutdown flush");
+    assert!(
+        flush.iter().all(|result| result.data_objects.is_empty()),
+        "no staged rows should remain after lifecycle shutdown"
+    );
 }
 
 #[test]
@@ -663,6 +734,23 @@ impl StorageRepository for FailingWriteStorage {
             DatalensErrorKind::StorageWriteFailure,
             "injected durable write failure",
         ))
+    }
+}
+
+struct ControlledShutdownScheduler {
+    registry: QueryServiceRegistry,
+    events: Arc<Mutex<Vec<String>>>,
+}
+
+impl datalens_api::LifecycleShutdown for ControlledShutdownScheduler {
+    fn shutdown(self) {
+        self.events
+            .lock()
+            .expect("events")
+            .push("scheduler_shutdown".to_owned());
+        self.registry
+            .query(blocks_request(10, 10))
+            .expect("scheduler stages rows before final flush");
     }
 }
 
