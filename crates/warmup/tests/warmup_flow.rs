@@ -15,7 +15,7 @@ use datalens_core::{
 };
 use datalens_executor::{NativeQueryExecutionConfig, NativeQueryExecutor};
 use datalens_metrics::{ApplicationIdentity, MetricsRecorder};
-use datalens_planner::{FieldSelection, NativePlannerConfig, NativeQueryInput, ResponseShape};
+use datalens_planner::{FieldSelection, NativePlannerConfig, NativeQueryInput};
 use datalens_solana::{SolanaAdapter, solana_all_selector};
 use datalens_storage::{LocalObjectStore, LocalStorage};
 use datalens_tron::{TronAdapter, tron_all_selector};
@@ -422,7 +422,6 @@ fn test_query_path_hits_warmup_generated_durable_coverage() {
                 dataset_key: DatasetKey::evm_logs(),
                 ledger_range: blocks(1, 3),
                 selector: selector(),
-                response_shape: ResponseShape::LegacyEvmLogs,
                 field_selection: FieldSelection::All,
                 finality: QueryFinalityRequirement::DurableOnly,
             },

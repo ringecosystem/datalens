@@ -59,7 +59,7 @@ impl MetricsLabels {
             chain: chain.configured_name().to_owned(),
             chain_kind: chain.family_ref().key().to_owned(),
             dataset: dataset_key
-                .legacy_dataset()
+                .evm_dataset()
                 .map(|dataset| dataset.as_str().to_owned())
                 .unwrap_or_else(|| dataset_key.as_str().to_owned()),
         }

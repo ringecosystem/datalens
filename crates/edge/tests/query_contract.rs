@@ -16,11 +16,10 @@ use datalens_edge::config::{
     ChainConfig, DatasetsConfig, LogsDatasetConfig, PlannerConfig, WriterConfig,
 };
 use datalens_edge::{
-    FieldSelectionApi, LegacyEvmQueryRequest, LegacyEvmQueryResponse, NativeQueryResponse,
-    QueryApiRequest, QueryApiResponse, QueryRangeApi, QuerySelectorApi, QueryService,
-    api_error_body, api_error_status, legacy_evm_to_native_input,
+    FieldSelectionApi, NativeQueryResponse, QueryApiRequest, QueryApiResponse, QueryRangeApi,
+    QuerySelectorApi, QueryService, api_error_body, api_error_status,
 };
-use datalens_planner::{FieldSelection, ResponseShape};
+use datalens_planner::{FieldSelection, NativeQueryInput};
 use datalens_storage::LocalStorage;
 
 #[test]
@@ -92,66 +91,6 @@ fn test_client_query_response_json_decodes_api_response_contract() {
 }
 
 #[test]
-fn test_legacy_blocks_request_maps_to_native_domain_input() {
-    let input = legacy_evm_to_native_input(blocks_request(10, 12)).expect("blocks request maps");
-
-    assert_eq!(input.chain, ethereum_identity());
-    assert_eq!(input.dataset_key, DatasetKey::evm_blocks());
-    assert_eq!(
-        input.ledger_range,
-        LedgerRange::from_block_range(BlockRange::expect_new(10, 12))
-    );
-    assert_eq!(input.selector, DatasetSelector::all());
-    assert_eq!(input.response_shape, ResponseShape::LegacyEvmBlocks);
-    assert_eq!(input.field_selection, FieldSelection::All);
-    assert_eq!(input.finality, QueryFinalityRequirement::DurableOnly);
-}
-
-#[test]
-fn test_legacy_logs_request_maps_to_native_domain_input() {
-    let input = legacy_evm_to_native_input(logs_request_with_topics(
-        20,
-        21,
-        vec!["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
-        vec![Some(vec![TOPIC_A])],
-    ))
-    .expect("logs request maps");
-
-    assert_eq!(input.chain, ethereum_identity());
-    assert_eq!(input.dataset_key, DatasetKey::evm_logs());
-    assert_eq!(
-        input.ledger_range,
-        LedgerRange::from_block_range(BlockRange::expect_new(20, 21))
-    );
-    assert!(matches!(input.selector, DatasetSelector::EvmLogs(_)));
-    assert_eq!(input.response_shape, ResponseShape::LegacyEvmLogs);
-    assert_eq!(input.field_selection, FieldSelection::All);
-    assert_eq!(input.finality, QueryFinalityRequirement::DurableOnly);
-}
-
-#[test]
-fn test_legacy_request_rejects_latest_finality_without_allow_hot() {
-    let mut request = blocks_request(100, 101);
-    request.finality = QueryFinalityRequirement::SafeToLatest;
-
-    let error = legacy_evm_to_native_input(request).expect_err("allow_hot is required");
-
-    assert_eq!(error.kind, DatalensErrorKind::InvalidInput);
-    assert!(error.message.contains("allow_hot"));
-}
-
-#[test]
-fn test_legacy_request_maps_explicit_hot_contract_to_native_input() {
-    let mut request = blocks_request(100, 101);
-    request.allow_hot = true;
-    request.finality = QueryFinalityRequirement::SafeToLatest;
-
-    let input = legacy_evm_to_native_input(request).expect("hot request maps");
-
-    assert_eq!(input.finality, QueryFinalityRequirement::SafeToLatest);
-}
-
-#[test]
 fn test_native_api_evm_blocks_request_maps_to_native_input() {
     let request = QueryApiRequest {
         chain: ethereum_identity(),
@@ -171,7 +110,6 @@ fn test_native_api_evm_blocks_request_maps_to_native_input() {
         LedgerRange::blocks(10, 12).expect("range")
     );
     assert_eq!(input.selector, DatasetSelector::all());
-    assert_eq!(input.response_shape, ResponseShape::NativeRows);
     assert_eq!(input.field_selection, FieldSelection::All);
     assert_eq!(input.finality, QueryFinalityRequirement::DurableOnly);
 }
@@ -382,21 +320,20 @@ fn test_query_service_supports_latest_only_read_through_without_durable_cache_wr
     let source = MockSource::default().with_blocks(vec![block(100, "0x64")]);
     let service = service(LocalStorage::new(&root), source.clone());
     let mut request = blocks_request(100, 100);
-    request.allow_hot = true;
     request.finality = QueryFinalityRequirement::LatestOnly;
 
-    let response = service.query(request).expect("hot query succeeds");
+    let response = service.query_native(request).expect("hot query succeeds");
 
     assert_eq!(
         response.cache.provider_fill_ranges,
-        vec![BlockRange::expect_new(100, 100)]
+        vec![LedgerRange::blocks(100, 100).expect("range")]
     );
     assert_eq!(
         response.cache.missing_ranges,
-        vec![BlockRange::expect_new(100, 100)]
+        vec![LedgerRange::blocks(100, 100).expect("range")]
     );
-    assert_eq!(response.cache.durable_hit_ranges, Vec::<BlockRange>::new());
-    assert_eq!(response.cache.hot_hit_ranges, Vec::<BlockRange>::new());
+    assert_eq!(response.cache.durable_hit_ranges, Vec::<LedgerRange>::new());
+    assert_eq!(response.cache.hot_hit_ranges, Vec::<LedgerRange>::new());
     assert_eq!(response.cache.segments.len(), 1);
     assert_eq!(
         response.cache.segments[0].source,
@@ -406,7 +343,7 @@ fn test_query_service_supports_latest_only_read_through_without_durable_cache_wr
         response.cache.segments[0].finality,
         QueryDataFinality::Latest
     );
-    assert_eq!(query_row_block_numbers(&response.rows), vec![100]);
+    assert_eq!(query_row_block_numbers(response.rows.rows()), vec![100]);
     assert_eq!(
         source.calls(),
         vec![SourceCall::Blocks(BlockRange::expect_new(100, 100))]
@@ -448,13 +385,15 @@ fn test_query_response_marks_provider_fill_source_and_finality() {
         source,
     );
 
-    let response = service.query(blocks_request(1, 2)).expect("query succeeds");
+    let response = service
+        .query_native(blocks_request(1, 2))
+        .expect("query succeeds");
 
     assert_eq!(
         response.cache.provider_fill_ranges,
-        vec![BlockRange::expect_new(1, 2)]
+        vec![LedgerRange::blocks(1, 2).expect("range")]
     );
-    assert_eq!(response.cache.hot_hit_ranges, Vec::<BlockRange>::new());
+    assert_eq!(response.cache.hot_hit_ranges, Vec::<LedgerRange>::new());
     assert_eq!(response.cache.segments.len(), 1);
     assert_eq!(
         response.cache.segments[0].source,
@@ -532,7 +471,9 @@ fn test_query_uses_adapter_range_limit_when_smaller_than_config() {
         source.clone(),
     );
 
-    let response = service.query(blocks_request(1, 4)).expect("query succeeds");
+    let response = service
+        .query_native(blocks_request(1, 4))
+        .expect("query succeeds");
 
     assert_eq!(block_numbers(&response), vec![1, 2, 3, 4]);
     assert_eq!(
@@ -555,7 +496,7 @@ fn test_query_uses_adapter_log_range_limit_when_smaller_than_config() {
     );
 
     service
-        .query(logs_request(
+        .query_native(logs_request(
             1,
             3,
             vec!["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
@@ -581,7 +522,7 @@ fn test_query_rejects_log_addresses_above_adapter_capability() {
     );
 
     let error = service
-        .query(logs_request(
+        .query_native(logs_request(
             1,
             1,
             vec![
@@ -614,7 +555,7 @@ fn test_query_delegates_log_address_limit_to_planner_capabilities() {
     );
 
     service
-        .query(logs_request(
+        .query_native(logs_request(
             1,
             1,
             vec![
@@ -638,7 +579,7 @@ fn assert_contract_violation_not_cached(name: &str, mutation: ResponseMutation) 
     let service = service(LocalStorage::new(&root), source);
 
     let error = service
-        .query(blocks_request(1, 2))
+        .query_native(blocks_request(1, 2))
         .expect_err("contract violation");
 
     assert_eq!(error.kind, DatalensErrorKind::Internal);
@@ -684,19 +625,18 @@ fn chain_config(max_addresses_per_query: usize) -> ChainConfig {
     }
 }
 
-fn blocks_request(from_block: u64, to_block: u64) -> LegacyEvmQueryRequest {
-    LegacyEvmQueryRequest {
+fn blocks_request(from_block: u64, to_block: u64) -> NativeQueryInput {
+    NativeQueryInput {
         chain: ethereum_identity(),
-        dataset: Dataset::Blocks,
-        range: BlockRange::expect_new(from_block, to_block),
-        filter: None,
-        include_block: false,
-        allow_hot: false,
+        dataset_key: DatasetKey::evm_blocks(),
+        ledger_range: LedgerRange::blocks(from_block, to_block).expect("valid range"),
+        selector: DatasetSelector::all(),
+        field_selection: FieldSelection::All,
         finality: QueryFinalityRequirement::DurableOnly,
     }
 }
 
-fn logs_request(from_block: u64, to_block: u64, addresses: Vec<&str>) -> LegacyEvmQueryRequest {
+fn logs_request(from_block: u64, to_block: u64, addresses: Vec<&str>) -> NativeQueryInput {
     logs_request_with_topics(
         from_block,
         to_block,
@@ -710,20 +650,20 @@ fn logs_request_with_topics(
     to_block: u64,
     addresses: Vec<&str>,
     topics: Vec<Option<Vec<&str>>>,
-) -> LegacyEvmQueryRequest {
-    LegacyEvmQueryRequest {
+) -> NativeQueryInput {
+    NativeQueryInput {
         chain: ethereum_identity(),
-        dataset: Dataset::Logs,
-        range: BlockRange::expect_new(from_block, to_block),
-        filter: Some(LogFilter {
+        dataset_key: DatasetKey::evm_logs(),
+        ledger_range: LedgerRange::blocks(from_block, to_block).expect("valid range"),
+        selector: DatasetSelector::try_evm_logs(LogFilter {
             addresses: addresses.into_iter().map(str::to_owned).collect(),
             topics: topics
                 .into_iter()
                 .map(|topic| topic.map(|values| values.into_iter().map(str::to_owned).collect()))
                 .collect(),
-        }),
-        include_block: false,
-        allow_hot: false,
+        })
+        .expect("valid logs selector"),
+        field_selection: FieldSelection::All,
         finality: QueryFinalityRequirement::DurableOnly,
     }
 }
@@ -769,8 +709,8 @@ fn temp_storage_root(name: &str) -> PathBuf {
     root
 }
 
-fn block_numbers(response: &LegacyEvmQueryResponse) -> Vec<u64> {
-    query_row_block_numbers(&response.rows)
+fn block_numbers(response: &NativeQueryResponse) -> Vec<u64> {
+    query_row_block_numbers(response.rows.rows())
 }
 
 fn query_row_block_numbers(rows: &QueryRows) -> Vec<u64> {
@@ -920,12 +860,8 @@ impl ChainAdapter for MockSource {
 
     fn fetch(&self, request: ChainFetchRequest) -> Result<ChainFetchResponse, DatalensError> {
         let range = request.range.block_range().expect("expected block range");
-        let response = match request
-            .dataset_key
-            .legacy_dataset()
-            .expect("legacy dataset")
-        {
-            Dataset::Blocks => self.fetch_blocks(range).and_then(|rows| {
+        let response = if request.dataset_key == DatasetKey::evm_blocks() {
+            self.fetch_blocks(range).and_then(|rows| {
                 Ok(ChainFetchResponse::try_new(
                     request.chain,
                     DatasetKey::evm_blocks(),
@@ -938,32 +874,28 @@ impl ChainAdapter for MockSource {
                     rows_scanned: 0,
                     warnings: Vec::new(),
                 }))
-            }),
-            Dataset::Transactions | Dataset::Receipts => {
-                unreachable!("legacy query contract fixtures only request blocks or logs")
-            }
-            Dataset::Logs => {
-                let filter = match &request.selector {
-                    DatasetSelector::EvmLogs(filter) => filter,
-                    selector => panic!("expected EVM logs selector, got {selector:?}"),
-                };
-                self.fetch_logs(range, filter).and_then(|rows| {
-                    Ok(ChainFetchResponse::try_new(
-                        request.chain,
-                        DatasetKey::evm_logs(),
-                        LedgerRange::from_block_range(range),
-                        request.selector,
-                        QueryRows::EvmLogs(rows),
-                    )?
-                    .with_provider_diagnostics(
-                        datalens_chain::ProviderDiagnostics {
-                            calls: 1,
-                            rows_scanned: 0,
-                            warnings: Vec::new(),
-                        },
-                    ))
-                })
-            }
+            })
+        } else if request.dataset_key == DatasetKey::evm_logs() {
+            let filter = match &request.selector {
+                DatasetSelector::EvmLogs(filter) => filter,
+                selector => panic!("expected EVM logs selector, got {selector:?}"),
+            };
+            self.fetch_logs(range, filter).and_then(|rows| {
+                Ok(ChainFetchResponse::try_new(
+                    request.chain,
+                    DatasetKey::evm_logs(),
+                    LedgerRange::from_block_range(range),
+                    request.selector,
+                    QueryRows::EvmLogs(rows),
+                )?
+                .with_provider_diagnostics(datalens_chain::ProviderDiagnostics {
+                    calls: 1,
+                    rows_scanned: 0,
+                    warnings: Vec::new(),
+                }))
+            })
+        } else {
+            panic!("query contract fixtures only request blocks or logs")
         }?;
 
         Ok(self.mutate_response(response))

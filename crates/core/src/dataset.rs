@@ -146,7 +146,7 @@ impl DatasetKey {
         &self.key
     }
 
-    pub fn legacy_dataset(&self) -> Option<Dataset> {
+    pub fn evm_dataset(&self) -> Option<Dataset> {
         match (self.family(), self.name().as_str()) {
             (ChainFamily::Evm, "blocks") => Some(Dataset::Blocks),
             (ChainFamily::Evm, "transactions") => Some(Dataset::Transactions),

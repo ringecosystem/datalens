@@ -20,7 +20,6 @@ fn test_native_query_input_is_planner_boundary() {
             topics: vec![None],
         })
         .expect("valid selector"),
-        response_shape: ResponseShape::LegacyEvmLogs,
         field_selection: FieldSelection::All,
         finality: QueryFinalityRequirement::DurableOnly,
     };
@@ -32,7 +31,6 @@ fn test_native_query_input_is_planner_boundary() {
         LedgerRange::blocks(10, 12).expect("valid range")
     );
     assert_eq!(input.selector.kind(), SelectorKind::EvmLogs);
-    assert_eq!(input.response_shape, ResponseShape::LegacyEvmLogs);
 }
 
 #[test]
@@ -42,7 +40,6 @@ fn test_native_planner_rejects_range_beyond_durable_boundary() {
         dataset_key: DatasetKey::evm_blocks(),
         ledger_range: LedgerRange::blocks(9, 10).expect("valid range"),
         selector: datalens_chain::DatasetSelector::all(),
-        response_shape: ResponseShape::LegacyEvmBlocks,
         field_selection: FieldSelection::All,
         finality: QueryFinalityRequirement::DurableOnly,
     };
@@ -73,7 +70,6 @@ fn test_native_planner_builds_executable_plan_from_capabilities() {
             topics: vec![None],
         })
         .expect("valid selector"),
-        response_shape: ResponseShape::LegacyEvmLogs,
         field_selection: FieldSelection::All,
         finality: QueryFinalityRequirement::DurableOnly,
     };
@@ -96,7 +92,6 @@ fn test_native_planner_builds_executable_plan_from_capabilities() {
         LedgerRange::blocks(1, 4).expect("valid range")
     );
     assert_eq!(plan.selector.kind(), SelectorKind::EvmLogs);
-    assert_eq!(plan.response_shape, ResponseShape::LegacyEvmLogs);
     assert_eq!(
         plan.range_split,
         RangeSplitStrategy::MaxLedgerSpan {
@@ -428,7 +423,6 @@ fn blocks_input(start: u64, end: u64) -> NativeQueryInput {
         dataset_key: DatasetKey::evm_blocks(),
         ledger_range: LedgerRange::blocks(start, end).expect("valid range"),
         selector: datalens_chain::DatasetSelector::all(),
-        response_shape: ResponseShape::LegacyEvmBlocks,
         field_selection: FieldSelection::All,
         finality: QueryFinalityRequirement::DurableOnly,
     }
@@ -444,7 +438,6 @@ fn logs_input(start: u64, end: u64) -> NativeQueryInput {
             topics: vec![None],
         })
         .expect("valid selector"),
-        response_shape: ResponseShape::LegacyEvmLogs,
         field_selection: FieldSelection::All,
         finality: QueryFinalityRequirement::DurableOnly,
     }

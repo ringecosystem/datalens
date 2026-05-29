@@ -54,7 +54,7 @@ pub fn decode_rows(dataset_key: DatasetKey, bytes: &[u8]) -> Result<DatasetRows,
     for batch in reader {
         let batch =
             batch.map_err(|error| parquet_read_error(format!("read parquet batch: {error}")))?;
-        let batch_rows = match dataset_key.legacy_dataset() {
+        let batch_rows = match dataset_key.evm_dataset() {
             Some(datalens_core::Dataset::Blocks) => decode_evm_blocks(&batch)?,
             Some(datalens_core::Dataset::Transactions) => decode_evm_transactions(&batch)?,
             Some(datalens_core::Dataset::Receipts) => decode_evm_receipts(&batch)?,
@@ -376,7 +376,7 @@ fn decode_evm_receipts(batch: &RecordBatch) -> Result<QueryRows, DatalensError> 
 }
 
 fn empty_query_rows(dataset_key: &DatasetKey) -> QueryRows {
-    match dataset_key.legacy_dataset() {
+    match dataset_key.evm_dataset() {
         Some(datalens_core::Dataset::Blocks) => QueryRows::EvmBlocks(Vec::new()),
         Some(datalens_core::Dataset::Transactions) => QueryRows::EvmTransactions(Vec::new()),
         Some(datalens_core::Dataset::Receipts) => QueryRows::EvmReceipts(Vec::new()),

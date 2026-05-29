@@ -7,7 +7,7 @@ use datalens_indexer::{
     IndexRuntimeConfig,
 };
 use datalens_metrics::ApplicationIdentity;
-use datalens_planner::{FieldSelection, NativePlannerConfig, NativeQueryInput, ResponseShape};
+use datalens_planner::{FieldSelection, NativePlannerConfig, NativeQueryInput};
 use datalens_storage::LocalStorage;
 use datalens_tron::{TronAdapter, TronFixtureProviderRpc, tron_all_selector};
 use datalens_writer::DurableWriterConfig;
@@ -199,7 +199,6 @@ fn test_tron_durable_query_reads_indexed_transactions() {
             dataset_key: DatasetKey::tron_transactions(),
             ledger_range: LedgerRange::blocks(10, 12).expect("range"),
             selector: tron_all_selector().expect("selector"),
-            response_shape: ResponseShape::NativeRows,
             field_selection: FieldSelection::All,
             finality: QueryFinalityRequirement::DurableOnly,
         })

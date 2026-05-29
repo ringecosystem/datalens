@@ -1,7 +1,7 @@
 use datalens_chain::ChainAdapter;
 use datalens_core::{DatasetKey, LedgerRange, QueryFinalityRequirement, QueryRows};
 use datalens_executor::{NativeQueryExecutionConfig, NativeQueryExecutor};
-use datalens_planner::{FieldSelection, NativePlannerConfig, NativeQueryInput, ResponseShape};
+use datalens_planner::{FieldSelection, NativePlannerConfig, NativeQueryInput};
 use datalens_solana::{SolanaAdapter, solana_all_selector};
 use datalens_storage::LocalStorage;
 use datalens_writer::DurableWriterConfig;
@@ -32,7 +32,6 @@ fn test_solana_slots_complete_fetch_query_cache_flow() {
         dataset_key: DatasetKey::solana_slots(),
         ledger_range: LedgerRange::slots(10, 12).expect("valid range"),
         selector: solana_all_selector().expect("selector"),
-        response_shape: ResponseShape::NativeRows,
         field_selection: FieldSelection::All,
         finality: QueryFinalityRequirement::DurableOnly,
     };

@@ -1054,7 +1054,6 @@ where
                 dataset_key: plan.dataset_key.clone(),
                 ledger_range: plan.ledger_range.clone(),
                 selector: plan.selector.clone(),
-                response_shape: plan.response_shape.clone(),
                 field_selection: plan.field_selection.clone(),
                 finality: plan.requested_finality,
             },
@@ -1284,7 +1283,7 @@ fn boundary_for_cached_hit(range: &LedgerRange) -> ChainHeight {
 }
 
 fn empty_query_rows(dataset_key: &DatasetKey) -> QueryRows {
-    match dataset_key.legacy_dataset() {
+    match dataset_key.evm_dataset() {
         Some(Dataset::Blocks) => QueryRows::EvmBlocks(Vec::new()),
         Some(Dataset::Transactions) => QueryRows::EvmTransactions(Vec::new()),
         Some(Dataset::Receipts) => QueryRows::EvmReceipts(Vec::new()),

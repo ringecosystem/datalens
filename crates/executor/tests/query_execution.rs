@@ -14,7 +14,7 @@ use datalens_core::{
 };
 use datalens_executor::{NativeQueryExecutionConfig, NativeQueryExecutor};
 use datalens_metrics::{ApplicationIdentity, MetricsRecorder};
-use datalens_planner::{FieldSelection, NativePlannerConfig, NativeQueryInput, ResponseShape};
+use datalens_planner::{FieldSelection, NativePlannerConfig, NativeQueryInput};
 use datalens_storage::{
     CacheOutcome, FillOutcome, LocalObjectStore, LocalStorage, Manifest, ObjectMetadata,
     ObjectStore, QueryOutcome, StorageRepository, StorageWriteOutcome, StorageWriteRequest,
@@ -963,7 +963,6 @@ fn blocks_input(start: u64, end: u64) -> NativeQueryInput {
         dataset_key: DatasetKey::evm_blocks(),
         ledger_range: LedgerRange::blocks(start, end).expect("valid range"),
         selector: DatasetSelector::all(),
-        response_shape: ResponseShape::LegacyEvmBlocks,
         field_selection: FieldSelection::All,
         finality: QueryFinalityRequirement::DurableOnly,
     }
