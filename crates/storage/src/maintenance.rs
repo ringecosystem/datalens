@@ -281,9 +281,14 @@ where
             }
             let bytes = self.object_store().get(object_key)?;
             issues.extend(metadata_issues(entry, object_key, &bytes));
-            let encoding = entry.object_encoding.unwrap_or_else(|| {
-                ObjectEncoding::from_object_key(object_key).unwrap_or(ObjectEncoding::Json)
-            });
+            let Some(encoding) = entry.object_encoding else {
+                issues.push(entry_issue(
+                    entry,
+                    MaintenanceIssueKind::ObjectDecodeFailure,
+                    format!("manifest entry object {object_key} missing object_encoding"),
+                ));
+                continue;
+            };
             if let Err(error) = decode_object_rows(encoding, entry.dataset_key.clone(), &bytes) {
                 issues.push(entry_issue(
                     entry,

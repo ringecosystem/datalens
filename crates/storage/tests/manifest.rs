@@ -151,6 +151,7 @@ fn test_manifest_deserialization_rejects_invalid_coverage_semantics() {
 #[test]
 fn test_manifest_deserialization_rejects_data_object_missing_required_metadata() {
     for field in [
+        "object_encoding",
         "object_size_bytes",
         "checksum",
         "checksum_algorithm",
@@ -1021,6 +1022,7 @@ fn test_read_rows_rejects_manifest_entry_with_missing_object() {
                 "selector_canonical_key":"all",
                 "finality_level":"safe",
                 "object_key":"chains/evm/ethereum/1/datasets/evm.blocks/json/block/all/00000000000000000001-00000000000000000001.json",
+                "object_encoding":"json",
                 "row_count":1,
                 "object_size_bytes":128,
                 "checksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",

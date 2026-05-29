@@ -186,9 +186,12 @@ where
                     format!("manifest entry object not found {object_key}"),
                 ));
             }
-            let encoding = entry.object_encoding.unwrap_or_else(|| {
-                ObjectEncoding::from_object_key(object_key).unwrap_or(ObjectEncoding::Json)
-            });
+            let Some(encoding) = entry.object_encoding else {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::StorageReadFailure,
+                    format!("manifest entry object {object_key} missing object_encoding"),
+                ));
+            };
             let mut object_rows =
                 if let Some(rows) = self.read_through_cache.get(object_key, &entry, encoding) {
                     rows
@@ -592,16 +595,6 @@ impl ObjectEncoding {
         match self {
             Self::Json => ".json",
             Self::ParquetV1 => ".parquet",
-        }
-    }
-
-    fn from_object_key(object_key: &str) -> Option<Self> {
-        if object_key.contains("/parquet-v1/") || object_key.ends_with(".parquet") {
-            Some(Self::ParquetV1)
-        } else if object_key.contains("/json/") || object_key.ends_with(".json") {
-            Some(Self::Json)
-        } else {
-            None
         }
     }
 

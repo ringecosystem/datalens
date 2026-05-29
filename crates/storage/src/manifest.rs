@@ -126,6 +126,8 @@ impl ManifestEntry {
                         "data object coverage must have row_count greater than zero",
                     ));
                 }
+                let object_encoding =
+                    required_data_object_metadata(raw.object_encoding, "object_encoding")?;
                 let object_size_bytes =
                     required_data_object_metadata(raw.object_size_bytes, "object_size_bytes")?;
                 let checksum = required_data_object_metadata(raw.checksum, "checksum")?;
@@ -143,7 +145,7 @@ impl ManifestEntry {
                     selector_canonical_key: raw.selector_canonical_key,
                     finality_level: raw.finality_level,
                     object_key: Some(object_key),
-                    object_encoding: raw.object_encoding,
+                    object_encoding: Some(object_encoding),
                     row_count: raw.row_count,
                     object_size_bytes: Some(object_size_bytes),
                     checksum: Some(checksum),
