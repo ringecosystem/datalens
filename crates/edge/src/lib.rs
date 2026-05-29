@@ -391,6 +391,11 @@ pub mod compatibility {
 }
 
 pub mod http {
+    pub use super::{
+        ApiErrorBody, ApiErrorDetail, api_error_body, api_error_status, router, serve,
+        serve_lifecycle,
+    };
+
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub struct HttpRoute {
         pub path: &'static str,
@@ -409,6 +414,24 @@ pub mod streaming {
     pub struct ResponseStream {
         pub content_type: &'static str,
     }
+}
+
+pub mod contract {
+    pub use super::{
+        CacheSummary, ChainDiscovery, DiscoveryResponse, LegacyEvmQueryRequest,
+        LegacyEvmQueryResponse, NativeCacheSummary, NativeQueryResponse, QuerySegment,
+        WarmupDatasetKeyApi, WarmupRunOnceApiResponse, WarmupSelectorApiRequest,
+        WarmupSubmitApiRequest, WarmupSubmitApiResponse, WarmupTaskApiResponse,
+        WarmupTaskListApiResponse, WarmupTaskListQuery, WarmupTaskView,
+    };
+}
+
+pub mod service {
+    pub use super::{
+        LifecycleShutdown, NoopLifecycleShutdown, QueryService, QueryServiceRegistry,
+        RegisteredWarmupService, ServiceLifecycle, WarmupSchedulerHandle,
+        legacy_evm_to_native_input,
+    };
 }
 
 pub mod config {

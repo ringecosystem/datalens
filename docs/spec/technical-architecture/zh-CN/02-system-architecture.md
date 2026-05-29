@@ -48,7 +48,7 @@ EVM 响应标准化和 EVM 错误解释。它不应该决定存储策略或原�
 skipped ranges，并把 storage metadata 汇总返回给查询流程。它不拥有对象编码、object key 布局、
 对象存储 provider 或 Manifest repository 细节。
 
-`datalens-api` 拥有边界层行为：HTTP 解析、原生 API 路由、认证接入点、响应流式返回和兼容
+`datalens-edge` 拥有边界层行为：HTTP 解析、原生 API 路由、认证接入点、响应流式返回和兼容
 适配层。它在调用规划器前做边界转换，在原生响应组装后做兼容响应转换。
 
 ## 这一步先实现什么

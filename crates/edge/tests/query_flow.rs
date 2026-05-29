@@ -7,13 +7,6 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},
 };
-use datalens_api::config::{
-    ApplicationConfig, ApplicationQuotaConfig, ApplicationRegistryConfig, ChainConfig,
-    DatasetsConfig, LogsDatasetConfig, MetricsConfig, PlannerConfig, WriterConfig,
-};
-use datalens_api::{
-    LegacyEvmQueryRequest, LegacyEvmQueryResponse, QueryService, QueryServiceRegistry, router,
-};
 use datalens_chain::{
     AdapterCapabilities, AdapterKey, ChainAdapter, ChainFetchRequest, ChainFetchResponse,
     ChainHeight, DatasetCapability, DatasetSelector, FinalityKind, HeightRangeKind, SelectorKind,
@@ -21,6 +14,13 @@ use datalens_chain::{
 use datalens_core::{
     BlockHeader, BlockRange, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, Dataset,
     DatasetKey, LedgerRange, LogFilter, LogRecord, NetworkId, QueryFinalityRequirement, QueryRows,
+};
+use datalens_edge::config::{
+    ApplicationConfig, ApplicationQuotaConfig, ApplicationRegistryConfig, ChainConfig,
+    DatasetsConfig, LogsDatasetConfig, MetricsConfig, PlannerConfig, WriterConfig,
+};
+use datalens_edge::{
+    LegacyEvmQueryRequest, LegacyEvmQueryResponse, QueryService, QueryServiceRegistry, router,
 };
 use datalens_planner::{FieldSelection, NativeQueryInput, ResponseShape};
 use datalens_solana::{SolanaAdapter, solana_all_selector};
@@ -640,7 +640,7 @@ async fn test_metrics_route_returns_prometheus_text_for_query_path() {
     let registry = QueryServiceRegistry::new()
         .with_service(service)
         .expect("register metrics service");
-    let router = datalens_api::router(registry);
+    let router = datalens_edge::router(registry);
 
     let response = router
         .clone()
@@ -700,7 +700,7 @@ async fn test_query_route_uses_application_identity_header_for_metrics() {
     let registry = QueryServiceRegistry::new()
         .with_service(service)
         .expect("register metrics service");
-    let router = datalens_api::router(registry);
+    let router = datalens_edge::router(registry);
 
     let response = router
         .clone()
@@ -1091,9 +1091,9 @@ fn test_query_native_executes_non_evm_plan_without_legacy_route_validation() {
             kind: "tron".to_owned(),
             chain_id: 1,
             rpc_urls: vec!["http://example.invalid".to_owned()],
-            finality: datalens_api::config::FinalityConfig::Auto,
+            finality: datalens_edge::config::FinalityConfig::Auto,
             datasets: DatasetsConfig {
-                blocks: datalens_api::config::BlocksDatasetConfig {
+                blocks: datalens_edge::config::BlocksDatasetConfig {
                     enabled: false,
                     max_batch_blocks: 2,
                 },
@@ -1178,9 +1178,9 @@ fn service_named_with_datasets(
             kind: "evm".to_owned(),
             chain_id,
             rpc_urls: vec!["http://example.invalid".to_owned()],
-            finality: datalens_api::config::FinalityConfig::Auto,
+            finality: datalens_edge::config::FinalityConfig::Auto,
             datasets: DatasetsConfig {
-                blocks: datalens_api::config::BlocksDatasetConfig {
+                blocks: datalens_edge::config::BlocksDatasetConfig {
                     enabled: blocks_enabled,
                     max_batch_blocks: 2,
                 },
@@ -1199,9 +1199,9 @@ fn chain_config(chain_id: u64) -> ChainConfig {
         kind: "evm".to_owned(),
         chain_id,
         rpc_urls: vec!["http://example.invalid".to_owned()],
-        finality: datalens_api::config::FinalityConfig::Auto,
+        finality: datalens_edge::config::FinalityConfig::Auto,
         datasets: DatasetsConfig {
-            blocks: datalens_api::config::BlocksDatasetConfig {
+            blocks: datalens_edge::config::BlocksDatasetConfig {
                 enabled: true,
                 max_batch_blocks: 2,
             },
@@ -1219,9 +1219,9 @@ fn solana_chain_config() -> ChainConfig {
         kind: "solana".to_owned(),
         chain_id: 0,
         rpc_urls: vec!["http://example.invalid".to_owned()],
-        finality: datalens_api::config::FinalityConfig::Auto,
+        finality: datalens_edge::config::FinalityConfig::Auto,
         datasets: DatasetsConfig {
-            blocks: datalens_api::config::BlocksDatasetConfig {
+            blocks: datalens_edge::config::BlocksDatasetConfig {
                 enabled: false,
                 max_batch_blocks: 2,
             },

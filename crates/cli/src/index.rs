@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
 use clap::{Args, Subcommand};
-use datalens_api::auth::normalize_application_id;
 use datalens_chain::{ChainAdapter, DatasetSelector, FinalityLevel, HeightRangeKind, SelectorKind};
 use datalens_core::{
     ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey, LedgerRange, LedgerRangeKind,
     LogFilter,
 };
+use datalens_edge::auth::normalize_application_id;
 use datalens_evm::EvmRpcClient;
 use datalens_indexer::{
     FileIndexCursorStore, IndexAccounting, IndexChunk, IndexDatasetProviderLimit,

@@ -1,16 +1,16 @@
 use std::{net::SocketAddr, sync::Arc};
 
 use clap::{Args, Parser, Subcommand};
-pub use datalens_api::config::{ChainConfig, DatalensConfig, FinalityConfig};
-use datalens_api::{
-    LegacyEvmQueryRequest, QueryService, QueryServiceRegistry,
-    auth::{ApplicationRegistry, normalize_application_id},
-};
 use datalens_chain::ChainAdapter;
 pub use datalens_core::DatalensErrorKind;
 use datalens_core::{
     BlockRange, ChainFamily, ChainIdentity, DatalensError, Dataset, EvmLogFilter, LedgerRangeKind,
     LogFilter, NetworkId,
+};
+pub use datalens_edge::config::{ChainConfig, DatalensConfig, FinalityConfig};
+use datalens_edge::{
+    LegacyEvmQueryRequest, QueryService, QueryServiceRegistry,
+    auth::{ApplicationRegistry, normalize_application_id},
 };
 use datalens_evm::{EvmAdapter, EvmAdapterMetadata, EvmFinalityPolicy, EvmRpcClient};
 use datalens_metrics::ApplicationIdentity;
@@ -157,12 +157,12 @@ async fn serve_command(
     let adapter = EvmAdapter::new(EvmAdapterMetadata::default());
     let _capabilities = adapter.capabilities();
 
-    log::info!("serving datalens API on {bind}");
-    let lifecycle = datalens_api::ServiceLifecycle::new(registry);
+    log::info!("serving datalens edge on {bind}");
+    let lifecycle = datalens_edge::ServiceLifecycle::new(registry);
     if let Some(scheduler) = warmup_scheduler {
-        datalens_api::serve_lifecycle(bind, lifecycle.with_warmup_scheduler(scheduler)).await?;
+        datalens_edge::serve_lifecycle(bind, lifecycle.with_warmup_scheduler(scheduler)).await?;
     } else {
-        datalens_api::serve_lifecycle(bind, lifecycle).await?;
+        datalens_edge::serve_lifecycle(bind, lifecycle).await?;
     }
     Ok(())
 }
@@ -904,7 +904,7 @@ fn build_evm_service_with_storage(
         chain.datasets.logs.max_get_logs_range_blocks,
         chain.datasets.logs.max_addresses_per_query,
     );
-    let mut service = datalens_api::QueryService::new_with_metrics_config(
+    let mut service = datalens_edge::QueryService::new_with_metrics_config(
         storage.clone(),
         source.clone(),
         config.planner.clone(),
@@ -965,7 +965,7 @@ fn build_solana_service_with_storage(
         SolanaHttpRpc::new(url.clone()),
     )
     .with_max_slot_range_len(chain.datasets.blocks.max_batch_blocks.max(1));
-    Ok(datalens_api::QueryService::new_with_metrics_config(
+    Ok(datalens_edge::QueryService::new_with_metrics_config(
         storage,
         source,
         config.planner.clone(),
@@ -1003,7 +1003,7 @@ fn build_tron_service_with_storage(
         TronHttpProvider::new(url.clone()),
     )
     .with_max_block_range_len(chain.datasets.blocks.max_batch_blocks.max(1));
-    Ok(datalens_api::QueryService::new_with_metrics_config(
+    Ok(datalens_edge::QueryService::new_with_metrics_config(
         storage,
         source,
         config.planner.clone(),
@@ -1189,7 +1189,7 @@ fn build_warmup_registry(
 }
 
 fn durable_writer_config(
-    config: &datalens_api::config::WriterConfig,
+    config: &datalens_edge::config::WriterConfig,
 ) -> datalens_writer::DurableWriterConfig {
     datalens_writer::DurableWriterConfig {
         target_object_bytes: config.target_object_bytes,

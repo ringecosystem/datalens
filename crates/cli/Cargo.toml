@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
-datalens-api = { path = "../api" }
+datalens-edge = { path = "../edge" }
 datalens-chain = { path = "../chain" }
 datalens-core = { path = "../core" }
 datalens-evm = { path = "../evm" }

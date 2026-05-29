@@ -8,11 +8,6 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},
 };
-use datalens_api::{
-    LegacyEvmQueryRequest, QueryService, QueryServiceRegistry,
-    config::{DatalensConfig, WriterConfig},
-    router,
-};
 use datalens_chain::{
     AdapterCapabilities, ChainAdapter, ChainFetchRequest, ChainFetchResponse, ChainHeight,
     DatasetCapability, FinalityKind, HeightRangeKind, ProviderDiagnostics, SelectorKind,
@@ -20,6 +15,11 @@ use datalens_chain::{
 use datalens_core::{
     BlockHeader, BlockRange, ChainFamily, ChainIdentity, DatalensError, Dataset, LogFilter,
     NetworkId, QueryFinalityRequirement, QueryRows,
+};
+use datalens_edge::{
+    LegacyEvmQueryRequest, QueryService, QueryServiceRegistry,
+    config::{DatalensConfig, WriterConfig},
+    router,
 };
 use datalens_metrics::MetricsRecorder;
 use datalens_storage::{
@@ -497,7 +497,7 @@ fn block(number: u64) -> BlockHeader {
     }
 }
 
-fn block_numbers(response: &datalens_api::LegacyEvmQueryResponse) -> Vec<u64> {
+fn block_numbers(response: &datalens_edge::LegacyEvmQueryResponse) -> Vec<u64> {
     match &response.rows {
         QueryRows::EvmBlocks(rows) => rows.iter().map(|row| row.number).collect(),
         _ => panic!("expected block rows"),

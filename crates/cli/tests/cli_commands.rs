@@ -741,12 +741,12 @@ fn test_doctor_chain_summary_rejects_unknown_auto_finality_without_profile() {
         chain_id: 999999,
         rpc_urls: vec![url],
         finality: FinalityConfig::Auto,
-        datasets: datalens_api::config::DatasetsConfig {
-            blocks: datalens_api::config::BlocksDatasetConfig {
+        datasets: datalens_edge::config::DatasetsConfig {
+            blocks: datalens_edge::config::BlocksDatasetConfig {
                 enabled: true,
                 max_batch_blocks: 10,
             },
-            logs: datalens_api::config::LogsDatasetConfig {
+            logs: datalens_edge::config::LogsDatasetConfig {
                 enabled: true,
                 max_get_logs_range_blocks: 10,
                 max_addresses_per_query: 2,

@@ -8,13 +8,6 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},
 };
-use datalens_api::config::{
-    BlocksDatasetConfig, ChainConfig, DatasetsConfig, LogsDatasetConfig, PlannerConfig,
-    WriterConfig, WriterStagingConfig,
-};
-use datalens_api::{
-    LegacyEvmQueryRequest, QueryService, QueryServiceRegistry, ServiceLifecycle, router,
-};
 use datalens_chain::{
     AdapterCapabilities, ChainAdapter, ChainFetchRequest, ChainFetchResponse, ChainHeight,
     DatasetCapability, FinalityKind, HeightRangeKind, ProviderDiagnostics, SelectorKind,
@@ -22,6 +15,13 @@ use datalens_chain::{
 use datalens_core::{
     BlockHeader, BlockRange, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, Dataset,
     DatasetKey, LedgerRange, LogFilter, NetworkId, QueryFinalityRequirement, QueryRows,
+};
+use datalens_edge::config::{
+    BlocksDatasetConfig, ChainConfig, DatasetsConfig, LogsDatasetConfig, PlannerConfig,
+    WriterConfig, WriterStagingConfig,
+};
+use datalens_edge::{
+    LegacyEvmQueryRequest, QueryService, QueryServiceRegistry, ServiceLifecycle, router,
 };
 use datalens_metrics::MetricsRecorder;
 use datalens_planner::{FieldSelection, NativeQueryInput, ResponseShape};
@@ -175,7 +175,7 @@ async fn test_api_warmup_routes_manage_application_scoped_tasks() {
     let root = temp_storage_root("api-warmup-routes");
     let source = MockSource::default();
     let service = service(LocalStorage::new(&root), source).with_warmup_pool(warmup_pool(&root));
-    let application_registry = datalens_api::config::ApplicationRegistryConfig {
+    let application_registry = datalens_edge::config::ApplicationRegistryConfig {
         required: true,
         applications: vec![
             application_config("app-a", "token-a"),
@@ -528,9 +528,9 @@ async fn test_api_warmup_native_submit_uses_chain_neutral_application_allowlists
     let root = temp_storage_root("api-warmup-native-auth");
     let solana = SolanaAdapter::with_fixture_defaults();
     let registry = QueryServiceRegistry::new()
-        .with_application_registry(datalens_api::config::ApplicationRegistryConfig {
+        .with_application_registry(datalens_edge::config::ApplicationRegistryConfig {
             required: true,
-            applications: vec![datalens_api::config::ApplicationConfig {
+            applications: vec![datalens_edge::config::ApplicationConfig {
                 id: "app-a".to_owned(),
                 name: "app-a".to_owned(),
                 enabled: true,
@@ -1027,7 +1027,7 @@ struct ControlledShutdownScheduler {
     events: Arc<Mutex<Vec<String>>>,
 }
 
-impl datalens_api::LifecycleShutdown for ControlledShutdownScheduler {
+impl datalens_edge::LifecycleShutdown for ControlledShutdownScheduler {
     fn shutdown(self) {
         self.events
             .lock()
@@ -1103,7 +1103,7 @@ fn chain_config(chain_id: u64) -> ChainConfig {
         kind: "evm".to_owned(),
         chain_id,
         rpc_urls: vec!["http://example.invalid".to_owned()],
-        finality: datalens_api::config::FinalityConfig::Auto,
+        finality: datalens_edge::config::FinalityConfig::Auto,
         datasets: DatasetsConfig {
             blocks: BlocksDatasetConfig {
                 enabled: true,
@@ -1123,7 +1123,7 @@ fn non_evm_chain_config(kind: &str) -> ChainConfig {
         kind: kind.to_owned(),
         chain_id: 0,
         rpc_urls: vec!["http://example.invalid".to_owned()],
-        finality: datalens_api::config::FinalityConfig::Auto,
+        finality: datalens_edge::config::FinalityConfig::Auto,
         datasets: DatasetsConfig {
             blocks: BlocksDatasetConfig {
                 enabled: false,
@@ -1242,8 +1242,8 @@ where
     )
 }
 
-fn application_config(id: &str, token: &str) -> datalens_api::config::ApplicationConfig {
-    datalens_api::config::ApplicationConfig {
+fn application_config(id: &str, token: &str) -> datalens_edge::config::ApplicationConfig {
+    datalens_edge::config::ApplicationConfig {
         id: id.to_owned(),
         name: id.to_owned(),
         enabled: true,
@@ -1299,7 +1299,7 @@ fn block(number: u64) -> BlockHeader {
     }
 }
 
-fn block_numbers(response: &datalens_api::LegacyEvmQueryResponse) -> Vec<u64> {
+fn block_numbers(response: &datalens_edge::LegacyEvmQueryResponse) -> Vec<u64> {
     match &response.rows {
         QueryRows::EvmBlocks(rows) => rows.iter().map(|row| row.number).collect(),
         _ => panic!("expected block rows"),

@@ -1,5 +1,5 @@
 [package]
-name = "datalens-api"
+name = "datalens-edge"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
