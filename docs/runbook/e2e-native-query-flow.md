@@ -1,9 +1,10 @@
 # E2E Native Query Flow
 
-Goal: Validate the native EVM block/log query flow, durable writer boundary, and
-hot/latest read-through behavior after code changes.
+Goal: Validate the deterministic native query lifecycle and multi-chain indexing paths
+after code changes.
 
-Read this when: You need to decide whether an HBX-13-style change is ready for review.
+Read this when: You need to decide whether query lifecycle, chain adapter, indexing, or
+CLI index command changes are ready for review.
 
 Preconditions:
 
@@ -23,6 +24,7 @@ Verification:
 
 - Required PR readiness command: `just e2e`
 - Full durable cache lifecycle command: `just e2e-lifecycle`
+- Deterministic multi-chain indexing command: `just multi-chain-e2e`
 - Required workspace gates: `just fmt-check` and `just check`
 
 ## CI-Suitable Validation
@@ -108,6 +110,37 @@ Default deterministic lifecycle coverage:
 The full lifecycle test suite is deterministic by default. It uses in-process mock
 sources and local temporary storage, and does not require Docker, public RPC, or real
 secrets.
+
+## Multi-Chain Indexing Validation
+
+Run this when a change touches chain adapters, selector handling, provider-optimized
+paths, the indexer runtime, or CLI index commands:
+
+```sh
+just multi-chain-e2e
+```
+
+`just multi-chain-e2e` runs:
+
+```sh
+cargo test -p datalens-solana
+cargo test -p datalens-tron
+cargo test -p datalens-indexer --test full_indexing_e2e
+cargo test -p datalens-cli --test index_commands
+```
+
+Default deterministic multi-chain coverage:
+
+| Scenario | Validation |
+| --- | --- |
+| Solana selector-driven indexing | Solana adapter tests cover fixture-backed query flow, conformance, optimized signature discovery paths, selector filtering, and full indexing behavior. |
+| Tron contract-event indexing | Tron adapter tests cover fixture-backed query flow, conformance, selector filtering, TronGrid contract-event handling, and indexing behavior. |
+| Indexer full indexing lifecycle | `datalens-indexer` full indexing e2e validates indexing progress, durable writes, resume behavior, and query hits from indexed coverage. |
+| CLI index commands | `datalens-cli` index command tests validate backfill, resume, verify, selector, and cursor behavior beyond the smaller production-readiness subset. |
+
+The multi-chain indexing suite is deterministic by default. It uses fixture providers,
+mock HTTP servers, local temporary storage, and in-memory cursor stores unless a test
+explicitly opts into an environment-gated external dependency.
 
 ## Optional RustFS/S3-Compatible Lifecycle
 

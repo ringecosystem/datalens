@@ -22,6 +22,12 @@ e2e-lifecycle:
   cargo test -p datalens-cli --test cli_commands test_inspect
   cargo test -p datalens-metrics --test metrics_encoding
 
+multi-chain-e2e:
+  cargo test -p datalens-solana
+  cargo test -p datalens-tron
+  cargo test -p datalens-indexer --test full_indexing_e2e
+  cargo test -p datalens-cli --test index_commands
+
 production-readiness:
   cargo test -p datalens-edge --test production_readiness
   cargo test -p datalens-cli --test index_commands test_index_backfill_persists_cursor_under_configured_cursor_path
@@ -44,5 +50,6 @@ release-check:
   just check
   just clippy
   just e2e-lifecycle
+  just multi-chain-e2e
   just container-smoke
   just config-doctor-smoke
