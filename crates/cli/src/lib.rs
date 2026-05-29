@@ -711,7 +711,7 @@ pub fn doctor_chain_summary(
     if chain.kind == "tron" {
         let source = TronAdapter::with_provider(
             chain_identity(name, chain)?,
-            TronHttpProvider::new(chain.rpc_urls.first().cloned().unwrap_or_default()),
+            tron_provider(chain.rpc_urls.first().cloned().unwrap_or_default(), chain),
         )
         .with_max_block_range_len(chain.datasets.blocks.max_batch_blocks.max(1));
         let safe_height = source.cache_safe_height().map_err(|error| {
@@ -739,8 +739,13 @@ pub fn doctor_chain_summary(
                     "max_batch_blocks": chain.datasets.blocks.max_batch_blocks,
                 },
                 "events": {
-                    "enabled": false,
-                    "reason": "unsupported by Tron adapter",
+                    "enabled": true,
+                    "selector": "tron_events",
+                    "trongrid": {
+                        "enabled": chain.trongrid.enabled,
+                        "base_url": chain.trongrid.base_url.as_deref().unwrap_or("https://api.trongrid.io"),
+                        "api_key_configured": chain.trongrid.api_key.as_ref().is_some_and(|value| !value.trim().is_empty()),
+                    },
                 }
             }
         }));
@@ -999,7 +1004,7 @@ fn build_tron_service_with_storage(
     })?;
     let source = TronAdapter::with_provider(
         chain_identity(chain_name, chain).expect("validated chain identity"),
-        TronHttpProvider::new(url.clone()),
+        tron_provider(url.clone(), chain),
     )
     .with_max_block_range_len(chain.datasets.blocks.max_batch_blocks.max(1));
     Ok(datalens_edge::QueryService::new_with_metrics_config(
@@ -1015,6 +1020,22 @@ fn build_tron_service_with_storage(
         usage_ledger,
         ApplicationIdentity::named(config.metrics.default_application.clone()),
     ))
+}
+
+fn tron_provider(url: String, chain: &ChainConfig) -> TronHttpProvider {
+    let provider = TronHttpProvider::new(url);
+    if chain.trongrid.enabled {
+        provider.with_trongrid(
+            chain
+                .trongrid
+                .base_url
+                .clone()
+                .unwrap_or_else(|| "https://api.trongrid.io".to_owned()),
+            chain.trongrid.api_key.clone(),
+        )
+    } else {
+        provider
+    }
 }
 
 fn build_storage(

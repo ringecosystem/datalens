@@ -35,6 +35,15 @@ impl TronFixtureProvider {
         )
         .expect("valid selector")
     }
+
+    pub fn event_selector(&self) -> DatasetSelector {
+        DatasetSelector::try_other(
+            AdapterKey::try_new("tron_events").expect("adapter key"),
+            "tron-events/conformance",
+            "contracts/41abcdefabcdefabcdefabcdefabcdefabcdefabcd/events/Transfer",
+        )
+        .expect("valid selector")
+    }
 }
 
 pub fn assert_tron_capability_conformance<A>(adapter: &A, expected_chain: ChainIdentity)
@@ -75,6 +84,27 @@ where
         assert!(capability.supports_empty_coverage());
         assert!(capability.supports_range_split());
         assert!(capability.supports_reorg_signals());
+    }
+
+    let events = capabilities
+        .dataset(&DatasetKey::tron_events())
+        .expect("Tron events capability");
+    assert!(events.supports_selector(SelectorKind::Other(
+        AdapterKey::try_new("tron_events").expect("adapter key")
+    )));
+    for dataset_key in [
+        DatasetKey::tron_blocks(),
+        DatasetKey::tron_transactions(),
+        DatasetKey::tron_transaction_infos(),
+    ] {
+        assert!(
+            !capabilities
+                .dataset(&dataset_key)
+                .expect("Tron dataset capability")
+                .supports_selector(SelectorKind::Other(
+                    AdapterKey::try_new("tron_events").expect("adapter key")
+                ))
+        );
     }
 }
 

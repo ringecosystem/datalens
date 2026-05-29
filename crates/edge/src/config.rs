@@ -350,8 +350,20 @@ pub struct ChainConfig {
     pub chain_id: u64,
     pub rpc_urls: Vec<String>,
     #[serde(default)]
+    pub trongrid: TronGridConfig,
+    #[serde(default)]
     pub finality: FinalityConfig,
     pub datasets: DatasetsConfig,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TronGridConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub api_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -403,12 +415,7 @@ fn expand_env_vars(text: &str) -> Result<String, DatalensError> {
             ));
         };
         let name = &tail[..end];
-        let value = env::var(name).map_err(|_| {
-            DatalensError::new(
-                DatalensErrorKind::InvalidInput,
-                format!("missing environment variable {name}"),
-            )
-        })?;
+        let value = env::var(name).unwrap_or_default();
         expanded.push_str(&value);
         rest = &tail[end + 1..];
     }

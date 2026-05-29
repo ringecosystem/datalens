@@ -63,6 +63,7 @@ pub(crate) fn chain_config(max_addresses_per_query: usize) -> ChainConfig {
         kind: "evm".to_owned(),
         chain_id: 1,
         rpc_urls: vec!["http://example.invalid".to_owned()],
+        trongrid: Default::default(),
         finality: datalens_edge::config::FinalityConfig::Auto,
         datasets: DatasetsConfig {
             blocks: datalens_edge::config::BlocksDatasetConfig {

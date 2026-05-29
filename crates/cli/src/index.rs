@@ -17,7 +17,7 @@ use datalens_indexer::{
 use datalens_metrics::ApplicationIdentity;
 use datalens_solana::{SolanaAdapter, SolanaHttpRpc};
 use datalens_storage::StorageRepository;
-use datalens_tron::{TronAdapter, TronHttpProvider};
+use datalens_tron::{TronAdapter, TronEventFilter, TronHttpProvider, tron_event_selector};
 use datalens_writer::DurableWriterConfig;
 
 use crate::{
@@ -111,6 +111,9 @@ pub struct IndexCommonCommand {
 
     #[arg(long = "topic")]
     pub topics: Vec<String>,
+
+    #[arg(long = "event-name")]
+    pub event_names: Vec<String>,
 }
 
 pub fn index_command(
@@ -179,7 +182,7 @@ pub fn index_summary(command: IndexWorkflowCommand) -> Result<serde_json::Value,
             })?;
             let adapter = TronAdapter::with_provider(
                 chain_identity(&chain_name, &chain)?,
-                TronHttpProvider::new(url.clone()),
+                tron_provider(url.clone(), &chain),
             )
             .with_max_block_range_len(chain.datasets.blocks.max_batch_blocks.max(1));
             index_summary_with_context(command, config, &chain_name, &chain, adapter)
@@ -402,6 +405,12 @@ fn dataset_selector(
                 .collect(),
         });
     }
+    if chain.kind == "tron" && dataset == "events" && !common.addresses.is_empty() {
+        return tron_event_selector(TronEventFilter {
+            contract_addresses: common.addresses.clone(),
+            event_names: common.event_names.clone(),
+        });
+    }
     Ok(DatasetSelector::all())
 }
 
@@ -473,6 +482,22 @@ fn selected_datasets(job: &IndexJob) -> Result<&[IndexDatasetRequest], DatalensE
             DatalensErrorKind::InvalidInput,
             "index dataset selection must not be empty",
         )),
+    }
+}
+
+fn tron_provider(url: String, chain: &ChainConfig) -> TronHttpProvider {
+    let provider = TronHttpProvider::new(url);
+    if chain.trongrid.enabled {
+        provider.with_trongrid(
+            chain
+                .trongrid
+                .base_url
+                .clone()
+                .unwrap_or_else(|| "https://api.trongrid.io".to_owned()),
+            chain.trongrid.api_key.clone(),
+        )
+    } else {
+        provider
     }
 }
 

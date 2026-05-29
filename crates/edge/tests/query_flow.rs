@@ -388,6 +388,7 @@ async fn test_discovery_route_lists_chain_identities_and_native_dataset_capabili
                 kind: "tron".to_owned(),
                 chain_id: 1,
                 rpc_urls: vec!["http://example.invalid".to_owned()],
+                trongrid: Default::default(),
                 finality: datalens_edge::config::FinalityConfig::Auto,
                 datasets: DatasetsConfig {
                     blocks: datalens_edge::config::BlocksDatasetConfig {
@@ -493,7 +494,7 @@ async fn test_discovery_route_lists_chain_identities_and_native_dataset_capabili
                         {
                             "dataset_key": "tron.events",
                             "range_kinds": [{"kind": "block"}],
-                            "selectors": ["tron_all"],
+                            "selectors": ["tron_all", "tron_events"],
                             "enabled": true
                         }
                     ]
