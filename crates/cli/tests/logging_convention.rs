@@ -29,12 +29,8 @@ fn test_cli_owns_tracing_backed_log_output() {
 
 #[test]
 fn test_library_code_uses_log_facade_without_initializing_tracing() {
-    for path in [
-        "crates/edge/src/lib.rs",
-        "crates/storage/src/lib.rs",
-        "crates/evm/src/lib.rs",
-    ] {
-        let source = read(path);
+    for path in ["crates/edge/src", "crates/storage/src", "crates/evm/src"] {
+        let source = read_rust_sources(path);
         assert!(
             source.contains("log::"),
             "{path} should use the log facade for runtime log calls"
@@ -67,12 +63,42 @@ fn assert_manifest_has_dependency(path: &str, dependency: &str) {
 }
 
 fn read(path: impl AsRef<Path>) -> String {
+    fs::read_to_string(workspace_path(path.as_ref())).unwrap_or_else(|error| {
+        panic!("read {}: {error}", workspace_path(path.as_ref()).display());
+    })
+}
+
+fn read_rust_sources(path: impl AsRef<Path>) -> String {
+    let mut source = String::new();
+    collect_rust_sources(&workspace_path(path.as_ref()), &mut source);
+    source
+}
+
+fn collect_rust_sources(path: &Path, source: &mut String) {
+    if path.is_file() {
+        if path.extension().is_some_and(|extension| extension == "rs") {
+            source.push_str(&fs::read_to_string(path).unwrap_or_else(|error| {
+                panic!("read {}: {error}", path.display());
+            }));
+        }
+        return;
+    }
+
+    let entries = fs::read_dir(path).unwrap_or_else(|error| {
+        panic!("read dir {}: {error}", path.display());
+    });
+    for entry in entries {
+        let entry = entry.unwrap_or_else(|error| {
+            panic!("read dir entry {}: {error}", path.display());
+        });
+        collect_rust_sources(&entry.path(), source);
+    }
+}
+
+fn workspace_path(path: &Path) -> std::path::PathBuf {
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
         .expect("workspace root");
-    let full_path = workspace_root.join(path.as_ref());
-    fs::read_to_string(&full_path).unwrap_or_else(|error| {
-        panic!("read {}: {error}", full_path.display());
-    })
+    workspace_root.join(path)
 }

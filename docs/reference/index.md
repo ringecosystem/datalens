@@ -19,4 +19,5 @@ Question this index answers: "how is it currently organized or implemented?"
 
 ## Current reference docs
 
-- No topic-specific reference docs exist yet.
+- [`edge.md`](edge.md): current `datalens-edge` crate module boundaries and transport
+  surfaces.

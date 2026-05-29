@@ -16,13 +16,24 @@ use datalens_warmup::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::{
-    AppState, ChainDiscovery, DiscoveryResponse, FieldSelectionApi, QueryApiRequest,
-    QueryApiResponse, QueryCacheApi, QueryRangeApi, QuerySelectorApi, QueryServiceRegistry,
-    WarmupDatasetKeyApi, WarmupRunOnceApiResponse, WarmupSelectorApiRequest,
-    WarmupSubmitApiRequest, WarmupSubmitApiResponse, WarmupTaskView, api_error_kind,
-    api_error_status, application_from_headers, application_id_from_headers, warmup_submit_request,
-    warmup_task_view,
+use crate::{
+    contract::error::{api_error_kind, api_error_status},
+    contract::{
+        discovery::{ChainDiscovery, DiscoveryResponse},
+        query::{
+            FieldSelectionApi, QueryApiRequest, QueryApiResponse, QueryCacheApi, QueryRangeApi,
+            QuerySelectorApi,
+        },
+        warmup::{
+            WarmupDatasetKeyApi, WarmupRunOnceApiResponse, WarmupSelectorApiRequest,
+            WarmupSubmitApiRequest, WarmupSubmitApiResponse, WarmupTaskView, warmup_task_view,
+        },
+    },
+    http::{
+        AppState,
+        handlers::{application_from_headers, application_id_from_headers, warmup_submit_request},
+    },
+    service::registry::QueryServiceRegistry,
 };
 
 pub(crate) type DatalensGraphqlSchema = Schema<QueryRoot, MutationRoot, EmptySubscription>;

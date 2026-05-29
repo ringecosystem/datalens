@@ -59,9 +59,13 @@ manifest writes to storage, records empty coverage when configured, tracks skipp
 and returns the storage metadata summary to the query flow. It must not own object
 encoding, object key layout, object store providers, or manifest repository details.
 
-`datalens-edge` owns edge behavior: HTTP parsing, native API routes, authentication hooks,
-response streaming, and compatibility adapters. It translates at the edge before calling
-the planner and reshapes responses at the edge after native response assembly.
+`datalens-edge` owns the multi-transport service boundary: REST routes, GraphQL,
+GraphiQL, metrics, discovery, warmup task operations, authentication, application
+authorization, quota checks, service registry routing, and native query entrypoints. REST
+and GraphQL query surfaces expose equivalent query capability over the same native
+contract; transport handlers reshape requests and responses but must not define separate
+planner, storage, or dataset semantics. The edge translates at the boundary before
+calling the planner and reshapes responses after native response assembly.
 
 ## What This Step Implements First
 

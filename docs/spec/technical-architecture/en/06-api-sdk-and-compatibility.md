@@ -82,6 +82,13 @@ The default client behavior is service-client only:
 
 ## HTTP Contract
 
+The edge exposes the native query contract through REST and GraphQL transports. REST
+uses `POST /v1/query`. GraphQL uses the `query(input:)` field on `POST /graphql`. Both
+transports must authorize the same application identity, enforce the same native request
+validation, call the same `NativeQueryInput` execution path, and return the same cache
+and row semantics. GraphQL may wrap chain identity, range, cache, and rows in JSON
+scalars where that preserves the native shape for GraphQL clients.
+
 `POST /v1/query` request fields:
 
 - `chain`: `ChainIdentity`.
@@ -153,6 +160,9 @@ Error responses have the stable shape:
 SDK callers must branch on typed error kind, not on `error.message`.
 `unsupported_hot_query` means datalens cannot safely serve the requested hot/latest
 contract. It is distinct from a durable cache miss.
+
+GraphQL errors must expose the same stable error kind vocabulary through error
+extensions so clients can branch on the same semantic failure categories as REST clients.
 
 ## Application Identity
 

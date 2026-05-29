@@ -1,0 +1,373 @@
+use std::sync::Arc;
+
+use datalens_chain::ChainAdapter;
+use datalens_core::{
+    ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey, DatasetRows, LedgerRange,
+    NetworkId,
+};
+use datalens_executor::{NativeQueryExecutionConfig, NativeQueryExecutor};
+use datalens_metrics::{ApplicationIdentity, MetricsRecorder};
+use datalens_planner::{NativePlannerConfig, NativeQueryInput};
+use datalens_storage::{StorageRepository, UsageLedgerRepository};
+use datalens_warmup::{
+    WarmupRegistry, WarmupRunResult, WarmupSubmitOutcome, WarmupSubmitRequest, WarmupTask,
+    WarmupTaskFilter, WarmupTaskId, WarmupTaskPool,
+};
+use datalens_writer::{DurableWriteResult, DurableWriterConfig};
+
+use crate::{
+    chain_family,
+    config::{ChainConfig, MetricsConfig, PlannerConfig, WriterConfig},
+    contract::discovery::ChainDiscovery,
+    enabled_datasets,
+};
+
+#[derive(Clone)]
+pub struct QueryService<S> {
+    executor: NativeQueryExecutor<Arc<dyn StorageRepository>, S>,
+    chain_name: String,
+    chain: ChainConfig,
+    metrics: Option<MetricsRecorder>,
+    warmup: Option<Arc<dyn RegisteredWarmupService>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeCacheSummary {
+    pub hit_ranges: Vec<LedgerRange>,
+    pub missing_ranges: Vec<LedgerRange>,
+    pub durable_hit_ranges: Vec<LedgerRange>,
+    pub hot_hit_ranges: Vec<LedgerRange>,
+    pub provider_fill_ranges: Vec<LedgerRange>,
+    pub promotion_pending_ranges: Vec<LedgerRange>,
+    pub segments: Vec<datalens_core::QuerySegmentMetadata>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeQueryResponse {
+    pub chain: datalens_core::ChainIdentity,
+    pub dataset_key: DatasetKey,
+    pub ledger_range: LedgerRange,
+    pub cache: NativeCacheSummary,
+    pub rows: DatasetRows,
+}
+
+impl<S> QueryService<S>
+where
+    S: ChainAdapter,
+{
+    pub fn new(
+        storage: impl StorageRepository + 'static,
+        source: S,
+        planner: PlannerConfig,
+        writer: WriterConfig,
+        chain: ChainConfig,
+    ) -> Self {
+        Self::new_named(storage, source, planner, writer, "ethereum", chain)
+    }
+
+    pub fn new_named(
+        storage: impl StorageRepository + 'static,
+        source: S,
+        planner: PlannerConfig,
+        writer: WriterConfig,
+        chain_name: impl Into<String>,
+        chain: ChainConfig,
+    ) -> Self {
+        Self::new_with_metrics_config(
+            storage,
+            source,
+            planner,
+            writer,
+            chain_name,
+            chain,
+            MetricsConfig::default(),
+        )
+        .expect("default metrics recorder initializes")
+    }
+
+    pub fn new_with_metrics_config(
+        storage: impl StorageRepository + 'static,
+        source: S,
+        planner: PlannerConfig,
+        writer: WriterConfig,
+        chain_name: impl Into<String>,
+        chain: ChainConfig,
+        metrics_config: MetricsConfig,
+    ) -> Result<Self, DatalensError> {
+        let storage: Arc<dyn StorageRepository> = Arc::new(storage);
+        let recorder = if metrics_config.enabled {
+            Some(MetricsRecorder::new().map_err(|error| {
+                DatalensError::new(
+                    DatalensErrorKind::Internal,
+                    format!("initialize metrics recorder: {error}"),
+                )
+            })?)
+        } else {
+            None
+        };
+        let mut executor = NativeQueryExecutor::new(
+            storage,
+            source,
+            NativeQueryExecutionConfig {
+                planner: NativePlannerConfig {
+                    max_query_range_len: planner.max_query_range_blocks,
+                    default_chunk_range_len: planner.default_chunk_range_blocks,
+                },
+                writer: DurableWriterConfig {
+                    target_object_bytes: writer.target_object_bytes,
+                    min_object_rows: writer.min_object_rows,
+                    record_empty_coverage: writer.record_empty_coverage,
+                    staging: datalens_writer::WriteStagingConfig {
+                        enabled: writer.staging.enabled,
+                        min_rows: writer.staging.min_rows,
+                        target_object_bytes: writer.staging.target_object_bytes,
+                        max_staged_ranges: writer.staging.max_staged_ranges,
+                        max_staged_rows: writer.staging.max_staged_rows,
+                        max_staged_age_ms: writer.staging.max_staged_age_ms,
+                        flush_on_shutdown: writer.staging.flush_on_shutdown,
+                        max_staged_bytes: writer.staging.max_staged_bytes,
+                    },
+                },
+            },
+        );
+        if let Some(recorder) = recorder.clone() {
+            executor = executor.with_metrics(
+                recorder,
+                ApplicationIdentity::named(metrics_config.default_application),
+            );
+        }
+
+        Ok(Self {
+            executor,
+            chain_name: chain_name.into(),
+            chain,
+            metrics: recorder,
+            warmup: None,
+        })
+    }
+
+    pub fn with_metrics(mut self, metrics: MetricsRecorder) -> Self {
+        self.executor = self
+            .executor
+            .with_metrics(metrics.clone(), ApplicationIdentity::unknown());
+        self.metrics = Some(metrics);
+        self
+    }
+
+    pub fn metrics_recorder(&self) -> Option<MetricsRecorder> {
+        self.metrics.clone()
+    }
+
+    pub fn with_usage_ledger(
+        mut self,
+        repository: impl UsageLedgerRepository + 'static,
+        application: ApplicationIdentity,
+    ) -> Self {
+        self.executor = self.executor.with_usage_ledger(repository, application);
+        self
+    }
+
+    pub fn with_warmup_pool<P>(mut self, pool: P) -> Self
+    where
+        P: RegisteredWarmupService + 'static,
+    {
+        self.warmup = Some(Arc::new(pool));
+        self
+    }
+
+    pub fn chain_name(&self) -> &str {
+        &self.chain_name
+    }
+
+    pub fn query_native(
+        &self,
+        native_input: NativeQueryInput,
+    ) -> Result<NativeQueryResponse, DatalensError> {
+        self.query_native_with_application(native_input, None)
+    }
+
+    pub fn query_native_with_application(
+        &self,
+        native_input: NativeQueryInput,
+        application: Option<ApplicationIdentity>,
+    ) -> Result<NativeQueryResponse, DatalensError> {
+        if let Err(error) = self.validate_native_query_route(&native_input) {
+            log::warn!("query validation failed kind={:?}", error.kind);
+            return Err(error);
+        }
+        log::info!(
+            "native query start chain={} dataset={} range={}-{}",
+            native_input.chain.configured_name(),
+            native_input.dataset_key.as_str(),
+            native_input.ledger_range.start(),
+            native_input.ledger_range.end()
+        );
+        let result = self
+            .executor
+            .execute_with_application(native_input, application)?;
+        Ok(NativeQueryResponse {
+            chain: result.chain,
+            dataset_key: result.dataset_key,
+            ledger_range: result.ledger_range,
+            cache: NativeCacheSummary {
+                hit_ranges: result.cache.hit_ranges,
+                missing_ranges: result.cache.missing_ranges,
+                durable_hit_ranges: result.cache.durable_hit_ranges,
+                hot_hit_ranges: result.cache.hot_hit_ranges,
+                provider_fill_ranges: result.cache.provider_fill_ranges,
+                promotion_pending_ranges: result.cache.promotion_pending_ranges,
+                segments: result.cache.segments,
+            },
+            rows: result.rows,
+        })
+    }
+
+    pub fn metrics_text(&self) -> Option<Result<String, DatalensError>> {
+        self.metrics.as_ref().map(|recorder| {
+            recorder.encode().map_err(|error| {
+                DatalensError::new(
+                    DatalensErrorKind::Internal,
+                    format!("encode metrics: {error}"),
+                )
+            })
+        })
+    }
+
+    pub fn flush_staged_writes_for_shutdown(&self) -> Result<DurableWriteResult, DatalensError> {
+        self.executor.flush_staged_writes_for_shutdown()
+    }
+
+    pub fn discovery(&self) -> Result<ChainDiscovery, DatalensError> {
+        Ok(ChainDiscovery {
+            identity: ChainIdentity::try_new(
+                chain_family(&self.chain.kind)?,
+                self.chain_name.clone(),
+                Some(NetworkId::numeric(self.chain.chain_id)),
+            )?,
+            datasets: enabled_datasets(&self.chain),
+        })
+    }
+
+    fn validate_native_query_route(&self, input: &NativeQueryInput) -> Result<(), DatalensError> {
+        if input.chain.configured_name() != self.chain_name {
+            return Err(DatalensError::new(
+                DatalensErrorKind::UnsupportedDataset,
+                "chain is not configured",
+            ));
+        }
+        let chain_family = chain_family(&self.chain.kind)?;
+        if input.chain.family_ref() != &chain_family || input.dataset_key.family() != &chain_family
+        {
+            return Err(DatalensError::new(
+                DatalensErrorKind::UnsupportedDataset,
+                "query chain and dataset must match the configured chain kind",
+            ));
+        }
+        if self.chain.kind == "evm" {
+            if input.dataset_key == DatasetKey::evm_blocks() && !self.chain.datasets.blocks.enabled
+            {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::UnsupportedDataset,
+                    "blocks dataset is disabled",
+                ));
+            }
+            if input.dataset_key == DatasetKey::evm_logs() && !self.chain.datasets.logs.enabled {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::UnsupportedDataset,
+                    "logs dataset is disabled",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) trait RegisteredQueryService: Send + Sync {
+    fn query_native(
+        &self,
+        request: NativeQueryInput,
+        application: Option<ApplicationIdentity>,
+    ) -> Result<NativeQueryResponse, DatalensError>;
+
+    fn metrics_text(&self) -> Option<Result<String, DatalensError>>;
+
+    fn flush_staged_writes_for_shutdown(&self) -> Result<DurableWriteResult, DatalensError>;
+
+    fn discovery(&self) -> Result<ChainDiscovery, DatalensError>;
+
+    fn warmup(&self) -> Option<Arc<dyn RegisteredWarmupService>>;
+}
+
+pub trait RegisteredWarmupService: Send + Sync {
+    fn submit(&self, request: WarmupSubmitRequest) -> Result<WarmupSubmitOutcome, DatalensError>;
+    fn get(&self, task_id: &WarmupTaskId) -> Result<Option<WarmupTask>, DatalensError>;
+    fn list(&self, filter: WarmupTaskFilter) -> Result<Vec<WarmupTask>, DatalensError>;
+    fn pause(&self, task_id: &WarmupTaskId) -> Result<(), DatalensError>;
+    fn cancel(&self, task_id: &WarmupTaskId) -> Result<(), DatalensError>;
+    fn retry_failed(&self, task_id: &WarmupTaskId) -> Result<(), DatalensError>;
+    fn run_available_once(&self) -> Result<Vec<WarmupRunResult>, DatalensError>;
+}
+
+impl<A, S, R> RegisteredWarmupService for WarmupTaskPool<A, S, R>
+where
+    A: ChainAdapter,
+    S: StorageRepository + Clone + 'static,
+    R: WarmupRegistry,
+{
+    fn submit(&self, request: WarmupSubmitRequest) -> Result<WarmupSubmitOutcome, DatalensError> {
+        WarmupTaskPool::submit(self, request)
+    }
+
+    fn get(&self, task_id: &WarmupTaskId) -> Result<Option<WarmupTask>, DatalensError> {
+        WarmupTaskPool::get(self, task_id)
+    }
+
+    fn list(&self, filter: WarmupTaskFilter) -> Result<Vec<WarmupTask>, DatalensError> {
+        WarmupTaskPool::list(self, filter)
+    }
+
+    fn pause(&self, task_id: &WarmupTaskId) -> Result<(), DatalensError> {
+        WarmupTaskPool::pause(self, task_id)
+    }
+
+    fn cancel(&self, task_id: &WarmupTaskId) -> Result<(), DatalensError> {
+        WarmupTaskPool::cancel(self, task_id)
+    }
+
+    fn retry_failed(&self, task_id: &WarmupTaskId) -> Result<(), DatalensError> {
+        WarmupTaskPool::retry_failed(self, task_id)
+    }
+
+    fn run_available_once(&self) -> Result<Vec<WarmupRunResult>, DatalensError> {
+        WarmupTaskPool::run_available_once(self)
+    }
+}
+
+impl<S> RegisteredQueryService for QueryService<S>
+where
+    S: ChainAdapter + 'static,
+{
+    fn query_native(
+        &self,
+        request: NativeQueryInput,
+        application: Option<ApplicationIdentity>,
+    ) -> Result<NativeQueryResponse, DatalensError> {
+        QueryService::query_native_with_application(self, request, application)
+    }
+
+    fn metrics_text(&self) -> Option<Result<String, DatalensError>> {
+        QueryService::metrics_text(self)
+    }
+
+    fn flush_staged_writes_for_shutdown(&self) -> Result<DurableWriteResult, DatalensError> {
+        QueryService::flush_staged_writes_for_shutdown(self)
+    }
+
+    fn discovery(&self) -> Result<ChainDiscovery, DatalensError> {
+        QueryService::discovery(self)
+    }
+
+    fn warmup(&self) -> Option<Arc<dyn RegisteredWarmupService>> {
+        self.warmup.clone()
+    }
+}
