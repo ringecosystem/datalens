@@ -27,51 +27,54 @@ use datalens_storage::LocalStorage;
 fn test_client_query_request_json_matches_api_request_contract() {
     let request = datalens_client::QueryRequest {
         chain: ethereum_identity(),
-        dataset: Dataset::Logs,
-        range: BlockRange::expect_new(20, 21),
-        filter: Some(LogFilter {
+        dataset_key: "evm.logs".to_owned(),
+        selector: datalens_client::QuerySelector::EvmLogs(LogFilter {
             addresses: vec!["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()],
             topics: vec![None, Some(vec![TOPIC_A.to_owned()])],
         }),
-        include_block: false,
-        allow_hot: false,
+        range: datalens_client::QueryRange::Block { start: 20, end: 21 },
         finality: QueryFinalityRequirement::DurableOnly,
+        fields: datalens_client::FieldSelection::All,
     };
 
-    let api_request: LegacyEvmQueryRequest =
+    let api_request: QueryApiRequest =
         serde_json::from_value(serde_json::to_value(request).expect("client request json"))
             .expect("api request json");
 
+    assert_eq!(api_request.chain, ethereum_identity());
+    assert_eq!(api_request.dataset_key, "evm.logs");
     assert_eq!(
-        api_request,
-        logs_request_with_topics(
-            20,
-            21,
-            vec!["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
-            vec![None, Some(vec![TOPIC_A])]
-        )
+        api_request.range,
+        QueryRangeApi::Block { start: 20, end: 21 }
     );
+    assert!(matches!(api_request.selector, QuerySelectorApi::EvmLogs(_)));
+    assert_eq!(api_request.finality, QueryFinalityRequirement::DurableOnly);
 }
 
 #[test]
 fn test_client_query_response_json_decodes_api_response_contract() {
-    let api_response = LegacyEvmQueryResponse {
+    let api_response = QueryApiResponse {
         chain: ethereum_identity(),
-        range: BlockRange::expect_new(10, 10),
-        cache: datalens_edge::CacheSummary {
-            hit_ranges: vec![BlockRange::expect_new(10, 10)],
+        dataset_key: "evm.blocks".to_owned(),
+        range: QueryRangeApi::Block { start: 10, end: 10 },
+        cache: datalens_edge::QueryCacheApi {
+            hit_ranges: vec![QueryRangeApi::Block { start: 10, end: 10 }],
             missing_ranges: Vec::new(),
-            durable_hit_ranges: vec![BlockRange::expect_new(10, 10)],
+            durable_hit_ranges: vec![QueryRangeApi::Block { start: 10, end: 10 }],
             hot_hit_ranges: Vec::new(),
             provider_fill_ranges: Vec::new(),
             promotion_pending_ranges: Vec::new(),
-            segments: vec![datalens_edge::QuerySegment {
-                range: BlockRange::expect_new(10, 10),
+            segments: vec![datalens_edge::QuerySegmentApi {
+                range: QueryRangeApi::Block { start: 10, end: 10 },
                 source: QuerySegmentSource::Durable,
                 finality: QueryDataFinality::Safe,
             }],
         },
-        rows: QueryRows::EvmBlocks(vec![block(10, "0x10")]),
+        rows: datalens_core::DatasetRows::new(
+            DatasetKey::evm_blocks(),
+            QueryRows::EvmBlocks(vec![block(10, "0x10")]),
+        )
+        .expect("rows"),
     };
 
     let client_response: datalens_client::QueryResponse =
@@ -82,7 +85,10 @@ fn test_client_query_response_json_decodes_api_response_contract() {
         client_response.cache.outcome(),
         datalens_client::CacheOutcome::FullHit
     );
-    assert_eq!(query_row_block_numbers(&client_response.rows), vec![10]);
+    assert_eq!(
+        query_row_block_numbers(client_response.rows.rows()),
+        vec![10]
+    );
 }
 
 #[test]

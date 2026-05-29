@@ -3,11 +3,12 @@ use std::sync::{Arc, Mutex};
 use datalens_client::{
     APPLICATION_IDENTITY_HEADER, ApiErrorKind, CacheOutcome, ChainDiscovery, DatalensClient,
     DatalensClientConfig, FallbackMode, HttpRequest, HttpResponse, HttpTransport, QueryOptions,
-    QueryResponse,
+    QueryRange, QueryResponse,
 };
 use datalens_core::{
-    BlockHeader, BlockRange, ChainFamily, ChainIdentity, Dataset, LogFilter, NetworkId,
-    QueryDataFinality, QueryFinalityRequirement, QueryRows, QuerySegmentSource,
+    BlockHeader, BlockRange, ChainFamily, ChainIdentity, Dataset, DatasetKey, DatasetRows,
+    LogFilter, NetworkId, QueryDataFinality, QueryFinalityRequirement, QueryRows,
+    QuerySegmentSource,
 };
 
 #[test]
@@ -16,9 +17,10 @@ fn test_query_blocks_serializes_api_request_and_application_header() {
         200,
         serde_json::json!({
             "chain": ethereum_identity(),
-            "range": { "from_block": 10, "to_block": 12 },
-            "cache": { "hit_ranges": [], "missing_ranges": [{ "from_block": 10, "to_block": 12 }] },
-            "rows": { "dataset": "blocks", "rows": [] }
+            "dataset_key": "evm.blocks",
+            "range": { "kind": "block", "start": 10, "end": 12 },
+            "cache": { "hit_ranges": [], "missing_ranges": [{ "kind": "block", "start": 10, "end": 12 }] },
+            "rows": dataset_rows_json(DatasetKey::evm_blocks(), QueryRows::EvmBlocks(Vec::new()))
         }),
     ));
     let client = client(transport.clone(), Some("wallet-search"));
@@ -39,12 +41,11 @@ fn test_query_blocks_serializes_api_request_and_application_header() {
         request.body,
         serde_json::json!({
             "chain": ethereum_identity(),
-            "dataset": "blocks",
-            "range": { "from_block": 10, "to_block": 12 },
-            "filter": null,
-            "include_block": false,
-            "allow_hot": false,
-            "finality": "durable_only"
+            "dataset_key": "evm.blocks",
+            "selector": { "kind": "all" },
+            "range": { "kind": "block", "start": 10, "end": 12 },
+            "finality": "durable_only",
+            "fields": "all"
         })
     );
 }
@@ -55,21 +56,22 @@ fn test_query_blocks_with_hot_options_serializes_explicit_hot_contract() {
         200,
         serde_json::json!({
             "chain": ethereum_identity(),
-            "range": { "from_block": 100, "to_block": 101 },
+            "dataset_key": "evm.blocks",
+            "range": { "kind": "block", "start": 100, "end": 101 },
             "cache": {
                 "hit_ranges": [],
-                "missing_ranges": [{ "from_block": 100, "to_block": 101 }],
+                "missing_ranges": [{ "kind": "block", "start": 100, "end": 101 }],
                 "durable_hit_ranges": [],
                 "hot_hit_ranges": [],
-                "provider_fill_ranges": [{ "from_block": 100, "to_block": 101 }],
+                "provider_fill_ranges": [{ "kind": "block", "start": 100, "end": 101 }],
                 "promotion_pending_ranges": [],
                 "segments": [{
-                    "range": { "from_block": 100, "to_block": 101 },
+                    "range": { "kind": "block", "start": 100, "end": 101 },
                     "source": "provider",
                     "finality": "latest"
                 }]
             },
-            "rows": { "dataset": "blocks", "rows": [] }
+            "rows": dataset_rows_json(DatasetKey::evm_blocks(), QueryRows::EvmBlocks(Vec::new()))
         }),
     ));
     let client = client(transport.clone(), Some("wallet-search"));
@@ -79,7 +81,6 @@ fn test_query_blocks_with_hot_options_serializes_explicit_hot_contract() {
             ethereum_identity(),
             BlockRange::expect_new(100, 101),
             QueryOptions {
-                allow_hot: true,
                 finality: QueryFinalityRequirement::SafeToLatest,
             },
         )
@@ -87,7 +88,10 @@ fn test_query_blocks_with_hot_options_serializes_explicit_hot_contract() {
 
     assert_eq!(
         response.cache.provider_fill_ranges,
-        vec![BlockRange::expect_new(100, 101)]
+        vec![QueryRange::Block {
+            start: 100,
+            end: 101
+        }]
     );
     assert_eq!(
         response.cache.segments[0].source,
@@ -102,12 +106,11 @@ fn test_query_blocks_with_hot_options_serializes_explicit_hot_contract() {
         request.body,
         serde_json::json!({
             "chain": ethereum_identity(),
-            "dataset": "blocks",
-            "range": { "from_block": 100, "to_block": 101 },
-            "filter": null,
-            "include_block": false,
-            "allow_hot": true,
-            "finality": "safe_to_latest"
+            "dataset_key": "evm.blocks",
+            "selector": { "kind": "all" },
+            "range": { "kind": "block", "start": 100, "end": 101 },
+            "finality": "safe_to_latest",
+            "fields": "all"
         })
     );
 }
@@ -118,28 +121,29 @@ fn test_query_logs_serializes_filter_topic_wildcards_and_empty_topic_sets() {
         200,
         serde_json::json!({
             "chain": ethereum_identity(),
-            "range": { "from_block": 20, "to_block": 21 },
+            "dataset_key": "evm.logs",
+            "range": { "kind": "block", "start": 20, "end": 21 },
             "cache": {
-                "hit_ranges": [{ "from_block": 20, "to_block": 20 }],
-                "missing_ranges": [{ "from_block": 21, "to_block": 21 }],
-                "durable_hit_ranges": [{ "from_block": 20, "to_block": 20 }],
+                "hit_ranges": [{ "kind": "block", "start": 20, "end": 20 }],
+                "missing_ranges": [{ "kind": "block", "start": 21, "end": 21 }],
+                "durable_hit_ranges": [{ "kind": "block", "start": 20, "end": 20 }],
                 "hot_hit_ranges": [],
-                "provider_fill_ranges": [{ "from_block": 21, "to_block": 21 }],
+                "provider_fill_ranges": [{ "kind": "block", "start": 21, "end": 21 }],
                 "promotion_pending_ranges": [],
                 "segments": [
                     {
-                        "range": { "from_block": 20, "to_block": 20 },
+                        "range": { "kind": "block", "start": 20, "end": 20 },
                         "source": "durable",
                         "finality": "safe"
                     },
                     {
-                        "range": { "from_block": 21, "to_block": 21 },
+                        "range": { "kind": "block", "start": 21, "end": 21 },
                         "source": "provider",
                         "finality": "safe"
                     }
                 ]
             },
-            "rows": { "dataset": "logs", "rows": [] }
+            "rows": dataset_rows_json(DatasetKey::evm_logs(), QueryRows::EvmLogs(Vec::new()))
         }),
     ));
     let client = client(transport.clone(), None);
@@ -158,11 +162,11 @@ fn test_query_logs_serializes_filter_topic_wildcards_and_empty_topic_sets() {
     assert_eq!(response.cache.outcome(), CacheOutcome::PartialHit);
     assert_eq!(
         response.cache.durable_hit_ranges,
-        vec![BlockRange::expect_new(20, 20)]
+        vec![QueryRange::Block { start: 20, end: 20 }]
     );
     assert_eq!(
         response.cache.provider_fill_ranges,
-        vec![BlockRange::expect_new(21, 21)]
+        vec![QueryRange::Block { start: 21, end: 21 }]
     );
     assert_eq!(
         response.cache.segments[0].source,
@@ -175,7 +179,7 @@ fn test_query_logs_serializes_filter_topic_wildcards_and_empty_topic_sets() {
     let request = transport.only_request();
     assert_eq!(request.header(APPLICATION_IDENTITY_HEADER), Some("unknown"));
     assert_eq!(
-        request.body["filter"],
+        request.body["selector"]["value"],
         serde_json::json!({
             "addresses": ["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
             "topics": [null, [], [topic_a()]]
@@ -211,29 +215,30 @@ fn test_discovery_decodes_chain_identity_and_dataset_capabilities() {
 fn test_response_rows_and_cache_summary_decode_with_outcome_helpers() {
     let response: QueryResponse = serde_json::from_value(serde_json::json!({
         "chain": ethereum_identity(),
-            "range": { "from_block": 1, "to_block": 2 },
+            "dataset_key": "evm.blocks",
+            "range": { "kind": "block", "start": 1, "end": 2 },
             "cache": {
-                "hit_ranges": [{ "from_block": 1, "to_block": 2 }],
+                "hit_ranges": [{ "kind": "block", "start": 1, "end": 2 }],
                 "missing_ranges": [],
-                "durable_hit_ranges": [{ "from_block": 1, "to_block": 2 }],
+                "durable_hit_ranges": [{ "kind": "block", "start": 1, "end": 2 }],
                 "hot_hit_ranges": [],
                 "provider_fill_ranges": [],
                 "promotion_pending_ranges": [],
                 "segments": [{
-                    "range": { "from_block": 1, "to_block": 2 },
+                    "range": { "kind": "block", "start": 1, "end": 2 },
                     "source": "durable",
                     "finality": "finalized"
                 }]
             },
-            "rows": {
-                "dataset": "blocks",
-                "rows": [{
-                "number": 1,
-                "hash": "0x01",
-                "parent_hash": "0x00",
-                "timestamp": 100
-            }]
-        }
+            "rows": dataset_rows_json(
+                DatasetKey::evm_blocks(),
+                QueryRows::EvmBlocks(vec![BlockHeader {
+                    number: 1,
+                    hash: "0x01".to_owned(),
+                    parent_hash: "0x00".to_owned(),
+                    timestamp: 100,
+                }])
+            )
     }))
     .expect("response json");
 
@@ -246,9 +251,10 @@ fn test_response_rows_and_cache_summary_decode_with_outcome_helpers() {
         response.cache.segments[0].finality,
         QueryDataFinality::Finalized
     );
+    assert_eq!(response.rows.dataset_key(), &DatasetKey::evm_blocks());
     assert_eq!(
-        response.rows,
-        QueryRows::EvmBlocks(vec![BlockHeader {
+        response.rows.rows(),
+        &QueryRows::EvmBlocks(vec![BlockHeader {
             number: 1,
             hash: "0x01".to_owned(),
             parent_hash: "0x00".to_owned(),
@@ -261,38 +267,45 @@ fn test_response_rows_and_cache_summary_decode_with_outcome_helpers() {
 fn test_hot_response_source_and_finality_decode_without_rpc_fallback() {
     let response: QueryResponse = serde_json::from_value(serde_json::json!({
         "chain": ethereum_identity(),
-        "range": { "from_block": 100, "to_block": 101 },
+        "dataset_key": "evm.blocks",
+        "range": { "kind": "block", "start": 100, "end": 101 },
         "cache": {
             "hit_ranges": [],
             "missing_ranges": [],
             "durable_hit_ranges": [],
-            "hot_hit_ranges": [{ "from_block": 100, "to_block": 100 }],
-            "provider_fill_ranges": [{ "from_block": 101, "to_block": 101 }],
-            "promotion_pending_ranges": [{ "from_block": 100, "to_block": 101 }],
+            "hot_hit_ranges": [{ "kind": "block", "start": 100, "end": 100 }],
+            "provider_fill_ranges": [{ "kind": "block", "start": 101, "end": 101 }],
+            "promotion_pending_ranges": [{ "kind": "block", "start": 100, "end": 101 }],
             "segments": [
                 {
-                    "range": { "from_block": 100, "to_block": 100 },
+                    "range": { "kind": "block", "start": 100, "end": 100 },
                     "source": "hot",
                     "finality": "unsafe"
                 },
                 {
-                    "range": { "from_block": 101, "to_block": 101 },
+                    "range": { "kind": "block", "start": 101, "end": 101 },
                     "source": "provider",
                     "finality": "latest"
                 }
             ]
         },
-        "rows": { "dataset": "blocks", "rows": [] }
+        "rows": dataset_rows_json(DatasetKey::evm_blocks(), QueryRows::EvmBlocks(Vec::new()))
     }))
     .expect("hot response json");
 
     assert_eq!(
         response.cache.hot_hit_ranges,
-        vec![BlockRange::expect_new(100, 100)]
+        vec![QueryRange::Block {
+            start: 100,
+            end: 100
+        }]
     );
     assert_eq!(
         response.cache.provider_fill_ranges,
-        vec![BlockRange::expect_new(101, 101)]
+        vec![QueryRange::Block {
+            start: 101,
+            end: 101
+        }]
     );
     assert_eq!(response.cache.segments[0].source, QuerySegmentSource::Hot);
     assert_eq!(
@@ -369,6 +382,11 @@ fn ethereum_identity() -> ChainIdentity {
 
 fn topic_a() -> String {
     "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()
+}
+
+fn dataset_rows_json(dataset_key: DatasetKey, rows: QueryRows) -> serde_json::Value {
+    serde_json::to_value(DatasetRows::new(dataset_key, rows).expect("dataset rows"))
+        .expect("dataset rows json")
 }
 
 #[derive(Clone)]

@@ -3,8 +3,8 @@
 use std::{collections::BTreeMap, error::Error, fmt};
 
 use datalens_core::{
-    BlockRange, ChainIdentity, DatalensError, Dataset, LogFilter, QueryDataFinality,
-    QueryFinalityRequirement, QueryRows, QuerySegmentSource,
+    BlockRange, ChainIdentity, DatalensError, Dataset, DatasetKey, DatasetRows, LogFilter,
+    QueryDataFinality, QueryFinalityRequirement, QuerySegmentSource,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -60,12 +60,14 @@ where
     ) -> Result<QueryResponse, ClientError> {
         self.query(QueryRequest {
             chain,
-            dataset: Dataset::Blocks,
-            range,
-            filter: None,
-            include_block: false,
-            allow_hot: false,
+            dataset_key: DatasetKey::evm_blocks().as_str().to_owned(),
+            selector: QuerySelector::All,
+            range: QueryRange::Block {
+                start: range.from_block,
+                end: range.to_block,
+            },
             finality: QueryFinalityRequirement::DurableOnly,
+            fields: FieldSelection::All,
         })
     }
 
@@ -77,12 +79,14 @@ where
     ) -> Result<QueryResponse, ClientError> {
         self.query(QueryRequest {
             chain,
-            dataset: Dataset::Blocks,
-            range,
-            filter: None,
-            include_block: false,
-            allow_hot: options.allow_hot,
+            dataset_key: DatasetKey::evm_blocks().as_str().to_owned(),
+            selector: QuerySelector::All,
+            range: QueryRange::Block {
+                start: range.from_block,
+                end: range.to_block,
+            },
             finality: options.finality,
+            fields: FieldSelection::All,
         })
     }
 
@@ -94,12 +98,14 @@ where
     ) -> Result<QueryResponse, ClientError> {
         self.query(QueryRequest {
             chain,
-            dataset: Dataset::Logs,
-            range,
-            filter: Some(filter),
-            include_block: false,
-            allow_hot: false,
+            dataset_key: DatasetKey::evm_logs().as_str().to_owned(),
+            selector: QuerySelector::EvmLogs(filter),
+            range: QueryRange::Block {
+                start: range.from_block,
+                end: range.to_block,
+            },
             finality: QueryFinalityRequirement::DurableOnly,
+            fields: FieldSelection::All,
         })
     }
 
@@ -216,40 +222,67 @@ impl HttpResponse {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct QueryRequest {
     pub chain: ChainIdentity,
-    pub dataset: Dataset,
-    pub range: BlockRange,
-    pub filter: Option<LogFilter>,
-    pub include_block: bool,
-    pub allow_hot: bool,
+    pub dataset_key: String,
+    pub selector: QuerySelector,
+    pub range: QueryRange,
     pub finality: QueryFinalityRequirement,
+    pub fields: FieldSelection,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum QueryRange {
+    Block { start: u64, end: u64 },
+    Slot { start: u64, end: u64 },
+    Height { start: u64, end: u64 },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum QuerySelector {
+    All,
+    EvmLogs(LogFilter),
+    Other {
+        kind: String,
+        fingerprint: String,
+        canonical_key: String,
+    },
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FieldSelection {
+    #[default]
+    All,
+    Include(Vec<String>),
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct QueryOptions {
-    pub allow_hot: bool,
     pub finality: QueryFinalityRequirement,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct QueryResponse {
     pub chain: ChainIdentity,
-    pub range: BlockRange,
+    pub dataset_key: String,
+    pub range: QueryRange,
     pub cache: CacheSummary,
-    pub rows: QueryRows,
+    pub rows: DatasetRows,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CacheSummary {
-    pub hit_ranges: Vec<BlockRange>,
-    pub missing_ranges: Vec<BlockRange>,
+    pub hit_ranges: Vec<QueryRange>,
+    pub missing_ranges: Vec<QueryRange>,
     #[serde(default)]
-    pub durable_hit_ranges: Vec<BlockRange>,
+    pub durable_hit_ranges: Vec<QueryRange>,
     #[serde(default)]
-    pub hot_hit_ranges: Vec<BlockRange>,
+    pub hot_hit_ranges: Vec<QueryRange>,
     #[serde(default)]
-    pub provider_fill_ranges: Vec<BlockRange>,
+    pub provider_fill_ranges: Vec<QueryRange>,
     #[serde(default)]
-    pub promotion_pending_ranges: Vec<BlockRange>,
+    pub promotion_pending_ranges: Vec<QueryRange>,
     #[serde(default)]
     pub segments: Vec<QuerySegment>,
 }
@@ -267,7 +300,7 @@ impl CacheSummary {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct QuerySegment {
-    pub range: BlockRange,
+    pub range: QueryRange,
     pub source: QuerySegmentSource,
     pub finality: QueryDataFinality,
 }

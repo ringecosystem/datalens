@@ -128,7 +128,10 @@ pub mod auth {
         pub fn authenticate_headers(
             &self,
             headers: &HeaderMap,
-            request: &LegacyEvmQueryRequest,
+            chain: &str,
+            dataset: &str,
+            range_len: u128,
+            finality: QueryFinalityRequirement,
         ) -> Result<Option<ApplicationContext>, DatalensError> {
             if !self.required {
                 return Ok(None);
@@ -178,8 +181,8 @@ pub mod auth {
                     "application is disabled",
                 ));
             }
-            authorize_application(application, request)?;
-            enforce_quota(application, request)?;
+            authorize_application_dataset(application, chain, dataset)?;
+            enforce_quota(application, range_len, finality)?;
             Ok(Some(ApplicationContext {
                 id: application.id.clone(),
                 name: application.name.clone(),
@@ -286,15 +289,6 @@ pub mod auth {
             .filter(|token| !token.trim().is_empty())
     }
 
-    fn authorize_application(
-        application: &config::ApplicationConfig,
-        request: &LegacyEvmQueryRequest,
-    ) -> Result<(), DatalensError> {
-        let chain = request.chain.configured_name();
-        let dataset = request.dataset.as_str();
-        authorize_application_dataset(application, chain, dataset)
-    }
-
     fn authorize_application_dataset(
         application: &config::ApplicationConfig,
         chain: &str,
@@ -321,30 +315,28 @@ pub mod auth {
 
     fn enforce_quota(
         application: &config::ApplicationConfig,
-        request: &LegacyEvmQueryRequest,
+        range_len: u128,
+        finality: QueryFinalityRequirement,
     ) -> Result<(), DatalensError> {
         let Some(quota) = &application.quota else {
             return Ok(());
         };
-        if let Some(limit) = quota.max_query_range_blocks {
-            let requested = request.range.len();
-            if requested > u128::from(limit) {
-                return Err(DatalensError::new(
-                    DatalensErrorKind::RateLimited,
-                    "application query range quota exceeded",
-                ));
-            }
-        }
-        if (request.allow_hot || request.finality.allows_hot())
-            && let Some(limit) = quota.max_hot_query_range_blocks
+        if let Some(limit) = quota.max_query_range_blocks
+            && range_len > u128::from(limit)
         {
-            let requested = request.range.len();
-            if requested > u128::from(limit) {
-                return Err(DatalensError::new(
-                    DatalensErrorKind::RateLimited,
-                    "application hot query range quota exceeded",
-                ));
-            }
+            return Err(DatalensError::new(
+                DatalensErrorKind::RateLimited,
+                "application query range quota exceeded",
+            ));
+        }
+        if finality.allows_hot()
+            && let Some(limit) = quota.max_hot_query_range_blocks
+            && range_len > u128::from(limit)
+        {
+            return Err(DatalensError::new(
+                DatalensErrorKind::RateLimited,
+                "application hot query range quota exceeded",
+            ));
         }
         Ok(())
     }
@@ -1101,9 +1093,26 @@ impl QueryApiRequest {
             finality: self.finality,
         })
     }
+
+    fn dataset_for_auth(&self) -> Result<String, DatalensError> {
+        Ok(parse_dataset_key(&self.dataset_key)?.as_str().to_owned())
+    }
+
+    fn range_len(&self) -> u128 {
+        self.range.len()
+    }
 }
 
 impl QueryRangeApi {
+    fn len(&self) -> u128 {
+        let (start, end) = match *self {
+            Self::Block { start, end }
+            | Self::Slot { start, end }
+            | Self::Height { start, end } => (start, end),
+        };
+        u128::from(end.saturating_sub(start)) + 1
+    }
+
     fn into_ledger_range(self) -> Result<LedgerRange, DatalensError> {
         match self {
             Self::Block { start, end } => LedgerRange::blocks(start, end),
@@ -1857,10 +1866,13 @@ impl QueryServiceRegistry {
     fn authenticate_headers(
         &self,
         headers: &HeaderMap,
-        request: &LegacyEvmQueryRequest,
+        chain: &str,
+        dataset: &str,
+        range_len: u128,
+        finality: QueryFinalityRequirement,
     ) -> Result<Option<ApplicationContext>, DatalensError> {
         self.application_registry
-            .authenticate_headers(headers, request)
+            .authenticate_headers(headers, chain, dataset, range_len, finality)
     }
 
     fn authenticate_warmup_headers(
@@ -2156,25 +2168,37 @@ async fn discovery(State(state): State<AppState>) -> Result<Json<DiscoveryRespon
 async fn query(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<LegacyEvmQueryRequest>,
-) -> Result<Json<LegacyEvmQueryResponse>, ApiError> {
+    Json(request): Json<QueryApiRequest>,
+) -> Result<Json<QueryApiResponse>, ApiError> {
     let registry = state.registry.clone();
+    let dataset = request.dataset_for_auth().map_err(ApiError)?;
     let application_context = registry
-        .authenticate_headers(&headers, &request)
+        .authenticate_headers(
+            &headers,
+            request.chain.configured_name(),
+            &dataset,
+            request.range_len(),
+            request.finality,
+        )
         .map_err(ApiError)?;
     let application = application_context
         .map(|application| application.metrics_identity())
         .or_else(|| application_from_headers(&headers));
-    tokio::task::spawn_blocking(move || registry.query_with_application(request, application))
-        .await
-        .map_err(|error| {
-            ApiError(DatalensError::new(
-                DatalensErrorKind::Internal,
-                format!("query task failed: {error}"),
-            ))
-        })?
-        .map(Json)
-        .map_err(ApiError)
+    let native_input = request.into_native_input().map_err(ApiError)?;
+    tokio::task::spawn_blocking(move || {
+        registry
+            .query_native_with_application(native_input, application)
+            .and_then(QueryApiResponse::try_from_native_response)
+    })
+    .await
+    .map_err(|error| {
+        ApiError(DatalensError::new(
+            DatalensErrorKind::Internal,
+            format!("query task failed: {error}"),
+        ))
+    })?
+    .map(Json)
+    .map_err(ApiError)
 }
 
 async fn warmup_submit(
