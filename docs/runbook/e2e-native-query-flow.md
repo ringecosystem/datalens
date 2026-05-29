@@ -1,6 +1,7 @@
 # E2E Native Query Flow
 
-Goal: Validate the initial native EVM block and log query flow after code changes.
+Goal: Validate the native EVM block/log query flow, durable writer boundary, and
+hot/latest read-through behavior after code changes.
 
 Read this when: You need to decide whether an HBX-13-style change is ready for review.
 
@@ -92,13 +93,14 @@ Default deterministic lifecycle coverage:
 | --- | --- |
 | API health and chain registry | In-process router validates `GET /health`, `GET /v1/chains`, and `POST /v1/query`. |
 | API metrics | `GET /metrics` returns Prometheus text with `application`, `chain`, `chain_kind`, and `dataset` labels. |
-| Block miss/fill/hit | First `blocks` query fetches and writes durable cache; equivalent second query is a full hit and does not call the provider. |
+| Block miss/fill/hit | First `blocks` query fetches safe/finalized rows through the durable writer; after writer flush or empty coverage, an equivalent second query is a full hit and does not call the provider. |
 | Staged query fill and flush | Below-threshold provider fills return rows without manifest coverage, repeated fills remain provider-backed until `flush_staged_writes`, and the flushed range becomes a durable hit. |
+| Hot/latest read-through | `latest_only` and `safe_to_latest` requests can return live provider segments while keeping durable cache writes limited to safe/finalized ranges. |
 | Durable write failure recovery | Provider rows still return when a durable write fails, and the failed write does not create manifest coverage or data objects. |
-| Warmup durable writer path | Warmup tasks fetch chain chunks, pass `DurableWriteSegment` values through `DurableWriter`, checkpoint progress, and produce coverage that later query execution can hit without provider fetches. |
+| Warmup durable writer path | Native warmup tasks fetch chain/dataset chunks, pass `DurableWriteSegment` values through `DurableWriter`, checkpoint progress, and produce coverage that later query execution can hit without provider fetches. |
 | Read-through cache | Query lifecycle and storage tests prove durable hits read through manifest-backed objects and a second compatible read can use `ReadThroughCache` without another object fetch. |
 | Empty logs coverage | Empty `logs` query records empty coverage, writes no data object, and equivalent second query is a full hit. |
-| Metrics lifecycle | Miss/fill, full hit, cache coverage, fill, latest requested block, latest filled block, and provider error counters are validated. |
+| Metrics lifecycle | Miss/fill, full hit, hot/latest read-through, cache coverage, fill, latest requested block, latest filled block, and provider error counters are validated. |
 | Multi-chain isolation | `ethereum` and `polygon` use separate mock sources and write separate chain manifest paths for the same range and dataset. |
 | Unknown chain | Querying a chain outside the configured service route returns `UnsupportedDataset` instead of falling back to another chain. |
 | CLI inspect | `datalens inspect manifest` and `datalens inspect coverage` command tests validate object key, row count, size, checksum, checksum algorithm, written time, range, dataset, selector, finality, and empty/data coverage fields. |

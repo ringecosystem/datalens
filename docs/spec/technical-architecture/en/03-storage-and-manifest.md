@@ -216,10 +216,11 @@ should not write a tiny empty Parquet file just to remember the miss. It should 
 empty coverage entry in the manifest, with row count `0` and no data object, so the same
 range/filter does not need to be fetched again.
 
-If a non-empty result is still too small, the writer may keep accumulating adjacent ranges
-for the same dataset, selector coverage shape, finality level, and range kind until it
-reaches the configured flush threshold. It should then delegate one immutable object write
-for the combined range to storage and record that exact combined coverage through storage.
+If a non-empty result is still too small, the staged writer may keep accumulating adjacent
+compatible ranges for the same dataset, selector coverage shape, finality level, and
+range kind until it reaches a configured flush threshold or shutdown flush. It should
+then delegate one immutable object write for the combined range to storage and record
+that exact combined coverage through storage.
 
 The first implementation uses `min_object_rows` as the primary sparse-result merge
 threshold and a conservative JSON-encoded row estimate for `target_object_bytes` before
@@ -239,8 +240,9 @@ construction, object bytes, and manifest repository updates:
 1. Receive normalized fetched data for one planned fill segment.
 2. Verify the segment is within the adapter's safe/finalized height before any durable
    write or manifest update.
-3. Merge adjacent compatible segments when doing so improves object size.
-4. Ask storage to write a data object when the segment has rows.
+3. Stage and merge adjacent compatible non-empty segments when doing so improves object
+   size and no flush threshold has been reached.
+4. Ask storage to write a data object when a non-empty staged group is flushed.
 5. Ask storage to write only manifest empty coverage when the segment has no rows.
 6. Let storage verify or trust the object write according to backend capabilities.
 7. Let storage update the manifest coverage entry.

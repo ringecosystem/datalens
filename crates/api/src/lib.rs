@@ -2208,7 +2208,7 @@ fn legacy_warmup_submit_request(
         Dataset::Blocks | Dataset::Transactions | Dataset::Receipts => {
             return Err(DatalensError::new(
                 DatalensErrorKind::UnsupportedDataset,
-                "warmup MVP supports logs only",
+                "legacy EVM warmup submit supports logs only",
             ));
         }
     };

@@ -741,7 +741,7 @@ pub fn doctor_chain_summary(
                 },
                 "events": {
                     "enabled": false,
-                    "reason": "unsupported by Tron MVP",
+                    "reason": "unsupported by Tron adapter",
                 }
             }
         }));

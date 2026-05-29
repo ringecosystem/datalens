@@ -165,9 +165,9 @@ metrics 必须使用不同 outcome label 区分 durable cache、hot cache、live
 labels 必须继续使用 normalized application id、chain、chain kind、dataset。metrics labels 不能包含 selector
 values、block hashes、raw credentials 或 untrusted headers。
 
-## Unsupported First-Version Behavior
+## Unsupported Hot Behavior
 
-第一版 hot-capable implementation 必须对以下情况返回稳定 unsupported errors：
+Hot-capable implementation 必须对以下情况返回稳定 unsupported errors：
 
 - adapter 不支持 `canonical_block`。
 - adapter 无法确定 latest height。
@@ -176,21 +176,22 @@ values、block hashes、raw credentials 或 untrusted headers。
 - chain finality 无法表示为 `safe`、`finalized`、`unsafe` 或 `latest`。
 - hot hit 缺少 reorg metadata。
 - chain identity 模糊或未注册。
-- Tron 或 Solana latest/hot cache behavior 在其 adapter 定义 canonicality contract 前被请求。
+- 某个 chain adapter 尚未定义请求的 hot/latest mode 所需的 canonicality contract。
 
 这些 error 不能被记录成 durable cache miss。durable cache miss 表示 safe/finalized durable coverage 缺失，
-并且可以通过 durable writer 填充。unsupported hot behavior 表示 datalens 无法安全服务 latest-capable request。
+并且可以通过 durable writer 填充。unsupported hot behavior 表示 datalens 无法安全服务这个具体的
+latest-capable request，并不表示所有 hot/latest read-through 都不可用。
 
-## First Implementation Scope
+## Current Runtime And Follow-Up Scope
 
-基于本架构的第一版 implementation 应只加入最小 hot-aware runtime path：
+当前 runtime 已包含最小 hot-aware read-through path：
 
 - planner segmentation：durable、hot、live provider ranges。
-- hot cache interface traits 或等价 module boundary。
-- 支持能力足够的 EVM provider 的 adapter canonical block lookup。
+- explicit `latest_only` request 的 live provider read-through。
+- `safe_to_latest` 在 durable work 和 latest-capable provider segments 之间拆分。
 - API 和 SDK model 的 response segment metadata。
 - hot outcomes 的 metrics 和 usage ledger recording。
 - 对不满足 hot requirements 的 adapter 或 chain 返回 unsupported errors。
 
-storage layout、完整 rollback replacement、promotion scheduling、durable promotion writes 应保留给后续 issue，
-除非具体 implementation issue 明确包含这些内容。
+hot cache storage layout、完整 rollback replacement、promotion scheduling、durable promotion writes 仍保留给
+后续 issue，除非具体 implementation issue 明确包含这些内容。

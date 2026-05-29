@@ -58,10 +58,10 @@ EVM adapter 通过链级 finality policy 判断 safe/finalized height：
 Lag-based value 是 fallback policy，不是默认 truth source。Durable cache writes 不能使用
 zero lag，因为这会把 `latest` 标记为 safe/finalized。
 
-## 未来 Tron 和 Solana 支持
+## Non-EVM 链支持
 
-未来适配器不应该被迫模仿 EVM。Solana 可能使用 slots 和 account changes；Tron 可能有自己的
-事件和交易表面。这些概念应该成为同一个适配器边界后面的链家族专属数据集。
+Non-EVM 适配器不应该被迫模仿 EVM。Solana 使用 slots 和链家族专属数据集；Tron 使用 block
+range 和自己的事件、交易表面。这些概念应该成为同一个适配器边界后面的链家族专属数据集。
 
 增加新链家族应需要：
 
