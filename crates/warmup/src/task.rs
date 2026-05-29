@@ -134,6 +134,9 @@ pub struct WarmupSubmitRequest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Submitted warmup work scoped to one application, chain, dataset, selector,
+/// and range policy. The dedupe key uses canonical selector form so equivalent
+/// requests map to the same task id.
 pub struct WarmupTask {
     pub task_id: WarmupTaskId,
     pub application_id: String,

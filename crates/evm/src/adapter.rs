@@ -79,6 +79,9 @@ impl ChainAdapter for EvmAdapter {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+/// EVM finality discovery strategy. Durable cache writes use the resulting
+/// safe/finalized boundary; latest block height is never enough to authorize
+/// manifest coverage.
 pub enum EvmFinalityPolicy {
     #[default]
     Auto,
@@ -407,6 +410,8 @@ impl ChainAdapter for EvmRpcClient {
             EvmFinalityPolicy::Auto => self
                 .rpc_finality_height("finalized", "safe")
                 .or_else(|error| {
+                    // Some EVM providers do not implement safe/finalized tags;
+                    // configured lag is the durable boundary fallback.
                     if is_finality_tag_unsupported(&error) {
                         let profile = chain_profile(self.chain.network_id()).ok_or_else(|| {
                             DatalensError::new(
@@ -533,12 +538,16 @@ impl ChainAdapter for EvmRpcClient {
         if let Some(max_range_len) = capability.max_range_len()
             && range.len() > u128::from(max_range_len)
         {
+            // The adapter reports provider limits instead of splitting here so
+            // planners, indexers, and warmup can account for the split policy.
             return Err(DatalensError::new(
                 DatalensErrorKind::ProviderLimit,
                 "request range exceeds EVM provider range limit",
             ));
         }
         if let DatasetSelector::EvmLogs(filter) = &request.selector {
+            // Selector limits are checked against normalized filters so storage
+            // fingerprints and provider requests agree about the same selector.
             if let Some(max_addresses) = capability.max_addresses_per_query()
                 && filter.addresses().len() > max_addresses
             {

@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 use crate::WarmupTaskId;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Warmup cursor for resumable task execution. It records scheduler progress
+/// and failure position, while manifest coverage remains the durable authority
+/// used to decide what data already exists.
 pub struct WarmupCursor {
     pub task_id: WarmupTaskId,
     pub next: u64,

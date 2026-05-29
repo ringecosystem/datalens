@@ -96,6 +96,10 @@ struct RawChainIdentity {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "RawChainIdentity")]
+/// Stable identity for a configured chain as it appears in storage keys,
+/// metrics labels, and API contracts. The configured name and optional network
+/// id are validated to stay path-safe because durable object keys derive from
+/// this value.
 pub struct ChainIdentity {
     family: ChainFamily,
     configured_name: String,

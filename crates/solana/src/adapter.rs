@@ -270,6 +270,9 @@ where
         let mut provider_calls = 0;
         let mut signature_pages = 0;
         loop {
+            // Address/program selectors use signature discovery as an optimized
+            // path, but the page cap keeps a sparse account from turning one
+            // query into an unbounded provider scan.
             if signature_pages >= MAX_SIGNATURE_DISCOVERY_PAGES {
                 return Err(DatalensError::new(
                     DatalensErrorKind::ProviderLimit,
@@ -512,6 +515,9 @@ where
                 Ok(Some(result)) => result,
                 Ok(None) => self.fetch_blocks_for_range(&range)?,
                 Err(error) if can_fallback_selector_fetch(&error) => {
+                    // Selector discovery is an optimization. When it fails for
+                    // safe fallback errors, a finalized slot scan preserves the
+                    // same query contract with a diagnostic warning.
                     warnings.push(
                         "solana optimized selector fetch failed; fell back to slot scan".to_owned(),
                     );
@@ -578,6 +584,8 @@ pub fn solana_all_selector() -> Result<DatasetSelector, DatalensError> {
 
 pub fn solana_address_selector(address: &str) -> Result<DatasetSelector, DatalensError> {
     let address = normalize_solana_key("address", address)?;
+    // Store a digest in the fingerprint so long base58 keys do not become long
+    // object paths; the canonical key keeps the full selector for dedupe.
     DatasetSelector::try_other(
         adapter_key(SOLANA_ADDRESS_KIND),
         format!("solana-address/{}", digest_prefix(&address)),
@@ -596,6 +604,8 @@ pub fn solana_program_selector(program_id: &str) -> Result<DatasetSelector, Data
 
 pub fn solana_signature_selector(signature: &str) -> Result<DatasetSelector, DatalensError> {
     let signature = normalize_solana_key("signature", signature)?;
+    // Signature selectors are exact transaction lookups, but they still use the
+    // same digest/canonical-key split as broader Solana selectors.
     DatasetSelector::try_other(
         adapter_key(SOLANA_SIGNATURE_KIND),
         format!("solana-signature/{}", digest_prefix(&signature)),

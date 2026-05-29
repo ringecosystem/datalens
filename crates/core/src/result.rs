@@ -41,6 +41,10 @@ pub enum QueryDataFinality {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Caller-selected finality policy for native queries. `DurableOnly` may read
+/// and fill only safe/finalized data, while hot policies can return provider
+/// data that must not be persisted into durable coverage unless a plan marks a
+/// segment cache-write safe.
 pub enum QueryFinalityRequirement {
     #[default]
     DurableOnly,
@@ -74,6 +78,9 @@ impl QueryDataFinality {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Per-range provenance returned with query coverage summaries. Consumers can
+/// rely on source and finality being segment-local because mixed queries may
+/// combine durable cache, hot read-through, and provider-filled ranges.
 pub struct QuerySegmentMetadata {
     pub range: LedgerRange,
     pub source: QuerySegmentSource,

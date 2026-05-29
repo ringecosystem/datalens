@@ -26,6 +26,9 @@ use crate::helpers::*;
 pub use crate::hot_promotion::HotCachePromoter;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Native query executor configuration shared by REST and GraphQL query flows.
+/// Planner settings decide coverage and provider gaps; writer settings decide
+/// how safe/finalized fills become durable objects.
 pub struct NativeQueryExecutionConfig {
     pub planner: NativePlannerConfig,
     pub writer: DurableWriterConfig,
@@ -57,6 +60,9 @@ pub struct HotPromotionResult {
 }
 
 #[derive(Clone)]
+/// Executes the native datalens query contract: plan coverage, read durable
+/// rows, fetch provider gaps, persist only durable-safe fills, and record metrics
+/// plus usage ledger entries under the caller's application identity.
 pub struct NativeQueryExecutor<R, S> {
     storage: R,
     source: S,
@@ -149,6 +155,9 @@ where
             return self.execute_hot_read_through(input, application, start, labels);
         }
 
+        // Coverage is read before asking the adapter for finality so full
+        // durable hits avoid unnecessary provider calls; misses still require a
+        // safe/finalized boundary before they can be filled and written.
         let covered_ranges = match self.storage.covered_ranges(
             &input.chain,
             &input.dataset_key,
@@ -382,6 +391,9 @@ where
                 }
             };
             if task.cache_write {
+                // Only planner-marked durable misses are staged for durable
+                // cache. Hot/latest provider data is appended to the response
+                // but intentionally excluded from fetched_segments.
                 fill_end_block = Some(
                     fill_end_block
                         .unwrap_or(task.range.end())
@@ -493,6 +505,8 @@ where
         labels: Option<MetricsLabels>,
     ) -> Result<NativeQueryExecutionResult, DatalensError> {
         let ledger_application = self.ledger_application(application);
+        // Latest-only queries bypass durable coverage entirely so unsafe/latest
+        // provider rows cannot become manifest authority through this path.
         let latest = match self.source.latest_height() {
             Ok(latest) => latest,
             Err(error) => {

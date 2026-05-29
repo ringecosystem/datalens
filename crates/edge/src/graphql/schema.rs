@@ -102,6 +102,8 @@ impl QueryRoot {
         let application_context = registry
             .authenticate_native_query_headers(&headers, &request)
             .map_err(graphql_error)?;
+        // GraphQL uses the same native query request and application context as
+        // REST so cache policy, quotas, and attribution do not diverge by API.
         let application = application_context
             .as_ref()
             .map(|application| application.metrics_identity())
@@ -408,6 +410,8 @@ async fn mutate_warmup_task(
             format!("warmup task {} not found", task_id.as_str()),
         ))
     })?;
+    // Mutations first load the current task, then authorize against its owner;
+    // ownership is a warmup task boundary, not a GraphQL session property.
     authorize_warmup_task_application(&current_task, application_id).map_err(graphql_error)?;
     let task = spawn_graphql_blocking(move || match mutation {
         WarmupMutation::Pause => registry.pause_warmup_task(&task_id),

@@ -56,6 +56,9 @@ struct RawDatasetKey {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "RawDatasetKey")]
+/// Stable dataset identity in `family.name` form. The precomputed string is the
+/// canonical cache, metrics, and API key, so construction validates both parts
+/// instead of accepting arbitrary serialized text.
 pub struct DatasetKey {
     family: ChainFamily,
     name: DatasetId,

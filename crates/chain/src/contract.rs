@@ -4,6 +4,9 @@ use datalens_core::{
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Adapter-declared contract for one chain. Capabilities describe what the
+/// query planner may ask for; they do not grant application access and they do
+/// not imply that durable storage already contains coverage.
 pub struct AdapterCapabilities {
     chain: ChainIdentity,
     datasets: Vec<DatasetKey>,
@@ -50,6 +53,9 @@ impl AdapterCapabilities {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Dataset-level provider limits and selector support advertised to planners,
+/// indexers, and warmup. Range and selector caps are provider limits, not
+/// durable storage policy; callers must split requests before invoking fetch.
 pub struct DatasetCapability {
     dataset: DatasetKey,
     selectors: Vec<SelectorKind>,
@@ -256,6 +262,10 @@ pub type HeightRangeKind = LedgerRangeKind;
 pub type HeightRange = LedgerRange;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Selector whose fingerprint is safe for storage paths and whose canonical key
+/// is stable across semantically equivalent filters. Adapters provide
+/// chain-specific selector kinds while the planner treats all selectors through
+/// this common contract.
 pub enum DatasetSelector {
     All,
     EvmLogs(EvmLogFilter),
@@ -315,6 +325,9 @@ impl DatasetSelector {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Query-driven provider fetch request. The adapter owns provider IO only; it
+/// must not apply application authorization, durable storage writes, or
+/// business-specific indexing rules.
 pub struct ChainFetchRequest {
     pub chain: ChainIdentity,
     pub dataset_key: DatasetKey,
@@ -338,6 +351,9 @@ impl FetchLimit {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+/// Per-fetch execution context supplied by higher layers. `cache_write` tells
+/// adapters whether the caller intends durable persistence, but adapters still
+/// must return data only for the requested range and selector.
 pub struct FetchContext {
     pub request_id: Option<String>,
     pub cache_write: bool,
@@ -372,6 +388,8 @@ impl ChainFetchRequest {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Chain height with the finality level that made it observable. Only safe and
+/// finalized heights may authorize durable cache writes or manifest coverage.
 pub enum FinalityLevel {
     Latest,
     Safe,
@@ -498,6 +516,9 @@ fn validate_storage_key(kind: &str, value: String) -> Result<String, DatalensErr
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Provider response for an exact fetch request. Coverage selector and row
+/// dataset must match the request so durable cache keys cannot be polluted by a
+/// broader or differently normalized provider result.
 pub struct ChainFetchResponse {
     pub chain: ChainIdentity,
     pub dataset_key: DatasetKey,
@@ -633,6 +654,8 @@ pub fn validate_durable_range(
     range: &HeightRange,
     cache_safe_height: &ChainHeight,
 ) -> Result<(), DatalensError> {
+    // Durable storage authority comes from the adapter's safe/finalized boundary,
+    // not from a request's desired range or a provider's latest height.
     cache_safe_height.validate_durable_writable()?;
     if range.kind() != cache_safe_height.range_kind {
         return Err(DatalensError::new(
@@ -654,12 +677,22 @@ pub fn validate_durable_range(
 }
 
 pub trait ChainAdapter: Clone + Send + Sync + 'static {
+    /// Return planner-visible capabilities for this adapter's configured chain.
+    /// EVM, Solana, and Tron all expose the same query contract even though
+    /// their selectors and height domains are chain-specific.
     fn capabilities(&self) -> AdapterCapabilities;
 
+    /// Return the provider's latest observable height. Latest data is suitable
+    /// for hot read-through, but by itself cannot authorize durable writes.
     fn latest_height(&self) -> Result<ChainHeight, DatalensError>;
 
+    /// Return the highest height that may be written to durable cache. The
+    /// returned finality must be safe or finalized and must match the range kind
+    /// accepted by this adapter.
     fn cache_safe_height(&self) -> Result<ChainHeight, DatalensError>;
 
+    /// Return an explicitly finalized height when the provider exposes one.
+    /// Adapters that only expose a cache-safe boundary leave this unsupported.
     fn finalized_height(&self) -> Result<ChainHeight, DatalensError> {
         Err(DatalensError::new(
             DatalensErrorKind::UnsupportedDataset,
@@ -695,5 +728,8 @@ pub trait ChainAdapter: Clone + Send + Sync + 'static {
         ))
     }
 
+    /// Fetch rows for exactly the requested dataset, selector, and range. The
+    /// response must include diagnostics even for empty coverage so callers can
+    /// distinguish a real provider query from an accidental empty value.
     fn fetch(&self, request: ChainFetchRequest) -> Result<ChainFetchResponse, DatalensError>;
 }

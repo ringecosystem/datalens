@@ -49,6 +49,9 @@ pub struct TronBlock {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// TronGrid contract event filter before normalization. Selectors require at
+/// least one contract address so optimized event queries and block-scan fallback
+/// remain bounded by explicit caller intent.
 pub struct TronEventFilter {
     pub contract_addresses: Vec<String>,
     pub event_names: Vec<String>,
@@ -409,6 +412,9 @@ where
             && matches!(request.selector.kind(), SelectorKind::Other(kind) if kind.as_str() == TRON_EVENTS_KIND)
             && self.provider.supports_contract_event_query()
         {
+            // Prefer TronGrid contract events when available; fallback is only
+            // used for errors that can be safely recovered by finalized block
+            // scanning without weakening authorization or rate-limit signals.
             match self.fetch_contract_events(&request, &range) {
                 Ok((rows, calls)) => {
                     let rows = QueryRows::AdapterJson {
@@ -434,6 +440,8 @@ where
         if request.dataset_key == DatasetKey::tron_events()
             && matches!(request.selector.kind(), SelectorKind::Other(kind) if kind.as_str() == TRON_EVENTS_KIND)
         {
+            // Block-scan fallback can filter event names only when the name maps
+            // to a known topic; otherwise it would silently broaden results.
             validate_block_scan_event_filter(&request.selector)?;
         }
 
@@ -499,6 +507,8 @@ pub fn tron_event_selector(filter: TronEventFilter) -> Result<DatasetSelector, D
     digest.update(canonical_key.as_bytes());
     let digest = digest.finalize();
     let fingerprint = format!("tron-events/{}", hex_prefix(&digest, 12));
+    // The canonical key is human-readable for task dedupe, while the digest
+    // keeps durable object paths short and stable.
     DatasetSelector::try_other(adapter_key(TRON_EVENTS_KIND), fingerprint, canonical_key)
 }
 

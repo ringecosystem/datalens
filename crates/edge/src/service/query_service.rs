@@ -19,6 +19,9 @@ use crate::{
 };
 
 #[derive(Clone)]
+/// Edge-facing service wrapper around the native query executor. REST and
+/// GraphQL both enter through this service so route validation, application
+/// attribution, and the native query contract stay identical across APIs.
 pub struct QueryService<S> {
     executor: NativeQueryExecutor<Arc<dyn StorageRepository>, S>,
     chain_name: String,
@@ -29,6 +32,9 @@ pub struct QueryService<S> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// API-safe cache summary derived from planner coverage. Segment metadata is
+/// range-local because one response may combine durable cache, hot cache, and
+/// provider-filled data with different finality.
 pub struct NativeCacheSummary {
     pub hit_ranges: Vec<LedgerRange>,
     pub missing_ranges: Vec<LedgerRange>,
@@ -263,6 +269,8 @@ where
     }
 
     fn validate_native_query_route(&self, input: &NativeQueryInput) -> Result<(), DatalensError> {
+        // Route policy is the edge boundary: adapters validate provider support,
+        // while the service rejects chains or disabled datasets before execution.
         if input.chain.configured_name() != self.chain_name {
             return Err(DatalensError::new(
                 DatalensErrorKind::UnsupportedDataset,
