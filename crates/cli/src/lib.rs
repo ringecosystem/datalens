@@ -43,7 +43,7 @@ pub enum Command {
     Doctor(ConfigCommand),
     Query(QueryCommand),
     Inspect(InspectCommand),
-    Index(IndexCommand),
+    Index(Box<IndexCommand>),
 }
 
 #[derive(Debug, Args)]
@@ -131,7 +131,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Command::Doctor(command) => doctor_command(command)?,
         Command::Query(command) => query_command(command)?,
         Command::Inspect(command) => inspect_command(command)?,
-        Command::Index(command) => index_command(command)?,
+        Command::Index(command) => index_command(*command)?,
     }
     Ok(())
 }

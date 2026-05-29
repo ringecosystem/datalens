@@ -12,7 +12,7 @@ use datalens_metrics::ApplicationIdentity;
 use datalens_planner::{FieldSelection, NativePlannerConfig, NativeQueryInput};
 use datalens_solana::{
     SolanaAdapter, SolanaBlock, SolanaCommitment, SolanaInnerInstructionGroup, SolanaInstruction,
-    SolanaRpc, SolanaTokenBalance, SolanaTransaction,
+    SolanaRpc, SolanaTokenBalance, SolanaTransaction, solana_address_selector,
 };
 use datalens_storage::LocalStorage;
 use datalens_writer::DurableWriterConfig;
@@ -189,6 +189,81 @@ fn test_durable_query_reads_indexed_solana_data_without_provider_fill() {
 }
 
 #[test]
+fn test_selector_specific_solana_indexing_reads_back_without_all_selector_collision() {
+    let storage = LocalStorage::new(temp_storage_root("selector-specific-readback"));
+    let provider = CountingSolanaRpc::default();
+    let adapter =
+        SolanaAdapter::with_provider(solana_chain(), provider.clone()).with_max_slot_range_len(3);
+    let selector =
+        solana_address_selector("Account111111111111111111111111111111111").expect("selector");
+    let runtime = solana_runtime(adapter.clone(), storage.clone());
+
+    let result = runtime
+        .run(selector_solana_transactions_job(
+            10,
+            12,
+            selector.clone(),
+            IndexRunMode::Backfill,
+        ))
+        .expect("backfill selected transactions");
+
+    assert_eq!(result.status, IndexRunStatus::Completed);
+    assert_eq!(
+        storage
+            .read_rows(
+                adapter.capabilities().chain(),
+                &DatasetKey::solana_transactions(),
+                &selector,
+                LedgerRange::slots(10, 12).expect("range"),
+            )
+            .expect("read selector-specific transactions")
+            .row_count(),
+        2
+    );
+    assert_eq!(
+        storage
+            .read_rows(
+                adapter.capabilities().chain(),
+                &DatasetKey::solana_transactions(),
+                &DatasetSelector::all(),
+                LedgerRange::slots(10, 12).expect("range"),
+            )
+            .expect("read all selector transactions")
+            .row_count(),
+        0
+    );
+
+    let query_provider = CountingSolanaRpc::default();
+    let query_adapter = SolanaAdapter::with_provider(solana_chain(), query_provider.clone())
+        .with_max_slot_range_len(3);
+    let executor = NativeQueryExecutor::new(
+        storage,
+        query_adapter.clone(),
+        NativeQueryExecutionConfig {
+            planner: NativePlannerConfig {
+                max_query_range_len: 10,
+                default_chunk_range_len: 10,
+            },
+            writer: writer_config(),
+        },
+    );
+    let result = executor
+        .execute(NativeQueryInput {
+            chain: query_adapter.capabilities().chain().clone(),
+            dataset_key: DatasetKey::solana_transactions(),
+            ledger_range: LedgerRange::slots(10, 12).expect("range"),
+            selector,
+            field_selection: FieldSelection::All,
+            finality: datalens_core::QueryFinalityRequirement::DurableOnly,
+        })
+        .expect("query durable selector transactions");
+
+    assert_eq!(result.cache.missing_ranges, Vec::<LedgerRange>::new());
+    assert_eq!(result.rows.row_count(), 2);
+    assert_eq!(query_provider.blocks_with_limit_calls(), 0);
+}
+
+#[test]
 fn test_solana_account_updates_are_supported_from_finalized_block_metadata() {
     let adapter = SolanaAdapter::with_provider(solana_chain(), CountingSolanaRpc::default());
     assert!(
@@ -234,6 +309,21 @@ fn solana_slots_job(start: u64, end: u64, run_mode: IndexRunMode) -> IndexJob {
         dataset_selection: IndexDatasetSelection::Selected(vec![IndexDatasetRequest {
             dataset_key: DatasetKey::solana_slots(),
             selector: DatasetSelector::all(),
+        }]),
+        ..full_solana_job(start, end, run_mode)
+    }
+}
+
+fn selector_solana_transactions_job(
+    start: u64,
+    end: u64,
+    selector: DatasetSelector,
+    run_mode: IndexRunMode,
+) -> IndexJob {
+    IndexJob {
+        dataset_selection: IndexDatasetSelection::Selected(vec![IndexDatasetRequest {
+            dataset_key: DatasetKey::solana_transactions(),
+            selector,
         }]),
         ..full_solana_job(start, end, run_mode)
     }

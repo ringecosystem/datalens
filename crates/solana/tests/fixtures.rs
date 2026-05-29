@@ -3,8 +3,8 @@ use datalens_chain::{
 };
 use datalens_core::{DatalensErrorKind, DatasetKey, LedgerRange, QueryRows};
 use datalens_solana::{
-    SolanaAdapter, SolanaFixtureRpc, solana_address_selector, solana_all_selector,
-    solana_program_selector,
+    SolanaAdapter, SolanaFixtureRpc, SolanaSignatureInfo, solana_address_selector,
+    solana_all_selector, solana_program_selector, solana_signature_selector,
 };
 
 #[test]
@@ -186,4 +186,229 @@ fn test_provider_limit_is_classified_for_oversized_slot_ranges() {
         .expect_err("range too large");
 
     assert_eq!(error.kind, DatalensErrorKind::ProviderLimit);
+}
+
+#[test]
+fn test_signature_selector_uses_get_transaction_when_available() {
+    let provider = OptimizedSolanaRpc::default();
+    let adapter = SolanaAdapter::with_provider(default_chain(), provider.clone());
+    let response = adapter
+        .fetch(ChainFetchRequest::new(
+            adapter.capabilities().chain().clone(),
+            DatasetKey::solana_transactions(),
+            LedgerRange::slots(10, 12).expect("valid range"),
+            solana_signature_selector("sigslot10").expect("selector"),
+        ))
+        .expect("transactions");
+
+    let QueryRows::AdapterJson { rows, .. } = response.rows.rows() else {
+        panic!("expected adapter JSON rows");
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["signature"], "sigslot10");
+    assert_eq!(provider.transaction_calls(), vec!["sigslot10"]);
+    assert_eq!(provider.blocks_with_limit_calls(), 0);
+    assert_eq!(provider.block_calls(), Vec::<u64>::new());
+}
+
+#[test]
+fn test_address_selector_discovers_signatures_before_fetching_transactions() {
+    let provider = OptimizedSolanaRpc::default();
+    let adapter = SolanaAdapter::with_provider(default_chain(), provider.clone());
+    let response = adapter
+        .fetch(ChainFetchRequest::new(
+            adapter.capabilities().chain().clone(),
+            DatasetKey::solana_account_updates(),
+            LedgerRange::slots(10, 12).expect("valid range"),
+            solana_address_selector("Account111111111111111111111111111111111").expect("selector"),
+        ))
+        .expect("account updates");
+
+    let QueryRows::AdapterJson { rows, .. } = response.rows.rows() else {
+        panic!("expected adapter JSON rows");
+    };
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        provider.signature_address_calls(),
+        vec![
+            "Account111111111111111111111111111111111",
+            "Account111111111111111111111111111111111",
+        ]
+    );
+    assert_eq!(provider.transaction_calls(), vec!["sigslot10"]);
+    assert_eq!(provider.blocks_with_limit_calls(), 0);
+}
+
+#[test]
+fn test_optimized_selector_fetch_falls_back_to_slot_scan_on_provider_limit() {
+    let provider = OptimizedSolanaRpc::with_signature_discovery_error(
+        DatalensErrorKind::ProviderLimit,
+        "provider limit",
+    );
+    let adapter = SolanaAdapter::with_provider(default_chain(), provider.clone());
+    let response = adapter
+        .fetch(ChainFetchRequest::new(
+            adapter.capabilities().chain().clone(),
+            DatasetKey::solana_transactions(),
+            LedgerRange::slots(10, 12).expect("valid range"),
+            solana_address_selector("Account111111111111111111111111111111111").expect("selector"),
+        ))
+        .expect("transactions");
+
+    let QueryRows::AdapterJson { rows, .. } = response.rows.rows() else {
+        panic!("expected adapter JSON rows");
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(provider.signature_address_calls().len(), 1);
+    assert_eq!(provider.blocks_with_limit_calls(), 1);
+    assert_eq!(provider.block_calls(), vec![10, 12]);
+    assert!(
+        response
+            .provider_diagnostics
+            .warnings
+            .contains(&"solana optimized selector fetch failed; fell back to slot scan".to_owned())
+    );
+}
+
+#[derive(Clone, Default)]
+struct OptimizedSolanaRpc {
+    state: std::sync::Arc<std::sync::Mutex<OptimizedState>>,
+}
+
+#[derive(Default)]
+struct OptimizedState {
+    signature_address_calls: Vec<String>,
+    transaction_calls: Vec<String>,
+    blocks_with_limit_calls: u64,
+    block_calls: Vec<u64>,
+    signature_discovery_error: Option<DatalensErrorKind>,
+    signature_discovery_message: String,
+}
+
+impl OptimizedSolanaRpc {
+    fn with_signature_discovery_error(kind: DatalensErrorKind, message: &str) -> Self {
+        let provider = Self::default();
+        {
+            let mut state = provider.state.lock().expect("state");
+            state.signature_discovery_error = Some(kind);
+            state.signature_discovery_message = message.to_owned();
+        }
+        provider
+    }
+
+    fn signature_address_calls(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .expect("state")
+            .signature_address_calls
+            .clone()
+    }
+
+    fn transaction_calls(&self) -> Vec<String> {
+        self.state.lock().expect("state").transaction_calls.clone()
+    }
+
+    fn blocks_with_limit_calls(&self) -> u64 {
+        self.state.lock().expect("state").blocks_with_limit_calls
+    }
+
+    fn block_calls(&self) -> Vec<u64> {
+        self.state.lock().expect("state").block_calls.clone()
+    }
+}
+
+impl datalens_solana::SolanaRpc for OptimizedSolanaRpc {
+    fn get_slot(
+        &self,
+        commitment: datalens_solana::SolanaCommitment,
+    ) -> Result<u64, datalens_core::DatalensError> {
+        SolanaFixtureRpc.get_slot(commitment)
+    }
+
+    fn get_blocks_with_limit(
+        &self,
+        start_slot: u64,
+        limit: u64,
+        commitment: datalens_solana::SolanaCommitment,
+    ) -> Result<Vec<u64>, datalens_core::DatalensError> {
+        self.state.lock().expect("state").blocks_with_limit_calls += 1;
+        SolanaFixtureRpc.get_blocks_with_limit(start_slot, limit, commitment)
+    }
+
+    fn get_block(
+        &self,
+        slot: u64,
+        commitment: datalens_solana::SolanaCommitment,
+    ) -> Result<Option<datalens_solana::SolanaBlock>, datalens_core::DatalensError> {
+        self.state.lock().expect("state").block_calls.push(slot);
+        SolanaFixtureRpc.get_block(slot, commitment)
+    }
+
+    fn get_signatures_for_address(
+        &self,
+        address: &str,
+        before: Option<&str>,
+        _until: Option<&str>,
+        _limit: usize,
+        _commitment: datalens_solana::SolanaCommitment,
+    ) -> Result<Vec<SolanaSignatureInfo>, datalens_core::DatalensError> {
+        let mut state = self.state.lock().expect("state");
+        state.signature_address_calls.push(address.to_owned());
+        if let Some(kind) = state.signature_discovery_error.clone() {
+            return Err(datalens_core::DatalensError::new(
+                kind,
+                state.signature_discovery_message.clone(),
+            ));
+        }
+        if before.is_some() {
+            return Ok(Vec::new());
+        }
+        Ok(vec![SolanaSignatureInfo {
+            signature: "sigslot10".to_owned(),
+            slot: 10,
+        }])
+    }
+
+    fn get_transaction(
+        &self,
+        signature: &str,
+        commitment: datalens_solana::SolanaCommitment,
+    ) -> Result<Option<datalens_solana::SolanaTransactionWithSlot>, datalens_core::DatalensError>
+    {
+        self.state
+            .lock()
+            .expect("state")
+            .transaction_calls
+            .push(signature.to_owned());
+        let block = SolanaFixtureRpc
+            .get_block(10, commitment)?
+            .expect("fixture block");
+        Ok(block
+            .transactions
+            .into_iter()
+            .next()
+            .map(|mut transaction| {
+                transaction.signature = signature.to_owned();
+                datalens_solana::SolanaTransactionWithSlot {
+                    slot: block.slot,
+                    block_time: block.block_time,
+                    blockhash: block.blockhash,
+                    transaction,
+                    raw: block.raw,
+                }
+            }))
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "optimized-solana-fixture"
+    }
+}
+
+fn default_chain() -> datalens_core::ChainIdentity {
+    datalens_core::ChainIdentity::try_new(
+        datalens_core::ChainFamily::Other("solana".to_owned()),
+        "solana-mainnet-beta",
+        Some(datalens_core::NetworkId::textual("mainnet-beta").expect("network id")),
+    )
+    .expect("chain")
 }

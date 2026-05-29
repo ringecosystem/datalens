@@ -74,6 +74,21 @@ pub struct SolanaTransaction {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SolanaTransactionWithSlot {
+    pub slot: u64,
+    pub block_time: Option<u64>,
+    pub blockhash: String,
+    pub transaction: SolanaTransaction,
+    pub raw: Value,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SolanaSignatureInfo {
+    pub signature: String,
+    pub slot: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SolanaTokenBalance {
     pub account_index: usize,
     pub mint: String,
@@ -114,6 +129,31 @@ pub trait SolanaRpc: Clone + Send + Sync + 'static {
         slot: u64,
         commitment: SolanaCommitment,
     ) -> Result<Option<SolanaBlock>, DatalensError>;
+
+    fn get_signatures_for_address(
+        &self,
+        _address: &str,
+        _before: Option<&str>,
+        _until: Option<&str>,
+        _limit: usize,
+        _commitment: SolanaCommitment,
+    ) -> Result<Vec<SolanaSignatureInfo>, DatalensError> {
+        Err(DatalensError::new(
+            DatalensErrorKind::UnsupportedDataset,
+            "Solana provider does not support getSignaturesForAddress",
+        ))
+    }
+
+    fn get_transaction(
+        &self,
+        _signature: &str,
+        _commitment: SolanaCommitment,
+    ) -> Result<Option<SolanaTransactionWithSlot>, DatalensError> {
+        Err(DatalensError::new(
+            DatalensErrorKind::UnsupportedDataset,
+            "Solana provider does not support getTransaction",
+        ))
+    }
 
     fn provider_name(&self) -> &'static str;
 }
@@ -202,10 +242,75 @@ where
         Ok((blocks, provider_calls))
     }
 
+    fn fetch_blocks_for_selector(
+        &self,
+        range: &LedgerRange,
+        selector: &DatasetSelector,
+    ) -> Result<Option<(Vec<SolanaBlock>, usize)>, DatalensError> {
+        if let Some(signature) = selector_value(selector, SOLANA_SIGNATURE_KIND, "signature/") {
+            let Some(transaction) = self.provider.get_transaction(signature, FINALIZED)? else {
+                return Ok(Some((Vec::new(), 1)));
+            };
+            if !range.contains(transaction.slot) {
+                return Ok(Some((Vec::new(), 1)));
+            }
+            return Ok(Some((vec![block_from_transaction(transaction)], 1)));
+        }
+
+        let address = selector_value(selector, SOLANA_ADDRESS_KIND, "address/")
+            .or_else(|| selector_value(selector, SOLANA_PROGRAM_KIND, "program/"));
+        let Some(address) = address else {
+            return Ok(None);
+        };
+
+        let mut before = None;
+        let mut signatures = Vec::new();
+        let mut provider_calls = 0;
+        loop {
+            let previous_before = before.clone();
+            provider_calls += 1;
+            let page = self.provider.get_signatures_for_address(
+                address,
+                before.as_deref(),
+                None,
+                1_000,
+                FINALIZED,
+            )?;
+            if page.is_empty() {
+                break;
+            }
+            let reached_before_range = page.iter().any(|entry| entry.slot < range.start());
+            before = page.last().map(|entry| entry.signature.clone());
+            signatures.extend(
+                page.into_iter()
+                    .filter(|entry| range.contains(entry.slot))
+                    .map(|entry| entry.signature),
+            );
+            if reached_before_range || before.is_none() || before == previous_before {
+                break;
+            }
+        }
+
+        signatures.sort();
+        signatures.dedup();
+        let mut blocks = Vec::new();
+        for signature in signatures {
+            provider_calls += 1;
+            if let Some(transaction) = self.provider.get_transaction(&signature, FINALIZED)?
+                && range.contains(transaction.slot)
+            {
+                blocks.push(block_from_transaction(transaction));
+            }
+        }
+        blocks.sort_by_key(|block| block.slot);
+        Ok(Some((blocks, provider_calls)))
+    }
+
     fn metadata(
         &self,
         request: &ChainFetchRequest,
         calls: usize,
+        warnings: Vec<String>,
     ) -> (SourceMetadata, ProviderDiagnostics) {
         (
             SourceMetadata {
@@ -215,7 +320,7 @@ where
             ProviderDiagnostics {
                 calls,
                 rows_scanned: 0,
-                warnings: Vec::new(),
+                warnings,
             },
         )
     }
@@ -387,7 +492,24 @@ where
             ));
         }
 
-        let (blocks, provider_calls) = self.fetch_blocks_for_range(&range)?;
+        let mut warnings = Vec::new();
+        let (blocks, provider_calls) = if request.dataset_key == DatasetKey::solana_slots()
+            || request.dataset_key == DatasetKey::solana_blocks()
+        {
+            self.fetch_blocks_for_range(&range)?
+        } else {
+            match self.fetch_blocks_for_selector(&range, &request.selector) {
+                Ok(Some(result)) => result,
+                Ok(None) => self.fetch_blocks_for_range(&range)?,
+                Err(error) if can_fallback_selector_fetch(&error) => {
+                    warnings.push(
+                        "solana optimized selector fetch failed; fell back to slot scan".to_owned(),
+                    );
+                    self.fetch_blocks_for_range(&range)?
+                }
+                Err(error) => return Err(error),
+            }
+        };
         let rows = match &request.dataset_key {
             dataset if *dataset == DatasetKey::solana_slots() => slot_rows(&blocks),
             dataset if *dataset == DatasetKey::solana_blocks() => block_rows(&blocks),
@@ -411,7 +533,8 @@ where
             dataset_key: request.dataset_key.clone(),
             rows,
         };
-        let (source_metadata, provider_diagnostics) = self.metadata(&request, provider_calls);
+        let (source_metadata, provider_diagnostics) =
+            self.metadata(&request, provider_calls, warnings);
         Ok(ChainFetchResponse::try_new(
             request.chain,
             request.dataset_key,
@@ -550,6 +673,28 @@ fn block_rows(blocks: &[SolanaBlock]) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+fn block_from_transaction(transaction: SolanaTransactionWithSlot) -> SolanaBlock {
+    SolanaBlock {
+        slot: transaction.slot,
+        block_height: None,
+        blockhash: transaction.blockhash,
+        previous_blockhash: String::new(),
+        parent_slot: transaction.slot.saturating_sub(1),
+        block_time: transaction.block_time,
+        transactions: vec![transaction.transaction],
+        raw: transaction.raw,
+    }
+}
+
+fn can_fallback_selector_fetch(error: &DatalensError) -> bool {
+    matches!(
+        error.kind,
+        DatalensErrorKind::UnsupportedDataset
+            | DatalensErrorKind::ProviderLimit
+            | DatalensErrorKind::RateLimited
+    )
 }
 
 fn transaction_rows(blocks: &[SolanaBlock], selector: &DatasetSelector) -> Vec<Value> {
@@ -828,7 +973,11 @@ fn transaction_matches(transaction: &SolanaTransaction, selector: &DatasetSelect
             ..
         } if kind.as_str() == SOLANA_ADDRESS_KIND => canonical_key
             .strip_prefix("address/")
-            .is_some_and(|address| transaction.account_keys.iter().any(|key| key == address)),
+            .is_some_and(|address| {
+                transaction_account_keys(transaction)
+                    .iter()
+                    .any(|key| key == address)
+            }),
         DatasetSelector::Other {
             kind,
             canonical_key,
