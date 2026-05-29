@@ -200,10 +200,9 @@ rollback, and promotion. Labels must continue to use normalized application id, 
 chain kind, and dataset. Metrics labels must not include selector values, block hashes,
 raw credentials, or untrusted headers.
 
-## Unsupported First-Version Behavior
+## Unsupported Hot Behavior
 
-The first hot-capable implementation must return stable unsupported errors for these
-cases:
+Hot-capable implementations must return stable unsupported errors for these cases:
 
 - The adapter does not support `canonical_block`.
 - The adapter cannot determine latest height.
@@ -212,25 +211,25 @@ cases:
 - Chain finality cannot be represented as `safe`, `finalized`, `unsafe`, or `latest`.
 - Reorg metadata is incomplete for a hot hit.
 - The chain identity is ambiguous or not registered.
-- Tron or Solana latest/hot cache behavior is requested before those adapters define
-  their canonicality contracts.
+- A chain adapter has not defined the canonicality contract needed for the requested
+  hot/latest mode.
 
 These errors must not be reported as durable cache misses. A durable cache miss means
 safe/finalized durable coverage is absent and may be filled through the durable writer.
-Unsupported hot behavior means datalens cannot safely serve the latest-capable request.
+Unsupported hot behavior means datalens cannot safely serve that specific
+latest-capable request. It does not mean all hot/latest read-through is unavailable.
 
-## First Implementation Scope
+## Current Runtime And Follow-Up Scope
 
-The first implementation based on this architecture should add only the smallest
-hot-aware runtime path:
+The current runtime includes the smallest hot-aware read-through path:
 
 - Planner segmentation for durable, hot, and live provider ranges.
-- Hot cache interface traits or equivalent module boundary.
-- Adapter canonical block lookup for EVM providers that support it.
+- Live provider read-through for explicit `latest_only` requests.
+- `safe_to_latest` splitting between durable work and latest-capable provider segments.
 - Response segment metadata in API and SDK models.
 - Metrics and usage ledger recording for hot outcomes.
 - Unsupported errors for adapters or chains that do not meet hot requirements.
 
-Storage layout, complete rollback replacement, promotion scheduling, and durable
-promotion writes should remain follow-up work unless the implementing issue explicitly
+Hot cache storage layout, complete rollback replacement, promotion scheduling, and
+durable promotion writes remain follow-up work unless the implementing issue explicitly
 includes them.

@@ -66,11 +66,12 @@ The EVM adapter determines safe/finalized height through a chain-level finality 
 Lag-based values are fallback policy, not the default source of truth. A lag of zero must
 not be used for durable cache writes because that would mark `latest` as safe/finalized.
 
-## Future Tron And Solana Support
+## Non-EVM Chain Support
 
-Future adapters should not be forced to imitate EVM. Solana may use slots and account
-changes; Tron may have its own event and transaction surfaces. Those concepts should
-become chain-family-specific datasets behind the same adapter boundary.
+Non-EVM adapters should not be forced to imitate EVM. Solana uses slots and
+chain-family-specific datasets; Tron uses block ranges and its own event and transaction
+surfaces. Those concepts remain chain-family-specific datasets behind the same adapter
+boundary.
 
 Adding a new chain family should require:
 

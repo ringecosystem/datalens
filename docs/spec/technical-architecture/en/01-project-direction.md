@@ -4,8 +4,8 @@ This step defines what datalens is building before any crate, API, schema, or st
 layout becomes permanent.
 
 datalens should become a query-driven structured historical archive/cache for blockchain
-data. The first implementation target is EVM, but the project direction must leave room
-for Tron, Solana, and other future chain families. The system is not only a compatibility
+data. EVM was the first implementation target, and the architecture must continue to
+support Tron, Solana, and other chain families. The system is not only a compatibility
 layer for any existing gateway protocol. Compatibility can be useful, but it must sit on
 top of datalens-owned architecture.
 
@@ -41,9 +41,9 @@ node method, mempool surface, pending-state query, or low-latency operational RP
 ## Technical Direction
 
 The durable cache should store structured datasets, not arbitrary caller response blobs.
-For EVM this may begin with block headers, logs, transactions, and receipts where needed.
-For future chain families, the datasets may differ. The shared architecture should not
-force Solana or Tron data into EVM concepts such as log topics or transaction receipts.
+For EVM this includes block headers, logs, transactions, and receipts where needed. For
+other chain families, the datasets may differ. The shared architecture should not force
+Solana or Tron data into EVM concepts such as log topics or transaction receipts.
 
 Object storage is the durable persistence layer. Local disk can be used as temporary
 workspace for downloads, uploads, retries, and query execution, but it should not be the
@@ -59,7 +59,7 @@ field coverage.
 The first project-direction work should produce:
 
 - A shared understanding that datalens is a structured historical cache service.
-- A clear decision that EVM is first but not the only future chain family.
+- A clear decision that EVM is first but not the only supported chain family.
 - A clear separation between datalens-owned native behavior and compatibility adapters.
 - A durable object-storage-first posture.
 - A development sequence that starts with stable architecture boundaries instead of

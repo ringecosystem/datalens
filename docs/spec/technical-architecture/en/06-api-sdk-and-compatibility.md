@@ -100,9 +100,11 @@ The default client behavior is service-client only:
   - `latest_only`: caller accepts only latest-capable hot/provider behavior.
 
 Hot/latest behavior is never implicit. `safe_to_latest` and `latest_only` require
-`allow_hot: true`; otherwise the server returns `invalid_input`. Until a hot storage path
-exists, explicit hot requests return `unsupported_hot_query` before provider fetch or
-durable cache write.
+`allow_hot: true`; otherwise the server returns `invalid_input`. `safe_to_latest` splits
+safe/finalized durable coverage from the latest-capable tail where the adapter can serve
+it. `latest_only` uses the live provider read-through path and does not read from or
+write to durable cache. If an adapter cannot safely serve the requested hot/latest
+contract, the server returns `unsupported_hot_query` before durable cache write.
 
 Logs filter fields:
 
@@ -172,7 +174,8 @@ Rules:
 
 ## Fallback Boundary
 
-The first Rust client does not implement safe-to-latest hot query or real RPC fallback.
+The Rust client can send the service hot/latest contract fields. It does not implement a
+client-side RPC fallback.
 
 The fallback boundary is explicit:
 
@@ -182,8 +185,8 @@ The fallback boundary is explicit:
 - If a future RPC fallback is configured, fallback/live rows must be marked with
   `source: provider` and `finality: unsafe` or `latest`, and fallback must not write
   durable cache.
-- Future hot query or RPC fallback must remain isolated from durable safe/finalized cache
-  writes.
+- Service-side hot/latest read-through and any future client-side RPC fallback must
+  remain isolated from durable safe/finalized cache writes.
 
 ## Compatibility Adapters
 

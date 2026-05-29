@@ -21,24 +21,33 @@ The plan should be bounded before any storage lookup or fetch begins. If a reque
 require unbounded work, the planner should reject it or split it into configured maximum
 ranges.
 
-The plan must also be bounded by the adapter safe/finalized height before any storage
-lookup, fetch, or durable write. First-stage datalens serves only safe/finalized
-historical ranges from the durable cache path. If the requested range ends above
-`adapter.safe_height()`, the query must fail with a clear invalid-input error. It must not
-silently truncate the range, fetch only the safe part, or return a response that looks
-complete.
+The plan must also separate durable work from latest-capable work before any storage
+lookup, fetch, or durable write. Durable-only requests are bounded by the adapter
+safe/finalized height and serve only safe/finalized historical ranges from the durable
+cache path. If a durable-only requested range ends above `adapter.safe_height()`, the
+query must fail with a clear invalid-input error. It must not silently truncate the
+range, fetch only the safe part, or return a response that looks complete.
+
+Latest-capable requests are explicit. `SafeToLatest` may split the request into durable
+coverage at or below the safe/finalized boundary and a hot/live provider tail up to the
+adapter latest height. `LatestOnly` may read through live provider data without reading
+or writing durable cache coverage. These segments must be visible in response metadata.
 
 ## Cache States
 
 A cache hit means manifest coverage satisfies the whole plan. The system reads stored
 chunks and streams the response. It does not fetch equivalent data again.
 
-A partial hit means some ranges are covered and some are missing. The system reads the
-covered ranges, fetches only the missing ranges, writes the fetched data as durable
-chunks, updates manifest coverage, and returns one coherent response.
+A partial hit means some durable ranges are covered and some durable ranges are missing.
+The system reads the covered ranges, fetches only the durable missing ranges, passes
+safe/finalized fetched rows through the durable writer, updates manifest coverage when
+the writer flushes or records empty coverage, and returns one coherent response.
 
-A cache miss means no required range is covered. The system fetches the planned ranges,
-persists them, updates manifest coverage, and returns the response.
+A durable cache miss means no required durable range is covered. The system fetches the
+planned durable ranges, passes safe/finalized rows through the durable writer, updates
+manifest coverage when the writer flushes or records empty coverage, and returns the
+response. A hot/latest live fetch is not a durable cache fill and must not write unsafe
+data into durable storage.
 
 The caller should not need to know which state happened except through optional metadata,
 latency, or observability. The result should have the same meaning.
@@ -52,10 +61,10 @@ and `written` fill outcome. Misses that record empty coverage use `empty` query 
 and `empty_coverage_recorded` fill outcome. Provider and storage failures use the
 corresponding error outcomes and must not make incomplete responses look successful.
 
-The interval above safe/finalized height and up to latest height is outside first-stage
-durable cache semantics. Callers that need that interval must query RPC directly or use a
-future explicitly non-durable hot path. Hot data must not update durable manifest
-coverage.
+The interval above safe/finalized height and up to latest height is outside durable cache
+semantics. Callers that need that interval must opt into latest-capable behavior with
+`allow_hot` and a hot finality contract such as `safe_to_latest` or `latest_only`. Hot or
+live provider data must not update durable manifest coverage.
 
 ## Fill Execution
 
@@ -64,9 +73,10 @@ larger fetches when the adapter and provider allow it, but must respect provider
 and configured range caps.
 
 Every fetch task that will write through the durable cache path must satisfy the same
-safe/finalized height bound as the original plan. If a task is above that height, the
-executor must fail before calling storage. It must not write a data object, manifest
-coverage, or empty coverage.
+safe/finalized height bound as the durable portion of the original plan. If a durable
+write task is above that height, the executor must fail before calling storage. It must
+not write a data object, manifest coverage, or empty coverage. Fetch tasks for hot/live
+segments must be marked non-durable and must not call the durable writer.
 
 For EVM logs, the first fill implementation can fetch by `eth_getLogs` using the planned
 address/topic/range filters. For block headers, it can fetch by block number batches. For

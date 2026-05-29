@@ -19,21 +19,29 @@ API 不应该直接调用存储层或链适配器。它先把原生请求交给�
 任何存储查找或拉取开始前，计划都应该有明确边界。如果请求会导致无边界工作，规划器应拒绝
 它，或按配置的最大范围拆分。
 
-计划还必须在任何 storage lookup、fetch 或 durable write 之前受 adapter safe/finalized height
-约束。第一阶段 datalens 的 durable cache path 只服务 safe/finalized 历史范围。如果请求范围
-结束高度超过 `adapter.safe_height()`，查询必须以明确的 invalid-input 错误失败。它不能静默
-截断范围、只拉取 safe 部分，或返回一个看起来完整的响应。
+计划还必须在任何 storage lookup、fetch 或 durable write 之前区分 durable work 和 latest-capable
+work。durable-only request 受 adapter safe/finalized height 约束，并且 durable cache path 只服务
+safe/finalized 历史范围。如果 durable-only 请求范围结束高度超过 `adapter.safe_height()`，查询必须
+以明确的 invalid-input 错误失败。它不能静默截断范围、只拉取 safe 部分，或返回一个看起来完整的响应。
+
+Latest-capable request 必须显式声明。`SafeToLatest` 可以把请求拆成 safe/finalized boundary 内的
+durable coverage，以及直到 adapter latest height 的 hot/live provider tail。`LatestOnly` 可以
+直接 read through live provider data，且不读取或写入 durable cache coverage。这些 segment 必须出现在
+response metadata 中。
 
 ## 缓存状态
 
 缓存命中表示 Manifest 覆盖范围满足整个计划。系统读取已存储分片并返回响应流，不再重复
 拉取等价数据。
 
-部分命中表示一部分范围已覆盖，一部分范围缺失。系统读取已覆盖范围，只拉取缺失范围，将
-拉取到的数据写成持久化分片，更新 Manifest 覆盖范围，然后返回一个一致的响应。
+部分命中表示一部分 durable range 已覆盖，一部分 durable range 缺失。系统读取已覆盖范围，只拉取
+durable 缺失范围，把 safe/finalized fetched rows 交给 durable writer，并在 writer flush 或记录
+empty coverage 时更新 Manifest 覆盖范围，然后返回一个一致的响应。
 
-缓存未命中表示没有所需范围被覆盖。系统拉取计划范围，持久化，更新 Manifest 覆盖范围，然后
-返回响应。
+durable cache miss 表示没有所需 durable range 被覆盖。系统拉取计划中的 durable range，把
+safe/finalized rows 交给 durable writer，并在 writer flush 或记录 empty coverage 时更新 Manifest
+覆盖范围，然后返回响应。hot/latest live fetch 不是 durable cache fill，不能把 unsafe data 写入
+durable storage。
 
 除了可选元数据、延迟或可观测性指标，调用方不需要知道发生了哪种状态。返回结果的语义应该
 一致。
@@ -46,18 +54,19 @@ query outcome 和 `written` fill outcome。记录 empty coverage 的 miss 使用
 outcome 和 `empty_coverage_recorded` fill outcome。Provider 和 storage 失败使用对应的 error
 outcome，并且不能让不完整响应看起来成功。
 
-safe/finalized height 到 latest height 之间的区间不属于第一阶段 durable cache 语义。需要这段
-区间的调用方应直接查询 RPC，或使用未来明确标记为 non-durable 的 hot path。Hot 数据不能更新
-durable Manifest 覆盖范围。
+safe/finalized height 到 latest height 之间的区间不属于 durable cache 语义。需要这段区间的
+调用方必须通过 `allow_hot` 和 `safe_to_latest` 或 `latest_only` 这类 hot finality contract 显式
+选择 latest-capable behavior。Hot 或 live provider data 不能更新 durable Manifest 覆盖范围。
 
 ## 补齐执行
 
 缺失范围应被组合成拉取任务。在适配器和 provider 允许时，解析器可以倾向更少、更大的拉取，
 但必须遵守 provider 限制和配置的范围上限。
 
-任何会通过 durable cache path 写入的 fetch task，都必须满足和原始 plan 相同的 safe/finalized
-height 约束。如果一个 task 超过该高度，executor 必须在调用 storage 前失败。它不能写入数据
-对象、Manifest 覆盖范围或 empty coverage。
+任何会通过 durable cache path 写入的 fetch task，都必须满足和原始 plan durable 部分相同的
+safe/finalized height 约束。如果一个 durable write task 超过该高度，executor 必须在调用 storage
+前失败。它不能写入数据对象、Manifest 覆盖范围或 empty coverage。Hot/live segment 的 fetch task
+必须标记为 non-durable，并且不能调用 durable writer。
 
 对于 EVM logs，第一版补齐实现可以使用 `eth_getLogs`，按计划中的 address/topic/range
 filters 拉取。对于 block headers，可以按区块号批量拉取。对于 transactions 或 receipts，

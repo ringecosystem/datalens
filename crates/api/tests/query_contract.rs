@@ -199,7 +199,7 @@ fn test_api_error_mapping_uses_stable_response_codes() {
 
     let hot_body = api_error_body(DatalensError::new(
         DatalensErrorKind::UnsupportedHotQuery,
-        "hot query is not supported",
+        "adapter cannot safely serve the requested hot/latest contract",
     ));
     assert_eq!(
         api_error_status(&DatalensErrorKind::UnsupportedHotQuery),

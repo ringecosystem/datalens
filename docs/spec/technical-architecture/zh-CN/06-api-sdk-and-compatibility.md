@@ -36,6 +36,18 @@ application 认证。
 Metrics labels 必须使用 registry 规范化后的 application id，不能使用原始 header 值。
 Authentication token 不能出现在日志或 API error response 中。
 
+## HTTP Contract
+
+`POST /v1/query` 的 hot/latest behavior 不能隐式启用。`safe_to_latest` 和 `latest_only` 都要求
+`allow_hot: true`；否则 server 返回 `invalid_input`。`safe_to_latest` 会把 safe/finalized durable
+coverage 和 adapter 可服务的 latest-capable tail 拆开。`latest_only` 使用 live provider read-through
+path，不读取也不写入 durable cache。如果 adapter 无法安全服务请求的 hot/latest contract，server
+必须在 durable cache write 前返回 `unsupported_hot_query`。
+
+Response metadata 必须区分 durable cache、hot cache 和 live provider segment，并标记
+`finalized`、`safe`、`unsafe` 或 `latest` finality。调用方必须基于稳定的 `error.kind` 分支，而
+不是解析 `error.message`。
+
 ## SDK 角色
 
 SDK 是便捷层。它可以提供类型化请求、分页帮助方法、重试帮助方法、认证帮助方法，以及给
@@ -48,6 +60,10 @@ SDK 可以在两种形态之间选择：
 - 混合帮助层：当 datalens 未配置或请求超出 datalens 范围时，SDK 可以选择回退到直接 RPC。
 
 这个决策应根据真实集成需要后续再做。架构只要求直接 RPC 索引仍然是合法工作流。
+
+Rust client 可以发送 service-side hot/latest contract fields。它不实现 client-side RPC fallback。
+`FallbackMode::Rpc` 仍返回 `UnsupportedFallback`，并且不能写 durable cache。Service-side hot/latest
+read-through 和未来任何 client-side RPC fallback 都必须与 durable safe/finalized cache write 隔离。
 
 ## 兼容适配层
 
