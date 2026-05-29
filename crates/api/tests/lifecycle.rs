@@ -24,14 +24,22 @@ use datalens_core::{
     DatasetKey, LedgerRange, LogFilter, NetworkId, QueryFinalityRequirement, QueryRows,
 };
 use datalens_metrics::MetricsRecorder;
+use datalens_planner::{FieldSelection, NativeQueryInput, ResponseShape};
+use datalens_solana::{
+    SolanaAdapter, SolanaBlock, SolanaCommitment, SolanaFixtureRpc, SolanaRpc, solana_all_selector,
+};
 use datalens_storage::{
     DurableStorage, LocalObjectStore, LocalStorage, Manifest, ObjectMetadata, ObjectStore,
     ReadThroughCacheConfig, S3ObjectStore, S3ObjectStoreConfig, StorageRepository,
     StorageWriteOutcome, StorageWriteRequest,
 };
+use datalens_tron::{
+    TronAdapter, TronBlock, TronFinality, TronFixtureProviderRpc, TronProvider, tron_all_selector,
+};
 use datalens_warmup::{
     LocalWarmupRegistry, WarmupRuntime, WarmupRuntimeConfig, WarmupSchedulerConfig, WarmupTaskPool,
 };
+use serde_json::Value;
 use tower::ServiceExt;
 
 #[test]
@@ -332,6 +340,241 @@ async fn test_api_warmup_run_once_writes_durable_coverage_that_query_hits() {
     assert!(body.contains("datalens_warmup_task_total"));
     assert!(body.contains("datalens_warmup_fetch_total"));
     assert!(body.contains("datalens_warmup_write_total"));
+}
+
+#[tokio::test]
+async fn test_api_warmup_native_submit_runs_solana_and_tron_tasks() {
+    let root = temp_storage_root("api-warmup-native-multichain");
+    let storage: Arc<dyn StorageRepository> = Arc::new(LocalStorage::new(&root));
+    let solana_provider = CountingSolanaRpc::default();
+    let tron_provider = CountingTronProvider::default();
+    let solana = SolanaAdapter::with_provider(solana_identity(), solana_provider.clone())
+        .with_max_slot_range_len(3);
+    let tron = TronAdapter::with_provider(tron_identity(), tron_provider.clone())
+        .with_max_block_range_len(3);
+    let registry = QueryServiceRegistry::new()
+        .with_service(
+            QueryService::new_named(
+                storage.clone(),
+                solana.clone(),
+                planner_config(),
+                writer_config(),
+                "solana-mainnet-beta",
+                non_evm_chain_config("solana"),
+            )
+            .with_warmup_pool(warmup_pool_for(&root.join("solana"), solana)),
+        )
+        .expect("register solana")
+        .with_service(
+            QueryService::new_named(
+                storage.clone(),
+                tron.clone(),
+                planner_config(),
+                writer_config(),
+                "tron",
+                non_evm_chain_config("tron"),
+            )
+            .with_warmup_pool(warmup_pool_for(&root.join("tron"), tron)),
+        )
+        .expect("register tron");
+    let app = router(registry.clone());
+
+    let solana_submit = app
+        .clone()
+        .oneshot(native_warmup_request(serde_json::json!({
+            "chain": solana_identity(),
+            "dataset_key": "solana.slots",
+            "selector": { "kind": "other", "value": {
+                "kind": "solana_all",
+                "fingerprint": "solana-all/all",
+                "canonical_key": "all"
+            }},
+            "range_kind": { "kind": "slot" },
+            "start": 10,
+            "end": 12,
+            "mode": "fixed_range",
+            "chunk_policy": { "max_range_len": 3 }
+        })))
+        .await
+        .expect("solana submit response");
+    assert_eq!(solana_submit.status(), StatusCode::CREATED);
+
+    let tron_submit = app
+        .clone()
+        .oneshot(native_warmup_request(serde_json::json!({
+            "chain": tron_identity(),
+            "dataset_key": "tron.blocks",
+            "selector": { "kind": "other", "value": {
+                "kind": "tron_all",
+                "fingerprint": "tron-all/all",
+                "canonical_key": "all"
+            }},
+            "range_kind": { "kind": "block" },
+            "start": 10,
+            "end": 12,
+            "mode": "fixed_range"
+        })))
+        .await
+        .expect("tron submit response");
+    assert_eq!(tron_submit.status(), StatusCode::CREATED);
+
+    let list = app
+        .clone()
+        .oneshot(
+            Request::get("/v1/warmup/tasks")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("list response");
+    assert_eq!(list.status(), StatusCode::OK);
+    let list_body = body_json(list.into_body()).await;
+    let tasks = list_body["tasks"].as_array().expect("tasks");
+    assert_eq!(tasks.len(), 2);
+    assert!(tasks.iter().any(|task| {
+        task["dataset_key"].as_str() == Some("solana.slots")
+            && task["range_kind"] == serde_json::json!({ "kind": "slot" })
+            && task["start"] == 10
+            && task["end"] == 12
+    }));
+    assert!(tasks.iter().any(|task| {
+        task["dataset_key"].as_str() == Some("tron.blocks")
+            && task["range_kind"] == serde_json::json!({ "kind": "block" })
+            && task["start"] == 10
+            && task["end"] == 12
+    }));
+
+    let run_once = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/warmup/run-once")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("run once response");
+    assert_eq!(run_once.status(), StatusCode::OK);
+
+    solana_provider.fail_data_fetches();
+    tron_provider.fail_data_fetches();
+    registry
+        .query_native(NativeQueryInput {
+            chain: solana_identity(),
+            dataset_key: DatasetKey::solana_slots(),
+            ledger_range: LedgerRange::slots(10, 12).expect("valid range"),
+            selector: solana_all_selector().expect("selector"),
+            response_shape: ResponseShape::NativeRows,
+            field_selection: FieldSelection::All,
+            finality: QueryFinalityRequirement::DurableOnly,
+        })
+        .expect("solana query hits warmup cache");
+    registry
+        .query_native(NativeQueryInput {
+            chain: tron_identity(),
+            dataset_key: DatasetKey::tron_blocks(),
+            ledger_range: LedgerRange::blocks(10, 12).expect("valid range"),
+            selector: tron_all_selector().expect("selector"),
+            response_shape: ResponseShape::NativeRows,
+            field_selection: FieldSelection::All,
+            finality: QueryFinalityRequirement::DurableOnly,
+        })
+        .expect("tron query hits warmup cache");
+}
+
+#[tokio::test]
+async fn test_api_warmup_native_submit_uses_chain_neutral_application_allowlists() {
+    let root = temp_storage_root("api-warmup-native-auth");
+    let solana = SolanaAdapter::with_fixture_defaults();
+    let registry = QueryServiceRegistry::new()
+        .with_application_registry(datalens_api::config::ApplicationRegistryConfig {
+            required: true,
+            applications: vec![datalens_api::config::ApplicationConfig {
+                id: "app-a".to_owned(),
+                name: "app-a".to_owned(),
+                enabled: true,
+                display_name: None,
+                token: "token-a".to_owned(),
+                chains: vec!["solana-mainnet-beta".to_owned()],
+                datasets: vec!["solana.slots".to_owned()],
+                quota: None,
+            }],
+        })
+        .expect("application registry")
+        .with_service(
+            QueryService::new_named(
+                LocalStorage::new(&root),
+                solana.clone(),
+                planner_config(),
+                writer_config(),
+                "solana-mainnet-beta",
+                non_evm_chain_config("solana"),
+            )
+            .with_warmup_pool(warmup_pool_for(&root.join("warmup"), solana)),
+        )
+        .expect("register solana");
+    let app = router(registry);
+
+    let submit = app
+        .oneshot(
+            Request::post("/v1/warmup/tasks")
+                .header("content-type", "application/json")
+                .header("x-datalens-application", "app-a")
+                .header("authorization", "Bearer token-a")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "chain": solana_identity(),
+                        "dataset_key": "solana.slots",
+                        "selector": { "kind": "all" },
+                        "range_kind": { "kind": "slot" },
+                        "start": 10,
+                        "end": 12,
+                        "mode": "fixed_range"
+                    }))
+                    .expect("request json"),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("submit response");
+
+    assert_eq!(submit.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn test_api_warmup_native_submit_rejects_unsupported_combinations_before_fetch() {
+    let root = temp_storage_root("api-warmup-native-unsupported");
+    let solana_provider = CountingSolanaRpc::default();
+    let solana = SolanaAdapter::with_provider(solana_identity(), solana_provider.clone());
+    let registry = QueryServiceRegistry::new()
+        .with_service(
+            QueryService::new_named(
+                LocalStorage::new(&root),
+                solana.clone(),
+                planner_config(),
+                writer_config(),
+                "solana-mainnet-beta",
+                non_evm_chain_config("solana"),
+            )
+            .with_warmup_pool(warmup_pool_for(&root.join("warmup"), solana)),
+        )
+        .expect("register solana");
+    let app = router(registry);
+
+    let submit = app
+        .oneshot(native_warmup_request(serde_json::json!({
+            "chain": solana_identity(),
+            "dataset_key": "solana.slots",
+            "selector": { "kind": "all" },
+            "range_kind": { "kind": "block" },
+            "start": 10,
+            "end": 12,
+            "mode": "fixed_range"
+        })))
+        .await
+        .expect("submit response");
+
+    assert_eq!(submit.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(solana_provider.data_fetch_count(), 0);
 }
 
 #[tokio::test]
@@ -797,6 +1040,22 @@ fn service_named(
     )
 }
 
+fn planner_config() -> PlannerConfig {
+    PlannerConfig {
+        max_query_range_blocks: 8,
+        default_chunk_range_blocks: 4,
+    }
+}
+
+fn writer_config() -> WriterConfig {
+    WriterConfig {
+        target_object_bytes: 1024,
+        min_object_rows: 1,
+        record_empty_coverage: true,
+        staging: Default::default(),
+    }
+}
+
 fn chain_config(chain_id: u64) -> ChainConfig {
     ChainConfig {
         kind: "evm".to_owned(),
@@ -811,6 +1070,26 @@ fn chain_config(chain_id: u64) -> ChainConfig {
             logs: LogsDatasetConfig {
                 enabled: true,
                 max_get_logs_range_blocks: 4,
+                max_addresses_per_query: 2,
+            },
+        },
+    }
+}
+
+fn non_evm_chain_config(kind: &str) -> ChainConfig {
+    ChainConfig {
+        kind: kind.to_owned(),
+        chain_id: 0,
+        rpc_urls: vec!["http://example.invalid".to_owned()],
+        finality: datalens_api::config::FinalityConfig::Auto,
+        datasets: DatasetsConfig {
+            blocks: BlocksDatasetConfig {
+                enabled: false,
+                max_batch_blocks: 2,
+            },
+            logs: LogsDatasetConfig {
+                enabled: false,
+                max_get_logs_range_blocks: 2,
                 max_addresses_per_query: 2,
             },
         },
@@ -889,6 +1168,38 @@ fn warmup_pool_inner(
     )
 }
 
+fn warmup_pool_for<A>(
+    root: &std::path::Path,
+    adapter: A,
+) -> WarmupTaskPool<A, LocalStorage, LocalWarmupRegistry<LocalObjectStore>>
+where
+    A: ChainAdapter,
+{
+    let storage = LocalStorage::new(root);
+    let registry = LocalWarmupRegistry::new(LocalObjectStore::new(root.join("warmup-registry")));
+    let runtime = WarmupRuntime::new(
+        adapter,
+        storage,
+        registry,
+        datalens_writer::DurableWriterConfig {
+            target_object_bytes: 1024,
+            min_object_rows: 1,
+            record_empty_coverage: true,
+            staging: Default::default(),
+        },
+    )
+    .with_runtime_config(WarmupRuntimeConfig {
+        max_fetches_per_task_loop: 4,
+    });
+    WarmupTaskPool::new(
+        runtime,
+        WarmupSchedulerConfig {
+            max_global_concurrent_tasks: 1,
+            max_concurrent_tasks_per_chain: 1,
+        },
+    )
+}
+
 fn application_config(id: &str, token: &str) -> datalens_api::config::ApplicationConfig {
     datalens_api::config::ApplicationConfig {
         id: id.to_owned(),
@@ -910,6 +1221,31 @@ fn ethereum_identity() -> ChainIdentity {
 fn polygon_identity() -> ChainIdentity {
     ChainIdentity::try_new(ChainFamily::Evm, "polygon", Some(NetworkId::numeric(137)))
         .expect("valid chain")
+}
+
+fn solana_identity() -> ChainIdentity {
+    ChainIdentity::try_new(
+        ChainFamily::Other("solana".to_owned()),
+        "solana-mainnet-beta",
+        Some(NetworkId::textual("mainnet-beta").expect("valid network")),
+    )
+    .expect("valid chain")
+}
+
+fn tron_identity() -> ChainIdentity {
+    ChainIdentity::try_new(
+        ChainFamily::Other("tron".to_owned()),
+        "tron",
+        Some(NetworkId::numeric(728126428)),
+    )
+    .expect("valid chain")
+}
+
+fn native_warmup_request(body: serde_json::Value) -> Request<Body> {
+    Request::post("/v1/warmup/tasks")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).expect("request json")))
+        .expect("request")
 }
 
 fn block(number: u64) -> BlockHeader {
@@ -986,6 +1322,111 @@ fn cleanup_s3_prefix(store: &S3ObjectStore) {
 enum SourceCall {
     Blocks(BlockRange),
     Logs(BlockRange),
+}
+
+#[derive(Clone, Default)]
+struct CountingSolanaRpc {
+    inner: SolanaFixtureRpc,
+    fail_data_fetches: Arc<Mutex<bool>>,
+    data_fetches: Arc<Mutex<usize>>,
+}
+
+impl CountingSolanaRpc {
+    fn fail_data_fetches(&self) {
+        *self.fail_data_fetches.lock().expect("fail lock") = true;
+    }
+
+    fn data_fetch_count(&self) -> usize {
+        *self.data_fetches.lock().expect("fetch lock")
+    }
+}
+
+impl SolanaRpc for CountingSolanaRpc {
+    fn get_slot(&self, commitment: SolanaCommitment) -> Result<u64, DatalensError> {
+        self.inner.get_slot(commitment)
+    }
+
+    fn get_blocks_with_limit(
+        &self,
+        start_slot: u64,
+        limit: u64,
+        commitment: SolanaCommitment,
+    ) -> Result<Vec<u64>, DatalensError> {
+        if *self.fail_data_fetches.lock().expect("fail lock") {
+            return Err(DatalensError::new(
+                DatalensErrorKind::ProviderFailure,
+                "unexpected Solana provider fetch",
+            ));
+        }
+        *self.data_fetches.lock().expect("fetch lock") += 1;
+        self.inner
+            .get_blocks_with_limit(start_slot, limit, commitment)
+    }
+
+    fn get_block(
+        &self,
+        slot: u64,
+        commitment: SolanaCommitment,
+    ) -> Result<Option<SolanaBlock>, DatalensError> {
+        if *self.fail_data_fetches.lock().expect("fail lock") {
+            return Err(DatalensError::new(
+                DatalensErrorKind::ProviderFailure,
+                "unexpected Solana provider fetch",
+            ));
+        }
+        *self.data_fetches.lock().expect("fetch lock") += 1;
+        self.inner.get_block(slot, commitment)
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "counting-solana-fixture"
+    }
+}
+
+#[derive(Clone, Default)]
+struct CountingTronProvider {
+    inner: TronFixtureProviderRpc,
+    fail_data_fetches: Arc<Mutex<bool>>,
+}
+
+impl CountingTronProvider {
+    fn fail_data_fetches(&self) {
+        *self.fail_data_fetches.lock().expect("fail lock") = true;
+    }
+}
+
+impl TronProvider for CountingTronProvider {
+    fn latest_block(&self, finality: TronFinality) -> Result<TronBlock, DatalensError> {
+        self.inner.latest_block(finality)
+    }
+
+    fn get_block_by_number(
+        &self,
+        number: u64,
+        finality: TronFinality,
+    ) -> Result<Option<TronBlock>, DatalensError> {
+        if *self.fail_data_fetches.lock().expect("fail lock") {
+            return Err(DatalensError::new(
+                DatalensErrorKind::ProviderFailure,
+                "unexpected Tron provider fetch",
+            ));
+        }
+        self.inner.get_block_by_number(number, finality)
+    }
+
+    fn get_transaction_info_by_id(&self, tx_id: &str) -> Result<Option<Value>, DatalensError> {
+        if *self.fail_data_fetches.lock().expect("fail lock") {
+            return Err(DatalensError::new(
+                DatalensErrorKind::ProviderFailure,
+                "unexpected Tron provider fetch",
+            ));
+        }
+        self.inner.get_transaction_info_by_id(tx_id)
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "counting-tron-fixture"
+    }
 }
 
 #[derive(Clone)]

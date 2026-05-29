@@ -1256,6 +1256,7 @@ dependencies = [
  "datalens-planner",
  "datalens-solana",
  "datalens-storage",
+ "datalens-tron",
  "datalens-warmup",
  "datalens-writer",
  "log",

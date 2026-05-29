@@ -23,4 +23,5 @@ toml.workspace = true
 [dev-dependencies]
 datalens-client = { path = "../client" }
 datalens-solana = { path = "../solana" }
+datalens-tron = { path = "../tron" }
 tower.workspace = true
