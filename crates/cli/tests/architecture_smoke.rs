@@ -77,7 +77,7 @@ fn edge_public_contract_omits_placeholder_modules_and_block_only_query_dtos() {
 
 #[test]
 fn serve_path_builds_registry_without_first_chain_selection() {
-    let source = include_str!("../src/lib.rs");
+    let source = include_str!("../src/commands.rs");
 
     assert!(source.contains("build_service_registry(&config)?"));
     assert!(!source.contains("fn first_chain("));
