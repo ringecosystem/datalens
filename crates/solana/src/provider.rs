@@ -39,32 +39,38 @@ impl SolanaHttpRpc {
                 )
             })?;
         let status = response.status();
-        let body: Value = response.json().map_err(|error| {
+        let body = response.text().map_err(|error| {
             DatalensError::new(
                 DatalensErrorKind::ProviderFailure,
-                format!("decode Solana JSON-RPC response: {error}"),
+                format!("read Solana JSON-RPC response: {error}"),
             )
         })?;
+        let body: Value = serde_json::from_str(&body).map_err(|error| {
+            if status.is_success() {
+                DatalensError::new(
+                    DatalensErrorKind::ProviderFailure,
+                    format!("decode Solana JSON-RPC response: {error}"),
+                )
+            } else {
+                classify_provider_error(status.as_u16() as i64, "")
+            }
+        })?;
         if !status.is_success() {
-            return Err(DatalensError::new(
-                DatalensErrorKind::ProviderFailure,
-                format!("Solana provider HTTP error {}", status.as_u16()),
+            return Err(classify_provider_error(
+                status.as_u16() as i64,
+                &body.to_string(),
             ));
         }
         if let Some(error) = body.get("error") {
+            let code = error
+                .get("code")
+                .and_then(Value::as_i64)
+                .unwrap_or_default();
             let message = error
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("Solana provider error");
-            let lower = message.to_ascii_lowercase();
-            let kind = if lower.contains("rate") {
-                DatalensErrorKind::RateLimited
-            } else if lower.contains("limit") || lower.contains("too many") {
-                DatalensErrorKind::ProviderLimit
-            } else {
-                DatalensErrorKind::ProviderFailure
-            };
-            return Err(DatalensError::new(kind, message));
+            return Err(classify_provider_error(code, message));
         }
         body.get("result").cloned().ok_or_else(|| {
             DatalensError::new(
@@ -73,6 +79,31 @@ impl SolanaHttpRpc {
             )
         })
     }
+}
+
+fn classify_provider_error(code: i64, message: &str) -> DatalensError {
+    let lower = message.to_ascii_lowercase();
+    let kind = if code == -32601
+        || lower.contains("method not found")
+        || lower.contains("unsupported method")
+        || lower.contains("unsupported")
+        || lower.contains("not supported")
+    {
+        DatalensErrorKind::UnsupportedDataset
+    } else if code == 429 || lower.contains("rate") {
+        DatalensErrorKind::RateLimited
+    } else if code == 413
+        || code == 414
+        || lower.contains("range")
+        || lower.contains("limit")
+        || lower.contains("too many")
+        || lower.contains("more than")
+    {
+        DatalensErrorKind::ProviderLimit
+    } else {
+        DatalensErrorKind::ProviderFailure
+    };
+    DatalensError::new(kind, message)
 }
 
 impl SolanaRpc for SolanaHttpRpc {
