@@ -106,6 +106,15 @@ fn test_dataset_key_has_builtin_chain_neutral_ids() {
         datalens_core::DatasetKey::from(Dataset::Logs),
         datalens_core::DatasetKey::evm_logs()
     );
+    assert_eq!(
+        datalens_core::DatasetKey::parse("evm.blocks").expect("parsed key"),
+        datalens_core::DatasetKey::evm_blocks()
+    );
+    assert_eq!(
+        datalens_core::DatasetKey::parse("solana.slots").expect("parsed key"),
+        datalens_core::DatasetKey::solana_slots()
+    );
+    assert!(datalens_core::DatasetKey::parse("blocks").is_err());
     assert!(datalens_core::DatasetKey::try_new(ChainFamily::Evm, "bad/path").is_err());
 }
 

@@ -73,7 +73,18 @@ The client crate must not depend on executor, storage, writer, or API server run
 construction crates.
 
 The default client behavior is service-client only and uses the same native request shape
-as the edge:
+as the edge. `DatalensClient::query(QueryRequest)` is the first-class Rust client API:
+
+- `QueryRequest::new(chain, dataset_key, range)` creates a native request with
+  `selector: all`, `finality: durable_only`, and `fields: all`.
+- Builder methods such as `with_selector`, `with_range`, `with_finality`, and
+  `with_fields` adjust native request fields without changing the wire contract.
+- `QueryResponse` exposes `DatasetKey` and `LedgerRange` values while preserving the
+  REST JSON shape of `dataset_key: "family.name"` and typed ledger ranges.
+- Non-EVM datasets such as `solana.slots` and `tron.blocks` are queried through the
+  same native method.
+
+EVM helpers are convenience wrappers over the native request:
 
 - `DatalensClient::query_blocks` sends a JSON request to `POST /v1/query` with
   `dataset_key: "evm.blocks"` and `selector: { "kind": "all" }`.
