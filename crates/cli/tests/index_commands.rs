@@ -195,6 +195,58 @@ fn test_index_backfill_solana_transactions_builds_address_selector() {
 }
 
 #[test]
+fn test_index_backfill_solana_transactions_builds_signature_selector() {
+    let root = temp_storage_root("index-solana-signature-selector");
+    let config = write_solana_config("index-solana-signature-selector", &root);
+    let mut common = index_common(config, 10, 12);
+    common.chain = "solana-mainnet-beta".to_owned();
+    common.datasets = vec!["transactions".to_owned()];
+    common.range_kind = "slot".to_owned();
+    common.signature = Some("sigslot10".to_owned());
+
+    let output = index_summary_with_adapter(
+        IndexWorkflowCommand::Backfill(IndexBackfillCommand {
+            common,
+            dry_run: true,
+        }),
+        SolanaAdapter::with_fixture_defaults(),
+    )
+    .expect("dry-run");
+
+    assert_eq!(output["datasets"][0]["selector_kind"], "solana_signature");
+    assert_eq!(
+        output["datasets"][0]["selector_canonical_key"],
+        "signature/sigslot10"
+    );
+}
+
+#[test]
+fn test_index_backfill_solana_account_updates_builds_account_selector() {
+    let root = temp_storage_root("index-solana-account-selector");
+    let config = write_solana_config("index-solana-account-selector", &root);
+    let mut common = index_common(config, 10, 12);
+    common.chain = "solana-mainnet-beta".to_owned();
+    common.datasets = vec!["account_updates".to_owned()];
+    common.range_kind = "slot".to_owned();
+    common.account = Some("Account111111111111111111111111111111111".to_owned());
+
+    let output = index_summary_with_adapter(
+        IndexWorkflowCommand::Backfill(IndexBackfillCommand {
+            common,
+            dry_run: true,
+        }),
+        SolanaAdapter::with_fixture_defaults(),
+    )
+    .expect("dry-run");
+
+    assert_eq!(output["datasets"][0]["selector_kind"], "solana_address");
+    assert_eq!(
+        output["datasets"][0]["selector_canonical_key"],
+        "address/Account111111111111111111111111111111111"
+    );
+}
+
+#[test]
 fn test_index_backfill_rejects_solana_selectors_for_blocks_and_slots() {
     for dataset in ["blocks", "slots"] {
         let root = temp_storage_root(&format!("index-solana-reject-{dataset}"));

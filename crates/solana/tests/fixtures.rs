@@ -1,11 +1,19 @@
+use std::{
+    io::{Read, Write},
+    net::TcpListener,
+    thread,
+};
+
 use datalens_chain::{
     ChainAdapter, ChainFetchRequest, DatasetSelector, FinalityKind, HeightRangeKind,
 };
-use datalens_core::{DatalensErrorKind, DatasetKey, LedgerRange, QueryRows};
+use datalens_core::{DatalensError, DatalensErrorKind, DatasetKey, LedgerRange, QueryRows};
 use datalens_solana::{
-    SolanaAdapter, SolanaFixtureRpc, SolanaSignatureInfo, solana_address_selector,
-    solana_all_selector, solana_program_selector, solana_signature_selector,
+    SolanaAdapter, SolanaFixtureRpc, SolanaHttpRpc, SolanaRpc, SolanaSignatureInfo,
+    solana_address_selector, solana_all_selector, solana_program_selector,
+    solana_signature_selector,
 };
+use serde_json::{Value, json};
 
 #[test]
 fn test_slots_fetch_skips_missing_slots_and_keeps_ordered_adapter_json_rows() {
@@ -270,6 +278,166 @@ fn test_optimized_selector_fetch_falls_back_to_slot_scan_on_provider_limit() {
     );
 }
 
+#[test]
+fn test_solana_http_rpc_classifies_429_as_rate_limited() {
+    let url = start_rpc_server(vec![rpc_response(
+        429,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {
+                "code": 429,
+                "message": "too many requests"
+            }
+        }),
+    )]);
+    let error = SolanaHttpRpc::new(url)
+        .get_slot(datalens_solana::SolanaCommitment::Finalized)
+        .expect_err("rate limited");
+
+    assert_eq!(error.kind, DatalensErrorKind::RateLimited);
+}
+
+#[test]
+fn test_solana_http_rpc_classifies_unsupported_json_rpc_method() {
+    let url = start_rpc_server(vec![rpc_response(
+        200,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {
+                "code": -32601,
+                "message": "method not found"
+            }
+        }),
+    )]);
+    let error = SolanaHttpRpc::new(url)
+        .get_transaction("sigslot10", datalens_solana::SolanaCommitment::Finalized)
+        .expect_err("unsupported method");
+
+    assert_eq!(error.kind, DatalensErrorKind::UnsupportedDataset);
+}
+
+#[test]
+fn test_http_429_from_signature_discovery_falls_back_to_slot_scan() {
+    let url = start_rpc_server(vec![
+        rpc_response(
+            429,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": {
+                    "code": 429,
+                    "message": "too many requests"
+                }
+            }),
+        ),
+        rpc_response(200, json!({ "jsonrpc": "2.0", "id": 1, "result": [10] })),
+        rpc_response(
+            200,
+            json!({ "jsonrpc": "2.0", "id": 1, "result": rpc_block(10) }),
+        ),
+    ]);
+    let adapter = SolanaAdapter::with_provider(default_chain(), SolanaHttpRpc::new(url));
+    let response = adapter
+        .fetch(ChainFetchRequest::new(
+            adapter.capabilities().chain().clone(),
+            DatasetKey::solana_transactions(),
+            LedgerRange::slots(10, 12).expect("valid range"),
+            solana_address_selector("Account111111111111111111111111111111111").expect("selector"),
+        ))
+        .expect("fallback transactions");
+
+    let QueryRows::AdapterJson { rows, .. } = response.rows.rows() else {
+        panic!("expected adapter JSON rows");
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["signature"], "sigslot10");
+    assert!(
+        response
+            .provider_diagnostics
+            .warnings
+            .contains(&"solana optimized selector fetch failed; fell back to slot scan".to_owned())
+    );
+}
+
+#[test]
+fn test_unsupported_get_transaction_falls_back_to_slot_scan() {
+    let provider = OptimizedSolanaRpc::with_transaction_error(
+        DatalensErrorKind::UnsupportedDataset,
+        "method not found",
+    );
+    let adapter = SolanaAdapter::with_provider(default_chain(), provider.clone());
+    let response = adapter
+        .fetch(ChainFetchRequest::new(
+            adapter.capabilities().chain().clone(),
+            DatasetKey::solana_transactions(),
+            LedgerRange::slots(10, 12).expect("valid range"),
+            solana_address_selector("Account111111111111111111111111111111111").expect("selector"),
+        ))
+        .expect("fallback transactions");
+
+    let QueryRows::AdapterJson { rows, .. } = response.rows.rows() else {
+        panic!("expected adapter JSON rows");
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(provider.transaction_calls(), vec!["sigslot10"]);
+    assert_eq!(provider.blocks_with_limit_calls(), 1);
+    assert!(
+        response
+            .provider_diagnostics
+            .warnings
+            .contains(&"solana optimized selector fetch failed; fell back to slot scan".to_owned())
+    );
+}
+
+#[test]
+fn test_malformed_optimized_transaction_response_is_fatal() {
+    let provider = OptimizedSolanaRpc::with_transaction_error(
+        DatalensErrorKind::ProviderFailure,
+        "missing transaction slot",
+    );
+    let adapter = SolanaAdapter::with_provider(default_chain(), provider.clone());
+    let error = adapter
+        .fetch(ChainFetchRequest::new(
+            adapter.capabilities().chain().clone(),
+            DatasetKey::solana_transactions(),
+            LedgerRange::slots(10, 12).expect("valid range"),
+            solana_signature_selector("sigslot10").expect("selector"),
+        ))
+        .expect_err("malformed optimized response is fatal");
+
+    assert_eq!(error.kind, DatalensErrorKind::ProviderFailure);
+    assert_eq!(provider.blocks_with_limit_calls(), 0);
+}
+
+#[test]
+fn test_signature_discovery_page_cap_falls_back_to_slot_scan() {
+    let provider = OptimizedSolanaRpc::with_endless_newer_signature_pages();
+    let adapter = SolanaAdapter::with_provider(default_chain(), provider.clone());
+    let response = adapter
+        .fetch(ChainFetchRequest::new(
+            adapter.capabilities().chain().clone(),
+            DatasetKey::solana_transactions(),
+            LedgerRange::slots(10, 12).expect("valid range"),
+            solana_address_selector("Account111111111111111111111111111111111").expect("selector"),
+        ))
+        .expect("fallback transactions");
+
+    let QueryRows::AdapterJson { rows, .. } = response.rows.rows() else {
+        panic!("expected adapter JSON rows");
+    };
+    assert_eq!(rows.len(), 1);
+    assert!(provider.signature_address_calls().len() > 1);
+    assert_eq!(provider.blocks_with_limit_calls(), 1);
+    assert!(
+        response
+            .provider_diagnostics
+            .warnings
+            .contains(&"solana optimized selector fetch failed; fell back to slot scan".to_owned())
+    );
+}
+
 #[derive(Clone, Default)]
 struct OptimizedSolanaRpc {
     state: std::sync::Arc<std::sync::Mutex<OptimizedState>>,
@@ -283,6 +451,9 @@ struct OptimizedState {
     block_calls: Vec<u64>,
     signature_discovery_error: Option<DatalensErrorKind>,
     signature_discovery_message: String,
+    transaction_error: Option<DatalensErrorKind>,
+    transaction_error_message: String,
+    endless_newer_signature_pages: bool,
 }
 
 impl OptimizedSolanaRpc {
@@ -293,6 +464,26 @@ impl OptimizedSolanaRpc {
             state.signature_discovery_error = Some(kind);
             state.signature_discovery_message = message.to_owned();
         }
+        provider
+    }
+
+    fn with_transaction_error(kind: DatalensErrorKind, message: &str) -> Self {
+        let provider = Self::default();
+        {
+            let mut state = provider.state.lock().expect("state");
+            state.transaction_error = Some(kind);
+            state.transaction_error_message = message.to_owned();
+        }
+        provider
+    }
+
+    fn with_endless_newer_signature_pages() -> Self {
+        let provider = Self::default();
+        provider
+            .state
+            .lock()
+            .expect("state")
+            .endless_newer_signature_pages = true;
         provider
     }
 
@@ -360,6 +551,13 @@ impl datalens_solana::SolanaRpc for OptimizedSolanaRpc {
                 state.signature_discovery_message.clone(),
             ));
         }
+        if state.endless_newer_signature_pages {
+            let page = state.signature_address_calls.len();
+            return Ok(vec![SolanaSignatureInfo {
+                signature: format!("newsig{page}"),
+                slot: 100,
+            }]);
+        }
         if before.is_some() {
             return Ok(Vec::new());
         }
@@ -380,6 +578,14 @@ impl datalens_solana::SolanaRpc for OptimizedSolanaRpc {
             .expect("state")
             .transaction_calls
             .push(signature.to_owned());
+        let state = self.state.lock().expect("state");
+        if let Some(kind) = state.transaction_error.clone() {
+            return Err(DatalensError::new(
+                kind,
+                state.transaction_error_message.clone(),
+            ));
+        }
+        drop(state);
         let block = SolanaFixtureRpc
             .get_block(10, commitment)?
             .expect("fixture block");
@@ -411,4 +617,70 @@ fn default_chain() -> datalens_core::ChainIdentity {
         Some(datalens_core::NetworkId::textual("mainnet-beta").expect("network id")),
     )
     .expect("chain")
+}
+
+struct RpcResponse {
+    status: u16,
+    body: Value,
+}
+
+fn rpc_response(status: u16, body: Value) -> RpcResponse {
+    RpcResponse { status, body }
+}
+
+fn start_rpc_server(responses: Vec<RpcResponse>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+    let address = listener.local_addr().expect("test server address");
+    let responses = std::sync::Arc::new(std::sync::Mutex::new(responses));
+
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = stream.expect("test server connection");
+            let mut buffer = [0; 8192];
+            let _ = stream.read(&mut buffer).expect("read request");
+            let response = responses.lock().expect("responses").remove(0);
+            let body = response.body.to_string();
+            write!(
+                stream,
+                "HTTP/1.1 {} OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                response.status,
+                body.len(),
+                body
+            )
+            .expect("write response");
+        }
+    });
+
+    format!("http://{address}")
+}
+
+fn rpc_block(slot: u64) -> Value {
+    json!({
+        "blockHeight": 1000,
+        "blockhash": format!("slot-{slot}-hash"),
+        "previousBlockhash": format!("slot-{}-hash", slot.saturating_sub(1)),
+        "parentSlot": slot.saturating_sub(1),
+        "blockTime": 1700000010,
+        "transactions": [{
+            "transaction": {
+                "signatures": ["sigslot10"],
+                "message": {
+                    "recentBlockhash": format!("slot-{slot}-hash"),
+                    "accountKeys": [
+                        "Account111111111111111111111111111111111",
+                        "program1111111111111111111111111111111111"
+                    ],
+                    "instructions": []
+                }
+            },
+            "meta": {
+                "fee": 5000,
+                "preBalances": [1000000, 1],
+                "postBalances": [900000, 1],
+                "preTokenBalances": [],
+                "postTokenBalances": [],
+                "innerInstructions": []
+            }
+        }]
+    })
 }

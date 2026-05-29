@@ -26,6 +26,7 @@ const SOLANA_PROGRAM_KIND: &str = "solana_program";
 const SOLANA_SIGNATURE_KIND: &str = "solana_signature";
 const FINALIZED: SolanaCommitment = SolanaCommitment::Finalized;
 const LATEST: SolanaCommitment = SolanaCommitment::Processed;
+const MAX_SIGNATURE_DISCOVERY_PAGES: usize = 8;
 type FinalizedBlockCache = Arc<Mutex<HashMap<(u64, u64), Vec<SolanaBlock>>>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -266,9 +267,17 @@ where
         let mut before = None;
         let mut signatures = Vec::new();
         let mut provider_calls = 0;
+        let mut signature_pages = 0;
         loop {
+            if signature_pages >= MAX_SIGNATURE_DISCOVERY_PAGES {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::ProviderLimit,
+                    "Solana signature discovery page limit reached",
+                ));
+            }
             let previous_before = before.clone();
             provider_calls += 1;
+            signature_pages += 1;
             let page = self.provider.get_signatures_for_address(
                 address,
                 before.as_deref(),
