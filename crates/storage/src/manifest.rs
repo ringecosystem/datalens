@@ -126,6 +126,15 @@ impl ManifestEntry {
                         "data object coverage must have row_count greater than zero",
                     ));
                 }
+                let object_size_bytes =
+                    required_data_object_metadata(raw.object_size_bytes, "object_size_bytes")?;
+                let checksum = required_data_object_metadata(raw.checksum, "checksum")?;
+                let checksum_algorithm =
+                    required_data_object_metadata(raw.checksum_algorithm, "checksum_algorithm")?;
+                let written_at_unix_seconds = required_data_object_metadata(
+                    raw.written_at_unix_seconds,
+                    "written_at_unix_seconds",
+                )?;
                 Ok(Self {
                     chain: raw.chain,
                     dataset_key: raw.dataset_key,
@@ -136,10 +145,10 @@ impl ManifestEntry {
                     object_key: Some(object_key),
                     object_encoding: raw.object_encoding,
                     row_count: raw.row_count,
-                    object_size_bytes: raw.object_size_bytes,
-                    checksum: raw.checksum,
-                    checksum_algorithm: raw.checksum_algorithm,
-                    written_at_unix_seconds: raw.written_at_unix_seconds,
+                    object_size_bytes: Some(object_size_bytes),
+                    checksum: Some(checksum),
+                    checksum_algorithm: Some(checksum_algorithm),
+                    written_at_unix_seconds: Some(written_at_unix_seconds),
                 })
             }
             None => {
@@ -167,6 +176,15 @@ impl ManifestEntry {
             }
         }
     }
+}
+
+fn required_data_object_metadata<T>(value: Option<T>, field: &str) -> Result<T, DatalensError> {
+    value.ok_or_else(|| {
+        DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            format!("data object coverage must include {field}"),
+        )
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
