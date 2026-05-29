@@ -161,9 +161,16 @@ fn test_tron_event_selector_filters_fallback_rows_by_contract_and_event_name() {
 }
 
 #[test]
-fn test_tron_event_selector_records_empty_fallback_coverage_for_filtered_events() {
-    let storage = LocalStorage::new(temp_storage_root("empty-filtered-events"));
-    let adapter = TronAdapter::with_fixture_defaults();
+fn test_tron_event_selector_without_known_topic_mapping_does_not_write_empty_fallback_coverage() {
+    let storage = LocalStorage::new(temp_storage_root("unknown-topic-filtered-events"));
+    let provider = ContractEventFixtureProvider::with_error(DatalensErrorKind::RateLimited);
+    let adapter = TronAdapter::with_provider(
+        TronAdapter::with_fixture_defaults()
+            .capabilities()
+            .chain()
+            .clone(),
+        provider,
+    );
     let runtime = runtime(adapter.clone(), storage.clone());
     let selector = tron_event_selector(TronEventFilter {
         contract_addresses: vec!["0xabcdefabcdefabcdefabcdefabcdefabcdefabcd".to_owned()],
@@ -171,7 +178,7 @@ fn test_tron_event_selector_records_empty_fallback_coverage_for_filtered_events(
     })
     .expect("selector");
 
-    let result = runtime
+    let error = runtime
         .run(tron_job(
             vec![IndexDatasetRequest {
                 dataset_key: DatasetKey::tron_events(),
@@ -181,9 +188,9 @@ fn test_tron_event_selector_records_empty_fallback_coverage_for_filtered_events(
             12,
             IndexRunMode::Backfill,
         ))
-        .expect("index filtered events");
+        .expect_err("unknown event-name fallback is unsupported");
 
-    assert_eq!(result.accounting.rows_written, 0);
+    assert_eq!(error.kind, DatalensErrorKind::UnsupportedDataset);
     assert_eq!(
         storage
             .covered_ranges(
@@ -193,7 +200,7 @@ fn test_tron_event_selector_records_empty_fallback_coverage_for_filtered_events(
                 LedgerRange::blocks(10, 12).expect("range"),
             )
             .expect("coverage"),
-        vec![LedgerRange::blocks(10, 12).expect("range")]
+        Vec::<LedgerRange>::new()
     );
 }
 
@@ -409,6 +416,50 @@ fn test_tron_contract_event_provider_rate_limit_falls_back_to_block_scan() {
 }
 
 #[test]
+fn test_tron_contract_event_provider_parse_error_does_not_fall_back_to_block_scan() {
+    let storage = LocalStorage::new(temp_storage_root("malformed-contract-events"));
+    let provider = ContractEventFixtureProvider::with_error(DatalensErrorKind::InvalidRequest);
+    let adapter = TronAdapter::with_provider(
+        TronAdapter::with_fixture_defaults()
+            .capabilities()
+            .chain()
+            .clone(),
+        provider,
+    );
+    let runtime = runtime(adapter.clone(), storage.clone());
+    let selector = tron_event_selector(TronEventFilter {
+        contract_addresses: vec!["0xabcdefabcdefabcdefabcdefabcdefabcdefabcd".to_owned()],
+        event_names: vec!["Transfer".to_owned()],
+    })
+    .expect("selector");
+
+    let error = runtime
+        .run(tron_job(
+            vec![IndexDatasetRequest {
+                dataset_key: DatasetKey::tron_events(),
+                selector: selector.clone(),
+            }],
+            10,
+            10,
+            IndexRunMode::Backfill,
+        ))
+        .expect_err("malformed contract event response is not fallback-safe");
+
+    assert_eq!(error.kind, DatalensErrorKind::InvalidRequest);
+    assert_eq!(
+        storage
+            .covered_ranges(
+                adapter.capabilities().chain(),
+                &DatasetKey::tron_events(),
+                &selector,
+                LedgerRange::blocks(10, 10).expect("range"),
+            )
+            .expect("coverage"),
+        Vec::<LedgerRange>::new()
+    );
+}
+
+#[test]
 fn test_tron_resume_after_partial_indexing_is_idempotent() {
     let storage = LocalStorage::new(temp_storage_root("resume"));
     let cursor_store = InMemoryIndexCursorStore::default();
@@ -532,10 +583,13 @@ fn test_tron_durable_query_reads_indexed_transactions() {
     assert_eq!(rows[0]["block_number"], 10);
 }
 
-fn runtime<P: TronProvider>(
+fn runtime<P>(
     adapter: TronAdapter<P>,
     storage: LocalStorage,
-) -> IndexRuntime<TronAdapter<P>, LocalStorage, InMemoryIndexCursorStore> {
+) -> IndexRuntime<TronAdapter<P>, LocalStorage, InMemoryIndexCursorStore>
+where
+    P: TronProvider,
+{
     IndexRuntime::new(
         adapter,
         storage,

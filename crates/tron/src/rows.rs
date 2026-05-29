@@ -139,8 +139,9 @@ pub(crate) fn event_rows(infos: &[TronTransactionInfo], selector: &DatasetSelect
                         .unwrap_or_default()
                         .to_owned()
                 });
-            let event_name = event_name_from_signature(topics.first().and_then(Value::as_str));
-            if !filter.matches(&contract_address, event_name.as_deref()) {
+            let topic0 = topics.first().and_then(Value::as_str);
+            let event_name = event_name_from_signature(topic0);
+            if !filter.matches_log(&contract_address, topic0) {
                 continue;
             }
             rows.push(json!({
@@ -163,6 +164,31 @@ pub(crate) fn event_rows(infos: &[TronTransactionInfo], selector: &DatasetSelect
         }
     }
     rows
+}
+
+pub(crate) fn validate_block_scan_event_filter(
+    selector: &DatasetSelector,
+) -> Result<(), DatalensError> {
+    let filter = selector_event_filter(selector);
+    if filter.event_names.is_empty() {
+        return Ok(());
+    }
+    let unsupported = filter
+        .event_names
+        .iter()
+        .filter(|event_name| event_topic_from_name(event_name).is_none())
+        .cloned()
+        .collect::<Vec<_>>();
+    if unsupported.is_empty() {
+        return Ok(());
+    }
+    Err(DatalensError::new(
+        DatalensErrorKind::UnsupportedDataset,
+        format!(
+            "Tron block-scan fallback cannot map event names to topics: {}",
+            unsupported.join(",")
+        ),
+    ))
 }
 
 impl<P> TronAdapter<P>
@@ -264,16 +290,24 @@ fn contract_event_row(event: TronContractEvent) -> Value {
     })
 }
 
-pub(crate) fn should_fallback_from_contract_events(kind: DatalensErrorKind) -> bool {
-    matches!(
-        kind,
+pub(crate) fn should_fallback_from_contract_events(error: &DatalensError) -> bool {
+    match error.kind {
         DatalensErrorKind::AuthenticationFailed
-            | DatalensErrorKind::Unauthorized
-            | DatalensErrorKind::RateLimited
-            | DatalensErrorKind::ProviderFailure
-            | DatalensErrorKind::ProviderTimeout
-            | DatalensErrorKind::UnsupportedDataset
-    )
+        | DatalensErrorKind::Unauthorized
+        | DatalensErrorKind::RateLimited
+        | DatalensErrorKind::ProviderTimeout
+        | DatalensErrorKind::UnsupportedDataset => true,
+        DatalensErrorKind::ProviderFailure => {
+            is_contract_event_provider_failure_fallback_safe(error)
+        }
+        _ => false,
+    }
+}
+
+fn is_contract_event_provider_failure_fallback_safe(error: &DatalensError) -> bool {
+    let message = error.message.as_str();
+    message.starts_with("TronGrid contract events request failed:")
+        || message.starts_with("TronGrid contract events HTTP error 5")
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -291,6 +325,23 @@ impl NormalizedTronEventFilter {
         }
         self.event_names.is_empty()
             || event_name.is_some_and(|name| self.event_names.iter().any(|value| value == name))
+    }
+
+    fn matches_log(&self, contract_address: &str, topic0: Option<&str>) -> bool {
+        let normalized = normalize_tron_contract_address(contract_address)
+            .unwrap_or_else(|_| contract_address.to_owned());
+        if !self.contract_addresses.is_empty() && !self.contract_addresses.contains(&normalized) {
+            return false;
+        }
+        if self.event_names.is_empty() {
+            return true;
+        }
+        topic0.is_some_and(|topic| {
+            self.event_names
+                .iter()
+                .filter_map(|event_name| event_topic_from_name(event_name))
+                .any(|known_topic| topic.eq_ignore_ascii_case(known_topic))
+        })
     }
 }
 
@@ -381,13 +432,30 @@ fn normalize_event_name(name: &str) -> Result<String, DatalensError> {
 }
 
 fn event_name_from_signature(signature: Option<&str>) -> Option<String> {
-    match signature {
-        Some("ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef") => {
-            Some("Transfer".to_owned())
-        }
-        _ => None,
-    }
+    KNOWN_EVENT_TOPICS
+        .iter()
+        .find(|event| {
+            signature.is_some_and(|signature| signature.eq_ignore_ascii_case(event.topic0))
+        })
+        .map(|event| event.name.to_owned())
 }
+
+fn event_topic_from_name(name: &str) -> Option<&'static str> {
+    KNOWN_EVENT_TOPICS
+        .iter()
+        .find(|event| event.name == name)
+        .map(|event| event.topic0)
+}
+
+struct KnownEventTopic {
+    name: &'static str,
+    topic0: &'static str,
+}
+
+const KNOWN_EVENT_TOPICS: &[KnownEventTopic] = &[KnownEventTopic {
+    name: "Transfer",
+    topic0: "ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+}];
 
 pub(crate) fn hex_prefix(bytes: &[u8], len: usize) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
