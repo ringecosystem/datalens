@@ -116,6 +116,10 @@ Run the standard gate:
 just release-check
 ```
 
+`just release-check` includes the deterministic durable lifecycle and multi-chain
+indexing gates, including EVM lifecycle coverage plus Solana, Tron, indexer full
+indexing, and CLI index command tests.
+
 Run optional S3 coverage when S3-compatible credentials are available:
 
 ```bash

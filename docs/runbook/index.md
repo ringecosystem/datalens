@@ -22,8 +22,8 @@ outputs.
 - `chain-adapter-conformance.md`: checklist for wiring a chain adapter into the shared
   conformance suite before durable or hot query path enablement.
 - `e2e-native-query-flow.md`: local validation for the initial native EVM block and
-  log query flow, including deterministic cache behavior checks and the full durable
-  cache lifecycle E2E with optional RustFS/S3-compatible coverage.
+  log query flow, deterministic cache behavior checks, multi-chain indexing gates, and
+  the full durable cache lifecycle E2E with optional RustFS/S3-compatible coverage.
 - `local-rustfs.md`: local RustFS object storage setup, bucket initialization, S3 test
   variables, stop, and cleanup commands.
 - `production.md`: production-shaped binary/container build, config doctor, runtime
