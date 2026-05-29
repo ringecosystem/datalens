@@ -82,6 +82,22 @@ impl DatasetKey {
         Ok(Self { family, name, key })
     }
 
+    pub fn parse(value: impl AsRef<str>) -> Result<Self, DatalensError> {
+        let value = value.as_ref().trim();
+        let Some((family, name)) = value.split_once('.') else {
+            return Err(DatalensError::new(
+                crate::DatalensErrorKind::InvalidInput,
+                "dataset_key must use family.name form",
+            ));
+        };
+        let family = if family == "evm" {
+            ChainFamily::Evm
+        } else {
+            ChainFamily::Other(family.to_owned())
+        };
+        Self::try_new(family, name)
+    }
+
     pub fn evm_blocks() -> Self {
         Self::from(Dataset::Blocks)
     }

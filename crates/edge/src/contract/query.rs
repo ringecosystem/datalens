@@ -1,8 +1,7 @@
 use datalens_chain::{AdapterKey, DatasetSelector};
 use datalens_core::{
-    ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey, DatasetRows,
-    LedgerRange, LedgerRangeKind, LogFilter, QueryDataFinality, QueryFinalityRequirement,
-    QuerySegmentSource,
+    ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey, DatasetRows, LedgerRange,
+    LedgerRangeKind, LogFilter, QueryDataFinality, QueryFinalityRequirement, QuerySegmentSource,
 };
 use datalens_planner::NativeQueryInput;
 use serde::{Deserialize, Serialize};
@@ -249,17 +248,5 @@ fn query_api_ranges(ranges: Vec<LedgerRange>) -> Result<Vec<QueryRangeApi>, Data
 }
 
 pub(crate) fn parse_dataset_key(value: &str) -> Result<DatasetKey, DatalensError> {
-    let value = value.trim();
-    let Some((family, name)) = value.split_once('.') else {
-        return Err(DatalensError::new(
-            DatalensErrorKind::InvalidInput,
-            "dataset_key must use family.name form",
-        ));
-    };
-    let family = if family == "evm" {
-        ChainFamily::Evm
-    } else {
-        ChainFamily::Other(family.to_owned())
-    };
-    DatasetKey::try_new(family, name)
+    DatasetKey::parse(value)
 }

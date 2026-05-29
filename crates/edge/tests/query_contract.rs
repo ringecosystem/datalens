@@ -6,12 +6,12 @@ use support::query_contract::*;
 fn test_client_query_request_json_matches_api_request_contract() {
     let request = datalens_client::QueryRequest {
         chain: ethereum_identity(),
-        dataset_key: "evm.logs".to_owned(),
+        dataset_key: DatasetKey::evm_logs(),
         selector: datalens_client::QuerySelector::EvmLogs(LogFilter {
             addresses: vec!["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()],
             topics: vec![None, Some(vec![TOPIC_A.to_owned()])],
         }),
-        range: datalens_client::QueryRange::Block { start: 20, end: 21 },
+        range: LedgerRange::blocks(20, 21).expect("range"),
         finality: QueryFinalityRequirement::DurableOnly,
         fields: datalens_client::FieldSelection::All,
     };

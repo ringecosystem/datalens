@@ -3,10 +3,11 @@
 use std::{collections::BTreeMap, error::Error, fmt};
 
 use datalens_core::{
-    BlockRange, ChainIdentity, DatalensError, Dataset, DatasetKey, DatasetRows, LogFilter,
-    QueryDataFinality, QueryFinalityRequirement, QuerySegmentSource,
+    BlockRange, ChainIdentity, DatalensError, DatalensErrorKind, Dataset, DatasetKey, DatasetRows,
+    LedgerRange, LedgerRangeKind, LogFilter, QueryDataFinality, QueryFinalityRequirement,
+    QuerySegmentSource,
 };
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::DeserializeOwned};
 
 pub const APPLICATION_IDENTITY_HEADER: &str = "x-datalens-application";
 const DEFAULT_APPLICATION: &str = "unknown";
@@ -60,12 +61,9 @@ where
     ) -> Result<QueryResponse, ClientError> {
         self.query(QueryRequest {
             chain,
-            dataset_key: DatasetKey::evm_blocks().as_str().to_owned(),
+            dataset_key: DatasetKey::evm_blocks(),
             selector: QuerySelector::All,
-            range: QueryRange::Block {
-                start: range.from_block,
-                end: range.to_block,
-            },
+            range: LedgerRange::from_block_range(range),
             finality: QueryFinalityRequirement::DurableOnly,
             fields: FieldSelection::All,
         })
@@ -79,12 +77,9 @@ where
     ) -> Result<QueryResponse, ClientError> {
         self.query(QueryRequest {
             chain,
-            dataset_key: DatasetKey::evm_blocks().as_str().to_owned(),
+            dataset_key: DatasetKey::evm_blocks(),
             selector: QuerySelector::All,
-            range: QueryRange::Block {
-                start: range.from_block,
-                end: range.to_block,
-            },
+            range: LedgerRange::from_block_range(range),
             finality: options.finality,
             fields: FieldSelection::All,
         })
@@ -98,12 +93,9 @@ where
     ) -> Result<QueryResponse, ClientError> {
         self.query(QueryRequest {
             chain,
-            dataset_key: DatasetKey::evm_logs().as_str().to_owned(),
+            dataset_key: DatasetKey::evm_logs(),
             selector: QuerySelector::EvmLogs(filter),
-            range: QueryRange::Block {
-                start: range.from_block,
-                end: range.to_block,
-            },
+            range: LedgerRange::from_block_range(range),
             finality: QueryFinalityRequirement::DurableOnly,
             fields: FieldSelection::All,
         })
@@ -121,7 +113,7 @@ where
         }
     }
 
-    fn query(&self, request: QueryRequest) -> Result<QueryResponse, ClientError> {
+    pub fn query(&self, request: QueryRequest) -> Result<QueryResponse, ClientError> {
         self.send_json("POST", "/v1/query", request)
     }
 
@@ -222,11 +214,62 @@ impl HttpResponse {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct QueryRequest {
     pub chain: ChainIdentity,
-    pub dataset_key: String,
+    #[serde(
+        serialize_with = "serialize_dataset_key",
+        deserialize_with = "deserialize_dataset_key"
+    )]
+    pub dataset_key: DatasetKey,
     pub selector: QuerySelector,
-    pub range: QueryRange,
+    #[serde(
+        serialize_with = "serialize_ledger_range",
+        deserialize_with = "deserialize_ledger_range"
+    )]
+    pub range: LedgerRange,
     pub finality: QueryFinalityRequirement,
     pub fields: FieldSelection,
+}
+
+impl QueryRequest {
+    pub fn new(chain: ChainIdentity, dataset_key: DatasetKey, range: LedgerRange) -> Self {
+        Self {
+            chain,
+            dataset_key,
+            selector: QuerySelector::All,
+            range,
+            finality: QueryFinalityRequirement::DurableOnly,
+            fields: FieldSelection::All,
+        }
+    }
+
+    pub fn with_chain(mut self, chain: ChainIdentity) -> Self {
+        self.chain = chain;
+        self
+    }
+
+    pub fn with_dataset_key(mut self, dataset_key: DatasetKey) -> Self {
+        self.dataset_key = dataset_key;
+        self
+    }
+
+    pub fn with_selector(mut self, selector: QuerySelector) -> Self {
+        self.selector = selector;
+        self
+    }
+
+    pub fn with_range(mut self, range: LedgerRange) -> Self {
+        self.range = range;
+        self
+    }
+
+    pub fn with_finality(mut self, finality: QueryFinalityRequirement) -> Self {
+        self.finality = finality;
+        self
+    }
+
+    pub fn with_fields(mut self, fields: FieldSelection) -> Self {
+        self.fields = fields;
+        self
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -235,6 +278,30 @@ pub enum QueryRange {
     Block { start: u64, end: u64 },
     Slot { start: u64, end: u64 },
     Height { start: u64, end: u64 },
+}
+
+impl QueryRange {
+    fn from_ledger_range(range: &LedgerRange) -> Result<Self, DatalensError> {
+        let start = range.start();
+        let end = range.end();
+        match range.kind() {
+            LedgerRangeKind::Block => Ok(Self::Block { start, end }),
+            LedgerRangeKind::Slot => Ok(Self::Slot { start, end }),
+            LedgerRangeKind::Height => Ok(Self::Height { start, end }),
+            LedgerRangeKind::Other(kind) => Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                format!("ledger range kind {kind} is not supported by the query API"),
+            )),
+        }
+    }
+
+    fn into_ledger_range(self) -> Result<LedgerRange, DatalensError> {
+        match self {
+            Self::Block { start, end } => LedgerRange::blocks(start, end),
+            Self::Slot { start, end } => LedgerRange::slots(start, end),
+            Self::Height { start, end } => LedgerRange::heights(start, end),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -247,6 +314,20 @@ pub enum QuerySelector {
         fingerprint: String,
         canonical_key: String,
     },
+}
+
+impl QuerySelector {
+    pub fn other(
+        kind: impl Into<String>,
+        fingerprint: impl Into<String>,
+        canonical_key: impl Into<String>,
+    ) -> Self {
+        Self::Other {
+            kind: kind.into(),
+            fingerprint: fingerprint.into(),
+            canonical_key: canonical_key.into(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -265,24 +346,56 @@ pub struct QueryOptions {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct QueryResponse {
     pub chain: ChainIdentity,
-    pub dataset_key: String,
-    pub range: QueryRange,
+    #[serde(
+        serialize_with = "serialize_dataset_key",
+        deserialize_with = "deserialize_dataset_key"
+    )]
+    pub dataset_key: DatasetKey,
+    #[serde(
+        serialize_with = "serialize_ledger_range",
+        deserialize_with = "deserialize_ledger_range"
+    )]
+    pub range: LedgerRange,
     pub cache: CacheSummary,
     pub rows: DatasetRows,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CacheSummary {
-    pub hit_ranges: Vec<QueryRange>,
-    pub missing_ranges: Vec<QueryRange>,
+    #[serde(
+        serialize_with = "serialize_ledger_ranges",
+        deserialize_with = "deserialize_ledger_ranges"
+    )]
+    pub hit_ranges: Vec<LedgerRange>,
+    #[serde(
+        serialize_with = "serialize_ledger_ranges",
+        deserialize_with = "deserialize_ledger_ranges"
+    )]
+    pub missing_ranges: Vec<LedgerRange>,
     #[serde(default)]
-    pub durable_hit_ranges: Vec<QueryRange>,
+    #[serde(
+        serialize_with = "serialize_ledger_ranges",
+        deserialize_with = "deserialize_ledger_ranges"
+    )]
+    pub durable_hit_ranges: Vec<LedgerRange>,
     #[serde(default)]
-    pub hot_hit_ranges: Vec<QueryRange>,
+    #[serde(
+        serialize_with = "serialize_ledger_ranges",
+        deserialize_with = "deserialize_ledger_ranges"
+    )]
+    pub hot_hit_ranges: Vec<LedgerRange>,
     #[serde(default)]
-    pub provider_fill_ranges: Vec<QueryRange>,
+    #[serde(
+        serialize_with = "serialize_ledger_ranges",
+        deserialize_with = "deserialize_ledger_ranges"
+    )]
+    pub provider_fill_ranges: Vec<LedgerRange>,
     #[serde(default)]
-    pub promotion_pending_ranges: Vec<QueryRange>,
+    #[serde(
+        serialize_with = "serialize_ledger_ranges",
+        deserialize_with = "deserialize_ledger_ranges"
+    )]
+    pub promotion_pending_ranges: Vec<LedgerRange>,
     #[serde(default)]
     pub segments: Vec<QuerySegment>,
 }
@@ -300,7 +413,11 @@ impl CacheSummary {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct QuerySegment {
-    pub range: QueryRange,
+    #[serde(
+        serialize_with = "serialize_ledger_range",
+        deserialize_with = "deserialize_ledger_range"
+    )]
+    pub range: LedgerRange,
     pub source: QuerySegmentSource,
     pub finality: QueryDataFinality,
 }
@@ -409,6 +526,62 @@ struct ApiErrorBody {
 struct ApiErrorDetail {
     kind: String,
     message: String,
+}
+
+fn serialize_dataset_key<S>(dataset_key: &DatasetKey, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(dataset_key.as_str())
+}
+
+fn deserialize_dataset_key<'de, D>(deserializer: D) -> Result<DatasetKey, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    DatasetKey::parse(value).map_err(serde::de::Error::custom)
+}
+
+fn serialize_ledger_range<S>(range: &LedgerRange, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    QueryRange::from_ledger_range(range)
+        .map_err(serde::ser::Error::custom)?
+        .serialize(serializer)
+}
+
+fn deserialize_ledger_range<'de, D>(deserializer: D) -> Result<LedgerRange, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    QueryRange::deserialize(deserializer)?
+        .into_ledger_range()
+        .map_err(serde::de::Error::custom)
+}
+
+fn serialize_ledger_ranges<S>(ranges: &[LedgerRange], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    ranges
+        .iter()
+        .map(QueryRange::from_ledger_range)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(serde::ser::Error::custom)?
+        .serialize(serializer)
+}
+
+fn deserialize_ledger_ranges<'de, D>(deserializer: D) -> Result<Vec<LedgerRange>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Vec::<QueryRange>::deserialize(deserializer)?
+        .into_iter()
+        .map(QueryRange::into_ledger_range)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(serde::de::Error::custom)
 }
 
 fn decode_response<R>(response: HttpResponse) -> Result<R, ClientError>

@@ -119,7 +119,18 @@ Rust client 可以发送 service-side hot/latest contract fields。它不实现 
 `FallbackMode::Rpc` 仍返回 `UnsupportedFallback`，并且不能写 durable cache。Service-side hot/latest
 read-through 和未来任何 client-side RPC fallback 都必须与 durable safe/finalized cache write 隔离。
 
-第一版 Rust client contract 是 `datalens-client` crate。默认行为是 service-client only：
+第一版 Rust client contract 是 `datalens-client` crate。默认行为是 service-client only。
+`DatalensClient::query(QueryRequest)` 是第一类 Rust client API：
+
+- `QueryRequest::new(chain, dataset_key, range)` 创建原生请求，默认
+  `selector: all`、`finality: durable_only`、`fields: all`。
+- `with_selector`、`with_range`、`with_finality` 和 `with_fields` 等 builder 方法调整原生
+  request 字段，但不改变 wire contract。
+- `QueryResponse` 暴露 `DatasetKey` 和 `LedgerRange`，同时保持 REST JSON 中
+  `dataset_key: "family.name"` 和 typed ledger range 的形态。
+- `solana.slots`、`tron.blocks` 等非 EVM dataset 通过同一个原生方法查询。
+
+EVM helper 只是原生请求上的 convenience wrapper：
 
 - `DatalensClient::query_blocks` 向 `POST /v1/query` 发送
   `dataset_key: "evm.blocks"` 和 `selector: { "kind": "all" }`。

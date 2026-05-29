@@ -3,16 +3,16 @@ use std::sync::{Arc, Mutex};
 use datalens_client::{
     APPLICATION_IDENTITY_HEADER, ApiErrorKind, CacheOutcome, ChainDiscovery, DatalensClient,
     DatalensClientConfig, FallbackMode, HttpRequest, HttpResponse, HttpTransport, QueryOptions,
-    QueryRange, QueryResponse,
+    QueryRequest, QueryResponse, QuerySelector,
 };
 use datalens_core::{
     BlockHeader, BlockRange, ChainFamily, ChainIdentity, Dataset, DatasetKey, DatasetRows,
-    LogFilter, NetworkId, QueryDataFinality, QueryFinalityRequirement, QueryRows,
+    LedgerRange, LogFilter, NetworkId, QueryDataFinality, QueryFinalityRequirement, QueryRows,
     QuerySegmentSource,
 };
 
 #[test]
-fn test_query_blocks_serializes_api_request_and_application_header() {
+fn test_query_serializes_native_request_and_application_header() {
     let transport = RecordingTransport::new(HttpResponse::json(
         200,
         serde_json::json!({
@@ -26,10 +26,23 @@ fn test_query_blocks_serializes_api_request_and_application_header() {
     let client = client(transport.clone(), Some("wallet-search"));
 
     let response = client
-        .query_blocks(ethereum_identity(), BlockRange::expect_new(10, 12))
+        .query(
+            QueryRequest::new(
+                ethereum_identity(),
+                DatasetKey::evm_blocks(),
+                LedgerRange::blocks(10, 12).expect("range"),
+            )
+            .with_finality(QueryFinalityRequirement::DurableOnly)
+            .with_fields(datalens_client::FieldSelection::All),
+        )
         .expect("blocks query decodes");
 
     assert_eq!(response.cache.outcome(), CacheOutcome::Miss);
+    assert_eq!(response.dataset_key, DatasetKey::evm_blocks());
+    assert_eq!(
+        response.range,
+        LedgerRange::blocks(10, 12).expect("ledger range")
+    );
     let request = transport.only_request();
     assert_eq!(request.method, "POST");
     assert_eq!(request.path, "/v1/query");
@@ -88,10 +101,7 @@ fn test_query_blocks_with_hot_options_serializes_explicit_hot_contract() {
 
     assert_eq!(
         response.cache.provider_fill_ranges,
-        vec![QueryRange::Block {
-            start: 100,
-            end: 101
-        }]
+        vec![LedgerRange::blocks(100, 101).expect("range")]
     );
     assert_eq!(
         response.cache.segments[0].source,
@@ -113,6 +123,116 @@ fn test_query_blocks_with_hot_options_serializes_explicit_hot_contract() {
             "fields": "all"
         })
     );
+}
+
+#[test]
+fn test_query_serializes_solana_slot_request_with_native_selector_and_fields() {
+    let transport = RecordingTransport::new(HttpResponse::json(
+        200,
+        serde_json::json!({
+            "chain": solana_identity(),
+            "dataset_key": "solana.slots",
+            "range": { "kind": "slot", "start": 500, "end": 501 },
+            "cache": {
+                "hit_ranges": [{ "kind": "slot", "start": 500, "end": 501 }],
+                "missing_ranges": []
+            },
+            "rows": dataset_rows_json(
+                DatasetKey::solana_slots(),
+                QueryRows::AdapterJson {
+                    dataset_key: DatasetKey::solana_slots(),
+                    rows: vec![serde_json::json!({ "slot": 500, "block_hash": "hash-500" })],
+                }
+            )
+        }),
+    ));
+    let client = client(transport.clone(), Some("indexer"));
+
+    let response = client
+        .query(
+            QueryRequest::new(
+                solana_identity(),
+                DatasetKey::solana_slots(),
+                LedgerRange::slots(500, 501).expect("range"),
+            )
+            .with_selector(QuerySelector::other(
+                "solana_program",
+                "program-11111111",
+                "program=11111111111111111111111111111111",
+            ))
+            .with_fields(datalens_client::FieldSelection::Include(vec![
+                "slot".to_owned(),
+                "block_hash".to_owned(),
+            ])),
+        )
+        .expect("solana query decodes");
+
+    assert_eq!(response.dataset_key, DatasetKey::solana_slots());
+    assert_eq!(
+        response.range,
+        LedgerRange::slots(500, 501).expect("ledger range")
+    );
+    assert_eq!(response.rows.dataset_key(), &DatasetKey::solana_slots());
+    let request = transport.only_request();
+    assert_eq!(
+        request.body,
+        serde_json::json!({
+            "chain": solana_identity(),
+            "dataset_key": "solana.slots",
+            "selector": {
+                "kind": "other",
+                "value": {
+                    "kind": "solana_program",
+                    "fingerprint": "program-11111111",
+                    "canonical_key": "program=11111111111111111111111111111111"
+                }
+            },
+            "range": { "kind": "slot", "start": 500, "end": 501 },
+            "finality": "durable_only",
+            "fields": { "include": ["slot", "block_hash"] }
+        })
+    );
+}
+
+#[test]
+fn test_query_decodes_tron_block_response_with_native_dataset_and_range() {
+    let response: QueryResponse = serde_json::from_value(serde_json::json!({
+        "chain": tron_identity(),
+        "dataset_key": "tron.blocks",
+        "range": { "kind": "block", "start": 1000, "end": 1000 },
+        "cache": {
+            "hit_ranges": [{ "kind": "block", "start": 1000, "end": 1000 }],
+            "missing_ranges": [],
+            "durable_hit_ranges": [{ "kind": "block", "start": 1000, "end": 1000 }],
+            "hot_hit_ranges": [],
+            "provider_fill_ranges": [],
+            "promotion_pending_ranges": [],
+            "segments": [{
+                "range": { "kind": "block", "start": 1000, "end": 1000 },
+                "source": "durable",
+                "finality": "finalized"
+            }]
+        },
+        "rows": dataset_rows_json(
+            DatasetKey::tron_blocks(),
+            QueryRows::AdapterJson {
+                dataset_key: DatasetKey::tron_blocks(),
+                rows: vec![serde_json::json!({ "number": 1000, "block_id": "000003e8" })],
+            }
+        )
+    }))
+    .expect("tron response json");
+
+    assert_eq!(response.dataset_key, DatasetKey::tron_blocks());
+    assert_eq!(
+        response.range,
+        LedgerRange::blocks(1000, 1000).expect("range")
+    );
+    assert_eq!(
+        response.cache.durable_hit_ranges,
+        vec![LedgerRange::blocks(1000, 1000).expect("range")]
+    );
+    assert_eq!(response.rows.dataset_key(), &DatasetKey::tron_blocks());
 }
 
 #[test]
@@ -162,11 +282,11 @@ fn test_query_logs_serializes_filter_topic_wildcards_and_empty_topic_sets() {
     assert_eq!(response.cache.outcome(), CacheOutcome::PartialHit);
     assert_eq!(
         response.cache.durable_hit_ranges,
-        vec![QueryRange::Block { start: 20, end: 20 }]
+        vec![LedgerRange::blocks(20, 20).expect("range")]
     );
     assert_eq!(
         response.cache.provider_fill_ranges,
-        vec![QueryRange::Block { start: 21, end: 21 }]
+        vec![LedgerRange::blocks(21, 21).expect("range")]
     );
     assert_eq!(
         response.cache.segments[0].source,
@@ -295,17 +415,11 @@ fn test_hot_response_source_and_finality_decode_without_rpc_fallback() {
 
     assert_eq!(
         response.cache.hot_hit_ranges,
-        vec![QueryRange::Block {
-            start: 100,
-            end: 100
-        }]
+        vec![LedgerRange::blocks(100, 100).expect("range")]
     );
     assert_eq!(
         response.cache.provider_fill_ranges,
-        vec![QueryRange::Block {
-            start: 101,
-            end: 101
-        }]
+        vec![LedgerRange::blocks(101, 101).expect("range")]
     );
     assert_eq!(response.cache.segments[0].source, QuerySegmentSource::Hot);
     assert_eq!(
@@ -378,6 +492,24 @@ fn client(
 fn ethereum_identity() -> ChainIdentity {
     ChainIdentity::try_new(ChainFamily::Evm, "ethereum", Some(NetworkId::numeric(1)))
         .expect("valid chain")
+}
+
+fn solana_identity() -> ChainIdentity {
+    ChainIdentity::try_new(
+        ChainFamily::try_other("solana").expect("family"),
+        "mainnet",
+        None,
+    )
+    .expect("valid chain")
+}
+
+fn tron_identity() -> ChainIdentity {
+    ChainIdentity::try_new(
+        ChainFamily::try_other("tron").expect("family"),
+        "mainnet",
+        None,
+    )
+    .expect("valid chain")
 }
 
 fn topic_a() -> String {
