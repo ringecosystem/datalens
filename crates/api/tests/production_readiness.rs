@@ -1,0 +1,599 @@
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
+
+use axum::{
+    body::{Body, to_bytes},
+    http::{Request, StatusCode},
+};
+use datalens_api::{
+    LegacyEvmQueryRequest, QueryService, QueryServiceRegistry,
+    config::{DatalensConfig, WriterConfig},
+    router,
+};
+use datalens_chain::{
+    AdapterCapabilities, ChainAdapter, ChainFetchRequest, ChainFetchResponse, ChainHeight,
+    DatasetCapability, FinalityKind, HeightRangeKind, ProviderDiagnostics, SelectorKind,
+};
+use datalens_core::{
+    BlockHeader, BlockRange, ChainFamily, ChainIdentity, DatalensError, Dataset, LogFilter,
+    NetworkId, QueryFinalityRequirement, QueryRows,
+};
+use datalens_metrics::MetricsRecorder;
+use datalens_storage::{
+    DurableStorage, LocalObjectStore, LocalStorage, ObjectMetadata, ObjectStore,
+    ReadThroughCacheConfig,
+};
+use datalens_warmup::{
+    LocalWarmupRegistry, WarmupRuntime, WarmupRuntimeConfig, WarmupSchedulerConfig, WarmupTaskPool,
+};
+use tower::ServiceExt;
+
+#[tokio::test]
+async fn test_production_readiness_validates_service_staging_warmup_metrics_and_hot_boundary() {
+    let root = temp_storage_root("production-readiness");
+    let config_path = write_config(&root);
+    let config = DatalensConfig::from_file(&config_path).expect("config boundary loads");
+    let chain = config
+        .chains
+        .get("ethereum")
+        .expect("configured ethereum chain")
+        .clone();
+    let store = CountingObjectStore::new(&root);
+    let storage = DurableStorage::from_object_store_with_read_through_cache_config(
+        store.clone(),
+        ReadThroughCacheConfig::enabled(8),
+    );
+    let source = MockSource::default().with_blocks(vec![
+        block(10),
+        block(12),
+        block(13),
+        block(14),
+        block(90),
+    ]);
+    let service = QueryService::new_with_metrics_config(
+        storage.clone(),
+        source.clone(),
+        config.planner.clone(),
+        config.writer.clone(),
+        "ethereum",
+        chain,
+        config.metrics.clone(),
+    )
+    .expect("service boundary builds from config");
+    let metrics = service.metrics_recorder();
+    let service = service.with_warmup_pool(warmup_pool(&root, &config.writer, metrics));
+
+    let staged = service
+        .query(blocks_request(10, 10))
+        .expect("staging boundary returns provider rows");
+    assert_eq!(block_numbers(&staged), vec![10]);
+    assert_eq!(
+        staged.cache.missing_ranges,
+        vec![BlockRange::expect_new(10, 10)]
+    );
+    assert!(
+        storage.manifest().expect("manifest").entries.is_empty(),
+        "writer boundary should not create durable coverage below the staging threshold"
+    );
+
+    let flush = service
+        .flush_staged_writes_for_shutdown()
+        .expect("writer boundary flushes staged rows");
+    assert_eq!(flush.data_objects.len(), 1);
+    let manifest = storage.manifest().expect("manifest after flush");
+    let object_key = manifest.entries[0]
+        .object_key
+        .clone()
+        .expect("flushed data object key");
+
+    let first_hit = service
+        .query(blocks_request(10, 10))
+        .expect("durable boundary serves flushed rows");
+    let second_hit = service
+        .query(blocks_request(10, 10))
+        .expect("read-through boundary serves cached object bytes");
+    assert_eq!(
+        first_hit.cache.durable_hit_ranges,
+        vec![BlockRange::expect_new(10, 10)]
+    );
+    assert_eq!(
+        second_hit.cache.durable_hit_ranges,
+        vec![BlockRange::expect_new(10, 10)]
+    );
+    assert_eq!(store.read_count(&object_key), 1);
+
+    let flushed = service
+        .query(blocks_request(12, 14))
+        .expect("writer boundary flushes when staged rows reach threshold");
+    assert_eq!(block_numbers(&flushed), vec![12, 13, 14]);
+    assert!(
+        storage
+            .manifest()
+            .expect("manifest after threshold flush")
+            .entries
+            .len()
+            >= 2,
+        "writer boundary should create durable manifest coverage after threshold flush"
+    );
+
+    let hot = service
+        .query(LegacyEvmQueryRequest {
+            allow_hot: true,
+            finality: QueryFinalityRequirement::LatestOnly,
+            ..blocks_request(90, 90)
+        })
+        .expect("hot boundary serves explicit latest query without durable write");
+    assert_eq!(block_numbers(&hot), vec![90]);
+    assert_eq!(
+        hot.cache.provider_fill_ranges,
+        vec![BlockRange::expect_new(90, 90)]
+    );
+    assert!(hot.cache.durable_hit_ranges.is_empty());
+
+    let registry = QueryServiceRegistry::new()
+        .with_service(service)
+        .expect("registry boundary");
+    let app = router(registry);
+
+    let submit = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/warmup/tasks")
+                .header("content-type", "application/json")
+                .header("x-datalens-application", "production-app")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "chain": ethereum_identity(),
+                        "dataset": "logs",
+                        "range": BlockRange::expect_new(20, 21),
+                        "filter": logs_request(20, 21).filter,
+                        "mode": "fixed_range",
+                        "chunk_policy": {
+                            "max_range_len": 2
+                        }
+                    }))
+                    .expect("warmup request json"),
+                ))
+                .expect("warmup submit request"),
+        )
+        .await
+        .expect("warmup submit response");
+    assert_eq!(submit.status(), StatusCode::CREATED);
+
+    let run_once = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/warmup/run-once")
+                .body(Body::empty())
+                .expect("warmup run-once request"),
+        )
+        .await
+        .expect("warmup run-once response");
+    assert_eq!(run_once.status(), StatusCode::OK);
+
+    source.clear_calls();
+    let warmed = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/query")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&logs_request(20, 21)).expect("query request json"),
+                ))
+                .expect("logs query request"),
+        )
+        .await
+        .expect("warmed query response");
+    assert_eq!(warmed.status(), StatusCode::OK);
+    assert_eq!(
+        source.calls(),
+        Vec::<SourceCall>::new(),
+        "service boundary should hit warmup-created durable coverage"
+    );
+
+    let metrics = app
+        .oneshot(
+            Request::get("/metrics")
+                .body(Body::empty())
+                .expect("metrics request"),
+        )
+        .await
+        .expect("metrics response");
+    assert_eq!(metrics.status(), StatusCode::OK);
+    let metrics = body_text(metrics.into_body()).await;
+    assert!(metrics.contains(r#"application="prod-readiness""#));
+    assert!(metrics.contains(r#"chain="ethereum""#));
+    assert!(metrics.contains(r#"chain_kind="evm""#));
+    assert!(metrics.contains(r#"dataset="blocks""#));
+    assert!(metrics.contains(r#"datalens_query_total"#));
+    assert!(metrics.contains(r#"outcome="hit""#));
+    assert!(metrics.contains(r#"outcome="hot_miss""#));
+    assert!(metrics.contains(r#"datalens_fill_total"#));
+    assert!(metrics.contains(r#"outcome="live_fetch""#));
+    assert!(metrics.contains(r#"datalens_durable_write_total"#));
+    assert!(metrics.contains(r#"outcome="staged""#));
+    assert!(metrics.contains(r#"outcome="flushed""#));
+    assert!(metrics.contains(r#"datalens_warmup_task_total"#));
+    assert!(metrics.contains(r#"datalens_warmup_fetch_total"#));
+    assert!(metrics.contains(r#"datalens_warmup_write_total"#));
+    assert!(metrics.contains(r#"application="production-app""#));
+}
+
+#[derive(Clone, Debug)]
+struct CountingObjectStore {
+    inner: LocalObjectStore,
+    reads: Arc<Mutex<BTreeMap<String, usize>>>,
+}
+
+impl CountingObjectStore {
+    fn new(root: &Path) -> Self {
+        Self {
+            inner: LocalObjectStore::new(root),
+            reads: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    fn read_count(&self, key: &str) -> usize {
+        *self
+            .reads
+            .lock()
+            .expect("read counts")
+            .get(key)
+            .unwrap_or(&0)
+    }
+}
+
+impl ObjectStore for CountingObjectStore {
+    fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError> {
+        *self
+            .reads
+            .lock()
+            .expect("read counts")
+            .entry(key.to_owned())
+            .or_default() += 1;
+        self.inner.get(key)
+    }
+
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
+        self.inner.put(key, bytes)
+    }
+
+    fn exists(&self, key: &str) -> Result<bool, DatalensError> {
+        self.inner.exists(key)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
+        self.inner.list(prefix)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), DatalensError> {
+        self.inner.delete(key)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SourceCall {
+    Blocks(BlockRange),
+    Logs(BlockRange),
+}
+
+#[derive(Clone)]
+struct MockSource {
+    blocks: Arc<Mutex<Vec<BlockHeader>>>,
+    calls: Arc<Mutex<Vec<SourceCall>>>,
+}
+
+impl Default for MockSource {
+    fn default() -> Self {
+        Self {
+            blocks: Arc::new(Mutex::new(Vec::new())),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+impl MockSource {
+    fn with_blocks(self, blocks: Vec<BlockHeader>) -> Self {
+        *self.blocks.lock().expect("blocks") = blocks;
+        self
+    }
+
+    fn calls(&self) -> Vec<SourceCall> {
+        self.calls.lock().expect("calls").clone()
+    }
+
+    fn clear_calls(&self) {
+        self.calls.lock().expect("calls").clear();
+    }
+}
+
+impl ChainAdapter for MockSource {
+    fn capabilities(&self) -> AdapterCapabilities {
+        AdapterCapabilities::new(ethereum_identity())
+            .with_dataset_capability(
+                DatasetCapability::new(Dataset::Blocks)
+                    .with_selector(SelectorKind::All)
+                    .with_range(HeightRangeKind::Block)
+                    .with_max_range_len(4)
+                    .with_empty_coverage(true)
+                    .with_safe_height(true)
+                    .with_finalized_height(true)
+                    .with_range_split(true),
+            )
+            .with_dataset_capability(
+                DatasetCapability::new(Dataset::Logs)
+                    .with_selector(SelectorKind::EvmLogs)
+                    .with_range(HeightRangeKind::Block)
+                    .with_max_range_len(4)
+                    .with_max_addresses_per_query(2)
+                    .with_empty_coverage(true)
+                    .with_safe_height(true)
+                    .with_finalized_height(true)
+                    .with_range_split(true),
+            )
+    }
+
+    fn latest_height(&self) -> Result<ChainHeight, DatalensError> {
+        Ok(ChainHeight::block(100))
+    }
+
+    fn cache_safe_height(&self) -> Result<ChainHeight, DatalensError> {
+        Ok(ChainHeight::block(100).with_finality(FinalityKind::Safe))
+    }
+
+    fn finalized_height(&self) -> Result<ChainHeight, DatalensError> {
+        Ok(ChainHeight::block(100).with_finality(FinalityKind::Finalized))
+    }
+
+    fn fetch(&self, request: ChainFetchRequest) -> Result<ChainFetchResponse, DatalensError> {
+        let range = request.range.block_range().expect("block range");
+        match request.dataset_key.legacy_dataset() {
+            Some(Dataset::Blocks) => {
+                self.calls
+                    .lock()
+                    .expect("calls")
+                    .push(SourceCall::Blocks(range));
+                let rows = self
+                    .blocks
+                    .lock()
+                    .expect("blocks")
+                    .iter()
+                    .filter(|block| range.contains(block.number))
+                    .cloned()
+                    .collect();
+                response(request, QueryRows::EvmBlocks(rows))
+            }
+            Some(Dataset::Logs) => {
+                self.calls
+                    .lock()
+                    .expect("calls")
+                    .push(SourceCall::Logs(range));
+                response(request, QueryRows::EvmLogs(Vec::new()))
+            }
+            Some(Dataset::Transactions) | Some(Dataset::Receipts) | None => {
+                unreachable!("production-readiness fixture only serves EVM blocks and logs")
+            }
+        }
+    }
+}
+
+fn response(
+    request: ChainFetchRequest,
+    rows: QueryRows,
+) -> Result<ChainFetchResponse, DatalensError> {
+    ChainFetchResponse::try_new(
+        request.chain,
+        request.dataset_key,
+        request.range,
+        request.selector,
+        rows,
+    )
+    .map(|response| {
+        response.with_provider_diagnostics(ProviderDiagnostics {
+            calls: 1,
+            rows_scanned: 0,
+            warnings: Vec::new(),
+        })
+    })
+}
+
+async fn body_text(body: Body) -> String {
+    String::from_utf8(
+        to_bytes(body, usize::MAX)
+            .await
+            .expect("body bytes")
+            .to_vec(),
+    )
+    .expect("utf8 body")
+}
+
+fn warmup_pool(
+    root: &Path,
+    writer: &WriterConfig,
+    metrics: Option<MetricsRecorder>,
+) -> WarmupTaskPool<MockSource, LocalStorage, LocalWarmupRegistry<LocalObjectStore>> {
+    let registry = LocalWarmupRegistry::new(LocalObjectStore::new(root.join("warmup-registry")));
+    let mut runtime = WarmupRuntime::new(
+        MockSource::default(),
+        LocalStorage::new(root),
+        registry,
+        datalens_writer::DurableWriterConfig {
+            target_object_bytes: writer.target_object_bytes,
+            min_object_rows: writer.min_object_rows,
+            record_empty_coverage: writer.record_empty_coverage,
+            staging: datalens_writer::WriteStagingConfig {
+                enabled: writer.staging.enabled,
+                min_rows: writer.staging.min_rows,
+                target_object_bytes: writer.staging.target_object_bytes,
+                max_staged_ranges: writer.staging.max_staged_ranges,
+                max_staged_rows: writer.staging.max_staged_rows,
+                max_staged_age_ms: writer.staging.max_staged_age_ms,
+                flush_on_shutdown: writer.staging.flush_on_shutdown,
+                max_staged_bytes: writer.staging.max_staged_bytes,
+            },
+        },
+    )
+    .with_runtime_config(WarmupRuntimeConfig {
+        max_fetches_per_task_loop: 4,
+    });
+    if let Some(metrics) = metrics {
+        runtime = runtime.with_metrics(metrics);
+    }
+    WarmupTaskPool::new(
+        runtime,
+        WarmupSchedulerConfig {
+            max_global_concurrent_tasks: 1,
+            max_concurrent_tasks_per_chain: 1,
+        },
+    )
+}
+
+fn blocks_request(from_block: u64, to_block: u64) -> LegacyEvmQueryRequest {
+    LegacyEvmQueryRequest {
+        chain: ethereum_identity(),
+        dataset: Dataset::Blocks,
+        range: BlockRange::expect_new(from_block, to_block),
+        filter: None,
+        include_block: false,
+        allow_hot: false,
+        finality: QueryFinalityRequirement::DurableOnly,
+    }
+}
+
+fn logs_request(from_block: u64, to_block: u64) -> LegacyEvmQueryRequest {
+    LegacyEvmQueryRequest {
+        chain: ethereum_identity(),
+        dataset: Dataset::Logs,
+        range: BlockRange::expect_new(from_block, to_block),
+        filter: Some(LogFilter {
+            addresses: vec!["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()],
+            topics: Vec::new(),
+        }),
+        include_block: false,
+        allow_hot: false,
+        finality: QueryFinalityRequirement::DurableOnly,
+    }
+}
+
+fn ethereum_identity() -> ChainIdentity {
+    ChainIdentity::try_new(ChainFamily::Evm, "ethereum", Some(NetworkId::numeric(1)))
+        .expect("valid chain")
+}
+
+fn block(number: u64) -> BlockHeader {
+    BlockHeader {
+        number,
+        hash: format!("0x{number:064x}"),
+        parent_hash: format!("0x{:064x}", number.saturating_sub(1)),
+        timestamp: number * 10,
+    }
+}
+
+fn block_numbers(response: &datalens_api::LegacyEvmQueryResponse) -> Vec<u64> {
+    match &response.rows {
+        QueryRows::EvmBlocks(rows) => rows.iter().map(|row| row.number).collect(),
+        _ => panic!("expected block rows"),
+    }
+}
+
+fn write_config(root: &Path) -> PathBuf {
+    let path = root.with_file_name(format!(
+        "datalens-production-readiness-{}.toml",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    std::fs::write(
+        &path,
+        format!(
+            r#"
+            [server]
+            bind = "127.0.0.1:0"
+
+            [storage]
+            backend = "local"
+
+            [storage.local]
+            root = "{}"
+
+            [planner]
+            max_query_range_blocks = 8
+            default_chunk_range_blocks = 4
+
+            [writer]
+            target_object_bytes = 1048576
+            min_object_rows = 3
+            record_empty_coverage = true
+
+            [writer.staging]
+            enabled = true
+            min_rows = 3
+            target_object_bytes = 1048576
+            max_staged_ranges = 8
+            max_staged_rows = 16
+            max_staged_age_ms = 60000
+            flush_on_shutdown = true
+            max_staged_bytes = 1048576
+
+            [metrics]
+            enabled = true
+            default_application = "prod-readiness"
+
+            [warmup]
+            enabled = true
+            registry_path = "{}"
+            scheduler_interval_ms = 1000
+            max_global_tasks = 1
+            max_per_chain_tasks = 1
+            max_fetches_per_loop = 4
+            flush_on_shutdown = true
+
+            [index]
+            default_chunk_range = 2
+            max_concurrency = 1
+            default_finality = "finalized"
+            cursor_path = "{}"
+
+            [chains.ethereum]
+            kind = "evm"
+            chain_id = 1
+            rpc_urls = ["http://example.invalid"]
+
+            [chains.ethereum.finality]
+            mode = "lag"
+            safe_lag_blocks = 4
+            finalized_lag_blocks = 8
+
+            [chains.ethereum.datasets.blocks]
+            enabled = true
+            max_batch_blocks = 4
+
+            [chains.ethereum.datasets.logs]
+            enabled = true
+            max_get_logs_range_blocks = 4
+            max_addresses_per_query = 2
+            "#,
+            root.display(),
+            root.join("warmup").display(),
+            root.join("cursors").display()
+        ),
+    )
+    .expect("write production-readiness config");
+    path
+}
+
+fn temp_storage_root(name: &str) -> PathBuf {
+    let root = std::env::temp_dir().join(format!(
+        "datalens-{name}-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).expect("create temp root");
+    root
+}
