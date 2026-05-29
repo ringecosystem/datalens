@@ -55,8 +55,8 @@ outcome 和 `empty_coverage_recorded` fill outcome。Provider 和 storage 失败
 outcome，并且不能让不完整响应看起来成功。
 
 safe/finalized height 到 latest height 之间的区间不属于 durable cache 语义。需要这段区间的
-调用方必须通过 `allow_hot` 和 `safe_to_latest` 或 `latest_only` 这类 hot finality contract 显式
-选择 latest-capable behavior。Hot 或 live provider data 不能更新 durable Manifest 覆盖范围。
+调用方必须通过 `QueryFinalityRequirement` 显式选择 latest-capable behavior，取值为
+`safe_to_latest` 或 `latest_only`。Hot 或 live provider data 不能更新 durable Manifest 覆盖范围。
 
 ## 补齐执行
 

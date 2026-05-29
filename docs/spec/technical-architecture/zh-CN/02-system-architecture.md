@@ -11,8 +11,9 @@ API 兼容、EVM 细节、查询规划、存储和持久化混在一个服务文
 标准流程是：
 
 1. SDK/API 请求进入边界层。
-2. 边界层验证请求格式和传输层约束。
-3. 必要时兼容转换层把外部协议的表达转换成 datalens 原生表达。
+2. 边界层验证请求格式和传输层约束，并把 REST 或 GraphQL 输入转换为原生查询契约。
+3. 未来兼容适配层可以在此之前把外部协议表达转换成 datalens 原生表达；它不属于当前一等
+   API 流程。
 4. 查询规划器构建可执行计划。
 5. 存储层读取 Manifest 覆盖范围。
 6. 规划器将范围分类为已覆盖、部分覆盖或缺失。
@@ -24,7 +25,7 @@ API 兼容、EVM 细节、查询规划、存储和持久化混在一个服务文
 12. 响应组装层返回一个一致的结果流。
 
 实现可以为了性能把这些操作流水线化，但可观察语义应保持一致。缺失数据在持久化写入之前
-不能被标记为已覆盖。兼容格式不能泄漏到核心存储模型。
+不能被标记为已覆盖。未来适配层的输出格式不能泄漏到核心存储模型。
 
 ## Crate 和模块边界
 
@@ -48,8 +49,12 @@ EVM 响应标准化和 EVM 错误解释。它不应该决定存储策略或原�
 skipped ranges，并把 storage metadata 汇总返回给查询流程。它不拥有对象编码、object key 布局、
 对象存储 provider 或 Manifest repository 细节。
 
-`datalens-edge` 拥有边界层行为：HTTP 解析、原生 API 路由、认证接入点、响应流式返回和兼容
-适配层。它在调用规划器前做边界转换，在原生响应组装后做兼容响应转换。
+`datalens-edge` 拥有多传输边界行为：REST 路由、GraphQL、GraphiQL、metrics、discovery、
+warmup task 操作、authentication、application authorization、quota checks、service registry
+routing 和 native query 入口。REST 和 GraphQL 查询入口通过同一份原生契约暴露等价查询能力：
+`chain`、`dataset_key`、`selector`、`range`、`finality` 和 `fields`。传输层 handler 可以转换请求
+和响应形态，但不能定义独立的 planner、storage 或 dataset 语义。Edge 在调用 planner 前做边界
+转换，在 native response assembly 后转换响应形态。
 
 ## 这一步先实现什么
 

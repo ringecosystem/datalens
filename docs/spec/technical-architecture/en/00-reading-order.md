@@ -228,7 +228,7 @@ Expected work:
 
 - Translate compatibility requests into native datalens requests.
 - Reuse planner, storage, adapter, writer, and response assembly.
-- Reshape native responses into compatibility response formats at the edge.
+- Map native responses into external protocol response formats at the edge.
 - Add compatibility tests with a real or fixture indexer.
 - Keep compatibility fields out of the core storage schema.
 

@@ -62,9 +62,9 @@ and `empty_coverage_recorded` fill outcome. Provider and storage failures use th
 corresponding error outcomes and must not make incomplete responses look successful.
 
 The interval above safe/finalized height and up to latest height is outside durable cache
-semantics. Callers that need that interval must opt into latest-capable behavior with
-`allow_hot` and a hot finality contract such as `safe_to_latest` or `latest_only`. Hot or
-live provider data must not update durable manifest coverage.
+semantics. Callers that need that interval must opt into latest-capable behavior through
+`QueryFinalityRequirement`, using `safe_to_latest` or `latest_only`. Hot or live provider
+data must not update durable manifest coverage.
 
 ## Fill Execution
 
