@@ -20,11 +20,11 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use datalens_chain::ChainAdapter;
+use datalens_chain::{AdapterKey, ChainAdapter, DatasetSelector};
 use datalens_core::{
     BlockRange, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, Dataset, DatasetKey,
-    DatasetRows, LedgerRange, LogFilter, NetworkId, QueryDataFinality, QueryFinalityRequirement,
-    QueryRows, QuerySegmentSource,
+    DatasetRows, LedgerRange, LedgerRangeKind, LogFilter, NetworkId, QueryDataFinality,
+    QueryFinalityRequirement, QueryRows, QuerySegmentSource,
 };
 use datalens_executor::{NativeQueryExecutionConfig, NativeQueryExecutor};
 use datalens_metrics::{ApplicationIdentity, MetricsRecorder};
@@ -877,8 +877,31 @@ pub struct ChainDiscovery {
     pub datasets: Vec<Dataset>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct WarmupSubmitApiRequest {
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[serde(untagged)]
+pub enum WarmupSubmitApiRequest {
+    Native(WarmupNativeSubmitApiRequest),
+    LegacyEvmLogs(WarmupLegacyEvmLogsSubmitApiRequest),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+pub struct WarmupNativeSubmitApiRequest {
+    pub chain: ChainIdentity,
+    pub dataset_key: WarmupDatasetKeyApi,
+    pub selector: WarmupSelectorApiRequest,
+    pub range_kind: LedgerRangeKind,
+    pub start: u64,
+    pub end: Option<u64>,
+    #[serde(default = "default_warmup_api_mode")]
+    pub mode: WarmupTaskMode,
+    #[serde(default)]
+    pub chunk_policy: WarmupChunkPolicy,
+    #[serde(default)]
+    pub retry_policy: WarmupRetryPolicy,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+pub struct WarmupLegacyEvmLogsSubmitApiRequest {
     pub chain: ChainIdentity,
     pub dataset: Dataset,
     pub range: BlockRange,
@@ -889,6 +912,27 @@ pub struct WarmupSubmitApiRequest {
     pub chunk_policy: WarmupChunkPolicy,
     #[serde(default)]
     pub retry_policy: WarmupRetryPolicy,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[serde(untagged)]
+pub enum WarmupDatasetKeyApi {
+    Key(String),
+    Structured(DatasetKey),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum WarmupSelectorApiRequest {
+    All,
+    EvmLogs {
+        filter: LogFilter,
+    },
+    Other {
+        kind: String,
+        fingerprint: String,
+        canonical_key: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -917,8 +961,10 @@ pub struct WarmupTaskView {
     pub task_id: WarmupTaskId,
     pub application_id: String,
     pub chain: ChainIdentity,
-    pub dataset_key: DatasetKey,
-    pub range: BlockRange,
+    pub dataset_key: String,
+    pub range_kind: LedgerRangeKind,
+    pub start: u64,
+    pub end: Option<u64>,
     pub mode: WarmupTaskMode,
     pub state: WarmupTaskState,
     pub created_at: u64,
@@ -937,14 +983,77 @@ fn default_warmup_api_mode() -> WarmupTaskMode {
     WarmupTaskMode::FixedRange
 }
 
+impl WarmupDatasetKeyApi {
+    fn into_dataset_key(self) -> Result<DatasetKey, DatalensError> {
+        match self {
+            Self::Structured(dataset_key) => Ok(dataset_key),
+            Self::Key(value) => parse_dataset_key(&value),
+        }
+    }
+
+    fn dataset_key(&self) -> Result<DatasetKey, DatalensError> {
+        match self {
+            Self::Structured(dataset_key) => Ok(dataset_key.clone()),
+            Self::Key(value) => parse_dataset_key(value),
+        }
+    }
+}
+
+impl WarmupSelectorApiRequest {
+    fn into_selector(self) -> Result<DatasetSelector, DatalensError> {
+        match self {
+            Self::All => Ok(DatasetSelector::all()),
+            Self::EvmLogs { filter } => DatasetSelector::try_evm_logs(filter),
+            Self::Other {
+                kind,
+                fingerprint,
+                canonical_key,
+            } => DatasetSelector::try_other(AdapterKey::try_new(kind)?, fingerprint, canonical_key),
+        }
+    }
+}
+
+impl WarmupSubmitApiRequest {
+    fn chain(&self) -> &ChainIdentity {
+        match self {
+            Self::Native(request) => &request.chain,
+            Self::LegacyEvmLogs(request) => &request.chain,
+        }
+    }
+
+    fn dataset_for_auth(&self) -> Result<String, DatalensError> {
+        match self {
+            Self::Native(request) => Ok(request.dataset_key.dataset_key()?.as_str().to_owned()),
+            Self::LegacyEvmLogs(request) => Ok(request.dataset.as_str().to_owned()),
+        }
+    }
+}
+
+fn parse_dataset_key(value: &str) -> Result<DatasetKey, DatalensError> {
+    let value = value.trim();
+    let Some((family, name)) = value.split_once('.') else {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "dataset_key must use family.name form",
+        ));
+    };
+    let family = if family == "evm" {
+        ChainFamily::Evm
+    } else {
+        ChainFamily::Other(family.to_owned())
+    };
+    DatasetKey::try_new(family, name)
+}
+
 fn warmup_task_view(task: WarmupTask) -> Result<WarmupTaskView, DatalensError> {
-    let range = BlockRange::try_new(task.start, task.end.unwrap_or(task.start))?;
     Ok(WarmupTaskView {
         task_id: task.task_id,
         application_id: task.application_id,
         chain: task.chain,
-        dataset_key: task.dataset_key,
-        range,
+        dataset_key: task.dataset_key.as_str().to_owned(),
+        range_kind: task.range_kind,
+        start: task.start,
+        end: task.end,
         mode: task.mode,
         state: task.state,
         created_at: task.created_at,
@@ -1857,12 +1966,9 @@ async fn warmup_submit(
     Json(request): Json<WarmupSubmitApiRequest>,
 ) -> Result<Response, ApiError> {
     let registry = state.registry.clone();
+    let dataset = request.dataset_for_auth().map_err(ApiError)?;
     let application_context = registry
-        .authenticate_warmup_headers(
-            &headers,
-            request.chain.configured_name(),
-            request.dataset.as_str(),
-        )
+        .authenticate_warmup_headers(&headers, request.chain().configured_name(), &dataset)
         .map_err(ApiError)?;
     let application_id = application_context
         .map(|application| application.id)
@@ -2049,6 +2155,45 @@ async fn mutate_authorized_warmup_task(
 fn warmup_submit_request(
     application_id: String,
     request: WarmupSubmitApiRequest,
+) -> Result<WarmupSubmitRequest, DatalensError> {
+    match request {
+        WarmupSubmitApiRequest::Native(request) => {
+            native_warmup_submit_request(application_id, request)
+        }
+        WarmupSubmitApiRequest::LegacyEvmLogs(request) => {
+            legacy_warmup_submit_request(application_id, request)
+        }
+    }
+}
+
+fn native_warmup_submit_request(
+    application_id: String,
+    request: WarmupNativeSubmitApiRequest,
+) -> Result<WarmupSubmitRequest, DatalensError> {
+    Ok(WarmupSubmitRequest {
+        application_id,
+        chain: request.chain,
+        dataset_key: request.dataset_key.into_dataset_key()?,
+        selector: request.selector.into_selector()?,
+        range_kind: request.range_kind,
+        start: request.start,
+        end: request.end,
+        mode: request.mode,
+        chunk_policy: WarmupChunkPolicy {
+            max_range_len: request.chunk_policy.max_range_len.max(1),
+            target_rows_hint: request.chunk_policy.target_rows_hint,
+        },
+        retry_policy: WarmupRetryPolicy {
+            max_attempts: request.retry_policy.max_attempts.max(1),
+            initial_backoff_ms: request.retry_policy.initial_backoff_ms,
+            max_backoff_ms: request.retry_policy.max_backoff_ms,
+        },
+    })
+}
+
+fn legacy_warmup_submit_request(
+    application_id: String,
+    request: WarmupLegacyEvmLogsSubmitApiRequest,
 ) -> Result<WarmupSubmitRequest, DatalensError> {
     let selector = match request.dataset {
         Dataset::Logs => {
