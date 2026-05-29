@@ -429,7 +429,7 @@ pub fn validate_config(config: &DatalensConfig) -> Result<(), DatalensError> {
             let local = config.storage.local.as_ref().ok_or_else(|| {
                 DatalensError::new(
                     DatalensErrorKind::InvalidInput,
-                    "storage.local.root or legacy storage.root must be set",
+                    "storage.local.root must be set",
                 )
             })?;
             if local.root.trim().is_empty() {
@@ -1025,7 +1025,7 @@ fn build_storage(
             let local = config.storage.local.as_ref().ok_or_else(|| {
                 DatalensError::new(
                     DatalensErrorKind::InvalidInput,
-                    "storage.local.root or legacy storage.root must be set",
+                    "storage.local.root must be set",
                 )
             })?;
             Ok(Box::new(LocalStorage::new(&local.root)))
@@ -1055,7 +1055,7 @@ fn maintenance_report(
             let local = config.storage.local.as_ref().ok_or_else(|| {
                 DatalensError::new(
                     DatalensErrorKind::InvalidInput,
-                    "storage.local.root or legacy storage.root must be set",
+                    "storage.local.root must be set",
                 )
             })?;
             LocalStorage::new(&local.root).maintenance_report()
@@ -1084,7 +1084,7 @@ fn build_usage_ledger(
             let local = config.storage.local.as_ref().ok_or_else(|| {
                 DatalensError::new(
                     DatalensErrorKind::InvalidInput,
-                    "storage.local.root or legacy storage.root must be set",
+                    "storage.local.root must be set",
                 )
             })?;
             Ok(Box::new(UsageLedgerStore::new(LocalObjectStore::new(

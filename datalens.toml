@@ -3,6 +3,8 @@ bind = "0.0.0.0:8080"
 
 [storage]
 backend = "local"
+
+[storage.local]
 root = ".datalens/storage"
 
 [planner]

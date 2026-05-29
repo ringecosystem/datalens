@@ -167,6 +167,8 @@ bind = "${DATALENS_E2E_BIND}"
 
 [storage]
 backend = "local"
+
+[storage.local]
 root = "${DATALENS_E2E_STORAGE_ROOT}"
 
 [planner]
