@@ -57,6 +57,85 @@ fn test_index_backfill_accepts_required_inputs_and_dry_run() {
 }
 
 #[test]
+fn test_index_backfill_accepts_tron_event_names() {
+    let cli = Cli::parse_from([
+        "datalens",
+        "index",
+        "backfill",
+        "--config",
+        "custom.toml",
+        "--chain",
+        "tron-mainnet",
+        "--dataset",
+        "events",
+        "--range-kind",
+        "block",
+        "--range-start",
+        "62251337",
+        "--range-end",
+        "82371640",
+        "--application",
+        "ormpindexer",
+        "--address",
+        "0x3Bc5362EC3a3DBc07292aEd4ef18Be18De02DA3a",
+        "--address",
+        "0x5C5c383FEbE62F377F8c0eA1de97F2a2Ba102e98",
+        "--event-name",
+        "MessageAccepted",
+        "--event-name",
+        "MessageDispatched",
+        "--finality",
+        "finalized",
+        "--json",
+    ]);
+
+    match cli.command {
+        Command::Index(IndexCommand {
+            command: IndexSubcommand::Backfill(command),
+        }) => {
+            assert_eq!(command.common.chain, "tron-mainnet");
+            assert_eq!(command.common.datasets, vec!["events"]);
+            assert_eq!(command.common.addresses.len(), 2);
+            assert_eq!(
+                command.common.event_names,
+                vec!["MessageAccepted", "MessageDispatched"]
+            );
+        }
+        command => panic!("expected index backfill command, got {command:?}"),
+    }
+}
+
+#[test]
+fn test_index_backfill_tron_events_builds_tron_event_selector() {
+    let root = temp_storage_root("index-tron-events-selector");
+    let config = write_tron_config("index-tron-events-selector", &root);
+    let mut common = index_common(config, 10, 12);
+    common.chain = "tron-mainnet".to_owned();
+    common.datasets = vec!["events".to_owned()];
+    common.addresses = vec!["0xabcdefabcdefabcdefabcdefabcdefabcdefabcd".to_owned()];
+    common.event_names = vec!["Transfer".to_owned()];
+
+    let output = index_summary_with_adapter(
+        IndexWorkflowCommand::Backfill(IndexBackfillCommand {
+            common,
+            dry_run: true,
+        }),
+        IndexFixtureAdapter::default().with_chain(tron_chain()),
+    )
+    .expect("dry-run");
+
+    assert_eq!(output["datasets"][0]["selector_kind"], "tron_events");
+    assert_eq!(
+        output["datasets"][0]["selector_fingerprint"]
+            .as_str()
+            .expect("fingerprint")
+            .split('/')
+            .next(),
+        Some("tron-events")
+    );
+}
+
+#[test]
 fn test_index_resume_repair_and_verify_parse_required_inputs() {
     for workflow in ["resume", "repair", "verify"] {
         let cli = Cli::parse_from([
@@ -146,6 +225,61 @@ fn test_index_config_loads_defaults_and_limits() {
     assert_eq!(config.index.default_finality, "finalized");
     assert_eq!(config.index.cursor_path, "/tmp/datalens-cursors");
     assert_eq!(config.index.retry.max_attempts, 4);
+}
+
+#[test]
+fn test_index_config_accepts_trongrid_without_api_key() {
+    let config: DatalensConfig = toml::from_str(
+        r#"
+        [server]
+        bind = "127.0.0.1:8080"
+
+        [storage]
+        backend = "local"
+
+        [storage.local]
+        root = "/tmp/datalens"
+
+        [planner]
+        max_query_range_blocks = 100
+        default_chunk_range_blocks = 10
+
+        [writer]
+        target_object_bytes = 1024
+        min_object_rows = 1
+        record_empty_coverage = true
+
+        [index]
+        default_chunk_range = 2
+        max_concurrency = 1
+        default_finality = "finalized"
+        cursor_path = "/tmp/datalens-cursors"
+
+        [chains.tron-mainnet]
+        kind = "tron"
+        chain_id = 728126428
+        rpc_urls = ["http://example.invalid/tron"]
+
+        [chains.tron-mainnet.trongrid]
+        enabled = true
+        base_url = "https://api.trongrid.io"
+
+        [chains.tron-mainnet.datasets.blocks]
+        enabled = true
+        max_batch_blocks = 10
+
+        [chains.tron-mainnet.datasets.logs]
+        enabled = true
+        max_get_logs_range_blocks = 10
+        max_addresses_per_query = 2
+        "#,
+    )
+    .expect("config parses");
+
+    validate_config(&config).expect("TronGrid config without key is valid");
+    let chain = config.chains.get("tron-mainnet").expect("chain");
+    assert!(chain.trongrid.enabled);
+    assert!(chain.trongrid.api_key.is_none());
 }
 
 #[test]
@@ -458,6 +592,58 @@ fn write_config(name: &str, storage_root: &std::path::Path) -> String {
     config_path.to_string_lossy().into_owned()
 }
 
+fn write_tron_config(name: &str, storage_root: &std::path::Path) -> String {
+    let config_path = storage_root.with_file_name(format!("{name}.toml"));
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+            [server]
+            bind = "127.0.0.1:8080"
+
+            [storage]
+            backend = "local"
+
+            [storage.local]
+            root = "{}"
+
+            [planner]
+            max_query_range_blocks = 100
+            default_chunk_range_blocks = 10
+
+            [writer]
+            target_object_bytes = 1024
+            min_object_rows = 1
+            record_empty_coverage = true
+
+            [index]
+            default_chunk_range = 2
+            max_concurrency = 1
+            default_finality = "finalized"
+            cursor_path = "{}"
+
+            [chains.tron-mainnet]
+            kind = "tron"
+            chain_id = 728126428
+            rpc_urls = ["http://example.invalid"]
+
+            [chains.tron-mainnet.datasets.blocks]
+            enabled = true
+            max_batch_blocks = 10
+
+            [chains.tron-mainnet.datasets.logs]
+            enabled = true
+            max_get_logs_range_blocks = 10
+            max_addresses_per_query = 2
+            "#,
+            storage_root.display(),
+            storage_root.join("cursors").display()
+        ),
+    )
+    .expect("write config");
+    config_path.to_string_lossy().into_owned()
+}
+
 fn index_common(config: String, start: u64, end: u64) -> IndexCommonCommand {
     IndexCommonCommand {
         config,
@@ -471,6 +657,7 @@ fn index_common(config: String, start: u64, end: u64) -> IndexCommonCommand {
         json: true,
         addresses: Vec::new(),
         topics: Vec::new(),
+        event_names: Vec::new(),
     }
 }
 
@@ -485,6 +672,14 @@ fn index_test_common(command: &IndexWorkflowCommand) -> &IndexCommonCommand {
 
 fn test_chain() -> ChainIdentity {
     ChainIdentity::expect_with_network_id(ChainFamily::Evm, "ethereum", NetworkId::numeric(1))
+}
+
+fn tron_chain() -> ChainIdentity {
+    ChainIdentity::expect_with_network_id(
+        ChainFamily::Other("tron".to_owned()),
+        "tron-mainnet",
+        NetworkId::numeric(728126428),
+    )
 }
 
 fn block(number: u64) -> BlockHeader {
@@ -522,6 +717,7 @@ enum IndexSourceCall {
 
 #[derive(Clone)]
 struct IndexFixtureAdapter {
+    chain: ChainIdentity,
     blocks: Arc<Mutex<Vec<BlockHeader>>>,
     calls: Arc<Mutex<Vec<IndexSourceCall>>>,
 }
@@ -529,6 +725,7 @@ struct IndexFixtureAdapter {
 impl Default for IndexFixtureAdapter {
     fn default() -> Self {
         Self {
+            chain: test_chain(),
             blocks: Arc::new(Mutex::new(Vec::new())),
             calls: Arc::new(Mutex::new(Vec::new())),
         }
@@ -541,6 +738,11 @@ impl IndexFixtureAdapter {
         self
     }
 
+    fn with_chain(mut self, chain: ChainIdentity) -> Self {
+        self.chain = chain;
+        self
+    }
+
     fn calls(&self) -> Vec<IndexSourceCall> {
         self.calls.lock().expect("calls").clone()
     }
@@ -548,15 +750,22 @@ impl IndexFixtureAdapter {
 
 impl ChainAdapter for IndexFixtureAdapter {
     fn capabilities(&self) -> AdapterCapabilities {
-        AdapterCapabilities::new(test_chain()).with_dataset_capability(
-            DatasetCapability::new(DatasetKey::evm_blocks())
-                .with_selector(SelectorKind::All)
-                .with_range(HeightRangeKind::Block)
-                .with_max_range_len(2)
-                .with_empty_coverage(true)
-                .with_safe_height(true)
-                .with_finalized_height(true)
-                .with_range_split(true),
+        AdapterCapabilities::new(self.chain.clone()).with_dataset_capability(
+            DatasetCapability::new(if self.chain.family() == ChainFamily::Evm {
+                DatasetKey::evm_blocks()
+            } else {
+                DatasetKey::tron_events()
+            })
+            .with_selector(SelectorKind::All)
+            .with_selector(SelectorKind::Other(
+                datalens_chain::AdapterKey::try_new("tron_events").expect("selector"),
+            ))
+            .with_range(HeightRangeKind::Block)
+            .with_max_range_len(2)
+            .with_empty_coverage(true)
+            .with_safe_height(true)
+            .with_finalized_height(true)
+            .with_range_split(true),
         )
     }
 
@@ -591,7 +800,14 @@ impl ChainAdapter for IndexFixtureAdapter {
             request.dataset_key,
             request.range,
             request.selector,
-            QueryRows::EvmBlocks(rows),
+            if self.chain.family() == ChainFamily::Evm {
+                QueryRows::EvmBlocks(rows)
+            } else {
+                QueryRows::AdapterJson {
+                    dataset_key: DatasetKey::tron_events(),
+                    rows: Vec::new(),
+                }
+            },
         )
         .map(|response| {
             response.with_provider_diagnostics(ProviderDiagnostics {

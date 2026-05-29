@@ -748,6 +748,7 @@ fn test_doctor_chain_summary_rejects_unknown_auto_finality_without_profile() {
         kind: "evm".to_owned(),
         chain_id: 999999,
         rpc_urls: vec![url],
+        trongrid: Default::default(),
         finality: FinalityConfig::Auto,
         datasets: datalens_edge::config::DatasetsConfig {
             blocks: datalens_edge::config::BlocksDatasetConfig {
