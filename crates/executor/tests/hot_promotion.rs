@@ -117,8 +117,8 @@ fn test_safe_canonical_hot_data_promotes_through_durable_writer_and_records_outc
     assert_eq!(events[0].fill_outcome, FillOutcome::PromotionWritten);
 
     let metrics = recorder.encode().expect("metrics output");
-    assert!(metrics.contains(r#"datalens_hot_promotion_total{application="system",chain="ethereum",chain_kind="evm",dataset="blocks",outcome="attempted"} 1"#));
-    assert!(metrics.contains(r#"datalens_hot_promotion_total{application="system",chain="ethereum",chain_kind="evm",dataset="blocks",outcome="promoted"} 1"#));
+    assert!(metrics.contains(r#"datalens_hot_promotion_total{application="system",chain="ethereum",chain_kind="evm",dataset="evm.blocks",outcome="attempted"} 1"#));
+    assert!(metrics.contains(r#"datalens_hot_promotion_total{application="system",chain="ethereum",chain_kind="evm",dataset="evm.blocks",outcome="promoted"} 1"#));
 }
 
 #[test]
@@ -292,8 +292,8 @@ fn test_promotion_failure_does_not_mark_or_delete_hot_data() {
             .expect("hot object")
     );
     let metrics = recorder.encode().expect("metrics output");
-    assert!(metrics.contains(r#"datalens_hot_promotion_total{application="system",chain="ethereum",chain_kind="evm",dataset="blocks",outcome="attempted"} 1"#));
-    assert!(metrics.contains(r#"datalens_hot_promotion_total{application="system",chain="ethereum",chain_kind="evm",dataset="blocks",outcome="failed"} 1"#));
+    assert!(metrics.contains(r#"datalens_hot_promotion_total{application="system",chain="ethereum",chain_kind="evm",dataset="evm.blocks",outcome="attempted"} 1"#));
+    assert!(metrics.contains(r#"datalens_hot_promotion_total{application="system",chain="ethereum",chain_kind="evm",dataset="evm.blocks",outcome="failed"} 1"#));
 }
 
 fn promoter<S>(

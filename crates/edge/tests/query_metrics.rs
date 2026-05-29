@@ -60,13 +60,13 @@ async fn test_metrics_route_returns_prometheus_text_for_query_path() {
         .expect("metrics body");
     let text = std::str::from_utf8(&body).expect("utf8 metrics");
     assert!(text.contains(
-        r#"datalens_query_total{application="datalens",chain="ethereum",chain_kind="evm",dataset="blocks",outcome="filled"} 1"#
+        r#"datalens_query_total{application="datalens",chain="ethereum",chain_kind="evm",dataset="evm.blocks",outcome="filled"} 1"#
     ));
     assert!(text.contains(
-        r#"datalens_cache_coverage_total{application="datalens",chain="ethereum",chain_kind="evm",dataset="blocks",outcome="miss"} 1"#
+        r#"datalens_cache_coverage_total{application="datalens",chain="ethereum",chain_kind="evm",dataset="evm.blocks",outcome="miss"} 1"#
     ));
     assert!(text.contains(
-        r#"datalens_application_chain_latest_requested_block{application="datalens",chain="ethereum",chain_kind="evm",dataset="blocks"} 10"#
+        r#"datalens_application_chain_latest_requested_block{application="datalens",chain="ethereum",chain_kind="evm",dataset="evm.blocks"} 10"#
     ));
 }
 
@@ -108,7 +108,7 @@ async fn test_query_route_uses_application_identity_header_for_metrics() {
         .expect("metrics body");
     let text = std::str::from_utf8(&body).expect("utf8 metrics");
     assert!(text.contains(
-        r#"datalens_query_total{application="wallet-search",chain="ethereum",chain_kind="evm",dataset="blocks",outcome="filled"} 1"#
+        r#"datalens_query_total{application="wallet-search",chain="ethereum",chain_kind="evm",dataset="evm.blocks",outcome="filled"} 1"#
     ));
 }
 
