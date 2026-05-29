@@ -199,9 +199,14 @@ async fn test_api_warmup_routes_manage_application_scoped_tasks() {
                 .body(Body::from(
                     serde_json::to_vec(&serde_json::json!({
                         "chain": ethereum_identity(),
-                        "dataset": "logs",
-                        "range": BlockRange::expect_new(10, 12),
-                        "filter": logs_request(10, 12).filter,
+                        "dataset_key": "evm.logs",
+                        "selector": {
+                            "kind": "evm_logs",
+                            "value": logs_request(10, 12).filter
+                        },
+                        "range_kind": { "kind": "block" },
+                        "start": 10,
+                        "end": 12,
                         "mode": "fixed_range",
                         "chunk_policy": {
                             "max_range_len": 2
@@ -262,6 +267,38 @@ async fn test_api_warmup_routes_manage_application_scoped_tasks() {
 }
 
 #[tokio::test]
+async fn test_api_warmup_rejects_legacy_evm_logs_submit_shape() {
+    let root = temp_storage_root("api-warmup-rejects-legacy-submit");
+    let source = MockSource::default();
+    let service = service(LocalStorage::new(&root), source).with_warmup_pool(warmup_pool(&root));
+    let registry = QueryServiceRegistry::new()
+        .with_service(service)
+        .expect("registry");
+    let app = router(registry);
+
+    let submit = app
+        .oneshot(
+            Request::post("/v1/warmup/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "chain": ethereum_identity(),
+                        "dataset": "logs",
+                        "range": BlockRange::expect_new(20, 21),
+                        "filter": logs_request(20, 21).filter,
+                        "mode": "fixed_range"
+                    }))
+                    .expect("request json"),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("submit response");
+
+    assert_eq!(submit.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
 async fn test_api_warmup_run_once_writes_durable_coverage_that_query_hits() {
     let root = temp_storage_root("api-warmup-run-once");
     let source = MockSource::default();
@@ -283,9 +320,14 @@ async fn test_api_warmup_run_once_writes_durable_coverage_that_query_hits() {
                 .body(Body::from(
                     serde_json::to_vec(&serde_json::json!({
                         "chain": ethereum_identity(),
-                        "dataset": "logs",
-                        "range": BlockRange::expect_new(20, 21),
-                        "filter": logs_request(20, 21).filter,
+                        "dataset_key": "evm.logs",
+                        "selector": {
+                            "kind": "evm_logs",
+                            "value": logs_request(20, 21).filter
+                        },
+                        "range_kind": { "kind": "block" },
+                        "start": 20,
+                        "end": 21,
                         "mode": "fixed_range"
                     }))
                     .expect("request json"),
@@ -1208,7 +1250,7 @@ fn application_config(id: &str, token: &str) -> datalens_api::config::Applicatio
         display_name: None,
         token: token.to_owned(),
         chains: vec!["ethereum".to_owned()],
-        datasets: vec!["logs".to_owned()],
+        datasets: vec!["evm.logs".to_owned()],
         quota: None,
     }
 }

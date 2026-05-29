@@ -147,9 +147,14 @@ async fn test_production_readiness_validates_service_staging_warmup_metrics_and_
                 .body(Body::from(
                     serde_json::to_vec(&serde_json::json!({
                         "chain": ethereum_identity(),
-                        "dataset": "logs",
-                        "range": BlockRange::expect_new(20, 21),
-                        "filter": logs_request(20, 21).filter,
+                        "dataset_key": "evm.logs",
+                        "selector": {
+                            "kind": "evm_logs",
+                            "value": logs_request(20, 21).filter
+                        },
+                        "range_kind": { "kind": "block" },
+                        "start": 20,
+                        "end": 21,
                         "mode": "fixed_range",
                         "chunk_policy": {
                             "max_range_len": 2
