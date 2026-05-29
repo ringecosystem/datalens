@@ -17,6 +17,7 @@ async fn test_graphql_playground_respects_config() {
                 enabled: true,
                 playground_enabled: true,
             },
+            ..Default::default()
         },
     );
     let disabled = router_with_edge_config(
@@ -26,6 +27,7 @@ async fn test_graphql_playground_respects_config() {
                 enabled: true,
                 playground_enabled: false,
             },
+            ..Default::default()
         },
     );
 
@@ -66,6 +68,7 @@ async fn test_graphql_can_be_disabled_independently() {
                 enabled: false,
                 playground_enabled: true,
             },
+            ..Default::default()
         },
     );
 

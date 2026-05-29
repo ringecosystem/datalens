@@ -13,6 +13,7 @@ use datalens_warmup::{
 
 use crate::{
     APPLICATION_IDENTITY_HEADER, auth,
+    config::ApplicationOperationConfig,
     contract::{
         discovery::DiscoveryResponse,
         error::{api_error_body, api_error_status},
@@ -31,13 +32,27 @@ pub(crate) async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "status": "ok" }))
 }
 
-pub(crate) async fn chains(State(state): State<AppState>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "chains": state.registry.chain_names() }))
+pub(crate) async fn chains(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let _application_context = state
+        .registry
+        .authenticate_discovery_headers(&headers)
+        .map_err(ApiError)?;
+    Ok(Json(
+        serde_json::json!({ "chains": state.registry.chain_names() }),
+    ))
 }
 
 pub(crate) async fn discovery(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<Json<DiscoveryResponse>, ApiError> {
+    let _application_context = state
+        .registry
+        .authenticate_discovery_headers(&headers)
+        .map_err(ApiError)?;
     state.registry.discovery().map(Json).map_err(ApiError)
 }
 
@@ -58,6 +73,7 @@ pub(crate) async fn query(
         )
         .map_err(ApiError)?;
     let application = application_context
+        .as_ref()
         .map(|application| application.metrics_identity())
         .or_else(|| application_from_headers(&headers));
     let native_input = request.into_native_input().map_err(ApiError)?;
@@ -85,10 +101,16 @@ pub(crate) async fn warmup_submit(
     let registry = state.registry.clone();
     let dataset = request.dataset_for_auth().map_err(ApiError)?;
     let application_context = registry
-        .authenticate_warmup_headers(&headers, request.chain().configured_name(), &dataset)
+        .authenticate_warmup_headers(
+            &headers,
+            request.chain().configured_name(),
+            &dataset,
+            ApplicationOperationConfig::WarmupSubmit,
+        )
         .map_err(ApiError)?;
     let application_id = application_context
-        .map(|application| application.id)
+        .as_ref()
+        .map(|application| application.id.clone())
         .or_else(|| application_id_from_headers(&headers))
         .unwrap_or_else(|| "unknown".to_owned());
     let request = warmup_submit_request(application_id, request).map_err(ApiError)?;
@@ -123,10 +145,11 @@ pub(crate) async fn warmup_list(
 ) -> Result<Json<WarmupTaskListApiResponse>, ApiError> {
     let registry = state.registry.clone();
     let application_context = registry
-        .authenticate_task_headers(&headers)
+        .authenticate_task_headers(&headers, ApplicationOperationConfig::WarmupRead)
         .map_err(ApiError)?;
     let application_id = application_context
-        .map(|application| application.id)
+        .as_ref()
+        .map(|application| application.id.clone())
         .or_else(|| application_id_from_headers(&headers));
     let filter = WarmupTaskFilter {
         application_id,
@@ -187,8 +210,12 @@ pub(crate) async fn warmup_retry(
 
 pub(crate) async fn warmup_run_once(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<Json<WarmupRunOnceApiResponse>, ApiError> {
     let registry = state.registry.clone();
+    let _application_context = registry
+        .authenticate_task_headers(&headers, ApplicationOperationConfig::WarmupRun)
+        .map_err(ApiError)?;
     let results = tokio::task::spawn_blocking(move || registry.run_warmup_once())
         .await
         .map_err(|error| {
@@ -207,7 +234,7 @@ async fn load_authorized_warmup_task(
     task_id: WarmupTaskId,
 ) -> Result<WarmupTask, ApiError> {
     let application_context = registry
-        .authenticate_task_headers(headers)
+        .authenticate_task_headers(headers, ApplicationOperationConfig::WarmupRead)
         .map_err(ApiError)?;
     let task = tokio::task::spawn_blocking(move || {
         registry.get_warmup_task(&task_id)?.ok_or_else(|| {
@@ -228,7 +255,8 @@ async fn load_authorized_warmup_task(
     authorize_warmup_task_application(
         &task,
         application_context
-            .map(|application| application.id)
+            .as_ref()
+            .map(|application| application.id.clone())
             .or_else(|| application_id_from_headers(headers)),
     )?;
     Ok(task)
@@ -243,12 +271,13 @@ async fn mutate_authorized_warmup_task(
     let task_id = WarmupTaskId::new(task_id).map_err(ApiError)?;
     let task = load_authorized_warmup_task(registry.clone(), &headers, task_id.clone()).await?;
     let application_context = registry
-        .authenticate_task_headers(&headers)
+        .authenticate_task_headers(&headers, ApplicationOperationConfig::WarmupMutate)
         .map_err(ApiError)?;
     authorize_warmup_task_application(
         &task,
         application_context
-            .map(|application| application.id)
+            .as_ref()
+            .map(|application| application.id.clone())
             .or_else(|| application_id_from_headers(&headers)),
     )?;
     let task = tokio::task::spawn_blocking(move || match mutation {
@@ -304,13 +333,17 @@ fn authorize_warmup_task_application(
     if application_id != task.application_id {
         return Err(ApiError(DatalensError::new(
             DatalensErrorKind::Unauthorized,
-            "application is not allowed to mutate another application's warmup task",
+            "application is not allowed to access another application's warmup task",
         )));
     }
     Ok(())
 }
 
-pub(crate) async fn metrics(State(state): State<AppState>) -> Result<Response, ApiError> {
+pub(crate) async fn metrics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    authorize_metrics(&state, &headers)?;
     match state.registry.metrics_text() {
         Some(Ok(text)) => Ok((
             [(
@@ -323,6 +356,31 @@ pub(crate) async fn metrics(State(state): State<AppState>) -> Result<Response, A
         Some(Err(error)) => Err(ApiError(error)),
         None => Ok(StatusCode::NOT_FOUND.into_response()),
     }
+}
+
+fn authorize_metrics(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    if state.edge.metrics.public || !state.registry.application_auth_required() {
+        return Ok(());
+    }
+    let Some(token) = state
+        .edge
+        .metrics
+        .bearer_token
+        .as_deref()
+        .filter(|token| !token.trim().is_empty())
+    else {
+        return Err(ApiError(DatalensError::new(
+            DatalensErrorKind::Unauthorized,
+            "metrics endpoint is not public",
+        )));
+    };
+    if auth::bearer_token(headers) == Some(token) {
+        return Ok(());
+    }
+    Err(ApiError(DatalensError::new(
+        DatalensErrorKind::AuthenticationFailed,
+        "metrics credentials are invalid",
+    )))
 }
 
 pub(crate) struct ApiError(DatalensError);

@@ -1,4 +1,8 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use axum::http::{HeaderMap, header};
 use datalens_core::{DatalensError, DatalensErrorKind, QueryFinalityRequirement};
@@ -13,12 +17,13 @@ pub struct AuthContext {
     pub subject: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct ApplicationContext {
     pub id: String,
     pub name: String,
     pub display_name: Option<String>,
     pub quota: Option<config::ApplicationQuotaConfig>,
+    _permit: Option<ApplicationRequestPermit>,
 }
 
 impl ApplicationContext {
@@ -44,6 +49,7 @@ impl AuthenticationHook for NoAuthentication {
 pub struct ApplicationRegistry {
     required: bool,
     applications: BTreeMap<String, config::ApplicationConfig>,
+    quota_state: Arc<Mutex<BTreeMap<String, ApplicationQuotaState>>>,
 }
 
 impl ApplicationRegistry {
@@ -81,6 +87,7 @@ impl ApplicationRegistry {
         Ok(Self {
             required: config.required,
             applications,
+            quota_state: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -99,59 +106,18 @@ impl ApplicationRegistry {
         if !self.required {
             return Ok(None);
         }
-        let raw_application = headers
-            .get(APPLICATION_HEADER)
-            .ok_or_else(|| {
-                DatalensError::new(
-                    DatalensErrorKind::AuthenticationFailed,
-                    "application identity is required",
-                )
-            })?
-            .to_str()
-            .map_err(|_| {
-                DatalensError::new(
-                    DatalensErrorKind::AuthenticationFailed,
-                    "application identity is invalid",
-                )
-            })?;
-        let application_id = normalize_application_id(raw_application).map_err(|_| {
-            DatalensError::new(
-                DatalensErrorKind::AuthenticationFailed,
-                "application identity is invalid",
-            )
-        })?;
-        let application = self.applications.get(&application_id).ok_or_else(|| {
-            DatalensError::new(
-                DatalensErrorKind::AuthenticationFailed,
-                "application credentials are invalid",
-            )
-        })?;
-        let token = bearer_token(headers).ok_or_else(|| {
-            DatalensError::new(
-                DatalensErrorKind::AuthenticationFailed,
-                "application credentials are required",
-            )
-        })?;
-        if token != application.token {
-            return Err(DatalensError::new(
-                DatalensErrorKind::AuthenticationFailed,
-                "application credentials are invalid",
-            ));
-        }
-        if !application.enabled {
-            return Err(DatalensError::new(
-                DatalensErrorKind::Unauthorized,
-                "application is disabled",
-            ));
-        }
-        authorize_application_dataset(application, chain, dataset)?;
-        enforce_quota(application, range_len, finality)?;
-        Ok(Some(ApplicationContext {
-            id: application.id.clone(),
-            name: application.name.clone(),
-            display_name: application.display_name.clone(),
-            quota: application.quota.clone(),
-        }))
+        let result = (|| {
+            let application = self.authenticate_application_headers(headers)?;
+            authorize_application_operation(
+                application,
+                config::ApplicationOperationConfig::Query,
+            )?;
+            authorize_application_dataset(application, chain, dataset)?;
+            enforce_quota(application, range_len, finality)?;
+            self.application_context(application)
+        })();
+        self.record_auth_result(headers, &result);
+        result
     }
 
     pub fn authenticate_warmup_headers(
@@ -159,18 +125,19 @@ impl ApplicationRegistry {
         headers: &HeaderMap,
         chain: &str,
         dataset: &str,
+        operation: config::ApplicationOperationConfig,
     ) -> Result<Option<ApplicationContext>, DatalensError> {
         if !self.required {
             return Ok(None);
         }
-        let application = self.authenticate_application_headers(headers)?;
-        authorize_application_dataset(application, chain, dataset)?;
-        Ok(Some(ApplicationContext {
-            id: application.id.clone(),
-            name: application.name.clone(),
-            display_name: application.display_name.clone(),
-            quota: application.quota.clone(),
-        }))
+        let result = (|| {
+            let application = self.authenticate_application_headers(headers)?;
+            authorize_application_operation(application, operation)?;
+            authorize_application_dataset(application, chain, dataset)?;
+            self.application_context(application)
+        })();
+        self.record_auth_result(headers, &result);
+        result
     }
 
     pub fn authenticate_native_query_headers(
@@ -181,35 +148,58 @@ impl ApplicationRegistry {
         if !self.required {
             return Ok(None);
         }
-        let application = self.authenticate_application_headers(headers)?;
-        authorize_application_dataset(
-            application,
-            request.chain.configured_name(),
-            &request.dataset_key,
-        )?;
-        enforce_native_query_quota(application, request)?;
-        Ok(Some(ApplicationContext {
-            id: application.id.clone(),
-            name: application.name.clone(),
-            display_name: application.display_name.clone(),
-            quota: application.quota.clone(),
-        }))
+        let result = (|| {
+            let application = self.authenticate_application_headers(headers)?;
+            authorize_application_operation(
+                application,
+                config::ApplicationOperationConfig::Query,
+            )?;
+            authorize_application_dataset(
+                application,
+                request.chain.configured_name(),
+                &request.dataset_key,
+            )?;
+            enforce_native_query_quota(application, request)?;
+            self.application_context(application)
+        })();
+        self.record_auth_result(headers, &result);
+        result
     }
 
     pub fn authenticate_task_headers(
+        &self,
+        headers: &HeaderMap,
+        operation: config::ApplicationOperationConfig,
+    ) -> Result<Option<ApplicationContext>, DatalensError> {
+        if !self.required {
+            return Ok(None);
+        }
+        let result = (|| {
+            let application = self.authenticate_application_headers(headers)?;
+            authorize_application_operation(application, operation)?;
+            self.application_context(application)
+        })();
+        self.record_auth_result(headers, &result);
+        result
+    }
+
+    pub fn authenticate_discovery_headers(
         &self,
         headers: &HeaderMap,
     ) -> Result<Option<ApplicationContext>, DatalensError> {
         if !self.required {
             return Ok(None);
         }
-        let application = self.authenticate_application_headers(headers)?;
-        Ok(Some(ApplicationContext {
-            id: application.id.clone(),
-            name: application.name.clone(),
-            display_name: application.display_name.clone(),
-            quota: application.quota.clone(),
-        }))
+        let result = (|| {
+            let application = self.authenticate_application_headers(headers)?;
+            authorize_application_operation(
+                application,
+                config::ApplicationOperationConfig::Discovery,
+            )?;
+            self.application_context(application)
+        })();
+        self.record_auth_result(headers, &result);
+        result
     }
 
     fn authenticate_application_headers(
@@ -263,9 +253,176 @@ impl ApplicationRegistry {
         }
         Ok(application)
     }
+
+    fn application_context(
+        &self,
+        application: &config::ApplicationConfig,
+    ) -> Result<Option<ApplicationContext>, DatalensError> {
+        Ok(Some(ApplicationContext {
+            id: application.id.clone(),
+            name: application.name.clone(),
+            display_name: application.display_name.clone(),
+            quota: application.quota.clone(),
+            _permit: Some(self.acquire_quota_permit(application)?),
+        }))
+    }
+
+    fn acquire_quota_permit(
+        &self,
+        application: &config::ApplicationConfig,
+    ) -> Result<ApplicationRequestPermit, DatalensError> {
+        let Some(quota) = &application.quota else {
+            return Ok(ApplicationRequestPermit::noop());
+        };
+        let mut states = self.quota_state.lock().expect("application quota state");
+        let state = states.entry(application.id.clone()).or_default();
+        let now = Instant::now();
+        if now.duration_since(state.window_started_at) >= Duration::from_secs(60) {
+            state.window_started_at = now;
+            state.requests_in_window = 0;
+        }
+        if let Some(limit) = quota.max_requests_per_minute
+            && state.requests_in_window >= limit
+        {
+            return Err(DatalensError::new(
+                DatalensErrorKind::RateLimited,
+                "application request rate quota exceeded",
+            ));
+        }
+        if let Some(limit) = quota.max_concurrent_requests
+            && state.in_flight >= limit
+        {
+            return Err(DatalensError::new(
+                DatalensErrorKind::RateLimited,
+                "application concurrent request quota exceeded",
+            ));
+        }
+        if quota.max_requests_per_minute.is_some() {
+            state.requests_in_window += 1;
+        }
+        let release = if quota.max_concurrent_requests.is_some() {
+            state.in_flight += 1;
+            true
+        } else {
+            false
+        };
+        Ok(ApplicationRequestPermit {
+            application_id: application.id.clone(),
+            quota_state: self.quota_state.clone(),
+            release,
+        })
+    }
+
+    fn record_auth_result(
+        &self,
+        headers: &HeaderMap,
+        result: &Result<Option<ApplicationContext>, DatalensError>,
+    ) {
+        let mut states = self.quota_state.lock().expect("application quota state");
+        match result {
+            Ok(Some(application)) => {
+                states.entry(application.id.clone()).or_default().accepted += 1;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let reason = match error.kind {
+                    DatalensErrorKind::AuthenticationFailed => "rejected_authentication",
+                    DatalensErrorKind::Unauthorized => "rejected_authorization",
+                    DatalensErrorKind::RateLimited => "rejected_quota",
+                    _ => "rejected_other",
+                };
+                let state = states.entry(metrics_application_id(headers)).or_default();
+                *state.rejected.entry(reason.to_owned()).or_default() += 1;
+            }
+        }
+    }
+
+    pub(crate) fn metrics_text(&self) -> Option<String> {
+        let states = self.quota_state.lock().expect("application quota state");
+        if states.is_empty() {
+            return None;
+        }
+        let mut lines = Vec::new();
+        for (application_id, state) in states.iter() {
+            if state.accepted > 0 {
+                lines.push(format!(
+                    r#"datalens_edge_request_total{{application="{application_id}",outcome="accepted"}} {}"#,
+                    state.accepted
+                ));
+            }
+            for (reason, count) in &state.rejected {
+                lines.push(format!(
+                    r#"datalens_edge_request_rejected_total{{application="{application_id}",reason="{reason}"}} {count}"#
+                ));
+            }
+            lines.push(format!(
+                r#"datalens_edge_application_in_flight{{application="{application_id}"}} {}"#,
+                state.in_flight
+            ));
+        }
+        Some(lines.join("\n"))
+    }
 }
 
-fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+#[derive(Debug)]
+struct ApplicationRequestPermit {
+    application_id: String,
+    quota_state: Arc<Mutex<BTreeMap<String, ApplicationQuotaState>>>,
+    release: bool,
+}
+
+impl ApplicationRequestPermit {
+    fn noop() -> Self {
+        Self {
+            application_id: String::new(),
+            quota_state: Arc::new(Mutex::new(BTreeMap::new())),
+            release: false,
+        }
+    }
+}
+
+impl Drop for ApplicationRequestPermit {
+    fn drop(&mut self) {
+        if !self.release {
+            return;
+        }
+        let mut states = self.quota_state.lock().expect("application quota state");
+        if let Some(state) = states.get_mut(&self.application_id) {
+            state.in_flight = state.in_flight.saturating_sub(1);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ApplicationQuotaState {
+    window_started_at: Instant,
+    requests_in_window: u64,
+    in_flight: u64,
+    accepted: u64,
+    rejected: BTreeMap<String, u64>,
+}
+
+impl Default for ApplicationQuotaState {
+    fn default() -> Self {
+        Self {
+            window_started_at: Instant::now(),
+            requests_in_window: 0,
+            in_flight: 0,
+            accepted: 0,
+            rejected: BTreeMap::new(),
+        }
+    }
+}
+
+fn metrics_application_id(headers: &HeaderMap) -> String {
+    headers
+        .get(APPLICATION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| normalize_application_id(value).ok())
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     value
         .strip_prefix("Bearer ")
@@ -294,6 +451,19 @@ fn authorize_application_dataset(
         ));
     }
     Ok(())
+}
+
+fn authorize_application_operation(
+    application: &config::ApplicationConfig,
+    operation: config::ApplicationOperationConfig,
+) -> Result<(), DatalensError> {
+    if application.operations.is_empty() || application.operations.contains(&operation) {
+        return Ok(());
+    }
+    Err(DatalensError::new(
+        DatalensErrorKind::Unauthorized,
+        "application is not allowed to perform this operation",
+    ))
 }
 
 fn enforce_quota(

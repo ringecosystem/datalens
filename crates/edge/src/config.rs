@@ -129,6 +129,8 @@ pub struct MetricsConfig {
 pub struct EdgeConfig {
     #[serde(default)]
     pub graphql: GraphqlConfig,
+    #[serde(default)]
+    pub metrics: MetricsEndpointConfig,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -251,6 +253,14 @@ fn default_graphql_playground_enabled() -> bool {
     true
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MetricsEndpointConfig {
+    #[serde(default)]
+    pub public: bool,
+    #[serde(default)]
+    pub bearer_token: Option<String>,
+}
+
 fn default_warmup_registry_path() -> String {
     ".datalens/warmup".to_owned()
 }
@@ -325,7 +335,20 @@ pub struct ApplicationConfig {
     #[serde(default)]
     pub datasets: Vec<String>,
     #[serde(default)]
+    pub operations: Vec<ApplicationOperationConfig>,
+    #[serde(default)]
     pub quota: Option<ApplicationQuotaConfig>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplicationOperationConfig {
+    Query,
+    Discovery,
+    WarmupSubmit,
+    WarmupRead,
+    WarmupMutate,
+    WarmupRun,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

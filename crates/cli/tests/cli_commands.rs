@@ -510,6 +510,9 @@ fn test_validate_config_accepts_application_registry() {
         min_object_rows = 1
         record_empty_coverage = true
 
+        [edge.metrics]
+        public = true
+
         [applications]
         required = true
 
@@ -520,6 +523,7 @@ fn test_validate_config_accepts_application_registry() {
         token = "secret-token"
         chains = ["ethereum"]
         datasets = ["blocks"]
+        operations = ["query"]
 
         [applications.applications.quota]
         max_query_range_blocks = 10
@@ -567,6 +571,9 @@ fn test_validate_config_rejects_invalid_application_boundary_without_leaking_tok
         target_object_bytes = 1024
         min_object_rows = 1
         record_empty_coverage = true
+
+        [edge.metrics]
+        public = true
 
         [applications]
         required = true
@@ -787,6 +794,7 @@ fn test_production_config_doctor_smoke_uses_nonsecret_environment() {
         .env("DATALENS_S3_REGION", "auto")
         .env("DATALENS_S3_ENDPOINT_URL", "https://s3.example.invalid")
         .env("DATALENS_PUBLIC_APP_TOKEN", "replace-with-secret")
+        .env("DATALENS_METRICS_TOKEN", "replace-with-secret")
         .env("AWS_ACCESS_KEY_ID", "replace-with-secret")
         .env("AWS_SECRET_ACCESS_KEY", "replace-with-secret")
         .output()

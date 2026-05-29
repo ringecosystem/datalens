@@ -94,6 +94,21 @@ pub fn validate_config(config: &DatalensConfig) -> Result<(), DatalensError> {
             "metrics.default_application must not be empty when metrics are enabled",
         ));
     }
+    if config.applications.required
+        && config.metrics.enabled
+        && !config.edge.metrics.public
+        && config
+            .edge
+            .metrics
+            .bearer_token
+            .as_deref()
+            .is_none_or(|token| token.trim().is_empty())
+    {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "edge.metrics.bearer_token must be set when application auth and metrics are enabled unless edge.metrics.public is true",
+        ));
+    }
     validate_index_config(config)?;
     validate_warmup_config(config)?;
     validate_applications(config)?;
@@ -204,10 +219,26 @@ fn validate_applications(config: &DatalensConfig) -> Result<(), DatalensError> {
                 format!("application {application_id} must allow at least one dataset"),
             ));
         }
+        if config.applications.required && application.operations.is_empty() {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                format!(
+                    "application {application_id} must declare at least one operation when application auth is required"
+                ),
+            ));
+        }
         for dataset in &application.datasets {
             if !matches!(
                 dataset.as_str(),
-                "blocks" | "transactions" | "receipts" | "logs"
+                "blocks"
+                    | "transactions"
+                    | "receipts"
+                    | "logs"
+                    | "evm.blocks"
+                    | "evm.logs"
+                    | "solana.slots"
+                    | "tron.blocks"
+                    | "tron.events"
             ) {
                 return Err(DatalensError::new(
                     DatalensErrorKind::InvalidInput,

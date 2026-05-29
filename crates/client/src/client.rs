@@ -8,18 +8,21 @@ use datalens_core::{
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::DeserializeOwned};
 
 pub const APPLICATION_IDENTITY_HEADER: &str = "x-datalens-application";
+pub const AUTHORIZATION_HEADER: &str = "authorization";
 const DEFAULT_APPLICATION: &str = "unknown";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DatalensClientConfig {
     pub endpoint: String,
     pub application: Option<String>,
+    pub bearer_token: Option<String>,
 }
 
 #[derive(Clone)]
 pub struct DatalensClient<T = ReqwestTransport> {
     endpoint: String,
     application: String,
+    bearer_token: Option<String>,
     transport: T,
 }
 
@@ -44,6 +47,7 @@ where
         Ok(Self {
             endpoint,
             application: normalize_application(config.application),
+            bearer_token: normalize_bearer_token(config.bearer_token),
             transport,
         })
     }
@@ -164,6 +168,9 @@ where
             APPLICATION_IDENTITY_HEADER.to_owned(),
             self.application.clone(),
         );
+        if let Some(token) = &self.bearer_token {
+            headers.insert(AUTHORIZATION_HEADER.to_owned(), format!("Bearer {token}"));
+        }
         let request = HttpRequest {
             method: method.to_owned(),
             endpoint: self.endpoint.clone(),
@@ -656,6 +663,13 @@ fn normalize_application(application: Option<String>) -> String {
         .filter(|value| !value.trim().is_empty())
         .map(|value| value.trim().to_owned())
         .unwrap_or_else(|| DEFAULT_APPLICATION.to_owned())
+}
+
+fn normalize_bearer_token(token: Option<String>) -> Option<String> {
+    token.and_then(|value| {
+        let value = value.trim();
+        (!value.is_empty()).then(|| value.to_owned())
+    })
 }
 
 fn api_error_kind(kind: &str) -> ApiErrorKind {

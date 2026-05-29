@@ -200,6 +200,85 @@ async fn test_graphql_native_evm_blocks_and_logs_query_match_rest_contract() {
 }
 
 #[tokio::test]
+async fn test_graphql_query_enforces_application_auth_like_rest_query() {
+    let source = MockSource::default().with_blocks(vec![block(10, "0x10")]);
+    let registry = QueryServiceRegistry::new()
+        .with_application_registry(datalens_edge::config::ApplicationRegistryConfig {
+            required: true,
+            applications: vec![datalens_edge::config::ApplicationConfig {
+                id: "graphql-app".to_owned(),
+                name: "graphql-app".to_owned(),
+                enabled: true,
+                display_name: None,
+                token: "secret-token".to_owned(),
+                chains: vec!["ethereum".to_owned()],
+                datasets: vec!["evm.blocks".to_owned()],
+                operations: vec![datalens_edge::config::ApplicationOperationConfig::Query],
+                quota: None,
+            }],
+        })
+        .expect("application registry")
+        .with_service(service(
+            LocalStorage::new(temp_storage_root("gql-auth")),
+            source,
+        ))
+        .expect("register service");
+    let app = router(registry);
+    let body = serde_json::to_vec(&serde_json::json!({
+        "query": r#"
+            query($input: QueryInput!) {
+              query(input: $input) {
+                datasetKey
+              }
+            }
+        "#,
+        "variables": {
+            "input": {
+                "chain": ethereum_chain_input(),
+                "datasetKey": dataset_key_input("evm", "blocks"),
+                "selector": { "kind": "all" },
+                "range": { "kind": "block", "start": 10, "end": 10 },
+                "finality": "durable_only"
+            }
+        }
+    }))
+    .expect("graphql request");
+
+    let missing = app
+        .clone()
+        .oneshot(
+            Request::post("/graphql")
+                .header("content-type", "application/json")
+                .body(Body::from(body.clone()))
+                .expect("missing request"),
+        )
+        .await
+        .expect("missing response");
+    let authorized = app
+        .oneshot(
+            Request::post("/graphql")
+                .header("content-type", "application/json")
+                .header("x-datalens-application", "graphql-app")
+                .header("authorization", "Bearer secret-token")
+                .body(Body::from(body))
+                .expect("authorized request"),
+        )
+        .await
+        .expect("authorized response");
+
+    assert_eq!(missing.status(), StatusCode::OK);
+    let missing = body_json(missing.into_body()).await;
+    assert_eq!(
+        missing["errors"][0]["extensions"]["kind"],
+        "authentication_failed"
+    );
+    assert_eq!(authorized.status(), StatusCode::OK);
+    let authorized = body_json(authorized.into_body()).await;
+    assert_eq!(authorized["errors"], serde_json::Value::Null);
+    assert_eq!(authorized["data"]["query"]["datasetKey"], "evm.blocks");
+}
+
+#[tokio::test]
 async fn test_graphql_native_solana_query_uses_native_contract() {
     let root = temp_storage_root("gql-solana");
     let solana = SolanaAdapter::with_fixture_defaults();

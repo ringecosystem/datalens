@@ -1,9 +1,9 @@
 use std::sync::{Arc, Mutex};
 
 use datalens_client::{
-    APPLICATION_IDENTITY_HEADER, ApiErrorKind, CacheOutcome, ChainDiscovery, ClientError,
-    DatalensClient, DatalensClientConfig, FallbackMode, HttpRequest, HttpResponse, HttpTransport,
-    QueryOptions, QueryRequest, QueryResponse, QuerySelector, TronEventSelector,
+    APPLICATION_IDENTITY_HEADER, AUTHORIZATION_HEADER, ApiErrorKind, CacheOutcome, ChainDiscovery,
+    ClientError, DatalensClient, DatalensClientConfig, FallbackMode, HttpRequest, HttpResponse,
+    HttpTransport, QueryOptions, QueryRequest, QueryResponse, QuerySelector, TronEventSelector,
 };
 use datalens_core::{
     BlockHeader, BlockRange, ChainFamily, ChainIdentity, Dataset, DatasetKey, DatasetRows,
@@ -60,6 +60,47 @@ fn test_query_serializes_native_request_and_application_header() {
             "finality": "durable_only",
             "fields": "all"
         })
+    );
+}
+
+#[test]
+fn test_client_sends_bearer_token_when_configured() {
+    let transport = RecordingTransport::new(HttpResponse::json(
+        200,
+        serde_json::json!({
+            "chain": ethereum_identity(),
+            "dataset_key": "evm.blocks",
+            "range": { "kind": "block", "start": 10, "end": 10 },
+            "cache": { "hit_ranges": [], "missing_ranges": [{ "kind": "block", "start": 10, "end": 10 }] },
+            "rows": dataset_rows_json(DatasetKey::evm_blocks(), QueryRows::EvmBlocks(Vec::new()))
+        }),
+    ));
+    let client = DatalensClient::with_transport(
+        DatalensClientConfig {
+            endpoint: "http://datalens.invalid".to_owned(),
+            application: Some("wallet-search".to_owned()),
+            bearer_token: Some(" secret-token ".to_owned()),
+        },
+        transport.clone(),
+    )
+    .expect("client config");
+
+    client
+        .query(QueryRequest::new(
+            ethereum_identity(),
+            DatasetKey::evm_blocks(),
+            LedgerRange::blocks(10, 10).expect("range"),
+        ))
+        .expect("query response");
+
+    let request = transport.only_request();
+    assert_eq!(
+        request.header(APPLICATION_IDENTITY_HEADER),
+        Some("wallet-search")
+    );
+    assert_eq!(
+        request.header(AUTHORIZATION_HEADER),
+        Some("Bearer secret-token")
     );
 }
 
@@ -635,6 +676,7 @@ fn client(
         DatalensClientConfig {
             endpoint: "http://datalens.invalid".to_owned(),
             application: application.map(str::to_owned),
+            bearer_token: None,
         },
         transport,
     )
