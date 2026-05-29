@@ -1,31 +1,13 @@
 use datalens_chain::{AdapterKey, DatasetSelector};
 use datalens_core::{
-    BlockRange, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey,
-    DatasetRows, LedgerRange, LedgerRangeKind, LogFilter, QueryDataFinality,
-    QueryFinalityRequirement, QuerySegmentSource,
+    ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey, DatasetRows,
+    LedgerRange, LedgerRangeKind, LogFilter, QueryDataFinality, QueryFinalityRequirement,
+    QuerySegmentSource,
 };
 use datalens_planner::NativeQueryInput;
 use serde::{Deserialize, Serialize};
 
 use crate::service::query_service::{NativeCacheSummary, NativeQueryResponse};
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct CacheSummary {
-    pub hit_ranges: Vec<BlockRange>,
-    pub missing_ranges: Vec<BlockRange>,
-    pub durable_hit_ranges: Vec<BlockRange>,
-    pub hot_hit_ranges: Vec<BlockRange>,
-    pub provider_fill_ranges: Vec<BlockRange>,
-    pub promotion_pending_ranges: Vec<BlockRange>,
-    pub segments: Vec<QuerySegment>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct QuerySegment {
-    pub range: BlockRange,
-    pub source: QuerySegmentSource,
-    pub finality: QueryDataFinality,
-}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct QueryApiRequest {

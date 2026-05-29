@@ -3,7 +3,7 @@ use datalens_core::{
     ChainFamily, ChainIdentity, CoverageLevel, DatasetId, DatasetKey, DatasetRows, LedgerRange,
     QueryRows, ResultEnvelope, TimeRange,
 };
-use datalens_edge::{auth::AuthenticationHook, compatibility::CompatibilityAdapter};
+use datalens_edge::auth::AuthenticationHook;
 use datalens_evm::EvmAdapterMetadata;
 use datalens_planner::{PlanRequest, PlanStatus};
 use datalens_writer::{
@@ -29,7 +29,6 @@ fn workspace_exposes_architecture_boundaries() {
     fn assert_chain_adapter<T: ChainAdapter>() {}
     fn assert_storage_repository<T: datalens_storage::StorageRepository>() {}
     fn assert_auth_hook<T: AuthenticationHook>() {}
-    fn assert_compatibility<T: CompatibilityAdapter>() {}
 
     let _ = EvmAdapterMetadata::default();
     let _ = PlanRequest::new(chain.clone(), dataset.clone(), range);
@@ -58,8 +57,22 @@ fn workspace_exposes_architecture_boundaries() {
     let _chain_adapter_type_check = assert_chain_adapter::<datalens_evm::EvmAdapter>;
     let _storage_type_check = assert_storage_repository::<datalens_storage::LocalStorage>;
     let _auth_hook_type_check = assert_auth_hook::<datalens_edge::auth::NoAuthentication>;
-    let _compatibility_type_check =
-        assert_compatibility::<datalens_edge::compatibility::NativeCompatibility>;
+}
+
+#[test]
+fn edge_public_contract_omits_placeholder_modules_and_block_only_query_dtos() {
+    let edge_lib = include_str!("../../edge/src/lib.rs");
+    let query_contract = include_str!("../../edge/src/contract/query.rs");
+    let block_cache_summary = ["Cache", "Summary"].concat();
+    let block_query_segment = ["Query", "Segment"].concat();
+
+    assert!(!edge_lib.contains("pub mod compatibility;"));
+    assert!(!edge_lib.contains("pub mod native;"));
+    assert!(!edge_lib.contains("pub mod streaming;"));
+    assert!(!edge_lib.contains(&format!("{block_cache_summary}, FieldSelectionApi")));
+    assert!(!edge_lib.contains(&format!("QueryRangeApi, {block_query_segment},")));
+    assert!(!query_contract.contains(&format!("pub struct {block_cache_summary} {{")));
+    assert!(!query_contract.contains(&format!("pub struct {block_query_segment} {{")));
 }
 
 #[test]
