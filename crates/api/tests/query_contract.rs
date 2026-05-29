@@ -145,13 +145,13 @@ fn test_legacy_request_maps_explicit_hot_contract_to_native_input() {
 }
 
 #[test]
-fn test_query_service_supports_explicit_hot_read_through_without_durable_cache_write() {
+fn test_query_service_supports_latest_only_read_through_without_durable_cache_write() {
     let root = temp_storage_root("hot-read-through");
     let source = MockSource::default().with_blocks(vec![block(100, "0x64")]);
     let service = service(LocalStorage::new(&root), source.clone());
     let mut request = blocks_request(100, 100);
     request.allow_hot = true;
-    request.finality = QueryFinalityRequirement::SafeToLatest;
+    request.finality = QueryFinalityRequirement::LatestOnly;
 
     let response = service.query(request).expect("hot query succeeds");
 

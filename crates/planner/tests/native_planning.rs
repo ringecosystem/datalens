@@ -4,7 +4,7 @@ use datalens_chain::{
 };
 use datalens_core::{
     ChainFamily, ChainIdentity, DatalensErrorKind, DatasetKey, LedgerRange, NetworkId,
-    QueryFinalityRequirement,
+    QueryDataFinality, QueryFinalityRequirement, QuerySegmentSource,
 };
 
 use datalens_planner::*;
@@ -315,6 +315,110 @@ fn test_native_planner_uses_adapter_range_limit_for_fetch_tasks() {
                 cache_write: true,
             },
         ]
+    );
+}
+
+#[test]
+fn test_native_planner_latest_only_ignores_durable_coverage() {
+    let mut input = blocks_input(1, 4);
+    input.finality = QueryFinalityRequirement::LatestOnly;
+
+    let plan = NativePlanner::new(NativePlannerConfig {
+        max_query_range_len: 10,
+        default_chunk_range_len: 3,
+    })
+    .plan_with_live_coverage(
+        input,
+        &capabilities(),
+        ChainHeight::block(2).with_finality(FinalityKind::Safe),
+        ChainHeight::block(4),
+        vec![LedgerRange::blocks(1, 2).expect("valid range")],
+    )
+    .expect("native plan");
+
+    assert_eq!(plan.read_segments, Vec::<DurableReadSegment>::new());
+    assert_eq!(
+        plan.fetch_tasks,
+        vec![
+            DurableFetchTask {
+                range: LedgerRange::blocks(1, 2).expect("valid range"),
+                cache_write: false,
+            },
+            DurableFetchTask {
+                range: LedgerRange::blocks(3, 4).expect("valid range"),
+                cache_write: false,
+            },
+        ]
+    );
+    assert_eq!(plan.coverage.durable_hit_ranges, Vec::<LedgerRange>::new());
+}
+
+#[test]
+fn test_native_planner_safe_to_latest_splits_durable_coverage_and_hot_tail() {
+    let mut input = blocks_input(1, 5);
+    input.finality = QueryFinalityRequirement::SafeToLatest;
+
+    let plan = NativePlanner::new(NativePlannerConfig {
+        max_query_range_len: 10,
+        default_chunk_range_len: 3,
+    })
+    .plan_with_live_coverage(
+        input,
+        &capabilities(),
+        ChainHeight::block(3).with_finality(FinalityKind::Safe),
+        ChainHeight::block(5),
+        vec![LedgerRange::blocks(1, 2).expect("valid range")],
+    )
+    .expect("native plan");
+
+    assert_eq!(
+        plan.read_segments,
+        vec![DurableReadSegment {
+            range: LedgerRange::blocks(1, 2).expect("valid range")
+        }]
+    );
+    assert_eq!(
+        plan.fetch_tasks,
+        vec![
+            DurableFetchTask {
+                range: LedgerRange::blocks(3, 3).expect("valid range"),
+                cache_write: true,
+            },
+            DurableFetchTask {
+                range: LedgerRange::blocks(4, 5).expect("valid range"),
+                cache_write: false,
+            },
+        ]
+    );
+    assert_eq!(
+        plan.coverage.durable_hit_ranges,
+        vec![LedgerRange::blocks(1, 2).expect("valid range")]
+    );
+    assert_eq!(
+        plan.coverage.missing_ranges,
+        vec![
+            LedgerRange::blocks(3, 3).expect("valid range"),
+            LedgerRange::blocks(4, 5).expect("valid range"),
+        ]
+    );
+    assert_eq!(plan.coverage.segments.len(), 3);
+    assert_eq!(
+        plan.coverage.segments[0].source,
+        QuerySegmentSource::Durable
+    );
+    assert_eq!(plan.coverage.segments[0].finality, QueryDataFinality::Safe);
+    assert_eq!(
+        plan.coverage.segments[1].source,
+        QuerySegmentSource::Provider
+    );
+    assert_eq!(plan.coverage.segments[1].finality, QueryDataFinality::Safe);
+    assert_eq!(
+        plan.coverage.segments[2].source,
+        QuerySegmentSource::Provider
+    );
+    assert_eq!(
+        plan.coverage.segments[2].finality,
+        QueryDataFinality::Latest
     );
 }
 

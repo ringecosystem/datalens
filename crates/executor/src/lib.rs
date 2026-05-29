@@ -8,7 +8,7 @@ use datalens_chain::{
 };
 use datalens_core::{
     ChainIdentity, DatalensError, DatalensErrorKind, Dataset, DatasetKey, DatasetRows, LedgerRange,
-    QueryDataFinality, QueryRows, QuerySegmentMetadata, QuerySegmentSource, missing_ranges,
+    QueryFinalityRequirement, QueryRows, missing_ranges,
 };
 use datalens_metrics::HotPromotionOutcome as MetricsHotPromotionOutcome;
 use datalens_metrics::{
@@ -436,7 +436,7 @@ where
         if let Some((recorder, labels)) = self.metrics_recorder(&labels) {
             recorder.set_latest_requested_block(labels, input.ledger_range.end());
         }
-        if input.finality.allows_hot() {
+        if matches!(input.finality, QueryFinalityRequirement::LatestOnly) {
             return self.execute_hot_read_through(input, application, start, labels);
         }
 
@@ -469,9 +469,28 @@ where
             .filter_map(|range| range.intersection(&input.ledger_range))
             .collect::<Vec<_>>();
         let miss_ranges = missing_ranges(input.ledger_range.clone(), &hit_ranges);
-        let coverage_outcome = coverage_outcome(&hit_ranges, &miss_ranges);
-        self.record_cache_coverage(&labels, coverage_outcome);
-        let durable_boundary = if miss_ranges.is_empty() {
+        let preliminary_coverage_outcome = coverage_outcome(&hit_ranges, &miss_ranges);
+        let durable_boundary = if matches!(input.finality, QueryFinalityRequirement::SafeToLatest) {
+            match self.source.cache_safe_height() {
+                Ok(boundary) => boundary,
+                Err(error) => {
+                    self.record_error(&labels, &error);
+                    self.record_cache_coverage(&labels, CacheCoverageOutcome::Error);
+                    self.record_query(&labels, QueryOutcome::Error, start);
+                    self.record_usage(
+                        &ledger_application,
+                        &input,
+                        FinalityLevel::Safe,
+                        ledger_query_error(&error),
+                        ledger_cache_outcome(preliminary_coverage_outcome),
+                        LedgerFillOutcome::NotAttempted,
+                        LedgerDurableWriteOutcome::NotAttempted,
+                        0,
+                    )?;
+                    return Err(error);
+                }
+            }
+        } else if miss_ranges.is_empty() {
             boundary_for_cached_hit(&input.ledger_range)
         } else {
             match self.source.cache_safe_height() {
@@ -484,7 +503,7 @@ where
                         &input,
                         FinalityLevel::Safe,
                         ledger_query_error(&error),
-                        ledger_cache_outcome(coverage_outcome),
+                        ledger_cache_outcome(preliminary_coverage_outcome),
                         LedgerFillOutcome::NotAttempted,
                         LedgerDurableWriteOutcome::NotAttempted,
                         0,
@@ -493,10 +512,34 @@ where
                 }
             }
         };
-        let plan = match self.planner.plan_with_coverage(
+        let latest = if matches!(input.finality, QueryFinalityRequirement::SafeToLatest) {
+            match self.source.latest_height() {
+                Ok(latest) => latest,
+                Err(error) => {
+                    self.record_error(&labels, &error);
+                    self.record_cache_coverage(&labels, CacheCoverageOutcome::Error);
+                    self.record_query(&labels, QueryOutcome::Error, start);
+                    self.record_usage(
+                        &ledger_application,
+                        &input,
+                        FinalityLevel::Latest,
+                        ledger_query_error(&error),
+                        ledger_cache_outcome(preliminary_coverage_outcome),
+                        LedgerFillOutcome::NotAttempted,
+                        LedgerDurableWriteOutcome::NotAttempted,
+                        0,
+                    )?;
+                    return Err(error);
+                }
+            }
+        } else {
+            durable_boundary.clone()
+        };
+        let plan = match self.planner.plan_with_live_coverage(
             input.clone(),
             &self.source.capabilities(),
             durable_boundary.clone(),
+            latest,
             covered_ranges,
         ) {
             Ok(plan) => plan,
@@ -507,7 +550,7 @@ where
                     &input,
                     durable_boundary.finality,
                     LedgerQueryOutcome::Error,
-                    ledger_cache_outcome(coverage_outcome),
+                    ledger_cache_outcome(preliminary_coverage_outcome),
                     LedgerFillOutcome::NotAttempted,
                     LedgerDurableWriteOutcome::NotAttempted,
                     0,
@@ -522,6 +565,8 @@ where
             plan.coverage.hit_ranges.len(),
             plan.coverage.missing_ranges.len()
         );
+        let coverage_outcome = plan_coverage_outcome(&plan);
+        self.record_cache_coverage(&labels, coverage_outcome);
 
         let mut rows = empty_query_rows(&plan.dataset_key);
         for segment in &plan.read_segments {
@@ -565,6 +610,9 @@ where
         let finality_level = match &plan.finality_policy {
             FinalityPolicy::DurableCache { boundary } => boundary.finality,
             FinalityPolicy::HotReadThrough { latest } => latest.finality,
+            FinalityPolicy::MixedReadThrough {
+                durable_boundary, ..
+            } => durable_boundary.finality,
         };
         let mut fetched_segments = Vec::new();
         let mut fill_row_count = 0usize;
@@ -651,6 +699,7 @@ where
             }
         }
 
+        let provider_fetch_attempted = !plan.fetch_tasks.is_empty();
         let cache_fill_attempted = !fetched_segments.is_empty();
         let mut durable_write_outcome = LedgerDurableWriteOutcome::NotAttempted;
         if cache_fill_attempted {
@@ -682,8 +731,10 @@ where
                 }
             };
         }
-        if cache_fill_attempted {
-            let fill_outcome = if fill_row_count == 0 {
+        if provider_fetch_attempted {
+            let fill_outcome = if !cache_fill_attempted {
+                FillOutcome::LiveFetch
+            } else if fill_row_count == 0 {
                 FillOutcome::Empty
             } else {
                 FillOutcome::Filled
@@ -703,13 +754,6 @@ where
             .iter()
             .map(|task| task.range.clone())
             .collect();
-        cache.segments.extend(plan.fetch_tasks.iter().map(|task| {
-            QuerySegmentMetadata::new(
-                task.range.clone(),
-                QuerySegmentSource::Provider,
-                query_data_finality(finality_level),
-            )
-        }));
 
         let result = NativeQueryExecutionResult {
             chain: plan.chain.clone(),
@@ -725,7 +769,7 @@ where
             &plan,
             ledger_query_outcome(query_outcome),
             ledger_cache_outcome(coverage_outcome),
-            ledger_fill_outcome(cache_fill_attempted, fill_row_count),
+            ledger_fill_outcome(provider_fetch_attempted, fill_row_count),
             durable_write_outcome,
             result.rows.row_count(),
         )?;
@@ -858,13 +902,6 @@ where
             .iter()
             .map(|task| task.range.clone())
             .collect();
-        cache.segments.extend(plan.fetch_tasks.iter().map(|task| {
-            QuerySegmentMetadata::new(
-                task.range.clone(),
-                QuerySegmentSource::Provider,
-                QueryDataFinality::Latest,
-            )
-        }));
 
         let result = NativeQueryExecutionResult {
             chain: plan.chain.clone(),
@@ -1024,6 +1061,7 @@ where
             match &plan.finality_policy {
                 FinalityPolicy::DurableCache { boundary } => boundary.finality,
                 FinalityPolicy::HotReadThrough { latest } => latest.finality,
+                FinalityPolicy::MixedReadThrough { latest, .. } => latest.finality,
             },
             query_outcome,
             cache_outcome,
@@ -1031,14 +1069,6 @@ where
             durable_write_outcome,
             row_count,
         )
-    }
-}
-
-fn query_data_finality(finality: FinalityLevel) -> QueryDataFinality {
-    match finality {
-        FinalityLevel::Finalized => QueryDataFinality::Finalized,
-        FinalityLevel::Safe | FinalityLevel::ChainSpecific(_) => QueryDataFinality::Safe,
-        FinalityLevel::Latest => QueryDataFinality::Latest,
     }
 }
 
@@ -1136,8 +1166,11 @@ fn ledger_fill_error(error: &DatalensError) -> LedgerFillOutcome {
     }
 }
 
-fn ledger_fill_outcome(cache_fill_attempted: bool, _fill_row_count: usize) -> LedgerFillOutcome {
-    if !cache_fill_attempted {
+fn ledger_fill_outcome(
+    provider_fetch_attempted: bool,
+    _fill_row_count: usize,
+) -> LedgerFillOutcome {
+    if !provider_fetch_attempted {
         LedgerFillOutcome::NotAttempted
     } else {
         LedgerFillOutcome::LiveFetch
@@ -1181,6 +1214,25 @@ fn coverage_outcome(
         (true, false) => CacheCoverageOutcome::Miss,
         (false, false) => CacheCoverageOutcome::PartialHit,
         (true, true) => CacheCoverageOutcome::Empty,
+    }
+}
+
+fn plan_coverage_outcome(plan: &datalens_planner::NativeQueryPlan) -> CacheCoverageOutcome {
+    let has_hot_fetch = plan.fetch_tasks.iter().any(|task| !task.cache_write);
+    let has_durable_work = !plan.coverage.durable_hit_ranges.is_empty()
+        || plan.fetch_tasks.iter().any(|task| task.cache_write);
+    if matches!(
+        plan.requested_finality,
+        datalens_core::QueryFinalityRequirement::SafeToLatest
+    ) && has_hot_fetch
+    {
+        if has_durable_work {
+            CacheCoverageOutcome::Mixed
+        } else {
+            CacheCoverageOutcome::HotMiss
+        }
+    } else {
+        coverage_outcome(&plan.coverage.hit_ranges, &plan.coverage.missing_ranges)
     }
 }
 
