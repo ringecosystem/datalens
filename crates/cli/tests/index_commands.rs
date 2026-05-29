@@ -12,6 +12,7 @@ use datalens_core::{
     BlockHeader, BlockRange, ChainFamily, ChainIdentity, DatalensError, DatasetKey, DatasetRows,
     LedgerRange, NetworkId, QueryRows,
 };
+use datalens_solana::SolanaAdapter;
 use datalens_storage::{LocalStorage, StorageWriteRequest};
 
 #[test]
@@ -39,19 +40,22 @@ fn test_index_backfill_accepts_required_inputs_and_dry_run() {
     ]);
 
     match cli.command {
-        Command::Index(IndexCommand {
-            command: IndexSubcommand::Backfill(command),
-        }) => {
-            assert_eq!(command.common.config, "custom.toml");
-            assert_eq!(command.common.chain, "ethereum");
-            assert_eq!(command.common.datasets, vec!["blocks"]);
-            assert_eq!(command.common.range_kind, "block");
-            assert_eq!(command.common.range_start, 10);
-            assert_eq!(command.common.range_end, 12);
-            assert_eq!(command.common.application, "Indexer_App");
-            assert!(command.dry_run);
-            assert!(command.common.json);
-        }
+        Command::Index(command) => match *command {
+            IndexCommand {
+                command: IndexSubcommand::Backfill(command),
+            } => {
+                assert_eq!(command.common.config, "custom.toml");
+                assert_eq!(command.common.chain, "ethereum");
+                assert_eq!(command.common.datasets, vec!["blocks"]);
+                assert_eq!(command.common.range_kind, "block");
+                assert_eq!(command.common.range_start, 10);
+                assert_eq!(command.common.range_end, 12);
+                assert_eq!(command.common.application, "Indexer_App");
+                assert!(command.dry_run);
+                assert!(command.common.json);
+            }
+            command => panic!("expected index backfill command, got {command:?}"),
+        },
         command => panic!("expected index backfill command, got {command:?}"),
     }
 }
@@ -90,17 +94,20 @@ fn test_index_backfill_accepts_tron_event_names() {
     ]);
 
     match cli.command {
-        Command::Index(IndexCommand {
-            command: IndexSubcommand::Backfill(command),
-        }) => {
-            assert_eq!(command.common.chain, "tron-mainnet");
-            assert_eq!(command.common.datasets, vec!["events"]);
-            assert_eq!(command.common.addresses.len(), 2);
-            assert_eq!(
-                command.common.event_names,
-                vec!["MessageAccepted", "MessageDispatched"]
-            );
-        }
+        Command::Index(command) => match *command {
+            IndexCommand {
+                command: IndexSubcommand::Backfill(command),
+            } => {
+                assert_eq!(command.common.chain, "tron-mainnet");
+                assert_eq!(command.common.datasets, vec!["events"]);
+                assert_eq!(command.common.addresses.len(), 2);
+                assert_eq!(
+                    command.common.event_names,
+                    vec!["MessageAccepted", "MessageDispatched"]
+                );
+            }
+            command => panic!("expected index backfill command, got {command:?}"),
+        },
         command => panic!("expected index backfill command, got {command:?}"),
     }
 }
@@ -136,6 +143,87 @@ fn test_index_backfill_tron_events_builds_tron_event_selector() {
 }
 
 #[test]
+fn test_index_backfill_solana_instructions_builds_program_selector() {
+    let root = temp_storage_root("index-solana-program-selector");
+    let config = write_solana_config("index-solana-program-selector", &root);
+    let mut common = index_common(config, 10, 12);
+    common.chain = "solana-mainnet-beta".to_owned();
+    common.datasets = vec!["instructions".to_owned()];
+    common.range_kind = "slot".to_owned();
+    common.program_id = Some("program1111111111111111111111111111111111".to_owned());
+
+    let output = index_summary_with_adapter(
+        IndexWorkflowCommand::Backfill(IndexBackfillCommand {
+            common,
+            dry_run: true,
+        }),
+        SolanaAdapter::with_fixture_defaults(),
+    )
+    .expect("dry-run");
+
+    assert_eq!(output["datasets"][0]["selector_kind"], "solana_program");
+    assert_eq!(
+        output["datasets"][0]["selector_canonical_key"],
+        "program/program1111111111111111111111111111111111"
+    );
+}
+
+#[test]
+fn test_index_backfill_solana_transactions_builds_address_selector() {
+    let root = temp_storage_root("index-solana-address-selector");
+    let config = write_solana_config("index-solana-address-selector", &root);
+    let mut common = index_common(config, 10, 12);
+    common.chain = "solana-mainnet-beta".to_owned();
+    common.datasets = vec!["transactions".to_owned()];
+    common.range_kind = "slot".to_owned();
+    common.addresses = vec!["Account111111111111111111111111111111111".to_owned()];
+
+    let output = index_summary_with_adapter(
+        IndexWorkflowCommand::Backfill(IndexBackfillCommand {
+            common,
+            dry_run: true,
+        }),
+        SolanaAdapter::with_fixture_defaults(),
+    )
+    .expect("dry-run");
+
+    assert_eq!(output["datasets"][0]["selector_kind"], "solana_address");
+    assert_eq!(
+        output["datasets"][0]["selector_canonical_key"],
+        "address/Account111111111111111111111111111111111"
+    );
+}
+
+#[test]
+fn test_index_backfill_rejects_solana_selectors_for_blocks_and_slots() {
+    for dataset in ["blocks", "slots"] {
+        let root = temp_storage_root(&format!("index-solana-reject-{dataset}"));
+        let config = write_solana_config(&format!("index-solana-reject-{dataset}"), &root);
+        let mut common = index_common(config, 10, 12);
+        common.chain = "solana-mainnet-beta".to_owned();
+        common.datasets = vec![dataset.to_owned()];
+        common.range_kind = "slot".to_owned();
+        common.program_id = Some("program1111111111111111111111111111111111".to_owned());
+
+        let error = index_summary_with_adapter(
+            IndexWorkflowCommand::Backfill(IndexBackfillCommand {
+                common,
+                dry_run: true,
+            }),
+            SolanaAdapter::with_fixture_defaults(),
+        )
+        .expect_err("selector rejected");
+
+        assert_eq!(error.kind, datalens_core::DatalensErrorKind::InvalidInput);
+        assert!(
+            error
+                .message
+                .contains("Solana blocks and slots only support all selectors")
+        );
+    }
+}
+
+#[test]
 fn test_index_resume_repair_and_verify_parse_required_inputs() {
     for workflow in ["resume", "repair", "verify"] {
         let cli = Cli::parse_from([
@@ -159,7 +247,8 @@ fn test_index_resume_repair_and_verify_parse_required_inputs() {
         ]);
 
         match cli.command {
-            Command::Index(IndexCommand { command }) => {
+            Command::Index(index) => {
+                let IndexCommand { command } = *index;
                 assert_eq!(index_test_common(&command).config, "custom.toml");
                 assert_eq!(index_test_common(&command).chain, "ethereum");
                 assert_eq!(index_test_common(&command).datasets, vec!["blocks"]);
@@ -656,9 +745,65 @@ fn index_common(config: String, start: u64, end: u64) -> IndexCommonCommand {
         finality: None,
         json: true,
         addresses: Vec::new(),
+        account: None,
+        program_id: None,
+        signature: None,
         topics: Vec::new(),
         event_names: Vec::new(),
     }
+}
+
+fn write_solana_config(name: &str, storage_root: &std::path::Path) -> String {
+    let config_path = storage_root.join(format!("{name}.toml"));
+    std::fs::create_dir_all(storage_root).expect("create config root");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+            [server]
+            bind = "127.0.0.1:8080"
+
+            [storage]
+            backend = "local"
+
+            [storage.local]
+            root = "{}"
+
+            [planner]
+            max_query_range_blocks = 100
+            default_chunk_range_blocks = 10
+
+            [writer]
+            target_object_bytes = 1024
+            min_object_rows = 1
+            record_empty_coverage = true
+
+            [index]
+            default_chunk_range = 2
+            max_concurrency = 1
+            default_finality = "finalized"
+            cursor_path = "{}"
+
+            [chains.solana-mainnet-beta]
+            kind = "solana"
+            chain_id = 101
+            rpc_urls = ["http://example.invalid"]
+
+            [chains.solana-mainnet-beta.datasets.blocks]
+            enabled = true
+            max_batch_blocks = 10
+
+            [chains.solana-mainnet-beta.datasets.logs]
+            enabled = true
+            max_get_logs_range_blocks = 10
+            max_addresses_per_query = 2
+            "#,
+            storage_root.display(),
+            storage_root.join("cursors").display()
+        ),
+    )
+    .expect("write config");
+    config_path.to_string_lossy().into_owned()
 }
 
 fn index_test_common(command: &IndexWorkflowCommand) -> &IndexCommonCommand {

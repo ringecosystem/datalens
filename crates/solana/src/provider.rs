@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 
 use crate::{
     SolanaBlock, SolanaCommitment, SolanaInnerInstructionGroup, SolanaInstruction, SolanaRpc,
-    SolanaTokenBalance, SolanaTransaction,
+    SolanaSignatureInfo, SolanaTokenBalance, SolanaTransaction, SolanaTransactionWithSlot,
 };
 
 #[derive(Clone, Debug)]
@@ -131,6 +131,52 @@ impl SolanaRpc for SolanaHttpRpc {
             return Ok(None);
         }
         parse_block(slot, &result).map(Some)
+    }
+
+    fn get_signatures_for_address(
+        &self,
+        address: &str,
+        before: Option<&str>,
+        until: Option<&str>,
+        limit: usize,
+        commitment: SolanaCommitment,
+    ) -> Result<Vec<SolanaSignatureInfo>, DatalensError> {
+        let mut config = serde_json::Map::new();
+        config.insert("commitment".to_owned(), json!(commitment.as_str()));
+        config.insert("limit".to_owned(), json!(limit));
+        if let Some(before) = before {
+            config.insert("before".to_owned(), json!(before));
+        }
+        if let Some(until) = until {
+            config.insert("until".to_owned(), json!(until));
+        }
+        let result = self.call("getSignaturesForAddress", json!([address, config]))?;
+        let signatures = result.as_array().ok_or_else(|| {
+            DatalensError::new(
+                DatalensErrorKind::ProviderFailure,
+                "invalid getSignaturesForAddress result",
+            )
+        })?;
+        signatures.iter().map(parse_signature_info).collect()
+    }
+
+    fn get_transaction(
+        &self,
+        signature: &str,
+        commitment: SolanaCommitment,
+    ) -> Result<Option<SolanaTransactionWithSlot>, DatalensError> {
+        let result = self.call(
+            "getTransaction",
+            json!([signature, {
+                "commitment": commitment.as_str(),
+                "encoding": "jsonParsed",
+                "maxSupportedTransactionVersion": 0,
+            }]),
+        )?;
+        if result.is_null() {
+            return Ok(None);
+        }
+        parse_transaction_with_slot(&result).map(Some)
     }
 
     fn provider_name(&self) -> &'static str {
@@ -303,6 +349,42 @@ fn parse_block(slot: u64, value: &Value) -> Result<SolanaBlock, DatalensError> {
             })?,
         block_time: value.get("blockTime").and_then(Value::as_u64),
         transactions,
+        raw: value.clone(),
+    })
+}
+
+fn parse_signature_info(value: &Value) -> Result<SolanaSignatureInfo, DatalensError> {
+    Ok(SolanaSignatureInfo {
+        signature: string_field(value, "signature")?,
+        slot: value.get("slot").and_then(Value::as_u64).ok_or_else(|| {
+            DatalensError::new(
+                DatalensErrorKind::ProviderFailure,
+                "missing getSignaturesForAddress slot",
+            )
+        })?,
+    })
+}
+
+fn parse_transaction_with_slot(value: &Value) -> Result<SolanaTransactionWithSlot, DatalensError> {
+    let transaction = parse_transaction(value)?;
+    let slot = value.get("slot").and_then(Value::as_u64).ok_or_else(|| {
+        DatalensError::new(
+            DatalensErrorKind::ProviderFailure,
+            "missing transaction slot",
+        )
+    })?;
+    let blockhash = value
+        .get("transaction")
+        .and_then(|transaction| transaction.get("message"))
+        .and_then(|message| message.get("recentBlockhash"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    Ok(SolanaTransactionWithSlot {
+        slot,
+        block_time: value.get("blockTime").and_then(Value::as_u64),
+        blockhash,
+        transaction,
         raw: value.clone(),
     })
 }

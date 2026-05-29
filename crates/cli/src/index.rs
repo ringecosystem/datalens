@@ -15,7 +15,10 @@ use datalens_indexer::{
     IndexSkippedRange, IndexVerificationRange,
 };
 use datalens_metrics::ApplicationIdentity;
-use datalens_solana::{SolanaAdapter, SolanaHttpRpc};
+use datalens_solana::{
+    SolanaAdapter, SolanaHttpRpc, solana_address_selector, solana_program_selector,
+    solana_signature_selector,
+};
 use datalens_storage::StorageRepository;
 use datalens_tron::{TronAdapter, TronEventFilter, TronHttpProvider, tron_event_selector};
 use datalens_writer::DurableWriterConfig;
@@ -108,6 +111,15 @@ pub struct IndexCommonCommand {
 
     #[arg(long = "address")]
     pub addresses: Vec<String>,
+
+    #[arg(long = "account")]
+    pub account: Option<String>,
+
+    #[arg(long = "program-id")]
+    pub program_id: Option<String>,
+
+    #[arg(long = "signature")]
+    pub signature: Option<String>,
 
     #[arg(long = "topic")]
     pub topics: Vec<String>,
@@ -411,7 +423,69 @@ fn dataset_selector(
             event_names: common.event_names.clone(),
         });
     }
+    if chain.kind == "solana" {
+        return solana_dataset_selector(dataset, common);
+    }
     Ok(DatasetSelector::all())
+}
+
+fn solana_dataset_selector(
+    dataset: &str,
+    common: &IndexCommonCommand,
+) -> Result<DatasetSelector, DatalensError> {
+    let address = common.account.as_ref().or_else(|| common.addresses.first());
+    if common.addresses.len() > 1 || (common.account.is_some() && !common.addresses.is_empty()) {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "Solana index accepts only one account/address selector",
+        ));
+    }
+    let selector_count = usize::from(common.program_id.is_some())
+        + usize::from(address.is_some())
+        + usize::from(common.signature.is_some());
+    if selector_count > 1 {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "Solana index accepts only one of --program-id, --address/--account, or --signature",
+        ));
+    }
+
+    match dataset {
+        "slots" | "blocks" => {
+            if selector_count == 0 {
+                Ok(DatasetSelector::all())
+            } else {
+                Err(DatalensError::new(
+                    DatalensErrorKind::InvalidInput,
+                    "Solana blocks and slots only support all selectors",
+                ))
+            }
+        }
+        "instructions" => {
+            if let Some(program_id) = &common.program_id {
+                solana_program_selector(program_id)
+            } else if selector_count == 0 {
+                Ok(DatasetSelector::all())
+            } else {
+                Err(DatalensError::new(
+                    DatalensErrorKind::InvalidInput,
+                    "Solana instructions only support --program-id selectors",
+                ))
+            }
+        }
+        "transactions" | "account_updates" => {
+            if let Some(program_id) = &common.program_id {
+                solana_program_selector(program_id)
+            } else if let Some(address) = address {
+                solana_address_selector(address)
+            } else if let Some(signature) = &common.signature {
+                solana_signature_selector(signature)
+            } else {
+                Ok(DatasetSelector::all())
+            }
+        }
+        _ => Ok(DatasetSelector::all()),
+    }
 }
 
 fn range_kind(value: &str) -> Result<HeightRangeKind, DatalensError> {
@@ -632,6 +706,7 @@ fn selected_dataset_summary(job: &IndexJob) -> Vec<serde_json::Value> {
                 "key": dataset.dataset_key.as_str(),
                 "selector_kind": selector_kind_name(dataset.selector.kind()),
                 "selector_fingerprint": dataset.selector.fingerprint(),
+                "selector_canonical_key": dataset.selector.canonical_key(),
             })
         })
         .collect()
