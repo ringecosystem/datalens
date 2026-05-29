@@ -199,20 +199,8 @@ fn test_tron_event_selector_records_empty_fallback_coverage_for_filtered_events(
 
 #[test]
 fn test_tron_contract_event_provider_success_uses_trongrid_rows() {
-    let provider = ContractEventFixtureProvider::with_contract_events(vec![TronContractEvent {
-        contract_address: "41abcdefabcdefabcdefabcdefabcdefabcdefabcd".to_owned(),
-        event_name: Some("Transfer".to_owned()),
-        event_signature: Some("Transfer(address,address,uint256)".to_owned()),
-        indexed_fields: Vec::new(),
-        non_indexed_fields: serde_json::json!({"value":"1"}),
-        transaction_id: Some("tron-grid-tx".to_owned()),
-        block_number: 10,
-        block_hash: Some("tron-grid-block".to_owned()),
-        transaction_index: 4,
-        event_index: 5,
-        confirmed: true,
-        raw: serde_json::json!({"event_name":"Transfer"}),
-    }]);
+    let provider =
+        ContractEventFixtureProvider::with_contract_events(vec![contract_event("tron-grid-tx")]);
     let adapter = TronAdapter::with_provider(
         TronAdapter::with_fixture_defaults()
             .capabilities()
@@ -242,6 +230,148 @@ fn test_tron_contract_event_provider_success_uses_trongrid_rows() {
     assert_eq!(rows[0]["transaction_id"], "tron-grid-tx");
     assert_eq!(rows[0]["source"]["provider"], "trongrid_contract_events");
     assert_eq!(provider.contract_event_calls(), 1);
+}
+
+#[test]
+fn test_tron_contract_event_provider_multi_page_success_uses_all_pages() {
+    let provider = ContractEventFixtureProvider::with_contract_event_pages(vec![
+        TronContractEventPage {
+            events: vec![contract_event("tron-grid-tx-1")],
+            next_fingerprint: Some("page-2".to_owned()),
+            provider_calls: 1,
+        },
+        TronContractEventPage {
+            events: vec![contract_event("tron-grid-tx-2")],
+            next_fingerprint: None,
+            provider_calls: 1,
+        },
+    ]);
+    let adapter = TronAdapter::with_provider(
+        TronAdapter::with_fixture_defaults()
+            .capabilities()
+            .chain()
+            .clone(),
+        provider.clone(),
+    );
+    let selector = tron_event_selector(TronEventFilter {
+        contract_addresses: vec!["0xabcdefabcdefabcdefabcdefabcdefabcdefabcd".to_owned()],
+        event_names: vec!["Transfer".to_owned()],
+    })
+    .expect("selector");
+
+    let response = adapter
+        .fetch(datalens_chain::ChainFetchRequest::new(
+            adapter.capabilities().chain().clone(),
+            DatasetKey::tron_events(),
+            LedgerRange::blocks(10, 10).expect("range"),
+            selector,
+        ))
+        .expect("fetch events");
+
+    let QueryRows::AdapterJson { rows, .. } = response.rows.rows() else {
+        panic!("expected adapter JSON rows");
+    };
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["transaction_id"], "tron-grid-tx-1");
+    assert_eq!(rows[1]["transaction_id"], "tron-grid-tx-2");
+    assert_eq!(provider.contract_event_calls(), 2);
+}
+
+#[test]
+fn test_tron_contract_event_provider_repeated_fingerprint_fails_without_fallback() {
+    let provider =
+        ContractEventFixtureProvider::with_contract_event_pages(vec![TronContractEventPage {
+            events: vec![contract_event("tron-grid-tx")],
+            next_fingerprint: Some("same-page".to_owned()),
+            provider_calls: 1,
+        }])
+        .with_loop_guard(4);
+    let adapter = TronAdapter::with_provider(
+        TronAdapter::with_fixture_defaults()
+            .capabilities()
+            .chain()
+            .clone(),
+        provider.clone(),
+    );
+    let selector = tron_event_selector(TronEventFilter {
+        contract_addresses: vec!["0xabcdefabcdefabcdefabcdefabcdefabcdefabcd".to_owned()],
+        event_names: vec!["Transfer".to_owned()],
+    })
+    .expect("selector");
+
+    let error = adapter
+        .fetch(datalens_chain::ChainFetchRequest::new(
+            adapter.capabilities().chain().clone(),
+            DatasetKey::tron_events(),
+            LedgerRange::blocks(10, 10).expect("range"),
+            selector,
+        ))
+        .expect_err("repeated fingerprint should fail");
+
+    assert_eq!(error.kind, DatalensErrorKind::ProviderLimit);
+    assert!(
+        error
+            .message
+            .contains("repeated TronGrid contract event fingerprint")
+    );
+    assert_eq!(provider.contract_event_calls(), 2);
+}
+
+#[test]
+fn test_tron_contract_event_provider_page_cap_fails_without_durable_coverage() {
+    let storage = LocalStorage::new(temp_storage_root("contract-event-page-cap"));
+    let provider = ContractEventFixtureProvider::with_contract_event_pages(vec![
+        TronContractEventPage {
+            events: vec![contract_event("tron-grid-tx-1")],
+            next_fingerprint: Some("page-2".to_owned()),
+            provider_calls: 1,
+        },
+        TronContractEventPage {
+            events: vec![contract_event("tron-grid-tx-2")],
+            next_fingerprint: Some("page-3".to_owned()),
+            provider_calls: 1,
+        },
+    ]);
+    let adapter = TronAdapter::with_provider(
+        TronAdapter::with_fixture_defaults()
+            .capabilities()
+            .chain()
+            .clone(),
+        provider.clone(),
+    )
+    .with_max_contract_event_pages(1);
+    let runtime = runtime(adapter.clone(), storage.clone());
+    let selector = tron_event_selector(TronEventFilter {
+        contract_addresses: vec!["0xabcdefabcdefabcdefabcdefabcdefabcdefabcd".to_owned()],
+        event_names: vec!["Transfer".to_owned()],
+    })
+    .expect("selector");
+
+    let error = runtime
+        .run(tron_job(
+            vec![IndexDatasetRequest {
+                dataset_key: DatasetKey::tron_events(),
+                selector: selector.clone(),
+            }],
+            10,
+            10,
+            IndexRunMode::Backfill,
+        ))
+        .expect_err("page cap should fail indexing");
+
+    assert_eq!(error.kind, DatalensErrorKind::ProviderLimit);
+    assert!(error.message.contains("TronGrid contract event page limit"));
+    assert_eq!(
+        storage
+            .covered_ranges(
+                adapter.capabilities().chain(),
+                &DatasetKey::tron_events(),
+                &selector,
+                LedgerRange::blocks(10, 10).expect("range"),
+            )
+            .expect("coverage"),
+        Vec::<LedgerRange>::new()
+    );
 }
 
 #[test]
@@ -402,10 +532,10 @@ fn test_tron_durable_query_reads_indexed_transactions() {
     assert_eq!(rows[0]["block_number"], 10);
 }
 
-fn runtime(
-    adapter: TronAdapter<TronFixtureProviderRpc>,
+fn runtime<P: TronProvider>(
+    adapter: TronAdapter<P>,
     storage: LocalStorage,
-) -> IndexRuntime<TronAdapter<TronFixtureProviderRpc>, LocalStorage, InMemoryIndexCursorStore> {
+) -> IndexRuntime<TronAdapter<P>, LocalStorage, InMemoryIndexCursorStore> {
     IndexRuntime::new(
         adapter,
         storage,
@@ -501,26 +631,42 @@ fn temp_storage_root(name: &str) -> std::path::PathBuf {
 
 #[derive(Clone, Debug)]
 struct ContractEventFixtureProvider {
-    events: Vec<TronContractEvent>,
+    pages: Vec<TronContractEventPage>,
     error: Option<DatalensErrorKind>,
+    loop_guard: Option<usize>,
     contract_event_calls: Arc<Mutex<usize>>,
 }
 
 impl ContractEventFixtureProvider {
     fn with_contract_events(events: Vec<TronContractEvent>) -> Self {
-        Self {
+        Self::with_contract_event_pages(vec![TronContractEventPage {
             events,
+            next_fingerprint: None,
+            provider_calls: 1,
+        }])
+    }
+
+    fn with_contract_event_pages(pages: Vec<TronContractEventPage>) -> Self {
+        Self {
+            pages,
             error: None,
+            loop_guard: None,
             contract_event_calls: Arc::new(Mutex::new(0)),
         }
     }
 
     fn with_error(error: DatalensErrorKind) -> Self {
         Self {
-            events: Vec::new(),
+            pages: Vec::new(),
             error: Some(error),
+            loop_guard: None,
             contract_event_calls: Arc::new(Mutex::new(0)),
         }
+    }
+
+    fn with_loop_guard(mut self, loop_guard: usize) -> Self {
+        self.loop_guard = Some(loop_guard);
+        self
     }
 
     fn contract_event_calls(&self) -> usize {
@@ -559,21 +705,54 @@ impl TronProvider for ContractEventFixtureProvider {
         &self,
         _request: TronContractEventRequest,
     ) -> Result<TronContractEventPage, DatalensError> {
-        *self
+        let mut contract_event_calls = self
             .contract_event_calls
             .lock()
-            .expect("contract event calls") += 1;
+            .expect("contract event calls");
+        *contract_event_calls += 1;
+        let call_index = *contract_event_calls - 1;
         if let Some(error) = &self.error {
             return Err(DatalensError::new(error.clone(), "contract event failure"));
         }
-        Ok(TronContractEventPage {
-            events: self.events.clone(),
-            next_fingerprint: None,
-            provider_calls: 1,
-        })
+        if self
+            .loop_guard
+            .is_some_and(|loop_guard| *contract_event_calls > loop_guard)
+        {
+            return Err(DatalensError::new(
+                DatalensErrorKind::ProviderFailure,
+                "contract event fixture loop guard exceeded",
+            ));
+        }
+        Ok(self
+            .pages
+            .get(call_index)
+            .or_else(|| self.pages.last())
+            .cloned()
+            .unwrap_or_else(|| TronContractEventPage {
+                events: Vec::new(),
+                next_fingerprint: None,
+                provider_calls: 1,
+            }))
     }
 
     fn provider_name(&self) -> &'static str {
         "contract-event-fixture"
+    }
+}
+
+fn contract_event(transaction_id: &str) -> TronContractEvent {
+    TronContractEvent {
+        contract_address: "41abcdefabcdefabcdefabcdefabcdefabcdefabcd".to_owned(),
+        event_name: Some("Transfer".to_owned()),
+        event_signature: Some("Transfer(address,address,uint256)".to_owned()),
+        indexed_fields: Vec::new(),
+        non_indexed_fields: serde_json::json!({"value":"1"}),
+        transaction_id: Some(transaction_id.to_owned()),
+        block_number: 10,
+        block_hash: Some("tron-grid-block".to_owned()),
+        transaction_index: 4,
+        event_index: 5,
+        confirmed: true,
+        raw: serde_json::json!({"event_name":"Transfer"}),
     }
 }
