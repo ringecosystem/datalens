@@ -30,6 +30,7 @@ const TRON_ALL_KIND: &str = "tron_all";
 const TRON_EVENTS_KIND: &str = "tron_events";
 const FINALIZED: TronFinality = TronFinality::Finalized;
 const LATEST: TronFinality = TronFinality::Latest;
+const DEFAULT_MAX_CONTRACT_EVENT_PAGES: usize = 100;
 
 type BlockCache = Arc<Mutex<HashMap<(u64, u64), Vec<TronBlock>>>>;
 type TransactionInfoCache = Arc<Mutex<HashMap<String, Value>>>;
@@ -123,6 +124,7 @@ pub struct TronAdapter<P> {
     chain: ChainIdentity,
     provider: P,
     max_block_range_len: u64,
+    max_contract_event_pages: usize,
     block_cache: BlockCache,
     transaction_info_cache: TransactionInfoCache,
 }
@@ -136,6 +138,7 @@ where
             chain,
             provider,
             max_block_range_len: 64,
+            max_contract_event_pages: DEFAULT_MAX_CONTRACT_EVENT_PAGES,
             block_cache: Arc::new(Mutex::new(HashMap::new())),
             transaction_info_cache: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -143,6 +146,11 @@ where
 
     pub fn with_max_block_range_len(mut self, max_block_range_len: u64) -> Self {
         self.max_block_range_len = max_block_range_len.max(1);
+        self
+    }
+
+    pub fn with_max_contract_event_pages(mut self, max_contract_event_pages: usize) -> Self {
+        self.max_contract_event_pages = max_contract_event_pages.max(1);
         self
     }
 

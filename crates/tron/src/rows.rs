@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use datalens_chain::{ChainFetchRequest, DatasetSelector};
 use datalens_core::{DatalensError, DatalensErrorKind, LedgerRange};
 use serde_json::{Value, json};
@@ -209,6 +211,8 @@ where
             };
             for event_name in event_names {
                 let mut fingerprint = None;
+                let mut pages = 0;
+                let mut seen_fingerprints = HashSet::new();
                 loop {
                     let page = self
                         .provider
@@ -220,6 +224,7 @@ where
                             limit: 200,
                             fingerprint: fingerprint.clone(),
                         })?;
+                    pages += 1;
                     calls += page.provider_calls;
                     rows.extend(
                         page.events
@@ -232,6 +237,31 @@ where
                     let Some(next) = page.next_fingerprint else {
                         break;
                     };
+                    if !seen_fingerprints.insert(next.clone()) {
+                        return Err(DatalensError::new(
+                            DatalensErrorKind::ProviderLimit,
+                            format!(
+                                "repeated TronGrid contract event fingerprint for contract {} event {} range {}-{}",
+                                contract_address,
+                                event_name.as_deref().unwrap_or("all"),
+                                range.start(),
+                                range.end()
+                            ),
+                        ));
+                    }
+                    if pages >= self.max_contract_event_pages {
+                        return Err(DatalensError::new(
+                            DatalensErrorKind::ProviderLimit,
+                            format!(
+                                "TronGrid contract event page limit {} reached for contract {} event {} range {}-{}",
+                                self.max_contract_event_pages,
+                                contract_address,
+                                event_name.as_deref().unwrap_or("all"),
+                                range.start(),
+                                range.end()
+                            ),
+                        ));
+                    }
                     fingerprint = Some(next);
                 }
             }
@@ -265,7 +295,6 @@ pub(crate) fn should_fallback_from_contract_events(error: &DatalensError) -> boo
         DatalensErrorKind::AuthenticationFailed
         | DatalensErrorKind::Unauthorized
         | DatalensErrorKind::RateLimited
-        | DatalensErrorKind::ProviderLimit
         | DatalensErrorKind::ProviderTimeout
         | DatalensErrorKind::UnsupportedDataset => true,
         DatalensErrorKind::ProviderFailure => {
