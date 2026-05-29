@@ -1,4 +1,4 @@
-use datalens_core::{ChainFamily, ChainIdentity, DatalensErrorKind, Dataset};
+use datalens_core::{ChainFamily, ChainIdentity, DatalensErrorKind, DatasetKey};
 use datalens_metrics::{
     ApplicationIdentity, CacheCoverageOutcome, DurableWriteOutcome, ErrorLabels, FillOutcome,
     HotReorgOutcome, MetricsLabels, MetricsRecorder, QueryOutcome, WarmupFetchOutcome,
@@ -31,30 +31,30 @@ fn test_record_metrics_renders_prometheus_text_with_expected_labels() {
 
     assert!(output.contains("datalens_query_total"));
     assert!(output.contains(
-        r#"datalens_query_total{application="indexer",chain="ethereum",chain_kind="evm",dataset="logs",outcome="miss"} 1"#
+        r#"datalens_query_total{application="indexer",chain="ethereum",chain_kind="evm",dataset="evm.logs",outcome="miss"} 1"#
     ));
     assert!(output.contains("datalens_query_duration_seconds"));
     assert!(output.contains(
-        r#"datalens_cache_coverage_total{application="indexer",chain="ethereum",chain_kind="evm",dataset="logs",outcome="partial_hit"} 1"#
+        r#"datalens_cache_coverage_total{application="indexer",chain="ethereum",chain_kind="evm",dataset="evm.logs",outcome="partial_hit"} 1"#
     ));
     assert!(output.contains(
-        r#"datalens_fill_total{application="indexer",chain="ethereum",chain_kind="evm",dataset="logs",outcome="filled"} 1"#
+        r#"datalens_fill_total{application="indexer",chain="ethereum",chain_kind="evm",dataset="evm.logs",outcome="filled"} 1"#
     ));
     assert!(output.contains(
-        r#"datalens_durable_write_total{application="indexer",chain="ethereum",chain_kind="evm",dataset="logs",outcome="staged"} 1"#
+        r#"datalens_durable_write_total{application="indexer",chain="ethereum",chain_kind="evm",dataset="evm.logs",outcome="staged"} 1"#
     ));
     assert!(output.contains("datalens_fill_duration_seconds"));
     assert!(output.contains(
-        r#"datalens_provider_error_total{chain="ethereum",chain_kind="evm",dataset="logs",error_kind="provider_timeout"} 1"#
+        r#"datalens_provider_error_total{chain="ethereum",chain_kind="evm",dataset="evm.logs",error_kind="provider_timeout"} 1"#
     ));
     assert!(output.contains(
-        r#"datalens_storage_error_total{chain="ethereum",chain_kind="evm",dataset="logs",error_kind="storage_read_failure"} 1"#
+        r#"datalens_storage_error_total{chain="ethereum",chain_kind="evm",dataset="evm.logs",error_kind="storage_read_failure"} 1"#
     ));
     assert!(output.contains(
-        r#"datalens_application_chain_latest_requested_block{application="indexer",chain="ethereum",chain_kind="evm",dataset="logs"} 42"#
+        r#"datalens_application_chain_latest_requested_block{application="indexer",chain="ethereum",chain_kind="evm",dataset="evm.logs"} 42"#
     ));
     assert!(output.contains(
-        r#"datalens_application_chain_latest_filled_block{application="indexer",chain="ethereum",chain_kind="evm",dataset="logs"} 40"#
+        r#"datalens_application_chain_latest_filled_block{application="indexer",chain="ethereum",chain_kind="evm",dataset="evm.logs"} 40"#
     ));
 }
 
@@ -73,22 +73,22 @@ fn test_warmup_metrics_have_distinct_series_and_outcomes() {
     let output = recorder.encode().expect("prometheus text");
 
     assert!(output.contains(
-        r#"datalens_warmup_task_total{application="warmup-app",chain="ethereum",chain_kind="evm",dataset="logs",outcome="completed"} 1"#
+        r#"datalens_warmup_task_total{application="warmup-app",chain="ethereum",chain_kind="evm",dataset="evm.logs",outcome="completed"} 1"#
     ));
     assert!(output.contains(
-        r#"datalens_warmup_fetch_total{application="warmup-app",chain="ethereum",chain_kind="evm",dataset="logs",outcome="fetched",selector_kind="evm_logs"} 1"#
+        r#"datalens_warmup_fetch_total{application="warmup-app",chain="ethereum",chain_kind="evm",dataset="evm.logs",outcome="fetched",selector_kind="evm_logs"} 1"#
     ));
     assert!(output.contains(
-        r#"datalens_warmup_write_total{application="warmup-app",chain="ethereum",chain_kind="evm",dataset="logs",outcome="written"} 1"#
+        r#"datalens_warmup_write_total{application="warmup-app",chain="ethereum",chain_kind="evm",dataset="evm.logs",outcome="written"} 1"#
     ));
     assert!(output.contains(
-        r#"datalens_warmup_rows_total{application="warmup-app",chain="ethereum",chain_kind="evm",dataset="logs"} 7"#
+        r#"datalens_warmup_rows_total{application="warmup-app",chain="ethereum",chain_kind="evm",dataset="evm.logs"} 7"#
     ));
     assert!(output.contains(
-        r#"datalens_warmup_provider_error_total{application="warmup-app",chain="ethereum",chain_kind="evm",dataset="logs",error_kind="provider_limit",selector_kind="evm_logs"} 1"#
+        r#"datalens_warmup_provider_error_total{application="warmup-app",chain="ethereum",chain_kind="evm",dataset="evm.logs",error_kind="provider_limit",selector_kind="evm_logs"} 1"#
     ));
     assert!(output.contains(
-        r#"datalens_warmup_current_height{application="warmup-app",chain="ethereum",chain_kind="evm",dataset="logs"} 123"#
+        r#"datalens_warmup_current_height{application="warmup-app",chain="ethereum",chain_kind="evm",dataset="evm.logs"} 123"#
     ));
 }
 
@@ -105,15 +105,15 @@ fn test_unknown_application_fallback_is_stable() {
 
 #[test]
 fn test_metrics_labels_do_not_include_filter_values() {
-    let labels = MetricsLabels::new(
+    let labels = MetricsLabels::from_dataset_key(
         ApplicationIdentity::named("wallet-search"),
         ChainIdentity::expect_new(ChainFamily::Evm, "ethereum"),
-        Dataset::Logs,
+        DatasetKey::evm_logs(),
     );
 
     assert_eq!(
         labels.label_values(),
-        ["wallet-search", "ethereum", "evm", "logs"]
+        ["wallet-search", "ethereum", "evm", "evm.logs"]
     );
 
     let recorder = MetricsRecorder::new().expect("metrics recorder");
@@ -137,16 +137,16 @@ fn test_hot_cache_metrics_have_distinct_outcome_labels() {
     let output = recorder.encode().expect("prometheus text");
 
     assert!(output.contains(
-        r#"datalens_query_total{application="indexer",chain="ethereum",chain_kind="evm",dataset="logs",outcome="hot_hit"} 1"#
+        r#"datalens_query_total{application="indexer",chain="ethereum",chain_kind="evm",dataset="evm.logs",outcome="hot_hit"} 1"#
     ));
     assert!(output.contains(
-        r#"datalens_cache_coverage_total{application="indexer",chain="ethereum",chain_kind="evm",dataset="logs",outcome="hot_miss"} 1"#
+        r#"datalens_cache_coverage_total{application="indexer",chain="ethereum",chain_kind="evm",dataset="evm.logs",outcome="hot_miss"} 1"#
     ));
     assert!(output.contains(
-        r#"datalens_fill_total{application="indexer",chain="ethereum",chain_kind="evm",dataset="logs",outcome="live_fetch"} 1"#
+        r#"datalens_fill_total{application="indexer",chain="ethereum",chain_kind="evm",dataset="evm.logs",outcome="live_fetch"} 1"#
     ));
     assert!(output.contains(
-        r#"datalens_fill_total{application="indexer",chain="ethereum",chain_kind="evm",dataset="logs",outcome="promotion_written"} 1"#
+        r#"datalens_fill_total{application="indexer",chain="ethereum",chain_kind="evm",dataset="evm.logs",outcome="promotion_written"} 1"#
     ));
 }
 
@@ -163,23 +163,61 @@ fn test_hot_reorg_metrics_record_detection_rollback_stale_and_refetch_outcomes()
     let output = recorder.encode().expect("prometheus text");
 
     assert!(output.contains(
-        r#"datalens_hot_reorg_total{application="indexer",chain="ethereum",chain_kind="evm",dataset="logs",outcome="detected"} 1"#
+        r#"datalens_hot_reorg_total{application="indexer",chain="ethereum",chain_kind="evm",dataset="evm.logs",outcome="detected"} 1"#
     ));
     assert!(output.contains(
-        r#"datalens_hot_reorg_total{application="indexer",chain="ethereum",chain_kind="evm",dataset="logs",outcome="rollback_applied"} 1"#
+        r#"datalens_hot_reorg_total{application="indexer",chain="ethereum",chain_kind="evm",dataset="evm.logs",outcome="rollback_applied"} 1"#
     ));
     assert!(output.contains(
-        r#"datalens_hot_reorg_total{application="indexer",chain="ethereum",chain_kind="evm",dataset="logs",outcome="stale_entry"} 3"#
+        r#"datalens_hot_reorg_total{application="indexer",chain="ethereum",chain_kind="evm",dataset="evm.logs",outcome="stale_entry"} 3"#
     ));
     assert!(output.contains(
-        r#"datalens_hot_reorg_total{application="indexer",chain="ethereum",chain_kind="evm",dataset="logs",outcome="refetch_succeeded"} 1"#
+        r#"datalens_hot_reorg_total{application="indexer",chain="ethereum",chain_kind="evm",dataset="evm.logs",outcome="refetch_succeeded"} 1"#
     ));
 }
 
+#[test]
+fn test_metrics_labels_preserve_native_dataset_keys() {
+    assert_eq!(
+        labels_with(
+            ChainIdentity::expect_new(ChainFamily::Evm, "ethereum"),
+            DatasetKey::evm_logs(),
+        )
+        .label_values(),
+        ["indexer", "ethereum", "evm", "evm.logs"]
+    );
+    assert_eq!(
+        labels_with(
+            ChainIdentity::expect_new(
+                ChainFamily::try_other("solana").expect("solana family"),
+                "solana-mainnet-beta",
+            ),
+            DatasetKey::solana_slots(),
+        )
+        .label_values(),
+        ["indexer", "solana-mainnet-beta", "solana", "solana.slots"]
+    );
+    assert_eq!(
+        labels_with(
+            ChainIdentity::expect_new(
+                ChainFamily::try_other("tron").expect("tron family"),
+                "tron-mainnet",
+            ),
+            DatasetKey::tron_blocks(),
+        )
+        .label_values(),
+        ["indexer", "tron-mainnet", "tron", "tron.blocks"]
+    );
+}
+
 fn labels(application: Option<&str>) -> MetricsLabels {
-    MetricsLabels::new(
+    MetricsLabels::from_dataset_key(
         ApplicationIdentity::from_optional(application),
         ChainIdentity::expect_new(ChainFamily::Evm, "ethereum"),
-        Dataset::Logs,
+        DatasetKey::evm_logs(),
     )
+}
+
+fn labels_with(chain: ChainIdentity, dataset_key: DatasetKey) -> MetricsLabels {
+    MetricsLabels::from_dataset_key(ApplicationIdentity::named("indexer"), chain, dataset_key)
 }

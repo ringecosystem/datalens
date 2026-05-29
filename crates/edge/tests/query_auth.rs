@@ -3,7 +3,7 @@ mod support;
 use support::query::*;
 
 #[tokio::test]
-async fn test_registered_application_query_uses_normalized_metrics_label() {
+async fn test_registered_application_query_uses_native_dataset_metrics_label() {
     let storage = LocalStorage::new(temp_storage_root("app-auth-metrics"));
     let source = MockSource::default().with_blocks(vec![block(10, "0x10")]);
     let registry = QueryServiceRegistry::new()
@@ -48,7 +48,7 @@ async fn test_registered_application_query_uses_normalized_metrics_label() {
     let text = std::str::from_utf8(&body).expect("utf8 metrics");
 
     assert!(text.contains(
-        r#"datalens_query_total{application="indexer_app",chain="ethereum",chain_kind="evm",dataset="blocks",outcome="filled"} 1"#
+        r#"datalens_query_total{application="indexer_app",chain="ethereum",chain_kind="evm",dataset="evm.blocks",outcome="filled"} 1"#
     ));
     assert!(!text.contains("Indexer_App"));
 }

@@ -373,7 +373,7 @@ async fn test_graphql_query_records_metrics_with_application_header() {
     assert_eq!(metrics.status(), StatusCode::OK);
     let text = body_text(metrics.into_body()).await;
     assert!(text.contains(
-        r#"datalens_query_total{application="wallet-search",chain="ethereum",chain_kind="evm",dataset="blocks",outcome="filled"} 1"#
+        r#"datalens_query_total{application="wallet-search",chain="ethereum",chain_kind="evm",dataset="evm.blocks",outcome="filled"} 1"#
     ));
 }
 

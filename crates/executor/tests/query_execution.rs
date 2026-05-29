@@ -586,28 +586,28 @@ fn test_executor_records_metrics_for_cache_hit_and_fill_paths() {
 
     let output = recorder.encode().expect("prometheus text");
     assert!(output.contains(
-        r#"datalens_query_total{application="api",chain="ethereum",chain_kind="evm",dataset="blocks",outcome="hit"} 1"#
+        r#"datalens_query_total{application="api",chain="ethereum",chain_kind="evm",dataset="evm.blocks",outcome="hit"} 1"#
     ));
     assert!(output.contains(
-        r#"datalens_query_total{application="api",chain="ethereum",chain_kind="evm",dataset="blocks",outcome="partial_hit"} 1"#
+        r#"datalens_query_total{application="api",chain="ethereum",chain_kind="evm",dataset="evm.blocks",outcome="partial_hit"} 1"#
     ));
     assert!(output.contains(
-        r#"datalens_cache_coverage_total{application="api",chain="ethereum",chain_kind="evm",dataset="blocks",outcome="hit"} 1"#
+        r#"datalens_cache_coverage_total{application="api",chain="ethereum",chain_kind="evm",dataset="evm.blocks",outcome="hit"} 1"#
     ));
     assert!(output.contains(
-        r#"datalens_cache_coverage_total{application="api",chain="ethereum",chain_kind="evm",dataset="blocks",outcome="partial_hit"} 1"#
+        r#"datalens_cache_coverage_total{application="api",chain="ethereum",chain_kind="evm",dataset="evm.blocks",outcome="partial_hit"} 1"#
     ));
     assert!(output.contains(
-        r#"datalens_fill_total{application="api",chain="ethereum",chain_kind="evm",dataset="blocks",outcome="filled"} 1"#
+        r#"datalens_fill_total{application="api",chain="ethereum",chain_kind="evm",dataset="evm.blocks",outcome="filled"} 1"#
     ));
     assert!(output.contains(
-        r#"datalens_durable_write_total{application="api",chain="ethereum",chain_kind="evm",dataset="blocks",outcome="flushed"} 1"#
+        r#"datalens_durable_write_total{application="api",chain="ethereum",chain_kind="evm",dataset="evm.blocks",outcome="flushed"} 1"#
     ));
     assert!(output.contains(
-        r#"datalens_application_chain_latest_requested_block{application="api",chain="ethereum",chain_kind="evm",dataset="blocks"} 4"#
+        r#"datalens_application_chain_latest_requested_block{application="api",chain="ethereum",chain_kind="evm",dataset="evm.blocks"} 4"#
     ));
     assert!(output.contains(
-        r#"datalens_application_chain_latest_filled_block{application="api",chain="ethereum",chain_kind="evm",dataset="blocks"} 4"#
+        r#"datalens_application_chain_latest_filled_block{application="api",chain="ethereum",chain_kind="evm",dataset="evm.blocks"} 4"#
     ));
 }
 
@@ -627,13 +627,13 @@ fn test_executor_records_provider_and_storage_errors_without_rewriting_errors() 
     assert_eq!(provider_error.kind, DatalensErrorKind::ProviderLimit);
     let provider_output = provider_recorder.encode().expect("prometheus text");
     assert!(provider_output.contains(
-        r#"datalens_query_total{application="api",chain="ethereum",chain_kind="evm",dataset="blocks",outcome="error"} 1"#
+        r#"datalens_query_total{application="api",chain="ethereum",chain_kind="evm",dataset="evm.blocks",outcome="error"} 1"#
     ));
     assert!(provider_output.contains(
-        r#"datalens_fill_total{application="api",chain="ethereum",chain_kind="evm",dataset="blocks",outcome="error"} 1"#
+        r#"datalens_fill_total{application="api",chain="ethereum",chain_kind="evm",dataset="evm.blocks",outcome="error"} 1"#
     ));
     assert!(provider_output.contains(
-        r#"datalens_provider_error_total{chain="ethereum",chain_kind="evm",dataset="blocks",error_kind="provider_limit"} 1"#
+        r#"datalens_provider_error_total{chain="ethereum",chain_kind="evm",dataset="evm.blocks",error_kind="provider_limit"} 1"#
     ));
 
     let storage_recorder = MetricsRecorder::new().expect("storage metrics recorder");
@@ -650,7 +650,7 @@ fn test_executor_records_provider_and_storage_errors_without_rewriting_errors() 
     assert_eq!(storage_error.kind, DatalensErrorKind::StorageReadFailure);
     let storage_output = storage_recorder.encode().expect("prometheus text");
     assert!(storage_output.contains(
-        r#"datalens_storage_error_total{chain="ethereum",chain_kind="evm",dataset="blocks",error_kind="storage_read_failure"} 1"#
+        r#"datalens_storage_error_total{chain="ethereum",chain_kind="evm",dataset="evm.blocks",error_kind="storage_read_failure"} 1"#
     ));
 }
 

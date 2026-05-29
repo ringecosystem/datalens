@@ -211,7 +211,7 @@ async fn test_production_readiness_validates_service_staging_warmup_metrics_and_
     assert!(metrics.contains(r#"application="prod-readiness""#));
     assert!(metrics.contains(r#"chain="ethereum""#));
     assert!(metrics.contains(r#"chain_kind="evm""#));
-    assert!(metrics.contains(r#"dataset="blocks""#));
+    assert!(metrics.contains(r#"dataset="evm.blocks""#));
     assert!(metrics.contains(r#"datalens_query_total"#));
     assert!(metrics.contains(r#"outcome="hit""#));
     assert!(metrics.contains(r#"outcome="hot_miss""#));

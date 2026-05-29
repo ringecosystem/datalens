@@ -1,6 +1,6 @@
 //! Prometheus-compatible metrics recording for datalens.
 
-use datalens_core::{ChainIdentity, DatalensErrorKind, Dataset, DatasetKey};
+use datalens_core::{ChainIdentity, DatalensErrorKind, DatasetKey};
 use prometheus::{CounterVec, GaugeVec, HistogramOpts, HistogramVec, Opts, Registry, TextEncoder};
 
 const APPLICATION: &str = "unknown";
@@ -45,11 +45,7 @@ pub struct MetricsLabels {
 }
 
 impl MetricsLabels {
-    pub fn new(application: ApplicationIdentity, chain: ChainIdentity, dataset: Dataset) -> Self {
-        Self::from_dataset_key(application, chain, DatasetKey::from(dataset))
-    }
-
-    pub fn from_dataset_key(
+    pub fn new(
         application: ApplicationIdentity,
         chain: ChainIdentity,
         dataset_key: DatasetKey,
@@ -58,11 +54,16 @@ impl MetricsLabels {
             application,
             chain: chain.configured_name().to_owned(),
             chain_kind: chain.family_ref().key().to_owned(),
-            dataset: dataset_key
-                .evm_dataset()
-                .map(|dataset| dataset.as_str().to_owned())
-                .unwrap_or_else(|| dataset_key.as_str().to_owned()),
+            dataset: dataset_key.as_str().to_owned(),
         }
+    }
+
+    pub fn from_dataset_key(
+        application: ApplicationIdentity,
+        chain: ChainIdentity,
+        dataset_key: DatasetKey,
+    ) -> Self {
+        Self::new(application, chain, dataset_key)
     }
 
     pub fn label_values(&self) -> [&str; 4] {

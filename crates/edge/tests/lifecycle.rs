@@ -22,25 +22,25 @@ fn test_local_lifecycle_records_metrics_for_miss_fill_hit_and_provider_error() {
 
     let metrics = recorder.encode().expect("metrics text");
     assert!(metrics.contains(
-        r#"datalens_query_total{application="unknown",chain="ethereum",chain_kind="evm",dataset="blocks",outcome="filled"} 1"#
+        r#"datalens_query_total{application="unknown",chain="ethereum",chain_kind="evm",dataset="evm.blocks",outcome="filled"} 1"#
     ));
     assert!(metrics.contains(
-        r#"datalens_query_total{application="unknown",chain="ethereum",chain_kind="evm",dataset="blocks",outcome="hit"} 1"#
+        r#"datalens_query_total{application="unknown",chain="ethereum",chain_kind="evm",dataset="evm.blocks",outcome="hit"} 1"#
     ));
     assert!(metrics.contains(
-        r#"datalens_cache_coverage_total{application="unknown",chain="ethereum",chain_kind="evm",dataset="blocks",outcome="miss"} 1"#
+        r#"datalens_cache_coverage_total{application="unknown",chain="ethereum",chain_kind="evm",dataset="evm.blocks",outcome="miss"} 1"#
     ));
     assert!(metrics.contains(
-        r#"datalens_cache_coverage_total{application="unknown",chain="ethereum",chain_kind="evm",dataset="blocks",outcome="hit"} 1"#
+        r#"datalens_cache_coverage_total{application="unknown",chain="ethereum",chain_kind="evm",dataset="evm.blocks",outcome="hit"} 1"#
     ));
     assert!(metrics.contains(
-        r#"datalens_fill_total{application="unknown",chain="ethereum",chain_kind="evm",dataset="blocks",outcome="filled"} 1"#
+        r#"datalens_fill_total{application="unknown",chain="ethereum",chain_kind="evm",dataset="evm.blocks",outcome="filled"} 1"#
     ));
     assert!(metrics.contains(
-        r#"datalens_application_chain_latest_requested_block{application="unknown",chain="ethereum",chain_kind="evm",dataset="blocks"} 11"#
+        r#"datalens_application_chain_latest_requested_block{application="unknown",chain="ethereum",chain_kind="evm",dataset="evm.blocks"} 11"#
     ));
     assert!(metrics.contains(
-        r#"datalens_application_chain_latest_filled_block{application="unknown",chain="ethereum",chain_kind="evm",dataset="blocks"} 11"#
+        r#"datalens_application_chain_latest_filled_block{application="unknown",chain="ethereum",chain_kind="evm",dataset="evm.blocks"} 11"#
     ));
     assert_eq!(
         source.calls(),
@@ -60,7 +60,7 @@ fn test_local_lifecycle_records_metrics_for_miss_fill_hit_and_provider_error() {
 
     let metrics = recorder.encode().expect("metrics text");
     assert!(metrics.contains(
-        r#"datalens_provider_error_total{chain="ethereum",chain_kind="evm",dataset="blocks",error_kind="provider_timeout"} 1"#
+        r#"datalens_provider_error_total{chain="ethereum",chain_kind="evm",dataset="evm.blocks",error_kind="provider_timeout"} 1"#
     ));
 }
 
@@ -127,7 +127,7 @@ async fn test_api_lifecycle_routes_expose_health_chains_query_and_metrics() {
     assert!(body.contains("# HELP datalens_query_total"));
     assert!(body.contains(r#"chain="ethereum""#));
     assert!(body.contains(r#"chain_kind="evm""#));
-    assert!(body.contains(r#"dataset="blocks""#));
+    assert!(body.contains(r#"dataset="evm.blocks""#));
 }
 
 #[tokio::test]
