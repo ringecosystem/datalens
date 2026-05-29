@@ -159,7 +159,7 @@ async fn serve_command(
     let _capabilities = adapter.capabilities();
 
     log::info!("serving datalens edge on {bind}");
-    let lifecycle = datalens_edge::ServiceLifecycle::new(registry);
+    let lifecycle = datalens_edge::ServiceLifecycle::new_with_edge_config(registry, config.edge);
     if let Some(scheduler) = warmup_scheduler {
         datalens_edge::serve_lifecycle(bind, lifecycle.with_warmup_scheduler(scheduler)).await?;
     } else {

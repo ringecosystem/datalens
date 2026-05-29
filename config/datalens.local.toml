@@ -30,6 +30,10 @@ max_staged_bytes = 33554432
 enabled = true
 default_application = "local"
 
+[edge.graphql]
+enabled = true
+playground_enabled = true
+
 [warmup]
 enabled = false
 registry_path = ".tmp/datalens-warmup"

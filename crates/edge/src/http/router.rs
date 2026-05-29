@@ -16,11 +16,11 @@ use crate::{
 };
 
 pub fn router(registry: QueryServiceRegistry) -> Router {
-    router_with_api_config(registry, config::ApiConfig::default())
+    router_with_edge_config(registry, config::EdgeConfig::default())
 }
 
-pub fn router_with_api_config(registry: QueryServiceRegistry, api: config::ApiConfig) -> Router {
-    let graphql_schema = api
+pub fn router_with_edge_config(registry: QueryServiceRegistry, edge: config::EdgeConfig) -> Router {
+    let graphql_schema = edge
         .graphql
         .enabled
         .then(|| crate::graphql::schema(registry.clone()));
@@ -40,7 +40,7 @@ pub fn router_with_api_config(registry: QueryServiceRegistry, api: config::ApiCo
     if graphql_schema.is_some() {
         router = router.route("/graphql", post(crate::graphql::graphql_handler));
     }
-    if api.graphql.enabled && api.graphql.playground_enabled {
+    if edge.graphql.enabled && edge.graphql.playground_enabled {
         router = router.route("/graphql/playground", get(crate::graphql::playground));
     }
     router.with_state(AppState {

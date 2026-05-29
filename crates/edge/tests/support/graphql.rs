@@ -18,11 +18,11 @@ pub(crate) use datalens_core::{
     DatasetKey, LedgerRange, NetworkId, QueryRows,
 };
 pub(crate) use datalens_edge::config::{
-    ApiConfig, BlocksDatasetConfig, ChainConfig, DatasetsConfig, GraphqlConfig, LogsDatasetConfig,
+    BlocksDatasetConfig, ChainConfig, DatasetsConfig, EdgeConfig, GraphqlConfig, LogsDatasetConfig,
     PlannerConfig, WriterConfig,
 };
 pub(crate) use datalens_edge::{
-    QueryService, QueryServiceRegistry, router, router_with_api_config,
+    QueryService, QueryServiceRegistry, router, router_with_edge_config,
 };
 pub(crate) use datalens_solana::SolanaAdapter;
 pub(crate) use datalens_storage::{LocalObjectStore, LocalStorage};
