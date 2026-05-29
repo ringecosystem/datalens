@@ -4,16 +4,17 @@ use clap::{Args, Parser, Subcommand};
 use datalens_chain::ChainAdapter;
 pub use datalens_core::DatalensErrorKind;
 use datalens_core::{
-    BlockRange, ChainFamily, ChainIdentity, DatalensError, Dataset, EvmLogFilter, LedgerRangeKind,
-    LogFilter, NetworkId,
+    ChainFamily, ChainIdentity, DatalensError, DatasetKey, EvmLogFilter, LedgerRange,
+    LedgerRangeKind, LogFilter, NetworkId,
 };
 pub use datalens_edge::config::{ChainConfig, DatalensConfig, FinalityConfig};
 use datalens_edge::{
-    LegacyEvmQueryRequest, QueryService, QueryServiceRegistry,
+    QueryApiResponse, QueryService, QueryServiceRegistry,
     auth::{ApplicationRegistry, normalize_application_id},
 };
 use datalens_evm::{EvmAdapter, EvmAdapterMetadata, EvmFinalityPolicy, EvmRpcClient};
 use datalens_metrics::ApplicationIdentity;
+use datalens_planner::{FieldSelection, NativeQueryInput, ResponseShape};
 use datalens_solana::{SolanaAdapter, SolanaHttpRpc};
 use datalens_storage::{
     DurableStorage, LocalObjectStore, LocalStorage, ManifestEntry, ManifestFinalityLevel,
@@ -207,13 +208,13 @@ fn query_command(command: QueryCommand) -> Result<(), Box<dyn std::error::Error 
     let (chain_name, chain) = configured_chain(&config, &chain_name)?;
     let service = build_service(&config, chain_name, chain)?;
     let request = match command.command {
-        QuerySubcommand::Blocks(command) => LegacyEvmQueryRequest {
+        QuerySubcommand::Blocks(command) => NativeQueryInput {
             chain: chain_identity(chain_name, chain)?,
-            dataset: Dataset::Blocks,
-            range: BlockRange::try_new(command.from_block, command.to_block)?,
-            filter: None,
-            include_block: false,
-            allow_hot: false,
+            dataset_key: DatasetKey::evm_blocks(),
+            ledger_range: LedgerRange::blocks(command.from_block, command.to_block)?,
+            selector: datalens_chain::DatasetSelector::all(),
+            response_shape: ResponseShape::NativeRows,
+            field_selection: FieldSelection::All,
             finality: datalens_core::QueryFinalityRequirement::DurableOnly,
         },
         QuerySubcommand::Logs(command) => {
@@ -226,18 +227,18 @@ fn query_command(command: QueryCommand) -> Result<(), Box<dyn std::error::Error 
                     .collect(),
             };
             EvmLogFilter::try_from(&filter)?;
-            LegacyEvmQueryRequest {
+            NativeQueryInput {
                 chain: chain_identity(chain_name, chain)?,
-                dataset: Dataset::Logs,
-                range: BlockRange::try_new(command.from_block, command.to_block)?,
-                filter: Some(filter),
-                include_block: false,
-                allow_hot: false,
+                dataset_key: DatasetKey::evm_logs(),
+                ledger_range: LedgerRange::blocks(command.from_block, command.to_block)?,
+                selector: datalens_chain::DatasetSelector::try_evm_logs(filter)?,
+                response_shape: ResponseShape::NativeRows,
+                field_selection: FieldSelection::All,
                 finality: datalens_core::QueryFinalityRequirement::DurableOnly,
             }
         }
     };
-    let response = service.query(request)?;
+    let response = QueryApiResponse::try_from_native_response(service.query_native(request)?)?;
     println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
 }

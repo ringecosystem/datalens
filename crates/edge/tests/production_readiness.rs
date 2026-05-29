@@ -13,8 +13,8 @@ use datalens_chain::{
     DatasetCapability, FinalityKind, HeightRangeKind, ProviderDiagnostics, SelectorKind,
 };
 use datalens_core::{
-    BlockHeader, BlockRange, ChainFamily, ChainIdentity, DatalensError, Dataset, LogFilter,
-    NetworkId, QueryFinalityRequirement, QueryRows,
+    BlockHeader, BlockRange, ChainFamily, ChainIdentity, DatalensError, Dataset, DatasetKey,
+    LogFilter, NetworkId, QueryFinalityRequirement, QueryRows,
 };
 use datalens_edge::{
     LegacyEvmQueryRequest, QueryService, QueryServiceRegistry,
@@ -185,9 +185,7 @@ async fn test_production_readiness_validates_service_staging_warmup_metrics_and_
         .oneshot(
             Request::post("/v1/query")
                 .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::to_vec(&logs_request(20, 21)).expect("query request json"),
-                ))
+                .body(Body::from(query_body(logs_request(20, 21))))
                 .expect("logs query request"),
         )
         .await
@@ -481,6 +479,32 @@ fn logs_request(from_block: u64, to_block: u64) -> LegacyEvmQueryRequest {
         allow_hot: false,
         finality: QueryFinalityRequirement::DurableOnly,
     }
+}
+
+fn query_body(request: LegacyEvmQueryRequest) -> Vec<u8> {
+    let selector = match request.dataset {
+        Dataset::Blocks => serde_json::json!({ "kind": "all" }),
+        Dataset::Logs => serde_json::json!({
+            "kind": "evm_logs",
+            "value": request.filter.expect("logs request filter")
+        }),
+        Dataset::Transactions | Dataset::Receipts => {
+            panic!("test helper only supports blocks and logs")
+        }
+    };
+    serde_json::to_vec(&serde_json::json!({
+        "chain": request.chain,
+        "dataset_key": DatasetKey::from(request.dataset).as_str(),
+        "selector": selector,
+        "range": {
+            "kind": "block",
+            "start": request.range.from_block,
+            "end": request.range.to_block
+        },
+        "finality": request.finality,
+        "fields": "all"
+    }))
+    .expect("query request json")
 }
 
 fn ethereum_identity() -> ChainIdentity {

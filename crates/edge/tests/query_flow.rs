@@ -644,16 +644,7 @@ async fn test_metrics_route_returns_prometheus_text_for_query_path() {
 
     let response = router
         .clone()
-        .oneshot(
-            axum::http::Request::builder()
-                .method(axum::http::Method::POST)
-                .uri("/v1/query")
-                .header(axum::http::header::CONTENT_TYPE, "application/json")
-                .body(axum::body::Body::from(
-                    serde_json::to_vec(&blocks_request(10, 10)).expect("request body"),
-                ))
-                .expect("query request"),
-        )
+        .oneshot(query_http_request(blocks_request(10, 10), None, None))
         .await
         .expect("query response");
 
@@ -704,17 +695,11 @@ async fn test_query_route_uses_application_identity_header_for_metrics() {
 
     let response = router
         .clone()
-        .oneshot(
-            axum::http::Request::builder()
-                .method(axum::http::Method::POST)
-                .uri("/v1/query")
-                .header(axum::http::header::CONTENT_TYPE, "application/json")
-                .header("x-datalens-application", "wallet-search")
-                .body(axum::body::Body::from(
-                    serde_json::to_vec(&blocks_request(10, 10)).expect("request body"),
-                ))
-                .expect("query request"),
-        )
+        .oneshot(query_http_request(
+            blocks_request(10, 10),
+            Some("wallet-search"),
+            None,
+        ))
         .await
         .expect("query response");
 
@@ -750,7 +735,7 @@ async fn test_registered_application_query_uses_normalized_metrics_label() {
             true,
             "secret-token",
             vec!["ethereum"],
-            vec!["blocks"],
+            vec!["evm.blocks"],
             None,
         )]))
         .expect("application registry")
@@ -802,7 +787,7 @@ async fn test_missing_invalid_and_disabled_application_are_rejected_before_fetch
                 true,
                 "secret-token",
                 vec!["ethereum"],
-                vec!["blocks"],
+                vec!["evm.blocks"],
                 None,
             ),
             application(
@@ -810,7 +795,7 @@ async fn test_missing_invalid_and_disabled_application_are_rejected_before_fetch
                 false,
                 "disabled-token",
                 vec!["ethereum"],
-                vec!["blocks"],
+                vec!["evm.blocks"],
                 None,
             ),
         ]))
@@ -866,7 +851,7 @@ async fn test_application_allowlist_and_quota_rejections_happen_before_fetch_or_
                 true,
                 "secret-token",
                 vec!["ethereum"],
-                vec!["logs"],
+                vec!["evm.logs"],
                 Some(ApplicationQuotaConfig {
                     max_query_range_blocks: Some(1),
                     max_hot_query_range_blocks: None,
@@ -879,7 +864,7 @@ async fn test_application_allowlist_and_quota_rejections_happen_before_fetch_or_
                 true,
                 "hot-token",
                 vec!["ethereum"],
-                vec!["logs"],
+                vec!["evm.logs"],
                 Some(ApplicationQuotaConfig {
                     max_query_range_blocks: Some(4),
                     max_hot_query_range_blocks: Some(1),
@@ -941,7 +926,7 @@ async fn test_application_identity_does_not_partition_durable_cache_key() {
                 true,
                 "token-a",
                 vec!["ethereum"],
-                vec!["blocks"],
+                vec!["evm.blocks"],
                 None,
             ),
             application(
@@ -949,7 +934,7 @@ async fn test_application_identity_does_not_partition_durable_cache_key() {
                 true,
                 "token-b",
                 vec!["ethereum"],
-                vec!["blocks"],
+                vec!["evm.blocks"],
                 None,
             ),
         ]))
@@ -1050,6 +1035,28 @@ fn query_http_request(
     application: Option<&str>,
     authorization: Option<&str>,
 ) -> Request<Body> {
+    let selector = match request.dataset {
+        Dataset::Blocks => serde_json::json!({ "kind": "all" }),
+        Dataset::Logs => serde_json::json!({
+            "kind": "evm_logs",
+            "value": request.filter.expect("logs request filter")
+        }),
+        Dataset::Transactions | Dataset::Receipts => {
+            panic!("test helper only supports blocks and logs")
+        }
+    };
+    let body = serde_json::json!({
+        "chain": request.chain,
+        "dataset_key": DatasetKey::from(request.dataset).as_str(),
+        "selector": selector,
+        "range": {
+            "kind": "block",
+            "start": request.range.from_block,
+            "end": request.range.to_block
+        },
+        "finality": request.finality,
+        "fields": "all"
+    });
     let mut builder = Request::builder()
         .method(axum::http::Method::POST)
         .uri("/v1/query")
@@ -1061,9 +1068,7 @@ fn query_http_request(
         builder = builder.header(axum::http::header::AUTHORIZATION, authorization);
     }
     builder
-        .body(Body::from(
-            serde_json::to_vec(&request).expect("request body"),
-        ))
+        .body(Body::from(serde_json::to_vec(&body).expect("request body")))
         .expect("query request")
 }
 
