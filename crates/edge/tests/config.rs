@@ -18,6 +18,22 @@ fn test_config_api_graphql_namespace_is_not_supported() {
     assert!(error.to_string().contains("unknown field `api`"));
 }
 
+#[test]
+fn test_config_storage_root_field_is_not_supported() {
+    let config = config_text("[edge.graphql]").replace(
+        r#"
+        [storage.local]
+        root = ".tmp/datalens-config-test"
+"#,
+        r#"        root = ".tmp/datalens-config-test"
+"#,
+    );
+    let error = toml::from_str::<DatalensConfig>(&config)
+        .expect_err("top-level storage root should be rejected");
+
+    assert!(error.to_string().contains("unknown field `root`"));
+}
+
 fn config_text(graphql_header: &str) -> String {
     format!(
         r#"

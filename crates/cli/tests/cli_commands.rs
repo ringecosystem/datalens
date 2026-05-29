@@ -340,6 +340,8 @@ fn test_validate_config_rejects_zero_lag_finality_override() {
 
         [storage]
         backend = "local"
+
+        [storage.local]
         root = ".datalens/storage"
 
         [planner]
@@ -434,6 +436,8 @@ fn test_config_parses_writer_staging_thresholds() {
 
         [storage]
         backend = "local"
+
+        [storage.local]
         root = ".datalens/storage"
 
         [planner]
@@ -492,6 +496,8 @@ fn test_validate_config_accepts_application_registry() {
 
         [storage]
         backend = "local"
+
+        [storage.local]
         root = "/tmp/datalens"
 
         [planner]
@@ -548,6 +554,8 @@ fn test_validate_config_rejects_invalid_application_boundary_without_leaking_tok
 
         [storage]
         backend = "local"
+
+        [storage.local]
         root = "/tmp/datalens"
 
         [planner]
@@ -595,8 +603,8 @@ fn test_validate_config_rejects_invalid_application_boundary_without_leaking_tok
 }
 
 #[test]
-fn test_validate_config_keeps_legacy_storage_root_compatible() {
-    let config = toml::from_str::<DatalensConfig>(
+fn test_validate_config_rejects_top_level_storage_root() {
+    let error = toml::from_str::<DatalensConfig>(
         r#"
         [server]
         bind = "127.0.0.1:8080"
@@ -629,13 +637,9 @@ fn test_validate_config_keeps_legacy_storage_root_compatible() {
         max_addresses_per_query = 2
         "#,
     )
-    .expect("config parses");
+    .expect_err("top-level storage root is rejected");
 
-    validate_config(&config).expect("legacy local root config remains valid");
-    assert_eq!(
-        config.storage.local.expect("legacy local config").root,
-        ".datalens/storage"
-    );
+    assert!(error.to_string().contains("unknown field `root`"));
 }
 
 #[test]
@@ -647,6 +651,8 @@ fn test_validate_config_accepts_evm_and_solana_chains_together() {
 
         [storage]
         backend = "local"
+
+        [storage.local]
         root = ".datalens/storage"
 
         [planner]
@@ -701,6 +707,8 @@ fn test_validate_config_accepts_tron_chain() {
 
         [storage]
         backend = "local"
+
+        [storage.local]
         root = ".datalens/storage"
 
         [planner]
@@ -825,6 +833,8 @@ fn write_config(name: &str, storage_root: &std::path::Path) -> String {
 
             [storage]
             backend = "local"
+
+            [storage.local]
             root = "{}"
 
             [planner]
