@@ -83,6 +83,19 @@ async fn test_api_warmup_routes_manage_application_scoped_tasks() {
         .expect("forbidden response");
     assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
 
+    let forbidden_read = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/v1/warmup/tasks/{task_id}"))
+                .header("x-datalens-application", "app-b")
+                .header("authorization", "Bearer token-b")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("forbidden read response");
+    assert_eq!(forbidden_read.status(), StatusCode::FORBIDDEN);
+
     let cancel = app
         .oneshot(
             Request::post(format!("/v1/warmup/tasks/{task_id}/cancel"))
@@ -96,6 +109,55 @@ async fn test_api_warmup_routes_manage_application_scoped_tasks() {
     assert_eq!(cancel.status(), StatusCode::OK);
     let cancel_body = body_json(cancel.into_body()).await;
     assert_eq!(cancel_body["task"]["state"], "cancelled");
+}
+
+#[tokio::test]
+async fn test_api_warmup_run_once_requires_warmup_run_operation() {
+    let root = temp_storage_root("api-warmup-run-once-auth");
+    let source = MockSource::default();
+    let service = service(LocalStorage::new(&root), source).with_warmup_pool(warmup_pool(&root));
+    let registry = QueryServiceRegistry::new()
+        .with_application_registry(datalens_edge::config::ApplicationRegistryConfig {
+            required: true,
+            applications: vec![datalens_edge::config::ApplicationConfig {
+                id: "submitter".to_owned(),
+                name: "submitter".to_owned(),
+                enabled: true,
+                display_name: None,
+                token: "submit-token".to_owned(),
+                chains: vec!["ethereum".to_owned()],
+                datasets: vec!["evm.logs".to_owned()],
+                operations: vec![datalens_edge::config::ApplicationOperationConfig::WarmupSubmit],
+                quota: None,
+            }],
+        })
+        .expect("application registry")
+        .with_service(service)
+        .expect("registry");
+    let app = router(registry);
+
+    let missing = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/warmup/run-once")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("missing auth response");
+    let unauthorized = app
+        .oneshot(
+            Request::post("/v1/warmup/run-once")
+                .header("x-datalens-application", "submitter")
+                .header("authorization", "Bearer submit-token")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("unauthorized response");
+
+    assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(unauthorized.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
@@ -366,6 +428,7 @@ async fn test_api_warmup_native_submit_uses_chain_neutral_application_allowlists
                 token: "token-a".to_owned(),
                 chains: vec!["solana-mainnet-beta".to_owned()],
                 datasets: vec!["solana.slots".to_owned()],
+                operations: vec![datalens_edge::config::ApplicationOperationConfig::WarmupSubmit],
                 quota: None,
             }],
         })

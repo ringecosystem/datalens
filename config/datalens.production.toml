@@ -38,6 +38,9 @@ default_application = "datalens"
 enabled = true
 playground_enabled = false
 
+[edge.metrics]
+bearer_token = "${DATALENS_METRICS_TOKEN}"
+
 [warmup]
 enabled = false
 registry_path = "warmup"
@@ -57,7 +60,8 @@ enabled = true
 display_name = "Public API"
 token = "${DATALENS_PUBLIC_APP_TOKEN}"
 chains = ["ethereum"]
-datasets = ["blocks", "logs"]
+datasets = ["evm.blocks", "evm.logs"]
+operations = ["query", "discovery"]
 
 [applications.applications.quota]
 max_query_range_blocks = 10000

@@ -3,6 +3,7 @@
 pub(crate) use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 pub(crate) use axum::{
@@ -19,8 +20,9 @@ pub(crate) use datalens_core::{
     TopicFilter,
 };
 pub(crate) use datalens_edge::config::{
-    ApplicationConfig, ApplicationQuotaConfig, ApplicationRegistryConfig, ChainConfig,
-    DatasetsConfig, LogsDatasetConfig, MetricsConfig, PlannerConfig, WriterConfig,
+    ApplicationConfig, ApplicationOperationConfig, ApplicationQuotaConfig,
+    ApplicationRegistryConfig, ChainConfig, DatasetsConfig, LogsDatasetConfig, MetricsConfig,
+    PlannerConfig, WriterConfig,
 };
 pub(crate) use datalens_edge::{NativeQueryResponse, QueryService, QueryServiceRegistry, router};
 pub(crate) use datalens_planner::{FieldSelection, NativeQueryInput};
@@ -54,6 +56,14 @@ pub(crate) fn application(
         token: token.to_owned(),
         chains: chains.into_iter().map(str::to_owned).collect(),
         datasets: datasets.into_iter().map(str::to_owned).collect(),
+        operations: vec![
+            ApplicationOperationConfig::Query,
+            ApplicationOperationConfig::Discovery,
+            ApplicationOperationConfig::WarmupSubmit,
+            ApplicationOperationConfig::WarmupRead,
+            ApplicationOperationConfig::WarmupMutate,
+            ApplicationOperationConfig::WarmupRun,
+        ],
         quota,
     }
 }
@@ -450,6 +460,7 @@ pub(crate) struct MockSource {
     max_addresses_per_query: Arc<Mutex<usize>>,
     safe_height: Arc<Mutex<ChainHeight>>,
     chain: Arc<Mutex<ChainIdentity>>,
+    fetch_delay: Arc<Mutex<Option<Duration>>>,
 }
 
 impl Default for MockSource {
@@ -467,6 +478,7 @@ impl Default for MockSource {
                 ChainHeight::block(100).with_finality(FinalityKind::Safe),
             )),
             chain: Arc::new(Mutex::new(ethereum_identity())),
+            fetch_delay: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -500,6 +512,11 @@ impl MockSource {
     pub(crate) fn with_safe_height(self, value: u64, finality: FinalityKind) -> Self {
         *self.safe_height.lock().expect("safe height lock") =
             ChainHeight::block(value).with_finality(finality);
+        self
+    }
+
+    pub(crate) fn with_fetch_delay(self, delay: Duration) -> Self {
+        *self.fetch_delay.lock().expect("fetch delay lock") = Some(delay);
         self
     }
 
@@ -649,6 +666,9 @@ impl MockSource {
             .lock()
             .expect("calls lock")
             .push(SourceCall::Blocks(range));
+        if let Some(delay) = *self.fetch_delay.lock().expect("fetch delay lock") {
+            std::thread::sleep(delay);
+        }
         if let Some(kind) = self.error.lock().expect("error lock").clone() {
             return Err(DatalensError::new(kind, "mock provider error"));
         }
@@ -671,6 +691,9 @@ impl MockSource {
             .lock()
             .expect("calls lock")
             .push(SourceCall::Logs(range));
+        if let Some(delay) = *self.fetch_delay.lock().expect("fetch delay lock") {
+            std::thread::sleep(delay);
+        }
         if let Some(kind) = self.error.lock().expect("error lock").clone() {
             return Err(DatalensError::new(kind, "mock provider error"));
         }
