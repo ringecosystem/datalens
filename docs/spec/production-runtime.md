@@ -75,9 +75,9 @@ release gates.
 - `GET /graphql/playground` exposes GraphiQL when GraphQL and
   `edge.graphql.playground_enabled` are both enabled.
 - REST and GraphQL query operations must expose equivalent query capability over the
-  same native contract. GraphQL may reshape inputs and outputs for GraphQL clients, but
-  it must not introduce a separate query planner, storage contract, or dataset
-  vocabulary.
+  same native contract: `chain`, `dataset_key`, `selector`, `range`, `finality`, and
+  `fields`. GraphQL may reshape inputs and outputs for GraphQL clients, but it must not
+  introduce a separate query planner, storage contract, or dataset vocabulary.
 - Warmup task submission, listing, mutation, and run-once routes are edge operations over
   the warmup service registry. They share the same application authentication and
   authorization boundary as query routes.

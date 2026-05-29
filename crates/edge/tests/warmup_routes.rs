@@ -1,0 +1,448 @@
+mod support;
+
+use support::lifecycle::*;
+
+#[tokio::test]
+async fn test_api_warmup_routes_manage_application_scoped_tasks() {
+    let root = temp_storage_root("api-warmup-routes");
+    let source = MockSource::default();
+    let service = service(LocalStorage::new(&root), source).with_warmup_pool(warmup_pool(&root));
+    let application_registry = datalens_edge::config::ApplicationRegistryConfig {
+        required: true,
+        applications: vec![
+            application_config("app-a", "token-a"),
+            application_config("app-b", "token-b"),
+        ],
+    };
+    let registry = QueryServiceRegistry::new()
+        .with_application_registry(application_registry)
+        .expect("application registry")
+        .with_service(service)
+        .expect("registry");
+    let app = router(registry);
+
+    let submit = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/warmup/tasks")
+                .header("content-type", "application/json")
+                .header("x-datalens-application", "app-a")
+                .header("authorization", "Bearer token-a")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "chain": ethereum_identity(),
+                        "dataset_key": "evm.logs",
+                        "selector": {
+                            "kind": "evm_logs",
+                            "value": evm_logs_selector_value(&logs_request(10, 12))
+                        },
+                        "range_kind": { "kind": "block" },
+                        "start": 10,
+                        "end": 12,
+                        "mode": "fixed_range",
+                        "chunk_policy": {
+                            "max_range_len": 2
+                        }
+                    }))
+                    .expect("request json"),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("submit response");
+    assert_eq!(submit.status(), StatusCode::CREATED);
+    let submit_body = body_json(submit.into_body()).await;
+    let task_id = submit_body["task_id"].as_str().expect("task id").to_owned();
+    assert_eq!(submit_body["created"], true);
+
+    let list = app
+        .clone()
+        .oneshot(
+            Request::get("/v1/warmup/tasks")
+                .header("x-datalens-application", "app-a")
+                .header("authorization", "Bearer token-a")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("list response");
+    assert_eq!(list.status(), StatusCode::OK);
+    let list_body = body_json(list.into_body()).await;
+    assert_eq!(list_body["tasks"].as_array().expect("tasks").len(), 1);
+
+    let forbidden = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/v1/warmup/tasks/{task_id}/cancel"))
+                .header("x-datalens-application", "app-b")
+                .header("authorization", "Bearer token-b")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("forbidden response");
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+    let cancel = app
+        .oneshot(
+            Request::post(format!("/v1/warmup/tasks/{task_id}/cancel"))
+                .header("x-datalens-application", "app-a")
+                .header("authorization", "Bearer token-a")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("cancel response");
+    assert_eq!(cancel.status(), StatusCode::OK);
+    let cancel_body = body_json(cancel.into_body()).await;
+    assert_eq!(cancel_body["task"]["state"], "cancelled");
+}
+
+#[tokio::test]
+async fn test_api_warmup_rejects_old_evm_logs_submit_shape() {
+    let root = temp_storage_root("api-warmup-rejects-old-submit");
+    let source = MockSource::default();
+    let service = service(LocalStorage::new(&root), source).with_warmup_pool(warmup_pool(&root));
+    let registry = QueryServiceRegistry::new()
+        .with_service(service)
+        .expect("registry");
+    let app = router(registry);
+
+    let submit = app
+        .oneshot(
+            Request::post("/v1/warmup/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "chain": ethereum_identity(),
+                        "dataset": "logs",
+                        "range": BlockRange::expect_new(20, 21),
+                        "filter": evm_logs_selector_value(&logs_request(20, 21)),
+                        "mode": "fixed_range"
+                    }))
+                    .expect("request json"),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("submit response");
+
+    assert_eq!(submit.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn test_api_warmup_run_once_writes_durable_coverage_that_query_hits() {
+    let root = temp_storage_root("api-warmup-run-once");
+    let source = MockSource::default();
+    let recorder = MetricsRecorder::new().expect("metrics recorder");
+    let service = service(LocalStorage::new(&root), source.clone())
+        .with_metrics(recorder.clone())
+        .with_warmup_pool(warmup_pool_with_metrics(&root, recorder));
+    let registry = QueryServiceRegistry::new()
+        .with_service(service)
+        .expect("registry");
+    let app = router(registry);
+
+    let submit = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/warmup/tasks")
+                .header("content-type", "application/json")
+                .header("x-datalens-application", "app-a")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "chain": ethereum_identity(),
+                        "dataset_key": "evm.logs",
+                        "selector": {
+                            "kind": "evm_logs",
+                            "value": evm_logs_selector_value(&logs_request(20, 21))
+                        },
+                        "range_kind": { "kind": "block" },
+                        "start": 20,
+                        "end": 21,
+                        "mode": "fixed_range"
+                    }))
+                    .expect("request json"),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("submit response");
+    assert_eq!(submit.status(), StatusCode::CREATED);
+
+    let run_once = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/warmup/run-once")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("run once response");
+    assert_eq!(run_once.status(), StatusCode::OK);
+
+    source.clear_calls();
+    let query = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/query")
+                .header("content-type", "application/json")
+                .body(Body::from(query_body(logs_request(20, 21))))
+                .expect("request"),
+        )
+        .await
+        .expect("query response");
+    assert_eq!(query.status(), StatusCode::OK);
+    assert_eq!(
+        source.calls(),
+        Vec::<SourceCall>::new(),
+        "query should hit warmup-created durable coverage"
+    );
+
+    let metrics = app
+        .oneshot(
+            Request::get("/metrics")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("metrics response");
+    assert_eq!(metrics.status(), StatusCode::OK);
+    let body = body_text(metrics.into_body()).await;
+    assert!(body.contains("datalens_warmup_task_total"));
+    assert!(body.contains("datalens_warmup_fetch_total"));
+    assert!(body.contains("datalens_warmup_write_total"));
+}
+
+#[tokio::test]
+async fn test_api_warmup_native_submit_runs_solana_and_tron_tasks() {
+    let root = temp_storage_root("api-warmup-native-multichain");
+    let storage: Arc<dyn StorageRepository> = Arc::new(LocalStorage::new(&root));
+    let solana_provider = CountingSolanaRpc::default();
+    let tron_provider = CountingTronProvider::default();
+    let solana = SolanaAdapter::with_provider(solana_identity(), solana_provider.clone())
+        .with_max_slot_range_len(3);
+    let tron = TronAdapter::with_provider(tron_identity(), tron_provider.clone())
+        .with_max_block_range_len(3);
+    let registry = QueryServiceRegistry::new()
+        .with_service(
+            QueryService::new_named(
+                storage.clone(),
+                solana.clone(),
+                planner_config(),
+                writer_config(),
+                "solana-mainnet-beta",
+                non_evm_chain_config("solana"),
+            )
+            .with_warmup_pool(warmup_pool_for(&root.join("solana"), solana)),
+        )
+        .expect("register solana")
+        .with_service(
+            QueryService::new_named(
+                storage.clone(),
+                tron.clone(),
+                planner_config(),
+                writer_config(),
+                "tron",
+                non_evm_chain_config("tron"),
+            )
+            .with_warmup_pool(warmup_pool_for(&root.join("tron"), tron)),
+        )
+        .expect("register tron");
+    let app = router(registry.clone());
+
+    let solana_submit = app
+        .clone()
+        .oneshot(native_warmup_request(serde_json::json!({
+            "chain": solana_identity(),
+            "dataset_key": "solana.slots",
+            "selector": { "kind": "other", "value": {
+                "kind": "solana_all",
+                "fingerprint": "solana-all/all",
+                "canonical_key": "all"
+            }},
+            "range_kind": { "kind": "slot" },
+            "start": 10,
+            "end": 12,
+            "mode": "fixed_range",
+            "chunk_policy": { "max_range_len": 3 }
+        })))
+        .await
+        .expect("solana submit response");
+    assert_eq!(solana_submit.status(), StatusCode::CREATED);
+
+    let tron_submit = app
+        .clone()
+        .oneshot(native_warmup_request(serde_json::json!({
+            "chain": tron_identity(),
+            "dataset_key": "tron.blocks",
+            "selector": { "kind": "other", "value": {
+                "kind": "tron_all",
+                "fingerprint": "tron-all/all",
+                "canonical_key": "all"
+            }},
+            "range_kind": { "kind": "block" },
+            "start": 10,
+            "end": 12,
+            "mode": "fixed_range"
+        })))
+        .await
+        .expect("tron submit response");
+    assert_eq!(tron_submit.status(), StatusCode::CREATED);
+
+    let list = app
+        .clone()
+        .oneshot(
+            Request::get("/v1/warmup/tasks")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("list response");
+    assert_eq!(list.status(), StatusCode::OK);
+    let list_body = body_json(list.into_body()).await;
+    let tasks = list_body["tasks"].as_array().expect("tasks");
+    assert_eq!(tasks.len(), 2);
+    assert!(tasks.iter().any(|task| {
+        task["dataset_key"].as_str() == Some("solana.slots")
+            && task["range_kind"] == serde_json::json!({ "kind": "slot" })
+            && task["start"] == 10
+            && task["end"] == 12
+    }));
+    assert!(tasks.iter().any(|task| {
+        task["dataset_key"].as_str() == Some("tron.blocks")
+            && task["range_kind"] == serde_json::json!({ "kind": "block" })
+            && task["start"] == 10
+            && task["end"] == 12
+    }));
+
+    let run_once = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/warmup/run-once")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("run once response");
+    assert_eq!(run_once.status(), StatusCode::OK);
+
+    solana_provider.fail_data_fetches();
+    tron_provider.fail_data_fetches();
+    registry
+        .query_native(NativeQueryInput {
+            chain: solana_identity(),
+            dataset_key: DatasetKey::solana_slots(),
+            ledger_range: LedgerRange::slots(10, 12).expect("valid range"),
+            selector: solana_all_selector().expect("selector"),
+            field_selection: FieldSelection::All,
+            finality: QueryFinalityRequirement::DurableOnly,
+        })
+        .expect("solana query hits warmup cache");
+    registry
+        .query_native(NativeQueryInput {
+            chain: tron_identity(),
+            dataset_key: DatasetKey::tron_blocks(),
+            ledger_range: LedgerRange::blocks(10, 12).expect("valid range"),
+            selector: tron_all_selector().expect("selector"),
+            field_selection: FieldSelection::All,
+            finality: QueryFinalityRequirement::DurableOnly,
+        })
+        .expect("tron query hits warmup cache");
+}
+
+#[tokio::test]
+async fn test_api_warmup_native_submit_uses_chain_neutral_application_allowlists() {
+    let root = temp_storage_root("api-warmup-native-auth");
+    let solana = SolanaAdapter::with_fixture_defaults();
+    let registry = QueryServiceRegistry::new()
+        .with_application_registry(datalens_edge::config::ApplicationRegistryConfig {
+            required: true,
+            applications: vec![datalens_edge::config::ApplicationConfig {
+                id: "app-a".to_owned(),
+                name: "app-a".to_owned(),
+                enabled: true,
+                display_name: None,
+                token: "token-a".to_owned(),
+                chains: vec!["solana-mainnet-beta".to_owned()],
+                datasets: vec!["solana.slots".to_owned()],
+                quota: None,
+            }],
+        })
+        .expect("application registry")
+        .with_service(
+            QueryService::new_named(
+                LocalStorage::new(&root),
+                solana.clone(),
+                planner_config(),
+                writer_config(),
+                "solana-mainnet-beta",
+                non_evm_chain_config("solana"),
+            )
+            .with_warmup_pool(warmup_pool_for(&root.join("warmup"), solana)),
+        )
+        .expect("register solana");
+    let app = router(registry);
+
+    let submit = app
+        .oneshot(
+            Request::post("/v1/warmup/tasks")
+                .header("content-type", "application/json")
+                .header("x-datalens-application", "app-a")
+                .header("authorization", "Bearer token-a")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "chain": solana_identity(),
+                        "dataset_key": "solana.slots",
+                        "selector": { "kind": "all" },
+                        "range_kind": { "kind": "slot" },
+                        "start": 10,
+                        "end": 12,
+                        "mode": "fixed_range"
+                    }))
+                    .expect("request json"),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("submit response");
+
+    assert_eq!(submit.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn test_api_warmup_native_submit_rejects_unsupported_combinations_before_fetch() {
+    let root = temp_storage_root("api-warmup-native-unsupported");
+    let solana_provider = CountingSolanaRpc::default();
+    let solana = SolanaAdapter::with_provider(solana_identity(), solana_provider.clone());
+    let registry = QueryServiceRegistry::new()
+        .with_service(
+            QueryService::new_named(
+                LocalStorage::new(&root),
+                solana.clone(),
+                planner_config(),
+                writer_config(),
+                "solana-mainnet-beta",
+                non_evm_chain_config("solana"),
+            )
+            .with_warmup_pool(warmup_pool_for(&root.join("warmup"), solana)),
+        )
+        .expect("register solana");
+    let app = router(registry);
+
+    let submit = app
+        .oneshot(native_warmup_request(serde_json::json!({
+            "chain": solana_identity(),
+            "dataset_key": "solana.slots",
+            "selector": { "kind": "all" },
+            "range_kind": { "kind": "block" },
+            "start": 10,
+            "end": 12,
+            "mode": "fixed_range"
+        })))
+        .await
+        .expect("submit response");
+
+    assert_eq!(submit.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(solana_provider.data_fetch_count(), 0);
+}

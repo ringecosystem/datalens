@@ -1,31 +1,83 @@
-use std::{
+#![allow(dead_code, unused_imports)]
+
+pub(crate) use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
 };
 
-use datalens_chain::{
+pub(crate) use axum::{
+    body::{Body, to_bytes},
+    http::{Request, StatusCode},
+};
+pub(crate) use datalens_chain::{
     AdapterCapabilities, ChainAdapter, ChainFetchRequest, ChainFetchResponse, ChainHeight,
-    DatasetCapability, HeightRangeKind, ProviderDiagnostics, SelectorKind,
+    DatasetCapability, DatasetSelector, HeightRangeKind, ProviderDiagnostics, SelectorKind,
 };
-use datalens_core::{
+pub(crate) use datalens_core::{
     BlockHeader, BlockRange, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, Dataset,
-    DatasetKey, NetworkId, QueryRows,
+    DatasetKey, LedgerRange, NetworkId, QueryRows,
 };
-use datalens_edge::QueryService;
-use datalens_edge::config::{
-    BlocksDatasetConfig, ChainConfig, DatasetsConfig, LogsDatasetConfig, PlannerConfig,
-    WriterConfig,
+pub(crate) use datalens_edge::config::{
+    BlocksDatasetConfig, ChainConfig, DatasetsConfig, EdgeConfig, GraphqlConfig, LogsDatasetConfig,
+    PlannerConfig, WriterConfig,
 };
-use datalens_storage::{LocalObjectStore, LocalStorage};
-use datalens_warmup::{
+pub(crate) use datalens_edge::{
+    QueryService, QueryServiceRegistry, router, router_with_edge_config,
+};
+pub(crate) use datalens_solana::SolanaAdapter;
+pub(crate) use datalens_storage::{LocalObjectStore, LocalStorage};
+pub(crate) use datalens_tron::TronAdapter;
+pub(crate) use datalens_warmup::{
     LocalWarmupRegistry, WarmupRuntime, WarmupRuntimeConfig, WarmupSchedulerConfig, WarmupTaskPool,
 };
+pub(crate) use tower::ServiceExt;
 
-pub(super) fn service(storage: LocalStorage, source: MockSource) -> QueryService<MockSource> {
+pub(crate) async fn graphql_json(
+    app: axum::Router,
+    query: &str,
+    variables: serde_json::Value,
+) -> serde_json::Value {
+    let response = app
+        .oneshot(
+            Request::post("/graphql")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "query": query,
+                        "variables": variables
+                    }))
+                    .expect("graphql request"),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("graphql response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body();
+    serde_json::from_slice(&to_bytes(body, usize::MAX).await.expect("body bytes"))
+        .expect("json body")
+}
+
+pub(crate) async fn body_json(body: Body) -> serde_json::Value {
+    serde_json::from_slice(&to_bytes(body, usize::MAX).await.expect("body bytes"))
+        .expect("json body")
+}
+
+pub(crate) async fn body_text(body: Body) -> String {
+    String::from_utf8(
+        to_bytes(body, usize::MAX)
+            .await
+            .expect("body bytes")
+            .to_vec(),
+    )
+    .expect("utf8 body")
+}
+
+pub(crate) fn service(storage: LocalStorage, source: MockSource) -> QueryService<MockSource> {
     service_named(storage, source, "ethereum", chain_config(1))
 }
 
-pub(super) fn service_named(
+pub(crate) fn service_named(
     storage: LocalStorage,
     source: MockSource,
     chain_name: &str,
@@ -41,14 +93,14 @@ pub(super) fn service_named(
     )
 }
 
-pub(super) fn planner_config() -> PlannerConfig {
+pub(crate) fn planner_config() -> PlannerConfig {
     PlannerConfig {
         max_query_range_blocks: 8,
         default_chunk_range_blocks: 4,
     }
 }
 
-pub(super) fn writer_config() -> WriterConfig {
+pub(crate) fn writer_config() -> WriterConfig {
     WriterConfig {
         target_object_bytes: 1024,
         min_object_rows: 1,
@@ -57,7 +109,7 @@ pub(super) fn writer_config() -> WriterConfig {
     }
 }
 
-pub(super) fn chain_config(chain_id: u64) -> ChainConfig {
+pub(crate) fn chain_config(chain_id: u64) -> ChainConfig {
     ChainConfig {
         kind: "evm".to_owned(),
         chain_id,
@@ -77,7 +129,7 @@ pub(super) fn chain_config(chain_id: u64) -> ChainConfig {
     }
 }
 
-pub(super) fn non_evm_chain_config(kind: &str) -> ChainConfig {
+pub(crate) fn non_evm_chain_config(kind: &str) -> ChainConfig {
     ChainConfig {
         kind: kind.to_owned(),
         chain_id: 0,
@@ -97,7 +149,7 @@ pub(super) fn non_evm_chain_config(kind: &str) -> ChainConfig {
     }
 }
 
-pub(super) fn warmup_pool(
+pub(crate) fn warmup_pool(
     root: &std::path::Path,
 ) -> WarmupTaskPool<MockSource, LocalStorage, LocalWarmupRegistry<LocalObjectStore>> {
     let storage = LocalStorage::new(root);
@@ -125,12 +177,12 @@ pub(super) fn warmup_pool(
     )
 }
 
-pub(super) fn ethereum_identity() -> ChainIdentity {
+pub(crate) fn ethereum_identity() -> ChainIdentity {
     ChainIdentity::try_new(ChainFamily::Evm, "ethereum", Some(NetworkId::numeric(1)))
         .expect("valid chain")
 }
 
-pub(super) fn ethereum_chain_input() -> serde_json::Value {
+pub(crate) fn ethereum_chain_input() -> serde_json::Value {
     serde_json::json!({
         "family": { "kind": "evm" },
         "configuredName": "ethereum",
@@ -138,7 +190,16 @@ pub(super) fn ethereum_chain_input() -> serde_json::Value {
     })
 }
 
-pub(super) fn solana_chain_input() -> serde_json::Value {
+pub(crate) fn solana_identity() -> ChainIdentity {
+    ChainIdentity::try_new(
+        ChainFamily::Other("solana".to_owned()),
+        "solana-mainnet-beta",
+        Some(NetworkId::textual("mainnet-beta").expect("valid network")),
+    )
+    .expect("valid chain")
+}
+
+pub(crate) fn solana_chain_input() -> serde_json::Value {
     serde_json::json!({
         "family": { "kind": "other", "other": "solana" },
         "configuredName": "solana-mainnet-beta",
@@ -146,7 +207,7 @@ pub(super) fn solana_chain_input() -> serde_json::Value {
     })
 }
 
-pub(super) fn tron_chain_input() -> serde_json::Value {
+pub(crate) fn tron_chain_input() -> serde_json::Value {
     serde_json::json!({
         "family": { "kind": "other", "other": "tron" },
         "configuredName": "tron-mainnet",
@@ -154,14 +215,33 @@ pub(super) fn tron_chain_input() -> serde_json::Value {
     })
 }
 
-pub(super) fn dataset_key_input(family: &str, name: &str) -> serde_json::Value {
+pub(crate) fn dataset_key_input(family: &str, name: &str) -> serde_json::Value {
     serde_json::json!({
         "family": family,
         "name": name
     })
 }
 
-pub(super) fn block(number: u64, hash: &str) -> BlockHeader {
+pub(crate) fn assert_input_field_type(
+    parent: &serde_json::Value,
+    field_name: &str,
+    expected_type: &str,
+) {
+    let field = parent["inputFields"]
+        .as_array()
+        .expect("input fields")
+        .iter()
+        .find(|field| field["name"] == field_name)
+        .unwrap_or_else(|| panic!("missing input field {field_name}"));
+    let field_type = &field["type"];
+    let type_name = field_type["name"]
+        .as_str()
+        .or_else(|| field_type["ofType"]["name"].as_str())
+        .expect("field type name");
+    assert_eq!(type_name, expected_type, "{field_name} type");
+}
+
+pub(crate) fn block(number: u64, hash: &str) -> BlockHeader {
     BlockHeader {
         number,
         hash: hash.to_owned(),
@@ -170,7 +250,7 @@ pub(super) fn block(number: u64, hash: &str) -> BlockHeader {
     }
 }
 
-pub(super) fn temp_storage_root(name: &str) -> PathBuf {
+pub(crate) fn temp_storage_root(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!(
         "datalens-graphql-{name}-{}",
         std::time::SystemTime::now()
@@ -183,30 +263,30 @@ pub(super) fn temp_storage_root(name: &str) -> PathBuf {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum SourceCall {
+pub(crate) enum SourceCall {
     Blocks(BlockRange),
     Logs(BlockRange),
 }
 
 #[derive(Clone, Default)]
-pub(super) struct MockSource {
+pub(crate) struct MockSource {
     chain: Option<ChainIdentity>,
     blocks: Arc<Mutex<Vec<BlockHeader>>>,
     calls: Arc<Mutex<Vec<SourceCall>>>,
 }
 
 impl MockSource {
-    pub(super) fn with_chain(mut self, chain: ChainIdentity) -> Self {
+    pub(crate) fn with_chain(mut self, chain: ChainIdentity) -> Self {
         self.chain = Some(chain);
         self
     }
 
-    pub(super) fn with_blocks(self, blocks: Vec<BlockHeader>) -> Self {
+    pub(crate) fn with_blocks(self, blocks: Vec<BlockHeader>) -> Self {
         *self.blocks.lock().expect("blocks") = blocks;
         self
     }
 
-    pub(super) fn calls(&self) -> Vec<SourceCall> {
+    pub(crate) fn calls(&self) -> Vec<SourceCall> {
         self.calls.lock().expect("calls").clone()
     }
 }
