@@ -1,10 +1,7 @@
 use std::sync::Arc;
 
-use datalens_chain::ChainAdapter;
-use datalens_core::{
-    ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey, DatasetRows, LedgerRange,
-    NetworkId,
-};
+use datalens_chain::{AdapterCapabilities, ChainAdapter, DatasetCapability, SelectorKind};
+use datalens_core::{DatalensError, DatalensErrorKind, DatasetKey, DatasetRows, LedgerRange};
 use datalens_executor::{NativeQueryExecutionConfig, NativeQueryExecutor};
 use datalens_metrics::{ApplicationIdentity, MetricsRecorder};
 use datalens_planner::{NativePlannerConfig, NativeQueryInput};
@@ -18,8 +15,7 @@ use datalens_writer::{DurableWriteResult, DurableWriterConfig};
 use crate::{
     chain_family,
     config::{ChainConfig, MetricsConfig, PlannerConfig, WriterConfig},
-    contract::discovery::ChainDiscovery,
-    enabled_datasets,
+    contract::discovery::{ChainDiscovery, DatasetDiscovery},
 };
 
 #[derive(Clone)]
@@ -27,6 +23,7 @@ pub struct QueryService<S> {
     executor: NativeQueryExecutor<Arc<dyn StorageRepository>, S>,
     chain_name: String,
     chain: ChainConfig,
+    capabilities: AdapterCapabilities,
     metrics: Option<MetricsRecorder>,
     warmup: Option<Arc<dyn RegisteredWarmupService>>,
 }
@@ -105,6 +102,7 @@ where
         } else {
             None
         };
+        let capabilities = source.capabilities();
         let mut executor = NativeQueryExecutor::new(
             storage,
             source,
@@ -141,6 +139,7 @@ where
             executor,
             chain_name: chain_name.into(),
             chain,
+            capabilities,
             metrics: recorder,
             warmup: None,
         })
@@ -239,13 +238,28 @@ where
 
     pub fn discovery(&self) -> Result<ChainDiscovery, DatalensError> {
         Ok(ChainDiscovery {
-            identity: ChainIdentity::try_new(
-                chain_family(&self.chain.kind)?,
-                self.chain_name.clone(),
-                Some(NetworkId::numeric(self.chain.chain_id)),
-            )?,
-            datasets: enabled_datasets(&self.chain),
+            identity: self.capabilities.chain().clone(),
+            datasets: self
+                .capabilities
+                .dataset_capabilities()
+                .iter()
+                .filter(|capability| self.dataset_discovery_enabled(capability.dataset()))
+                .map(dataset_discovery)
+                .collect(),
         })
+    }
+
+    fn dataset_discovery_enabled(&self, dataset_key: &DatasetKey) -> bool {
+        if self.chain.kind != "evm" {
+            return true;
+        }
+        if dataset_key == &DatasetKey::evm_blocks() {
+            return self.chain.datasets.blocks.enabled;
+        }
+        if dataset_key == &DatasetKey::evm_logs() {
+            return self.chain.datasets.logs.enabled;
+        }
+        true
     }
 
     fn validate_native_query_route(&self, input: &NativeQueryInput) -> Result<(), DatalensError> {
@@ -279,6 +293,27 @@ where
             }
         }
         Ok(())
+    }
+}
+
+fn dataset_discovery(capability: &DatasetCapability) -> DatasetDiscovery {
+    DatasetDiscovery {
+        dataset_key: capability.dataset().as_str().to_owned(),
+        range_kinds: capability.ranges().to_vec(),
+        selectors: capability
+            .selectors()
+            .iter()
+            .map(selector_kind_name)
+            .collect(),
+        enabled: true,
+    }
+}
+
+fn selector_kind_name(selector: &SelectorKind) -> String {
+    match selector {
+        SelectorKind::All => "all".to_owned(),
+        SelectorKind::EvmLogs => "evm_logs".to_owned(),
+        SelectorKind::Other(kind) => kind.as_str().to_owned(),
     }
 }
 

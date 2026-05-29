@@ -26,6 +26,7 @@ pub(crate) use datalens_edge::{NativeQueryResponse, QueryService, QueryServiceRe
 pub(crate) use datalens_planner::{FieldSelection, NativeQueryInput};
 pub(crate) use datalens_solana::{SolanaAdapter, solana_all_selector};
 pub(crate) use datalens_storage::{LocalStorage, StorageRepository};
+pub(crate) use datalens_tron::TronAdapter;
 pub(crate) use tower::ServiceExt;
 
 pub(crate) fn application_registry(
@@ -213,6 +214,22 @@ pub(crate) fn chain_config(chain_id: u64) -> ChainConfig {
     }
 }
 
+pub(crate) fn planner_config() -> PlannerConfig {
+    PlannerConfig {
+        max_query_range_blocks: 4,
+        default_chunk_range_blocks: 2,
+    }
+}
+
+pub(crate) fn writer_config() -> WriterConfig {
+    WriterConfig {
+        target_object_bytes: 1024,
+        min_object_rows: 1,
+        record_empty_coverage: true,
+        staging: Default::default(),
+    }
+}
+
 pub(crate) fn solana_chain_config() -> ChainConfig {
     ChainConfig {
         kind: "solana".to_owned(),
@@ -323,11 +340,29 @@ pub(crate) fn polygon_identity() -> ChainIdentity {
         .expect("valid chain identity")
 }
 
+pub(crate) fn solana_identity() -> ChainIdentity {
+    ChainIdentity::try_new(
+        ChainFamily::Other("solana".to_owned()),
+        "solana-mainnet-beta",
+        Some(NetworkId::textual("mainnet-beta").expect("valid network")),
+    )
+    .expect("valid chain identity")
+}
+
 pub(crate) fn tron_identity() -> ChainIdentity {
     ChainIdentity::try_new(
         ChainFamily::Other("tron".to_owned()),
         "tron",
         Some(NetworkId::numeric(1)),
+    )
+    .expect("valid chain identity")
+}
+
+pub(crate) fn tron_mainnet_identity() -> ChainIdentity {
+    ChainIdentity::try_new(
+        ChainFamily::Other("tron".to_owned()),
+        "tron-mainnet",
+        Some(NetworkId::textual("mainnet").expect("valid network")),
     )
     .expect("valid chain identity")
 }

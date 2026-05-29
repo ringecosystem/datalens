@@ -26,6 +26,7 @@ pub(crate) use datalens_edge::{
 };
 pub(crate) use datalens_solana::SolanaAdapter;
 pub(crate) use datalens_storage::{LocalObjectStore, LocalStorage};
+pub(crate) use datalens_tron::TronAdapter;
 pub(crate) use datalens_warmup::{
     LocalWarmupRegistry, WarmupRuntime, WarmupRuntimeConfig, WarmupSchedulerConfig, WarmupTaskPool,
 };

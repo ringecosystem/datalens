@@ -8,7 +8,7 @@ pub mod http;
 pub mod service;
 
 pub use contract::{
-    discovery::{ChainDiscovery, DiscoveryResponse},
+    discovery::{ChainDiscovery, DatasetDiscovery, DiscoveryResponse},
     error::{ApiErrorBody, ApiErrorDetail, api_error_body, api_error_status},
     query::{
         FieldSelectionApi, QueryApiRequest, QueryApiResponse, QueryCacheApi, QueryRangeApi,
@@ -41,15 +41,4 @@ pub(crate) fn chain_family(
         "evm" => Ok(datalens_core::ChainFamily::Evm),
         value => datalens_core::ChainFamily::try_other(value.to_owned()),
     }
-}
-
-pub(crate) fn enabled_datasets(chain: &config::ChainConfig) -> Vec<datalens_core::Dataset> {
-    let mut datasets = Vec::new();
-    if chain.datasets.blocks.enabled {
-        datasets.push(datalens_core::Dataset::Blocks);
-    }
-    if chain.datasets.logs.enabled {
-        datasets.push(datalens_core::Dataset::Logs);
-    }
-    datasets
 }
