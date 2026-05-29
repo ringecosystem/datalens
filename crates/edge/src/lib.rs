@@ -23,7 +23,7 @@ pub use contract::{
         WarmupTaskListApiResponse, WarmupTaskListQuery, WarmupTaskView,
     },
 };
-pub use http::router::{router, router_with_api_config};
+pub use http::router::{router, router_with_edge_config};
 pub use service::{
     lifecycle::{
         LifecycleShutdown, NoopLifecycleShutdown, ServiceLifecycle, WarmupSchedulerHandle, serve,

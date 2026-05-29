@@ -7,7 +7,10 @@ use std::{
     thread,
 };
 
-use crate::{http::router::router, service::registry::QueryServiceRegistry};
+use crate::{
+    config::EdgeConfig, http::router::router_with_edge_config,
+    service::registry::QueryServiceRegistry,
+};
 
 pub struct WarmupSchedulerHandle {
     pub(crate) stop: Arc<AtomicBool>,
@@ -48,6 +51,7 @@ impl Drop for WarmupSchedulerHandle {
 
 pub struct ServiceLifecycle<S = NoopLifecycleShutdown> {
     registry: QueryServiceRegistry,
+    edge: EdgeConfig,
     warmup_scheduler: Option<S>,
 }
 
@@ -61,6 +65,15 @@ impl ServiceLifecycle<NoopLifecycleShutdown> {
     pub fn new(registry: QueryServiceRegistry) -> Self {
         Self {
             registry,
+            edge: EdgeConfig::default(),
+            warmup_scheduler: None,
+        }
+    }
+
+    pub fn new_with_edge_config(registry: QueryServiceRegistry, edge: EdgeConfig) -> Self {
+        Self {
+            registry,
+            edge,
             warmup_scheduler: None,
         }
     }
@@ -73,12 +86,17 @@ impl<S> ServiceLifecycle<S> {
     {
         ServiceLifecycle {
             registry: self.registry,
+            edge: self.edge,
             warmup_scheduler: Some(scheduler),
         }
     }
 
     fn registry(&self) -> QueryServiceRegistry {
         self.registry.clone()
+    }
+
+    fn edge_config(&self) -> EdgeConfig {
+        self.edge.clone()
     }
 }
 
@@ -108,7 +126,8 @@ where
     let listener = tokio::net::TcpListener::bind(bind).await?;
     log::info!("api listener bound to {bind}");
     let registry = lifecycle.registry();
-    axum::serve(listener, router(registry))
+    let edge = lifecycle.edge_config();
+    axum::serve(listener, router_with_edge_config(registry, edge))
         .with_graceful_shutdown(async {
             if let Err(error) = tokio::signal::ctrl_c().await {
                 log::error!("failed to listen for shutdown signal: {error}");

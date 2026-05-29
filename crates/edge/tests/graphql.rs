@@ -16,10 +16,10 @@ use datalens_core::{
     DatasetKey, NetworkId, QueryRows,
 };
 use datalens_edge::config::{
-    ApiConfig, BlocksDatasetConfig, ChainConfig, DatasetsConfig, GraphqlConfig, LogsDatasetConfig,
+    BlocksDatasetConfig, ChainConfig, DatasetsConfig, EdgeConfig, GraphqlConfig, LogsDatasetConfig,
     PlannerConfig, WriterConfig,
 };
-use datalens_edge::{QueryService, QueryServiceRegistry, router, router_with_api_config};
+use datalens_edge::{QueryService, QueryServiceRegistry, router, router_with_edge_config};
 use datalens_solana::SolanaAdapter;
 use datalens_storage::{LocalObjectStore, LocalStorage};
 use datalens_warmup::{
@@ -328,18 +328,18 @@ async fn test_graphql_playground_respects_config() {
             MockSource::default(),
         ))
         .expect("register service");
-    let enabled = router_with_api_config(
+    let enabled = router_with_edge_config(
         registry.clone(),
-        ApiConfig {
+        EdgeConfig {
             graphql: GraphqlConfig {
                 enabled: true,
                 playground_enabled: true,
             },
         },
     );
-    let disabled = router_with_api_config(
+    let disabled = router_with_edge_config(
         registry,
-        ApiConfig {
+        EdgeConfig {
             graphql: GraphqlConfig {
                 enabled: true,
                 playground_enabled: false,
@@ -377,9 +377,9 @@ async fn test_graphql_can_be_disabled_independently() {
             MockSource::default(),
         ))
         .expect("register service");
-    let app = router_with_api_config(
+    let app = router_with_edge_config(
         registry,
-        ApiConfig {
+        EdgeConfig {
             graphql: GraphqlConfig {
                 enabled: false,
                 playground_enabled: true,

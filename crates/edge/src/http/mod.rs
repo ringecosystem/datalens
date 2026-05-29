@@ -4,7 +4,7 @@ pub mod router;
 use crate::{graphql::DatalensGraphqlSchema, service::registry::QueryServiceRegistry};
 
 pub use crate::service::lifecycle::{serve, serve_lifecycle};
-pub use router::{router, router_with_api_config};
+pub use router::{router, router_with_edge_config};
 
 #[derive(Clone)]
 pub(crate) struct AppState {

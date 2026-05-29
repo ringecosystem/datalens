@@ -5,6 +5,7 @@ use datalens_storage::S3ObjectStoreConfig;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DatalensConfig {
     pub server: ServerConfig,
     pub storage: StorageConfig,
@@ -17,7 +18,7 @@ pub struct DatalensConfig {
     #[serde(default)]
     pub warmup: WarmupConfig,
     #[serde(default)]
-    pub api: ApiConfig,
+    pub edge: EdgeConfig,
     #[serde(default)]
     pub applications: ApplicationRegistryConfig,
     pub chains: BTreeMap<String, ChainConfig>,
@@ -153,7 +154,7 @@ pub struct MetricsConfig {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ApiConfig {
+pub struct EdgeConfig {
     #[serde(default)]
     pub graphql: GraphqlConfig,
 }
