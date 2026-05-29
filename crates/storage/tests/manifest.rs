@@ -146,6 +146,21 @@ fn test_manifest_deserialization_rejects_invalid_coverage_semantics() {
         }]
     }"#;
     assert!(serde_json::from_str::<Manifest>(encoding_key_mismatch).is_err());
+
+    let data_object_without_metadata = r#"{
+        "entries":[{
+            "chain":{"family":"Evm","configured_name":"ethereum","network_id":{"kind":"numeric","value":1}},
+            "dataset_key":{"family":"Evm","name":"logs"},
+            "range":{"kind":{"kind":"block"},"start":1,"end":2},
+            "selector_fingerprint":"evm-logs/addr-topic-deadbeef",
+            "selector_canonical_key":"evm-logs/addr=*",
+            "finality_level":"safe",
+            "object_key":"chains/evm/ethereum/1/objects/logs/parquet-v1/key/1-2.parquet",
+            "object_encoding":"parquet-v1",
+            "row_count":1
+        }]
+    }"#;
+    assert!(serde_json::from_str::<Manifest>(data_object_without_metadata).is_err());
 }
 
 #[test]
@@ -172,8 +187,13 @@ fn test_manifest_deserialization_accepts_valid_coverage_semantics() {
             "selector_fingerprint":"evm-logs/addr-topic-deadbeef",
             "selector_canonical_key":"evm-logs/addr=*",
             "finality_level":"finalized",
-            "object_key":"objects/logs/key/1-2.json",
-            "row_count":1
+            "object_key":"chains/evm/ethereum/1/objects/logs/parquet-v1/key/1-2.parquet",
+            "object_encoding":"parquet-v1",
+            "row_count":1,
+            "object_size_bytes":128,
+            "checksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "checksum_algorithm":"sha256",
+            "written_at_unix_seconds":1
         }]
     }"#;
     assert!(serde_json::from_str::<Manifest>(data_object).is_ok());
@@ -621,8 +641,8 @@ fn test_read_rows_rejects_unknown_checksum_algorithm() {
 }
 
 #[test]
-fn test_read_rows_accepts_legacy_manifest_without_object_metadata() {
-    let storage = LocalStorage::new(temp_storage_root("legacy-object-metadata"));
+fn test_read_rows_rejects_data_object_manifest_without_object_metadata() {
+    let storage = LocalStorage::new(temp_storage_root("missing-object-metadata"));
     let chain = test_chain();
     let selector = DatasetSelector::all();
     let range = LedgerRange::blocks(1, 1).expect("valid range");
@@ -649,11 +669,11 @@ fn test_read_rows_accepts_legacy_manifest_without_object_metadata() {
     entry.remove("written_at_unix_seconds");
     write_manifest_json(&storage, &chain, manifest);
 
-    let read = storage
+    let error = storage
         .read_rows(&chain, &DatasetKey::evm_blocks(), &selector, range)
-        .expect("read legacy manifest");
+        .expect_err("missing object metadata");
 
-    assert_eq!(read, rows);
+    assert_eq!(error.kind, DatalensErrorKind::StorageReadFailure);
 }
 
 #[test]
@@ -979,7 +999,12 @@ fn test_read_rows_rejects_manifest_entry_with_missing_object() {
                 "selector_canonical_key":"all",
                 "finality_level":"safe",
                 "object_key":"chains/evm/ethereum/1/datasets/evm.blocks/json/block/all/00000000000000000001-00000000000000000001.json",
-                "row_count":1
+                "object_encoding":"json",
+                "row_count":1,
+                "object_size_bytes":128,
+                "checksum":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "checksum_algorithm":"sha256",
+                "written_at_unix_seconds":1
             }]
         }"#,
     )
