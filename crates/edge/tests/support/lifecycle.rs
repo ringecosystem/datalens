@@ -21,8 +21,8 @@ pub(crate) use datalens_core::{
     TopicFilter,
 };
 pub(crate) use datalens_edge::config::{
-    BlocksDatasetConfig, ChainConfig, DatasetsConfig, LogsDatasetConfig, PlannerConfig,
-    WriterConfig, WriterStagingConfig,
+    ApplicationOperationConfig, BlocksDatasetConfig, ChainConfig, DatasetsConfig,
+    LogsDatasetConfig, PlannerConfig, WriterConfig, WriterStagingConfig,
 };
 pub(crate) use datalens_edge::{QueryService, QueryServiceRegistry, ServiceLifecycle, router};
 pub(crate) use datalens_metrics::MetricsRecorder;
@@ -437,6 +437,14 @@ pub(crate) fn application_config(
         token: token.to_owned(),
         chains: vec!["ethereum".to_owned()],
         datasets: vec!["evm.logs".to_owned()],
+        operations: vec![
+            ApplicationOperationConfig::Query,
+            ApplicationOperationConfig::Discovery,
+            ApplicationOperationConfig::WarmupSubmit,
+            ApplicationOperationConfig::WarmupRead,
+            ApplicationOperationConfig::WarmupMutate,
+            ApplicationOperationConfig::WarmupRun,
+        ],
         quota: None,
     }
 }

@@ -117,9 +117,10 @@ impl QueryServiceRegistry {
         headers: &HeaderMap,
         chain: &str,
         dataset: &str,
+        operation: config::ApplicationOperationConfig,
     ) -> Result<Option<ApplicationContext>, DatalensError> {
         self.application_registry
-            .authenticate_warmup_headers(headers, chain, dataset)
+            .authenticate_warmup_headers(headers, chain, dataset, operation)
     }
 
     pub(crate) fn authenticate_native_query_headers(
@@ -134,8 +135,22 @@ impl QueryServiceRegistry {
     pub(crate) fn authenticate_task_headers(
         &self,
         headers: &HeaderMap,
+        operation: config::ApplicationOperationConfig,
     ) -> Result<Option<ApplicationContext>, DatalensError> {
-        self.application_registry.authenticate_task_headers(headers)
+        self.application_registry
+            .authenticate_task_headers(headers, operation)
+    }
+
+    pub(crate) fn authenticate_discovery_headers(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<Option<ApplicationContext>, DatalensError> {
+        self.application_registry
+            .authenticate_discovery_headers(headers)
+    }
+
+    pub(crate) fn application_auth_required(&self) -> bool {
+        self.application_registry.required()
     }
 
     pub fn submit_warmup_task(
@@ -268,6 +283,9 @@ impl QueryServiceRegistry {
                 Some(Err(error)) => return Some(Err(error)),
                 None => {}
             }
+        }
+        if let Some(text) = self.application_registry.metrics_text() {
+            texts.push(text);
         }
         if texts.is_empty() {
             None

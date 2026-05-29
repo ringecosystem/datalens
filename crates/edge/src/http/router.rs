@@ -46,5 +46,6 @@ pub fn router_with_edge_config(registry: QueryServiceRegistry, edge: config::Edg
     router.with_state(AppState {
         registry,
         graphql_schema,
+        edge,
     })
 }

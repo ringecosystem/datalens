@@ -15,6 +15,7 @@ use datalens_warmup::{WarmupRunResult, WarmupTaskFilter, WarmupTaskId};
 use serde::Serialize;
 
 use crate::{
+    config::ApplicationOperationConfig,
     contract::error::{api_error_kind, api_error_status},
     contract::{
         discovery::{ChainDiscovery, DatasetDiscovery, DiscoveryResponse},
@@ -58,7 +59,14 @@ pub(crate) async fn graphql_handler(
         .into()
 }
 
-pub(crate) async fn playground() -> Response {
+pub(crate) async fn playground(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(error) = state.registry.authenticate_discovery_headers(&headers) {
+        return (
+            api_error_status(&error.kind),
+            axum::Json(crate::contract::error::api_error_body(error)),
+        )
+            .into_response();
+    }
     Html(GraphiQLSource::build().endpoint("/graphql").finish()).into_response()
 }
 
@@ -68,11 +76,17 @@ pub(crate) struct QueryRoot;
 impl QueryRoot {
     async fn chains(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<String>> {
         let registry = registry(ctx)?;
+        let _application_context = registry
+            .authenticate_discovery_headers(&headers(ctx))
+            .map_err(graphql_error)?;
         Ok(registry.chain_names())
     }
 
     async fn discovery(&self, ctx: &Context<'_>) -> async_graphql::Result<Discovery> {
         let registry = registry(ctx)?.clone();
+        let _application_context = registry
+            .authenticate_discovery_headers(&headers(ctx))
+            .map_err(graphql_error)?;
         let response = spawn_graphql_blocking(move || registry.discovery()).await?;
         Ok(response.into())
     }
@@ -91,6 +105,7 @@ impl QueryRoot {
         // GraphQL uses the same native query request and application context as
         // REST so cache policy, quotas, and attribution do not diverge by API.
         let application = application_context
+            .as_ref()
             .map(|application| application.metrics_identity())
             .or_else(|| application_from_headers(&headers));
         let native_input = request.clone().into_native_input().map_err(graphql_error)?;
@@ -112,10 +127,11 @@ impl QueryRoot {
         let headers = headers(ctx);
         let task_id = WarmupTaskId::new(id.to_string()).map_err(graphql_error)?;
         let application_context = registry
-            .authenticate_task_headers(&headers)
+            .authenticate_task_headers(&headers, ApplicationOperationConfig::WarmupRead)
             .map_err(graphql_error)?;
         let application_id = application_context
-            .map(|application| application.id)
+            .as_ref()
+            .map(|application| application.id.clone())
             .or_else(|| application_id_from_headers(&headers));
         let task = spawn_graphql_blocking(move || registry.get_warmup_task(&task_id)).await?;
         task.map(|task| {
@@ -134,7 +150,7 @@ impl QueryRoot {
         let registry = registry(ctx)?.clone();
         let headers = headers(ctx);
         let application_context = registry
-            .authenticate_task_headers(&headers)
+            .authenticate_task_headers(&headers, ApplicationOperationConfig::WarmupRead)
             .map_err(graphql_error)?;
         let mut filter = match filter {
             Some(filter) => filter.into_filter()?,
@@ -142,7 +158,8 @@ impl QueryRoot {
         };
         if filter.application_id.is_none() {
             filter.application_id = application_context
-                .map(|application| application.id)
+                .as_ref()
+                .map(|application| application.id.clone())
                 .or_else(|| application_id_from_headers(&headers));
         }
         let tasks = spawn_graphql_blocking(move || registry.list_warmup_tasks(filter)).await?;
@@ -169,10 +186,16 @@ impl MutationRoot {
         let request = input.into_request()?;
         let dataset = request.dataset_for_auth().map_err(graphql_error)?;
         let application_context = registry
-            .authenticate_warmup_headers(&headers, request.chain().configured_name(), &dataset)
+            .authenticate_warmup_headers(
+                &headers,
+                request.chain().configured_name(),
+                &dataset,
+                ApplicationOperationConfig::WarmupSubmit,
+            )
             .map_err(graphql_error)?;
         let application_id = application_context
-            .map(|application| application.id)
+            .as_ref()
+            .map(|application| application.id.clone())
             .or_else(|| application_id_from_headers(&headers))
             .unwrap_or_else(|| "unknown".to_owned());
         let request = warmup_submit_request(application_id, request).map_err(graphql_error)?;
@@ -213,6 +236,10 @@ impl MutationRoot {
         ctx: &Context<'_>,
     ) -> async_graphql::Result<WarmupRunOncePayload> {
         let registry = registry(ctx)?.clone();
+        let headers = headers(ctx);
+        let _application_context = registry
+            .authenticate_task_headers(&headers, ApplicationOperationConfig::WarmupRun)
+            .map_err(graphql_error)?;
         let results = spawn_graphql_blocking(move || registry.run_warmup_once()).await?;
         Ok(WarmupRunOnceApiResponse { results }.into())
     }
@@ -367,10 +394,11 @@ async fn mutate_warmup_task(
     let headers = headers(ctx);
     let task_id = WarmupTaskId::new(id.to_string()).map_err(graphql_error)?;
     let application_context = registry
-        .authenticate_task_headers(&headers)
+        .authenticate_task_headers(&headers, ApplicationOperationConfig::WarmupMutate)
         .map_err(graphql_error)?;
     let application_id = application_context
-        .map(|application| application.id)
+        .as_ref()
+        .map(|application| application.id.clone())
         .or_else(|| application_id_from_headers(&headers));
     let current_task_id = task_id.clone();
     let current_registry = registry.clone();
@@ -406,7 +434,7 @@ fn authorize_warmup_task_application(
     if application_id != task.application_id {
         return Err(DatalensError::new(
             DatalensErrorKind::Unauthorized,
-            "application is not allowed to mutate another application's warmup task",
+            "application is not allowed to access another application's warmup task",
         ));
     }
     Ok(())

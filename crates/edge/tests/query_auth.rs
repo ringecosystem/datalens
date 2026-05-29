@@ -1,5 +1,9 @@
 mod support;
 
+use datalens_edge::{
+    config::{EdgeConfig, MetricsEndpointConfig},
+    router_with_edge_config,
+};
 use support::query::*;
 
 #[tokio::test]
@@ -18,7 +22,16 @@ async fn test_registered_application_query_uses_native_dataset_metrics_label() {
         .expect("application registry")
         .with_service(service(storage, source))
         .expect("register service");
-    let app = router(registry);
+    let app = router_with_edge_config(
+        registry,
+        EdgeConfig {
+            metrics: MetricsEndpointConfig {
+                public: true,
+                bearer_token: None,
+            },
+            ..Default::default()
+        },
+    );
 
     let response = app
         .clone()
@@ -50,7 +63,215 @@ async fn test_registered_application_query_uses_native_dataset_metrics_label() {
     assert!(text.contains(
         r#"datalens_query_total{application="indexer_app",chain="ethereum",chain_kind="evm",dataset="evm.blocks",outcome="filled"} 1"#
     ));
+    assert!(text.contains(
+        r#"datalens_edge_request_total{application="indexer_app",outcome="accepted"} 1"#
+    ));
     assert!(!text.contains("Indexer_App"));
+}
+
+#[tokio::test]
+async fn test_operation_allowlist_does_not_let_query_credentials_read_discovery() {
+    let registry = QueryServiceRegistry::new()
+        .with_application_registry(application_registry(vec![ApplicationConfig {
+            id: "query-only".to_owned(),
+            name: "query-only".to_owned(),
+            enabled: true,
+            display_name: None,
+            token: "secret-token".to_owned(),
+            chains: vec!["ethereum".to_owned()],
+            datasets: vec!["evm.blocks".to_owned()],
+            operations: vec![ApplicationOperationConfig::Query],
+            quota: None,
+        }]))
+        .expect("application registry")
+        .with_service(service(
+            LocalStorage::new(temp_storage_root("app-operation-discovery")),
+            MockSource::default(),
+        ))
+        .expect("register service");
+    let app = router(registry);
+
+    let query = app
+        .clone()
+        .oneshot(query_http_request(
+            blocks_request(10, 10),
+            Some("query-only"),
+            Some("Bearer secret-token"),
+        ))
+        .await
+        .expect("query response");
+    let discovery = app
+        .oneshot(
+            Request::get("/v1/discovery")
+                .header("x-datalens-application", "query-only")
+                .header("authorization", "Bearer secret-token")
+                .body(Body::empty())
+                .expect("discovery request"),
+        )
+        .await
+        .expect("discovery response");
+
+    assert_eq!(query.status(), StatusCode::OK);
+    assert_eq!(discovery.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn test_max_requests_per_minute_is_enforced_before_provider_fetch() {
+    let root = temp_storage_root("app-rate-limit");
+    let source = MockSource::default().with_blocks(vec![block(10, "0x10"), block(11, "0x11")]);
+    let registry = QueryServiceRegistry::new()
+        .with_application_registry(application_registry(vec![application(
+            "limited",
+            true,
+            "secret-token",
+            vec!["ethereum"],
+            vec!["evm.blocks"],
+            Some(ApplicationQuotaConfig {
+                max_query_range_blocks: None,
+                max_hot_query_range_blocks: None,
+                max_requests_per_minute: Some(1),
+                max_concurrent_requests: None,
+            }),
+        )]))
+        .expect("application registry")
+        .with_service(service(LocalStorage::new(&root), source.clone()))
+        .expect("register service");
+    let app = router(registry);
+
+    let first = app
+        .clone()
+        .oneshot(query_http_request(
+            blocks_request(10, 10),
+            Some("limited"),
+            Some("Bearer secret-token"),
+        ))
+        .await
+        .expect("first response");
+    let second = app
+        .oneshot(query_http_request(
+            blocks_request(11, 11),
+            Some("limited"),
+            Some("Bearer secret-token"),
+        ))
+        .await
+        .expect("second response");
+
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        source.calls(),
+        vec![SourceCall::Blocks(BlockRange::expect_new(10, 10))]
+    );
+}
+
+#[tokio::test]
+async fn test_max_concurrent_requests_is_enforced_while_request_is_in_flight() {
+    let source = MockSource::default()
+        .with_blocks(vec![block(10, "0x10"), block(11, "0x11")])
+        .with_fetch_delay(std::time::Duration::from_millis(200));
+    let registry = QueryServiceRegistry::new()
+        .with_application_registry(application_registry(vec![application(
+            "limited",
+            true,
+            "secret-token",
+            vec!["ethereum"],
+            vec!["evm.blocks"],
+            Some(ApplicationQuotaConfig {
+                max_query_range_blocks: None,
+                max_hot_query_range_blocks: None,
+                max_requests_per_minute: None,
+                max_concurrent_requests: Some(1),
+            }),
+        )]))
+        .expect("application registry")
+        .with_service(service(
+            LocalStorage::new(temp_storage_root("app-concurrency-limit")),
+            source.clone(),
+        ))
+        .expect("register service");
+    let app = router(registry);
+
+    let first_app = app.clone();
+    let first = tokio::spawn(async move {
+        first_app
+            .oneshot(query_http_request(
+                blocks_request(10, 10),
+                Some("limited"),
+                Some("Bearer secret-token"),
+            ))
+            .await
+            .expect("first response")
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let second = app
+        .oneshot(query_http_request(
+            blocks_request(11, 11),
+            Some("limited"),
+            Some("Bearer secret-token"),
+        ))
+        .await
+        .expect("second response");
+    let first = first.await.expect("first task");
+
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        source.calls(),
+        vec![SourceCall::Blocks(BlockRange::expect_new(10, 10))]
+    );
+}
+
+#[tokio::test]
+async fn test_metrics_route_requires_operator_token_when_application_auth_is_required() {
+    let registry = QueryServiceRegistry::new()
+        .with_application_registry(application_registry(vec![application(
+            "query-app",
+            true,
+            "query-token",
+            vec!["ethereum"],
+            vec!["evm.blocks"],
+            None,
+        )]))
+        .expect("application registry")
+        .with_service(service(
+            LocalStorage::new(temp_storage_root("metrics-policy")),
+            MockSource::default(),
+        ))
+        .expect("register service");
+    let app = router_with_edge_config(
+        registry,
+        EdgeConfig {
+            metrics: MetricsEndpointConfig {
+                public: false,
+                bearer_token: Some("metrics-token".to_owned()),
+            },
+            ..Default::default()
+        },
+    );
+
+    let application_credentials = app
+        .clone()
+        .oneshot(
+            Request::get("/metrics")
+                .header("x-datalens-application", "query-app")
+                .header("authorization", "Bearer query-token")
+                .body(Body::empty())
+                .expect("metrics request"),
+        )
+        .await
+        .expect("application metrics response");
+    let operator_credentials = app
+        .oneshot(
+            Request::get("/metrics")
+                .header("authorization", "Bearer metrics-token")
+                .body(Body::empty())
+                .expect("metrics request"),
+        )
+        .await
+        .expect("operator metrics response");
+
+    assert_eq!(application_credentials.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(operator_credentials.status(), StatusCode::OK);
 }
 
 #[tokio::test]
