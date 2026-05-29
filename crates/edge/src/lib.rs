@@ -38,6 +38,8 @@ use datalens_warmup::{
 use datalens_writer::{DurableWriteResult, DurableWriterConfig};
 use serde::{Deserialize, Serialize};
 
+mod graphql;
+
 pub mod auth {
     use super::*;
 
@@ -210,6 +212,29 @@ pub mod auth {
             }))
         }
 
+        pub fn authenticate_native_query_headers(
+            &self,
+            headers: &HeaderMap,
+            request: &QueryApiRequest,
+        ) -> Result<Option<ApplicationContext>, DatalensError> {
+            if !self.required {
+                return Ok(None);
+            }
+            let application = self.authenticate_application_headers(headers)?;
+            authorize_application_dataset(
+                application,
+                request.chain.configured_name(),
+                &request.dataset_key,
+            )?;
+            enforce_native_query_quota(application, request)?;
+            Ok(Some(ApplicationContext {
+                id: application.id.clone(),
+                name: application.name.clone(),
+                display_name: application.display_name.clone(),
+                quota: application.quota.clone(),
+            }))
+        }
+
         pub fn authenticate_task_headers(
             &self,
             headers: &HeaderMap,
@@ -341,6 +366,37 @@ pub mod auth {
         Ok(())
     }
 
+    fn enforce_native_query_quota(
+        application: &config::ApplicationConfig,
+        request: &QueryApiRequest,
+    ) -> Result<(), DatalensError> {
+        let Some(quota) = &application.quota else {
+            return Ok(());
+        };
+        let range = request.range.into_ledger_range()?;
+        if let Some(limit) = quota.max_query_range_blocks {
+            let requested = range.len();
+            if requested > u128::from(limit) {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::RateLimited,
+                    "application query range quota exceeded",
+                ));
+            }
+        }
+        if request.finality.allows_hot()
+            && let Some(limit) = quota.max_hot_query_range_blocks
+        {
+            let requested = range.len();
+            if requested > u128::from(limit) {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::RateLimited,
+                    "application hot query range quota exceeded",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn normalize_application_id(value: &str) -> Result<String, DatalensError> {
         let normalized = value.trim().to_ascii_lowercase();
         if normalized.is_empty()
@@ -384,8 +440,8 @@ pub mod compatibility {
 
 pub mod http {
     pub use super::{
-        ApiErrorBody, ApiErrorDetail, api_error_body, api_error_status, router, serve,
-        serve_lifecycle,
+        ApiErrorBody, ApiErrorDetail, api_error_body, api_error_status, router,
+        router_with_api_config, serve, serve_lifecycle,
     };
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -441,6 +497,8 @@ pub mod config {
         pub index: IndexConfig,
         #[serde(default)]
         pub warmup: WarmupConfig,
+        #[serde(default)]
+        pub api: ApiConfig,
         #[serde(default)]
         pub applications: ApplicationRegistryConfig,
         pub chains: BTreeMap<String, ChainConfig>,
@@ -575,6 +633,29 @@ pub mod config {
         pub default_application: String,
     }
 
+    #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+    pub struct ApiConfig {
+        #[serde(default)]
+        pub graphql: GraphqlConfig,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    pub struct GraphqlConfig {
+        #[serde(default = "default_graphql_enabled")]
+        pub enabled: bool,
+        #[serde(default = "default_graphql_playground_enabled")]
+        pub playground_enabled: bool,
+    }
+
+    impl Default for GraphqlConfig {
+        fn default() -> Self {
+            Self {
+                enabled: default_graphql_enabled(),
+                playground_enabled: default_graphql_playground_enabled(),
+            }
+        }
+    }
+
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
     pub struct WarmupConfig {
         #[serde(default)]
@@ -668,6 +749,14 @@ pub mod config {
 
     fn default_metrics_application() -> String {
         "datalens".to_owned()
+    }
+
+    fn default_graphql_enabled() -> bool {
+        true
+    }
+
+    fn default_graphql_playground_enabled() -> bool {
+        true
     }
 
     fn default_warmup_registry_path() -> String {
@@ -974,14 +1063,14 @@ pub struct WarmupSubmitApiRequest {
     pub retry_policy: WarmupRetryPolicy,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum WarmupDatasetKeyApi {
     Key(String),
     Structured(DatasetKey),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum WarmupSelectorApiRequest {
     All,
@@ -1885,6 +1974,15 @@ impl QueryServiceRegistry {
             .authenticate_warmup_headers(headers, chain, dataset)
     }
 
+    fn authenticate_native_query_headers(
+        &self,
+        headers: &HeaderMap,
+        request: &QueryApiRequest,
+    ) -> Result<Option<ApplicationContext>, DatalensError> {
+        self.application_registry
+            .authenticate_native_query_headers(headers, request)
+    }
+
     fn authenticate_task_headers(
         &self,
         headers: &HeaderMap,
@@ -2133,7 +2231,15 @@ where
 }
 
 pub fn router(registry: QueryServiceRegistry) -> Router {
-    Router::new()
+    router_with_api_config(registry, config::ApiConfig::default())
+}
+
+pub fn router_with_api_config(registry: QueryServiceRegistry, api: config::ApiConfig) -> Router {
+    let graphql_schema = api
+        .graphql
+        .enabled
+        .then(|| graphql::schema(registry.clone()));
+    let mut router = Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .route("/v1/chains", get(chains))
@@ -2144,13 +2250,24 @@ pub fn router(registry: QueryServiceRegistry) -> Router {
         .route("/v1/warmup/tasks/{task_id}/pause", post(warmup_pause))
         .route("/v1/warmup/tasks/{task_id}/cancel", post(warmup_cancel))
         .route("/v1/warmup/tasks/{task_id}/retry", post(warmup_retry))
-        .route("/v1/warmup/run-once", post(warmup_run_once))
-        .with_state(AppState { registry })
+        .route("/v1/warmup/run-once", post(warmup_run_once));
+
+    if graphql_schema.is_some() {
+        router = router.route("/graphql", post(graphql::graphql_handler));
+    }
+    if api.graphql.enabled && api.graphql.playground_enabled {
+        router = router.route("/graphql/playground", get(graphql::playground));
+    }
+    router.with_state(AppState {
+        registry,
+        graphql_schema,
+    })
 }
 
 #[derive(Clone)]
-struct AppState {
+pub(crate) struct AppState {
     registry: QueryServiceRegistry,
+    graphql_schema: Option<graphql::DatalensGraphqlSchema>,
 }
 
 async fn health() -> Json<serde_json::Value> {
