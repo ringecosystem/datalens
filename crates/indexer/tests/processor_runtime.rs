@@ -11,8 +11,10 @@ use datalens_indexer::{
     DatalensIndexConfig, IndexCheckpointFileStore, IndexPlan, IndexPlanBuilder, ProcessorRunStatus,
     ProcessorRuntime, ProcessorRuntimeOptions,
     sdk::{
-        ApplicationProcessor, ApplicationStore, ApplicationStoreTransaction, EventBatch,
-        ProcessResult, ProcessorContext, ProcessorError, TransactionalApplicationStore,
+        ApplicationDatabaseKind, ApplicationProcessor, ApplicationSchemaInitializer,
+        ApplicationSchemaStore, ApplicationStore, ApplicationStoreTransaction, EventBatch,
+        ProcessResult, ProcessorContext, ProcessorError, SchemaInitializationContext,
+        TransactionalApplicationStore,
     },
 };
 use serde_json::json;
@@ -50,6 +52,113 @@ async fn test_processor_runtime_commits_store_then_advances_checkpoint() {
         checkpoint_completed_block(&checkpoint_path, &plan),
         Some(11)
     );
+}
+
+#[tokio::test]
+async fn test_processor_runtime_runs_schema_initialization_before_first_query() {
+    let root = temp_path("schema-before-query");
+    let checkpoint_path = root.join("checkpoint.json");
+    let plan = plan(12, 13, 2);
+    let store = RecordingTransactionalStore::default();
+    let initializer = RecordingSchemaInitializer::default()
+        .with_statement("CREATE TABLE IF NOT EXISTS payment_transfers");
+    let transport = QueueTransport::new(vec![Ok(HttpResponse::json(
+        200,
+        response_json(12, 13, vec![log_row(12, 0, 0)], true),
+    ))]);
+    let client = client(transport.clone());
+
+    let report = ProcessorRuntime::new(plan.clone(), RecordingProcessor::default(), store.clone())
+        .with_schema_initializer(initializer)
+        .with_options(ProcessorRuntimeOptions::default().with_checkpoint_path(&checkpoint_path))
+        .run(&client)
+        .await
+        .expect("processor run");
+
+    assert_eq!(report.status, ProcessorRunStatus::Succeeded);
+    assert_eq!(
+        store.schema_events(),
+        vec![
+            "execute sqlite processor-tests processor CREATE TABLE IF NOT EXISTS payment_transfers"
+        ]
+    );
+    assert_eq!(request_ranges(&transport), vec![(12, 13)]);
+    assert_eq!(
+        checkpoint_completed_block(&checkpoint_path, &plan),
+        Some(13)
+    );
+}
+
+#[tokio::test]
+async fn test_processor_runtime_schema_initialization_is_run_on_each_start() {
+    let root = temp_path("schema-repeat");
+    let checkpoint_path = root.join("checkpoint.json");
+    let plan = plan(14, 15, 2);
+    let store = RecordingTransactionalStore::default();
+    let initializer = RecordingSchemaInitializer::default()
+        .with_statement("CREATE TABLE IF NOT EXISTS payment_transfers");
+    let first_transport = QueueTransport::new(vec![Ok(HttpResponse::json(
+        200,
+        response_json(14, 15, Vec::new(), true),
+    ))]);
+    let second_transport = QueueTransport::new(Vec::new());
+
+    ProcessorRuntime::new(plan.clone(), RecordingProcessor::default(), store.clone())
+        .with_schema_initializer(initializer.clone())
+        .with_options(ProcessorRuntimeOptions::default().with_checkpoint_path(&checkpoint_path))
+        .run(&client(first_transport))
+        .await
+        .expect("first processor run");
+    ProcessorRuntime::new(plan, RecordingProcessor::default(), store.clone())
+        .with_schema_initializer(initializer)
+        .with_options(ProcessorRuntimeOptions::default().with_checkpoint_path(&checkpoint_path))
+        .run(&client(second_transport))
+        .await
+        .expect("second processor run");
+
+    assert_eq!(
+        store
+            .schema_events()
+            .iter()
+            .filter(|event| {
+                event.as_str()
+                    == "execute sqlite processor-tests processor CREATE TABLE IF NOT EXISTS payment_transfers"
+            })
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn test_processor_runtime_schema_initialization_failure_prevents_indexing() {
+    let root = temp_path("schema-failure");
+    let checkpoint_path = root.join("checkpoint.json");
+    let plan = plan(16, 17, 2);
+    let store = RecordingTransactionalStore::default();
+    let initializer = RecordingSchemaInitializer::default()
+        .with_statement("CREATE TABLE IF NOT EXISTS payment_transfers")
+        .with_fail(true);
+    let transport = QueueTransport::new(vec![Ok(HttpResponse::json(
+        200,
+        response_json(16, 17, vec![log_row(16, 0, 0)], true),
+    ))]);
+    let client = client(transport.clone());
+
+    let error = ProcessorRuntime::new(plan.clone(), RecordingProcessor::default(), store.clone())
+        .with_schema_initializer(initializer)
+        .with_options(ProcessorRuntimeOptions::default().with_checkpoint_path(&checkpoint_path))
+        .run(&client)
+        .await
+        .expect_err("schema initialization should fail startup");
+
+    assert!(
+        error
+            .to_string()
+            .contains("processor schema initialization failed")
+    );
+    assert!(request_ranges(&transport).is_empty());
+    assert_eq!(store.counts(), (0, 0, 0));
+    assert_eq!(checkpoint_completed_block(&checkpoint_path, &plan), None);
 }
 
 #[tokio::test]
@@ -284,6 +393,47 @@ struct RecordingProcessor {
     fail_on_start: Option<u64>,
 }
 
+#[derive(Clone, Default)]
+struct RecordingSchemaInitializer {
+    statement: Option<&'static str>,
+    fail: bool,
+}
+
+impl RecordingSchemaInitializer {
+    fn with_statement(mut self, statement: &'static str) -> Self {
+        self.statement = Some(statement);
+        self
+    }
+
+    fn with_fail(mut self, fail: bool) -> Self {
+        self.fail = fail;
+        self
+    }
+}
+
+impl ApplicationSchemaInitializer for RecordingSchemaInitializer {
+    fn initialize_schema<'a>(
+        &'a self,
+        context: SchemaInitializationContext<'a>,
+    ) -> BoxFuture<'a, Result<(), ProcessorError>> {
+        Box::pin(async move {
+            if self.fail {
+                return Err(ProcessorError::user("application schema setup failed"));
+            }
+            if let Some(statement) = self.statement {
+                let statement = format!(
+                    "{} {} {} {statement}",
+                    context.store().database_kind().as_str(),
+                    context.application(),
+                    context.index()
+                );
+                context.store().execute_sql(&statement).await?;
+            }
+            Ok(())
+        })
+    }
+}
+
 impl RecordingProcessor {
     fn with_fail_after_writes(mut self, fail_after_writes: bool) -> Self {
         self.fail_after_writes = fail_after_writes;
@@ -352,11 +502,24 @@ impl RecordingTransactionalStore {
         let state = self.state.lock().expect("state lock");
         (state.begins, state.commits, state.rollbacks)
     }
+
+    fn schema_events(&self) -> Vec<String> {
+        self.state.lock().expect("state lock").schema_events.clone()
+    }
+
+    fn record_schema_event(&self, event: String) {
+        self.state
+            .lock()
+            .expect("state lock")
+            .schema_events
+            .push(event);
+    }
 }
 
 #[derive(Default)]
 struct RecordingStoreState {
     committed: Vec<String>,
+    schema_events: Vec<String>,
     begins: usize,
     commits: usize,
     rollbacks: usize,
@@ -364,6 +527,10 @@ struct RecordingStoreState {
 }
 
 impl TransactionalApplicationStore for RecordingTransactionalStore {
+    fn schema_store(&self) -> Option<&dyn ApplicationSchemaStore> {
+        Some(self)
+    }
+
     fn begin_transaction<'a>(
         &'a self,
     ) -> BoxFuture<
@@ -378,6 +545,19 @@ impl TransactionalApplicationStore for RecordingTransactionalStore {
                     pending: Mutex::new(Vec::new()),
                 });
             Ok(tx)
+        })
+    }
+}
+
+impl ApplicationSchemaStore for RecordingTransactionalStore {
+    fn database_kind(&self) -> ApplicationDatabaseKind {
+        ApplicationDatabaseKind::Sqlite
+    }
+
+    fn execute_sql<'a>(&'a self, statement: &'a str) -> BoxFuture<'a, Result<(), ProcessorError>> {
+        Box::pin(async move {
+            self.record_schema_event(format!("execute {statement}"));
+            Ok(())
         })
     }
 }
