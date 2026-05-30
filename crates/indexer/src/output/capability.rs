@@ -76,14 +76,16 @@ impl OutputSinkConfig {
     pub fn kind(&self) -> OutputKind {
         match self {
             Self::StdoutJson | Self::FileJson { .. } => OutputKind::Jsonl,
-            Self::DatabaseSqlite { .. } => OutputKind::Database,
+            Self::DatabaseSqlite { .. } | Self::DatabasePostgres { .. } => OutputKind::Database,
         }
     }
 
     pub fn capability(&self) -> OutputCapability {
         match self {
             Self::StdoutJson | Self::FileJson { .. } => OutputCapability::jsonl(),
-            Self::DatabaseSqlite { .. } => OutputCapability::database(),
+            Self::DatabaseSqlite { .. } | Self::DatabasePostgres { .. } => {
+                OutputCapability::database()
+            }
         }
     }
 }

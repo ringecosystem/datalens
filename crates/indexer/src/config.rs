@@ -160,6 +160,7 @@ pub struct DatabaseOutputConfig {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DatabaseDriver {
     Sqlite,
+    Postgres,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -472,17 +473,19 @@ fn parse_database_output(
         errors.push("output.database: missing required table".to_owned());
         return None;
     };
-    let driver =
-        match required_non_empty("output.database.driver", database.driver, errors).as_deref() {
-            Some("sqlite") => Some(DatabaseDriver::Sqlite),
-            Some(value) => {
-                errors.push(format!(
-                    "output.database.driver: unsupported driver {value}; supported value is sqlite"
+    let driver = match required_non_empty("output.database.driver", database.driver, errors)
+        .as_deref()
+    {
+        Some("sqlite") => Some(DatabaseDriver::Sqlite),
+        Some("postgres") => Some(DatabaseDriver::Postgres),
+        Some(value) => {
+            errors.push(format!(
+                    "output.database.driver: unsupported driver {value}; supported values are sqlite and postgres"
                 ));
-                None
-            }
-            None => None,
-        };
+            None
+        }
+        None => None,
+    };
     let url = required_non_empty("output.database.url", database.url, errors);
 
     Some(OutputConfig::Database {

@@ -203,15 +203,44 @@ fn test_parse_valid_sqlite_database_output_allows_query_service() {
 }
 
 #[test]
-fn test_parse_rejects_unsupported_database_driver() {
+fn test_parse_valid_postgres_database_output_allows_query_service() {
     let input = valid_config().replace(
         "[output.jsonl]\npath = \".data/indexes/ormp/events.jsonl\"",
         "[output]\nkind = \"database\"\n\n[output.database]\ndriver = \"postgres\"\nurl = \"postgres://localhost/datalens\"",
+    )
+    .replace("[checkpoint]", "[query]\nenabled = true\ngraphql = true\n\n[checkpoint]");
+
+    let config = DatalensIndexConfig::from_toml_str(&input).expect("valid database config");
+
+    assert_eq!(
+        config.output,
+        OutputConfig::Database {
+            database: DatabaseOutputConfig {
+                driver: DatabaseDriver::Postgres,
+                url: "postgres://localhost/datalens".to_owned(),
+            },
+        }
+    );
+    assert_eq!(
+        config.query,
+        QueryServiceConfig {
+            enabled: true,
+            graphql: true,
+        }
+    );
+}
+
+#[test]
+fn test_parse_rejects_unsupported_database_driver() {
+    let input = valid_config().replace(
+        "[output.jsonl]\npath = \".data/indexes/ormp/events.jsonl\"",
+        "[output]\nkind = \"database\"\n\n[output.database]\ndriver = \"mysql\"\nurl = \"mysql://localhost/datalens\"",
     );
     let error = parse_error(&input);
 
     assert!(error.contains("output.database.driver"), "{error}");
     assert!(error.contains("sqlite"), "{error}");
+    assert!(error.contains("postgres"), "{error}");
 }
 
 #[test]
