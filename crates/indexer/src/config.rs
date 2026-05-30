@@ -148,6 +148,18 @@ pub struct EvmSourceConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OutputConfig {
     Jsonl { path: PathBuf },
+    Database { database: DatabaseOutputConfig },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DatabaseOutputConfig {
+    pub driver: DatabaseDriver,
+    pub url: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DatabaseDriver {
+    Sqlite,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -202,13 +214,22 @@ struct RawSourceConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawOutputConfig {
+    kind: Option<String>,
     jsonl: Option<RawJsonlOutputConfig>,
+    database: Option<RawDatabaseOutputConfig>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawJsonlOutputConfig {
     path: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDatabaseOutputConfig {
+    driver: Option<String>,
+    url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -252,7 +273,7 @@ impl TryFrom<RawDatalensIndexConfig> for DatalensIndexConfig {
                 path: PathBuf::new(),
             }),
             None => {
-                errors.push("output: missing required jsonl output table".to_owned());
+                errors.push("output: missing required output table".to_owned());
                 OutputConfig::Jsonl {
                     path: PathBuf::new(),
                 }
@@ -419,12 +440,57 @@ fn parse_source(
 }
 
 fn parse_output(raw: RawOutputConfig, errors: &mut Vec<String>) -> Option<OutputConfig> {
-    let Some(jsonl) = raw.jsonl else {
+    match raw.kind.as_deref() {
+        Some("database") => parse_database_output(raw.database, errors),
+        Some("jsonl") | None => parse_jsonl_output(raw.jsonl, errors),
+        Some(value) => {
+            errors.push(format!(
+                "output.kind: unsupported output kind {value}; supported values are jsonl and database"
+            ));
+            None
+        }
+    }
+}
+
+fn parse_jsonl_output(
+    raw: Option<RawJsonlOutputConfig>,
+    errors: &mut Vec<String>,
+) -> Option<OutputConfig> {
+    let Some(jsonl) = raw else {
         errors.push("output: missing required jsonl output table".to_owned());
         return None;
     };
     let path = required_path("output.jsonl.path", jsonl.path, errors)?;
     Some(OutputConfig::Jsonl { path })
+}
+
+fn parse_database_output(
+    raw: Option<RawDatabaseOutputConfig>,
+    errors: &mut Vec<String>,
+) -> Option<OutputConfig> {
+    let Some(database) = raw else {
+        errors.push("output.database: missing required table".to_owned());
+        return None;
+    };
+    let driver =
+        match required_non_empty("output.database.driver", database.driver, errors).as_deref() {
+            Some("sqlite") => Some(DatabaseDriver::Sqlite),
+            Some(value) => {
+                errors.push(format!(
+                    "output.database.driver: unsupported driver {value}; supported value is sqlite"
+                ));
+                None
+            }
+            None => None,
+        };
+    let url = required_non_empty("output.database.url", database.url, errors);
+
+    Some(OutputConfig::Database {
+        database: DatabaseOutputConfig {
+            driver: driver?,
+            url: url?,
+        },
+    })
 }
 
 fn parse_query(raw: Option<RawQueryServiceConfig>) -> QueryServiceConfig {

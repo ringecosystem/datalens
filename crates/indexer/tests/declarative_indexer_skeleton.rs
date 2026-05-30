@@ -7,7 +7,7 @@ use datalens_client::{
 use datalens_core::{DatasetKey, DatasetRows, QueryRows};
 use datalens_indexer::{
     DatalensIndexConfig, IndexCheckpointFileStore, IndexPlanBuilder, IndexRunner,
-    IndexRunnerOptions, OutputSinkConfig,
+    IndexRunnerOptions, OutputSinkConfig, QueryableStore, SqliteOutputStore, StoreQuery,
 };
 
 #[test]
@@ -195,6 +195,41 @@ fn test_index_runner_appends_jsonl_rows_to_existing_file() {
     let lines = std::fs::read_to_string(&output_path).expect("jsonl output");
     assert_eq!(lines.lines().count(), 3);
     assert!(lines.starts_with("{\"existing\":true}\n"));
+}
+
+#[test]
+fn test_index_runner_writes_evm_logs_to_sqlite_output() {
+    let config = index_config(10);
+    let plan = IndexPlanBuilder::new().build(&config).unwrap();
+    let output_path = temp_path("sqlite-runner").join("index.db");
+    let url = format!("sqlite:{}", output_path.display());
+    let transport = QueueTransport::new(vec![HttpResponse::json(
+        200,
+        response_json(10, 12, 2, true),
+    )]);
+    let client =
+        DatalensClient::with_transport(config.client.to_datalens_client_config(), transport)
+            .expect("client config");
+    let runner = IndexRunner::new(plan, OutputSinkConfig::DatabaseSqlite { url: url.clone() });
+
+    let report = runner.run(&client).expect("index run");
+    let store = SqliteOutputStore::connect(&url).expect("sqlite store connects");
+    let rows = store
+        .query(StoreQuery {
+            dataset: "evm.logs".to_owned(),
+            filter: serde_json::json!({
+                "chain": "ethereum",
+                "address": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "from_block": 10,
+                "to_block": 12,
+            }),
+        })
+        .expect("query sqlite output");
+
+    assert_eq!(report.tasks[0].row_count, 2);
+    assert_eq!(rows.rows.len(), 2);
+    assert_eq!(rows.rows[0]["index"], "ormp");
+    assert_eq!(rows.rows[0]["transaction_hash"], format!("0x{:064x}", 0));
 }
 
 #[test]

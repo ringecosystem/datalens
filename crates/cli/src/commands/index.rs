@@ -1,24 +1,18 @@
-use std::{fs, sync::Arc};
+use std::sync::Arc;
 
 use clap::{Args, Subcommand};
-use datalens_chain::{ChainAdapter, DatasetSelector, FinalityLevel, HeightRangeKind, SelectorKind};
-use datalens_client::DatalensClient;
+use datalens_chain::{ChainAdapter, DatasetSelector, HeightRangeKind};
 use datalens_core::{
     ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey, LedgerRange, LedgerRangeKind,
     LogFilter,
 };
 use datalens_edge::auth::normalize_application_id;
 use datalens_evm::EvmRpcClient;
-use datalens_indexer::{
-    CheckpointPolicy, DatalensIndexConfig, FinalityRequirement, IndexDataset, IndexPlanBuilder,
-    IndexRunner, IndexRunnerOptions, OutputConfig, OutputSinkConfig, SourceConfig,
-};
 use datalens_metrics::ApplicationIdentity;
 use datalens_runtime_indexer::{
-    FileIndexCursorStore, IndexAccounting, IndexChunk, IndexDatasetProviderLimit,
-    IndexDatasetRequest, IndexDatasetSelection, IndexFinalityRequirement, IndexJob, IndexJobId,
-    IndexPlan, IndexRetryPolicy, IndexRunMode, IndexRunResult, IndexRuntime, IndexRuntimeConfig,
-    IndexSkippedRange, IndexVerificationRange,
+    FileIndexCursorStore, IndexDatasetProviderLimit, IndexDatasetRequest, IndexDatasetSelection,
+    IndexFinalityRequirement, IndexJob, IndexJobId, IndexPlan, IndexRetryPolicy, IndexRunMode,
+    IndexRuntime, IndexRuntimeConfig,
 };
 use datalens_solana::{
     SolanaAdapter, SolanaHttpRpc, solana_address_selector, solana_program_selector,
@@ -32,6 +26,9 @@ use crate::{
     ChainConfig, DatalensConfig, build_storage, build_usage_ledger, chain_identity,
     configured_chain, evm_finality_policy, load_config, validate_config,
 };
+
+use super::index_declarative::{index_doctor_summary, index_plan, index_run};
+use super::index_report::{plan_summary, run_summary};
 
 #[derive(Debug, Args)]
 pub struct IndexCommand {
@@ -204,117 +201,6 @@ pub fn index_command(
         );
     }
     Ok(())
-}
-
-fn index_plan(
-    command: IndexPlanCommand,
-) -> Result<datalens_indexer::IndexPlan, Box<dyn std::error::Error + Send + Sync>> {
-    let input = fs::read_to_string(&command.config)?;
-    let config = DatalensIndexConfig::from_toml_str(&input)?;
-    Ok(IndexPlanBuilder::new().build(&config)?)
-}
-
-fn index_run(
-    command: IndexRunCommand,
-) -> Result<datalens_indexer::IndexRunReport, Box<dyn std::error::Error + Send + Sync>> {
-    let input = fs::read_to_string(&command.config)?;
-    let config = DatalensIndexConfig::from_toml_str(&input)?;
-    let plan = IndexPlanBuilder::new().build(&config)?;
-    let client = DatalensClient::new(config.client.to_datalens_client_config())?;
-    let options = IndexRunnerOptions::default()
-        .with_checkpoint_policy(config.checkpoint.clone())
-        .with_no_checkpoint(command.no_checkpoint)
-        .with_from_start(command.from_start)
-        .with_dry_run(command.dry_run);
-    let runner = IndexRunner::new(plan, output_sink_config(&config.output)).with_options(options);
-    Ok(runner.run(&client)?)
-}
-
-fn output_sink_config(output: &OutputConfig) -> OutputSinkConfig {
-    match output {
-        OutputConfig::Jsonl { path } => OutputSinkConfig::FileJson { path: path.clone() },
-    }
-}
-
-pub fn index_doctor_summary(
-    command: &IndexDoctorCommand,
-) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
-    let input = fs::read_to_string(&command.config)?;
-    let config = DatalensIndexConfig::from_toml_str(&input)?;
-    Ok(declarative_index_summary(&config))
-}
-
-fn declarative_index_summary(config: &DatalensIndexConfig) -> serde_json::Value {
-    serde_json::json!({
-        "status": "ok",
-        "index": config.index.name,
-        "client": {
-            "endpoint": config.client.endpoint,
-            "application": config.client.application,
-        },
-        "dataset": index_dataset_name(config.index.dataset),
-        "finality": declarative_finality_name(config.index.finality),
-        "chunk_blocks": config.index.chunk_blocks,
-        "source_count": config.sources.len(),
-        "sources": config.sources.iter().map(declarative_source_summary).collect::<Vec<_>>(),
-        "output": declarative_output_summary(&config.output),
-        "checkpoint": declarative_checkpoint_summary(&config.checkpoint),
-    })
-}
-
-fn declarative_source_summary(source: &SourceConfig) -> serde_json::Value {
-    match source {
-        SourceConfig::Evm(source) => serde_json::json!({
-            "chain": source.chain,
-            "family": "evm",
-            "chain_id": source.chain_id,
-            "from_block": source.from_block,
-            "to_block": source.to_block,
-            "addresses": source.addresses.len(),
-            "topics": source.topics.len(),
-        }),
-    }
-}
-
-fn declarative_output_summary(output: &OutputConfig) -> serde_json::Value {
-    match output {
-        OutputConfig::Jsonl { path } => {
-            let capability = output.capability();
-            serde_json::json!({
-                "kind": capability.kind.as_str(),
-                "path": path.to_string_lossy(),
-                "capability": {
-                    "write": capability.supports_write,
-                    "query": capability.supports_query,
-                    "graphql": capability.supports_graphql,
-                    "write_mode": capability.write_mode,
-                },
-            })
-        }
-    }
-}
-
-fn declarative_checkpoint_summary(checkpoint: &CheckpointPolicy) -> serde_json::Value {
-    match checkpoint {
-        CheckpointPolicy::File { path } => serde_json::json!({
-            "path": path.to_string_lossy(),
-        }),
-        CheckpointPolicy::Disabled => serde_json::json!({
-            "path": null,
-        }),
-    }
-}
-
-fn index_dataset_name(dataset: IndexDataset) -> &'static str {
-    match dataset {
-        IndexDataset::EvmLogs => "evm.logs",
-    }
-}
-
-fn declarative_finality_name(finality: FinalityRequirement) -> &'static str {
-    match finality {
-        FinalityRequirement::Durable => "durable",
-    }
 }
 
 pub fn index_summary(command: IndexWorkflowCommand) -> Result<serde_json::Value, DatalensError> {
@@ -739,151 +625,6 @@ fn tron_provider(url: String, chain: &ChainConfig) -> TronHttpProvider {
     }
 }
 
-fn plan_summary(
-    config_path: &str,
-    chain_name: &str,
-    job: &IndexJob,
-    plan: &IndexPlan,
-    config: &DatalensConfig,
-    dry_run: bool,
-) -> serde_json::Value {
-    serde_json::json!({
-        "status": "planned",
-        "mode": index_mode_name(job.run_mode),
-        "dry_run": dry_run,
-        "read_only": dry_run || job.run_mode == IndexRunMode::Verify,
-        "config": config_path,
-        "chain": chain_name,
-        "application": job.application.as_str(),
-        "cursor_path": config.index.cursor_path,
-        "concurrency": config.index.max_concurrency,
-        "finality": {
-            "requirement": finality_requirement_name(job.finality_requirement),
-            "durable": finality_level_name(plan.durable_finality),
-            "boundary": {
-                "kind": range_kind_name(plan.finality_boundary.range_kind.clone()),
-                "height": plan.finality_boundary.value,
-            },
-        },
-        "range": range_summary(&job.range),
-        "datasets": selected_dataset_summary(job),
-        "plan": {
-            "planned_range": range_summary(&plan.planned_range),
-            "chunk_count": plan.chunks.len(),
-            "chunks": plan.chunks.iter().map(chunk_summary).collect::<Vec<_>>(),
-            "skipped_ranges": plan.skipped_ranges.iter().map(skipped_summary).collect::<Vec<_>>(),
-            "verification_ranges": plan.verification_ranges.iter().map(verification_summary).collect::<Vec<_>>(),
-        },
-        "accounting": {
-            "chunks_planned": plan.chunks.len(),
-            "chunks_fetched": 0,
-            "chunks_skipped": plan.skipped_ranges.len(),
-            "chunks_written": 0,
-            "rows_written": 0,
-        },
-    })
-}
-
-fn run_summary(
-    config_path: &str,
-    chain_name: &str,
-    config: &DatalensConfig,
-    result: &IndexRunResult,
-    read_only: bool,
-) -> serde_json::Value {
-    serde_json::json!({
-        "status": index_status_name(result.status),
-        "mode": index_mode_name(result.mode),
-        "dry_run": false,
-        "read_only": read_only,
-        "config": config_path,
-        "chain": chain_name,
-        "cursor_path": config.index.cursor_path,
-        "concurrency": config.index.max_concurrency,
-        "job_id": result.job_id.as_str(),
-        "accounting": accounting_summary(&result.accounting),
-        "checkpoints": result.checkpoints.iter().map(|checkpoint| {
-            serde_json::json!({
-                "dataset": checkpoint.chunk.dataset_key.as_str(),
-                "range": range_summary(&checkpoint.chunk.range),
-                "provider_calls": checkpoint.provider_calls,
-                "attempts": checkpoint.attempts,
-                "durable_write": checkpoint.durable_write.as_ref().map(|write| {
-                    serde_json::json!({
-                        "finality": finality_level_name(write.finality_level),
-                        "data_objects": write.data_objects,
-                        "empty_coverages": write.empty_coverages,
-                        "rows_written": write.rows_written,
-                    })
-                }),
-            })
-        }).collect::<Vec<_>>(),
-    })
-}
-
-fn accounting_summary(accounting: &IndexAccounting) -> serde_json::Value {
-    serde_json::json!({
-        "chunks_planned": accounting.chunks_planned,
-        "chunks_fetched": accounting.chunks_fetched,
-        "chunks_skipped": accounting.chunks_skipped,
-        "chunks_written": accounting.chunks_written,
-        "chunks_failed": accounting.chunks_failed,
-        "provider_limit_splits": accounting.provider_limit_splits,
-        "finality_capped_ranges": accounting.finality_capped_ranges,
-        "provider_calls": accounting.provider_calls,
-        "rows_written": accounting.rows_written,
-        "skipped_ranges": accounting.skipped_ranges,
-        "retries": accounting.retries,
-        "failures": accounting.failures,
-    })
-}
-
-fn chunk_summary(chunk: &IndexChunk) -> serde_json::Value {
-    serde_json::json!({
-        "ordinal": chunk.ordinal,
-        "dataset": chunk.dataset_key.as_str(),
-        "range": range_summary(&chunk.range),
-    })
-}
-
-fn skipped_summary(skipped: &IndexSkippedRange) -> serde_json::Value {
-    serde_json::json!({
-        "dataset": skipped.dataset_key.as_str(),
-        "range": range_summary(&skipped.range),
-        "reason": "covered_by_manifest",
-    })
-}
-
-fn verification_summary(range: &IndexVerificationRange) -> serde_json::Value {
-    serde_json::json!({
-        "dataset": range.dataset_key.as_str(),
-        "range": range_summary(&range.range),
-    })
-}
-
-fn selected_dataset_summary(job: &IndexJob) -> Vec<serde_json::Value> {
-    selected_datasets(job)
-        .unwrap_or(&[])
-        .iter()
-        .map(|dataset| {
-            serde_json::json!({
-                "key": dataset.dataset_key.as_str(),
-                "selector_kind": selector_kind_name(dataset.selector.kind()),
-                "selector_fingerprint": dataset.selector.fingerprint(),
-                "selector_canonical_key": dataset.selector.canonical_key(),
-            })
-        })
-        .collect()
-}
-
-fn range_summary(range: &LedgerRange) -> serde_json::Value {
-    serde_json::json!({
-        "kind": range_kind_name(range.kind()),
-        "start": range.start(),
-        "end": range.end(),
-    })
-}
-
 fn index_common(command: &IndexWorkflowCommand) -> &IndexCommonCommand {
     match command {
         IndexWorkflowCommand::Backfill(command) => &command.common,
@@ -944,46 +685,5 @@ fn index_mode_name(mode: IndexRunMode) -> &'static str {
         IndexRunMode::Resume => "resume",
         IndexRunMode::Repair => "repair",
         IndexRunMode::Verify => "verify",
-    }
-}
-
-fn index_status_name(status: datalens_runtime_indexer::IndexRunStatus) -> &'static str {
-    match status {
-        datalens_runtime_indexer::IndexRunStatus::Completed => "completed",
-        datalens_runtime_indexer::IndexRunStatus::Partial => "partial",
-        datalens_runtime_indexer::IndexRunStatus::Failed => "failed",
-    }
-}
-
-fn finality_requirement_name(finality: IndexFinalityRequirement) -> &'static str {
-    match finality {
-        IndexFinalityRequirement::Safe => "safe",
-        IndexFinalityRequirement::Finalized => "finalized",
-    }
-}
-
-fn finality_level_name(finality: FinalityLevel) -> &'static str {
-    match finality {
-        FinalityLevel::Latest => "latest",
-        FinalityLevel::Safe => "safe",
-        FinalityLevel::Finalized => "finalized",
-        FinalityLevel::ChainSpecific(value) => value,
-    }
-}
-
-fn range_kind_name(kind: HeightRangeKind) -> String {
-    match kind {
-        LedgerRangeKind::Block => "block".to_owned(),
-        LedgerRangeKind::Slot => "slot".to_owned(),
-        LedgerRangeKind::Height => "height".to_owned(),
-        LedgerRangeKind::Other(value) => value,
-    }
-}
-
-fn selector_kind_name(kind: SelectorKind) -> String {
-    match kind {
-        SelectorKind::All => "all".to_owned(),
-        SelectorKind::EvmLogs => "evm_logs".to_owned(),
-        SelectorKind::Other(value) => value.as_str().to_owned(),
     }
 }

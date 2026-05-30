@@ -1,6 +1,8 @@
 mod doctor;
 mod helpers;
 mod index;
+mod index_declarative;
+mod index_report;
 mod inspect;
 mod query;
 mod root;
@@ -9,6 +11,7 @@ mod serve;
 pub use doctor::doctor_command;
 pub(crate) use helpers::{chain_identity, configured_chain, parse_bind};
 pub use index::*;
+pub use index_declarative::index_doctor_summary;
 pub(crate) use inspect::inspect_command;
 pub use inspect::{InspectCommand, InspectSubcommand, InspectUsageCommand, inspect_summary};
 pub(crate) use query::query_command;

@@ -2,13 +2,14 @@ use std::{io, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::jsonl::write_records_jsonl;
+use super::{jsonl::write_records_jsonl, sqlite::SqliteOutputStore};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum OutputSinkConfig {
     StdoutJson,
     FileJson { path: PathBuf },
+    DatabaseSqlite { url: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -28,6 +29,10 @@ pub struct OutputWriteResult {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OutputWriteReceipt {
+    pub accepted_rows: usize,
+    pub inserted_rows: usize,
+    pub skipped_or_replaced_rows: usize,
+    pub highest_position: Option<String>,
     pub last_record: Option<String>,
 }
 
@@ -43,6 +48,7 @@ impl OutputWriteSink for OutputSinkConfig {
                 receipt: None,
             }),
             Self::FileJson { path } => write_records_jsonl(path, records),
+            Self::DatabaseSqlite { url } => SqliteOutputStore::connect(url)?.write_records(records),
         }
     }
 }
