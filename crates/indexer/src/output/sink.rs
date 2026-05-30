@@ -2,9 +2,11 @@ use std::{fmt, io, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::ParquetOutputConfig;
+
 use super::{
-    jsonl::write_records_jsonl, postgres::PostgresOutputStore, sqlite::SqliteOutputStore,
-    webhook::write_records_webhook,
+    jsonl::write_records_jsonl, parquet::write_records_parquet, postgres::PostgresOutputStore,
+    sqlite::SqliteOutputStore, webhook::write_records_webhook,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -14,6 +16,7 @@ pub enum OutputSinkConfig {
     FileJson { path: PathBuf },
     DatabaseSqlite { url: String },
     DatabasePostgres { url: String },
+    Parquet { config: ParquetOutputConfig },
     Webhook { webhook: WebhookOutputConfig },
 }
 
@@ -35,8 +38,10 @@ pub struct OutputWriteResult {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OutputWriteReceipt {
     pub accepted_rows: usize,
+    pub flushed_rows: usize,
     pub inserted_rows: usize,
     pub skipped_or_replaced_rows: usize,
+    pub files_written: usize,
     pub batches_attempted: usize,
     pub batches_delivered: usize,
     pub highest_position: Option<String>,
@@ -59,6 +64,7 @@ impl OutputWriteSink for OutputSinkConfig {
             Self::DatabasePostgres { url } => {
                 PostgresOutputStore::connect(url)?.write_records(records)
             }
+            Self::Parquet { config } => write_records_parquet(config, records),
             Self::Webhook { webhook } => write_records_webhook(webhook, records),
         }
     }

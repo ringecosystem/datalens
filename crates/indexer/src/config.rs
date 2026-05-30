@@ -1,6 +1,6 @@
 use std::{env, fmt, path::PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     IndexerError,
@@ -153,7 +153,17 @@ pub struct EvmSourceConfig {
 pub enum OutputConfig {
     Jsonl { path: PathBuf },
     Database { database: DatabaseOutputConfig },
+    Parquet { parquet: ParquetOutputConfig },
     Webhook { webhook: WebhookOutputConfig },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ParquetOutputConfig {
+    pub path: PathBuf,
+    pub max_rows_per_file: Option<usize>,
+    pub max_bytes_per_file: Option<usize>,
+    pub partition_by: Vec<String>,
+    pub compression: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -253,6 +263,7 @@ struct RawOutputConfig {
     kind: Option<String>,
     jsonl: Option<RawJsonlOutputConfig>,
     database: Option<RawDatabaseOutputConfig>,
+    parquet: Option<RawParquetOutputConfig>,
     webhook: Option<RawWebhookOutputConfig>,
 }
 
@@ -267,6 +278,17 @@ struct RawJsonlOutputConfig {
 struct RawDatabaseOutputConfig {
     driver: Option<String>,
     url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawParquetOutputConfig {
+    path: Option<PathBuf>,
+    max_rows_per_file: Option<usize>,
+    max_bytes_per_file: Option<usize>,
+    #[serde(default)]
+    partition_by: Vec<String>,
+    compression: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -482,11 +504,12 @@ fn parse_source(
 fn parse_output(raw: RawOutputConfig, errors: &mut Vec<String>) -> Option<OutputConfig> {
     match raw.kind.as_deref() {
         Some("database") => parse_database_output(raw.database, errors),
+        Some("parquet") => parse_parquet_output(raw.parquet, errors),
         Some("webhook") => parse_webhook_output(raw.webhook, errors),
         Some("jsonl") | None => parse_jsonl_output(raw.jsonl, errors),
         Some(value) => {
             errors.push(format!(
-                "output.kind: unsupported output kind {value}; supported values are jsonl, database, and webhook"
+                "output.kind: unsupported output kind {value}; supported values are jsonl, database, parquet, and webhook"
             ));
             None
         }
@@ -532,6 +555,39 @@ fn parse_database_output(
         database: DatabaseOutputConfig {
             driver: driver?,
             url: url?,
+        },
+    })
+}
+
+fn parse_parquet_output(
+    raw: Option<RawParquetOutputConfig>,
+    errors: &mut Vec<String>,
+) -> Option<OutputConfig> {
+    let Some(parquet) = raw else {
+        errors.push("output.parquet: missing required table".to_owned());
+        return None;
+    };
+    let path = required_path("output.parquet.path", parquet.path, errors);
+    validate_optional_positive_usize(
+        "output.parquet.max_rows_per_file",
+        parquet.max_rows_per_file,
+        errors,
+    );
+    validate_optional_positive_usize(
+        "output.parquet.max_bytes_per_file",
+        parquet.max_bytes_per_file,
+        errors,
+    );
+    validate_parquet_partitions(&parquet.partition_by, errors);
+    validate_parquet_compression(parquet.compression.as_deref(), errors);
+
+    Some(OutputConfig::Parquet {
+        parquet: ParquetOutputConfig {
+            path: path?,
+            max_rows_per_file: parquet.max_rows_per_file,
+            max_bytes_per_file: parquet.max_bytes_per_file,
+            partition_by: parquet.partition_by,
+            compression: parquet.compression,
         },
     })
 }
@@ -641,6 +697,32 @@ fn required_path(field: &str, value: Option<PathBuf>, errors: &mut Vec<String>) 
             errors.push(format!("{field}: missing required field"));
             None
         }
+    }
+}
+
+fn validate_optional_positive_usize(field: &str, value: Option<usize>, errors: &mut Vec<String>) {
+    if value == Some(0) {
+        errors.push(format!("{field}: must be greater than 0"));
+    }
+}
+
+fn validate_parquet_partitions(values: &[String], errors: &mut Vec<String>) {
+    for (index, value) in values.iter().enumerate() {
+        match value.as_str() {
+            "index" | "chain_family" | "chain_id" | "chain" | "dataset" => {}
+            _ => errors.push(format!(
+                "output.parquet.partition_by[{index}]: unsupported partition field {value}; supported values are index, chain_family, chain_id, chain, and dataset"
+            )),
+        }
+    }
+}
+
+fn validate_parquet_compression(value: Option<&str>, errors: &mut Vec<String>) {
+    match value {
+        Some("uncompressed" | "snappy" | "zstd") | None => {}
+        Some(value) => errors.push(format!(
+            "output.parquet.compression: unsupported compression {value}; supported values are uncompressed, snappy, and zstd"
+        )),
     }
 }
 

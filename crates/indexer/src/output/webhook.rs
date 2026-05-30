@@ -52,8 +52,10 @@ pub(super) fn write_records_webhook(
         written_rows: records.len(),
         receipt: Some(OutputWriteReceipt {
             accepted_rows: records.len(),
+            flushed_rows: records.len(),
             inserted_rows: records.len(),
             skipped_or_replaced_rows: 0,
+            files_written: 0,
             batches_attempted,
             batches_delivered,
             highest_position: highest_position.clone(),

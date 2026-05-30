@@ -42,6 +42,11 @@ pub fn validate_daemon_config(
                 "query.enabled: output kind jsonl does not support query service mode".to_owned(),
             ));
         }
+        OutputConfig::Parquet { .. } => {
+            return Err(IndexerError::Config(
+                "query.enabled: output kind parquet does not support query service mode".to_owned(),
+            ));
+        }
         OutputConfig::Webhook { .. } => {
             return Err(IndexerError::Config(
                 "query.enabled: output kind webhook does not support query service mode".to_owned(),
@@ -269,6 +274,9 @@ fn output_sink_config(output: &OutputConfig) -> OutputSinkConfig {
             DatabaseDriver::Postgres => OutputSinkConfig::DatabasePostgres {
                 url: database.url.clone(),
             },
+        },
+        OutputConfig::Parquet { parquet } => OutputSinkConfig::Parquet {
+            config: parquet.clone(),
         },
         OutputConfig::Webhook { webhook } => OutputSinkConfig::Webhook {
             webhook: webhook.clone(),

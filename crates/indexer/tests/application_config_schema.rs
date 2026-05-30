@@ -1,7 +1,7 @@
 use datalens_indexer::{
     CheckpointPolicy, DatabaseDriver, DatabaseOutputConfig, DatalensIndexConfig,
-    FinalityRequirement, IndexDataset, OutputConfig, QueryProtocol, QueryServiceConfig,
-    SourceConfig, WebhookHeaderConfig, WebhookOutputConfig, WebhookRetryConfig,
+    FinalityRequirement, IndexDataset, OutputConfig, ParquetOutputConfig, QueryProtocol,
+    QueryServiceConfig, SourceConfig, WebhookHeaderConfig, WebhookOutputConfig, WebhookRetryConfig,
 };
 
 fn valid_config() -> &'static str {
@@ -76,6 +76,42 @@ fn test_parse_valid_toml_config_returns_typed_schema() {
         config.checkpoint,
         CheckpointPolicy::File {
             path: ".data/indexes/ormp/checkpoint.json".into()
+        }
+    );
+}
+
+#[test]
+fn test_parse_valid_parquet_output_config() {
+    let input = valid_config().replace(
+        "[output.jsonl]\npath = \".data/indexes/ormp/events.jsonl\"",
+        r#"[output]
+kind = "parquet"
+
+[output.parquet]
+path = ".data/indexes/ormp/parquet"
+max_rows_per_file = 5000
+max_bytes_per_file = 134217728
+partition_by = ["index", "chain_family", "chain_id", "dataset"]
+compression = "zstd""#,
+    );
+
+    let config = DatalensIndexConfig::from_toml_str(&input).expect("valid parquet config");
+
+    assert_eq!(
+        config.output,
+        OutputConfig::Parquet {
+            parquet: ParquetOutputConfig {
+                path: ".data/indexes/ormp/parquet".into(),
+                max_rows_per_file: Some(5000),
+                max_bytes_per_file: Some(134217728),
+                partition_by: vec![
+                    "index".to_owned(),
+                    "chain_family".to_owned(),
+                    "chain_id".to_owned(),
+                    "dataset".to_owned(),
+                ],
+                compression: Some("zstd".to_owned()),
+            },
         }
     );
 }
@@ -185,6 +221,32 @@ fn test_parse_rejects_graphql_with_jsonl_output() {
 
     assert!(error.contains("query.protocol"), "{error}");
     assert!(error.contains("jsonl"), "{error}");
+    assert!(
+        error.contains("does not support graphql query service"),
+        "{error}"
+    );
+}
+
+#[test]
+fn test_parse_rejects_query_service_with_parquet_output() {
+    let input = valid_config()
+        .replace(
+            "[output.jsonl]\npath = \".data/indexes/ormp/events.jsonl\"",
+            "[output]\nkind = \"parquet\"\n\n[output.parquet]\npath = \".data/indexes/ormp/parquet\"",
+        )
+        .replace(
+            "[checkpoint]",
+            "[query]\nenabled = true\nprotocol = \"graphql\"\n\n[checkpoint]",
+        );
+    let error = parse_error(&input);
+
+    assert!(error.contains("query.enabled"), "{error}");
+    assert!(error.contains("query.protocol"), "{error}");
+    assert!(error.contains("parquet"), "{error}");
+    assert!(
+        error.contains("does not support query service mode"),
+        "{error}"
+    );
     assert!(
         error.contains("does not support graphql query service"),
         "{error}"
