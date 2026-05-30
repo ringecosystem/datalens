@@ -44,6 +44,16 @@ impl ClientToken {
     }
 }
 
+impl ClientConfig {
+    pub fn to_datalens_client_config(&self) -> datalens_client::DatalensClientConfig {
+        datalens_client::DatalensClientConfig {
+            endpoint: self.endpoint.clone(),
+            application: Some(self.application.clone()),
+            bearer_token: Some(self.token.secret().to_owned()),
+        }
+    }
+}
+
 impl fmt::Debug for ClientToken {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
