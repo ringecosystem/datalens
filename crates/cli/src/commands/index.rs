@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{fs, sync::Arc};
 
 use clap::{Args, Subcommand};
 use datalens_chain::{ChainAdapter, DatasetSelector, FinalityLevel, HeightRangeKind, SelectorKind};
@@ -8,6 +8,10 @@ use datalens_core::{
 };
 use datalens_edge::auth::normalize_application_id;
 use datalens_evm::EvmRpcClient;
+use datalens_indexer::{
+    CheckpointPolicy, DatalensIndexConfig, FinalityRequirement, IndexDataset, OutputConfig,
+    SourceConfig,
+};
 use datalens_metrics::ApplicationIdentity;
 use datalens_runtime_indexer::{
     FileIndexCursorStore, IndexAccounting, IndexChunk, IndexDatasetProviderLimit,
@@ -40,6 +44,7 @@ pub enum IndexWorkflowCommand {
     Resume(IndexResumeCommand),
     Repair(IndexRepairCommand),
     Verify(IndexVerifyCommand),
+    Doctor(IndexDoctorCommand),
 }
 
 pub type IndexSubcommand = IndexWorkflowCommand;
@@ -78,6 +83,12 @@ pub struct IndexVerifyCommand {
 
     #[arg(long)]
     pub verify_only: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct IndexDoctorCommand {
+    #[arg(long)]
+    pub config: String,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -131,6 +142,12 @@ pub struct IndexCommonCommand {
 pub fn index_command(
     command: IndexCommand,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let IndexWorkflowCommand::Doctor(command) = command.command {
+        let summary = index_doctor_summary(&command)?;
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+        return Ok(());
+    }
+
     let json = index_common(&command.command).json;
     let summary = index_summary(command.command)?;
     if json {
@@ -150,6 +167,78 @@ pub fn index_command(
         );
     }
     Ok(())
+}
+
+pub fn index_doctor_summary(
+    command: &IndexDoctorCommand,
+) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+    let input = fs::read_to_string(&command.config)?;
+    let config = DatalensIndexConfig::from_toml_str(&input)?;
+    Ok(declarative_index_summary(&config))
+}
+
+fn declarative_index_summary(config: &DatalensIndexConfig) -> serde_json::Value {
+    serde_json::json!({
+        "status": "ok",
+        "index": config.index.name,
+        "client": {
+            "endpoint": config.client.endpoint,
+            "application": config.client.application,
+        },
+        "dataset": index_dataset_name(config.index.dataset),
+        "finality": declarative_finality_name(config.index.finality),
+        "chunk_blocks": config.index.chunk_blocks,
+        "source_count": config.sources.len(),
+        "sources": config.sources.iter().map(declarative_source_summary).collect::<Vec<_>>(),
+        "output": declarative_output_summary(&config.output),
+        "checkpoint": declarative_checkpoint_summary(&config.checkpoint),
+    })
+}
+
+fn declarative_source_summary(source: &SourceConfig) -> serde_json::Value {
+    match source {
+        SourceConfig::Evm(source) => serde_json::json!({
+            "chain": source.chain,
+            "family": "evm",
+            "chain_id": source.chain_id,
+            "from_block": source.from_block,
+            "to_block": source.to_block,
+            "addresses": source.addresses.len(),
+            "topics": source.topics.len(),
+        }),
+    }
+}
+
+fn declarative_output_summary(output: &OutputConfig) -> serde_json::Value {
+    match output {
+        OutputConfig::Jsonl { path } => serde_json::json!({
+            "kind": "jsonl",
+            "path": path.to_string_lossy(),
+        }),
+    }
+}
+
+fn declarative_checkpoint_summary(checkpoint: &CheckpointPolicy) -> serde_json::Value {
+    match checkpoint {
+        CheckpointPolicy::File { path } => serde_json::json!({
+            "path": path.to_string_lossy(),
+        }),
+        CheckpointPolicy::Disabled => serde_json::json!({
+            "path": null,
+        }),
+    }
+}
+
+fn index_dataset_name(dataset: IndexDataset) -> &'static str {
+    match dataset {
+        IndexDataset::EvmLogs => "evm.logs",
+    }
+}
+
+fn declarative_finality_name(finality: FinalityRequirement) -> &'static str {
+    match finality {
+        FinalityRequirement::Durable => "durable",
+    }
 }
 
 pub fn index_summary(command: IndexWorkflowCommand) -> Result<serde_json::Value, DatalensError> {
@@ -726,6 +815,9 @@ fn index_common(command: &IndexWorkflowCommand) -> &IndexCommonCommand {
         IndexWorkflowCommand::Resume(command) => &command.common,
         IndexWorkflowCommand::Repair(command) => &command.common,
         IndexWorkflowCommand::Verify(command) => &command.common,
+        IndexWorkflowCommand::Doctor(_) => {
+            unreachable!("index doctor does not use runtime index common options")
+        }
     }
 }
 
@@ -735,6 +827,9 @@ fn index_dry_run(command: &IndexWorkflowCommand) -> bool {
         IndexWorkflowCommand::Resume(command) => command.dry_run,
         IndexWorkflowCommand::Repair(command) => command.dry_run,
         IndexWorkflowCommand::Verify(_) => false,
+        IndexWorkflowCommand::Doctor(_) => {
+            unreachable!("index doctor does not use runtime index dry-run options")
+        }
     }
 }
 
@@ -744,6 +839,9 @@ fn index_run_mode(command: &IndexWorkflowCommand) -> IndexRunMode {
         IndexWorkflowCommand::Resume(_) => IndexRunMode::Resume,
         IndexWorkflowCommand::Repair(_) => IndexRunMode::Repair,
         IndexWorkflowCommand::Verify(_) => IndexRunMode::Verify,
+        IndexWorkflowCommand::Doctor(_) => {
+            unreachable!("index doctor does not use runtime index run modes")
+        }
     }
 }
 
