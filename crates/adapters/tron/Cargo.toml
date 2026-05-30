@@ -16,7 +16,7 @@ sha2 = "0.11.0"
 [dev-dependencies]
 datalens-chain-conformance = { path = "../../testing/chain-conformance" }
 datalens-executor = { path = "../../runtime/executor" }
-datalens-indexer = { path = "../../runtime/indexer" }
+datalens-runtime-indexer = { path = "../../runtime/indexer" }
 datalens-metrics = { path = "../../metrics" }
 datalens-planner = { path = "../../runtime/planner" }
 datalens-storage = { path = "../../storage" }

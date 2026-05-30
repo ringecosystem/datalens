@@ -12,11 +12,11 @@ use datalens_core::{
     BlockHeader, ChainFamily, ChainIdentity, DatalensError, Dataset, DatasetKey, DatasetRows,
     EvmReceipt, EvmTransaction, LedgerRange, LogRecord, NetworkId, QueryRows,
 };
-use datalens_indexer::{
+use datalens_metrics::{ApplicationIdentity, MetricsRecorder};
+use datalens_runtime_indexer::{
     InMemoryIndexCursorStore, IndexDatasetRequest, IndexFinalityRequirement, IndexJob, IndexJobId,
     IndexRunMode, IndexRunStatus, IndexRuntime, IndexRuntimeConfig,
 };
-use datalens_metrics::{ApplicationIdentity, MetricsRecorder};
 use datalens_solana::{
     SolanaAdapter, SolanaFixtureRpc, solana_all_selector, solana_program_selector,
 };
@@ -367,7 +367,7 @@ fn evm_job(id: &str, start: u64, end: u64, run_mode: IndexRunMode) -> IndexJob {
         application: ApplicationIdentity::named(APPLICATION),
         chain: ethereum_identity(),
         range: LedgerRange::blocks(start, end).expect("range"),
-        dataset_selection: datalens_indexer::IndexDatasetSelection::Selected(vec![
+        dataset_selection: datalens_runtime_indexer::IndexDatasetSelection::Selected(vec![
             IndexDatasetRequest {
                 dataset_key: DatasetKey::evm_blocks(),
                 selector: all.clone(),
@@ -398,7 +398,7 @@ fn evm_blocks_job(id: &str, start: u64, end: u64, run_mode: IndexRunMode) -> Ind
         application: ApplicationIdentity::named(APPLICATION),
         chain: ethereum_identity(),
         range: LedgerRange::blocks(start, end).expect("range"),
-        dataset_selection: datalens_indexer::IndexDatasetSelection::Selected(vec![
+        dataset_selection: datalens_runtime_indexer::IndexDatasetSelection::Selected(vec![
             IndexDatasetRequest {
                 dataset_key: DatasetKey::evm_blocks(),
                 selector: DatasetSelector::all(),
@@ -426,7 +426,7 @@ fn solana_job(
             .chain()
             .clone(),
         range: LedgerRange::slots(start, end).expect("range"),
-        dataset_selection: datalens_indexer::IndexDatasetSelection::Selected(vec![
+        dataset_selection: datalens_runtime_indexer::IndexDatasetSelection::Selected(vec![
             IndexDatasetRequest {
                 dataset_key: DatasetKey::solana_slots(),
                 selector: solana_all_selector().expect("selector"),
@@ -460,7 +460,7 @@ fn tron_job(id: &str, start: u64, end: u64, run_mode: IndexRunMode) -> IndexJob 
             .chain()
             .clone(),
         range: LedgerRange::blocks(start, end).expect("range"),
-        dataset_selection: datalens_indexer::IndexDatasetSelection::Selected(vec![
+        dataset_selection: datalens_runtime_indexer::IndexDatasetSelection::Selected(vec![
             IndexDatasetRequest {
                 dataset_key: DatasetKey::tron_blocks(),
                 selector: tron_all_selector().expect("selector"),
@@ -473,8 +473,8 @@ fn tron_job(id: &str, start: u64, end: u64, run_mode: IndexRunMode) -> IndexJob 
     }
 }
 
-fn no_retry() -> datalens_indexer::IndexRetryPolicy {
-    datalens_indexer::IndexRetryPolicy {
+fn no_retry() -> datalens_runtime_indexer::IndexRetryPolicy {
+    datalens_runtime_indexer::IndexRetryPolicy {
         max_attempts: 1,
         initial_backoff_ms: 0,
         max_backoff_ms: 0,

@@ -125,7 +125,7 @@ just multi-chain-e2e
 ```sh
 cargo test -p datalens-solana
 cargo test -p datalens-tron
-cargo test -p datalens-indexer --test full_indexing_e2e
+cargo test -p datalens-runtime-indexer --test full_indexing_e2e
 cargo test -p datalens-cli --test index_commands
 ```
 
@@ -135,7 +135,7 @@ Default deterministic multi-chain coverage:
 | --- | --- |
 | Solana selector-driven indexing | Solana adapter tests cover fixture-backed query flow, conformance, optimized signature discovery paths, selector filtering, and full indexing behavior. |
 | Tron contract-event indexing | Tron adapter tests cover fixture-backed query flow, conformance, selector filtering, TronGrid contract-event handling, and indexing behavior. |
-| Indexer full indexing lifecycle | `datalens-indexer` full indexing e2e validates indexing progress, durable writes, resume behavior, and query hits from indexed coverage. |
+| Indexer full indexing lifecycle | `datalens-runtime-indexer` full indexing e2e validates indexing progress, durable writes, resume behavior, and query hits from indexed coverage. |
 | CLI index commands | `datalens-cli` index command tests validate backfill, resume, verify, selector, and cursor behavior beyond the smaller production-readiness subset. |
 
 The multi-chain indexing suite is deterministic by default. It uses fixture providers,

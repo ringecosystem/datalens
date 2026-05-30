@@ -1,0 +1,12 @@
+[package]
+name = "datalens-indexer"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+datalens-client = { path = "../client" }
+datalens-core = { path = "../core" }
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
