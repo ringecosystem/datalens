@@ -1,0 +1,28 @@
+[client]
+endpoint = "http://127.0.0.1:3000"
+application = "ormp"
+token_env = "DATALENS_ORMP_TOKEN"
+
+[index]
+name = "ormp"
+dataset = "evm.logs"
+finality = "durable"
+chunk_blocks = 1000
+
+[[sources]]
+chain = "ethereum"
+family = "evm"
+chain_id = 1
+from_block = 20009590
+to_block = 20059589
+addresses = [
+  "0x2cd1867fb8016f93710b6386f7f9f1d540a60812",
+  "0x13b2211a7ca45db2808f6db05557ce5347e3634e",
+]
+topics = []
+
+[output.jsonl]
+path = ".data/indexes/ormp/events.jsonl"
+
+[checkpoint]
+path = ".data/indexes/ormp/checkpoint.json"
