@@ -5,7 +5,10 @@ use datalens_client::{
     HttpTransport,
 };
 use datalens_core::{DatasetKey, DatasetRows, QueryRows};
-use datalens_indexer::{DatalensIndexConfig, IndexPlanBuilder, IndexRunner, OutputSinkConfig};
+use datalens_indexer::{
+    DatalensIndexConfig, IndexCheckpointFileStore, IndexPlanBuilder, IndexRunner,
+    IndexRunnerOptions, OutputSinkConfig,
+};
 
 #[test]
 fn test_index_config_builds_plan_without_executing_tasks() {
@@ -242,6 +245,249 @@ fn test_index_runner_fails_when_jsonl_output_cannot_be_written() {
 
     assert!(error.to_string().contains("write jsonl output"), "{error}");
     assert_eq!(transport.requests().len(), 1);
+}
+
+#[test]
+fn test_checkpoint_file_store_round_trips_completed_block_by_stable_task_key() {
+    let config = index_config(2);
+    let plan = IndexPlanBuilder::new().build(&config).unwrap();
+    let checkpoint_path = temp_path("checkpoint-roundtrip").join("checkpoint.json");
+    let store = IndexCheckpointFileStore::new(&checkpoint_path);
+
+    store
+        .advance(&plan.tasks()[0], plan.tasks()[0].range.end)
+        .expect("advance checkpoint");
+    let loaded = IndexCheckpointFileStore::new(&checkpoint_path)
+        .load()
+        .expect("load checkpoint");
+
+    assert_eq!(
+        loaded
+            .last_completed_block(&plan.tasks()[0])
+            .expect("entry"),
+        plan.tasks()[0].range.end
+    );
+    assert_eq!(loaded.last_completed_block(&plan.tasks()[1]), Some(11));
+}
+
+#[test]
+fn test_index_runner_skips_task_fully_covered_by_checkpoint() {
+    let config = index_config(2);
+    let plan = IndexPlanBuilder::new().build(&config).unwrap();
+    let checkpoint_path = temp_path("checkpoint-skip").join("checkpoint.json");
+    IndexCheckpointFileStore::new(&checkpoint_path)
+        .advance(&plan.tasks()[0], plan.tasks()[0].range.end)
+        .expect("seed checkpoint");
+    let transport = QueueTransport::new(vec![HttpResponse::json(
+        200,
+        response_json(12, 12, 0, false),
+    )]);
+    let client = DatalensClient::with_transport(
+        config.client.to_datalens_client_config(),
+        transport.clone(),
+    )
+    .expect("client config");
+    let runner = IndexRunner::new(plan, OutputSinkConfig::StdoutJson)
+        .with_options(IndexRunnerOptions::default().with_checkpoint_path(checkpoint_path));
+
+    let report = runner.run(&client).expect("index run");
+
+    assert_eq!(report.planned_queries, 2);
+    assert_eq!(report.checkpoint_skipped_ranges.len(), 1);
+    assert_eq!(report.checkpoint_skipped_ranges[0].range.start, 10);
+    assert_eq!(report.checkpoint_skipped_ranges[0].range.end, 11);
+    assert_eq!(report.tasks.len(), 1);
+    assert_eq!(report.tasks[0].range.start, 12);
+    assert_eq!(transport.requests().len(), 1);
+    assert_eq!(transport.requests()[0].body["range"]["start"], 12);
+}
+
+#[test]
+fn test_index_runner_writes_checkpoint_then_second_run_skips_completed_ranges() {
+    let config = index_config(2);
+    let plan = IndexPlanBuilder::new().build(&config).unwrap();
+    let checkpoint_path = temp_path("checkpoint-first-second").join("checkpoint.json");
+    let first_transport = QueueTransport::new(vec![
+        HttpResponse::json(200, response_json(10, 11, 0, true)),
+        HttpResponse::json(200, response_json(12, 12, 0, true)),
+    ]);
+    let first_client = DatalensClient::with_transport(
+        config.client.to_datalens_client_config(),
+        first_transport.clone(),
+    )
+    .expect("client config");
+    let runner = IndexRunner::new(plan.clone(), OutputSinkConfig::StdoutJson)
+        .with_options(IndexRunnerOptions::default().with_checkpoint_path(checkpoint_path.clone()));
+
+    let first_report = runner.run(&first_client).expect("first index run");
+
+    assert_eq!(first_report.tasks.len(), 2);
+    assert_eq!(first_transport.requests().len(), 2);
+    let checkpoint = IndexCheckpointFileStore::new(&checkpoint_path)
+        .load()
+        .expect("load checkpoint");
+    assert_eq!(checkpoint.last_completed_block(&plan.tasks()[0]), Some(12));
+
+    let second_transport = QueueTransport::new(Vec::new());
+    let second_client = DatalensClient::with_transport(
+        config.client.to_datalens_client_config(),
+        second_transport.clone(),
+    )
+    .expect("client config");
+    let second_runner = IndexRunner::new(plan, OutputSinkConfig::StdoutJson)
+        .with_options(IndexRunnerOptions::default().with_checkpoint_path(checkpoint_path));
+
+    let second_report = second_runner.run(&second_client).expect("second index run");
+
+    assert_eq!(second_report.tasks.len(), 0);
+    assert_eq!(second_report.checkpoint_skipped_ranges.len(), 2);
+    assert_eq!(second_transport.requests().len(), 0);
+}
+
+#[test]
+fn test_index_runner_resumes_partially_completed_task_from_next_block() {
+    let config = index_config(10);
+    let plan = IndexPlanBuilder::new().build(&config).unwrap();
+    let task = plan.tasks()[0].clone();
+    let checkpoint_path = temp_path("checkpoint-partial").join("checkpoint.json");
+    IndexCheckpointFileStore::new(&checkpoint_path)
+        .advance(&plan.tasks()[0], 11)
+        .expect("seed checkpoint");
+    let transport = QueueTransport::new(vec![HttpResponse::json(
+        200,
+        response_json(12, 12, 0, false),
+    )]);
+    let client = DatalensClient::with_transport(
+        config.client.to_datalens_client_config(),
+        transport.clone(),
+    )
+    .expect("client config");
+    let runner = IndexRunner::new(plan, OutputSinkConfig::StdoutJson)
+        .with_options(IndexRunnerOptions::default().with_checkpoint_path(checkpoint_path.clone()));
+
+    let report = runner.run(&client).expect("index run");
+
+    assert_eq!(report.checkpoint_skipped_ranges.len(), 1);
+    assert_eq!(report.checkpoint_skipped_ranges[0].range.start, 10);
+    assert_eq!(report.checkpoint_skipped_ranges[0].range.end, 11);
+    assert_eq!(report.tasks[0].range.start, 12);
+    assert_eq!(report.tasks[0].range.end, 12);
+    assert_eq!(transport.requests()[0].body["range"]["start"], 12);
+    let checkpoint = IndexCheckpointFileStore::new(&checkpoint_path)
+        .load()
+        .expect("load checkpoint");
+    assert_eq!(checkpoint.last_completed_block(&task), Some(12));
+}
+
+#[test]
+fn test_index_runner_from_start_ignores_checkpoint() {
+    let config = index_config(2);
+    let plan = IndexPlanBuilder::new().build(&config).unwrap();
+    let checkpoint_path = temp_path("checkpoint-from-start").join("checkpoint.json");
+    IndexCheckpointFileStore::new(&checkpoint_path)
+        .advance(&plan.tasks()[0], plan.tasks()[0].range.end)
+        .expect("seed checkpoint");
+    let transport = QueueTransport::new(vec![
+        HttpResponse::json(200, response_json(10, 11, 0, true)),
+        HttpResponse::json(200, response_json(12, 12, 0, true)),
+    ]);
+    let client = DatalensClient::with_transport(
+        config.client.to_datalens_client_config(),
+        transport.clone(),
+    )
+    .expect("client config");
+    let runner = IndexRunner::new(plan, OutputSinkConfig::StdoutJson).with_options(
+        IndexRunnerOptions::default()
+            .with_checkpoint_path(checkpoint_path)
+            .with_from_start(true),
+    );
+
+    let report = runner.run(&client).expect("index run");
+
+    assert_eq!(report.checkpoint_skipped_ranges.len(), 0);
+    assert_eq!(report.tasks.len(), 2);
+    assert_eq!(transport.requests().len(), 2);
+    assert_eq!(transport.requests()[0].body["range"]["start"], 10);
+}
+
+#[test]
+fn test_index_runner_dry_run_reports_checkpoint_skips_without_queries_or_writes() {
+    let config = index_config(2);
+    let plan = IndexPlanBuilder::new().build(&config).unwrap();
+    let checkpoint_path = temp_path("checkpoint-dry-run").join("checkpoint.json");
+    IndexCheckpointFileStore::new(&checkpoint_path)
+        .advance(&plan.tasks()[0], plan.tasks()[0].range.end)
+        .expect("seed checkpoint");
+    let transport = QueueTransport::new(Vec::new());
+    let client = DatalensClient::with_transport(
+        config.client.to_datalens_client_config(),
+        transport.clone(),
+    )
+    .expect("client config");
+    let runner = IndexRunner::new(plan, OutputSinkConfig::StdoutJson).with_options(
+        IndexRunnerOptions::default()
+            .with_checkpoint_path(checkpoint_path)
+            .with_dry_run(true),
+    );
+
+    let report = runner.run(&client).expect("dry run");
+
+    assert_eq!(report.planned_queries, 2);
+    assert_eq!(report.checkpoint_skipped_ranges.len(), 1);
+    assert_eq!(report.tasks.len(), 0);
+    assert_eq!(transport.requests().len(), 0);
+}
+
+#[test]
+fn test_index_runner_does_not_advance_checkpoint_when_output_write_fails() {
+    let config = index_config(10);
+    let plan = IndexPlanBuilder::new().build(&config).unwrap();
+    let checkpoint_path = temp_path("checkpoint-output-failure").join("checkpoint.json");
+    let output_parent = temp_path("checkpoint-output-failure-jsonl").join("not-a-directory");
+    std::fs::write(&output_parent, "file").expect("seed parent file");
+    let output_path = output_parent.join("events.jsonl");
+    let transport = QueueTransport::new(vec![HttpResponse::json(
+        200,
+        response_json(10, 12, 1, true),
+    )]);
+    let client = DatalensClient::with_transport(
+        config.client.to_datalens_client_config(),
+        transport.clone(),
+    )
+    .expect("client config");
+    let runner = IndexRunner::new(plan, OutputSinkConfig::FileJson { path: output_path })
+        .with_options(IndexRunnerOptions::default().with_checkpoint_path(checkpoint_path.clone()));
+
+    let error = runner.run(&client).expect_err("output failure stops run");
+
+    assert!(error.to_string().contains("write jsonl output"), "{error}");
+    assert!(
+        !checkpoint_path.exists(),
+        "checkpoint must not be created after output failure"
+    );
+}
+
+#[test]
+fn test_index_runner_reports_corrupt_checkpoint_file() {
+    let config = index_config(10);
+    let plan = IndexPlanBuilder::new().build(&config).unwrap();
+    let checkpoint_path = temp_path("checkpoint-corrupt").join("checkpoint.json");
+    std::fs::write(&checkpoint_path, "{not json").expect("seed corrupt checkpoint");
+    let transport = QueueTransport::new(Vec::new());
+    let client = DatalensClient::with_transport(
+        config.client.to_datalens_client_config(),
+        transport.clone(),
+    )
+    .expect("client config");
+    let runner = IndexRunner::new(plan, OutputSinkConfig::StdoutJson)
+        .with_options(IndexRunnerOptions::default().with_checkpoint_path(checkpoint_path));
+
+    let error = runner
+        .run(&client)
+        .expect_err("corrupt checkpoint fails run");
+
+    assert!(error.to_string().contains("checkpoint"), "{error}");
+    assert_eq!(transport.requests().len(), 0);
 }
 
 fn index_config(chunk_blocks: u64) -> DatalensIndexConfig {

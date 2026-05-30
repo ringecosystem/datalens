@@ -11,7 +11,7 @@ use datalens_edge::auth::normalize_application_id;
 use datalens_evm::EvmRpcClient;
 use datalens_indexer::{
     CheckpointPolicy, DatalensIndexConfig, FinalityRequirement, IndexDataset, IndexPlanBuilder,
-    IndexRunner, OutputConfig, OutputSinkConfig, SourceConfig,
+    IndexRunner, IndexRunnerOptions, OutputConfig, OutputSinkConfig, SourceConfig,
 };
 use datalens_metrics::ApplicationIdentity;
 use datalens_runtime_indexer::{
@@ -63,6 +63,15 @@ pub struct IndexPlanCommand {
 pub struct IndexRunCommand {
     #[arg(long, default_value = "app.index.toml")]
     pub config: String,
+
+    #[arg(long)]
+    pub from_start: bool,
+
+    #[arg(long)]
+    pub no_checkpoint: bool,
+
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -212,7 +221,12 @@ fn index_run(
     let config = DatalensIndexConfig::from_toml_str(&input)?;
     let plan = IndexPlanBuilder::new().build(&config)?;
     let client = DatalensClient::new(config.client.to_datalens_client_config())?;
-    let runner = IndexRunner::new(plan, output_sink_config(&config.output));
+    let options = IndexRunnerOptions::default()
+        .with_checkpoint_policy(config.checkpoint.clone())
+        .with_no_checkpoint(command.no_checkpoint)
+        .with_from_start(command.from_start)
+        .with_dry_run(command.dry_run);
+    let runner = IndexRunner::new(plan, output_sink_config(&config.output)).with_options(options);
     Ok(runner.run(&client)?)
 }
 

@@ -4,19 +4,32 @@ use datalens_core::{
     NetworkId, QueryFinalityRequirement, QueryRows, missing_ranges,
 };
 use serde::Serialize;
-use std::time::Instant;
+use std::{path::PathBuf, time::Instant};
 
-use crate::{IndexPlan, IndexerError, OutputSinkConfig};
+use crate::{
+    CheckpointPolicy, IndexCheckpointFile, IndexCheckpointFileStore, IndexPlan, IndexerError,
+    OutputSinkConfig, PlannedIndexTask,
+};
 
 #[derive(Clone)]
 pub struct IndexRunner {
     plan: IndexPlan,
     output: OutputSinkConfig,
+    options: IndexRunnerOptions,
 }
 
 impl IndexRunner {
     pub fn new(plan: IndexPlan, output: OutputSinkConfig) -> Self {
-        Self { plan, output }
+        Self {
+            plan,
+            output,
+            options: IndexRunnerOptions::default(),
+        }
+    }
+
+    pub fn with_options(mut self, options: IndexRunnerOptions) -> Self {
+        self.options = options;
+        self
     }
 
     pub fn plan(&self) -> &IndexPlan {
@@ -31,12 +44,31 @@ impl IndexRunner {
     where
         T: HttpTransport,
     {
+        let checkpoint_store = self.options.checkpoint_store();
+        let checkpoint = match &checkpoint_store {
+            Some(store) if !self.options.from_start => store.load()?,
+            _ => IndexCheckpointFile::empty(),
+        };
         let mut tasks = Vec::new();
+        let mut checkpoint_skipped_ranges = Vec::new();
 
         for task in self.plan.tasks() {
-            let range = LedgerRange::blocks(task.range.start, task.range.end)
+            let Some(range) = resume_task_range(
+                task,
+                &checkpoint,
+                self.options.from_start,
+                &mut checkpoint_skipped_ranges,
+            )?
+            else {
+                continue;
+            };
+            if self.options.dry_run {
+                continue;
+            }
+
+            let range = LedgerRange::blocks(range.start, range.end)
                 .map_err(|error| IndexerError::Runner(error.to_string()))?;
-            let block_range = BlockRange::try_new(task.range.start, task.range.end)
+            let block_range = BlockRange::try_new(range.start(), range.end())
                 .map_err(|error| IndexerError::Runner(error.to_string()))?;
             let chain = ChainIdentity::try_new(
                 ChainFamily::Evm,
@@ -131,19 +163,75 @@ impl IndexRunner {
                     .collect(),
                 full_durable_hit,
             });
+            if let Some(store) = &checkpoint_store {
+                store.advance(task, range.end())?;
+            }
         }
 
         Ok(IndexRunReport {
             planned_queries: self.plan.tasks().len(),
+            checkpoint_skipped_ranges,
             tasks,
         })
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct IndexRunnerOptions {
+    pub checkpoint: Option<CheckpointPolicy>,
+    pub from_start: bool,
+    pub dry_run: bool,
+}
+
+impl IndexRunnerOptions {
+    pub fn with_checkpoint_policy(mut self, checkpoint: CheckpointPolicy) -> Self {
+        self.checkpoint = Some(checkpoint);
+        self
+    }
+
+    pub fn with_checkpoint_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.checkpoint = Some(CheckpointPolicy::File { path: path.into() });
+        self
+    }
+
+    pub fn with_no_checkpoint(mut self, no_checkpoint: bool) -> Self {
+        if no_checkpoint {
+            self.checkpoint = Some(CheckpointPolicy::Disabled);
+        }
+        self
+    }
+
+    pub fn with_from_start(mut self, from_start: bool) -> Self {
+        self.from_start = from_start;
+        self
+    }
+
+    pub fn with_dry_run(mut self, dry_run: bool) -> Self {
+        self.dry_run = dry_run;
+        self
+    }
+
+    fn checkpoint_store(&self) -> Option<IndexCheckpointFileStore> {
+        match &self.checkpoint {
+            Some(CheckpointPolicy::File { path }) => Some(IndexCheckpointFileStore::new(path)),
+            Some(CheckpointPolicy::Disabled) | None => None,
+        }
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct IndexRunReport {
     pub planned_queries: usize,
+    pub checkpoint_skipped_ranges: Vec<CheckpointSkippedRange>,
     pub tasks: Vec<IndexRunTaskSummary>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CheckpointSkippedRange {
+    pub label: String,
+    pub chain: String,
+    pub range: ExecutedRange,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -184,4 +272,45 @@ fn range_kind_name(kind: LedgerRangeKind) -> String {
         LedgerRangeKind::Height => "height".to_owned(),
         LedgerRangeKind::Other(value) => value,
     }
+}
+
+fn resume_task_range(
+    task: &PlannedIndexTask,
+    checkpoint: &IndexCheckpointFile,
+    from_start: bool,
+    checkpoint_skipped_ranges: &mut Vec<CheckpointSkippedRange>,
+) -> Result<Option<crate::PlannedRange>, IndexerError> {
+    if from_start {
+        return Ok(Some(task.range.clone()));
+    }
+
+    let Some(last_completed_block) = checkpoint.last_completed_block(task) else {
+        return Ok(Some(task.range.clone()));
+    };
+
+    if last_completed_block < task.range.start {
+        return Ok(Some(task.range.clone()));
+    }
+
+    let skipped_end = last_completed_block.min(task.range.end);
+    checkpoint_skipped_ranges.push(CheckpointSkippedRange {
+        label: task.label.clone(),
+        chain: task.chain.clone(),
+        range: ExecutedRange {
+            kind: task.range.kind.clone(),
+            start: task.range.start,
+            end: skipped_end,
+        },
+        reason: "covered_by_checkpoint".to_owned(),
+    });
+
+    if last_completed_block >= task.range.end {
+        return Ok(None);
+    }
+
+    Ok(Some(crate::PlannedRange {
+        kind: task.range.kind.clone(),
+        start: last_completed_block.saturating_add(1),
+        end: task.range.end,
+    }))
 }
