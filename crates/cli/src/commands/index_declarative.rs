@@ -225,6 +225,11 @@ fn declarative_output_summary(output: &OutputConfig) -> serde_json::Value {
                     "max_rows_per_request": webhook.max_rows_per_request,
                     "max_bytes_per_request": webhook.max_bytes_per_request,
                     "idempotency_key_header": webhook.idempotency_key_header,
+                    "outbox": {
+                        "enabled": webhook.outbox.enabled,
+                        "path": webhook.outbox.path.as_ref().map(|path| path.display().to_string()),
+                        "max_attempts": webhook.outbox.max_attempts,
+                    },
                 },
                 "capability": {
                     "write": capability.supports_write,

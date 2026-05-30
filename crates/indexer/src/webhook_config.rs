@@ -2,7 +2,9 @@ use std::env;
 
 use serde::Deserialize;
 
-use crate::{OutputConfig, WebhookHeaderConfig, WebhookOutputConfig, WebhookRetryConfig};
+use crate::{
+    OutputConfig, WebhookHeaderConfig, WebhookOutboxConfig, WebhookOutputConfig, WebhookRetryConfig,
+};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -15,6 +17,7 @@ pub(crate) struct RawWebhookOutputConfig {
     max_rows_per_request: Option<usize>,
     max_bytes_per_request: Option<usize>,
     retry: Option<RawWebhookRetryConfig>,
+    outbox: Option<RawWebhookOutboxConfig>,
     idempotency_key_header: Option<String>,
 }
 
@@ -35,6 +38,14 @@ struct RawWebhookRetryConfig {
     retry_429: Option<bool>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawWebhookOutboxConfig {
+    enabled: Option<bool>,
+    path: Option<std::path::PathBuf>,
+    max_attempts: Option<usize>,
+}
+
 pub(crate) fn parse_webhook_output(
     raw: Option<RawWebhookOutputConfig>,
     errors: &mut Vec<String>,
@@ -51,6 +62,7 @@ pub(crate) fn parse_webhook_output(
     let url = required_non_empty("output.webhook.url", webhook.url, errors);
     let headers = parse_webhook_headers(webhook.headers, errors);
     let retry = parse_webhook_retry(webhook.retry, errors);
+    let outbox = parse_webhook_outbox(webhook.outbox, errors);
     let timeout_ms = optional_positive_u64(
         "output.webhook.timeout_ms",
         webhook.timeout_ms,
@@ -84,6 +96,7 @@ pub(crate) fn parse_webhook_output(
             max_bytes_per_request,
             retry,
             idempotency_key_header,
+            outbox,
         },
     })
 }
@@ -160,6 +173,30 @@ fn parse_webhook_retry(
             errors,
         ),
         retry_429: raw.retry_429.unwrap_or(default.retry_429),
+    }
+}
+
+fn parse_webhook_outbox(
+    raw: Option<RawWebhookOutboxConfig>,
+    errors: &mut Vec<String>,
+) -> WebhookOutboxConfig {
+    let default = WebhookOutboxConfig::default();
+    let Some(raw) = raw else {
+        return default;
+    };
+    let enabled = raw.enabled.unwrap_or(default.enabled);
+    if enabled && raw.path.is_none() {
+        errors.push("output.webhook.outbox.path: missing required field".to_owned());
+    }
+    WebhookOutboxConfig {
+        enabled,
+        path: raw.path,
+        max_attempts: optional_positive_usize(
+            "output.webhook.outbox.max_attempts",
+            raw.max_attempts,
+            default.max_attempts,
+            errors,
+        ),
     }
 }
 

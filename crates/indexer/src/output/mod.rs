@@ -8,6 +8,7 @@ mod query;
 mod sink;
 mod sqlite;
 mod webhook;
+mod webhook_outbox;
 
 pub use capability::*;
 pub use parquet::*;
