@@ -1,5 +1,6 @@
 use datalens_indexer::{
-    CheckpointCursor, PostgresApplicationEntityStore, ProcessorError, SqliteApplicationEntityStore,
+    ApplicationEntityQueryStore, ApplicationEntityReadQuery, CheckpointCursor,
+    PostgresApplicationEntityStore, ProcessorError, SqliteApplicationEntityStore,
     sdk::{ApplicationSchemaInitializer, ProcessorFuture, SchemaInitializationContext},
 };
 use sqlx::Row;
@@ -106,6 +107,26 @@ fn test_sqlite_application_entity_store_rolls_back_rows_and_checkpoint_on_error(
 }
 
 #[test]
+fn test_sqlite_application_entity_query_store_rejects_write_statements() {
+    let store = SqliteApplicationEntityStore::connect(&sqlite_test_url("query-read-only"))
+        .expect("sqlite application store connects");
+    tokio_runtime().block_on(async {
+        let error = store
+            .query_json(ApplicationEntityReadQuery::new(
+                "DELETE FROM payment_transfers WHERE account = ?",
+            ))
+            .await
+            .expect_err("write statement rejected");
+
+        assert_eq!(error.kind().as_str(), "user processor error");
+        assert!(
+            error.to_string().contains("read-only SELECT statements"),
+            "{error}"
+        );
+    });
+}
+
+#[test]
 fn test_sqlite_application_schema_initializer_creates_application_tables_idempotently() {
     let store = SqliteApplicationEntityStore::connect(&sqlite_test_url("schema-init"))
         .expect("sqlite application store connects");
@@ -133,6 +154,40 @@ fn test_sqlite_application_schema_initializer_creates_application_tables_idempot
             .expect("rollback read transaction");
 
         assert_eq!(row_count, 0);
+    });
+}
+
+#[test]
+fn test_sqlite_application_entity_query_store_returns_json_rows() {
+    let store = SqliteApplicationEntityStore::connect(&sqlite_test_url("query-json"))
+        .expect("sqlite application store connects");
+    tokio_runtime().block_on(async {
+        let mut transaction = store.begin().await.expect("begin transaction");
+        sqlx::query("CREATE TABLE payment_transfers (event_id TEXT PRIMARY KEY, amount INTEGER)")
+            .execute(transaction.sqlite())
+            .await
+            .expect("create application table");
+        sqlx::query("INSERT INTO payment_transfers (event_id, amount) VALUES (?, ?)")
+            .bind("ethereum:45:0:1")
+            .bind(13_i64)
+            .execute(transaction.sqlite())
+            .await
+            .expect("insert application row");
+        transaction.commit().await.expect("commit transaction");
+
+        let rows = store
+            .query_json(
+                ApplicationEntityReadQuery::new(
+                    "SELECT event_id, amount FROM payment_transfers WHERE event_id = ?",
+                )
+                .bind("ethereum:45:0:1"),
+            )
+            .await
+            .expect("query application rows");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["event_id"], "ethereum:45:0:1");
+        assert_eq!(rows[0]["amount"], 13);
     });
 }
 

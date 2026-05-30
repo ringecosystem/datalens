@@ -4,9 +4,12 @@ use std::{
     str::FromStr,
 };
 
+use serde_json::{Map, Number, Value};
 use sqlx::{
-    PgPool, Postgres, Sqlite, SqlitePool, Transaction,
+    AssertSqlSafe, Column, PgPool, Postgres, Row, Sqlite, SqlitePool, Transaction, TypeInfo,
+    ValueRef,
     postgres::{PgPoolOptions, PgQueryResult},
+    sqlite::SqliteRow,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteQueryResult},
 };
 use tokio::runtime::Runtime;
@@ -24,6 +27,41 @@ pub trait ProcessorApplicationEntityStore: Send + Sync {
     fn begin_transaction<'store>(
         &'store self,
     ) -> ProcessorFuture<'store, Result<Self::Transaction<'store>, ProcessorError>>;
+}
+
+pub trait ApplicationEntityQueryStore: Send + Sync {
+    fn query_json<'store>(
+        &'store self,
+        query: ApplicationEntityReadQuery,
+    ) -> ProcessorFuture<'store, Result<Vec<Value>, ProcessorError>>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApplicationEntityReadQuery {
+    statement: String,
+    arguments: Vec<Value>,
+}
+
+impl ApplicationEntityReadQuery {
+    pub fn new(statement: impl Into<String>) -> Self {
+        Self {
+            statement: statement.into(),
+            arguments: Vec::new(),
+        }
+    }
+
+    pub fn bind(mut self, value: impl Into<Value>) -> Self {
+        self.arguments.push(value.into());
+        self
+    }
+
+    pub fn statement(&self) -> &str {
+        &self.statement
+    }
+
+    pub fn arguments(&self) -> &[Value] {
+        &self.arguments
+    }
 }
 
 pub struct SqliteApplicationEntityStore {
@@ -111,6 +149,23 @@ impl ProcessorApplicationEntityStore for SqliteApplicationEntityStore {
         &'store self,
     ) -> ProcessorFuture<'store, Result<Self::Transaction<'store>, ProcessorError>> {
         Box::pin(async move { self.begin().await })
+    }
+}
+
+impl ApplicationEntityQueryStore for SqliteApplicationEntityStore {
+    fn query_json<'store>(
+        &'store self,
+        query: ApplicationEntityReadQuery,
+    ) -> ProcessorFuture<'store, Result<Vec<Value>, ProcessorError>> {
+        Box::pin(async move {
+            validate_read_statement(query.statement())?;
+            let mut sql = sqlx::query(AssertSqlSafe(query.statement.clone()));
+            for argument in query.arguments() {
+                sql = bind_sqlite_json(sql, argument)?;
+            }
+            let rows = sql.fetch_all(&self.pool).await?;
+            rows.into_iter().map(sqlite_row_json).collect()
+        })
     }
 }
 
@@ -264,6 +319,23 @@ impl ProcessorApplicationEntityStore for PostgresApplicationEntityStore {
     }
 }
 
+impl ApplicationEntityQueryStore for PostgresApplicationEntityStore {
+    fn query_json<'store>(
+        &'store self,
+        query: ApplicationEntityReadQuery,
+    ) -> ProcessorFuture<'store, Result<Vec<Value>, ProcessorError>> {
+        Box::pin(async move {
+            validate_read_statement(query.statement())?;
+            let mut sql = sqlx::query(AssertSqlSafe(query.statement.clone()));
+            for argument in query.arguments() {
+                sql = bind_postgres_json(sql, argument)?;
+            }
+            let rows = sql.fetch_all(&self.pool).await?;
+            rows.into_iter().map(postgres_row_json).collect()
+        })
+    }
+}
+
 impl ApplicationSchemaStore for PostgresApplicationEntityStore {
     fn database_kind(&self) -> ApplicationDatabaseKind {
         ApplicationDatabaseKind::Postgres
@@ -394,4 +466,127 @@ fn is_sensitive_query_name(name: &str) -> bool {
         name.to_ascii_lowercase().as_str(),
         "password" | "token" | "key" | "secret" | "signature"
     )
+}
+
+fn validate_read_statement(statement: &str) -> Result<(), ProcessorError> {
+    let trimmed = statement.trim_start();
+    let first = trimmed
+        .split(|character: char| character.is_whitespace() || character == '(')
+        .find(|part| !part.is_empty())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if first != "select" {
+        return Err(ProcessorError::user(
+            "application entity GraphQL queries must be read-only SELECT statements",
+        ));
+    }
+    if trimmed.trim_end().trim_end_matches(';').contains(';') {
+        return Err(ProcessorError::user(
+            "application entity GraphQL queries must contain a single statement",
+        ));
+    }
+    Ok(())
+}
+
+fn bind_sqlite_json<'query>(
+    sql: sqlx::query::Query<'query, Sqlite, sqlx::sqlite::SqliteArguments>,
+    value: &'query Value,
+) -> Result<sqlx::query::Query<'query, Sqlite, sqlx::sqlite::SqliteArguments>, ProcessorError> {
+    Ok(match value {
+        Value::Null => sql.bind(Option::<String>::None),
+        Value::Bool(value) => sql.bind(*value),
+        Value::Number(value) => bind_number_sqlite(sql, value)?,
+        Value::String(value) => sql.bind(value),
+        Value::Array(_) | Value::Object(_) => sql.bind(value.to_string()),
+    })
+}
+
+fn bind_number_sqlite<'query>(
+    sql: sqlx::query::Query<'query, Sqlite, sqlx::sqlite::SqliteArguments>,
+    value: &Number,
+) -> Result<sqlx::query::Query<'query, Sqlite, sqlx::sqlite::SqliteArguments>, ProcessorError> {
+    if let Some(value) = value.as_i64() {
+        Ok(sql.bind(value))
+    } else if let Some(value) = value.as_u64() {
+        let value = i64::try_from(value)
+            .map_err(|_| ProcessorError::user("application entity query integer is too large"))?;
+        Ok(sql.bind(value))
+    } else if let Some(value) = value.as_f64() {
+        Ok(sql.bind(value))
+    } else {
+        Err(ProcessorError::user(
+            "application entity query number is not supported",
+        ))
+    }
+}
+
+fn bind_postgres_json<'query>(
+    sql: sqlx::query::Query<'query, Postgres, sqlx::postgres::PgArguments>,
+    value: &'query Value,
+) -> Result<sqlx::query::Query<'query, Postgres, sqlx::postgres::PgArguments>, ProcessorError> {
+    Ok(match value {
+        Value::Null => sql.bind(Option::<String>::None),
+        Value::Bool(value) => sql.bind(*value),
+        Value::Number(value) => bind_number_postgres(sql, value)?,
+        Value::String(value) => sql.bind(value),
+        Value::Array(_) | Value::Object(_) => sql.bind(value.to_string()),
+    })
+}
+
+fn bind_number_postgres<'query>(
+    sql: sqlx::query::Query<'query, Postgres, sqlx::postgres::PgArguments>,
+    value: &Number,
+) -> Result<sqlx::query::Query<'query, Postgres, sqlx::postgres::PgArguments>, ProcessorError> {
+    if let Some(value) = value.as_i64() {
+        Ok(sql.bind(value))
+    } else if let Some(value) = value.as_u64() {
+        let value = i64::try_from(value)
+            .map_err(|_| ProcessorError::user("application entity query integer is too large"))?;
+        Ok(sql.bind(value))
+    } else if let Some(value) = value.as_f64() {
+        Ok(sql.bind(value))
+    } else {
+        Err(ProcessorError::user(
+            "application entity query number is not supported",
+        ))
+    }
+}
+
+fn sqlite_row_json(row: SqliteRow) -> Result<Value, ProcessorError> {
+    let mut object = Map::new();
+    for (index, column) in row.columns().iter().enumerate() {
+        let value = if row.try_get_raw(index)?.is_null() {
+            Value::Null
+        } else {
+            match column.type_info().name().to_ascii_uppercase().as_str() {
+                "INTEGER" | "INT" | "BIGINT" => Value::from(row.try_get::<i64, _>(index)?),
+                "REAL" | "FLOAT" | "DOUBLE" => Value::from(row.try_get::<f64, _>(index)?),
+                "BOOLEAN" | "BOOL" => Value::from(row.try_get::<bool, _>(index)?),
+                _ => Value::from(row.try_get::<String, _>(index)?),
+            }
+        };
+        object.insert(column.name().to_owned(), value);
+    }
+    Ok(Value::Object(object))
+}
+
+fn postgres_row_json(row: sqlx::postgres::PgRow) -> Result<Value, ProcessorError> {
+    let mut object = Map::new();
+    for (index, column) in row.columns().iter().enumerate() {
+        let value = if row.try_get_raw(index)?.is_null() {
+            Value::Null
+        } else {
+            match column.type_info().name() {
+                "INT2" => Value::from(i64::from(row.try_get::<i16, _>(index)?)),
+                "INT4" => Value::from(i64::from(row.try_get::<i32, _>(index)?)),
+                "INT8" => Value::from(row.try_get::<i64, _>(index)?),
+                "FLOAT4" => Value::from(f64::from(row.try_get::<f32, _>(index)?)),
+                "FLOAT8" => Value::from(row.try_get::<f64, _>(index)?),
+                "BOOL" => Value::from(row.try_get::<bool, _>(index)?),
+                _ => Value::from(row.try_get::<String, _>(index)?),
+            }
+        };
+        object.insert(column.name().to_owned(), value);
+    }
+    Ok(Value::Object(object))
 }

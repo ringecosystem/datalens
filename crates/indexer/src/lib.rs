@@ -21,6 +21,7 @@ pub use config::*;
 pub use daemon::*;
 pub use error::*;
 pub use evm_decode::*;
+pub use graphql::{ApplicationGraphqlSchemaContext, ApplicationGraphqlSchemaHook};
 pub use output::*;
 pub use plan::*;
 pub use processor_runtime::*;
