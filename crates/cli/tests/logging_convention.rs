@@ -9,7 +9,7 @@ fn test_logging_dependencies_are_declared_in_expected_crates() {
 
     assert_manifest_has_dependency("crates/edge/Cargo.toml", "log.workspace = true");
     assert_manifest_has_dependency("crates/storage/Cargo.toml", "log.workspace = true");
-    assert_manifest_has_dependency("crates/evm/Cargo.toml", "log.workspace = true");
+    assert_manifest_has_dependency("crates/adapters/evm/Cargo.toml", "log.workspace = true");
     assert_manifest_has_dependency("crates/cli/Cargo.toml", "log.workspace = true");
     assert_manifest_has_dependency("crates/cli/Cargo.toml", "tracing-log.workspace = true");
     assert_manifest_has_dependency(
@@ -29,7 +29,11 @@ fn test_cli_owns_tracing_backed_log_output() {
 
 #[test]
 fn test_library_code_uses_log_facade_without_initializing_tracing() {
-    for path in ["crates/edge/src", "crates/storage/src", "crates/evm/src"] {
+    for path in [
+        "crates/edge/src",
+        "crates/storage/src",
+        "crates/adapters/evm/src",
+    ] {
         let source = read_rust_sources(path);
         assert!(
             source.contains("log::"),

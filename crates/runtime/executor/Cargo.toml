@@ -5,11 +5,11 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
-datalens-chain = { path = "../chain" }
-datalens-core = { path = "../core" }
-datalens-metrics = { path = "../metrics" }
+datalens-chain = { path = "../../chain" }
+datalens-core = { path = "../../core" }
+datalens-metrics = { path = "../../metrics" }
 datalens-planner = { path = "../planner" }
-datalens-storage = { path = "../storage" }
+datalens-storage = { path = "../../storage" }
 datalens-writer = { path = "../writer" }
 log.workspace = true
 serde_json.workspace = true

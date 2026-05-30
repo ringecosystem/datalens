@@ -13,15 +13,15 @@ clap.workspace = true
 datalens-edge = { path = "../edge" }
 datalens-chain = { path = "../chain" }
 datalens-core = { path = "../core" }
-datalens-evm = { path = "../evm" }
-datalens-indexer = { path = "../indexer" }
+datalens-evm = { path = "../adapters/evm" }
+datalens-indexer = { path = "../runtime/indexer" }
 datalens-metrics = { path = "../metrics" }
-datalens-planner = { path = "../planner" }
-datalens-solana = { path = "../solana" }
+datalens-planner = { path = "../runtime/planner" }
+datalens-solana = { path = "../adapters/solana" }
 datalens-storage = { path = "../storage" }
-datalens-tron = { path = "../tron" }
-datalens-warmup = { path = "../warmup" }
-datalens-writer = { path = "../writer" }
+datalens-tron = { path = "../adapters/tron" }
+datalens-warmup = { path = "../runtime/warmup" }
+datalens-writer = { path = "../runtime/writer" }
 figment.workspace = true
 log.workspace = true
 serde_json.workspace = true

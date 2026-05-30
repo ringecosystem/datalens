@@ -9,7 +9,7 @@ Preconditions: The adapter can run against a deterministic fixture or mock provi
 does not require public RPC access for contract tests.
 
 Depends on: `crates/chain/src/lib.rs` for the adapter contract and
-`crates/chain-conformance/src/lib.rs` for reusable assertions.
+`crates/testing/chain-conformance/src/lib.rs` for reusable assertions.
 
 Verification: Run the adapter-specific conformance test plus `cargo test --workspace`.
 
@@ -40,9 +40,9 @@ Verification: Run the adapter-specific conformance test plus `cargo test --works
 ## Current Implementation
 
 - `datalens-chain-conformance` owns the reusable assertion helpers and fixture model.
-- `crates/evm/tests/conformance.rs` covers the EVM adapter.
-- `crates/solana/tests/conformance.rs` covers the Solana slot-based adapter.
-- `crates/tron/tests/conformance.rs` covers the Tron block-based adapter.
+- `crates/adapters/evm/tests/conformance.rs` covers the EVM adapter.
+- `crates/adapters/solana/tests/conformance.rs` covers the Solana slot-based adapter.
+- `crates/adapters/tron/tests/conformance.rs` covers the Tron block-based adapter.
 - The EVM fixture provider is local-only and serves JSON-RPC responses from a loopback
   test server.
 - Solana and Tron use deterministic in-memory fixture providers by default, so
