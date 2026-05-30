@@ -1,4 +1,0 @@
-pub const ETHEREUM_CHAIN_ID: u64 = 1;
-pub const ORMP_START_BLOCK: u64 = 20009590;
-pub const MSGPORT_ADDRESS: &str = "0x2cd1867fb8016f93710b6386f7f9f1d540a60812";
-pub const ORMP_ADDRESS: &str = "0x13b2211a7ca45db2808f6db05557ce5347e3634e";

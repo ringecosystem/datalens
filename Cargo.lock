@@ -1585,17 +1585,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "datalens-example-ormp"
-version = "0.1.0"
-dependencies = [
- "clap",
- "datalens-client",
- "datalens-core",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "datalens-executor"
 version = "0.1.0"
 dependencies = [

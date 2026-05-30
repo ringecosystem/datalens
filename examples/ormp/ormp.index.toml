@@ -9,12 +9,26 @@ dataset = "evm.logs"
 finality = "durable"
 chunk_blocks = 1000
 
+# Ethereum mainnet ORMP/Msgport smoke range.
 [[sources]]
 chain = "ethereum"
 family = "evm"
 chain_id = 1
 from_block = 20009590
 to_block = 20059589
+addresses = [
+  "0x2cd1867fb8016f93710b6386f7f9f1d540a60812",
+  "0x13b2211a7ca45db2808f6db05557ce5347e3634e",
+]
+topics = []
+
+# Polygon PoS ORMP/Msgport smoke range.
+[[sources]]
+chain = "polygon"
+family = "evm"
+chain_id = 137
+from_block = 64142806
+to_block = 64142806
 addresses = [
   "0x2cd1867fb8016f93710b6386f7f9f1d540a60812",
   "0x13b2211a7ca45db2808f6db05557ce5347e3634e",
