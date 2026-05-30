@@ -1,6 +1,7 @@
 use datalens_indexer::{
     CheckpointPolicy, DatabaseDriver, DatabaseOutputConfig, DatalensIndexConfig,
-    FinalityRequirement, IndexDataset, OutputConfig, QueryServiceConfig, SourceConfig,
+    FinalityRequirement, IndexDataset, OutputConfig, QueryProtocol, QueryServiceConfig,
+    SourceConfig,
 };
 
 fn valid_config() -> &'static str {
@@ -166,12 +167,18 @@ fn test_parse_rejects_query_service_with_jsonl_output() {
 
 #[test]
 fn test_parse_rejects_graphql_with_jsonl_output() {
-    let input = valid_config().replace("[checkpoint]", "[query]\ngraphql = true\n\n[checkpoint]");
+    let input = valid_config().replace(
+        "[checkpoint]",
+        "[query]\nenabled = true\nprotocol = \"graphql\"\n\n[checkpoint]",
+    );
     let error = parse_error(&input);
 
-    assert!(error.contains("query.graphql"), "{error}");
+    assert!(error.contains("query.protocol"), "{error}");
     assert!(error.contains("jsonl"), "{error}");
-    assert!(error.contains("does not support GraphQL"), "{error}");
+    assert!(
+        error.contains("does not support graphql query service"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -180,7 +187,10 @@ fn test_parse_valid_sqlite_database_output_allows_query_service() {
         "[output.jsonl]\npath = \".data/indexes/ormp/events.jsonl\"",
         "[output]\nkind = \"database\"\n\n[output.database]\ndriver = \"sqlite\"\nurl = \"sqlite:.data/indexes/ormp/index.db\"",
     )
-    .replace("[checkpoint]", "[query]\nenabled = true\ngraphql = true\n\n[checkpoint]");
+    .replace(
+        "[checkpoint]",
+        "[query]\nenabled = true\nprotocol = \"graphql\"\nbind = \"127.0.0.1:9100\"\npath = \"/query\"\nplayground = true\n\n[checkpoint]",
+    );
 
     let config = DatalensIndexConfig::from_toml_str(&input).expect("valid database config");
 
@@ -197,7 +207,10 @@ fn test_parse_valid_sqlite_database_output_allows_query_service() {
         config.query,
         QueryServiceConfig {
             enabled: true,
-            graphql: true,
+            protocol: QueryProtocol::Graphql,
+            bind: "127.0.0.1:9100".to_owned(),
+            path: "/query".to_owned(),
+            playground: true,
         }
     );
 }
@@ -208,7 +221,7 @@ fn test_parse_valid_postgres_database_output_allows_query_service() {
         "[output.jsonl]\npath = \".data/indexes/ormp/events.jsonl\"",
         "[output]\nkind = \"database\"\n\n[output.database]\ndriver = \"postgres\"\nurl = \"postgres://localhost/datalens\"",
     )
-    .replace("[checkpoint]", "[query]\nenabled = true\ngraphql = true\n\n[checkpoint]");
+    .replace("[checkpoint]", "[query]\nenabled = true\nprotocol = \"graphql\"\n\n[checkpoint]");
 
     let config = DatalensIndexConfig::from_toml_str(&input).expect("valid database config");
 
@@ -225,9 +238,41 @@ fn test_parse_valid_postgres_database_output_allows_query_service() {
         config.query,
         QueryServiceConfig {
             enabled: true,
-            graphql: true,
+            protocol: QueryProtocol::Graphql,
+            bind: "127.0.0.1:9090".to_owned(),
+            path: "/graphql".to_owned(),
+            playground: false,
         }
     );
+}
+
+#[test]
+fn test_parse_rejects_unsupported_query_protocol() {
+    let input = valid_config().replace(
+        "[checkpoint]",
+        "[query]\nenabled = true\nprotocol = \"rest\"\n\n[checkpoint]",
+    );
+    let error = parse_error(&input);
+
+    assert!(error.contains("query.protocol"), "{error}");
+    assert!(error.contains("graphql"), "{error}");
+}
+
+#[test]
+fn test_parse_rejects_query_path_without_leading_slash() {
+    let input = valid_config()
+        .replace(
+            "[output.jsonl]\npath = \".data/indexes/ormp/events.jsonl\"",
+            "[output]\nkind = \"database\"\n\n[output.database]\ndriver = \"sqlite\"\nurl = \"sqlite:.data/indexes/ormp/index.db\"",
+        )
+        .replace(
+            "[checkpoint]",
+            "[query]\nenabled = true\nprotocol = \"graphql\"\npath = \"graphql\"\n\n[checkpoint]",
+        );
+    let error = parse_error(&input);
+
+    assert!(error.contains("query.path"), "{error}");
+    assert!(error.contains("start with /"), "{error}");
 }
 
 #[test]
