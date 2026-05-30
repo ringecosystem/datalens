@@ -128,6 +128,8 @@ async fn write_records_postgres(
             inserted_rows,
             skipped_or_replaced_rows,
             files_written: 0,
+            batches_attempted: usize::from(!records.is_empty()),
+            batches_delivered: usize::from(!records.is_empty()),
             highest_position: highest_position
                 .clone()
                 .map(|position| position.receipt_key),

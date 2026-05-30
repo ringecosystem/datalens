@@ -38,6 +38,8 @@ pub(super) fn write_records_jsonl(
             inserted_rows: records.len(),
             skipped_or_replaced_rows: 0,
             files_written: usize::from(!records.is_empty()),
+            batches_attempted: usize::from(!records.is_empty()),
+            batches_delivered: usize::from(!records.is_empty()),
             highest_position: last_record.clone(),
             last_record,
         }),

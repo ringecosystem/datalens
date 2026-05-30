@@ -63,6 +63,9 @@ fn output_sink_config(output: &OutputConfig) -> OutputSinkConfig {
                 url: database.url.clone(),
             },
         },
+        OutputConfig::Webhook { webhook } => OutputSinkConfig::Webhook {
+            webhook: webhook.clone(),
+        },
     }
 }
 
@@ -147,6 +150,26 @@ fn declarative_output_summary(output: &OutputConfig) -> serde_json::Value {
                     "max_bytes_per_file": parquet.max_bytes_per_file,
                     "partition_by": parquet.partition_by,
                     "compression": parquet.compression,
+                },
+                "capability": {
+                    "write": capability.supports_write,
+                    "query": capability.supports_query,
+                    "graphql": capability.supports_graphql,
+                    "write_mode": capability.write_mode,
+                },
+            })
+        }
+        OutputConfig::Webhook { webhook } => {
+            let capability = output.capability();
+            serde_json::json!({
+                "kind": capability.kind.as_str(),
+                "webhook": {
+                    "url": webhook.url,
+                    "headers": webhook.headers.iter().map(|header| header.name.clone()).collect::<Vec<_>>(),
+                    "timeout_ms": webhook.timeout_ms,
+                    "max_rows_per_request": webhook.max_rows_per_request,
+                    "max_bytes_per_request": webhook.max_bytes_per_request,
+                    "idempotency_key_header": webhook.idempotency_key_header,
                 },
                 "capability": {
                     "write": capability.supports_write,

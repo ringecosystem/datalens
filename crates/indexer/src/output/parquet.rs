@@ -50,6 +50,8 @@ pub fn write_records_parquet(
             inserted_rows: records.len(),
             skipped_or_replaced_rows: 0,
             files_written,
+            batches_attempted: files_written,
+            batches_delivered: files_written,
             highest_position: highest_position
                 .clone()
                 .map(|position| position.receipt_key),

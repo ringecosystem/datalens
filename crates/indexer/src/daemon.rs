@@ -47,6 +47,11 @@ pub fn validate_daemon_config(
                 "query.enabled: output kind parquet does not support query service mode".to_owned(),
             ));
         }
+        OutputConfig::Webhook { .. } => {
+            return Err(IndexerError::Config(
+                "query.enabled: output kind webhook does not support query service mode".to_owned(),
+            ));
+        }
     };
     config.query.bind.parse::<SocketAddr>().map_err(|error| {
         IndexerError::Config(format!("query.bind: invalid socket address: {error}"))
@@ -272,6 +277,9 @@ fn output_sink_config(output: &OutputConfig) -> OutputSinkConfig {
         },
         OutputConfig::Parquet { parquet } => OutputSinkConfig::Parquet {
             config: parquet.clone(),
+        },
+        OutputConfig::Webhook { webhook } => OutputSinkConfig::Webhook {
+            webhook: webhook.clone(),
         },
     }
 }

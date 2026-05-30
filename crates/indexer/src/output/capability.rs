@@ -8,6 +8,7 @@ pub enum OutputKind {
     Jsonl,
     Database,
     Parquet,
+    Webhook,
 }
 
 impl OutputKind {
@@ -16,6 +17,7 @@ impl OutputKind {
             Self::Jsonl => "jsonl",
             Self::Database => "database",
             Self::Parquet => "parquet",
+            Self::Webhook => "webhook",
         }
     }
 }
@@ -67,6 +69,16 @@ impl OutputCapability {
             write_mode: OutputWriteMode::BatchedFiles,
         }
     }
+
+    pub const fn webhook() -> Self {
+        Self {
+            kind: OutputKind::Webhook,
+            supports_write: true,
+            supports_query: false,
+            supports_graphql: false,
+            write_mode: OutputWriteMode::IdempotentUpsert,
+        }
+    }
 }
 
 impl OutputConfig {
@@ -75,6 +87,7 @@ impl OutputConfig {
             Self::Jsonl { .. } => OutputKind::Jsonl,
             Self::Database { .. } => OutputKind::Database,
             Self::Parquet { .. } => OutputKind::Parquet,
+            Self::Webhook { .. } => OutputKind::Webhook,
         }
     }
 
@@ -83,6 +96,7 @@ impl OutputConfig {
             Self::Jsonl { .. } => OutputCapability::jsonl(),
             Self::Database { .. } => OutputCapability::database(),
             Self::Parquet { .. } => OutputCapability::parquet(),
+            Self::Webhook { .. } => OutputCapability::webhook(),
         }
     }
 }
@@ -93,6 +107,7 @@ impl OutputSinkConfig {
             Self::StdoutJson | Self::FileJson { .. } => OutputKind::Jsonl,
             Self::DatabaseSqlite { .. } | Self::DatabasePostgres { .. } => OutputKind::Database,
             Self::Parquet { .. } => OutputKind::Parquet,
+            Self::Webhook { .. } => OutputKind::Webhook,
         }
     }
 
@@ -103,6 +118,7 @@ impl OutputSinkConfig {
                 OutputCapability::database()
             }
             Self::Parquet { .. } => OutputCapability::parquet(),
+            Self::Webhook { .. } => OutputCapability::webhook(),
         }
     }
 }

@@ -2,7 +2,11 @@ use std::{env, fmt, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::IndexerError;
+use crate::{
+    IndexerError,
+    output::WebhookOutputConfig,
+    webhook_config::{RawWebhookOutputConfig, parse_webhook_output},
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DatalensIndexConfig {
@@ -150,6 +154,7 @@ pub enum OutputConfig {
     Jsonl { path: PathBuf },
     Database { database: DatabaseOutputConfig },
     Parquet { parquet: ParquetOutputConfig },
+    Webhook { webhook: WebhookOutputConfig },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -259,6 +264,7 @@ struct RawOutputConfig {
     jsonl: Option<RawJsonlOutputConfig>,
     database: Option<RawDatabaseOutputConfig>,
     parquet: Option<RawParquetOutputConfig>,
+    webhook: Option<RawWebhookOutputConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -499,10 +505,11 @@ fn parse_output(raw: RawOutputConfig, errors: &mut Vec<String>) -> Option<Output
     match raw.kind.as_deref() {
         Some("database") => parse_database_output(raw.database, errors),
         Some("parquet") => parse_parquet_output(raw.parquet, errors),
+        Some("webhook") => parse_webhook_output(raw.webhook, errors),
         Some("jsonl") | None => parse_jsonl_output(raw.jsonl, errors),
         Some(value) => {
             errors.push(format!(
-                "output.kind: unsupported output kind {value}; supported values are jsonl, database, and parquet"
+                "output.kind: unsupported output kind {value}; supported values are jsonl, database, parquet, and webhook"
             ));
             None
         }
