@@ -1,0 +1,11 @@
+[package]
+name = "datalens-example-ormp"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+datalens-client = { path = "../../crates/client" }
+datalens-core = { path = "../../crates/core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
