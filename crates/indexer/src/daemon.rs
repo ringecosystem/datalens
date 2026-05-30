@@ -267,22 +267,13 @@ async fn start_graphql_service(
     } else {
         None
     };
-    let app = match metrics {
-        Some(metrics) => graphql::graphql_router_with_auth(
-            store,
-            &config.query.path,
-            config.query.playground,
-            config.query.auth.clone(),
-            Some(metrics),
-        ),
-        None => graphql::graphql_router_with_auth(
-            store,
-            &config.query.path,
-            config.query.playground,
-            config.query.auth.clone(),
-            None,
-        ),
-    };
+    let app = graphql::graphql_router_with_auth(
+        store,
+        &config.query.path,
+        config.query.playground,
+        config.query.auth.clone(),
+        metrics,
+    );
     let graphql_path = config.query.path.clone();
     let (shutdown, shutdown_receiver) = oneshot::channel();
     let handle = tokio::spawn(async move {
