@@ -35,8 +35,23 @@ addresses = [
 ]
 topics = []
 
-[output.jsonl]
-path = ".data/indexes/ormp/events.jsonl"
+[output]
+kind = "database"
+
+[output.database]
+driver = "sqlite"
+url = "sqlite:.data/indexes/ormp/index.db"
+
+# PostgreSQL can be used for shared deployments:
+# driver = "postgres"
+# url = "postgres://datalens:datalens@127.0.0.1:5432/datalens_ormp"
+
+[query]
+enabled = true
+protocol = "graphql"
+bind = "127.0.0.1:9090"
+path = "/graphql"
+playground = true
 
 [checkpoint]
 path = ".data/indexes/ormp/checkpoint.json"

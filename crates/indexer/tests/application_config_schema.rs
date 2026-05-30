@@ -1,7 +1,7 @@
 use datalens_indexer::{
     CheckpointPolicy, DatabaseDriver, DatabaseOutputConfig, DatalensIndexConfig,
-    FinalityRequirement, IndexDataset, OutputConfig, ParquetOutputConfig, QueryProtocol,
-    QueryServiceConfig, SourceConfig, WebhookHeaderConfig, WebhookOutboxConfig,
+    FinalityRequirement, IndexDataset, MetricsServiceConfig, OutputConfig, ParquetOutputConfig,
+    QueryProtocol, QueryServiceConfig, SourceConfig, WebhookHeaderConfig, WebhookOutboxConfig,
     WebhookOutputConfig, WebhookRetryConfig,
 };
 
@@ -39,6 +39,72 @@ fn parse_error(input: &str) -> String {
     DatalensIndexConfig::from_toml_str(input)
         .expect_err("config should fail")
         .to_string()
+}
+
+#[test]
+fn test_parse_valid_solana_and_tron_source_configs() {
+    let input = valid_config()
+        .replace(
+            "dataset = \"evm.logs\"",
+            "dataset = \"solana.transactions\"",
+        )
+        .replace(
+            r#"[[sources]]
+chain = "ethereum"
+family = "evm"
+chain_id = 1
+from_block = 20009590
+to_block = 20059589
+addresses = ["0x0000000000000000000000000000000000000001"]
+topics = ["0x0000000000000000000000000000000000000000000000000000000000000000"]"#,
+            r#"[[sources]]
+chain = "solana-mainnet"
+family = "solana"
+network_id = "mainnet-beta"
+dataset = "solana.transactions"
+from_slot = 20009590
+to_slot = 20009599
+selector = { kind = "program", value = "11111111111111111111111111111111" }
+
+[[sources]]
+chain = "tron-mainnet"
+family = "tron"
+chain_id = 728126428
+dataset = "tron.events"
+from_block = 60000000
+to_block = 60000001
+contracts = ["0x0000000000000000000000000000000000000001"]
+events = ["Transfer"]"#,
+        );
+
+    let config = DatalensIndexConfig::from_toml_str(&input).expect("valid config");
+
+    assert_eq!(config.index.dataset, IndexDataset::SolanaTransactions);
+    assert_eq!(
+        config.sources[0],
+        SourceConfig::Solana(datalens_indexer::SolanaSourceConfig {
+            chain: "solana-mainnet".to_owned(),
+            network_id: Some("mainnet-beta".to_owned()),
+            dataset: IndexDataset::SolanaTransactions,
+            from_slot: 20009590,
+            to_slot: Some(20009599),
+            selector: datalens_indexer::SolanaSelectorConfig::Program(
+                "11111111111111111111111111111111".to_owned()
+            ),
+        })
+    );
+    assert_eq!(
+        config.sources[1],
+        SourceConfig::Tron(datalens_indexer::TronSourceConfig {
+            chain: "tron-mainnet".to_owned(),
+            chain_id: 728126428,
+            dataset: IndexDataset::TronEvents,
+            from_block: 60000000,
+            to_block: Some(60000001),
+            contracts: vec!["0x0000000000000000000000000000000000000001".to_owned()],
+            events: vec!["Transfer".to_owned()],
+        })
+    );
 }
 
 #[test]
@@ -170,11 +236,13 @@ fn test_parse_unsupported_dataset_returns_field_error() {
 
 #[test]
 fn test_parse_unsupported_family_returns_field_error() {
-    let input = valid_config().replace("family = \"evm\"", "family = \"tron\"");
+    let input = valid_config().replace("family = \"evm\"", "family = \"aptos\"");
     let error = parse_error(&input);
 
     assert!(error.contains("sources[0].family"), "{error}");
     assert!(error.contains("evm"), "{error}");
+    assert!(error.contains("solana"), "{error}");
+    assert!(error.contains("tron"), "{error}");
 }
 
 #[test]
@@ -284,6 +352,7 @@ fn test_parse_valid_sqlite_database_output_allows_query_service() {
             bind: "127.0.0.1:9100".to_owned(),
             path: "/query".to_owned(),
             playground: true,
+            metrics: MetricsServiceConfig::default(),
         }
     );
 }
@@ -306,6 +375,30 @@ fn test_parse_sqlite_query_config_captures_bind_address() {
     assert_eq!(
         datalens_indexer::validate_daemon_config(&config).expect("daemon config"),
         datalens_indexer::DaemonQueryMode::Graphql
+    );
+}
+
+#[test]
+fn test_parse_query_metrics_config_supports_operator_token_env() {
+    let input = valid_config()
+        .replace(
+            "[output.jsonl]\npath = \".data/indexes/ormp/events.jsonl\"",
+            "[output]\nkind = \"database\"\n\n[output.database]\ndriver = \"sqlite\"\nurl = \"sqlite:.data/indexes/ormp/index.db\"",
+        )
+        .replace(
+            "[checkpoint]",
+            "[query]\nenabled = true\nprotocol = \"graphql\"\n\n[query.metrics]\nenabled = true\npath = \"/metrics\"\ntoken_env = \"PATH\"\n\n[checkpoint]",
+        );
+
+    let config = DatalensIndexConfig::from_toml_str(&input).expect("valid database config");
+
+    assert_eq!(
+        config.query.metrics,
+        MetricsServiceConfig {
+            enabled: true,
+            path: "/metrics".to_owned(),
+            bearer_token: Some(std::env::var("PATH").expect("PATH should exist for tests")),
+        }
     );
 }
 
@@ -352,6 +445,7 @@ fn test_parse_valid_postgres_database_output_allows_query_service() {
             bind: "127.0.0.1:9090".to_owned(),
             path: "/graphql".to_owned(),
             playground: false,
+            metrics: MetricsServiceConfig::default(),
         }
     );
 }

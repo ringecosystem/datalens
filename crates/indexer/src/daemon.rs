@@ -1,6 +1,7 @@
 use std::{future::Future, net::SocketAddr, sync::Arc, time::Duration};
 
 use datalens_client::{DatalensClient, HttpTransport};
+use datalens_metrics::{IndexerGraphqlMetricLabels, MetricsRecorder};
 use serde::Serialize;
 use tokio::{sync::oneshot, task::JoinHandle};
 
@@ -245,7 +246,29 @@ async fn start_graphql_service(
         driver: database.driver,
         url: database.url.clone(),
     });
-    let app = graphql::graphql_router(store, &config.query.path, config.query.playground);
+    let metrics = if config.query.metrics.enabled {
+        Some(graphql::IndexerGraphqlMetrics {
+            recorder: MetricsRecorder::new().map_err(|error| {
+                IndexerError::Runner(format!("initialize query metrics recorder: {error}"))
+            })?,
+            labels: query_metric_labels(config),
+            endpoint: Some(graphql::MetricsEndpointConfig {
+                path: config.query.metrics.path.clone(),
+                bearer_token: config.query.metrics.bearer_token.clone(),
+            }),
+        })
+    } else {
+        None
+    };
+    let app = match metrics {
+        Some(metrics) => graphql::graphql_router_with_metrics(
+            store,
+            &config.query.path,
+            config.query.playground,
+            metrics,
+        ),
+        None => graphql::graphql_router(store, &config.query.path, config.query.playground),
+    };
     let graphql_path = config.query.path.clone();
     let (shutdown, shutdown_receiver) = oneshot::channel();
     let handle = tokio::spawn(async move {
@@ -294,5 +317,33 @@ fn output_sink_config(output: &OutputConfig) -> OutputSinkConfig {
         OutputConfig::Webhook { webhook } => OutputSinkConfig::Webhook {
             webhook: webhook.clone(),
         },
+    }
+}
+
+fn query_metric_labels(config: &DatalensIndexConfig) -> IndexerGraphqlMetricLabels {
+    IndexerGraphqlMetricLabels {
+        application: config.client.application.clone(),
+        index: config.index.name.clone(),
+        chain: query_metric_chain(&config.sources),
+        dataset: config.index.dataset.as_str().to_owned(),
+        output: query_metric_output(&config.output),
+    }
+}
+
+fn query_metric_chain(sources: &[crate::SourceConfig]) -> String {
+    let Some(first) = sources.first() else {
+        return "unknown".to_owned();
+    };
+    if sources.iter().all(|source| source.chain() == first.chain()) {
+        first.chain().to_owned()
+    } else {
+        "multiple".to_owned()
+    }
+}
+
+fn query_metric_output(output: &OutputConfig) -> String {
+    match output {
+        OutputConfig::Database { database } => database.driver.as_str().to_owned(),
+        _ => output.capability().kind.as_str().to_owned(),
     }
 }

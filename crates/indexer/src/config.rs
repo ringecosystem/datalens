@@ -7,6 +7,12 @@ use crate::{
     output::WebhookOutputConfig,
     webhook_config::{RawWebhookOutputConfig, parse_webhook_output},
 };
+use source_config::{RawSourceConfig, parse_sources};
+
+mod source_config;
+pub use source_config::{
+    EvmSourceConfig, SolanaSelectorConfig, SolanaSourceConfig, SourceConfig, TronSourceConfig,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DatalensIndexConfig {
@@ -99,12 +105,20 @@ pub struct IndexConfig {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IndexDataset {
     EvmLogs,
+    SolanaTransactions,
+    SolanaInstructions,
+    SolanaAccountUpdates,
+    TronEvents,
 }
 
 impl IndexDataset {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::EvmLogs => "evm.logs",
+            Self::SolanaTransactions => "solana.transactions",
+            Self::SolanaInstructions => "solana.instructions",
+            Self::SolanaAccountUpdates => "solana.account_updates",
+            Self::TronEvents => "tron.events",
         }
     }
 }
@@ -112,41 +126,6 @@ impl IndexDataset {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FinalityRequirement {
     Durable,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SourceConfig {
-    Evm(EvmSourceConfig),
-}
-
-impl SourceConfig {
-    pub fn chain(&self) -> &str {
-        match self {
-            Self::Evm(source) => &source.chain,
-        }
-    }
-
-    pub fn from_block(&self) -> u64 {
-        match self {
-            Self::Evm(source) => source.from_block,
-        }
-    }
-
-    pub fn to_block(&self) -> Option<u64> {
-        match self {
-            Self::Evm(source) => source.to_block,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EvmSourceConfig {
-    pub chain: String,
-    pub chain_id: u64,
-    pub from_block: u64,
-    pub to_block: Option<u64>,
-    pub addresses: Vec<String>,
-    pub topics: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -194,6 +173,7 @@ pub struct QueryServiceConfig {
     pub bind: String,
     pub path: String,
     pub playground: bool,
+    pub metrics: MetricsServiceConfig,
 }
 
 impl Default for QueryServiceConfig {
@@ -204,7 +184,39 @@ impl Default for QueryServiceConfig {
             bind: "127.0.0.1:9090".to_owned(),
             path: "/graphql".to_owned(),
             playground: false,
+            metrics: MetricsServiceConfig::default(),
         }
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct MetricsServiceConfig {
+    pub enabled: bool,
+    pub path: String,
+    pub bearer_token: Option<String>,
+}
+
+impl Default for MetricsServiceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: "/metrics".to_owned(),
+            bearer_token: None,
+        }
+    }
+}
+
+impl fmt::Debug for MetricsServiceConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MetricsServiceConfig")
+            .field("enabled", &self.enabled)
+            .field("path", &self.path)
+            .field(
+                "bearer_token",
+                &self.bearer_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
     }
 }
 
@@ -241,20 +253,6 @@ struct RawIndexConfig {
     dataset: Option<String>,
     finality: Option<String>,
     chunk_blocks: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawSourceConfig {
-    chain: Option<String>,
-    family: Option<String>,
-    chain_id: Option<u64>,
-    from_block: Option<u64>,
-    to_block: Option<u64>,
-    #[serde(default)]
-    addresses: Vec<String>,
-    #[serde(default)]
-    topics: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -301,6 +299,17 @@ struct RawQueryServiceConfig {
     path: Option<String>,
     #[serde(default)]
     playground: bool,
+    metrics: Option<RawMetricsServiceConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawMetricsServiceConfig {
+    #[serde(default)]
+    enabled: bool,
+    path: Option<String>,
+    bearer_token: Option<String>,
+    token_env: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -399,16 +408,8 @@ fn parse_client(raw: RawClientConfig, errors: &mut Vec<String>) -> Option<Client
 
 fn parse_index(raw: RawIndexConfig, errors: &mut Vec<String>) -> Option<IndexConfig> {
     let name = required_non_empty("index.name", raw.name, errors);
-    let dataset = match required_non_empty("index.dataset", raw.dataset, errors).as_deref() {
-        Some("evm.logs") => Some(IndexDataset::EvmLogs),
-        Some(value) => {
-            errors.push(format!(
-                "index.dataset: unsupported dataset {value}; supported value is evm.logs"
-            ));
-            None
-        }
-        None => None,
-    };
+    let dataset = required_non_empty("index.dataset", raw.dataset, errors)
+        .and_then(|value| parse_dataset("index.dataset", &value, errors));
     let finality = match required_non_empty("index.finality", raw.finality, errors).as_deref() {
         Some("durable") => Some(FinalityRequirement::Durable),
         Some(value) => {
@@ -439,65 +440,23 @@ fn parse_index(raw: RawIndexConfig, errors: &mut Vec<String>) -> Option<IndexCon
     })
 }
 
-fn parse_sources(raw_sources: Vec<RawSourceConfig>, errors: &mut Vec<String>) -> Vec<SourceConfig> {
-    if raw_sources.is_empty() {
-        errors.push("sources: at least one source is required".to_owned());
-        return Vec::new();
-    }
-
-    raw_sources
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, raw)| parse_source(index, raw, errors))
-        .collect()
-}
-
-fn parse_source(
-    index: usize,
-    raw: RawSourceConfig,
+pub(super) fn parse_dataset(
+    field: &str,
+    value: &str,
     errors: &mut Vec<String>,
-) -> Option<SourceConfig> {
-    let prefix = format!("sources[{index}]");
-    let chain = required_non_empty(&format!("{prefix}.chain"), raw.chain, errors);
-    let family = required_non_empty(&format!("{prefix}.family"), raw.family, errors);
-    let chain_id = required_u64(&format!("{prefix}.chain_id"), raw.chain_id, errors);
-    let from_block = required_u64(&format!("{prefix}.from_block"), raw.from_block, errors);
-    if let (Some(from_block), Some(to_block)) = (from_block, raw.to_block)
-        && from_block > to_block
-    {
-        errors.push(format!(
-            "{prefix}.to_block: must be greater than or equal to from_block"
-        ));
-    }
-    validate_hex_values(
-        &format!("{prefix}.addresses"),
-        &raw.addresses,
-        HexKind::Address,
-        errors,
-    );
-    validate_hex_values(
-        &format!("{prefix}.topics"),
-        &raw.topics,
-        HexKind::Topic,
-        errors,
-    );
-
-    match family.as_deref() {
-        Some("evm") => Some(SourceConfig::Evm(EvmSourceConfig {
-            chain: chain?,
-            chain_id: chain_id?,
-            from_block: from_block?,
-            to_block: raw.to_block,
-            addresses: raw.addresses,
-            topics: raw.topics,
-        })),
-        Some(value) => {
+) -> Option<IndexDataset> {
+    match value {
+        "evm.logs" => Some(IndexDataset::EvmLogs),
+        "solana.transactions" => Some(IndexDataset::SolanaTransactions),
+        "solana.instructions" => Some(IndexDataset::SolanaInstructions),
+        "solana.account_updates" => Some(IndexDataset::SolanaAccountUpdates),
+        "tron.events" => Some(IndexDataset::TronEvents),
+        value => {
             errors.push(format!(
-                "{prefix}.family: unsupported family {value}; supported value is evm"
+                "{field}: unsupported dataset {value}; supported values are evm.logs, solana.transactions, solana.instructions, solana.account_updates, and tron.events"
             ));
             None
         }
-        None => None,
     }
 }
 
@@ -617,6 +576,7 @@ fn parse_query(raw: Option<RawQueryServiceConfig>, errors: &mut Vec<String>) -> 
     if !path.starts_with('/') {
         errors.push("query.path: must start with /".to_owned());
     }
+    let metrics = parse_query_metrics(raw.metrics, &path, errors);
 
     QueryServiceConfig {
         enabled: raw.enabled,
@@ -624,6 +584,48 @@ fn parse_query(raw: Option<RawQueryServiceConfig>, errors: &mut Vec<String>) -> 
         bind,
         path,
         playground: raw.playground,
+        metrics,
+    }
+}
+
+fn parse_query_metrics(
+    raw: Option<RawMetricsServiceConfig>,
+    query_path: &str,
+    errors: &mut Vec<String>,
+) -> MetricsServiceConfig {
+    let Some(raw) = raw else {
+        return MetricsServiceConfig::default();
+    };
+    let default = MetricsServiceConfig::default();
+    let path = raw
+        .path
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(default.path);
+    if !path.starts_with('/') {
+        errors.push("query.metrics.path: must start with /".to_owned());
+    }
+    if path == query_path {
+        errors.push("query.metrics.path: must not equal query.path".to_owned());
+    }
+    let bearer_token = match raw.token_env {
+        Some(token_env) if !token_env.trim().is_empty() => env::var(&token_env)
+            .map_err(|_| {
+                errors.push(format!(
+                    "query.metrics.token_env: environment variable {token_env} is not set"
+                ));
+            })
+            .ok(),
+        Some(_) => {
+            errors.push("query.metrics.token_env: must not be empty".to_owned());
+            None
+        }
+        None => raw.bearer_token.filter(|value| !value.trim().is_empty()),
+    };
+
+    MetricsServiceConfig {
+        enabled: raw.enabled,
+        path,
+        bearer_token,
     }
 }
 
@@ -654,7 +656,7 @@ fn parse_checkpoint(
     Some(crate::CheckpointPolicy::File { path })
 }
 
-fn required_non_empty(
+pub(super) fn required_non_empty(
     field: &str,
     value: Option<String>,
     errors: &mut Vec<String>,
@@ -676,7 +678,11 @@ fn required_non_empty(
     }
 }
 
-fn required_u64(field: &str, value: Option<u64>, errors: &mut Vec<String>) -> Option<u64> {
+pub(super) fn required_u64(
+    field: &str,
+    value: Option<u64>,
+    errors: &mut Vec<String>,
+) -> Option<u64> {
     match value {
         Some(value) => Some(value),
         None => {
@@ -723,29 +729,6 @@ fn validate_parquet_compression(value: Option<&str>, errors: &mut Vec<String>) {
         Some(value) => errors.push(format!(
             "output.parquet.compression: unsupported compression {value}; supported values are uncompressed, snappy, and zstd"
         )),
-    }
-}
-
-enum HexKind {
-    Address,
-    Topic,
-}
-
-fn validate_hex_values(field: &str, values: &[String], kind: HexKind, errors: &mut Vec<String>) {
-    let expected_len = match kind {
-        HexKind::Address => 42,
-        HexKind::Topic => 66,
-    };
-    for (index, value) in values.iter().enumerate() {
-        if value.len() != expected_len
-            || !value.starts_with("0x")
-            || !value[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
-        {
-            errors.push(format!(
-                "{field}[{index}]: must be a 0x-prefixed {}-byte hex value",
-                (expected_len - 2) / 2
-            ));
-        }
     }
 }
 

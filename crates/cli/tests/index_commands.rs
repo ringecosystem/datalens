@@ -16,6 +16,9 @@ use datalens_core::{
     BlockHeader, BlockRange, ChainFamily, ChainIdentity, DatalensError, DatasetKey, DatasetRows,
     LedgerRange, NetworkId, QueryRows,
 };
+use datalens_indexer::{
+    CheckpointPolicy, DaemonQueryMode, DatalensIndexConfig, OutputConfig, QueryProtocol,
+};
 use datalens_solana::SolanaAdapter;
 use datalens_storage::{LocalStorage, StorageWriteRequest};
 
@@ -385,6 +388,31 @@ fn test_ormp_example_is_declarative_multi_chain_config() {
     assert!(example_dir.join("README.md").is_file());
     assert!(!example_dir.join("Cargo.toml").exists());
 
+    unsafe {
+        std::env::set_var("DATALENS_ORMP_TOKEN", "example-token");
+    }
+    let input = fs::read_to_string(&config_path).expect("read ORMP example config");
+    let config = DatalensIndexConfig::from_toml_str(&input).expect("parse ORMP example config");
+    match &config.output {
+        OutputConfig::Database { database } => {
+            assert_eq!(database.driver.as_str(), "sqlite");
+            assert_eq!(database.url, "sqlite:.data/indexes/ormp/index.db");
+        }
+        output => panic!("expected database output, got {output:?}"),
+    }
+    assert!(config.query.enabled);
+    assert_eq!(config.query.protocol, QueryProtocol::Graphql);
+    assert_eq!(config.query.bind, "127.0.0.1:9090");
+    assert_eq!(config.query.path, "/graphql");
+    assert_eq!(
+        datalens_indexer::validate_daemon_config(&config).expect("daemon config"),
+        DaemonQueryMode::Graphql
+    );
+    match &config.checkpoint {
+        CheckpointPolicy::File { path } => assert!(path.starts_with(".data/indexes/ormp")),
+        checkpoint => panic!("expected file checkpoint, got {checkpoint:?}"),
+    }
+
     let doctor_output = ProcessCommand::new(env!("CARGO_BIN_EXE_datalens"))
         .args(["index", "doctor", "--config"])
         .arg(&config_path)
@@ -406,6 +434,10 @@ fn test_ormp_example_is_declarative_multi_chain_config() {
         doctor["source_count"].as_u64().expect("source count") >= 2,
         "{doctor}"
     );
+    assert_eq!(doctor["output"]["kind"], "database");
+    assert_eq!(doctor["output"]["database"]["driver"], "sqlite");
+    assert_eq!(doctor["output"]["capability"]["query"], true);
+    assert_eq!(doctor["output"]["capability"]["graphql"], true);
 
     let plan_output = ProcessCommand::new(env!("CARGO_BIN_EXE_datalens"))
         .args(["index", "plan", "--config"])
