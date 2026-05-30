@@ -522,7 +522,7 @@ fn test_validate_config_accepts_application_registry() {
         enabled = true
         token = "secret-token"
         chains = ["ethereum"]
-        datasets = ["blocks"]
+        datasets = ["evm.blocks"]
         operations = ["query"]
 
         [applications.applications.quota]
@@ -548,6 +548,216 @@ fn test_validate_config_accepts_application_registry() {
     .expect("config parses");
 
     validate_config(&config).expect("application registry is valid");
+}
+
+#[test]
+fn test_validate_config_accepts_supported_application_dataset_keys() {
+    let supported = [
+        DatasetKey::evm_blocks(),
+        DatasetKey::evm_transactions(),
+        DatasetKey::evm_receipts(),
+        DatasetKey::evm_logs(),
+        DatasetKey::solana_slots(),
+        DatasetKey::solana_blocks(),
+        DatasetKey::solana_transactions(),
+        DatasetKey::solana_instructions(),
+        DatasetKey::solana_account_updates(),
+        DatasetKey::tron_blocks(),
+        DatasetKey::tron_transactions(),
+        DatasetKey::tron_transaction_infos(),
+        DatasetKey::tron_events(),
+    ];
+    let dataset_keys = supported
+        .iter()
+        .map(|dataset| format!(r#""{}""#, dataset.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let config = toml::from_str::<DatalensConfig>(&format!(
+        r#"
+        [server]
+        bind = "127.0.0.1:8080"
+
+        [storage]
+        backend = "local"
+
+        [storage.local]
+        root = "/tmp/datalens"
+
+        [planner]
+        max_query_range_blocks = 100
+        default_chunk_range_blocks = 10
+
+        [writer]
+        target_object_bytes = 1024
+        min_object_rows = 1
+        record_empty_coverage = true
+
+        [edge.metrics]
+        public = true
+
+        [applications]
+        required = true
+
+        [[applications.applications]]
+        id = "indexer"
+        name = "indexer"
+        enabled = true
+        token = "secret-token"
+        chains = ["ethereum"]
+        datasets = [{dataset_keys}]
+        operations = ["query"]
+
+        [chains.ethereum]
+        kind = "evm"
+        chain_id = 1
+        rpc_urls = ["http://example.invalid"]
+
+        [chains.ethereum.datasets.blocks]
+        enabled = true
+        max_batch_blocks = 10
+
+        [chains.ethereum.datasets.logs]
+        enabled = true
+        max_get_logs_range_blocks = 10
+        max_addresses_per_query = 1
+        "#
+    ))
+    .expect("config parses");
+
+    validate_config(&config).expect("application dataset keys are valid");
+}
+
+#[test]
+fn test_validate_config_rejects_unknown_and_legacy_application_dataset_keys() {
+    for dataset in ["not-a-dataset", "blocks", "logs"] {
+        let config = toml::from_str::<DatalensConfig>(&format!(
+            r#"
+            [server]
+            bind = "127.0.0.1:8080"
+
+            [storage]
+            backend = "local"
+
+            [storage.local]
+            root = "/tmp/datalens"
+
+            [planner]
+            max_query_range_blocks = 100
+            default_chunk_range_blocks = 10
+
+            [writer]
+            target_object_bytes = 1024
+            min_object_rows = 1
+            record_empty_coverage = true
+
+            [edge.metrics]
+            public = true
+
+            [applications]
+            required = true
+
+            [[applications.applications]]
+            id = "indexer"
+            name = "indexer"
+            enabled = true
+            token = "secret-token"
+            chains = ["ethereum"]
+            datasets = ["{dataset}"]
+            operations = ["query"]
+
+            [chains.ethereum]
+            kind = "evm"
+            chain_id = 1
+            rpc_urls = ["http://example.invalid"]
+
+            [chains.ethereum.datasets.blocks]
+            enabled = true
+            max_batch_blocks = 10
+
+            [chains.ethereum.datasets.logs]
+            enabled = true
+            max_get_logs_range_blocks = 10
+            max_addresses_per_query = 1
+            "#
+        ))
+        .expect("config parses");
+
+        let error = validate_config(&config).expect_err("dataset rejected");
+
+        assert_eq!(error.kind, DatalensErrorKind::InvalidInput);
+        assert!(
+            error
+                .message
+                .contains(&format!("references unknown dataset {dataset}"))
+        );
+    }
+}
+
+#[test]
+fn test_validate_config_rejects_zero_application_hot_query_range_quota() {
+    let config = toml::from_str::<DatalensConfig>(
+        r#"
+        [server]
+        bind = "127.0.0.1:8080"
+
+        [storage]
+        backend = "local"
+
+        [storage.local]
+        root = "/tmp/datalens"
+
+        [planner]
+        max_query_range_blocks = 100
+        default_chunk_range_blocks = 10
+
+        [writer]
+        target_object_bytes = 1024
+        min_object_rows = 1
+        record_empty_coverage = true
+
+        [edge.metrics]
+        public = true
+
+        [applications]
+        required = true
+
+        [[applications.applications]]
+        id = "indexer"
+        name = "indexer"
+        enabled = true
+        token = "secret-token"
+        chains = ["ethereum"]
+        datasets = ["evm.blocks"]
+        operations = ["query"]
+
+        [applications.applications.quota]
+        max_hot_query_range_blocks = 0
+
+        [chains.ethereum]
+        kind = "evm"
+        chain_id = 1
+        rpc_urls = ["http://example.invalid"]
+
+        [chains.ethereum.datasets.blocks]
+        enabled = true
+        max_batch_blocks = 10
+
+        [chains.ethereum.datasets.logs]
+        enabled = true
+        max_get_logs_range_blocks = 10
+        max_addresses_per_query = 1
+        "#,
+    )
+    .expect("config parses");
+
+    let error = validate_config(&config).expect_err("zero hot quota rejected");
+
+    assert_eq!(error.kind, DatalensErrorKind::InvalidInput);
+    assert!(
+        error
+            .message
+            .contains("application indexer quota limits must be greater than zero")
+    );
 }
 
 #[test]

@@ -1,6 +1,8 @@
 use datalens_chain::ChainAdapter;
 use datalens_core::{DatalensError, DatalensErrorKind};
-use datalens_edge::auth::{ApplicationRegistry, normalize_application_id};
+use datalens_edge::auth::{
+    ApplicationRegistry, normalize_application_dataset_key, normalize_application_id,
+};
 use datalens_edge::config::{ChainConfig, DatalensConfig, FinalityConfig};
 use datalens_evm::EvmRpcClient;
 use datalens_solana::{SolanaAdapter, SolanaHttpRpc};
@@ -228,18 +230,7 @@ fn validate_applications(config: &DatalensConfig) -> Result<(), DatalensError> {
             ));
         }
         for dataset in &application.datasets {
-            if !matches!(
-                dataset.as_str(),
-                "blocks"
-                    | "transactions"
-                    | "receipts"
-                    | "logs"
-                    | "evm.blocks"
-                    | "evm.logs"
-                    | "solana.slots"
-                    | "tron.blocks"
-                    | "tron.events"
-            ) {
+            if normalize_application_dataset_key(dataset).is_err() {
                 return Err(DatalensError::new(
                     DatalensErrorKind::InvalidInput,
                     format!("application {application_id} references unknown dataset {dataset}"),
@@ -248,6 +239,7 @@ fn validate_applications(config: &DatalensConfig) -> Result<(), DatalensError> {
         }
         if let Some(quota) = &application.quota
             && (matches!(quota.max_query_range_blocks, Some(0))
+                || matches!(quota.max_hot_query_range_blocks, Some(0))
                 || matches!(quota.max_requests_per_minute, Some(0))
                 || matches!(quota.max_concurrent_requests, Some(0)))
         {
