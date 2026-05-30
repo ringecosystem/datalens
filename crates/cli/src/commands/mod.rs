@@ -1,3 +1,4 @@
+mod benchmark;
 mod doctor;
 mod helpers;
 mod index;
@@ -8,6 +9,9 @@ mod query;
 mod root;
 mod serve;
 
+pub use benchmark::{
+    BenchmarkCommand, BenchmarkRunCommand, BenchmarkSubcommand, benchmark_command,
+};
 pub use doctor::doctor_command;
 pub(crate) use helpers::{chain_identity, configured_chain, parse_bind};
 pub use index::*;
