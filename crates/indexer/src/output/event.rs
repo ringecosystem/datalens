@@ -19,6 +19,7 @@ pub(super) struct NormalizedIndexedEvent {
     pub selector: Option<String>,
     pub topics_json: Option<String>,
     pub signature: Option<String>,
+    pub event_name: Option<String>,
     pub data_payload: Option<String>,
     pub raw_payload: String,
     pub removed: Option<i64>,
@@ -54,6 +55,7 @@ impl NormalizedIndexedEvent {
                 .and_then(Value::as_str)
                 .map(str::to_owned)
         });
+        let event_name = json_string(&record.payload, "event_name");
         let block_hash = json_string(&record.payload, "block_hash");
         let transaction_hash = json_string(&record.payload, "transaction_hash");
         let position =
@@ -83,6 +85,7 @@ impl NormalizedIndexedEvent {
             selector,
             topics_json,
             signature,
+            event_name,
             data_payload: json_string(&record.payload, "data"),
             raw_payload: record.payload.to_string(),
             removed: record

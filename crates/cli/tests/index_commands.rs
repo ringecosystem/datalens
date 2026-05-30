@@ -393,6 +393,15 @@ fn test_ormp_example_is_declarative_multi_chain_config() {
     assert_eq!(config.query.protocol, QueryProtocol::Graphql);
     assert_eq!(config.query.bind, "127.0.0.1:9090");
     assert_eq!(config.query.path, "/graphql");
+    assert!(config.decode.enabled);
+    assert_eq!(config.decode.events.len(), 4);
+    assert!(
+        config
+            .decode
+            .events
+            .iter()
+            .any(|event| event.name == "MessageAccepted")
+    );
     assert_eq!(
         datalens_indexer::validate_daemon_config(&config).expect("daemon config"),
         DaemonQueryMode::Graphql
@@ -427,6 +436,11 @@ fn test_ormp_example_is_declarative_multi_chain_config() {
     assert_eq!(doctor["output"]["database"]["driver"], "sqlite");
     assert_eq!(doctor["output"]["capability"]["query"], true);
     assert_eq!(doctor["output"]["capability"]["graphql"], true);
+    assert_eq!(doctor["decode"]["enabled"], true);
+    assert_eq!(
+        doctor["decode"]["events"].as_array().expect("events").len(),
+        4
+    );
 
     let plan_output = ProcessCommand::new(env!("CARGO_BIN_EXE_datalens"))
         .args(["index", "plan", "--config"])

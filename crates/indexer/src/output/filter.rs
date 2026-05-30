@@ -12,6 +12,7 @@ pub(super) struct StoreQueryFilter {
     pub to_block: Option<i64>,
     pub transaction_hash: Option<String>,
     pub signature: Option<String>,
+    pub event_name: Option<String>,
     pub topic0: Option<String>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
@@ -36,6 +37,7 @@ impl StoreQueryFilter {
                 .and_then(|filter| filter.get("signature").or_else(|| filter.get("topic")))
                 .and_then(Value::as_str)
                 .map(str::to_owned),
+            event_name: string_filter(filter, "event_name"),
             topic0: string_filter(filter, "topic0"),
             limit: u64_filter(filter, "limit"),
             offset: u64_filter(filter, "after"),

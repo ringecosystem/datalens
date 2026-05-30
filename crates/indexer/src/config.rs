@@ -19,6 +19,7 @@ pub struct DatalensIndexConfig {
     pub client: ClientConfig,
     pub index: IndexConfig,
     pub sources: Vec<SourceConfig>,
+    pub decode: DecodeConfig,
     pub output: OutputConfig,
     pub query: QueryServiceConfig,
     pub checkpoint: crate::CheckpointPolicy,
@@ -227,6 +228,28 @@ pub enum QueryProtocol {
     Graphql,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DecodeConfig {
+    pub enabled: bool,
+    pub events: Vec<DecodeEventConfig>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DecodeEventConfig {
+    pub name: String,
+    pub signature: String,
+    pub topic0: String,
+    pub contract: Option<String>,
+    pub inputs: Vec<DecodeEventInputConfig>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DecodeEventInputConfig {
+    pub name: String,
+    pub kind: String,
+    pub indexed: bool,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawDatalensIndexConfig {
@@ -234,6 +257,7 @@ struct RawDatalensIndexConfig {
     index: Option<RawIndexConfig>,
     #[serde(default)]
     sources: Vec<RawSourceConfig>,
+    decode: Option<RawDecodeConfig>,
     output: Option<RawOutputConfig>,
     query: Option<RawQueryServiceConfig>,
     checkpoint: Option<RawCheckpointConfig>,
@@ -315,6 +339,35 @@ struct RawMetricsServiceConfig {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawDecodeConfig {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    events: Vec<RawDecodeEventConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDecodeEventConfig {
+    name: Option<String>,
+    signature: Option<String>,
+    topic0: Option<String>,
+    contract: Option<String>,
+    #[serde(default)]
+    inputs: Vec<RawDecodeEventInputConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDecodeEventInputConfig {
+    name: Option<String>,
+    kind: Option<String>,
+    #[serde(default)]
+    indexed: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawCheckpointConfig {
     path: Option<PathBuf>,
 }
@@ -351,6 +404,7 @@ impl TryFrom<RawDatalensIndexConfig> for DatalensIndexConfig {
                 }
             }
         };
+        let decode = parse_decode(raw.decode, &mut errors);
         let query = parse_query(raw.query, &mut errors);
         validate_output_query_capabilities(&output, &query, &mut errors);
         let checkpoint = match raw.checkpoint {
@@ -375,6 +429,7 @@ impl TryFrom<RawDatalensIndexConfig> for DatalensIndexConfig {
             client,
             index,
             sources,
+            decode,
             output,
             query,
             checkpoint,
@@ -627,6 +682,86 @@ fn parse_query_metrics(
         enabled: raw.enabled,
         path,
         bearer_token,
+    }
+}
+
+fn parse_decode(raw: Option<RawDecodeConfig>, errors: &mut Vec<String>) -> DecodeConfig {
+    let Some(raw) = raw else {
+        return DecodeConfig::default();
+    };
+    let events = raw
+        .events
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, event)| parse_decode_event(index, event, errors))
+        .collect::<Vec<_>>();
+    if raw.enabled && events.is_empty() {
+        errors.push(
+            "decode.events: at least one event is required when decode is enabled".to_owned(),
+        );
+    }
+    DecodeConfig {
+        enabled: raw.enabled,
+        events,
+    }
+}
+
+fn parse_decode_event(
+    event_index: usize,
+    raw: RawDecodeEventConfig,
+    errors: &mut Vec<String>,
+) -> Option<DecodeEventConfig> {
+    let prefix = format!("decode.events[{event_index}]");
+    let name = required_non_empty(&format!("{prefix}.name"), raw.name, errors);
+    let signature = required_non_empty(&format!("{prefix}.signature"), raw.signature, errors);
+    let topic0 = required_non_empty(&format!("{prefix}.topic0"), raw.topic0, errors)
+        .and_then(|value| validate_topic0(&format!("{prefix}.topic0"), value, errors));
+    let contract = raw.contract.and_then(|value| {
+        let value = value.trim();
+        if value.is_empty() {
+            errors.push(format!("{prefix}.contract: must not be empty"));
+            None
+        } else {
+            Some(value.to_owned())
+        }
+    });
+    let inputs = raw
+        .inputs
+        .into_iter()
+        .enumerate()
+        .filter_map(|(input_index, input)| {
+            parse_decode_event_input(&format!("{prefix}.inputs[{input_index}]"), input, errors)
+        })
+        .collect::<Vec<_>>();
+
+    Some(DecodeEventConfig {
+        name: name?,
+        signature: signature?,
+        topic0: topic0?,
+        contract,
+        inputs,
+    })
+}
+
+fn parse_decode_event_input(
+    prefix: &str,
+    raw: RawDecodeEventInputConfig,
+    errors: &mut Vec<String>,
+) -> Option<DecodeEventInputConfig> {
+    Some(DecodeEventInputConfig {
+        name: required_non_empty(&format!("{prefix}.name"), raw.name, errors)?,
+        kind: required_non_empty(&format!("{prefix}.kind"), raw.kind, errors)?,
+        indexed: raw.indexed,
+    })
+}
+
+fn validate_topic0(field: &str, value: String, errors: &mut Vec<String>) -> Option<String> {
+    let hex = value.strip_prefix("0x");
+    if hex.is_none_or(|hex| hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit())) {
+        errors.push(format!("{field}: must be a 0x-prefixed 32-byte hex value"));
+        None
+    } else {
+        Some(value.to_ascii_lowercase())
     }
 }
 

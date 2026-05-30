@@ -1,0 +1,61 @@
+[
+  {
+    "anonymous": false,
+    "inputs": [
+      { "indexed": true, "internalType": "bytes32", "name": "msgId", "type": "bytes32" },
+      { "indexed": false, "internalType": "address", "name": "fromDapp", "type": "address" },
+      { "indexed": false, "internalType": "uint256", "name": "toChainId", "type": "uint256" },
+      { "indexed": false, "internalType": "address", "name": "toDapp", "type": "address" },
+      { "indexed": false, "internalType": "bytes", "name": "message", "type": "bytes" },
+      { "indexed": false, "internalType": "bytes", "name": "params", "type": "bytes" }
+    ],
+    "name": "MessageSent",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      { "indexed": true, "internalType": "bytes32", "name": "msgHash", "type": "bytes32" },
+      {
+        "components": [
+          { "internalType": "address", "name": "channel", "type": "address" },
+          { "internalType": "uint256", "name": "index", "type": "uint256" },
+          { "internalType": "uint256", "name": "fromChainId", "type": "uint256" },
+          { "internalType": "address", "name": "from", "type": "address" },
+          { "internalType": "uint256", "name": "toChainId", "type": "uint256" },
+          { "internalType": "address", "name": "to", "type": "address" },
+          { "internalType": "uint256", "name": "gasLimit", "type": "uint256" },
+          { "internalType": "bytes", "name": "encoded", "type": "bytes" }
+        ],
+        "indexed": false,
+        "internalType": "struct Message",
+        "name": "message",
+        "type": "tuple"
+      }
+    ],
+    "name": "MessageAccepted",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      { "indexed": true, "internalType": "bytes32", "name": "msgHash", "type": "bytes32" },
+      { "indexed": true, "internalType": "address", "name": "oracle", "type": "address" },
+      { "indexed": true, "internalType": "address", "name": "relayer", "type": "address" },
+      { "indexed": false, "internalType": "uint256", "name": "oracleFee", "type": "uint256" },
+      { "indexed": false, "internalType": "uint256", "name": "relayerFee", "type": "uint256" },
+      { "indexed": false, "internalType": "bytes", "name": "params", "type": "bytes" }
+    ],
+    "name": "MessageAssigned",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      { "indexed": true, "internalType": "bytes32", "name": "msgHash", "type": "bytes32" },
+      { "indexed": false, "internalType": "bool", "name": "dispatchResult", "type": "bool" }
+    ],
+    "name": "MessageDispatched",
+    "type": "event"
+  }
+]

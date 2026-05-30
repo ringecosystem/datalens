@@ -42,6 +42,34 @@ fn record(block_number: u64, log_index: u64, address: &str) -> IndexedRecord {
     }
 }
 
+fn decoded_record(block_number: u64, log_index: u64, signature: &str) -> IndexedRecord {
+    IndexedRecord {
+        index: "ormp".to_owned(),
+        chain: "ethereum".to_owned(),
+        chain_id: 1,
+        dataset: "evm.logs".to_owned(),
+        payload: serde_json::json!({
+            "block_number": block_number,
+            "block_hash": format!("0xblock{block_number:064x}"),
+            "transaction_hash": format!("0xtx{block_number:064x}"),
+            "transaction_index": 2,
+            "log_index": log_index,
+            "address": "0x2cd1867fb8016f93710b6386f7f9f1d540a60812",
+            "topics": [
+                "0x9e6c1c44f7b2b36245897f9be35a5500f3a9e0d5b8f29f89dbf04b54053bb7d1"
+            ],
+            "signature": signature,
+            "event_name": "MessageAccepted",
+            "decoded": {
+                "msgHash": "0xabc",
+                "fromChainId": "1"
+            },
+            "data": "0x010203",
+            "removed": false,
+        }),
+    }
+}
+
 #[test]
 fn test_graphql_events_query_filters_sqlite_store_and_returns_stable_fields() {
     let store = SqliteOutputStore::connect("sqlite::memory:").expect("sqlite store connects");
@@ -116,6 +144,65 @@ fn test_graphql_events_query_filters_sqlite_store_and_returns_stable_fields() {
     assert_eq!(events[0]["data"], "0x010203");
     assert_eq!(events[0]["payload"]["block_number"], 20);
     assert!(events[0]["createdAt"].as_str().is_some());
+}
+
+#[test]
+fn test_graphql_events_query_filters_signature_and_returns_decoded_shape() {
+    let store = SqliteOutputStore::connect("sqlite::memory:").expect("sqlite store connects");
+    store
+        .write_records(&[
+            decoded_record(10, 0, "MessageAccepted(bytes32,uint256,address,address)"),
+            decoded_record(20, 1, "MessageDispatched(bytes32,uint256,address,address)"),
+        ])
+        .expect("write records");
+    let schema = graphql_schema(Arc::new(store));
+
+    let response = Runtime::new().expect("runtime").block_on(async {
+        schema
+            .execute(
+                GraphqlRequest::new(
+                    r#"
+                query DecodedEvents($signature: String!) {
+                  events(
+                    indexName: "ormp"
+                    chain: "ethereum"
+                    chainId: 1
+                    dataset: "evm.logs"
+                    address: "0x2cd1867fb8016f93710b6386f7f9f1d540a60812"
+                    eventName: "MessageAccepted"
+                    signature: $signature
+                    fromBlock: 1
+                    toBlock: 15
+                    limit: 5
+                  ) {
+                    blockNumber
+                    address
+                    signature
+                    eventName
+                    decoded
+                  }
+                }
+                "#,
+                )
+                .variables(Variables::from_json(serde_json::json!({
+                    "signature": "MessageAccepted(bytes32,uint256,address,address)",
+                }))),
+            )
+            .await
+    });
+
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let body = response.data.into_json().expect("graphql data");
+    let events = body["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["blockNumber"], 10);
+    assert_eq!(
+        events[0]["signature"],
+        "MessageAccepted(bytes32,uint256,address,address)"
+    );
+    assert_eq!(events[0]["eventName"], "MessageAccepted");
+    assert_eq!(events[0]["decoded"]["msgHash"], "0xabc");
+    assert_eq!(events[0]["decoded"]["fromChainId"], "1");
 }
 
 #[test]
