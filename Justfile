@@ -51,6 +51,9 @@ container-smoke:
 config-doctor-smoke:
   cargo test -p datalens-cli --test cli_commands test_production_config_doctor_smoke_uses_nonsecret_environment
 
+benchmark:
+  cargo test -p datalens-cli --test benchmark_commands
+
 release-check:
   just fmt-check
   just check

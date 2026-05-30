@@ -1,8 +1,8 @@
 use clap::{Args, Parser, Subcommand};
 
 use super::{
-    IndexCommand, InspectCommand, QueryCommand, ServeCommand, doctor_command, index_command,
-    inspect_command, query_command, serve_command,
+    BenchmarkCommand, IndexCommand, InspectCommand, QueryCommand, ServeCommand, benchmark_command,
+    doctor_command, index_command, inspect_command, query_command, serve_command,
 };
 
 #[derive(Debug, Parser)]
@@ -19,6 +19,7 @@ pub enum Command {
     Query(QueryCommand),
     Inspect(InspectCommand),
     Index(Box<IndexCommand>),
+    Benchmark(BenchmarkCommand),
 }
 
 #[derive(Debug, Args)]
@@ -36,6 +37,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Command::Query(command) => query_command(command)?,
         Command::Inspect(command) => inspect_command(command)?,
         Command::Index(command) => index_command(*command)?,
+        Command::Benchmark(command) => benchmark_command(command)?,
     }
     Ok(())
 }
