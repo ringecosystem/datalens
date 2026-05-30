@@ -1061,7 +1061,11 @@ fn test_production_config_doctor_smoke_uses_nonsecret_environment() {
     })]);
 
     let output = ProcessCommand::new(env!("CARGO_BIN_EXE_datalens"))
-        .args(["doctor", "--config", "config/datalens.production.toml"])
+        .args([
+            "doctor",
+            "--config",
+            "examples/config/datalens.server.production.toml",
+        ])
         .current_dir(workspace_root())
         .env("DATALENS_ETHEREUM_RPC_URL", url)
         .env("DATALENS_S3_BUCKET", "datalens-production")

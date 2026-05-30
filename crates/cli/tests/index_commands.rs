@@ -471,6 +471,95 @@ fn test_ormp_example_is_declarative_multi_chain_config() {
 }
 
 #[test]
+fn test_production_index_daemon_example_uses_placeholder_environment() {
+    let config_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/config/datalens.index-daemon.production.toml")
+        .canonicalize()
+        .expect("production index daemon example");
+
+    unsafe {
+        std::env::set_var(
+            "DATALENS_INDEX_CLIENT_ENDPOINT",
+            "https://datalens.example.invalid",
+        );
+        std::env::set_var(
+            "DATALENS_INDEX_APPLICATION_TOKEN",
+            "replace-with-index-token",
+        );
+        std::env::set_var(
+            "DATALENS_INDEX_DATABASE_URL",
+            "postgres://datalens:replace-with-password@postgres.example.invalid:5432/datalens",
+        );
+        std::env::set_var("DATALENS_INDEX_QUERY_BIND", "0.0.0.0:9090");
+        std::env::set_var(
+            "DATALENS_INDEX_QUERY_METRICS_TOKEN",
+            "replace-with-index-metrics-token",
+        );
+    }
+
+    let input = fs::read_to_string(&config_path).expect("read production index daemon example");
+    let config =
+        DatalensIndexConfig::from_toml_str(&input).expect("parse production index daemon example");
+
+    assert_eq!(config.client.application, "public");
+    assert_eq!(
+        config.client.token.env(),
+        "DATALENS_INDEX_APPLICATION_TOKEN"
+    );
+    assert_eq!(config.index.dataset.as_str(), "evm.logs");
+    assert!(config.query.enabled);
+    assert_eq!(config.query.protocol, QueryProtocol::Graphql);
+    assert_eq!(config.query.bind, "0.0.0.0:9090");
+    assert_eq!(
+        datalens_indexer::validate_daemon_config(&config).expect("daemon config"),
+        DaemonQueryMode::Graphql
+    );
+    match &config.output {
+        OutputConfig::Database { database } => assert_eq!(database.driver.as_str(), "postgres"),
+        output => panic!("expected database output, got {output:?}"),
+    }
+    match &config.checkpoint {
+        CheckpointPolicy::File { path } => assert!(path.starts_with("/var/lib/datalens/indexes")),
+        checkpoint => panic!("expected file checkpoint, got {checkpoint:?}"),
+    }
+
+    let doctor_output = ProcessCommand::new(env!("CARGO_BIN_EXE_datalens"))
+        .args(["index", "doctor", "--config"])
+        .arg(&config_path)
+        .env(
+            "DATALENS_INDEX_CLIENT_ENDPOINT",
+            "https://datalens.example.invalid",
+        )
+        .env(
+            "DATALENS_INDEX_APPLICATION_TOKEN",
+            "replace-with-index-token",
+        )
+        .env(
+            "DATALENS_INDEX_DATABASE_URL",
+            "postgres://datalens:replace-with-password@postgres.example.invalid:5432/datalens",
+        )
+        .env("DATALENS_INDEX_QUERY_BIND", "0.0.0.0:9090")
+        .env(
+            "DATALENS_INDEX_QUERY_METRICS_TOKEN",
+            "replace-with-index-metrics-token",
+        )
+        .output()
+        .expect("run production index daemon example doctor");
+
+    assert!(
+        doctor_output.status.success(),
+        "production index daemon doctor failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&doctor_output.stdout),
+        String::from_utf8_lossy(&doctor_output.stderr)
+    );
+    let doctor: serde_json::Value =
+        serde_json::from_slice(&doctor_output.stdout).expect("doctor JSON");
+    assert_eq!(doctor["index"], "public-evm-logs");
+    assert_eq!(doctor["output"]["kind"], "database");
+    assert_eq!(doctor["output"]["database"]["driver"], "postgres");
+}
+
+#[test]
 fn test_index_doctor_rejects_invalid_config_without_leaking_token() {
     let root = temp_storage_root("index-doctor-invalid");
     let config = write_declarative_index_config("index-doctor-invalid", &root);
