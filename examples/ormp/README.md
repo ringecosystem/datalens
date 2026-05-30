@@ -14,12 +14,10 @@ running the index commands:
 export DATALENS_ORMP_TOKEN=replace-with-local-token
 ```
 
-The local workflow uses two processes:
+The service workflow uses one long-running Datalens process:
 
-1. `datalens serve` runs the shared cache server.
-2. `datalens index daemon` runs the ORMP application indexer, writes indexed
-   events to SQLite, labels configured ORMP/Msgport ABI events, and serves
-   GraphQL for those indexed events.
+1. `datalens serve --config datalens.toml` runs the shared cache server, ORMP
+   application index worker, and separate native/index GraphQL surfaces when enabled.
 
 For local development, start the cache server with the server configuration and
 storage setup documented by the repo runbooks:
@@ -28,27 +26,27 @@ storage setup documented by the repo runbooks:
 cargo run -p datalens-cli -- serve --config path/to/datalens.toml
 ```
 
-In another shell, inspect and plan the ORMP index:
+Inspect and plan the standalone ORMP index helper config:
 
 ```sh
 cargo run -p datalens-cli -- index doctor --config examples/ormp/ormp.index.toml
 cargo run -p datalens-cli -- index plan --config examples/ormp/ormp.index.toml
 ```
 
-With the cache server still running, start the application-side daemon:
+For one-shot local helper runs, execute the ORMP index config directly:
 
 ```sh
-cargo run -p datalens-cli -- index daemon --config examples/ormp/ormp.index.toml
+cargo run -p datalens-cli -- index run --config examples/ormp/ormp.index.toml
 ```
 
 The default config writes to `.data/indexes/ormp/index.db`, stores checkpoints
-under `.data/indexes/ormp/checkpoint.json`, and serves GraphQL on
-`http://127.0.0.1:9090/graphql`. If the playground is enabled, open
-`http://127.0.0.1:9090/graphql/playground`.
+under `.data/indexes/ormp/checkpoint.json`. When embedded in service config, the index
+GraphQL surface is served by `datalens serve` at `/index/graphql`; if the playground is
+enabled, open `/index/graphiql`.
 
 The example keeps only the ABI event fragments it needs in `abi/events.json`.
 The same minimal event definitions are declared in `ormp.index.toml` under
-`[decode]` so the daemon can attach stable event names and signatures to
+`[decode]` so the indexer can attach stable event names and signatures to
 matching EVM logs.
 
 After the daemon has indexed rows, query raw indexed events:

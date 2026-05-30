@@ -33,7 +33,6 @@ fn test_serve_accepts_config_path() {
     match cli.command {
         Command::Serve(command) => {
             assert_eq!(command.config, "custom.toml");
-            assert!(!command.enable_graphql);
         }
         command => panic!("expected serve command, got {command:?}"),
     }
@@ -41,27 +40,34 @@ fn test_serve_accepts_config_path() {
 
 #[test]
 fn test_serve_accepts_enable_graphql_flag() {
-    let cli = Cli::parse_from(["datalens", "serve", "--enable-graphql"]);
+    assert!(Cli::try_parse_from(["datalens", "serve", "--enable-graphql"]).is_err());
+}
+
+#[test]
+fn test_plan_accepts_config_path() {
+    let cli = Cli::parse_from(["datalens", "plan", "--config", "custom.toml"]);
 
     match cli.command {
-        Command::Serve(command) => assert!(command.enable_graphql),
-        command => panic!("expected serve command, got {command:?}"),
+        Command::Plan(command) => assert_eq!(command.config, "custom.toml"),
+        command => panic!("expected plan command, got {command:?}"),
     }
 }
 
 #[test]
-fn test_serve_enable_graphql_overrides_config_default() {
+fn test_serve_uses_unified_query_config() {
     let config: DatalensConfig =
         toml::from_str(&minimal_config_text()).expect("minimal config should parse");
     let command = ServeCommand {
         config: "datalens.toml".to_owned(),
-        enable_graphql: true,
     };
 
     let edge = serve_edge_config(&config, &command);
 
-    assert!(edge.graphql.enabled);
-    assert!(!edge.graphql.playground_enabled);
+    assert!(!edge.query.native.graphql_enabled);
+    assert_eq!(edge.query.native.path, "/native/graphql");
+    assert!(!edge.query.native.playground_enabled);
+    assert!(!edge.query.index.graphql_enabled);
+    assert_eq!(edge.query.index.path, "/index/graphql");
 }
 
 fn minimal_config_text() -> String {

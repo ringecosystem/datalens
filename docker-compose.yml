@@ -69,6 +69,8 @@ services:
     depends_on:
       rustfs-init:
         condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
     environment:
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-datalens-dev}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-datalens-dev-secret}
@@ -78,6 +80,8 @@ services:
       DATALENS_S3_PREFIX: ${DATALENS_S3_PREFIX:-local-compose}
       DATALENS_S3_REGION: ${DATALENS_S3_REGION:-auto}
       DATALENS_ETHEREUM_RPC_URL: ${DATALENS_ETHEREUM_RPC_URL:-http://host.docker.internal:8545}
+      DATALENS_INDEX_DATABASE_URL: ${DATALENS_INDEX_DATABASE_URL:-postgres://datalens:datalens@postgres:5432/datalens_test}
+      DATALENS_INDEX_QUERY_METRICS_TOKEN: ${DATALENS_INDEX_QUERY_METRICS_TOKEN:-replace-with-index-metrics-token}
       DATALENS_PUBLIC_APP_TOKEN: ${DATALENS_PUBLIC_APP_TOKEN:-replace-with-public-app-token}
       DATALENS_ORMP_TOKEN: ${DATALENS_ORMP_TOKEN:-replace-with-local-token}
       DATALENS_METRICS_TOKEN: ${DATALENS_METRICS_TOKEN:-replace-with-metrics-token}
@@ -100,33 +104,3 @@ services:
       interval: 5s
       timeout: 5s
       retries: 20
-
-  datalens-index-daemon:
-    profiles:
-      - datalens
-    build: .
-    image: ${DATALENS_IMAGE:-datalens:local}
-    depends_on:
-      rustfs-init:
-        condition: service_completed_successfully
-      postgres:
-        condition: service_healthy
-      datalens-server:
-        condition: service_healthy
-    environment:
-      DATALENS_INDEX_CLIENT_ENDPOINT: ${DATALENS_INDEX_CLIENT_ENDPOINT:-http://datalens-server:3000}
-      DATALENS_INDEX_DATABASE_URL: ${DATALENS_INDEX_DATABASE_URL:-postgres://datalens:datalens@postgres:5432/datalens_test}
-      DATALENS_INDEX_QUERY_BIND: ${DATALENS_INDEX_QUERY_BIND:-0.0.0.0:9090}
-      DATALENS_INDEX_QUERY_METRICS_TOKEN: ${DATALENS_INDEX_QUERY_METRICS_TOKEN:-replace-with-index-metrics-token}
-      DATALENS_ORMP_TOKEN: ${DATALENS_ORMP_TOKEN:-replace-with-local-token}
-      RUST_LOG: ${RUST_LOG:-datalens=info}
-    ports:
-      - "${DATALENS_INDEX_QUERY_PORT:-9090}:9090"
-    volumes:
-      - ./examples/ormp/ormp.compose.index.toml:/etc/datalens/ormp.index.toml:ro
-      - ./.data/indexes:/var/lib/datalens/indexes
-    command:
-      - index
-      - daemon
-      - --config
-      - ${DATALENS_INDEX_CONFIG:-/etc/datalens/ormp.index.toml}

@@ -20,9 +20,10 @@ pub fn router(registry: QueryServiceRegistry) -> Router {
 }
 
 pub fn router_with_edge_config(registry: QueryServiceRegistry, edge: config::EdgeConfig) -> Router {
-    let graphql_schema = edge
-        .graphql
-        .enabled
+    let native_graphql_schema = edge
+        .query
+        .native
+        .graphql_enabled
         .then(|| crate::graphql::schema(registry.clone()));
     let mut router = Router::new()
         .route("/health", get(health))
@@ -37,15 +38,21 @@ pub fn router_with_edge_config(registry: QueryServiceRegistry, edge: config::Edg
         .route("/v1/warmup/tasks/{task_id}/retry", post(warmup_retry))
         .route("/v1/warmup/run-once", post(warmup_run_once));
 
-    if graphql_schema.is_some() {
-        router = router.route("/graphql", post(crate::graphql::graphql_handler));
+    if native_graphql_schema.is_some() {
+        router = router.route(
+            &edge.query.native.path,
+            post(crate::graphql::graphql_handler),
+        );
     }
-    if edge.graphql.enabled && edge.graphql.playground_enabled {
-        router = router.route("/graphql/playground", get(crate::graphql::playground));
+    if edge.query.native.graphql_enabled && edge.query.native.playground_enabled {
+        router = router.route(
+            &edge.query.native.playground_path,
+            get(crate::graphql::playground),
+        );
     }
     router.with_state(AppState {
         registry,
-        graphql_schema,
+        native_graphql_schema,
         edge,
     })
 }

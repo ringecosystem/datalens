@@ -15,8 +15,6 @@ pub enum IndexWorkflowCommand {
     Plan(IndexPlanCommand),
     /// Run application index tasks from an app.index.toml config.
     Run(IndexRunCommand),
-    /// Run application indexing continuously from an app.index.toml config.
-    Daemon(IndexDaemonCommand),
     /// Validate an application index config.
     Doctor(IndexDoctorCommand),
 }
@@ -46,13 +44,6 @@ pub struct IndexRunCommand {
 }
 
 #[derive(Debug, Clone, Args)]
-/// Run declarative indexing continuously and serve query APIs when configured.
-pub struct IndexDaemonCommand {
-    #[arg(long, default_value = "app.index.toml")]
-    pub config: String,
-}
-
-#[derive(Debug, Clone, Args)]
 pub struct IndexDoctorCommand {
     #[arg(long)]
     pub config: String,
@@ -72,10 +63,6 @@ pub fn index_command(
         }
         IndexWorkflowCommand::Run(command) => {
             let summary = index_run(command)?;
-            println!("{}", serde_json::to_string_pretty(&summary)?);
-        }
-        IndexWorkflowCommand::Daemon(command) => {
-            let summary = super::index_declarative::index_daemon(command)?;
             println!("{}", serde_json::to_string_pretty(&summary)?);
         }
     }

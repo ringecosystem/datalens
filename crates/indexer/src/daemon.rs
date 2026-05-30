@@ -238,7 +238,7 @@ fn open_database_query_store(
 async fn start_graphql_service(
     config: &DatalensIndexConfig,
 ) -> Result<RunningQueryService, IndexerError> {
-    let OutputConfig::Database { database } = &config.output else {
+    let OutputConfig::Database { .. } = &config.output else {
         return Err(IndexerError::Config(
             "query.enabled: daemon GraphQL requires database output".to_owned(),
         ));
@@ -249,47 +249,10 @@ async fn start_graphql_service(
     let bind = listener
         .local_addr()
         .map_err(|error| IndexerError::Runner(format!("read query service bind: {error}")))?;
-    let driver = database.driver;
-    let url = database.url.clone();
-    tokio::task::spawn_blocking(move || open_database_query_store(driver, &url).map(drop))
+    let router_config = config.clone();
+    let app = tokio::task::spawn_blocking(move || application_query_router(&router_config))
         .await
         .map_err(|error| IndexerError::Runner(format!("open query output task: {error}")))??;
-    let store = Arc::new(DaemonDatabaseQueryStore {
-        driver: database.driver,
-        url: database.url.clone(),
-    });
-    let metrics = if config.query.metrics.enabled {
-        Some(graphql::IndexerGraphqlMetrics {
-            recorder: MetricsRecorder::new().map_err(|error| {
-                IndexerError::Runner(format!("initialize query metrics recorder: {error}"))
-            })?,
-            labels: query_metric_labels(config),
-            endpoint: Some(graphql::MetricsEndpointConfig {
-                path: config.query.metrics.path.clone(),
-                bearer_token: config.query.metrics.bearer_token.clone(),
-            }),
-        })
-    } else {
-        None
-    };
-    let app = if config.query.views.is_empty() {
-        graphql::graphql_router_with_auth(
-            store,
-            &config.query.path,
-            config.query.playground,
-            config.query.auth.clone(),
-            metrics,
-        )
-    } else {
-        graphql::graphql_router_with_views_auth(
-            store,
-            config.query.views.clone(),
-            &config.query.path,
-            config.query.playground,
-            config.query.auth.clone(),
-            metrics,
-        )?
-    };
     let graphql_path = config.query.path.clone();
     let (shutdown, shutdown_receiver) = oneshot::channel();
     let handle = tokio::spawn(async move {
@@ -317,6 +280,62 @@ async fn start_graphql_service(
         shutdown,
         handle,
     })
+}
+
+pub fn application_query_router(
+    config: &DatalensIndexConfig,
+) -> Result<axum::Router, IndexerError> {
+    application_query_router_with_playground_path(config, None)
+}
+
+pub fn application_query_router_with_playground_path(
+    config: &DatalensIndexConfig,
+    playground_path: Option<&str>,
+) -> Result<axum::Router, IndexerError> {
+    let OutputConfig::Database { database } = &config.output else {
+        return Err(IndexerError::Config(
+            "query.enabled: daemon GraphQL requires database output".to_owned(),
+        ));
+    };
+    open_database_query_store(database.driver, &database.url).map(drop)?;
+    let store = Arc::new(DaemonDatabaseQueryStore {
+        driver: database.driver,
+        url: database.url.clone(),
+    });
+    let metrics = if config.query.metrics.enabled {
+        Some(graphql::IndexerGraphqlMetrics {
+            recorder: MetricsRecorder::new().map_err(|error| {
+                IndexerError::Runner(format!("initialize query metrics recorder: {error}"))
+            })?,
+            labels: query_metric_labels(config),
+            endpoint: Some(graphql::MetricsEndpointConfig {
+                path: config.query.metrics.path.clone(),
+                bearer_token: config.query.metrics.bearer_token.clone(),
+            }),
+        })
+    } else {
+        None
+    };
+    if config.query.views.is_empty() {
+        Ok(graphql::graphql_router_with_auth_path(
+            store,
+            &config.query.path,
+            config.query.playground,
+            playground_path,
+            config.query.auth.clone(),
+            metrics,
+        ))
+    } else {
+        graphql::graphql_router_with_views_auth_path(
+            store,
+            config.query.views.clone(),
+            &config.query.path,
+            config.query.playground,
+            playground_path,
+            config.query.auth.clone(),
+            metrics,
+        )
+    }
 }
 
 async fn shutdown_query_service(service: Option<RunningQueryService>) -> Result<(), IndexerError> {

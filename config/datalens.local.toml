@@ -30,9 +30,17 @@ max_staged_bytes = 33554432
 enabled = true
 default_application = "local"
 
-[edge.graphql]
-enabled = true
+[query.native]
+graphql_enabled = true
+path = "/native/graphql"
 playground_enabled = true
+playground_path = "/native/graphiql"
+
+[query.index]
+graphql_enabled = false
+path = "/index/graphql"
+playground_enabled = false
+playground_path = "/index/graphiql"
 
 [warmup]
 enabled = false

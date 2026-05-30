@@ -18,8 +18,8 @@ pub(crate) use datalens_core::{
     DatasetKey, LedgerRange, NetworkId, QueryRows,
 };
 pub(crate) use datalens_edge::config::{
-    BlocksDatasetConfig, ChainConfig, DatasetsConfig, EdgeConfig, GraphqlConfig, LogsDatasetConfig,
-    PlannerConfig, WriterConfig,
+    BlocksDatasetConfig, ChainConfig, DatasetsConfig, EdgeConfig, GraphqlSurfaceConfig,
+    LogsDatasetConfig, PlannerConfig, QueryConfig, WriterConfig,
 };
 pub(crate) use datalens_edge::{
     QueryService, QueryServiceRegistry, router, router_with_edge_config,
@@ -39,7 +39,7 @@ pub(crate) async fn graphql_json(
 ) -> serde_json::Value {
     let response = app
         .oneshot(
-            Request::post("/graphql")
+            Request::post("/native/graphql")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&serde_json::json!({
@@ -62,9 +62,13 @@ pub(crate) fn graphql_router(registry: QueryServiceRegistry) -> axum::Router {
     router_with_edge_config(
         registry,
         EdgeConfig {
-            graphql: GraphqlConfig {
-                enabled: true,
-                playground_enabled: false,
+            query: QueryConfig {
+                native: GraphqlSurfaceConfig {
+                    graphql_enabled: true,
+                    playground_enabled: false,
+                    ..Default::default()
+                },
+                ..Default::default()
             },
             ..Default::default()
         },

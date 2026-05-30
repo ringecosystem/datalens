@@ -7,6 +7,8 @@ use std::{
     thread,
 };
 
+use axum::Router;
+
 use crate::{
     config::EdgeConfig, http::router::router_with_edge_config,
     service::registry::QueryServiceRegistry,
@@ -52,6 +54,7 @@ impl Drop for WarmupSchedulerHandle {
 pub struct ServiceLifecycle<S = NoopLifecycleShutdown> {
     registry: QueryServiceRegistry,
     edge: EdgeConfig,
+    extra_router: Option<Router>,
     warmup_scheduler: Option<S>,
 }
 
@@ -66,6 +69,7 @@ impl ServiceLifecycle<NoopLifecycleShutdown> {
         Self {
             registry,
             edge: EdgeConfig::default(),
+            extra_router: None,
             warmup_scheduler: None,
         }
     }
@@ -74,6 +78,7 @@ impl ServiceLifecycle<NoopLifecycleShutdown> {
         Self {
             registry,
             edge,
+            extra_router: None,
             warmup_scheduler: None,
         }
     }
@@ -87,8 +92,14 @@ impl<S> ServiceLifecycle<S> {
         ServiceLifecycle {
             registry: self.registry,
             edge: self.edge,
+            extra_router: self.extra_router,
             warmup_scheduler: Some(scheduler),
         }
+    }
+
+    pub fn with_extra_router(mut self, router: Router) -> Self {
+        self.extra_router = Some(router);
+        self
     }
 
     fn registry(&self) -> QueryServiceRegistry {
@@ -97,6 +108,14 @@ impl<S> ServiceLifecycle<S> {
 
     fn edge_config(&self) -> EdgeConfig {
         self.edge.clone()
+    }
+
+    fn router(&self) -> Router {
+        let router = router_with_edge_config(self.registry(), self.edge_config());
+        match &self.extra_router {
+            Some(extra) => router.merge(extra.clone()),
+            None => router,
+        }
     }
 }
 
@@ -125,9 +144,8 @@ where
 {
     let listener = tokio::net::TcpListener::bind(bind).await?;
     log::info!("api listener bound to {bind}");
-    let registry = lifecycle.registry();
-    let edge = lifecycle.edge_config();
-    axum::serve(listener, router_with_edge_config(registry, edge))
+    let router = lifecycle.router();
+    axum::serve(listener, router)
         .with_graceful_shutdown(async {
             if let Err(error) = tokio::signal::ctrl_c().await {
                 log::error!("failed to listen for shutdown signal: {error}");
