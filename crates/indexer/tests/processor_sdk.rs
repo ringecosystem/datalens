@@ -8,7 +8,7 @@ use datalens_core::{ChainFamily, ChainIdentity, DatasetKey, LedgerRange, Network
 use datalens_indexer::sdk::{
     ApplicationChainReader, ApplicationProcessor, ApplicationStore, CheckpointCursor, EventBatch,
     EventOrdering, EventOrderingKey, EventRecord, ProcessResult, ProcessorContext, ProcessorError,
-    ProcessorErrorKind, ProcessorMetrics,
+    ProcessorErrorKind, ProcessorMetrics, event_idempotency_key,
 };
 use serde_json::json;
 
@@ -73,6 +73,22 @@ fn test_process_result_defers_checkpoint_to_runtime_commit_boundary() {
     let skipped = ProcessResult::skipped("no matching records");
     assert_eq!(skipped.processed_records(), 0);
     assert_eq!(skipped.pending_checkpoint(), None);
+}
+
+#[test]
+fn test_event_idempotency_key_uses_stable_ledger_identity() {
+    let chain =
+        ChainIdentity::expect_with_network_id(ChainFamily::Evm, "ethereum", NetworkId::numeric(1));
+
+    assert_eq!(
+        event_idempotency_key(
+            &chain,
+            12,
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            3,
+        ),
+        "evm/ethereum/1:12:0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:3"
+    );
 }
 
 #[test]

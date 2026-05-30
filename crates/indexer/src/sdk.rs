@@ -235,6 +235,18 @@ pub struct EventOrderingKey {
     pub event_position: Option<u64>,
 }
 
+pub fn event_idempotency_key(
+    chain: &ChainIdentity,
+    block_number: u64,
+    transaction_hash: &str,
+    event_position: u64,
+) -> String {
+    format!(
+        "{}:{block_number}:{transaction_hash}:{event_position}",
+        chain.key_prefix()
+    )
+}
+
 impl EventOrderingKey {
     pub fn new(
         ledger_position: u64,
@@ -352,6 +364,18 @@ impl fmt::Display for ProcessorError {
 }
 
 impl Error for ProcessorError {}
+
+impl From<sqlx::Error> for ProcessorError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::transient(error.to_string())
+    }
+}
+
+impl From<std::io::Error> for ProcessorError {
+    fn from(error: std::io::Error) -> Self {
+        Self::transient(error.to_string())
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessorErrorKind {
