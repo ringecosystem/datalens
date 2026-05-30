@@ -1643,8 +1643,10 @@ dependencies = [
 name = "datalens-indexer"
 version = "0.1.0"
 dependencies = [
+ "arrow",
  "datalens-client",
  "datalens-core",
+ "parquet",
  "serde",
  "serde_json",
  "sha2 0.11.0",

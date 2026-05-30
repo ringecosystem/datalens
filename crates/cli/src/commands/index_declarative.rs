@@ -36,6 +36,9 @@ pub(super) fn index_run(
 fn output_sink_config(output: &OutputConfig) -> OutputSinkConfig {
     match output {
         OutputConfig::Jsonl { path } => OutputSinkConfig::FileJson { path: path.clone() },
+        OutputConfig::Parquet { parquet } => OutputSinkConfig::Parquet {
+            config: parquet.clone(),
+        },
         OutputConfig::Database { database } => match database.driver {
             DatabaseDriver::Sqlite => OutputSinkConfig::DatabaseSqlite {
                 url: database.url.clone(),
@@ -109,6 +112,25 @@ fn declarative_output_summary(output: &OutputConfig) -> serde_json::Value {
                 "database": {
                     "driver": database_driver_name(database.driver),
                     "url": database.url,
+                },
+                "capability": {
+                    "write": capability.supports_write,
+                    "query": capability.supports_query,
+                    "graphql": capability.supports_graphql,
+                    "write_mode": capability.write_mode,
+                },
+            })
+        }
+        OutputConfig::Parquet { parquet } => {
+            let capability = output.capability();
+            serde_json::json!({
+                "kind": capability.kind.as_str(),
+                "path": parquet.path.to_string_lossy(),
+                "parquet": {
+                    "max_rows_per_file": parquet.max_rows_per_file,
+                    "max_bytes_per_file": parquet.max_bytes_per_file,
+                    "partition_by": parquet.partition_by,
+                    "compression": parquet.compression,
                 },
                 "capability": {
                     "write": capability.supports_write,

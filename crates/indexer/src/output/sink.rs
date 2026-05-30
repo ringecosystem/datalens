@@ -2,7 +2,12 @@ use std::{io, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::{jsonl::write_records_jsonl, postgres::PostgresOutputStore, sqlite::SqliteOutputStore};
+use crate::ParquetOutputConfig;
+
+use super::{
+    jsonl::write_records_jsonl, parquet::write_records_parquet, postgres::PostgresOutputStore,
+    sqlite::SqliteOutputStore,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -11,6 +16,7 @@ pub enum OutputSinkConfig {
     FileJson { path: PathBuf },
     DatabaseSqlite { url: String },
     DatabasePostgres { url: String },
+    Parquet { config: ParquetOutputConfig },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -31,8 +37,10 @@ pub struct OutputWriteResult {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OutputWriteReceipt {
     pub accepted_rows: usize,
+    pub flushed_rows: usize,
     pub inserted_rows: usize,
     pub skipped_or_replaced_rows: usize,
+    pub files_written: usize,
     pub highest_position: Option<String>,
     pub last_record: Option<String>,
 }
@@ -53,6 +61,7 @@ impl OutputWriteSink for OutputSinkConfig {
             Self::DatabasePostgres { url } => {
                 PostgresOutputStore::connect(url)?.write_records(records)
             }
+            Self::Parquet { config } => write_records_parquet(config, records),
         }
     }
 }

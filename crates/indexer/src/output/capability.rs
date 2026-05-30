@@ -7,6 +7,7 @@ use crate::{OutputConfig, OutputSinkConfig};
 pub enum OutputKind {
     Jsonl,
     Database,
+    Parquet,
 }
 
 impl OutputKind {
@@ -14,6 +15,7 @@ impl OutputKind {
         match self {
             Self::Jsonl => "jsonl",
             Self::Database => "database",
+            Self::Parquet => "parquet",
         }
     }
 }
@@ -22,6 +24,7 @@ impl OutputKind {
 #[serde(rename_all = "snake_case")]
 pub enum OutputWriteMode {
     AppendOnly,
+    BatchedFiles,
     IdempotentUpsert,
 }
 
@@ -54,6 +57,16 @@ impl OutputCapability {
             write_mode: OutputWriteMode::IdempotentUpsert,
         }
     }
+
+    pub const fn parquet() -> Self {
+        Self {
+            kind: OutputKind::Parquet,
+            supports_write: true,
+            supports_query: false,
+            supports_graphql: false,
+            write_mode: OutputWriteMode::BatchedFiles,
+        }
+    }
 }
 
 impl OutputConfig {
@@ -61,6 +74,7 @@ impl OutputConfig {
         match self {
             Self::Jsonl { .. } => OutputKind::Jsonl,
             Self::Database { .. } => OutputKind::Database,
+            Self::Parquet { .. } => OutputKind::Parquet,
         }
     }
 
@@ -68,6 +82,7 @@ impl OutputConfig {
         match self {
             Self::Jsonl { .. } => OutputCapability::jsonl(),
             Self::Database { .. } => OutputCapability::database(),
+            Self::Parquet { .. } => OutputCapability::parquet(),
         }
     }
 }
@@ -77,6 +92,7 @@ impl OutputSinkConfig {
         match self {
             Self::StdoutJson | Self::FileJson { .. } => OutputKind::Jsonl,
             Self::DatabaseSqlite { .. } | Self::DatabasePostgres { .. } => OutputKind::Database,
+            Self::Parquet { .. } => OutputKind::Parquet,
         }
     }
 
@@ -86,6 +102,7 @@ impl OutputSinkConfig {
             Self::DatabaseSqlite { .. } | Self::DatabasePostgres { .. } => {
                 OutputCapability::database()
             }
+            Self::Parquet { .. } => OutputCapability::parquet(),
         }
     }
 }

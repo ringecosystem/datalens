@@ -124,8 +124,10 @@ async fn write_records_postgres(
         written_rows: records.len(),
         receipt: Some(OutputWriteReceipt {
             accepted_rows: records.len(),
+            flushed_rows: records.len(),
             inserted_rows,
             skipped_or_replaced_rows,
+            files_written: 0,
             highest_position: highest_position
                 .clone()
                 .map(|position| position.receipt_key),

@@ -5,8 +5,10 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
+arrow.workspace = true
 datalens-client = { path = "../client" }
 datalens-core = { path = "../core" }
+parquet.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.11.0"
