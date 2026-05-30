@@ -345,6 +345,37 @@ fn test_index_runner_writes_checkpoint_then_second_run_skips_completed_ranges() 
 }
 
 #[test]
+fn test_index_runner_reports_total_and_per_chain_comparisons() {
+    let config = index_config(2);
+    let plan = IndexPlanBuilder::new().build(&config).unwrap();
+    let transport = QueueTransport::new(vec![
+        HttpResponse::json(200, response_json(10, 11, 2, false)),
+        HttpResponse::json(200, response_json(12, 12, 0, true)),
+    ]);
+    let client = DatalensClient::with_transport(
+        config.client.to_datalens_client_config(),
+        transport.clone(),
+    )
+    .expect("client config");
+    let runner = IndexRunner::new(plan, OutputSinkConfig::StdoutJson);
+
+    let report = runner.run(&client).expect("index run");
+
+    assert_eq!(report.summary.planned_queries, 2);
+    assert_eq!(report.summary.executed_queries, 2);
+    assert_eq!(report.summary.rows_written, 2);
+    assert_eq!(report.summary.full_durable_hit_count, 1);
+    assert_eq!(report.summary.provider_fill_range_count, 1);
+    assert_eq!(report.chains.len(), 1);
+    assert_eq!(report.chains[0].chain, "ethereum");
+    assert_eq!(report.chains[0].executed_queries, 2);
+    assert_eq!(report.chains[0].rows_written, 2);
+    assert_eq!(report.chains[0].full_durable_hit_count, 1);
+    assert_eq!(report.chains[0].provider_fill_ranges[0].start, 10);
+    assert_eq!(report.chains[0].provider_fill_ranges[0].end, 11);
+}
+
+#[test]
 fn test_index_runner_resumes_partially_completed_task_from_next_block() {
     let config = index_config(10);
     let plan = IndexPlanBuilder::new().build(&config).unwrap();

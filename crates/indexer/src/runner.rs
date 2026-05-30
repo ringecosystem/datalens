@@ -4,7 +4,7 @@ use datalens_core::{
     NetworkId, QueryFinalityRequirement, QueryRows, missing_ranges,
 };
 use serde::Serialize;
-use std::{path::PathBuf, time::Instant};
+use std::{collections::BTreeMap, path::PathBuf, time::Instant};
 
 use crate::{
     CheckpointPolicy, IndexCheckpointFile, IndexCheckpointFileStore, IndexPlan, IndexerError,
@@ -168,8 +168,17 @@ impl IndexRunner {
             }
         }
 
+        let summary = IndexRunSummary::from_parts(
+            self.plan.tasks().len(),
+            &checkpoint_skipped_ranges,
+            &tasks,
+        );
+        let chains = ChainRunSummary::from_tasks(&tasks);
+
         Ok(IndexRunReport {
             planned_queries: self.plan.tasks().len(),
+            summary,
+            chains,
             checkpoint_skipped_ranges,
             tasks,
         })
@@ -222,8 +231,88 @@ impl IndexRunnerOptions {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct IndexRunReport {
     pub planned_queries: usize,
+    pub summary: IndexRunSummary,
+    pub chains: Vec<ChainRunSummary>,
     pub checkpoint_skipped_ranges: Vec<CheckpointSkippedRange>,
     pub tasks: Vec<IndexRunTaskSummary>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct IndexRunSummary {
+    pub planned_queries: usize,
+    pub executed_queries: usize,
+    pub checkpoint_skipped_ranges: usize,
+    pub elapsed_ms: u128,
+    pub rows_written: usize,
+    pub full_durable_hit_count: usize,
+    pub provider_fill_range_count: usize,
+}
+
+impl IndexRunSummary {
+    fn from_parts(
+        planned_queries: usize,
+        checkpoint_skipped_ranges: &[CheckpointSkippedRange],
+        tasks: &[IndexRunTaskSummary],
+    ) -> Self {
+        Self {
+            planned_queries,
+            executed_queries: tasks.len(),
+            checkpoint_skipped_ranges: checkpoint_skipped_ranges.len(),
+            elapsed_ms: tasks.iter().map(|task| task.elapsed_ms).sum(),
+            rows_written: tasks.iter().map(|task| task.row_count).sum(),
+            full_durable_hit_count: tasks.iter().filter(|task| task.full_durable_hit).count(),
+            provider_fill_range_count: tasks
+                .iter()
+                .map(|task| task.provider_fill_ranges.len())
+                .sum(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ChainRunSummary {
+    pub chain: String,
+    pub executed_queries: usize,
+    pub elapsed_ms: u128,
+    pub rows_written: usize,
+    pub full_durable_hit_count: usize,
+    pub provider_fill_ranges: Vec<ExecutedRange>,
+}
+
+impl ChainRunSummary {
+    fn from_tasks(tasks: &[IndexRunTaskSummary]) -> Vec<Self> {
+        let mut chains = BTreeMap::<String, ChainRunAccumulator>::new();
+        for task in tasks {
+            let chain = chains.entry(task.chain.clone()).or_default();
+            chain.executed_queries += 1;
+            chain.elapsed_ms += task.elapsed_ms;
+            chain.rows_written += task.row_count;
+            chain.full_durable_hit_count += usize::from(task.full_durable_hit);
+            chain
+                .provider_fill_ranges
+                .extend(task.provider_fill_ranges.iter().cloned());
+        }
+        chains
+            .into_iter()
+            .map(|(chain, summary)| Self {
+                chain,
+                executed_queries: summary.executed_queries,
+                elapsed_ms: summary.elapsed_ms,
+                rows_written: summary.rows_written,
+                full_durable_hit_count: summary.full_durable_hit_count,
+                provider_fill_ranges: summary.provider_fill_ranges,
+            })
+            .collect()
+    }
+}
+
+#[derive(Default)]
+struct ChainRunAccumulator {
+    executed_queries: usize,
+    elapsed_ms: u128,
+    rows_written: usize,
+    full_durable_hit_count: usize,
+    provider_fill_ranges: Vec<ExecutedRange>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
