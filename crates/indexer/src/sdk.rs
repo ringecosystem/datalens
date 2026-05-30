@@ -30,6 +30,21 @@ pub trait ApplicationStore: Send + Sync {
     fn delete<'a>(&'a self, key: &'a str) -> ProcessorFuture<'a, Result<(), ProcessorError>>;
 }
 
+pub trait ApplicationStoreTransaction: ApplicationStore {
+    fn commit<'a>(&'a self) -> ProcessorFuture<'a, Result<(), ProcessorError>>;
+
+    fn rollback<'a>(&'a self) -> ProcessorFuture<'a, Result<(), ProcessorError>>;
+}
+
+pub trait TransactionalApplicationStore: Send + Sync {
+    fn begin_transaction<'a>(
+        &'a self,
+    ) -> ProcessorFuture<
+        'a,
+        Result<Box<dyn ApplicationStoreTransaction + Send + Sync + 'a>, ProcessorError>,
+    >;
+}
+
 pub trait ApplicationChainReader: Send + Sync {
     fn read_json<'a>(
         &'a self,
