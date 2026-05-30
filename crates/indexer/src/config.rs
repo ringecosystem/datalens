@@ -10,6 +10,7 @@ pub struct DatalensIndexConfig {
     pub index: IndexConfig,
     pub sources: Vec<SourceConfig>,
     pub output: OutputConfig,
+    pub query: QueryServiceConfig,
     pub checkpoint: crate::CheckpointPolicy,
 }
 
@@ -149,6 +150,12 @@ pub enum OutputConfig {
     Jsonl { path: PathBuf },
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct QueryServiceConfig {
+    pub enabled: bool,
+    pub graphql: bool,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawDatalensIndexConfig {
@@ -157,6 +164,7 @@ struct RawDatalensIndexConfig {
     #[serde(default)]
     sources: Vec<RawSourceConfig>,
     output: Option<RawOutputConfig>,
+    query: Option<RawQueryServiceConfig>,
     checkpoint: Option<RawCheckpointConfig>,
 }
 
@@ -205,6 +213,15 @@ struct RawJsonlOutputConfig {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawQueryServiceConfig {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    graphql: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawCheckpointConfig {
     path: Option<PathBuf>,
 }
@@ -241,6 +258,8 @@ impl TryFrom<RawDatalensIndexConfig> for DatalensIndexConfig {
                 }
             }
         };
+        let query = parse_query(raw.query);
+        validate_output_query_capabilities(&output, &query, &mut errors);
         let checkpoint = match raw.checkpoint {
             Some(raw) => parse_checkpoint(raw, &mut errors).unwrap_or_else(|| {
                 crate::CheckpointPolicy::File {
@@ -264,6 +283,7 @@ impl TryFrom<RawDatalensIndexConfig> for DatalensIndexConfig {
             index,
             sources,
             output,
+            query,
             checkpoint,
         })
     }
@@ -405,6 +425,33 @@ fn parse_output(raw: RawOutputConfig, errors: &mut Vec<String>) -> Option<Output
     };
     let path = required_path("output.jsonl.path", jsonl.path, errors)?;
     Some(OutputConfig::Jsonl { path })
+}
+
+fn parse_query(raw: Option<RawQueryServiceConfig>) -> QueryServiceConfig {
+    raw.map(|raw| QueryServiceConfig {
+        enabled: raw.enabled,
+        graphql: raw.graphql,
+    })
+    .unwrap_or_default()
+}
+
+fn validate_output_query_capabilities(
+    output: &OutputConfig,
+    query: &QueryServiceConfig,
+    errors: &mut Vec<String>,
+) {
+    let capability = output.capability();
+    let output_kind = capability.kind.as_str();
+    if query.enabled && !capability.supports_query {
+        errors.push(format!(
+            "query.enabled: output kind {output_kind} does not support query service mode"
+        ));
+    }
+    if query.graphql && !capability.supports_graphql {
+        errors.push(format!(
+            "query.graphql: output kind {output_kind} does not support GraphQL"
+        ));
+    }
 }
 
 fn parse_checkpoint(

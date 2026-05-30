@@ -7,8 +7,8 @@ use serde::Serialize;
 use std::{collections::BTreeMap, path::PathBuf, time::Instant};
 
 use crate::{
-    CheckpointPolicy, IndexCheckpointFile, IndexCheckpointFileStore, IndexPlan, IndexerError,
-    OutputSinkConfig, PlannedIndexTask,
+    CheckpointPolicy, IndexCheckpointFile, IndexCheckpointFileStore, IndexPlan, IndexedRecord,
+    IndexerError, OutputSinkConfig, OutputWriteSink, PlannedIndexTask,
 };
 
 #[derive(Clone)]
@@ -108,20 +108,20 @@ impl IndexRunner {
                     && response.cache.missing_ranges.is_empty();
             match response.rows.rows() {
                 QueryRows::EvmLogs(rows) => {
-                    self.output
-                        .write_evm_logs(
-                            self.plan.index(),
-                            &task.chain,
-                            task.chain_id,
-                            &task.dataset,
-                            rows,
-                        )
-                        .map_err(|error| {
-                            IndexerError::Runner(format!(
-                                "task {} failed to write jsonl output: {error}",
-                                task.label
-                            ))
-                        })?;
+                    let records = evm_log_records(
+                        self.plan.index(),
+                        &task.chain,
+                        task.chain_id,
+                        &task.dataset,
+                        rows,
+                    );
+                    self.output.write_records(&records).map_err(|error| {
+                        let output_kind = self.output.capability().kind.as_str();
+                        IndexerError::Runner(format!(
+                            "task {} failed to write {output_kind} output: {error}",
+                            task.label
+                        ))
+                    })?;
                 }
                 _ => {
                     return Err(IndexerError::Runner(format!(
@@ -183,6 +183,34 @@ impl IndexRunner {
             tasks,
         })
     }
+}
+
+fn evm_log_records(
+    index: &str,
+    chain: &str,
+    chain_id: u64,
+    dataset: &str,
+    rows: &[datalens_core::LogRecord],
+) -> Vec<IndexedRecord> {
+    rows.iter()
+        .map(|row| IndexedRecord {
+            index: index.to_owned(),
+            chain: chain.to_owned(),
+            chain_id,
+            dataset: dataset.to_owned(),
+            payload: serde_json::json!({
+                "block_number": row.block_number,
+                "block_hash": row.block_hash,
+                "transaction_hash": row.transaction_hash,
+                "transaction_index": row.transaction_index,
+                "log_index": row.log_index,
+                "address": row.address,
+                "topics": row.topics,
+                "data": row.data,
+                "removed": row.removed,
+            }),
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

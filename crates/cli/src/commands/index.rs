@@ -278,10 +278,19 @@ fn declarative_source_summary(source: &SourceConfig) -> serde_json::Value {
 
 fn declarative_output_summary(output: &OutputConfig) -> serde_json::Value {
     match output {
-        OutputConfig::Jsonl { path } => serde_json::json!({
-            "kind": "jsonl",
-            "path": path.to_string_lossy(),
-        }),
+        OutputConfig::Jsonl { path } => {
+            let capability = output.capability();
+            serde_json::json!({
+                "kind": capability.kind.as_str(),
+                "path": path.to_string_lossy(),
+                "capability": {
+                    "write": capability.supports_write,
+                    "query": capability.supports_query,
+                    "graphql": capability.supports_graphql,
+                    "write_mode": capability.write_mode,
+                },
+            })
+        }
     }
 }
 
@@ -361,7 +370,6 @@ pub fn index_summary(command: IndexWorkflowCommand) -> Result<serde_json::Value,
         )),
     }
 }
-
 pub fn index_summary_with_adapter<A>(
     command: IndexWorkflowCommand,
     adapter: A,
