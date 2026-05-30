@@ -52,6 +52,10 @@ pub struct PlannedSelector {
     pub kind: String,
     pub address_count: usize,
     pub topic_count: usize,
+    #[serde(skip_serializing)]
+    pub addresses: Vec<String>,
+    #[serde(skip_serializing)]
+    pub topics: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -147,6 +151,8 @@ fn plan_source(
                             kind: "evm_logs".to_owned(),
                             address_count: evm_source.addresses.len(),
                             topic_count: evm_source.topics.len(),
+                            addresses: evm_source.addresses.clone(),
+                            topics: evm_source.topics.clone(),
                         },
                         finality: "durable".to_owned(),
                     })

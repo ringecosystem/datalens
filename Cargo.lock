@@ -1503,6 +1503,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "datalens-chain",
+ "datalens-client",
  "datalens-core",
  "datalens-edge",
  "datalens-evm",
