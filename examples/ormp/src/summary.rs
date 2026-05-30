@@ -63,7 +63,7 @@ pub fn summarize_response(response: &QueryResponse) -> Result<OrmpSummary, OrmpE
 }
 
 impl RangeSummary {
-    fn from_ledger_range(range: &LedgerRange) -> Self {
+    pub fn from_ledger_range(range: &LedgerRange) -> Self {
         match range.kind() {
             datalens_core::LedgerRangeKind::Block => Self::Block {
                 start: range.start(),

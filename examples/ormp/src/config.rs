@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, env};
+use std::{collections::BTreeMap, env, path::PathBuf};
 
 use clap::Parser;
 use datalens_client::DatalensClientConfig;
@@ -20,9 +20,20 @@ const DEFAULT_APPLICATION: &str = "public";
   DATALENS_PUBLIC_APP_TOKEN is optional for local unauthenticated smoke runs
 
 Example:
-  ORMP_TO_BLOCK=20009600 cargo run --manifest-path examples/ormp/Cargo.toml"
+  ORMP_TO_BLOCK=20009600 cargo run --manifest-path examples/ormp/Cargo.toml
+  cargo run --manifest-path examples/ormp/Cargo.toml -- --plan examples/ormp/plan.json"
 )]
-pub struct OrmpCli {}
+pub struct OrmpCli {
+    #[arg(long, value_name = "PATH")]
+    pub plan: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrmpEndpointConfig {
+    pub endpoint: String,
+    pub application: String,
+    pub bearer_token: Option<String>,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OrmpConfig {
@@ -31,6 +42,30 @@ pub struct OrmpConfig {
     pub bearer_token: Option<String>,
     pub from_block: u64,
     pub to_block: u64,
+}
+
+impl OrmpEndpointConfig {
+    pub fn from_env() -> Result<Self, OrmpExampleError> {
+        Ok(Self::from_map(&env::vars().collect()))
+    }
+
+    pub fn client_config(&self) -> DatalensClientConfig {
+        DatalensClientConfig {
+            endpoint: self.endpoint.clone(),
+            application: Some(self.application.clone()),
+            bearer_token: self.bearer_token.clone(),
+        }
+    }
+
+    fn from_map(values: &BTreeMap<String, String>) -> Self {
+        Self {
+            endpoint: read_string_env(values, "DATALENS_ENDPOINT")
+                .unwrap_or_else(|| DEFAULT_ENDPOINT.to_owned()),
+            application: read_string_env(values, "DATALENS_APPLICATION")
+                .unwrap_or_else(|| DEFAULT_APPLICATION.to_owned()),
+            bearer_token: read_string_env(values, "DATALENS_PUBLIC_APP_TOKEN"),
+        }
+    }
 }
 
 impl OrmpConfig {
@@ -56,16 +91,15 @@ impl OrmpConfig {
     }
 
     fn from_map(values: BTreeMap<String, String>) -> Result<Self, OrmpExampleError> {
+        let endpoint_config = OrmpEndpointConfig::from_map(&values);
         let from_block = read_u64_env(&values, "ORMP_FROM_BLOCK")?.unwrap_or(ORMP_START_BLOCK);
         let to_block = read_u64_env(&values, "ORMP_TO_BLOCK")?
             .ok_or(OrmpExampleError::MissingEnv("ORMP_TO_BLOCK"))?;
 
         Ok(Self {
-            endpoint: read_string_env(&values, "DATALENS_ENDPOINT")
-                .unwrap_or_else(|| DEFAULT_ENDPOINT.to_owned()),
-            application: read_string_env(&values, "DATALENS_APPLICATION")
-                .unwrap_or_else(|| DEFAULT_APPLICATION.to_owned()),
-            bearer_token: read_string_env(&values, "DATALENS_PUBLIC_APP_TOKEN"),
+            endpoint: endpoint_config.endpoint,
+            application: endpoint_config.application,
+            bearer_token: endpoint_config.bearer_token,
             from_block,
             to_block,
         })

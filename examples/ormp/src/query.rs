@@ -4,19 +4,47 @@ use datalens_core::{
     QueryFinalityRequirement,
 };
 
-use crate::{ETHEREUM_CHAIN_ID, MSGPORT_ADDRESS, ORMP_ADDRESS, OrmpConfig, OrmpExampleError};
+use crate::{
+    ETHEREUM_CHAIN_ID, MSGPORT_ADDRESS, ORMP_ADDRESS, OrmpConfig, OrmpExampleError, OrmpPlanJob,
+};
 
 pub fn build_query_request(
     from_block: u64,
     to_block: u64,
 ) -> Result<QueryRequest, OrmpExampleError> {
+    build_evm_logs_request(
+        "ethereum",
+        ETHEREUM_CHAIN_ID,
+        from_block,
+        to_block,
+        vec![MSGPORT_ADDRESS.to_owned(), ORMP_ADDRESS.to_owned()],
+    )
+}
+
+pub fn build_job_query_request(job: &OrmpPlanJob) -> Result<QueryRequest, OrmpExampleError> {
+    build_evm_logs_request(
+        &job.chain,
+        job.chain_id,
+        job.from_block,
+        job.to_block,
+        job.addresses.clone(),
+    )
+}
+
+fn build_evm_logs_request(
+    chain: &str,
+    chain_id: u64,
+    from_block: u64,
+    to_block: u64,
+    addresses: Vec<String>,
+) -> Result<QueryRequest, OrmpExampleError> {
     Ok(QueryRequest::new(
-        ethereum_chain(),
+        evm_chain(chain, chain_id)?,
         DatasetKey::evm_logs(),
         LedgerRange::from_block_range(BlockRange::try_new(from_block, to_block)?),
     )
     .with_selector(QuerySelector::EvmLogs(LogFilter {
-        addresses: vec![MSGPORT_ADDRESS.to_owned(), ORMP_ADDRESS.to_owned()],
+        addresses,
         topics: Vec::new(),
     }))
     .with_finality(QueryFinalityRequirement::DurableOnly))
@@ -34,10 +62,10 @@ where
     client.query(request)
 }
 
-fn ethereum_chain() -> ChainIdentity {
-    ChainIdentity::expect_with_network_id(
+fn evm_chain(configured_name: &str, chain_id: u64) -> Result<ChainIdentity, OrmpExampleError> {
+    Ok(ChainIdentity::try_new(
         ChainFamily::Evm,
-        "ethereum",
-        NetworkId::numeric(ETHEREUM_CHAIN_ID),
-    )
+        configured_name,
+        Some(NetworkId::numeric(chain_id)),
+    )?)
 }
