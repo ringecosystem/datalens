@@ -22,6 +22,10 @@ impl IndexPlan {
         &self.application
     }
 
+    pub fn index(&self) -> &str {
+        &self.index
+    }
+
     pub fn tasks(&self) -> &[PlannedIndexTask] {
         &self.tasks
     }

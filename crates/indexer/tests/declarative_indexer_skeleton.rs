@@ -119,6 +119,82 @@ fn test_index_runner_executes_evm_log_tasks_through_client() {
 }
 
 #[test]
+fn test_index_runner_writes_evm_logs_to_jsonl_and_creates_parent_directories() {
+    let config = index_config(10);
+    let plan = IndexPlanBuilder::new().build(&config).unwrap();
+    let output_path = temp_path("jsonl-create").join("nested/events.jsonl");
+    let transport = QueueTransport::new(vec![HttpResponse::json(
+        200,
+        response_json(10, 12, 2, true),
+    )]);
+    let client =
+        DatalensClient::with_transport(config.client.to_datalens_client_config(), transport)
+            .expect("client config");
+    let runner = IndexRunner::new(
+        plan,
+        OutputSinkConfig::FileJson {
+            path: output_path.clone(),
+        },
+    );
+
+    let report = runner.run(&client).expect("index run");
+
+    assert_eq!(report.tasks[0].row_count, 2);
+    let lines = std::fs::read_to_string(&output_path).expect("jsonl output");
+    let rows = lines
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json row"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[0],
+        serde_json::json!({
+            "index": "ormp",
+            "chain": "ethereum",
+            "chain_id": 1,
+            "dataset": "evm.logs",
+            "block_number": 10,
+            "block_hash": "0x01",
+            "transaction_hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "transaction_index": 0,
+            "log_index": 0,
+            "address": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "topics": [],
+            "data": "0x",
+            "removed": false
+        })
+    );
+}
+
+#[test]
+fn test_index_runner_appends_jsonl_rows_to_existing_file() {
+    let config = index_config(10);
+    let plan = IndexPlanBuilder::new().build(&config).unwrap();
+    let output_path = temp_path("jsonl-append").join("events.jsonl");
+    std::fs::write(&output_path, "{\"existing\":true}\n").expect("seed output");
+    let transport = QueueTransport::new(vec![HttpResponse::json(
+        200,
+        response_json(10, 12, 2, true),
+    )]);
+    let client =
+        DatalensClient::with_transport(config.client.to_datalens_client_config(), transport)
+            .expect("client config");
+    let runner = IndexRunner::new(
+        plan,
+        OutputSinkConfig::FileJson {
+            path: output_path.clone(),
+        },
+    );
+
+    runner.run(&client).expect("index run");
+
+    let lines = std::fs::read_to_string(&output_path).expect("jsonl output");
+    assert_eq!(lines.lines().count(), 3);
+    assert!(lines.starts_with("{\"existing\":true}\n"));
+}
+
+#[test]
 fn test_index_runner_stops_on_first_task_failure() {
     let config = index_config(1);
     let plan = IndexPlanBuilder::new().build(&config).unwrap();
@@ -141,6 +217,30 @@ fn test_index_runner_stops_on_first_task_failure() {
     let error = runner.run(&client).expect_err("first failure stops run");
 
     assert!(error.to_string().contains("ormp.000.000000"));
+    assert_eq!(transport.requests().len(), 1);
+}
+
+#[test]
+fn test_index_runner_fails_when_jsonl_output_cannot_be_written() {
+    let config = index_config(10);
+    let plan = IndexPlanBuilder::new().build(&config).unwrap();
+    let output_parent = temp_path("jsonl-output-failure").join("not-a-directory");
+    std::fs::write(&output_parent, "file").expect("seed parent file");
+    let output_path = output_parent.join("events.jsonl");
+    let transport = QueueTransport::new(vec![HttpResponse::json(
+        200,
+        response_json(10, 12, 1, true),
+    )]);
+    let client = DatalensClient::with_transport(
+        config.client.to_datalens_client_config(),
+        transport.clone(),
+    )
+    .expect("client config");
+    let runner = IndexRunner::new(plan, OutputSinkConfig::FileJson { path: output_path });
+
+    let error = runner.run(&client).expect_err("output failure stops run");
+
+    assert!(error.to_string().contains("write jsonl output"), "{error}");
     assert_eq!(transport.requests().len(), 1);
 }
 
@@ -178,6 +278,18 @@ path = ".data/indexes/ormp/checkpoint.json"
 "#
     ))
     .expect("valid config")
+}
+
+fn temp_path(name: &str) -> std::path::PathBuf {
+    let root = std::env::temp_dir().join(format!(
+        "datalens-indexer-{name}-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).expect("create temp dir");
+    root
 }
 
 fn response_json(start: u64, end: u64, row_count: usize, durable_hit: bool) -> serde_json::Value {

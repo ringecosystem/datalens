@@ -1,7 +1,7 @@
 use datalens_client::{DatalensClient, HttpTransport};
 use datalens_core::{
     BlockRange, ChainFamily, ChainIdentity, DatasetKey, LedgerRange, LedgerRangeKind, LogFilter,
-    NetworkId, QueryFinalityRequirement, missing_ranges,
+    NetworkId, QueryFinalityRequirement, QueryRows, missing_ranges,
 };
 use serde::Serialize;
 use std::time::Instant;
@@ -74,6 +74,30 @@ impl IndexRunner {
                 missing_ranges(range.clone(), &response.cache.durable_hit_ranges).is_empty()
                     && response.cache.provider_fill_ranges.is_empty()
                     && response.cache.missing_ranges.is_empty();
+            match response.rows.rows() {
+                QueryRows::EvmLogs(rows) => {
+                    self.output
+                        .write_evm_logs(
+                            self.plan.index(),
+                            &task.chain,
+                            task.chain_id,
+                            &task.dataset,
+                            rows,
+                        )
+                        .map_err(|error| {
+                            IndexerError::Runner(format!(
+                                "task {} failed to write jsonl output: {error}",
+                                task.label
+                            ))
+                        })?;
+                }
+                _ => {
+                    return Err(IndexerError::Runner(format!(
+                        "task {} returned rows for unsupported output dataset",
+                        task.label
+                    )));
+                }
+            }
 
             tasks.push(IndexRunTaskSummary {
                 label: task.label.clone(),
