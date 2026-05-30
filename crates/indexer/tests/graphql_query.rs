@@ -6,12 +6,16 @@ use std::{
 use async_graphql::{Request as GraphqlRequest, Variables};
 use axum::{
     body::{Body, to_bytes},
-    http::{Request, StatusCode},
+    http::{Request, StatusCode, header},
 };
 use datalens_indexer::{
     IndexedRecord, OutputWriteSink, PostgresOutputStore, SqliteOutputStore,
-    graphql::{graphql_router, graphql_schema},
+    graphql::{
+        IndexerGraphqlMetricLabels, IndexerGraphqlMetrics, MetricsEndpointConfig, graphql_router,
+        graphql_router_with_metrics, graphql_schema,
+    },
 };
+use datalens_metrics::MetricsRecorder;
 use tokio::runtime::Runtime;
 use tower::ServiceExt;
 
@@ -263,6 +267,158 @@ fn test_graphql_router_serves_playground_only_when_enabled() {
             .expect("disabled response");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     });
+}
+
+#[test]
+fn test_graphql_router_records_success_error_and_bounded_labels() {
+    let store = SqliteOutputStore::connect("sqlite::memory:").expect("sqlite store connects");
+    store
+        .write_records(&[record(10, 0, "0x0000000000000000000000000000000000000001")])
+        .expect("write records");
+    let recorder = MetricsRecorder::new().expect("metrics recorder");
+    let app = graphql_router_with_metrics(
+        Arc::new(store),
+        "/graphql",
+        false,
+        IndexerGraphqlMetrics {
+            recorder: recorder.clone(),
+            labels: metric_labels(),
+            endpoint: Some(MetricsEndpointConfig {
+                path: "/metrics".to_owned(),
+                bearer_token: None,
+            }),
+        },
+    );
+
+    Runtime::new().expect("runtime").block_on(async {
+        let success = app
+            .clone()
+            .oneshot(graphql_http_request(
+                r#"{ events(dataset: "evm.logs", address: "0x0000000000000000000000000000000000000001") { blockNumber } }"#,
+            ))
+            .await
+            .expect("success response");
+        let error = app
+            .clone()
+            .oneshot(graphql_http_request(r#"{ events(dataset: "evm.logs", limit: 1001) { blockNumber } }"#))
+            .await
+            .expect("error response");
+        let metrics = app
+            .clone()
+            .oneshot(
+                Request::get("/metrics")
+                    .body(Body::empty())
+                    .expect("metrics request"),
+            )
+            .await
+            .expect("metrics response");
+
+        assert_eq!(success.status(), StatusCode::OK);
+        assert_eq!(error.status(), StatusCode::OK);
+        assert_eq!(metrics.status(), StatusCode::OK);
+        assert_eq!(
+            metrics.headers().get(header::CONTENT_TYPE).and_then(|value| value.to_str().ok()),
+            Some("text/plain; version=0.0.4")
+        );
+        let text = response_text(metrics).await;
+        assert!(text.contains(
+            r#"datalens_indexer_graphql_query_total{application="ormp",chain="ethereum",dataset="evm.logs",index="ormp",outcome="success",output="sqlite"} 1"#
+        ));
+        assert!(text.contains(
+            r#"datalens_indexer_graphql_query_total{application="ormp",chain="ethereum",dataset="evm.logs",index="ormp",outcome="error",output="sqlite"} 1"#
+        ));
+        assert!(text.contains("datalens_indexer_graphql_query_duration_seconds"));
+        assert!(!text.contains("0x0000000000000000000000000000000000000001"));
+    });
+}
+
+#[test]
+fn test_graphql_metrics_route_requires_operator_token_and_records_auth_failure() {
+    let recorder = MetricsRecorder::new().expect("metrics recorder");
+    let app = graphql_router_with_metrics(
+        Arc::new(SqliteOutputStore::connect("sqlite::memory:").expect("sqlite store connects")),
+        "/graphql",
+        false,
+        IndexerGraphqlMetrics {
+            recorder: recorder.clone(),
+            labels: metric_labels(),
+            endpoint: Some(MetricsEndpointConfig {
+                path: "/metrics".to_owned(),
+                bearer_token: Some("metrics-token".to_owned()),
+            }),
+        },
+    );
+
+    Runtime::new().expect("runtime").block_on(async {
+        let rejected = app
+            .clone()
+            .oneshot(
+                Request::get("/metrics")
+                    .body(Body::empty())
+                    .expect("metrics request"),
+            )
+            .await
+            .expect("rejected response");
+        let accepted = app
+            .clone()
+            .oneshot(
+                Request::get("/metrics")
+                    .header("authorization", "Bearer metrics-token")
+                    .body(Body::empty())
+                    .expect("metrics request"),
+            )
+            .await
+            .expect("accepted response");
+
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let text = response_text(accepted).await;
+        assert!(text.contains(
+            r#"datalens_indexer_graphql_auth_failure_total{application="ormp",chain="ethereum",dataset="evm.logs",index="ormp",output="sqlite"} 1"#
+        ));
+    });
+}
+
+#[test]
+fn test_graphql_metrics_include_rate_limited_events() {
+    let recorder = MetricsRecorder::new().expect("metrics recorder");
+    let labels = metric_labels();
+    recorder.record_indexer_graphql_rate_limited(&labels);
+
+    let text = recorder.encode().expect("metrics text");
+
+    assert!(text.contains(
+        r#"datalens_indexer_graphql_rate_limited_total{application="ormp",chain="ethereum",dataset="evm.logs",index="ormp",output="sqlite"} 1"#
+    ));
+}
+
+fn metric_labels() -> IndexerGraphqlMetricLabels {
+    IndexerGraphqlMetricLabels {
+        application: "ormp".to_owned(),
+        index: "ormp".to_owned(),
+        chain: "ethereum".to_owned(),
+        dataset: "evm.logs".to_owned(),
+        output: "sqlite".to_owned(),
+    }
+}
+
+fn graphql_http_request(query: &str) -> Request<Body> {
+    Request::post("/graphql")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({ "query": query }).to_string(),
+        ))
+        .expect("graphql request")
+}
+
+async fn response_text(response: axum::response::Response) -> String {
+    String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body")
+            .to_vec(),
+    )
+    .expect("utf8 body")
 }
 
 fn unique_block_base() -> u64 {

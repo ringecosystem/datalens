@@ -11,6 +11,7 @@ async-graphql-axum.workspace = true
 axum.workspace = true
 datalens-client = { path = "../client" }
 datalens-core = { path = "../core" }
+datalens-metrics = { path = "../metrics" }
 log.workspace = true
 parquet.workspace = true
 serde.workspace = true

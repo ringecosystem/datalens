@@ -346,6 +346,34 @@ pub struct MetricsRecorder {
     warmup_rows_total: CounterVec,
     warmup_provider_error_total: CounterVec,
     warmup_current_height: GaugeVec,
+    indexer_graphql_query_total: CounterVec,
+    indexer_graphql_query_duration_seconds: HistogramVec,
+    indexer_graphql_auth_failure_total: CounterVec,
+    indexer_graphql_rate_limited_total: CounterVec,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IndexerGraphqlMetricLabels {
+    pub application: String,
+    pub index: String,
+    pub chain: String,
+    pub dataset: String,
+    pub output: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IndexerGraphqlQueryOutcome {
+    Success,
+    Error,
+}
+
+impl IndexerGraphqlQueryOutcome {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Error => "error",
+        }
+    }
 }
 
 impl MetricsRecorder {
@@ -488,6 +516,41 @@ impl MetricsRecorder {
             ),
             &["application", "chain", "chain_kind", "dataset"],
         )?;
+        let indexer_graphql_query_total = CounterVec::new(
+            Opts::new(
+                "datalens_indexer_graphql_query_total",
+                "Datalens indexer GraphQL queries by outcome.",
+            ),
+            &[
+                "application",
+                "chain",
+                "dataset",
+                "index",
+                "outcome",
+                "output",
+            ],
+        )?;
+        let indexer_graphql_query_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "datalens_indexer_graphql_query_duration_seconds",
+                "Datalens indexer GraphQL query duration in seconds.",
+            ),
+            &["application", "chain", "dataset", "index", "output"],
+        )?;
+        let indexer_graphql_auth_failure_total = CounterVec::new(
+            Opts::new(
+                "datalens_indexer_graphql_auth_failure_total",
+                "Datalens indexer GraphQL metrics authentication failures.",
+            ),
+            &["application", "chain", "dataset", "index", "output"],
+        )?;
+        let indexer_graphql_rate_limited_total = CounterVec::new(
+            Opts::new(
+                "datalens_indexer_graphql_rate_limited_total",
+                "Datalens indexer GraphQL rate limited requests.",
+            ),
+            &["application", "chain", "dataset", "index", "output"],
+        )?;
 
         registry.register(Box::new(query_total.clone()))?;
         registry.register(Box::new(query_duration_seconds.clone()))?;
@@ -507,6 +570,10 @@ impl MetricsRecorder {
         registry.register(Box::new(warmup_rows_total.clone()))?;
         registry.register(Box::new(warmup_provider_error_total.clone()))?;
         registry.register(Box::new(warmup_current_height.clone()))?;
+        registry.register(Box::new(indexer_graphql_query_total.clone()))?;
+        registry.register(Box::new(indexer_graphql_query_duration_seconds.clone()))?;
+        registry.register(Box::new(indexer_graphql_auth_failure_total.clone()))?;
+        registry.register(Box::new(indexer_graphql_rate_limited_total.clone()))?;
 
         Ok(Self {
             registry,
@@ -528,6 +595,10 @@ impl MetricsRecorder {
             warmup_rows_total,
             warmup_provider_error_total,
             warmup_current_height,
+            indexer_graphql_query_total,
+            indexer_graphql_query_duration_seconds,
+            indexer_graphql_auth_failure_total,
+            indexer_graphql_rate_limited_total,
         })
     }
 
@@ -662,6 +733,41 @@ impl MetricsRecorder {
             .set(height as f64);
     }
 
+    pub fn record_indexer_graphql_query(
+        &self,
+        labels: &IndexerGraphqlMetricLabels,
+        outcome: IndexerGraphqlQueryOutcome,
+    ) {
+        self.indexer_graphql_query_total
+            .with_label_values(&indexer_graphql_query_label_values(
+                labels,
+                outcome.as_str(),
+            ))
+            .inc();
+    }
+
+    pub fn observe_indexer_graphql_query_duration(
+        &self,
+        labels: &IndexerGraphqlMetricLabels,
+        seconds: f64,
+    ) {
+        self.indexer_graphql_query_duration_seconds
+            .with_label_values(&indexer_graphql_label_values(labels))
+            .observe(seconds);
+    }
+
+    pub fn record_indexer_graphql_auth_failure(&self, labels: &IndexerGraphqlMetricLabels) {
+        self.indexer_graphql_auth_failure_total
+            .with_label_values(&indexer_graphql_label_values(labels))
+            .inc();
+    }
+
+    pub fn record_indexer_graphql_rate_limited(&self, labels: &IndexerGraphqlMetricLabels) {
+        self.indexer_graphql_rate_limited_total
+            .with_label_values(&indexer_graphql_label_values(labels))
+            .inc();
+    }
+
     pub fn encode(&self) -> Result<String, prometheus::Error> {
         let families = self.registry.gather();
         let mut output = String::new();
@@ -697,6 +803,30 @@ fn warmup_error_label_values<'a>(
         &labels.dataset,
         selector_kind,
         error_kind,
+    ]
+}
+
+fn indexer_graphql_label_values(labels: &IndexerGraphqlMetricLabels) -> [&str; 5] {
+    [
+        labels.application.as_str(),
+        labels.chain.as_str(),
+        labels.dataset.as_str(),
+        labels.index.as_str(),
+        labels.output.as_str(),
+    ]
+}
+
+fn indexer_graphql_query_label_values<'a>(
+    labels: &'a IndexerGraphqlMetricLabels,
+    outcome: &'a str,
+) -> [&'a str; 6] {
+    [
+        labels.application.as_str(),
+        labels.chain.as_str(),
+        labels.dataset.as_str(),
+        labels.index.as_str(),
+        outcome,
+        labels.output.as_str(),
     ]
 }
 

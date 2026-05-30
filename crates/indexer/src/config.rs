@@ -173,6 +173,7 @@ pub struct QueryServiceConfig {
     pub bind: String,
     pub path: String,
     pub playground: bool,
+    pub metrics: MetricsServiceConfig,
 }
 
 impl Default for QueryServiceConfig {
@@ -183,7 +184,39 @@ impl Default for QueryServiceConfig {
             bind: "127.0.0.1:9090".to_owned(),
             path: "/graphql".to_owned(),
             playground: false,
+            metrics: MetricsServiceConfig::default(),
         }
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct MetricsServiceConfig {
+    pub enabled: bool,
+    pub path: String,
+    pub bearer_token: Option<String>,
+}
+
+impl Default for MetricsServiceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: "/metrics".to_owned(),
+            bearer_token: None,
+        }
+    }
+}
+
+impl fmt::Debug for MetricsServiceConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MetricsServiceConfig")
+            .field("enabled", &self.enabled)
+            .field("path", &self.path)
+            .field(
+                "bearer_token",
+                &self.bearer_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
     }
 }
 
@@ -266,6 +299,17 @@ struct RawQueryServiceConfig {
     path: Option<String>,
     #[serde(default)]
     playground: bool,
+    metrics: Option<RawMetricsServiceConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawMetricsServiceConfig {
+    #[serde(default)]
+    enabled: bool,
+    path: Option<String>,
+    bearer_token: Option<String>,
+    token_env: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -532,6 +576,7 @@ fn parse_query(raw: Option<RawQueryServiceConfig>, errors: &mut Vec<String>) -> 
     if !path.starts_with('/') {
         errors.push("query.path: must start with /".to_owned());
     }
+    let metrics = parse_query_metrics(raw.metrics, &path, errors);
 
     QueryServiceConfig {
         enabled: raw.enabled,
@@ -539,6 +584,48 @@ fn parse_query(raw: Option<RawQueryServiceConfig>, errors: &mut Vec<String>) -> 
         bind,
         path,
         playground: raw.playground,
+        metrics,
+    }
+}
+
+fn parse_query_metrics(
+    raw: Option<RawMetricsServiceConfig>,
+    query_path: &str,
+    errors: &mut Vec<String>,
+) -> MetricsServiceConfig {
+    let Some(raw) = raw else {
+        return MetricsServiceConfig::default();
+    };
+    let default = MetricsServiceConfig::default();
+    let path = raw
+        .path
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(default.path);
+    if !path.starts_with('/') {
+        errors.push("query.metrics.path: must start with /".to_owned());
+    }
+    if path == query_path {
+        errors.push("query.metrics.path: must not equal query.path".to_owned());
+    }
+    let bearer_token = match raw.token_env {
+        Some(token_env) if !token_env.trim().is_empty() => env::var(&token_env)
+            .map_err(|_| {
+                errors.push(format!(
+                    "query.metrics.token_env: environment variable {token_env} is not set"
+                ));
+            })
+            .ok(),
+        Some(_) => {
+            errors.push("query.metrics.token_env: must not be empty".to_owned());
+            None
+        }
+        None => raw.bearer_token.filter(|value| !value.trim().is_empty()),
+    };
+
+    MetricsServiceConfig {
+        enabled: raw.enabled,
+        path,
+        bearer_token,
     }
 }
 

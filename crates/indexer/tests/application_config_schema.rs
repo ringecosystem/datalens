@@ -1,7 +1,8 @@
 use datalens_indexer::{
     CheckpointPolicy, DatabaseDriver, DatabaseOutputConfig, DatalensIndexConfig,
-    FinalityRequirement, IndexDataset, OutputConfig, ParquetOutputConfig, QueryProtocol,
-    QueryServiceConfig, SourceConfig, WebhookHeaderConfig, WebhookOutputConfig, WebhookRetryConfig,
+    FinalityRequirement, IndexDataset, MetricsServiceConfig, OutputConfig, ParquetOutputConfig,
+    QueryProtocol, QueryServiceConfig, SourceConfig, WebhookHeaderConfig, WebhookOutputConfig,
+    WebhookRetryConfig,
 };
 
 fn valid_config() -> &'static str {
@@ -351,6 +352,7 @@ fn test_parse_valid_sqlite_database_output_allows_query_service() {
             bind: "127.0.0.1:9100".to_owned(),
             path: "/query".to_owned(),
             playground: true,
+            metrics: MetricsServiceConfig::default(),
         }
     );
 }
@@ -373,6 +375,30 @@ fn test_parse_sqlite_query_config_captures_bind_address() {
     assert_eq!(
         datalens_indexer::validate_daemon_config(&config).expect("daemon config"),
         datalens_indexer::DaemonQueryMode::Graphql
+    );
+}
+
+#[test]
+fn test_parse_query_metrics_config_supports_operator_token_env() {
+    let input = valid_config()
+        .replace(
+            "[output.jsonl]\npath = \".data/indexes/ormp/events.jsonl\"",
+            "[output]\nkind = \"database\"\n\n[output.database]\ndriver = \"sqlite\"\nurl = \"sqlite:.data/indexes/ormp/index.db\"",
+        )
+        .replace(
+            "[checkpoint]",
+            "[query]\nenabled = true\nprotocol = \"graphql\"\n\n[query.metrics]\nenabled = true\npath = \"/metrics\"\ntoken_env = \"PATH\"\n\n[checkpoint]",
+        );
+
+    let config = DatalensIndexConfig::from_toml_str(&input).expect("valid database config");
+
+    assert_eq!(
+        config.query.metrics,
+        MetricsServiceConfig {
+            enabled: true,
+            path: "/metrics".to_owned(),
+            bearer_token: Some(std::env::var("PATH").expect("PATH should exist for tests")),
+        }
     );
 }
 
@@ -419,6 +445,7 @@ fn test_parse_valid_postgres_database_output_allows_query_service() {
             bind: "127.0.0.1:9090".to_owned(),
             path: "/graphql".to_owned(),
             playground: false,
+            metrics: MetricsServiceConfig::default(),
         }
     );
 }
