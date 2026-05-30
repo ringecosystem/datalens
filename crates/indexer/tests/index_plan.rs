@@ -204,3 +204,84 @@ topics = ["0x0000000000000000000000000000000000000000000000000000000000000000"]
             .contains("0000000000000000000000000000000000000001")
     );
 }
+
+#[test]
+fn test_plan_solana_and_tron_sources_use_stable_family_dataset_and_range_keys() {
+    let config = DatalensIndexConfig::from_toml_str(
+        r#"
+[client]
+endpoint = "http://127.0.0.1:3000"
+application = "multi-chain"
+token_env = "PATH"
+
+[index]
+name = "activity"
+dataset = "solana.transactions"
+finality = "durable"
+chunk_blocks = 2
+
+[[sources]]
+chain = "tron-mainnet"
+family = "tron"
+chain_id = 728126428
+dataset = "tron.events"
+from_block = 9
+to_block = 10
+contracts = ["0x0000000000000000000000000000000000000001"]
+events = ["Transfer"]
+
+[[sources]]
+chain = "solana-mainnet"
+family = "solana"
+network_id = "mainnet-beta"
+dataset = "solana.transactions"
+from_slot = 5
+to_slot = 8
+selector = { kind = "program", value = "11111111111111111111111111111111" }
+
+[output.jsonl]
+path = ".data/indexes/activity/events.jsonl"
+
+[checkpoint]
+path = ".data/indexes/activity/checkpoint.json"
+"#,
+    )
+    .expect("valid config");
+
+    let plan = build_plan(&config);
+    let json = serde_json::to_value(&plan).expect("plan serializes");
+
+    assert_eq!(plan.tasks().len(), 3);
+    assert_eq!(plan.tasks()[0].family, "solana");
+    assert_eq!(
+        plan.tasks()[0].source_identity,
+        "solana:solana-mainnet:mainnet-beta:000"
+    );
+    assert_eq!(plan.tasks()[0].dataset, "solana.transactions");
+    assert_eq!(plan.tasks()[0].range.kind, "slot");
+    assert_eq!(plan.tasks()[0].selector.kind, "solana_program");
+    assert_eq!(plan.tasks()[2].family, "tron");
+    assert_eq!(
+        plan.tasks()[2].source_identity,
+        "tron:tron-mainnet:728126428:001"
+    );
+    assert_eq!(plan.tasks()[2].dataset, "tron.events");
+    assert_eq!(plan.tasks()[2].range.kind, "block");
+    assert_eq!(plan.tasks()[2].selector.kind, "tron_events");
+    assert_eq!(
+        json["tasks"][0]["selector"],
+        serde_json::json!({
+            "kind": "solana_program",
+            "fingerprint": "solana-program/26da562a2f106128",
+            "value_count": 1,
+        })
+    );
+    assert_eq!(
+        json["tasks"][2]["selector"],
+        serde_json::json!({
+            "kind": "tron_events",
+            "fingerprint": "tron-events/06719eaec45e49530c8b3b56",
+            "value_count": 2,
+        })
+    );
+}

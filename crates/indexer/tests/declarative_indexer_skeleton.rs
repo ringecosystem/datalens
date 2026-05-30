@@ -123,6 +123,164 @@ fn test_index_runner_executes_evm_log_tasks_through_client() {
 }
 
 #[test]
+fn test_index_runner_dispatches_solana_program_query_and_writes_generic_jsonl() {
+    let config = multi_chain_config(
+        "solana.transactions",
+        r#"
+[[sources]]
+chain = "solana-mainnet"
+family = "solana"
+network_id = "mainnet-beta"
+dataset = "solana.transactions"
+from_slot = 100
+to_slot = 100
+selector = { kind = "program", value = "11111111111111111111111111111111" }
+"#,
+    );
+    let plan = IndexPlanBuilder::new().build(&config).unwrap();
+    let output_path = temp_path("solana-jsonl").join("events.jsonl");
+    let transport = QueueTransport::new(vec![HttpResponse::json(
+        200,
+        adapter_response_json(
+            "solana",
+            "solana-mainnet",
+            None,
+            "mainnet-beta",
+            "solana.transactions",
+            serde_json::json!({ "kind": "slot", "start": 100, "end": 100 }),
+            vec![serde_json::json!({
+                "slot": 100,
+                "signature": "5NfYqLkP8xQK5exampleSignature",
+                "transaction_index": 2,
+                "program_id": "11111111111111111111111111111111",
+            })],
+        ),
+    )]);
+    let client = DatalensClient::with_transport(
+        config.client.to_datalens_client_config(),
+        transport.clone(),
+    )
+    .expect("client config");
+    let runner = IndexRunner::new(
+        plan,
+        OutputSinkConfig::FileJson {
+            path: output_path.clone(),
+        },
+    );
+
+    runner.run(&client).expect("index run");
+
+    let requests = transport.requests();
+    assert_eq!(
+        requests[0].body["chain"]["family"],
+        serde_json::json!({ "Other": "solana" })
+    );
+    assert_eq!(requests[0].body["dataset_key"], "solana.transactions");
+    assert_eq!(
+        requests[0].body["range"],
+        serde_json::json!({ "kind": "slot", "start": 100, "end": 100 })
+    );
+    assert_eq!(
+        requests[0].body["selector"]["value"]["kind"],
+        "solana_program"
+    );
+    assert_eq!(
+        requests[0].body["selector"]["value"]["canonical_key"],
+        "program/11111111111111111111111111111111"
+    );
+
+    let row = std::fs::read_to_string(&output_path).expect("jsonl output");
+    let row = serde_json::from_str::<serde_json::Value>(row.trim()).expect("json row");
+    assert_eq!(row["index"], "activity");
+    assert_eq!(row["chain"], "solana-mainnet");
+    assert_eq!(row["chain_id"], 0);
+    assert_eq!(row["network_id"], "mainnet-beta");
+    assert_eq!(row["dataset"], "solana.transactions");
+    assert_eq!(row["position"]["kind"], "slot");
+    assert_eq!(row["position"]["value"], 100);
+    assert_eq!(row["signature"], "5NfYqLkP8xQK5exampleSignature");
+    assert_eq!(row["selector"]["kind"], "solana_program");
+    assert_eq!(row["finality"], "durable");
+    assert_eq!(row["raw"]["slot"], 100);
+}
+
+#[test]
+fn test_index_runner_dispatches_tron_event_query_and_writes_generic_jsonl() {
+    let config = multi_chain_config(
+        "tron.events",
+        r#"
+[[sources]]
+chain = "tron-mainnet"
+family = "tron"
+chain_id = 728126428
+dataset = "tron.events"
+from_block = 60000000
+to_block = 60000000
+contracts = ["0x0000000000000000000000000000000000000001"]
+events = ["Transfer"]
+"#,
+    );
+    let plan = IndexPlanBuilder::new().build(&config).unwrap();
+    let output_path = temp_path("tron-jsonl").join("events.jsonl");
+    let transport = QueueTransport::new(vec![HttpResponse::json(
+        200,
+        adapter_response_json(
+            "tron",
+            "tron-mainnet",
+            Some(728126428),
+            "",
+            "tron.events",
+            serde_json::json!({ "kind": "block", "start": 60000000, "end": 60000000 }),
+            vec![serde_json::json!({
+                "block_number": 60000000,
+                "transaction_id": "0xabc",
+                "event_index": 1,
+                "contract_address": "410000000000000000000000000000000000000001",
+                "event_name": "Transfer",
+            })],
+        ),
+    )]);
+    let client = DatalensClient::with_transport(
+        config.client.to_datalens_client_config(),
+        transport.clone(),
+    )
+    .expect("client config");
+    let runner = IndexRunner::new(
+        plan,
+        OutputSinkConfig::FileJson {
+            path: output_path.clone(),
+        },
+    );
+
+    runner.run(&client).expect("index run");
+
+    let requests = transport.requests();
+    assert_eq!(
+        requests[0].body["chain"]["family"],
+        serde_json::json!({ "Other": "tron" })
+    );
+    assert_eq!(requests[0].body["dataset_key"], "tron.events");
+    assert_eq!(requests[0].body["selector"]["value"]["kind"], "tron_events");
+    assert_eq!(
+        requests[0].body["selector"]["value"]["canonical_key"],
+        "contracts/410000000000000000000000000000000000000001/events/Transfer"
+    );
+
+    let row = std::fs::read_to_string(&output_path).expect("jsonl output");
+    let row = serde_json::from_str::<serde_json::Value>(row.trim()).expect("json row");
+    assert_eq!(row["chain"], "tron-mainnet");
+    assert_eq!(row["chain_id"], 728126428);
+    assert_eq!(row["dataset"], "tron.events");
+    assert_eq!(row["position"]["kind"], "block");
+    assert_eq!(row["position"]["value"], 60000000);
+    assert_eq!(row["transaction_id"], "0xabc");
+    assert_eq!(row["event_id"], 1);
+    assert_eq!(row["selector"]["kind"], "tron_events");
+    assert_eq!(row["finality"], "durable");
+    assert_eq!(row["raw"]["event_name"], "Transfer");
+}
+
+#[test]
 fn test_index_runner_writes_evm_logs_to_jsonl_and_creates_parent_directories() {
     let config = index_config(10);
     let plan = IndexPlanBuilder::new().build(&config).unwrap();
@@ -635,6 +793,35 @@ path = ".data/indexes/ormp/checkpoint.json"
     .expect("valid config")
 }
 
+fn multi_chain_config(dataset: &str, sources: &str) -> DatalensIndexConfig {
+    unsafe {
+        std::env::set_var("DATALENS_INDEX_TEST_TOKEN", "runner-token");
+    }
+    DatalensIndexConfig::from_toml_str(&format!(
+        r#"
+[client]
+endpoint = "http://127.0.0.1:3000"
+application = "multi-chain-watcher"
+token_env = "DATALENS_INDEX_TEST_TOKEN"
+
+[index]
+name = "activity"
+dataset = "{dataset}"
+finality = "durable"
+chunk_blocks = 10
+
+{sources}
+
+[output.jsonl]
+path = ".data/indexes/activity/events.jsonl"
+
+[checkpoint]
+path = ".data/indexes/activity/checkpoint.json"
+"#
+    ))
+    .expect("valid config")
+}
+
 fn temp_path(name: &str) -> std::path::PathBuf {
     let root = std::env::temp_dir().join(format!(
         "datalens-indexer-{name}-{}",
@@ -687,6 +874,50 @@ fn response_json(start: u64, end: u64, row_count: usize, durable_hit: bool) -> s
                 )
                 .expect("log record")
             }).collect()),
+        ).expect("rows")).expect("rows json")
+    })
+}
+
+fn adapter_response_json(
+    family: &str,
+    chain: &str,
+    numeric_network_id: Option<u64>,
+    textual_network_id: &str,
+    dataset_key: &str,
+    range: serde_json::Value,
+    rows: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    let network_id = match (numeric_network_id, textual_network_id.is_empty()) {
+        (Some(value), _) => serde_json::json!({ "kind": "numeric", "value": value }),
+        (None, false) => serde_json::json!({ "kind": "textual", "value": textual_network_id }),
+        (None, true) => serde_json::Value::Null,
+    };
+    let mut chain_json = serde_json::json!({
+        "family": { "Other": family },
+        "configured_name": chain,
+    });
+    if !network_id.is_null() {
+        chain_json["network_id"] = network_id;
+    }
+    serde_json::json!({
+        "chain": chain_json,
+        "dataset_key": dataset_key,
+        "range": range,
+        "cache": {
+            "hit_ranges": [range],
+            "missing_ranges": [],
+            "durable_hit_ranges": [range],
+            "hot_hit_ranges": [],
+            "provider_fill_ranges": [],
+            "promotion_pending_ranges": [],
+            "segments": []
+        },
+        "rows": serde_json::to_value(DatasetRows::new(
+            DatasetKey::parse(dataset_key).expect("dataset key"),
+            QueryRows::AdapterJson {
+                dataset_key: DatasetKey::parse(dataset_key).expect("dataset key"),
+                rows,
+            },
         ).expect("rows")).expect("rows json")
     })
 }
