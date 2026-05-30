@@ -2,6 +2,7 @@
 
 mod checkpoint;
 mod config;
+mod daemon;
 mod error;
 pub mod graphql;
 mod output;
@@ -11,6 +12,7 @@ mod webhook_config;
 
 pub use checkpoint::*;
 pub use config::*;
+pub use daemon::*;
 pub use error::*;
 pub use output::*;
 pub use plan::*;

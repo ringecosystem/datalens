@@ -2,12 +2,12 @@ use std::fs;
 
 use datalens_client::DatalensClient;
 use datalens_indexer::{
-    CheckpointPolicy, DatabaseDriver, DatalensIndexConfig, FinalityRequirement, IndexDataset,
-    IndexPlanBuilder, IndexRunner, IndexRunnerOptions, OutputConfig, OutputSinkConfig,
-    SourceConfig,
+    CheckpointPolicy, DatabaseDriver, DatalensIndexConfig, FinalityRequirement, IndexDaemon,
+    IndexDataset, IndexPlanBuilder, IndexRunner, IndexRunnerOptions, OutputConfig,
+    OutputSinkConfig, SourceConfig,
 };
 
-use super::{IndexDoctorCommand, IndexPlanCommand, IndexRunCommand};
+use super::{IndexDaemonCommand, IndexDoctorCommand, IndexPlanCommand, IndexRunCommand};
 
 pub(super) fn index_plan(
     command: IndexPlanCommand,
@@ -31,6 +31,22 @@ pub(super) fn index_run(
         .with_dry_run(command.dry_run);
     let runner = IndexRunner::new(plan, output_sink_config(&config.output)).with_options(options);
     Ok(runner.run(&client)?)
+}
+
+pub(super) fn index_daemon(
+    command: IndexDaemonCommand,
+) -> Result<datalens_indexer::IndexDaemonReport, Box<dyn std::error::Error + Send + Sync>> {
+    let input = fs::read_to_string(&command.config)?;
+    let config = DatalensIndexConfig::from_toml_str(&input)?;
+    datalens_indexer::validate_daemon_config(&config)?;
+    let client = DatalensClient::new(config.client.to_datalens_client_config())?;
+    let daemon = IndexDaemon::new(config, client);
+    let runtime = tokio::runtime::Runtime::new()?;
+    Ok(runtime.block_on(daemon.run_until_shutdown(async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            log::error!("failed to listen for index daemon shutdown signal: {error}");
+        }
+    }))?)
 }
 
 fn output_sink_config(output: &OutputConfig) -> OutputSinkConfig {

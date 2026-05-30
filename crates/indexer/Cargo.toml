@@ -10,12 +10,13 @@ async-graphql-axum.workspace = true
 axum.workspace = true
 datalens-client = { path = "../client" }
 datalens-core = { path = "../core" }
+log.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 reqwest.workspace = true
 sha2 = "0.11.0"
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-native-roots", "sqlite", "postgres"] }
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 toml.workspace = true
 
 [dev-dependencies]

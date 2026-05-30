@@ -166,6 +166,16 @@ fn test_parse_rejects_query_service_with_jsonl_output() {
 }
 
 #[test]
+fn test_parse_allows_jsonl_daemon_without_query_service() {
+    let config = DatalensIndexConfig::from_toml_str(valid_config()).expect("valid config");
+
+    assert_eq!(
+        datalens_indexer::validate_daemon_config(&config).expect("daemon config"),
+        datalens_indexer::DaemonQueryMode::Disabled
+    );
+}
+
+#[test]
 fn test_parse_rejects_graphql_with_jsonl_output() {
     let input = valid_config().replace(
         "[checkpoint]",
@@ -212,6 +222,47 @@ fn test_parse_valid_sqlite_database_output_allows_query_service() {
             path: "/query".to_owned(),
             playground: true,
         }
+    );
+}
+
+#[test]
+fn test_parse_sqlite_query_config_captures_bind_address() {
+    let input = valid_config()
+        .replace(
+            "[output.jsonl]\npath = \".data/indexes/ormp/events.jsonl\"",
+            "[output]\nkind = \"database\"\n\n[output.database]\ndriver = \"sqlite\"\nurl = \"sqlite:.data/indexes/ormp/index.db\"",
+        )
+        .replace(
+            "[checkpoint]",
+            "[query]\nenabled = true\nprotocol = \"graphql\"\nbind = \"127.0.0.1:0\"\n\n[checkpoint]",
+        );
+
+    let config = DatalensIndexConfig::from_toml_str(&input).expect("valid database config");
+
+    assert_eq!(config.query.bind, "127.0.0.1:0");
+    assert_eq!(
+        datalens_indexer::validate_daemon_config(&config).expect("daemon config"),
+        datalens_indexer::DaemonQueryMode::Graphql
+    );
+}
+
+#[test]
+fn test_daemon_rejects_postgres_query_service_until_supported() {
+    let input = valid_config()
+        .replace(
+            "[output.jsonl]\npath = \".data/indexes/ormp/events.jsonl\"",
+            "[output]\nkind = \"database\"\n\n[output.database]\ndriver = \"postgres\"\nurl = \"postgres://localhost/datalens\"",
+        )
+        .replace("[checkpoint]", "[query]\nenabled = true\nprotocol = \"graphql\"\n\n[checkpoint]");
+    let config = DatalensIndexConfig::from_toml_str(&input).expect("database config parses");
+
+    let error = datalens_indexer::validate_daemon_config(&config)
+        .expect_err("daemon should reject unsupported query store")
+        .to_string();
+
+    assert!(
+        error.contains("daemon query service currently supports sqlite"),
+        "{error}"
     );
 }
 

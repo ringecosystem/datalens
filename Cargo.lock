@@ -1648,6 +1648,7 @@ dependencies = [
  "axum",
  "datalens-client",
  "datalens-core",
+ "log",
  "reqwest",
  "serde",
  "serde_json",
