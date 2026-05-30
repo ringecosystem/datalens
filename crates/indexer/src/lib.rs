@@ -11,6 +11,8 @@ mod plan;
 mod runner;
 mod webhook_config;
 
+pub mod sdk;
+
 pub use checkpoint::*;
 pub use config::*;
 pub use daemon::*;
