@@ -54,6 +54,7 @@ impl PostgresOutputStore {
                         selector TEXT,
                         topics_json TEXT,
                         signature TEXT,
+                        topic0 TEXT,
                         event_name TEXT,
                         data_payload TEXT,
                         raw_payload TEXT NOT NULL,
@@ -68,6 +69,11 @@ impl PostgresOutputStore {
                 .execute(&self.pool)
                 .await?;
                 ensure_event_name_column_postgres(&self.pool).await?;
+                ensure_topic0_column_postgres(&self.pool).await?;
+                backfill_topic0_postgres(&self.pool).await?;
+                for statement in DROP_INDEX_STATEMENTS {
+                    sqlx::query(*statement).execute(&self.pool).await?;
+                }
                 for statement in INDEX_STATEMENTS {
                     sqlx::query(*statement).execute(&self.pool).await?;
                 }
@@ -81,6 +87,27 @@ async fn ensure_event_name_column_postgres(pool: &PgPool) -> Result<(), sqlx::Er
     sqlx::query("ALTER TABLE indexed_events ADD COLUMN IF NOT EXISTS event_name TEXT")
         .execute(pool)
         .await?;
+    Ok(())
+}
+
+async fn ensure_topic0_column_postgres(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query("ALTER TABLE indexed_events ADD COLUMN IF NOT EXISTS topic0 TEXT")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+async fn backfill_topic0_postgres(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        UPDATE indexed_events
+        SET topic0 = topics_json::jsonb ->> 0
+        WHERE topic0 IS NULL
+          AND topics_json IS NOT NULL
+        "#,
+    )
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -100,16 +127,24 @@ impl QueryableStore for PostgresOutputStore {
     }
 }
 
+const DROP_INDEX_STATEMENTS: &[&str] = &[
+    "DROP INDEX IF EXISTS idx_indexed_events_pg_index_name",
+    "DROP INDEX IF EXISTS idx_indexed_events_pg_chain",
+    "DROP INDEX IF EXISTS idx_indexed_events_pg_dataset",
+    "DROP INDEX IF EXISTS idx_indexed_events_pg_selector",
+    "DROP INDEX IF EXISTS idx_indexed_events_pg_block_range",
+    "DROP INDEX IF EXISTS idx_indexed_events_pg_transaction",
+    "DROP INDEX IF EXISTS idx_indexed_events_pg_signature",
+    "DROP INDEX IF EXISTS idx_indexed_events_pg_event_name",
+    "DROP INDEX IF EXISTS idx_indexed_events_pg_ordering",
+];
+
 const INDEX_STATEMENTS: &[&str] = &[
-    "CREATE INDEX IF NOT EXISTS idx_indexed_events_pg_index_name ON indexed_events(index_name)",
-    "CREATE INDEX IF NOT EXISTS idx_indexed_events_pg_chain ON indexed_events(chain_family, chain_id, chain_name)",
-    "CREATE INDEX IF NOT EXISTS idx_indexed_events_pg_dataset ON indexed_events(dataset)",
-    "CREATE INDEX IF NOT EXISTS idx_indexed_events_pg_selector ON indexed_events(selector)",
-    "CREATE INDEX IF NOT EXISTS idx_indexed_events_pg_block_range ON indexed_events(chain_identity, dataset, block_number)",
-    "CREATE INDEX IF NOT EXISTS idx_indexed_events_pg_transaction ON indexed_events(transaction_hash)",
-    "CREATE INDEX IF NOT EXISTS idx_indexed_events_pg_signature ON indexed_events(signature)",
-    "CREATE INDEX IF NOT EXISTS idx_indexed_events_pg_event_name ON indexed_events(event_name)",
-    "CREATE INDEX IF NOT EXISTS idx_indexed_events_pg_ordering ON indexed_events(chain_identity, dataset, block_number, transaction_index, event_index)",
+    "CREATE INDEX IF NOT EXISTS idx_indexed_events_pg_query_page ON indexed_events(dataset, index_name, chain_name, chain_id, block_number, transaction_index, event_index, id)",
+    "CREATE INDEX IF NOT EXISTS idx_indexed_events_pg_selector_page ON indexed_events(dataset, index_name, chain_name, chain_id, selector, block_number, transaction_index, event_index, id)",
+    "CREATE INDEX IF NOT EXISTS idx_indexed_events_pg_topic0_page ON indexed_events(dataset, index_name, chain_name, chain_id, topic0, block_number, transaction_index, event_index, id)",
+    "CREATE INDEX IF NOT EXISTS idx_indexed_events_pg_event_name_page ON indexed_events(dataset, index_name, chain_name, chain_id, event_name, block_number, transaction_index, event_index, id)",
+    "CREATE INDEX IF NOT EXISTS idx_indexed_events_pg_transaction_page ON indexed_events(dataset, index_name, chain_name, chain_id, transaction_hash, block_number, transaction_index, event_index, id)",
 ];
 
 async fn write_records_postgres(
@@ -170,13 +205,14 @@ async fn insert_record(
             selector,
             topics_json,
             signature,
+            topic0,
             event_name,
             data_payload,
             raw_payload,
             removed,
             finality
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
         ON CONFLICT (unique_key) DO NOTHING
         "#,
     )
@@ -195,6 +231,7 @@ async fn insert_record(
     .bind(&row.selector)
     .bind(&row.topics_json)
     .bind(&row.signature)
+    .bind(&row.topic0)
     .bind(&row.event_name)
     .bind(&row.data_payload)
     .bind(&row.raw_payload)
@@ -242,19 +279,12 @@ async fn query_records_postgres(
         builder.push(" AND event_name = ").push_bind(event_name);
     }
     if let Some(topic0) = filter.topic0 {
-        builder
-            .push(" AND (signature = ")
-            .push_bind(topic0.clone())
-            .push(" OR topics_json LIKE ")
-            .push_bind(format!("[\"{topic0}\"%"))
-            .push(")");
+        builder.push(" AND topic0 = ").push_bind(topic0);
     }
     builder.push(" ORDER BY block_number, transaction_index, event_index, id");
-    if let Some(limit) = filter.limit {
-        builder
-            .push(" LIMIT ")
-            .push_bind(i64::try_from(limit).unwrap_or(i64::MAX));
-    }
+    builder
+        .push(" LIMIT ")
+        .push_bind(i64::try_from(filter.limit).unwrap_or(i64::MAX));
     if let Some(offset) = filter.offset {
         builder
             .push(" OFFSET ")

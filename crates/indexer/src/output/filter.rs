@@ -2,6 +2,9 @@ use serde_json::Value;
 
 use super::StoreQuery;
 
+const DEFAULT_QUERY_LIMIT: u64 = 100;
+const MAX_QUERY_LIMIT: u64 = 1000;
+
 #[derive(Clone, Debug, Default)]
 pub(super) struct StoreQueryFilter {
     pub index: Option<String>,
@@ -14,7 +17,7 @@ pub(super) struct StoreQueryFilter {
     pub signature: Option<String>,
     pub event_name: Option<String>,
     pub topic0: Option<String>,
-    pub limit: Option<u64>,
+    pub limit: u64,
     pub offset: Option<u64>,
 }
 
@@ -39,7 +42,7 @@ impl StoreQueryFilter {
                 .map(str::to_owned),
             event_name: string_filter(filter, "event_name"),
             topic0: string_filter(filter, "topic0"),
-            limit: u64_filter(filter, "limit"),
+            limit: bounded_limit(u64_filter(filter, "limit")),
             offset: u64_filter(filter, "after"),
         }
     }
@@ -56,4 +59,10 @@ fn u64_filter(filter: Option<&serde_json::Map<String, Value>>, field: &str) -> O
     filter
         .and_then(|filter| filter.get(field))
         .and_then(Value::as_u64)
+}
+
+fn bounded_limit(limit: Option<u64>) -> u64 {
+    limit
+        .unwrap_or(DEFAULT_QUERY_LIMIT)
+        .clamp(1, MAX_QUERY_LIMIT)
 }

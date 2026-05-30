@@ -10,9 +10,20 @@ use datalens_indexer::{
     IndexedRecord, OutputWriteSink, PostgresOutputStore, QueryableStore, StoreQuery,
     graphql::graphql_schema,
 };
+use sqlx::{PgPool, Row};
 use tokio::runtime::Runtime;
 
 fn record(index: &str, block_number: u64, log_index: u64, address: &str) -> IndexedRecord {
+    record_with_event(index, block_number, log_index, address, None)
+}
+
+fn record_with_event(
+    index: &str,
+    block_number: u64,
+    log_index: u64,
+    address: &str,
+    event_name: Option<&str>,
+) -> IndexedRecord {
     IndexedRecord {
         index: index.to_owned(),
         chain: "ethereum".to_owned(),
@@ -30,6 +41,7 @@ fn record(index: &str, block_number: u64, log_index: u64, address: &str) -> Inde
                 "0x0000000000000000000000000000000000000000000000000000000000000000"
             ],
             "signature": "Transfer(address,address,uint256)",
+            "event_name": event_name,
             "data": "0x010203",
             "removed": false,
         }),
@@ -100,6 +112,66 @@ fn test_postgres_output_batch_insert_is_idempotent_when_url_is_configured() {
         2
     );
     assert_eq!(rows.rows.len(), 2);
+}
+
+#[test]
+fn test_postgres_output_schema_matches_benchmark_query_paths_when_url_is_configured() {
+    let Some(url) = postgres_test_url() else {
+        return;
+    };
+    let _store = PostgresOutputStore::connect(&url).expect("postgres store connects");
+
+    Runtime::new().expect("runtime").block_on(async {
+        let pool = PgPool::connect(&url).await.expect("postgres pool");
+        let columns = sqlx::query(
+            r#"
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = 'indexed_events'
+            "#,
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("postgres columns")
+        .into_iter()
+        .map(|row| row.get::<String, _>("column_name"))
+        .collect::<Vec<_>>();
+        assert!(columns.iter().any(|column| column == "topic0"));
+
+        let indexes = sqlx::query(
+            r#"
+            SELECT indexname
+            FROM pg_indexes
+            WHERE tablename = 'indexed_events'
+            "#,
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("postgres indexes")
+        .into_iter()
+        .map(|row| row.get::<String, _>("indexname"))
+        .collect::<Vec<_>>();
+        assert!(
+            indexes
+                .iter()
+                .any(|name| name == "idx_indexed_events_pg_query_page")
+        );
+        assert!(
+            indexes
+                .iter()
+                .any(|name| name == "idx_indexed_events_pg_selector_page")
+        );
+        assert!(
+            indexes
+                .iter()
+                .any(|name| name == "idx_indexed_events_pg_topic0_page")
+        );
+        assert!(
+            indexes
+                .iter()
+                .any(|name| name == "idx_indexed_events_pg_event_name_page")
+        );
+    });
 }
 
 #[test]
@@ -181,6 +253,44 @@ fn test_postgres_graphql_events_query_filters_rows_when_url_is_configured() {
     assert_eq!(events[0]["signature"], "Transfer(address,address,uint256)");
     assert_eq!(events[0]["payload"]["block_number"], base_block + 10);
     assert!(events[0]["createdAt"].as_str().is_some());
+}
+
+#[test]
+fn test_postgres_output_filters_event_name_and_applies_default_limit_when_url_is_configured() {
+    let Some(url) = postgres_test_url() else {
+        return;
+    };
+    let store = PostgresOutputStore::connect(&url).expect("postgres store connects");
+    let base_block = unique_block_base();
+    let index = unique_index_name("postgres-limit");
+    let records = (0..105)
+        .map(|offset| {
+            record_with_event(
+                &index,
+                base_block + offset,
+                offset,
+                "0x0000000000000000000000000000000000000001",
+                Some("Transfer"),
+            )
+        })
+        .collect::<Vec<_>>();
+    store.write_records(&records).expect("write records");
+
+    let rows = store
+        .query(StoreQuery {
+            dataset: "evm.logs".to_owned(),
+            filter: serde_json::json!({
+                "index": index,
+                "chain": "ethereum",
+                "chain_id": 1,
+                "event_name": "Transfer",
+            }),
+        })
+        .expect("filtered query");
+
+    assert_eq!(rows.rows.len(), 100);
+    assert_eq!(rows.rows[0]["block_number"], base_block);
+    assert_eq!(rows.rows[99]["block_number"], base_block + 99);
 }
 
 fn postgres_test_url() -> Option<String> {
