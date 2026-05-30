@@ -9,6 +9,7 @@ use std::{collections::BTreeMap, path::PathBuf, time::Instant};
 use crate::{
     CheckpointPolicy, IndexCheckpointFile, IndexCheckpointFileStore, IndexPlan, IndexedRecord,
     IndexerError, OutputSinkConfig, OutputWriteSink, PlannedDecodeEvent, PlannedIndexTask,
+    decode_evm_log,
 };
 
 #[derive(Clone)]
@@ -233,7 +234,44 @@ fn evm_log_records(
                 "data": row.data,
                 "removed": row.removed,
             });
-            if let Some(event) = decoded_event_for_log(decode_events, row)
+            if !decode_events.is_empty() {
+                let raw_payload = payload.clone();
+                let Some(object) = payload.as_object_mut() else {
+                    unreachable!("evm payload is always an object");
+                };
+                object.insert("raw".to_owned(), raw_payload);
+                let decoded = decode_evm_log(
+                    decode_events,
+                    index,
+                    &task.chain,
+                    &task.dataset,
+                    &row.address,
+                    &row.topics,
+                    &row.data,
+                );
+                object.insert(
+                    "decode_status".to_owned(),
+                    serde_json::Value::String(decoded.status.as_str().to_owned()),
+                );
+                if let Some(topic0) = decoded.topic0 {
+                    object.insert("topic0".to_owned(), serde_json::Value::String(topic0));
+                }
+                if let Some(error) = decoded.error {
+                    object.insert("decode_error".to_owned(), serde_json::Value::String(error));
+                }
+                if let Some(arguments) = decoded.arguments {
+                    object.insert("decoded".to_owned(), arguments);
+                }
+                if let Some(signature) = decoded.signature {
+                    object.insert("signature".to_owned(), serde_json::Value::String(signature));
+                }
+                if let Some(event_name) = decoded.event_name {
+                    object.insert(
+                        "event_name".to_owned(),
+                        serde_json::Value::String(event_name),
+                    );
+                }
+            } else if let Some(event) = decoded_event_for_log(decode_events, row)
                 && let Some(object) = payload.as_object_mut()
             {
                 object.insert(

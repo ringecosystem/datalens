@@ -5,6 +5,9 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
+alloy-dyn-abi = "1.6.0"
+alloy-json-abi = "1.6.0"
+alloy-primitives = "1.6.0"
 arrow.workspace = true
 async-graphql.workspace = true
 async-graphql-axum.workspace = true

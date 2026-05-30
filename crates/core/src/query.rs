@@ -111,7 +111,7 @@ impl LogRecord {
             transaction_index,
             log_index,
             address: normalize_hex("address", address.as_ref(), 20)?,
-            topics: normalize_values("topic", topics, 32)?,
+            topics: normalize_ordered_values("topic", topics, 32)?,
             data,
             removed,
         })
@@ -390,6 +390,17 @@ fn normalize_values(
         normalized.insert(normalize_hex(kind, &value, byte_len)?);
     }
     Ok(normalized.into_iter().collect())
+}
+
+fn normalize_ordered_values(
+    kind: &str,
+    values: Vec<String>,
+    byte_len: usize,
+) -> Result<Vec<String>, DatalensError> {
+    values
+        .into_iter()
+        .map(|value| normalize_hex(kind, &value, byte_len))
+        .collect()
 }
 
 fn normalize_hex(kind: &str, value: &str, byte_len: usize) -> Result<String, DatalensError> {
