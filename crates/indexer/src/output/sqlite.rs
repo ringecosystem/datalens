@@ -67,6 +67,7 @@ impl SqliteOutputStore {
                         selector TEXT,
                         topics_json TEXT,
                         signature TEXT,
+                        topic0 TEXT,
                         event_name TEXT,
                         data_payload TEXT,
                         raw_payload TEXT NOT NULL,
@@ -79,6 +80,11 @@ impl SqliteOutputStore {
                 .execute(&self.pool)
                 .await?;
                 ensure_event_name_column_sqlite(&self.pool).await?;
+                ensure_topic0_column_sqlite(&self.pool).await?;
+                backfill_topic0_sqlite(&self.pool).await?;
+                for statement in DROP_INDEX_STATEMENTS {
+                    sqlx::query(*statement).execute(&self.pool).await?;
+                }
                 for statement in INDEX_STATEMENTS {
                     sqlx::query(*statement).execute(&self.pool).await?;
                 }
@@ -99,6 +105,32 @@ async fn ensure_event_name_column_sqlite(pool: &SqlitePool) -> Result<(), sqlx::
     }
 }
 
+async fn ensure_topic0_column_sqlite(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    match sqlx::query("ALTER TABLE indexed_events ADD COLUMN topic0 TEXT")
+        .execute(pool)
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(error) if error.to_string().contains("duplicate column name") => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+async fn backfill_topic0_sqlite(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        UPDATE indexed_events
+        SET topic0 = json_extract(topics_json, '$[0]')
+        WHERE topic0 IS NULL
+          AND topics_json IS NOT NULL
+          AND json_valid(topics_json)
+        "#,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 impl OutputWriteSink for SqliteOutputStore {
     fn write_records(&self, records: &[IndexedRecord]) -> io::Result<OutputWriteResult> {
         self.runtime
@@ -115,15 +147,23 @@ impl QueryableStore for SqliteOutputStore {
     }
 }
 
+const DROP_INDEX_STATEMENTS: &[&str] = &[
+    "DROP INDEX IF EXISTS idx_indexed_events_index_name",
+    "DROP INDEX IF EXISTS idx_indexed_events_chain",
+    "DROP INDEX IF EXISTS idx_indexed_events_dataset",
+    "DROP INDEX IF EXISTS idx_indexed_events_selector",
+    "DROP INDEX IF EXISTS idx_indexed_events_block_range",
+    "DROP INDEX IF EXISTS idx_indexed_events_transaction",
+    "DROP INDEX IF EXISTS idx_indexed_events_event_name",
+    "DROP INDEX IF EXISTS idx_indexed_events_ordering",
+];
+
 const INDEX_STATEMENTS: &[&str] = &[
-    "CREATE INDEX IF NOT EXISTS idx_indexed_events_index_name ON indexed_events(index_name)",
-    "CREATE INDEX IF NOT EXISTS idx_indexed_events_chain ON indexed_events(chain_family, chain_id, chain_name)",
-    "CREATE INDEX IF NOT EXISTS idx_indexed_events_dataset ON indexed_events(dataset)",
-    "CREATE INDEX IF NOT EXISTS idx_indexed_events_selector ON indexed_events(selector)",
-    "CREATE INDEX IF NOT EXISTS idx_indexed_events_block_range ON indexed_events(chain_identity, dataset, block_number)",
-    "CREATE INDEX IF NOT EXISTS idx_indexed_events_transaction ON indexed_events(transaction_hash)",
-    "CREATE INDEX IF NOT EXISTS idx_indexed_events_event_name ON indexed_events(event_name)",
-    "CREATE INDEX IF NOT EXISTS idx_indexed_events_ordering ON indexed_events(chain_identity, dataset, block_number, transaction_index, event_index)",
+    "CREATE INDEX IF NOT EXISTS idx_indexed_events_query_page ON indexed_events(dataset, index_name, chain_name, chain_id, block_number, transaction_index, event_index, id)",
+    "CREATE INDEX IF NOT EXISTS idx_indexed_events_selector_page ON indexed_events(dataset, index_name, chain_name, chain_id, selector, block_number, transaction_index, event_index, id)",
+    "CREATE INDEX IF NOT EXISTS idx_indexed_events_topic0_page ON indexed_events(dataset, index_name, chain_name, chain_id, topic0, block_number, transaction_index, event_index, id)",
+    "CREATE INDEX IF NOT EXISTS idx_indexed_events_event_name_page ON indexed_events(dataset, index_name, chain_name, chain_id, event_name, block_number, transaction_index, event_index, id)",
+    "CREATE INDEX IF NOT EXISTS idx_indexed_events_transaction_page ON indexed_events(dataset, index_name, chain_name, chain_id, transaction_hash, block_number, transaction_index, event_index, id)",
 ];
 
 async fn write_records_sqlite(
@@ -184,13 +224,14 @@ async fn insert_record(
             selector,
             topics_json,
             signature,
+            topic0,
             event_name,
             data_payload,
             raw_payload,
             removed,
             finality
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(&row.unique_key)
@@ -208,6 +249,7 @@ async fn insert_record(
     .bind(&row.selector)
     .bind(&row.topics_json)
     .bind(&row.signature)
+    .bind(&row.topic0)
     .bind(&row.event_name)
     .bind(&row.data_payload)
     .bind(&row.raw_payload)
@@ -222,7 +264,7 @@ async fn query_records_sqlite(
     query: StoreQuery,
 ) -> Result<StoreQueryResult, sqlx::Error> {
     let filter = StoreQueryFilter::from_query(&query);
-    let mut builder = sqlx::QueryBuilder::new("SELECT * FROM indexed_events WHERE dataset = ");
+    let mut builder = sqlx::QueryBuilder::new(sqlite_query_prefix(&filter));
     builder.push_bind(query.dataset);
     if let Some(index) = filter.index {
         builder.push(" AND index_name = ").push_bind(index);
@@ -254,19 +296,12 @@ async fn query_records_sqlite(
         builder.push(" AND event_name = ").push_bind(event_name);
     }
     if let Some(topic0) = filter.topic0 {
-        builder
-            .push(" AND (signature = ")
-            .push_bind(topic0.clone())
-            .push(" OR topics_json LIKE ")
-            .push_bind(format!("[\"{topic0}\"%"))
-            .push(")");
+        builder.push(" AND topic0 = ").push_bind(topic0);
     }
     builder.push(" ORDER BY block_number, transaction_index, event_index, id");
-    if let Some(limit) = filter.limit {
-        builder
-            .push(" LIMIT ")
-            .push_bind(i64::try_from(limit).unwrap_or(i64::MAX));
-    }
+    builder
+        .push(" LIMIT ")
+        .push_bind(i64::try_from(filter.limit).unwrap_or(i64::MAX));
     if let Some(offset) = filter.offset {
         builder
             .push(" OFFSET ")
@@ -282,6 +317,20 @@ async fn query_records_sqlite(
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(StoreQueryResult { rows })
+}
+
+fn sqlite_query_prefix(filter: &StoreQueryFilter) -> &'static str {
+    if filter.transaction_hash.is_some() {
+        "SELECT * FROM indexed_events INDEXED BY idx_indexed_events_transaction_page WHERE dataset = "
+    } else if filter.selector.is_some() {
+        "SELECT * FROM indexed_events INDEXED BY idx_indexed_events_selector_page WHERE dataset = "
+    } else if filter.topic0.is_some() {
+        "SELECT * FROM indexed_events INDEXED BY idx_indexed_events_topic0_page WHERE dataset = "
+    } else if filter.event_name.is_some() {
+        "SELECT * FROM indexed_events INDEXED BY idx_indexed_events_event_name_page WHERE dataset = "
+    } else {
+        "SELECT * FROM indexed_events INDEXED BY idx_indexed_events_query_page WHERE dataset = "
+    }
 }
 
 fn sqlite_row_to_json(row: SqliteRow) -> Result<Value, sqlx::Error> {
