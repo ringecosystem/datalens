@@ -3,13 +3,13 @@ use std::sync::{Arc, Mutex};
 use datalens_chain::{ChainAdapter, DatasetSelector};
 use datalens_core::{DatasetKey, LedgerRange, QueryRows};
 use datalens_executor::{NativeQueryExecutionConfig, NativeQueryExecutor};
-use datalens_indexer::{
+use datalens_metrics::ApplicationIdentity;
+use datalens_planner::{FieldSelection, NativePlannerConfig, NativeQueryInput};
+use datalens_runtime_indexer::{
     InMemoryIndexCursorStore, IndexDatasetRequest, IndexDatasetSelection, IndexFinalityRequirement,
     IndexJob, IndexJobId, IndexRetryPolicy, IndexRunMode, IndexRunStatus, IndexRuntime,
     IndexRuntimeConfig,
 };
-use datalens_metrics::ApplicationIdentity;
-use datalens_planner::{FieldSelection, NativePlannerConfig, NativeQueryInput};
 use datalens_solana::{
     SolanaAdapter, SolanaBlock, SolanaCommitment, SolanaInnerInstructionGroup, SolanaInstruction,
     SolanaRpc, SolanaTokenBalance, SolanaTransaction, solana_address_selector,

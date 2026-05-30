@@ -25,7 +25,7 @@ e2e-lifecycle:
 multi-chain-e2e:
   cargo test -p datalens-solana
   cargo test -p datalens-tron
-  cargo test -p datalens-indexer --test full_indexing_e2e
+  cargo test -p datalens-runtime-indexer --test full_indexing_e2e
   cargo test -p datalens-cli --test index_commands
 
 production-readiness:

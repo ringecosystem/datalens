@@ -1509,6 +1509,7 @@ dependencies = [
  "datalens-indexer",
  "datalens-metrics",
  "datalens-planner",
+ "datalens-runtime-indexer",
  "datalens-solana",
  "datalens-storage",
  "datalens-tron",
@@ -1611,15 +1612,11 @@ dependencies = [
 name = "datalens-indexer"
 version = "0.1.0"
 dependencies = [
- "datalens-chain",
+ "datalens-client",
  "datalens-core",
- "datalens-metrics",
- "datalens-solana",
- "datalens-storage",
- "datalens-tron",
- "datalens-writer",
  "serde",
  "serde_json",
+ "toml",
 ]
 
 [[package]]
@@ -1639,6 +1636,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "datalens-runtime-indexer"
+version = "0.1.0"
+dependencies = [
+ "datalens-chain",
+ "datalens-core",
+ "datalens-metrics",
+ "datalens-solana",
+ "datalens-storage",
+ "datalens-tron",
+ "datalens-writer",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "datalens-solana"
 version = "0.1.0"
 dependencies = [
@@ -1646,9 +1658,9 @@ dependencies = [
  "datalens-chain-conformance",
  "datalens-core",
  "datalens-executor",
- "datalens-indexer",
  "datalens-metrics",
  "datalens-planner",
+ "datalens-runtime-indexer",
  "datalens-storage",
  "datalens-writer",
  "log",
@@ -1684,9 +1696,9 @@ dependencies = [
  "datalens-chain-conformance",
  "datalens-core",
  "datalens-executor",
- "datalens-indexer",
  "datalens-metrics",
  "datalens-planner",
+ "datalens-runtime-indexer",
  "datalens-storage",
  "datalens-writer",
  "log",

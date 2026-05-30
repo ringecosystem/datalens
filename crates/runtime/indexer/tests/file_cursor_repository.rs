@@ -2,7 +2,7 @@ use datalens_chain::DatasetSelector;
 use datalens_core::{
     ChainFamily, ChainIdentity, DatalensErrorKind, DatasetKey, LedgerRange, NetworkId,
 };
-use datalens_indexer::{
+use datalens_runtime_indexer::{
     FileIndexCursorStore, IndexChunk, IndexCursor, IndexCursorRepository, IndexFailureState,
     IndexJobId, IndexRetryPolicy,
 };
@@ -103,7 +103,7 @@ fn chunk(start: u64, end: u64, ordinal: u64) -> IndexChunk {
 
 fn temp_cursor_root(name: &str) -> std::path::PathBuf {
     let root = std::env::temp_dir().join(format!(
-        "datalens-indexer-file-cursor-{name}-{}",
+        "datalens-runtime-indexer-file-cursor-{name}-{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")

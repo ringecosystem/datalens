@@ -13,8 +13,8 @@ use datalens_core::{
     DatasetKey, DatasetRows, EvmReceipt, EvmTransaction, LedgerRange, LogRecord, NetworkId,
     QueryRows,
 };
-use datalens_indexer::*;
 use datalens_metrics::{ApplicationIdentity, MetricsRecorder};
+use datalens_runtime_indexer::*;
 use datalens_storage::{
     CacheOutcome, FillOutcome, LocalObjectStore, LocalStorage, QueryOutcome, UsageLedgerRepository,
     UsageLedgerStore,
@@ -517,7 +517,7 @@ fn log(block_number: u64, log_index: u64) -> LogRecord {
 
 fn temp_storage_root(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!(
-        "datalens-indexer-runtime-{name}-{}",
+        "datalens-runtime-indexer-runtime-{name}-{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")

@@ -5,13 +5,13 @@ use datalens_core::{
     DatalensError, DatalensErrorKind, DatasetKey, LedgerRange, QueryFinalityRequirement, QueryRows,
 };
 use datalens_executor::{NativeQueryExecutionConfig, NativeQueryExecutor};
-use datalens_indexer::{
+use datalens_metrics::ApplicationIdentity;
+use datalens_planner::{FieldSelection, NativePlannerConfig, NativeQueryInput};
+use datalens_runtime_indexer::{
     InMemoryIndexCursorStore, IndexDatasetRequest, IndexDatasetSelection, IndexFinalityRequirement,
     IndexJob, IndexJobId, IndexRetryPolicy, IndexRunMode, IndexRunStatus, IndexRuntime,
     IndexRuntimeConfig,
 };
-use datalens_metrics::ApplicationIdentity;
-use datalens_planner::{FieldSelection, NativePlannerConfig, NativeQueryInput};
 use datalens_storage::LocalStorage;
 use datalens_tron::{
     TronAdapter, TronBlock, TronContractEvent, TronContractEventPage, TronContractEventRequest,

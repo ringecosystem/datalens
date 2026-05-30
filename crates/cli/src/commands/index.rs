@@ -8,13 +8,13 @@ use datalens_core::{
 };
 use datalens_edge::auth::normalize_application_id;
 use datalens_evm::EvmRpcClient;
-use datalens_indexer::{
+use datalens_metrics::ApplicationIdentity;
+use datalens_runtime_indexer::{
     FileIndexCursorStore, IndexAccounting, IndexChunk, IndexDatasetProviderLimit,
     IndexDatasetRequest, IndexDatasetSelection, IndexFinalityRequirement, IndexJob, IndexJobId,
     IndexPlan, IndexRetryPolicy, IndexRunMode, IndexRunResult, IndexRuntime, IndexRuntimeConfig,
     IndexSkippedRange, IndexVerificationRange,
 };
-use datalens_metrics::ApplicationIdentity;
 use datalens_solana::{
     SolanaAdapter, SolanaHttpRpc, solana_address_selector, solana_program_selector,
     solana_signature_selector,
@@ -756,11 +756,11 @@ fn index_mode_name(mode: IndexRunMode) -> &'static str {
     }
 }
 
-fn index_status_name(status: datalens_indexer::IndexRunStatus) -> &'static str {
+fn index_status_name(status: datalens_runtime_indexer::IndexRunStatus) -> &'static str {
     match status {
-        datalens_indexer::IndexRunStatus::Completed => "completed",
-        datalens_indexer::IndexRunStatus::Partial => "partial",
-        datalens_indexer::IndexRunStatus::Failed => "failed",
+        datalens_runtime_indexer::IndexRunStatus::Completed => "completed",
+        datalens_runtime_indexer::IndexRunStatus::Partial => "partial",
+        datalens_runtime_indexer::IndexRunStatus::Failed => "failed",
     }
 }
 

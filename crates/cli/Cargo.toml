@@ -14,9 +14,10 @@ datalens-edge = { path = "../edge" }
 datalens-chain = { path = "../chain" }
 datalens-core = { path = "../core" }
 datalens-evm = { path = "../adapters/evm" }
-datalens-indexer = { path = "../runtime/indexer" }
+datalens-indexer = { path = "../indexer" }
 datalens-metrics = { path = "../metrics" }
 datalens-planner = { path = "../runtime/planner" }
+datalens-runtime-indexer = { path = "../runtime/indexer" }
 datalens-solana = { path = "../adapters/solana" }
 datalens-storage = { path = "../storage" }
 datalens-tron = { path = "../adapters/tron" }

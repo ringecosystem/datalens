@@ -1,7 +1,7 @@
 use datalens_chain::{ChainHeight, DatasetSelector, FinalityLevel, HeightRangeKind};
 use datalens_core::{ChainFamily, ChainIdentity, DatasetKey, LedgerRange, NetworkId};
-use datalens_indexer::*;
 use datalens_metrics::ApplicationIdentity;
+use datalens_runtime_indexer::*;
 
 #[test]
 fn test_index_job_contract_captures_chain_datasets_range_and_run_mode() {

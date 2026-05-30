@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "crates/edge",
+  "crates/indexer",
   "crates/chain",
   "crates/testing/chain-conformance",
   "crates/cli",
