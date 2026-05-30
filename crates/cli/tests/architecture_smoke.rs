@@ -77,10 +77,38 @@ fn edge_public_contract_omits_placeholder_modules_and_block_only_query_dtos() {
 
 #[test]
 fn serve_path_builds_registry_without_first_chain_selection() {
-    let source = include_str!("../src/commands.rs");
+    let source = include_str!("../src/commands/serve.rs");
 
     assert!(source.contains("build_service_registry(&config)?"));
     assert!(!source.contains("fn first_chain("));
+}
+
+#[test]
+fn cli_command_implementations_are_split_by_boundary() {
+    let commands_mod = include_str!("../src/commands/mod.rs");
+    let serve = include_str!("../src/commands/serve.rs");
+    let doctor = include_str!("../src/commands/doctor.rs");
+    let query = include_str!("../src/commands/query.rs");
+    let inspect = include_str!("../src/commands/inspect.rs");
+    let index = include_str!("../src/commands/index.rs");
+    let helpers = include_str!("../src/commands/helpers.rs");
+    let root = include_str!("../src/commands/root.rs");
+    let lib = include_str!("../src/lib.rs");
+
+    assert!(commands_mod.contains("mod serve;"));
+    assert!(commands_mod.contains("mod doctor;"));
+    assert!(commands_mod.contains("mod query;"));
+    assert!(commands_mod.contains("mod inspect;"));
+    assert!(commands_mod.contains("mod index;"));
+    assert!(commands_mod.contains("mod root;"));
+    assert!(!commands_mod.contains("fn serve_command("));
+    assert!(!commands_mod.contains("fn inspect_summary("));
+    assert!(!commands_mod.contains("pub struct Cli"));
+    assert!(!lib.contains("fn "));
+
+    for source in [serve, doctor, query, inspect, index, helpers, root] {
+        assert!(source.lines().count() <= 800);
+    }
 }
 
 #[test]

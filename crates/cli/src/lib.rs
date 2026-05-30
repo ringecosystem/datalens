@@ -1,13 +1,11 @@
 mod commands;
 mod config;
-mod index;
 mod runtime;
 
 pub use commands::*;
 pub use config::{doctor_chain_summary, validate_config};
 pub use datalens_core::DatalensErrorKind;
 pub use datalens_edge::config::{ChainConfig, DatalensConfig, FinalityConfig};
-pub use index::*;
 
 pub(crate) use commands::{chain_identity, configured_chain, parse_bind};
 pub(crate) use config::load_config;
