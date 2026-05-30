@@ -390,10 +390,10 @@ fn test_inspect_maintenance_reports_stable_dry_run_json() {
 }
 
 #[test]
-fn test_redact_url_hides_credentials_path_and_query() {
+fn test_redact_url_hides_credentials_and_sensitive_query_values() {
     assert_eq!(
-        redact_url("https://user:secret@example.invalid/path?token=secret"),
-        "https://example.invalid/<redacted>"
+        redact_url("https://user:secret@example.invalid/path?token=secret&batch=evm"),
+        "https://<redacted>@example.invalid/path?token=<redacted>&batch=evm"
     );
 }
 

@@ -253,6 +253,117 @@ fn test_index_doctor_prints_stable_json_for_valid_config() {
 }
 
 #[test]
+fn test_index_doctor_redacts_database_url_credentials() {
+    let root = temp_storage_root("index-doctor-database-redaction");
+    let config = write_declarative_index_config("index-doctor-database-redaction", &root);
+    let input = fs::read_to_string(&config)
+        .expect("read config")
+        .replace(
+            r#"[output.jsonl]
+path = ".data/indexes/ormp/events.jsonl""#,
+            r#"[output]
+kind = "database"
+
+[output.database]
+driver = "postgres"
+url = "postgres://indexer:database-password@db.example.invalid:5432/datalens?sslmode=require&password=query-password""#,
+        );
+    fs::write(&config, input).expect("write database config");
+
+    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_datalens"))
+        .args(["index", "doctor", "--config", &config])
+        .env("DATALENS_INDEX_TOKEN", "super-secret-token")
+        .output()
+        .expect("run index doctor");
+
+    assert!(
+        output.status.success(),
+        "index doctor failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let summary: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("index doctor JSON");
+    assert_eq!(
+        summary["output"]["database"]["url"],
+        "postgres://<redacted>@db.example.invalid:5432/datalens?sslmode=require&password=<redacted>"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stdout.contains("database-password"));
+    assert!(!stdout.contains("query-password"));
+    assert!(!stderr.contains("database-password"));
+    assert!(!stderr.contains("query-password"));
+}
+
+#[test]
+fn test_index_doctor_redacts_webhook_url_tokens_and_header_values() {
+    let root = temp_storage_root("index-doctor-webhook-redaction");
+    let config = write_declarative_index_config("index-doctor-webhook-redaction", &root);
+    let input = fs::read_to_string(&config)
+        .expect("read config")
+        .replace(
+            r#"[output.jsonl]
+path = ".data/indexes/ormp/events.jsonl""#,
+            r#"[output]
+kind = "webhook"
+
+[output.webhook]
+url = "https://hooks.example.invalid/indexed-events?token=webhook-token&batch=evm&signature=webhook-signature"
+
+[[output.webhook.headers]]
+name = "Authorization"
+value = "Bearer header-token"
+
+[[output.webhook.headers]]
+name = "X-Datalens-Source"
+value = "indexer""#,
+        );
+    fs::write(&config, input).expect("write webhook config");
+
+    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_datalens"))
+        .args(["index", "doctor", "--config", &config])
+        .env("DATALENS_INDEX_TOKEN", "super-secret-token")
+        .output()
+        .expect("run index doctor");
+
+    assert!(
+        output.status.success(),
+        "index doctor failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let summary: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("index doctor JSON");
+    assert_eq!(
+        summary["output"]["webhook"]["url"],
+        "https://hooks.example.invalid/indexed-events?token=<redacted>&batch=evm&signature=<redacted>"
+    );
+    assert_eq!(
+        summary["output"]["webhook"]["headers"][0]["name"],
+        "Authorization"
+    );
+    assert_eq!(summary["output"]["webhook"]["headers"][0]["secret"], true);
+    assert_eq!(
+        summary["output"]["webhook"]["headers"][1]["name"],
+        "X-Datalens-Source"
+    );
+    assert_eq!(summary["output"]["webhook"]["headers"][1]["secret"], false);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stdout.contains("webhook-token"));
+    assert!(!stdout.contains("webhook-signature"));
+    assert!(!stdout.contains("header-token"));
+    assert!(!stderr.contains("webhook-token"));
+    assert!(!stderr.contains("webhook-signature"));
+    assert!(!stderr.contains("header-token"));
+}
+
+#[test]
 fn test_ormp_example_is_declarative_multi_chain_config() {
     let example_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../examples/ormp")
