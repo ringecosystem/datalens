@@ -26,7 +26,8 @@ pub struct DatalensIndexConfig {
 
 impl DatalensIndexConfig {
     pub fn from_toml_str(input: &str) -> Result<Self, IndexerError> {
-        let raw = toml::from_str::<RawDatalensIndexConfig>(input)
+        let expanded = expand_env_vars(input)?;
+        let raw = toml::from_str::<RawDatalensIndexConfig>(&expanded)
             .map_err(|error| IndexerError::Config(error.to_string()))?;
         Self::try_from(raw)
     }
@@ -710,6 +711,26 @@ fn validate_optional_positive_usize(field: &str, value: Option<usize>, errors: &
     if value == Some(0) {
         errors.push(format!("{field}: must be greater than 0"));
     }
+}
+
+fn expand_env_vars(text: &str) -> Result<String, IndexerError> {
+    let mut expanded = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("${") {
+        expanded.push_str(&rest[..start]);
+        let tail = &rest[start + 2..];
+        let Some(end) = tail.find('}') else {
+            return Err(IndexerError::Config(
+                "unterminated environment variable placeholder".to_owned(),
+            ));
+        };
+        let name = &tail[..end];
+        let value = env::var(name).unwrap_or_default();
+        expanded.push_str(&value);
+        rest = &tail[end + 1..];
+    }
+    expanded.push_str(rest);
+    Ok(expanded)
 }
 
 fn validate_parquet_partitions(values: &[String], errors: &mut Vec<String>) {

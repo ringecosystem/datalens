@@ -194,6 +194,34 @@ fn test_parse_valid_toml_config_redacts_resolved_token_from_debug() {
 }
 
 #[test]
+fn test_parse_expands_environment_placeholders_before_schema_validation() {
+    let path = std::env::var("PATH").expect("PATH should exist for tests");
+
+    let input = valid_config()
+        .replace(
+            "endpoint = \"http://127.0.0.1:3000\"",
+            "endpoint = \"${PATH}\"",
+        )
+        .replace(
+            "[output.jsonl]\npath = \".data/indexes/ormp/events.jsonl\"",
+            "[output]\nkind = \"database\"\n\n[output.database]\ndriver = \"postgres\"\nurl = \"${PATH}\"",
+        );
+
+    let config = DatalensIndexConfig::from_toml_str(&input).expect("valid database config");
+
+    assert_eq!(config.client.endpoint, path);
+    assert_eq!(
+        config.output,
+        OutputConfig::Database {
+            database: DatabaseOutputConfig {
+                driver: DatabaseDriver::Postgres,
+                url: std::env::var("PATH").expect("PATH should exist for tests"),
+            },
+        }
+    );
+}
+
+#[test]
 fn test_parse_missing_fields_returns_field_oriented_error() {
     let error = parse_error(
         r#"

@@ -1,17 +1,18 @@
 # Local RustFS
 
-Goal: Start, stop, validate, and clean the local RustFS object storage environment for
-S3-compatible storage integration tests.
+Goal: Start, stop, validate, and clean the local RustFS object storage environment and
+the optional local Datalens Compose deployment example.
 
 Read this when: You need a local object store for `datalens-storage` S3 integration
-tests, manual storage checks, or future e2e flows.
+tests, manual storage checks, local PostgreSQL, or the local Datalens server and index
+daemon Compose example.
 
 Preconditions: Docker Compose is available, ports `9000` and `9001` are free, and local
 development secrets are copied from `.env.example` to `.env` if defaults should be
 overridden.
 
-Depends on: `docker-compose.yml` for the RustFS service, permission initialization, and
-bucket initialization.
+Depends on: `docker-compose.yml` for RustFS, PostgreSQL, bucket initialization, the
+Datalens server service, and the application index daemon service.
 
 Verification: `docker compose up -d rustfs-init` creates `.data/oss`, starts RustFS, and
 creates the configured bucket.
@@ -38,6 +39,29 @@ creates the configured bucket.
 
 RustFS S3 API listens on `http://localhost:9000`. The console listens on
 `http://localhost:9001` when `RUSTFS_CONSOLE_ENABLE=true`.
+
+## Local Deployment Example
+
+Start object storage and PostgreSQL:
+
+```sh
+docker compose up -d rustfs-init postgres
+```
+
+Build and start the local Datalens server and ORMP index daemon example:
+
+```sh
+docker compose --profile datalens up -d --build
+```
+
+Check service status:
+
+```sh
+docker compose --profile datalens ps
+```
+
+The Datalens server listens on `http://localhost:3000`. The index daemon GraphQL query
+service listens on `http://localhost:9090/graphql`.
 
 ## Test Configuration
 
@@ -75,3 +99,5 @@ rm -rf .data/oss
 ```
 
 `.data/oss` is local persisted object data and must not be committed.
+`.data/postgres` and `.data/indexes` are local PostgreSQL and index daemon data and must
+not be committed.
