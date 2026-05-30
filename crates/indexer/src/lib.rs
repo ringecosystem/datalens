@@ -8,6 +8,7 @@ mod evm_decode;
 pub mod graphql;
 mod output;
 mod plan;
+mod processor_runtime;
 mod runner;
 mod webhook_config;
 
@@ -20,4 +21,5 @@ pub use error::*;
 pub use evm_decode::*;
 pub use output::*;
 pub use plan::*;
+pub use processor_runtime::*;
 pub use runner::*;

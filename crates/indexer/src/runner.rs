@@ -384,7 +384,7 @@ fn generic_payload(task: &PlannedIndexTask, row: &serde_json::Value) -> serde_js
     serde_json::Value::Object(payload)
 }
 
-fn task_ledger_range(
+pub(crate) fn task_ledger_range(
     task: &PlannedIndexTask,
     start: u64,
     end: u64,
@@ -398,7 +398,7 @@ fn task_ledger_range(
     .map_err(|error| IndexerError::Runner(error.to_string()))
 }
 
-fn task_chain_identity(task: &PlannedIndexTask) -> Result<ChainIdentity, IndexerError> {
+pub(crate) fn task_chain_identity(task: &PlannedIndexTask) -> Result<ChainIdentity, IndexerError> {
     let family = match task.family.as_str() {
         "evm" => ChainFamily::Evm,
         value => ChainFamily::Other(value.to_owned()),
@@ -417,7 +417,7 @@ fn task_chain_identity(task: &PlannedIndexTask) -> Result<ChainIdentity, Indexer
         .map_err(|error| IndexerError::Runner(error.to_string()))
 }
 
-fn task_query_selector(
+pub(crate) fn task_query_selector(
     task: &PlannedIndexTask,
 ) -> Result<datalens_client::QuerySelector, IndexerError> {
     match task.selector.kind.as_str() {
@@ -634,7 +634,7 @@ pub struct ExecutedRange {
 }
 
 impl ExecutedRange {
-    fn from_ledger_range(range: &LedgerRange) -> Self {
+    pub(crate) fn from_ledger_range(range: &LedgerRange) -> Self {
         Self {
             kind: range_kind_name(range.kind()),
             start: range.start(),
@@ -652,7 +652,7 @@ fn range_kind_name(kind: LedgerRangeKind) -> String {
     }
 }
 
-fn resume_task_range(
+pub(crate) fn resume_task_range(
     task: &PlannedIndexTask,
     checkpoint: &IndexCheckpointFile,
     from_start: bool,
