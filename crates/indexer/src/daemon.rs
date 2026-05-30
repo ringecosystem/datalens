@@ -183,6 +183,13 @@ pub struct IndexDaemonReport {
 pub struct QueryServiceReport {
     pub bind: SocketAddr,
     pub graphql_path: String,
+    pub auth: QueryServiceAuthReport,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct QueryServiceAuthReport {
+    pub enabled: bool,
+    pub applications: usize,
 }
 
 struct RunningQueryService {
@@ -261,13 +268,20 @@ async fn start_graphql_service(
         None
     };
     let app = match metrics {
-        Some(metrics) => graphql::graphql_router_with_metrics(
+        Some(metrics) => graphql::graphql_router_with_auth(
             store,
             &config.query.path,
             config.query.playground,
-            metrics,
+            config.query.auth.clone(),
+            Some(metrics),
         ),
-        None => graphql::graphql_router(store, &config.query.path, config.query.playground),
+        None => graphql::graphql_router_with_auth(
+            store,
+            &config.query.path,
+            config.query.playground,
+            config.query.auth.clone(),
+            None,
+        ),
     };
     let graphql_path = config.query.path.clone();
     let (shutdown, shutdown_receiver) = oneshot::channel();
@@ -279,9 +293,20 @@ async fn start_graphql_service(
             .await
             .map_err(|error| IndexerError::Runner(format!("query service failed: {error}")))
     });
-    log::info!("index daemon GraphQL query service listening on {bind}");
+    log::info!(
+        "index daemon GraphQL query service listening on {bind} auth_enabled={} auth_applications={}",
+        config.query.auth.enabled,
+        config.query.auth.applications.len()
+    );
     Ok(RunningQueryService {
-        report: QueryServiceReport { bind, graphql_path },
+        report: QueryServiceReport {
+            bind,
+            graphql_path,
+            auth: QueryServiceAuthReport {
+                enabled: config.query.auth.enabled,
+                applications: config.query.auth.applications.len(),
+            },
+        },
         shutdown,
         handle,
     })
