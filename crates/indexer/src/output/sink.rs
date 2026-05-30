@@ -2,7 +2,7 @@ use std::{io, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::{jsonl::write_records_jsonl, sqlite::SqliteOutputStore};
+use super::{jsonl::write_records_jsonl, postgres::PostgresOutputStore, sqlite::SqliteOutputStore};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -10,6 +10,7 @@ pub enum OutputSinkConfig {
     StdoutJson,
     FileJson { path: PathBuf },
     DatabaseSqlite { url: String },
+    DatabasePostgres { url: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -49,6 +50,9 @@ impl OutputWriteSink for OutputSinkConfig {
             }),
             Self::FileJson { path } => write_records_jsonl(path, records),
             Self::DatabaseSqlite { url } => SqliteOutputStore::connect(url)?.write_records(records),
+            Self::DatabasePostgres { url } => {
+                PostgresOutputStore::connect(url)?.write_records(records)
+            }
         }
     }
 }

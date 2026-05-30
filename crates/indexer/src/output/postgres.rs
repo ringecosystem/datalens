@@ -1,13 +1,9 @@
-use std::{
-    io,
-    path::{Path, PathBuf},
-    str::FromStr,
-};
+use std::io;
 
 use serde_json::{Map, Value};
 use sqlx::{
-    Row, Sqlite, SqlitePool, Transaction,
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow},
+    PgPool, Postgres, Row, Transaction,
+    postgres::{PgPoolOptions, PgRow},
 };
 use tokio::runtime::Runtime;
 
@@ -20,25 +16,16 @@ use super::{
     filter::StoreQueryFilter,
 };
 
-pub struct SqliteOutputStore {
+pub struct PostgresOutputStore {
     runtime: Runtime,
-    pool: SqlitePool,
+    pool: PgPool,
 }
 
-impl SqliteOutputStore {
+impl PostgresOutputStore {
     pub fn connect(url: &str) -> io::Result<Self> {
-        ensure_sqlite_parent_dir(url)?;
         let runtime = Runtime::new().map_err(io::Error::other)?;
-        let options = SqliteConnectOptions::from_str(url)
-            .map_err(io::Error::other)?
-            .create_if_missing(true);
         let pool = runtime
-            .block_on(async {
-                SqlitePoolOptions::new()
-                    .max_connections(1)
-                    .connect_with(options)
-                    .await
-            })
+            .block_on(async { PgPoolOptions::new().max_connections(5).connect(url).await })
             .map_err(io::Error::other)?;
         let store = Self { runtime, pool };
         store.initialize_schema()?;
@@ -51,27 +38,29 @@ impl SqliteOutputStore {
                 sqlx::query(
                     r#"
                     CREATE TABLE IF NOT EXISTS indexed_events (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        id BIGSERIAL PRIMARY KEY,
                         unique_key TEXT NOT NULL UNIQUE,
                         index_name TEXT NOT NULL,
                         chain_family TEXT NOT NULL,
-                        chain_id INTEGER NOT NULL,
+                        chain_id BIGINT NOT NULL,
                         chain_name TEXT NOT NULL,
                         chain_identity TEXT NOT NULL,
                         dataset TEXT NOT NULL,
-                        block_number INTEGER NOT NULL,
+                        block_number BIGINT NOT NULL,
                         block_hash TEXT,
                         transaction_hash TEXT,
-                        transaction_index INTEGER,
-                        event_index INTEGER,
+                        transaction_index BIGINT,
+                        event_index BIGINT,
                         selector TEXT,
                         topics_json TEXT,
                         signature TEXT,
                         data_payload TEXT,
                         raw_payload TEXT NOT NULL,
-                        removed INTEGER,
+                        removed BIGINT,
                         finality TEXT,
-                        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                        created_at TEXT NOT NULL DEFAULT (
+                            to_char(clock_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+                        )
                     )
                     "#,
                 )
@@ -86,34 +75,35 @@ impl SqliteOutputStore {
     }
 }
 
-impl OutputWriteSink for SqliteOutputStore {
+impl OutputWriteSink for PostgresOutputStore {
     fn write_records(&self, records: &[IndexedRecord]) -> io::Result<OutputWriteResult> {
         self.runtime
-            .block_on(write_records_sqlite(&self.pool, records))
+            .block_on(write_records_postgres(&self.pool, records))
             .map_err(io::Error::other)
     }
 }
 
-impl QueryableStore for SqliteOutputStore {
+impl QueryableStore for PostgresOutputStore {
     fn query(&self, query: StoreQuery) -> Result<StoreQueryResult, IndexerError> {
         self.runtime
-            .block_on(query_records_sqlite(&self.pool, query))
-            .map_err(|error| IndexerError::Runner(format!("sqlite query failed: {error}")))
+            .block_on(query_records_postgres(&self.pool, query))
+            .map_err(|error| IndexerError::Runner(format!("postgres query failed: {error}")))
     }
 }
 
 const INDEX_STATEMENTS: &[&str] = &[
-    "CREATE INDEX IF NOT EXISTS idx_indexed_events_index_name ON indexed_events(index_name)",
-    "CREATE INDEX IF NOT EXISTS idx_indexed_events_chain ON indexed_events(chain_family, chain_id, chain_name)",
-    "CREATE INDEX IF NOT EXISTS idx_indexed_events_dataset ON indexed_events(dataset)",
-    "CREATE INDEX IF NOT EXISTS idx_indexed_events_selector ON indexed_events(selector)",
-    "CREATE INDEX IF NOT EXISTS idx_indexed_events_block_range ON indexed_events(chain_identity, dataset, block_number)",
-    "CREATE INDEX IF NOT EXISTS idx_indexed_events_transaction ON indexed_events(transaction_hash)",
-    "CREATE INDEX IF NOT EXISTS idx_indexed_events_ordering ON indexed_events(chain_identity, dataset, block_number, transaction_index, event_index)",
+    "CREATE INDEX IF NOT EXISTS idx_indexed_events_pg_index_name ON indexed_events(index_name)",
+    "CREATE INDEX IF NOT EXISTS idx_indexed_events_pg_chain ON indexed_events(chain_family, chain_id, chain_name)",
+    "CREATE INDEX IF NOT EXISTS idx_indexed_events_pg_dataset ON indexed_events(dataset)",
+    "CREATE INDEX IF NOT EXISTS idx_indexed_events_pg_selector ON indexed_events(selector)",
+    "CREATE INDEX IF NOT EXISTS idx_indexed_events_pg_block_range ON indexed_events(chain_identity, dataset, block_number)",
+    "CREATE INDEX IF NOT EXISTS idx_indexed_events_pg_transaction ON indexed_events(transaction_hash)",
+    "CREATE INDEX IF NOT EXISTS idx_indexed_events_pg_signature ON indexed_events(signature)",
+    "CREATE INDEX IF NOT EXISTS idx_indexed_events_pg_ordering ON indexed_events(chain_identity, dataset, block_number, transaction_index, event_index)",
 ];
 
-async fn write_records_sqlite(
-    pool: &SqlitePool,
+async fn write_records_postgres(
+    pool: &PgPool,
     records: &[IndexedRecord],
 ) -> Result<OutputWriteResult, sqlx::Error> {
     let mut transaction = pool.begin().await?;
@@ -145,12 +135,12 @@ async fn write_records_sqlite(
 }
 
 async fn insert_record(
-    transaction: &mut Transaction<'_, Sqlite>,
+    transaction: &mut Transaction<'_, Postgres>,
     row: &NormalizedIndexedEvent,
-) -> Result<sqlx::sqlite::SqliteQueryResult, sqlx::Error> {
+) -> Result<sqlx::postgres::PgQueryResult, sqlx::Error> {
     sqlx::query(
         r#"
-        INSERT OR IGNORE INTO indexed_events (
+        INSERT INTO indexed_events (
             unique_key,
             index_name,
             chain_family,
@@ -171,7 +161,8 @@ async fn insert_record(
             removed,
             finality
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+        ON CONFLICT (unique_key) DO NOTHING
         "#,
     )
     .bind(&row.unique_key)
@@ -197,12 +188,13 @@ async fn insert_record(
     .await
 }
 
-async fn query_records_sqlite(
-    pool: &SqlitePool,
+async fn query_records_postgres(
+    pool: &PgPool,
     query: StoreQuery,
 ) -> Result<StoreQueryResult, sqlx::Error> {
     let filter = StoreQueryFilter::from_query(&query);
-    let mut builder = sqlx::QueryBuilder::new("SELECT * FROM indexed_events WHERE dataset = ");
+    let mut builder =
+        sqlx::QueryBuilder::<Postgres>::new("SELECT * FROM indexed_events WHERE dataset = ");
     builder.push_bind(query.dataset);
     if let Some(index) = filter.index {
         builder.push(" AND index_name = ").push_bind(index);
@@ -237,13 +229,13 @@ async fn query_records_sqlite(
         .fetch_all(pool)
         .await?
         .into_iter()
-        .map(sqlite_row_to_json)
+        .map(postgres_row_to_json)
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(StoreQueryResult { rows })
 }
 
-fn sqlite_row_to_json(row: SqliteRow) -> Result<Value, sqlx::Error> {
+fn postgres_row_to_json(row: PgRow) -> Result<Value, sqlx::Error> {
     let raw_payload: String = row.try_get("raw_payload")?;
     let value = serde_json::from_str::<Value>(&raw_payload).unwrap_or(Value::Object(Map::new()));
     Ok(row_payload_with_metadata(
@@ -255,30 +247,4 @@ fn sqlite_row_to_json(row: SqliteRow) -> Result<Value, sqlx::Error> {
         row.try_get("dataset")?,
         row.try_get("created_at")?,
     ))
-}
-
-fn ensure_sqlite_parent_dir(url: &str) -> io::Result<()> {
-    let Some(path) = sqlite_file_path(url) else {
-        return Ok(());
-    };
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)?;
-    }
-    Ok(())
-}
-
-fn sqlite_file_path(url: &str) -> Option<PathBuf> {
-    if url == "sqlite::memory:" || url.contains("mode=memory") {
-        return None;
-    }
-    let path = url.strip_prefix("sqlite:")?;
-    let path = path.split_once('?').map(|(path, _)| path).unwrap_or(path);
-    let path = path.strip_prefix("//").unwrap_or(path);
-    if path.is_empty() {
-        None
-    } else {
-        Some(Path::new(path).to_path_buf())
-    }
 }

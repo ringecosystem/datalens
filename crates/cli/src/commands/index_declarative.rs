@@ -2,8 +2,9 @@ use std::fs;
 
 use datalens_client::DatalensClient;
 use datalens_indexer::{
-    CheckpointPolicy, DatalensIndexConfig, FinalityRequirement, IndexDataset, IndexPlanBuilder,
-    IndexRunner, IndexRunnerOptions, OutputConfig, OutputSinkConfig, SourceConfig,
+    CheckpointPolicy, DatabaseDriver, DatalensIndexConfig, FinalityRequirement, IndexDataset,
+    IndexPlanBuilder, IndexRunner, IndexRunnerOptions, OutputConfig, OutputSinkConfig,
+    SourceConfig,
 };
 
 use super::{IndexDoctorCommand, IndexPlanCommand, IndexRunCommand};
@@ -35,8 +36,13 @@ pub(super) fn index_run(
 fn output_sink_config(output: &OutputConfig) -> OutputSinkConfig {
     match output {
         OutputConfig::Jsonl { path } => OutputSinkConfig::FileJson { path: path.clone() },
-        OutputConfig::Database { database } => OutputSinkConfig::DatabaseSqlite {
-            url: database.url.clone(),
+        OutputConfig::Database { database } => match database.driver {
+            DatabaseDriver::Sqlite => OutputSinkConfig::DatabaseSqlite {
+                url: database.url.clone(),
+            },
+            DatabaseDriver::Postgres => OutputSinkConfig::DatabasePostgres {
+                url: database.url.clone(),
+            },
         },
     }
 }
@@ -101,7 +107,7 @@ fn declarative_output_summary(output: &OutputConfig) -> serde_json::Value {
             serde_json::json!({
                 "kind": capability.kind.as_str(),
                 "database": {
-                    "driver": "sqlite",
+                    "driver": database_driver_name(database.driver),
                     "url": database.url,
                 },
                 "capability": {
@@ -112,6 +118,13 @@ fn declarative_output_summary(output: &OutputConfig) -> serde_json::Value {
                 },
             })
         }
+    }
+}
+
+fn database_driver_name(driver: DatabaseDriver) -> &'static str {
+    match driver {
+        DatabaseDriver::Sqlite => "sqlite",
+        DatabaseDriver::Postgres => "postgres",
     }
 }
 
