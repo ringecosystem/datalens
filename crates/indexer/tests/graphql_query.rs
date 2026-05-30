@@ -45,30 +45,50 @@ fn record(block_number: u64, log_index: u64, address: &str) -> IndexedRecord {
 }
 
 fn decoded_record(block_number: u64, log_index: u64, signature: &str) -> IndexedRecord {
+    decoded_record_with_status(block_number, log_index, signature, "decoded", None)
+}
+
+fn decoded_record_with_status(
+    block_number: u64,
+    log_index: u64,
+    signature: &str,
+    decode_status: &str,
+    decode_error: Option<&str>,
+) -> IndexedRecord {
+    let mut payload = serde_json::json!({
+        "block_number": block_number,
+        "block_hash": format!("0xblock{block_number:064x}"),
+        "transaction_hash": format!("0xtx{block_number:064x}"),
+        "transaction_index": 2,
+        "log_index": log_index,
+        "address": "0x2cd1867fb8016f93710b6386f7f9f1d540a60812",
+        "topics": [
+            "0x9e6c1c44f7b2b36245897f9be35a5500f3a9e0d5b8f29f89dbf04b54053bb7d1"
+        ],
+        "signature": signature,
+        "event_name": "MessageAccepted",
+        "decode_status": decode_status,
+        "decode_error": decode_error,
+        "data": "0x010203",
+        "removed": false,
+    });
+    if decode_status != "failed"
+        && let Some(object) = payload.as_object_mut()
+    {
+        object.insert(
+            "decoded".to_owned(),
+            serde_json::json!({
+                "msgHash": "0xabc",
+                "fromChainId": "1"
+            }),
+        );
+    }
     IndexedRecord {
         index: "ormp".to_owned(),
         chain: "ethereum".to_owned(),
         chain_id: 1,
         dataset: "evm.logs".to_owned(),
-        payload: serde_json::json!({
-            "block_number": block_number,
-            "block_hash": format!("0xblock{block_number:064x}"),
-            "transaction_hash": format!("0xtx{block_number:064x}"),
-            "transaction_index": 2,
-            "log_index": log_index,
-            "address": "0x2cd1867fb8016f93710b6386f7f9f1d540a60812",
-            "topics": [
-                "0x9e6c1c44f7b2b36245897f9be35a5500f3a9e0d5b8f29f89dbf04b54053bb7d1"
-            ],
-            "signature": signature,
-            "event_name": "MessageAccepted",
-            "decoded": {
-                "msgHash": "0xabc",
-                "fromChainId": "1"
-            },
-            "data": "0x010203",
-            "removed": false,
-        }),
+        payload,
     }
 }
 
@@ -205,6 +225,156 @@ fn test_graphql_events_query_filters_signature_and_returns_decoded_shape() {
     assert_eq!(events[0]["eventName"], "MessageAccepted");
     assert_eq!(events[0]["decoded"]["msgHash"], "0xabc");
     assert_eq!(events[0]["decoded"]["fromChainId"], "1");
+}
+
+#[test]
+fn test_graphql_decoded_events_query_returns_metadata_args_and_decode_status() {
+    let store = SqliteOutputStore::connect("sqlite::memory:").expect("sqlite store connects");
+    store
+        .write_records(&[
+            record(5, 0, "0x0000000000000000000000000000000000000001"),
+            decoded_record(10, 1, "MessageAccepted(bytes32,uint256,address,address)"),
+        ])
+        .expect("write records");
+    let schema = graphql_schema(Arc::new(store));
+
+    let response = Runtime::new().expect("runtime").block_on(async {
+        schema
+            .execute(
+                r#"
+            {
+              decodedEvents(
+                indexName: "ormp"
+                chain: "ethereum"
+                chainId: 1
+                dataset: "evm.logs"
+                eventName: "MessageAccepted"
+                limit: 10
+              ) {
+                indexName
+                chain
+                chainId
+                dataset
+                blockNumber
+                blockHash
+                transactionHash
+                transactionIndex
+                logIndex
+                address
+                eventName
+                signature
+                topic0
+                decodedArgs
+                decodeStatus
+                decodeError
+                payload
+                createdAt
+              }
+            }
+            "#,
+            )
+            .await
+    });
+
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let body = response.data.into_json().expect("graphql data");
+    let events = body["decodedEvents"]
+        .as_array()
+        .expect("decodedEvents array");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["indexName"], "ormp");
+    assert_eq!(events[0]["chain"], "ethereum");
+    assert_eq!(events[0]["chainId"], 1);
+    assert_eq!(events[0]["dataset"], "evm.logs");
+    assert_eq!(events[0]["blockNumber"], 10);
+    assert_eq!(events[0]["logIndex"], 1);
+    assert_eq!(
+        events[0]["address"],
+        "0x2cd1867fb8016f93710b6386f7f9f1d540a60812"
+    );
+    assert_eq!(events[0]["eventName"], "MessageAccepted");
+    assert_eq!(
+        events[0]["signature"],
+        "MessageAccepted(bytes32,uint256,address,address)"
+    );
+    assert_eq!(
+        events[0]["topic0"],
+        "0x9e6c1c44f7b2b36245897f9be35a5500f3a9e0d5b8f29f89dbf04b54053bb7d1"
+    );
+    assert_eq!(events[0]["decodedArgs"]["msgHash"], "0xabc");
+    assert_eq!(events[0]["decodedArgs"]["fromChainId"], "1");
+    assert_eq!(events[0]["decodeStatus"], "decoded");
+    assert!(events[0]["decodeError"].is_null());
+    assert_eq!(events[0]["payload"]["decoded"]["msgHash"], "0xabc");
+    assert!(events[0]["createdAt"].as_str().is_some());
+}
+
+#[test]
+fn test_graphql_decoded_events_query_supports_empty_result_pagination_and_filters() {
+    let store = SqliteOutputStore::connect("sqlite::memory:").expect("sqlite store connects");
+    store
+        .write_records(&[
+            decoded_record(10, 0, "MessageAccepted(bytes32,uint256,address,address)"),
+            decoded_record_with_status(
+                20,
+                1,
+                "MessageAccepted(bytes32,uint256,address,address)",
+                "failed",
+                Some("missing indexed argument"),
+            ),
+            decoded_record(30, 2, "MessageDispatched(bytes32,uint256,address,address)"),
+        ])
+        .expect("write records");
+    let schema = graphql_schema(Arc::new(store));
+
+    let response = Runtime::new().expect("runtime").block_on(async {
+        schema
+            .execute(
+                GraphqlRequest::new(
+                    r#"
+                query DecodedEvents($address: String!, $topic0: String!) {
+                  first: decodedEvents(dataset: "evm.logs", eventName: "Missing", limit: 10) {
+                    blockNumber
+                  }
+                  secondPage: decodedEvents(
+                    indexName: "ormp"
+                    chain: "ethereum"
+                    chainId: 1
+                    dataset: "evm.logs"
+                    address: $address
+                    eventName: "MessageAccepted"
+                    signature: "MessageAccepted(bytes32,uint256,address,address)"
+                    topic0: $topic0
+                    fromBlock: 1
+                    toBlock: 25
+                    limit: 1
+                    after: "1"
+                  ) {
+                    blockNumber
+                    logIndex
+                    decodeStatus
+                    decodeError
+                  }
+                }
+                "#,
+                )
+                .variables(Variables::from_json(serde_json::json!({
+                    "address": "0x2cd1867fb8016f93710b6386f7f9f1d540a60812",
+                    "topic0": "0x9e6c1c44f7b2b36245897f9be35a5500f3a9e0d5b8f29f89dbf04b54053bb7d1",
+                }))),
+            )
+            .await
+    });
+
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let body = response.data.into_json().expect("graphql data");
+    assert_eq!(body["first"].as_array().expect("first array").len(), 0);
+    let second_page = body["secondPage"].as_array().expect("secondPage array");
+    assert_eq!(second_page.len(), 1);
+    assert_eq!(second_page[0]["blockNumber"], 20);
+    assert_eq!(second_page[0]["logIndex"], 1);
+    assert_eq!(second_page[0]["decodeStatus"], "failed");
+    assert_eq!(second_page[0]["decodeError"], "missing indexed argument");
 }
 
 #[test]

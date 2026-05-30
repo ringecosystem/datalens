@@ -208,6 +208,11 @@ impl QueryableStore for DaemonDatabaseQueryStore {
         let store = open_database_query_store(self.driver, &self.url)?;
         store.query(query)
     }
+
+    fn query_decoded_events(&self, query: StoreQuery) -> Result<StoreQueryResult, IndexerError> {
+        let store = open_database_query_store(self.driver, &self.url)?;
+        store.query_decoded_events(query)
+    }
 }
 
 fn open_database_query_store(
