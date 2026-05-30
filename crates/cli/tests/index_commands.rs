@@ -66,6 +66,23 @@ fn test_index_run_accepts_config_path_and_checkpoint_options() {
 }
 
 #[test]
+fn test_index_daemon_accepts_config_path() {
+    let cli = Cli::parse_from(["datalens", "index", "daemon", "--config", "app.index.toml"]);
+
+    match cli.command {
+        Command::Index(command) => match *command {
+            IndexCommand {
+                command: IndexSubcommand::Daemon(command),
+            } => {
+                assert_eq!(command.config, "app.index.toml");
+            }
+            command => panic!("expected index daemon command, got {command:?}"),
+        },
+        command => panic!("expected index daemon command, got {command:?}"),
+    }
+}
+
+#[test]
 fn test_index_plan_prints_json_from_declarative_config() {
     let root = temp_storage_root("index-plan-json");
     let config_path = root.join("app.index.toml");
@@ -1162,6 +1179,9 @@ fn index_test_common(command: &IndexWorkflowCommand) -> &IndexCommonCommand {
         }
         IndexWorkflowCommand::Run(_) => {
             unreachable!("index run does not use runtime index common options")
+        }
+        IndexWorkflowCommand::Daemon(_) => {
+            unreachable!("index daemon does not use runtime index common options")
         }
         IndexWorkflowCommand::Doctor(_) => {
             unreachable!("index doctor does not use runtime index common options")

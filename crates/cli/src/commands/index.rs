@@ -40,6 +40,7 @@ pub struct IndexCommand {
 pub enum IndexWorkflowCommand {
     Plan(IndexPlanCommand),
     Run(IndexRunCommand),
+    Daemon(IndexDaemonCommand),
     Backfill(IndexBackfillCommand),
     Resume(IndexResumeCommand),
     Repair(IndexRepairCommand),
@@ -69,6 +70,13 @@ pub struct IndexRunCommand {
 
     #[arg(long)]
     pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+/// Run declarative indexing continuously and serve query APIs when configured.
+pub struct IndexDaemonCommand {
+    #[arg(long, default_value = "app.index.toml")]
+    pub config: String,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -178,6 +186,12 @@ pub fn index_command(
 
     if let IndexWorkflowCommand::Run(command) = command.command {
         let summary = index_run(command)?;
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+        return Ok(());
+    }
+
+    if let IndexWorkflowCommand::Daemon(command) = command.command {
+        let summary = super::index_declarative::index_daemon(command)?;
         println!("{}", serde_json::to_string_pretty(&summary)?);
         return Ok(());
     }
@@ -637,6 +651,9 @@ fn index_common(command: &IndexWorkflowCommand) -> &IndexCommonCommand {
         IndexWorkflowCommand::Run(_) => {
             unreachable!("index run does not use runtime index common options")
         }
+        IndexWorkflowCommand::Daemon(_) => {
+            unreachable!("index daemon does not use runtime index common options")
+        }
         IndexWorkflowCommand::Doctor(_) => {
             unreachable!("index doctor does not use runtime index common options")
         }
@@ -655,6 +672,9 @@ fn index_dry_run(command: &IndexWorkflowCommand) -> bool {
         IndexWorkflowCommand::Run(_) => {
             unreachable!("index run does not use runtime index dry-run options")
         }
+        IndexWorkflowCommand::Daemon(_) => {
+            unreachable!("index daemon does not use runtime index dry-run options")
+        }
         IndexWorkflowCommand::Doctor(_) => {
             unreachable!("index doctor does not use runtime index dry-run options")
         }
@@ -672,6 +692,9 @@ fn index_run_mode(command: &IndexWorkflowCommand) -> IndexRunMode {
         }
         IndexWorkflowCommand::Run(_) => {
             unreachable!("index run does not use runtime index run modes")
+        }
+        IndexWorkflowCommand::Daemon(_) => {
+            unreachable!("index daemon does not use runtime index run modes")
         }
         IndexWorkflowCommand::Doctor(_) => {
             unreachable!("index doctor does not use runtime index run modes")
