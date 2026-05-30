@@ -29,5 +29,7 @@ outputs.
   the full durable cache lifecycle E2E with optional RustFS/S3-compatible coverage.
 - `local-rustfs.md`: local RustFS object storage setup, bucket initialization, S3 test
   variables, stop, and cleanup commands.
+- `postgres-indexer-smoke.md`: opt-in PostgreSQL database setup and indexer smoke
+  target for schema creation, idempotent writes, query filters, and GraphQL events.
 - `production.md`: production-shaped binary/container build, config doctor, runtime
   endpoint smoke, backup/restore, and release gate commands.

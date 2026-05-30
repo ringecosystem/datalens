@@ -38,6 +38,12 @@ s3-e2e:
   cargo test -p datalens-storage --test object_store test_s3_object_store_put_get_exists_list_delete_with_prefix
   cargo test -p datalens-edge --test lifecycle test_s3_lifecycle_is_gated_and_uses_dedicated_prefix
 
+postgres-up:
+  docker compose up -d --wait postgres
+
+indexer-postgres-e2e:
+  DATALENS_REQUIRE_POSTGRES_TEST_URL=1 DATALENS_POSTGRES_TEST_URL="${DATALENS_POSTGRES_TEST_URL:-postgres://datalens:datalens@127.0.0.1:5432/datalens_test}" cargo test -p datalens-indexer --test postgres_output -- --test-threads=1
+
 container-smoke:
   docker build -t datalens:smoke .
   docker run --rm datalens:smoke --help
