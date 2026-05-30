@@ -86,9 +86,17 @@ max_staged_bytes = 33554432
 enabled = true
 default_application = "ormp"
 
-[edge.graphql]
-enabled = false
+[query.native]
+graphql_enabled = false
+path = "/native/graphql"
 playground_enabled = false
+playground_path = "/native/graphiql"
+
+[query.index]
+graphql_enabled = false
+path = "/index/graphql"
+playground_enabled = false
+playground_path = "/index/graphiql"
 
 [warmup]
 enabled = false

@@ -247,7 +247,7 @@ async fn test_graphql_query_enforces_application_auth_like_rest_query() {
     let missing = app
         .clone()
         .oneshot(
-            Request::post("/graphql")
+            Request::post("/native/graphql")
                 .header("content-type", "application/json")
                 .body(Body::from(body.clone()))
                 .expect("missing request"),
@@ -256,7 +256,7 @@ async fn test_graphql_query_enforces_application_auth_like_rest_query() {
         .expect("missing response");
     let authorized = app
         .oneshot(
-            Request::post("/graphql")
+            Request::post("/native/graphql")
                 .header("content-type", "application/json")
                 .header("x-datalens-application", "graphql-app")
                 .header("authorization", "Bearer secret-token")
@@ -410,7 +410,7 @@ async fn test_graphql_query_records_metrics_with_application_header() {
     let response = app
         .clone()
         .oneshot(
-            Request::post("/graphql")
+            Request::post("/native/graphql")
                 .header("content-type", "application/json")
                 .header("x-datalens-application", "wallet-search")
                 .body(Body::from(

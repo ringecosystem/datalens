@@ -69,20 +69,10 @@ fn test_index_run_accepts_config_path_and_checkpoint_options() {
 }
 
 #[test]
-fn test_index_daemon_accepts_config_path() {
-    let cli = Cli::parse_from(["datalens", "index", "daemon", "--config", "app.index.toml"]);
-
-    match cli.command {
-        Command::Index(command) => match *command {
-            IndexCommand {
-                command: IndexSubcommand::Daemon(command),
-            } => {
-                assert_eq!(command.config, "app.index.toml");
-            }
-            command => panic!("expected index daemon command, got {command:?}"),
-        },
-        command => panic!("expected index daemon command, got {command:?}"),
-    }
+fn test_index_daemon_is_not_primary_cli_entrypoint() {
+    assert!(
+        Cli::try_parse_from(["datalens", "index", "daemon", "--config", "app.index.toml"]).is_err()
+    );
 }
 
 #[test]
@@ -563,92 +553,64 @@ fn test_ormp_example_is_declarative_multi_chain_config() {
 }
 
 #[test]
-fn test_production_index_daemon_example_uses_placeholder_environment() {
+fn test_compose_service_config_embeds_application_index_environment() {
     let config_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples/config/datalens.index-daemon.production.toml")
+        .join("../../config/datalens.compose.toml")
         .canonicalize()
-        .expect("production index daemon example");
+        .expect("compose service config");
 
     unsafe {
-        std::env::set_var(
-            "DATALENS_INDEX_CLIENT_ENDPOINT",
-            "https://datalens.example.invalid",
-        );
-        std::env::set_var(
-            "DATALENS_INDEX_APPLICATION_TOKEN",
-            "replace-with-index-token",
-        );
+        std::env::set_var("DATALENS_S3_BUCKET", "datalens");
+        std::env::set_var("DATALENS_S3_PREFIX", "local-compose");
+        std::env::set_var("DATALENS_S3_REGION", "auto");
+        std::env::set_var("DATALENS_S3_ENDPOINT_URL", "http://127.0.0.1:9000");
+        std::env::set_var("DATALENS_ETHEREUM_RPC_URL", "http://example.invalid");
+        std::env::set_var("DATALENS_PUBLIC_APP_TOKEN", "replace-with-public-token");
+        std::env::set_var("DATALENS_ORMP_TOKEN", "replace-with-ormp-token");
+        std::env::set_var("DATALENS_METRICS_TOKEN", "replace-with-metrics-token");
         std::env::set_var(
             "DATALENS_INDEX_DATABASE_URL",
             "postgres://datalens:replace-with-password@postgres.example.invalid:5432/datalens",
         );
-        std::env::set_var("DATALENS_INDEX_QUERY_BIND", "0.0.0.0:9090");
         std::env::set_var(
             "DATALENS_INDEX_QUERY_METRICS_TOKEN",
             "replace-with-index-metrics-token",
         );
     }
 
-    let input = fs::read_to_string(&config_path).expect("read production index daemon example");
-    let config =
-        DatalensIndexConfig::from_toml_str(&input).expect("parse production index daemon example");
-
-    assert_eq!(config.client.application, "public");
-    assert_eq!(
-        config.client.token.env(),
-        "DATALENS_INDEX_APPLICATION_TOKEN"
-    );
-    assert_eq!(config.index.dataset.as_str(), "evm.logs");
-    assert!(config.query.enabled);
-    assert_eq!(config.query.protocol, QueryProtocol::Graphql);
-    assert_eq!(config.query.bind, "0.0.0.0:9090");
-    assert_eq!(
-        datalens_indexer::validate_daemon_config(&config).expect("daemon config"),
-        DaemonQueryMode::Graphql
-    );
-    match &config.output {
-        OutputConfig::Database { database } => assert_eq!(database.driver.as_str(), "postgres"),
-        output => panic!("expected database output, got {output:?}"),
-    }
-    match &config.checkpoint {
-        CheckpointPolicy::File { path } => assert!(path.starts_with("/var/lib/datalens/indexes")),
-        checkpoint => panic!("expected file checkpoint, got {checkpoint:?}"),
-    }
-
-    let doctor_output = ProcessCommand::new(env!("CARGO_BIN_EXE_datalens"))
-        .args(["index", "doctor", "--config"])
+    let plan_output = ProcessCommand::new(env!("CARGO_BIN_EXE_datalens"))
+        .args(["plan", "--config"])
         .arg(&config_path)
-        .env(
-            "DATALENS_INDEX_CLIENT_ENDPOINT",
-            "https://datalens.example.invalid",
-        )
-        .env(
-            "DATALENS_INDEX_APPLICATION_TOKEN",
-            "replace-with-index-token",
-        )
+        .env("DATALENS_S3_BUCKET", "datalens")
+        .env("DATALENS_S3_PREFIX", "local-compose")
+        .env("DATALENS_S3_REGION", "auto")
+        .env("DATALENS_S3_ENDPOINT_URL", "http://127.0.0.1:9000")
+        .env("DATALENS_ETHEREUM_RPC_URL", "http://example.invalid")
+        .env("DATALENS_PUBLIC_APP_TOKEN", "replace-with-public-token")
+        .env("DATALENS_ORMP_TOKEN", "replace-with-ormp-token")
+        .env("DATALENS_METRICS_TOKEN", "replace-with-metrics-token")
         .env(
             "DATALENS_INDEX_DATABASE_URL",
             "postgres://datalens:replace-with-password@postgres.example.invalid:5432/datalens",
         )
-        .env("DATALENS_INDEX_QUERY_BIND", "0.0.0.0:9090")
         .env(
             "DATALENS_INDEX_QUERY_METRICS_TOKEN",
             "replace-with-index-metrics-token",
         )
         .output()
-        .expect("run production index daemon example doctor");
+        .expect("run compose service plan");
 
     assert!(
-        doctor_output.status.success(),
-        "production index daemon doctor failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&doctor_output.stdout),
-        String::from_utf8_lossy(&doctor_output.stderr)
+        plan_output.status.success(),
+        "compose service plan failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&plan_output.stdout),
+        String::from_utf8_lossy(&plan_output.stderr)
     );
-    let doctor: serde_json::Value =
-        serde_json::from_slice(&doctor_output.stdout).expect("doctor JSON");
-    assert_eq!(doctor["index"], "public-evm-logs");
-    assert_eq!(doctor["output"]["kind"], "database");
-    assert_eq!(doctor["output"]["database"]["driver"], "postgres");
+    let plan: serde_json::Value = serde_json::from_slice(&plan_output.stdout).expect("plan JSON");
+    assert_eq!(plan["status"], "planned");
+    assert_eq!(plan["service"]["index"]["application_configured"], true);
+    assert_eq!(plan["service"]["query"]["index"]["graphql_enabled"], true);
+    assert_eq!(plan["service"]["query"]["index"]["path"], "/index/graphql");
 }
 
 #[test]

@@ -2,7 +2,7 @@ use clap::{Args, Parser, Subcommand};
 
 use super::{
     BenchmarkCommand, CacheCommand, IndexCommand, InspectCommand, QueryCommand, ServeCommand,
-    benchmark_command, cache_command, doctor_command, index_command, inspect_command,
+    benchmark_command, cache_command, doctor_command, index_command, inspect_command, plan_command,
     query_command, serve_command,
 };
 
@@ -17,6 +17,7 @@ pub struct Cli {
 pub enum Command {
     Serve(ServeCommand),
     Doctor(ConfigCommand),
+    Plan(ConfigCommand),
     Query(QueryCommand),
     Inspect(InspectCommand),
     Index(Box<IndexCommand>),
@@ -36,6 +37,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match cli.command {
         Command::Serve(command) => serve_command(command)?,
         Command::Doctor(command) => doctor_command(command)?,
+        Command::Plan(command) => plan_command(command)?,
         Command::Query(command) => query_command(command)?,
         Command::Inspect(command) => inspect_command(command)?,
         Command::Index(command) => index_command(*command)?,

@@ -112,10 +112,95 @@ pub fn validate_config(config: &DatalensConfig) -> Result<(), DatalensError> {
         ));
     }
     validate_index_config(config)?;
+    validate_query_config(config)?;
+    validate_application_index_config(config)?;
     validate_warmup_config(config)?;
     validate_applications(config)?;
     for (name, chain) in &config.chains {
         validate_chain(name, chain)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn application_index_config(
+    config: &DatalensConfig,
+) -> Result<Option<datalens_indexer::DatalensIndexConfig>, DatalensError> {
+    let Some(application) = &config.index.application else {
+        return Ok(None);
+    };
+    let input = toml::to_string(application).map_err(|error| {
+        DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            format!("index.application: serialize embedded config: {error}"),
+        )
+    })?;
+    datalens_indexer::DatalensIndexConfig::from_toml_str(&input)
+        .map(Some)
+        .map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                format!("index.application: {error}"),
+            )
+        })
+}
+
+fn validate_application_index_config(config: &DatalensConfig) -> Result<(), DatalensError> {
+    let Some(application) = application_index_config(config)? else {
+        if config.query.index.graphql_enabled {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                "query.index.graphql_enabled requires index.application",
+            ));
+        }
+        return Ok(());
+    };
+    let _ = application;
+    Ok(())
+}
+
+fn validate_query_config(config: &DatalensConfig) -> Result<(), DatalensError> {
+    validate_query_surface("query.native", &config.query.native)?;
+    validate_query_surface("query.index", &config.query.index)?;
+    let paths = [
+        ("query.native.path", &config.query.native.path),
+        (
+            "query.native.playground_path",
+            &config.query.native.playground_path,
+        ),
+        ("query.index.path", &config.query.index.path),
+        (
+            "query.index.playground_path",
+            &config.query.index.playground_path,
+        ),
+    ];
+    for (index, (left_name, left_path)) in paths.iter().enumerate() {
+        for (right_name, right_path) in paths.iter().skip(index + 1) {
+            if left_path == right_path {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::InvalidInput,
+                    format!("{left_name} must not equal {right_name}"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_query_surface(
+    name: &str,
+    surface: &datalens_edge::config::GraphqlSurfaceConfig,
+) -> Result<(), DatalensError> {
+    if !surface.path.starts_with('/') {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            format!("{name}.path must start with /"),
+        ));
+    }
+    if !surface.playground_path.starts_with('/') {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            format!("{name}.playground_path must start with /"),
+        ));
     }
     Ok(())
 }

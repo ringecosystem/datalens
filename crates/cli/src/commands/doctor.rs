@@ -26,6 +26,7 @@ pub fn doctor_command(
         "planner": config.planner,
         "writer": config.writer,
         "index": config.index,
+        "query": config.query,
         "warmup": config.warmup,
         "metrics": {
             "enabled": config.metrics.enabled,

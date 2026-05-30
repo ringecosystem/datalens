@@ -4,7 +4,7 @@ use datalens_core::{DatalensError, DatalensErrorKind};
 use datalens_storage::S3ObjectStoreConfig;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DatalensConfig {
     pub server: ServerConfig,
@@ -15,6 +15,8 @@ pub struct DatalensConfig {
     pub metrics: MetricsConfig,
     #[serde(default)]
     pub index: IndexConfig,
+    #[serde(default)]
+    pub query: QueryConfig,
     #[serde(default)]
     pub warmup: WarmupConfig,
     #[serde(default)]
@@ -126,27 +128,46 @@ pub struct MetricsConfig {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EdgeConfig {
     #[serde(default)]
-    pub graphql: GraphqlConfig,
-    #[serde(default)]
     pub metrics: MetricsEndpointConfig,
+    #[serde(skip)]
+    pub query: QueryConfig,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct GraphqlConfig {
-    #[serde(default = "default_graphql_enabled")]
-    pub enabled: bool,
-    #[serde(default = "default_graphql_playground_enabled")]
-    pub playground_enabled: bool,
+pub struct QueryConfig {
+    #[serde(default = "default_native_query_surface")]
+    pub native: GraphqlSurfaceConfig,
+    #[serde(default = "default_index_query_surface")]
+    pub index: GraphqlSurfaceConfig,
 }
 
-impl Default for GraphqlConfig {
+impl Default for QueryConfig {
     fn default() -> Self {
         Self {
-            enabled: default_graphql_enabled(),
-            playground_enabled: default_graphql_playground_enabled(),
+            native: default_native_query_surface(),
+            index: default_index_query_surface(),
         }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GraphqlSurfaceConfig {
+    #[serde(default = "default_graphql_enabled")]
+    pub graphql_enabled: bool,
+    #[serde(default = "default_native_graphql_path")]
+    pub path: String,
+    #[serde(default = "default_graphql_playground_enabled")]
+    pub playground_enabled: bool,
+    #[serde(default = "default_native_graphql_playground_path")]
+    pub playground_path: String,
+}
+
+impl Default for GraphqlSurfaceConfig {
+    fn default() -> Self {
+        default_native_query_surface()
     }
 }
 
@@ -182,7 +203,7 @@ impl Default for WarmupConfig {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct IndexConfig {
     #[serde(default = "default_index_chunk_range")]
     pub default_chunk_range: u64,
@@ -194,6 +215,8 @@ pub struct IndexConfig {
     pub default_finality: String,
     #[serde(default = "default_index_cursor_path")]
     pub cursor_path: String,
+    #[serde(default)]
+    pub application: Option<toml::Value>,
 }
 
 impl Default for IndexConfig {
@@ -204,6 +227,7 @@ impl Default for IndexConfig {
             retry: IndexRetryConfig::default(),
             default_finality: default_index_finality(),
             cursor_path: default_index_cursor_path(),
+            application: None,
         }
     }
 }
@@ -251,6 +275,40 @@ fn default_graphql_enabled() -> bool {
 
 fn default_graphql_playground_enabled() -> bool {
     false
+}
+
+fn default_native_query_surface() -> GraphqlSurfaceConfig {
+    GraphqlSurfaceConfig {
+        graphql_enabled: default_graphql_enabled(),
+        path: default_native_graphql_path(),
+        playground_enabled: default_graphql_playground_enabled(),
+        playground_path: default_native_graphql_playground_path(),
+    }
+}
+
+fn default_index_query_surface() -> GraphqlSurfaceConfig {
+    GraphqlSurfaceConfig {
+        graphql_enabled: default_graphql_enabled(),
+        path: default_index_graphql_path(),
+        playground_enabled: default_graphql_playground_enabled(),
+        playground_path: default_index_graphql_playground_path(),
+    }
+}
+
+fn default_native_graphql_path() -> String {
+    "/native/graphql".to_owned()
+}
+
+fn default_native_graphql_playground_path() -> String {
+    "/native/graphiql".to_owned()
+}
+
+fn default_index_graphql_path() -> String {
+    "/index/graphql".to_owned()
+}
+
+fn default_index_graphql_playground_path() -> String {
+    "/index/graphiql".to_owned()
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

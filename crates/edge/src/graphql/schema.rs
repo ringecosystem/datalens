@@ -46,7 +46,7 @@ pub(crate) async fn graphql_handler(
     headers: HeaderMap,
     request: GraphQLRequest,
 ) -> GraphQLResponse {
-    let Some(schema) = state.graphql_schema else {
+    let Some(schema) = state.native_graphql_schema else {
         return Schema::build(QueryRoot, MutationRoot, EmptySubscription)
             .finish()
             .execute(async_graphql::Request::new("{ __typename }"))
@@ -67,7 +67,12 @@ pub(crate) async fn playground(State(state): State<AppState>, headers: HeaderMap
         )
             .into_response();
     }
-    Html(GraphiQLSource::build().endpoint("/graphql").finish()).into_response()
+    Html(
+        GraphiQLSource::build()
+            .endpoint(&state.edge.query.native.path)
+            .finish(),
+    )
+    .into_response()
 }
 
 pub(crate) struct QueryRoot;

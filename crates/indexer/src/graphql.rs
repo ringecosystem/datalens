@@ -52,7 +52,7 @@ pub fn graphql_schema_with_views(
 }
 
 pub fn graphql_router(store: SharedStore, path: &str, playground: bool) -> Router {
-    graphql_router_internal(store, path, playground, None)
+    graphql_router_internal(store, path, playground, None, None)
 }
 
 pub fn graphql_router_with_metrics(
@@ -61,7 +61,7 @@ pub fn graphql_router_with_metrics(
     playground: bool,
     metrics: IndexerGraphqlMetrics,
 ) -> Router {
-    graphql_router_internal(store, path, playground, Some(metrics))
+    graphql_router_internal(store, path, playground, Some(metrics), None)
 }
 
 fn graphql_router_internal(
@@ -69,8 +69,16 @@ fn graphql_router_internal(
     path: &str,
     playground: bool,
     metrics: Option<IndexerGraphqlMetrics>,
+    playground_path: Option<&str>,
 ) -> Router {
-    graphql_router_with_auth(store, path, playground, QueryAuthConfig::default(), metrics)
+    graphql_router_with_auth_path(
+        store,
+        path,
+        playground,
+        playground_path,
+        QueryAuthConfig::default(),
+        metrics,
+    )
 }
 
 pub fn graphql_router_with_auth(
@@ -80,11 +88,24 @@ pub fn graphql_router_with_auth(
     auth: QueryAuthConfig,
     metrics: Option<IndexerGraphqlMetrics>,
 ) -> Router {
+    graphql_router_with_auth_path(store, path, playground, None, auth, metrics)
+}
+
+pub fn graphql_router_with_auth_path(
+    store: SharedStore,
+    path: &str,
+    playground: bool,
+    playground_path: Option<&str>,
+    auth: QueryAuthConfig,
+    metrics: Option<IndexerGraphqlMetrics>,
+) -> Router {
     let schema = graphql_schema(store);
     let mut router = Router::new().route(path, post(graphql_handler));
     if playground {
-        let playground_path = format!("{path}/playground");
-        router = router.route(&playground_path, get(playground_handler));
+        let path = playground_path
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("{path}/playground"));
+        router = router.route(&path, get(playground_handler));
     }
     if let Some(endpoint) = metrics
         .as_ref()
@@ -108,11 +129,25 @@ pub fn graphql_router_with_views_auth(
     auth: QueryAuthConfig,
     metrics: Option<IndexerGraphqlMetrics>,
 ) -> Result<Router, IndexerError> {
+    graphql_router_with_views_auth_path(store, views, path, playground, None, auth, metrics)
+}
+
+pub fn graphql_router_with_views_auth_path(
+    store: SharedStore,
+    views: Vec<GraphqlViewConfig>,
+    path: &str,
+    playground: bool,
+    playground_path: Option<&str>,
+    auth: QueryAuthConfig,
+    metrics: Option<IndexerGraphqlMetrics>,
+) -> Result<Router, IndexerError> {
     let schema = graphql_schema_with_views(store, views)?;
     let mut router = Router::new().route(path, post(graphql_dynamic_handler));
     if playground {
-        let playground_path = format!("{path}/playground");
-        router = router.route(&playground_path, get(playground_dynamic_handler));
+        let path = playground_path
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("{path}/playground"));
+        router = router.route(&path, get(playground_dynamic_handler));
     }
     if let Some(endpoint) = metrics
         .as_ref()

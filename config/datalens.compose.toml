@@ -34,12 +34,65 @@ max_staged_bytes = 33554432
 enabled = true
 default_application = "local-compose"
 
-[edge.graphql]
-enabled = true
+[query.native]
+graphql_enabled = true
+path = "/native/graphql"
 playground_enabled = true
+playground_path = "/native/graphiql"
+
+[query.index]
+graphql_enabled = true
+path = "/index/graphql"
+playground_enabled = true
+playground_path = "/index/graphiql"
 
 [edge.metrics]
 bearer_token = "${DATALENS_METRICS_TOKEN}"
+
+[index.application.client]
+endpoint = "http://127.0.0.1:3000"
+application = "ormp"
+token_env = "DATALENS_ORMP_TOKEN"
+
+[index.application.index]
+name = "ormp"
+dataset = "evm.logs"
+finality = "durable"
+chunk_blocks = 1000
+
+[[index.application.sources]]
+chain = "ethereum"
+family = "evm"
+chain_id = 1
+from_block = 20009590
+to_block = 20059589
+addresses = [
+  "0x2cd1867fb8016f93710b6386f7f9f1d540a60812",
+  "0x13b2211a7ca45db2808f6db05557ce5347e3634e",
+]
+topics = []
+
+[index.application.output]
+kind = "database"
+
+[index.application.output.database]
+driver = "postgres"
+url = "${DATALENS_INDEX_DATABASE_URL}"
+
+[index.application.query]
+enabled = false
+protocol = "graphql"
+bind = "127.0.0.1:3000"
+path = "/index/graphql"
+playground = false
+
+[index.application.query.metrics]
+enabled = false
+path = "/index/metrics"
+token_env = "DATALENS_INDEX_QUERY_METRICS_TOKEN"
+
+[index.application.checkpoint]
+path = "indexes/ormp/checkpoint.json"
 
 [warmup]
 enabled = false

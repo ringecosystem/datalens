@@ -148,26 +148,24 @@ fn local_compose_deployment_artifacts_are_declared() {
     let compose = include_str!("../../../docker-compose.yml");
     let env_example = include_str!("../../../.env.example");
     let compose_config = include_str!("../../../config/datalens.compose.toml");
-    let compose_index = include_str!("../../../examples/ormp/ormp.compose.index.toml");
     let gitignore = include_str!("../../../.gitignore");
     let runbook = include_str!("../../../docs/runbook/local-rustfs.md");
 
     assert!(compose.contains("datalens-server:"));
-    assert!(compose.contains("datalens-index-daemon:"));
+    assert!(!compose.contains("datalens-index-daemon:"));
     assert!(compose.contains(".data/indexes:/var/lib/datalens/indexes"));
     assert!(compose.contains("condition: service_healthy"));
     assert!(compose.contains("DATALENS_INDEX_DATABASE_URL"));
 
     assert!(env_example.contains("DATALENS_SERVER_CONFIG=/etc/datalens/datalens.toml"));
-    assert!(env_example.contains("DATALENS_INDEX_CONFIG=/etc/datalens/ormp.index.toml"));
     assert!(env_example.contains("DATALENS_INDEX_DATABASE_URL="));
-    assert!(env_example.contains("DATALENS_INDEX_QUERY_BIND=0.0.0.0:9090"));
 
     assert!(compose_config.contains("bucket = \"${DATALENS_S3_BUCKET}\""));
     assert!(compose_config.contains("endpoint_url = \"${DATALENS_S3_ENDPOINT_URL}\""));
     assert!(compose_config.contains("token = \"${DATALENS_ORMP_TOKEN}\""));
-    assert!(compose_index.contains("url = \"${DATALENS_INDEX_DATABASE_URL}\""));
-    assert!(compose_index.contains("token_env = \"DATALENS_ORMP_TOKEN\""));
+    assert!(compose_config.contains("[index.application.client]"));
+    assert!(compose_config.contains("url = \"${DATALENS_INDEX_DATABASE_URL}\""));
+    assert!(compose_config.contains("token_env = \"DATALENS_ORMP_TOKEN\""));
 
     assert!(gitignore.contains(".data/"));
     assert!(runbook.contains("docker compose up -d rustfs-init postgres"));

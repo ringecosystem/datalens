@@ -70,10 +70,16 @@ release gates.
 - `GET /v1/chains` and `GET /v1/discovery` expose configured chain discovery and
   native dataset capability discovery.
 - `POST /v1/query` is the REST query transport. It executes the native query contract.
-- `POST /graphql` is the GraphQL query and warmup transport when
-  `edge.graphql.enabled = true`.
-- `GET /graphql/playground` exposes GraphiQL when GraphQL and
-  `edge.graphql.playground_enabled` are both enabled.
+- `POST /native/graphql` is the native Datalens GraphQL query and warmup transport when
+  `query.native.graphql_enabled = true`.
+- `GET /native/graphiql` exposes native GraphiQL when native GraphQL and
+  `query.native.playground_enabled` are both enabled.
+- `POST /index/graphql` is the application index GraphQL query transport when
+  `query.index.graphql_enabled = true` and `index.application` is configured.
+- `GET /index/graphiql` exposes application index GraphiQL when index GraphQL and
+  `query.index.playground_enabled` are both enabled.
+- Native and application index GraphQL schemas are separate query surfaces. They must not
+  be merged into one ambiguous schema.
 - REST and GraphQL query operations must expose equivalent query capability over the
   same native contract: `chain`, `dataset_key`, `selector`, `range`, `finality`, and
   `fields`. GraphQL may reshape inputs and outputs for GraphQL clients, but it must not

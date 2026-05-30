@@ -45,9 +45,17 @@ max_backoff_ms = 30000
 enabled = true
 default_application = "datalens"
 
-[edge.graphql]
-enabled = false
+[query.native]
+graphql_enabled = false
+path = "/native/graphql"
 playground_enabled = false
+playground_path = "/native/graphiql"
+
+[query.index]
+graphql_enabled = false
+path = "/index/graphql"
+playground_enabled = false
+playground_path = "/index/graphiql"
 
 [edge.metrics]
 bearer_token = "${DATALENS_METRICS_TOKEN}"
