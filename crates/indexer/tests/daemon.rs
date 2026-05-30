@@ -47,7 +47,7 @@ url = "{sqlite_url}"
 
 [query]
 enabled = true
-graphql = true
+protocol = "graphql"
 bind = "127.0.0.1:0"
 
 [checkpoint]

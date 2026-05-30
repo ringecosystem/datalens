@@ -4,6 +4,7 @@ mod checkpoint;
 mod config;
 mod daemon;
 mod error;
+pub mod graphql;
 mod output;
 mod plan;
 mod runner;

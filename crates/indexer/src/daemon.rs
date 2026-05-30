@@ -1,15 +1,13 @@
-use std::{future::Future, net::SocketAddr, time::Duration};
+use std::{future::Future, net::SocketAddr, sync::Arc, time::Duration};
 
-use async_graphql::{EmptyMutation, EmptySubscription, Json, Object, Schema};
-use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
-use axum::{Router, extract::State, routing::post};
 use datalens_client::{DatalensClient, HttpTransport};
 use serde::Serialize;
 use tokio::{sync::oneshot, task::JoinHandle};
 
 use crate::{
     DatabaseDriver, DatalensIndexConfig, IndexPlanBuilder, IndexRunner, IndexRunnerOptions,
-    IndexerError, OutputConfig, OutputSinkConfig, QueryableStore, SqliteOutputStore, StoreQuery,
+    IndexerError, OutputConfig, OutputSinkConfig, QueryProtocol, QueryableStore, SqliteOutputStore,
+    StoreQuery, StoreQueryResult, graphql,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -24,9 +22,9 @@ pub fn validate_daemon_config(
     if !config.query.enabled {
         return Ok(DaemonQueryMode::Disabled);
     }
-    if !config.query.graphql {
+    if config.query.protocol != QueryProtocol::Graphql {
         return Err(IndexerError::Config(
-            "query.graphql: daemon query service requires GraphQL to be enabled".to_owned(),
+            "query.protocol: daemon query service requires graphql".to_owned(),
         ));
     }
     let mode = match &config.output {
@@ -190,36 +188,15 @@ struct RunningQueryService {
     handle: JoinHandle<Result<(), IndexerError>>,
 }
 
-type IndexGraphqlSchema = Schema<IndexQueryRoot, EmptyMutation, EmptySubscription>;
-
-#[derive(Clone)]
-struct IndexQueryRoot {
-    sqlite_url: String,
+struct DaemonSqliteQueryStore {
+    url: String,
 }
 
-#[Object]
-impl IndexQueryRoot {
-    async fn indexed_events(
-        &self,
-        dataset: String,
-        filter: Option<String>,
-    ) -> async_graphql::Result<Vec<Json<serde_json::Value>>> {
-        let filter = match filter {
-            Some(filter) => serde_json::from_str(&filter)
-                .map_err(|error| async_graphql::Error::new(error.to_string()))?,
-            None => serde_json::Value::Object(serde_json::Map::new()),
-        };
-        let sqlite_url = self.sqlite_url.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            let store = SqliteOutputStore::connect(&sqlite_url).map_err(|error| {
-                IndexerError::Runner(format!("open sqlite query output: {error}"))
-            })?;
-            store.query(StoreQuery { dataset, filter })
-        })
-        .await
-        .map_err(|error| async_graphql::Error::new(error.to_string()))?
-        .map_err(|error| async_graphql::Error::new(error.to_string()))?;
-        Ok(result.rows.into_iter().map(Json).collect())
+impl QueryableStore for DaemonSqliteQueryStore {
+    fn query(&self, query: StoreQuery) -> Result<StoreQueryResult, IndexerError> {
+        let store = SqliteOutputStore::connect(&self.url)
+            .map_err(|error| IndexerError::Runner(format!("open sqlite query output: {error}")))?;
+        store.query(query)
     }
 }
 
@@ -231,28 +208,22 @@ async fn start_graphql_service(
             "query.enabled: daemon GraphQL requires database output".to_owned(),
         ));
     };
-    let url = database.url.clone();
-    tokio::task::spawn_blocking(move || SqliteOutputStore::connect(&url).map(drop))
-        .await
-        .map_err(|error| IndexerError::Runner(format!("open sqlite query output task: {error}")))?
-        .map_err(|error| IndexerError::Runner(format!("open sqlite query output: {error}")))?;
-    let schema = Schema::build(
-        IndexQueryRoot {
-            sqlite_url: database.url.clone(),
-        },
-        EmptyMutation,
-        EmptySubscription,
-    )
-    .finish();
     let listener = tokio::net::TcpListener::bind(&config.query.bind)
         .await
         .map_err(|error| IndexerError::Runner(format!("bind query service: {error}")))?;
     let bind = listener
         .local_addr()
         .map_err(|error| IndexerError::Runner(format!("read query service bind: {error}")))?;
-    let app = Router::new()
-        .route("/graphql", post(graphql_handler))
-        .with_state(schema);
+    let url = database.url.clone();
+    tokio::task::spawn_blocking(move || SqliteOutputStore::connect(&url).map(drop))
+        .await
+        .map_err(|error| IndexerError::Runner(format!("open sqlite query output task: {error}")))?
+        .map_err(|error| IndexerError::Runner(format!("open sqlite query output: {error}")))?;
+    let store = Arc::new(DaemonSqliteQueryStore {
+        url: database.url.clone(),
+    });
+    let app = graphql::graphql_router(store, &config.query.path, config.query.playground);
+    let graphql_path = config.query.path.clone();
     let (shutdown, shutdown_receiver) = oneshot::channel();
     let handle = tokio::spawn(async move {
         axum::serve(listener, app)
@@ -264,20 +235,10 @@ async fn start_graphql_service(
     });
     log::info!("index daemon GraphQL query service listening on {bind}");
     Ok(RunningQueryService {
-        report: QueryServiceReport {
-            bind,
-            graphql_path: "/graphql".to_owned(),
-        },
+        report: QueryServiceReport { bind, graphql_path },
         shutdown,
         handle,
     })
-}
-
-async fn graphql_handler(
-    State(schema): State<IndexGraphqlSchema>,
-    request: GraphQLRequest,
-) -> GraphQLResponse {
-    schema.execute(request.into_inner()).await.into()
 }
 
 async fn shutdown_query_service(service: Option<RunningQueryService>) -> Result<(), IndexerError> {

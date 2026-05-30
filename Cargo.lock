@@ -1655,6 +1655,7 @@ dependencies = [
  "sqlx",
  "tokio",
  "toml",
+ "tower",
 ]
 
 [[package]]
