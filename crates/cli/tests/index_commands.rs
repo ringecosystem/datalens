@@ -232,6 +232,56 @@ fn test_index_doctor_prints_stable_json_for_valid_config() {
 }
 
 #[test]
+fn test_ormp_example_is_declarative_multi_chain_config() {
+    let example_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/ormp")
+        .canonicalize()
+        .expect("example dir");
+    let config_path = example_dir.join("ormp.index.toml");
+
+    assert!(example_dir.join("README.md").is_file());
+    assert!(!example_dir.join("Cargo.toml").exists());
+
+    let doctor_output = ProcessCommand::new(env!("CARGO_BIN_EXE_datalens"))
+        .args(["index", "doctor", "--config"])
+        .arg(&config_path)
+        .env("DATALENS_ORMP_TOKEN", "example-token")
+        .output()
+        .expect("run ORMP example doctor");
+
+    assert!(
+        doctor_output.status.success(),
+        "ORMP example doctor failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&doctor_output.stdout),
+        String::from_utf8_lossy(&doctor_output.stderr)
+    );
+    let doctor: serde_json::Value =
+        serde_json::from_slice(&doctor_output.stdout).expect("doctor JSON");
+    assert_eq!(doctor["index"], "ormp");
+    assert_eq!(doctor["dataset"], "evm.logs");
+    assert!(
+        doctor["source_count"].as_u64().expect("source count") >= 2,
+        "{doctor}"
+    );
+
+    let plan_output = ProcessCommand::new(env!("CARGO_BIN_EXE_datalens"))
+        .args(["index", "plan", "--config"])
+        .arg(&config_path)
+        .env("DATALENS_ORMP_TOKEN", "example-token")
+        .output()
+        .expect("run ORMP example plan");
+
+    assert!(
+        plan_output.status.success(),
+        "ORMP example plan failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&plan_output.stdout),
+        String::from_utf8_lossy(&plan_output.stderr)
+    );
+    let plan: serde_json::Value = serde_json::from_slice(&plan_output.stdout).expect("plan JSON");
+    assert!(plan["tasks"].as_array().expect("tasks").len() >= 2);
+}
+
+#[test]
 fn test_index_doctor_rejects_invalid_config_without_leaking_token() {
     let root = temp_storage_root("index-doctor-invalid");
     let config = write_declarative_index_config("index-doctor-invalid", &root);
