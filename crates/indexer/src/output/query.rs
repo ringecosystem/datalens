@@ -11,6 +11,6 @@ pub struct StoreQueryResult {
     pub rows: Vec<serde_json::Value>,
 }
 
-pub trait QueryableStore {
+pub trait QueryableStore: Send + Sync {
     fn query(&self, query: StoreQuery) -> Result<StoreQueryResult, IndexerError>;
 }

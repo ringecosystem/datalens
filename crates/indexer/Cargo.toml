@@ -6,6 +6,9 @@ version.workspace = true
 
 [dependencies]
 arrow.workspace = true
+async-graphql.workspace = true
+async-graphql-axum.workspace = true
+axum.workspace = true
 datalens-client = { path = "../client" }
 datalens-core = { path = "../core" }
 parquet.workspace = true
@@ -15,3 +18,6 @@ sha2 = "0.11.0"
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-native-roots", "sqlite", "postgres"] }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 toml.workspace = true
+
+[dev-dependencies]
+tower.workspace = true

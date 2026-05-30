@@ -232,7 +232,25 @@ async fn query_records_sqlite(
     if let Some(signature) = filter.signature {
         builder.push(" AND signature = ").push_bind(signature);
     }
+    if let Some(topic0) = filter.topic0 {
+        builder
+            .push(" AND (signature = ")
+            .push_bind(topic0.clone())
+            .push(" OR topics_json LIKE ")
+            .push_bind(format!("[\"{topic0}\"%"))
+            .push(")");
+    }
     builder.push(" ORDER BY block_number, transaction_index, event_index, id");
+    if let Some(limit) = filter.limit {
+        builder
+            .push(" LIMIT ")
+            .push_bind(i64::try_from(limit).unwrap_or(i64::MAX));
+    }
+    if let Some(offset) = filter.offset {
+        builder
+            .push(" OFFSET ")
+            .push_bind(i64::try_from(offset).unwrap_or(i64::MAX));
+    }
 
     let rows = builder
         .build()
