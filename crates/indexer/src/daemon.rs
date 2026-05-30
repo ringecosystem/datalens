@@ -6,8 +6,8 @@ use tokio::{sync::oneshot, task::JoinHandle};
 
 use crate::{
     DatabaseDriver, DatalensIndexConfig, IndexPlanBuilder, IndexRunner, IndexRunnerOptions,
-    IndexerError, OutputConfig, OutputSinkConfig, QueryProtocol, QueryableStore, SqliteOutputStore,
-    StoreQuery, StoreQueryResult, graphql,
+    IndexerError, OutputConfig, OutputSinkConfig, PostgresOutputStore, QueryProtocol,
+    QueryableStore, SqliteOutputStore, StoreQuery, StoreQueryResult, graphql,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -28,15 +28,7 @@ pub fn validate_daemon_config(
         ));
     }
     let mode = match &config.output {
-        OutputConfig::Database { database } if database.driver == DatabaseDriver::Sqlite => {
-            DaemonQueryMode::Graphql
-        }
-        OutputConfig::Database { database } => {
-            return Err(IndexerError::Config(format!(
-                "query.enabled: daemon query service currently supports sqlite output, not {}",
-                database.driver.as_str()
-            )));
-        }
+        OutputConfig::Database { .. } => DaemonQueryMode::Graphql,
         OutputConfig::Jsonl { .. } => {
             return Err(IndexerError::Config(
                 "query.enabled: output kind jsonl does not support query service mode".to_owned(),
@@ -198,15 +190,35 @@ struct RunningQueryService {
     handle: JoinHandle<Result<(), IndexerError>>,
 }
 
-struct DaemonSqliteQueryStore {
+struct DaemonDatabaseQueryStore {
+    driver: DatabaseDriver,
     url: String,
 }
 
-impl QueryableStore for DaemonSqliteQueryStore {
+impl QueryableStore for DaemonDatabaseQueryStore {
     fn query(&self, query: StoreQuery) -> Result<StoreQueryResult, IndexerError> {
-        let store = SqliteOutputStore::connect(&self.url)
-            .map_err(|error| IndexerError::Runner(format!("open sqlite query output: {error}")))?;
+        let store = open_database_query_store(self.driver, &self.url)?;
         store.query(query)
+    }
+}
+
+fn open_database_query_store(
+    driver: DatabaseDriver,
+    url: &str,
+) -> Result<Box<dyn QueryableStore>, IndexerError> {
+    match driver {
+        DatabaseDriver::Sqlite => {
+            let store = SqliteOutputStore::connect(url).map_err(|error| {
+                IndexerError::Runner(format!("open sqlite query output: {error}"))
+            })?;
+            Ok(Box::new(store))
+        }
+        DatabaseDriver::Postgres => {
+            let store = PostgresOutputStore::connect(url).map_err(|error| {
+                IndexerError::Runner(format!("open postgres query output: {error}"))
+            })?;
+            Ok(Box::new(store))
+        }
     }
 }
 
@@ -224,12 +236,13 @@ async fn start_graphql_service(
     let bind = listener
         .local_addr()
         .map_err(|error| IndexerError::Runner(format!("read query service bind: {error}")))?;
+    let driver = database.driver;
     let url = database.url.clone();
-    tokio::task::spawn_blocking(move || SqliteOutputStore::connect(&url).map(drop))
+    tokio::task::spawn_blocking(move || open_database_query_store(driver, &url).map(drop))
         .await
-        .map_err(|error| IndexerError::Runner(format!("open sqlite query output task: {error}")))?
-        .map_err(|error| IndexerError::Runner(format!("open sqlite query output: {error}")))?;
-    let store = Arc::new(DaemonSqliteQueryStore {
+        .map_err(|error| IndexerError::Runner(format!("open query output task: {error}")))??;
+    let store = Arc::new(DaemonDatabaseQueryStore {
+        driver: database.driver,
         url: database.url.clone(),
     });
     let app = graphql::graphql_router(store, &config.query.path, config.query.playground);

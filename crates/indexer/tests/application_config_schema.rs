@@ -309,7 +309,7 @@ fn test_parse_sqlite_query_config_captures_bind_address() {
 }
 
 #[test]
-fn test_daemon_rejects_postgres_query_service_until_supported() {
+fn test_daemon_allows_postgres_query_service() {
     let input = valid_config()
         .replace(
             "[output.jsonl]\npath = \".data/indexes/ormp/events.jsonl\"",
@@ -318,13 +318,9 @@ fn test_daemon_rejects_postgres_query_service_until_supported() {
         .replace("[checkpoint]", "[query]\nenabled = true\nprotocol = \"graphql\"\n\n[checkpoint]");
     let config = DatalensIndexConfig::from_toml_str(&input).expect("database config parses");
 
-    let error = datalens_indexer::validate_daemon_config(&config)
-        .expect_err("daemon should reject unsupported query store")
-        .to_string();
-
-    assert!(
-        error.contains("daemon query service currently supports sqlite"),
-        "{error}"
+    assert_eq!(
+        datalens_indexer::validate_daemon_config(&config).expect("daemon config"),
+        datalens_indexer::DaemonQueryMode::Graphql
     );
 }
 
