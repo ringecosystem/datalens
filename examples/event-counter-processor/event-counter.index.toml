@@ -1,0 +1,63 @@
+[client]
+endpoint = "http://127.0.0.1:3000"
+application = "example-counter"
+token_env = "DATALENS_EXAMPLE_COUNTER_TOKEN"
+
+[index]
+name = "event-counter"
+dataset = "evm.logs"
+finality = "durable"
+chunk_blocks = 1000
+
+[[sources]]
+chain = "ethereum"
+family = "evm"
+chain_id = 1
+from_block = 18000000
+to_block = 18001000
+addresses = ["0x0000000000000000000000000000000000000000"]
+topics = ["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"]
+
+[decode]
+enabled = true
+
+[[decode.events]]
+name = "Transfer"
+signature = "Transfer(address,address,uint256)"
+topic0 = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+contract = "erc20"
+
+[[decode.events.inputs]]
+name = "from"
+kind = "address"
+indexed = true
+
+[[decode.events.inputs]]
+name = "to"
+kind = "address"
+indexed = true
+
+[[decode.events.inputs]]
+name = "value"
+kind = "uint256"
+
+[application_store]
+driver = "sqlite"
+url = "sqlite:.data/examples/event-counter/entities.db"
+
+[output]
+kind = "database"
+
+[output.database]
+driver = "sqlite"
+url = "sqlite:.data/examples/event-counter/index.db"
+
+[query]
+enabled = true
+protocol = "graphql"
+bind = "127.0.0.1:9091"
+path = "/graphql"
+playground = true
+
+[checkpoint]
+path = ".data/examples/event-counter/checkpoint.json"
