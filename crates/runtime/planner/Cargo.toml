@@ -5,5 +5,5 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
-datalens-chain = { path = "../chain" }
-datalens-core = { path = "../core" }
+datalens-chain = { path = "../../chain" }
+datalens-core = { path = "../../core" }

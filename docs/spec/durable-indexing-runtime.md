@@ -16,7 +16,7 @@ chunking rules, durable write rules, and indexing accounting.
 
 ## Authority
 
-- Code-level contract: `crates/indexer/src/lib.rs`.
+- Code-level contract: `crates/runtime/indexer/src/lib.rs`.
 - Durable storage authority: manifest and coverage entries written through the existing
   durable writer and storage path.
 - Cursor authority: resume progress only. Cursor state is not durable coverage.

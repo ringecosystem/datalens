@@ -7,7 +7,7 @@ Date: 2026-05-28
 Question: Which non-EVM chain family should datalens implement first after the chain
 adapter conformance suite: Solana or Tron?
 
-Decision: Implement Solana first, in `crates/solana`, with slot-based datasets and
+Decision: Implement Solana first, in `crates/adapters/solana`, with slot-based datasets and
 adapter JSON rows. Keep Tron as the second candidate after Solana proves that the
 chain-neutral contracts can handle a non-block-height ledger model.
 
@@ -145,7 +145,7 @@ than validating the non-EVM abstraction.
 
 HBX-60 should implement only:
 
-- `crates/solana` as `datalens-solana`.
+- `crates/adapters/solana` as `datalens-solana`.
 - Configurable HTTP JSON-RPC endpoint and chain identity.
 - Capabilities for `solana.slots`, `solana.transactions`, and `solana.instructions`.
 - `latest_height`, `cache_safe_height`, and `finalized_height` using slot finality.
@@ -173,7 +173,7 @@ Expected changes before or during HBX-60:
 - Ensure `CanonicalBlock` can represent slot-based canonicality, either by documenting
   `height` as range-kind-specific or by adding `range_kind`.
 - Add Solana selector constructors or helper functions around `DatasetSelector::Other`
-  inside `crates/solana`; do not add raw Solana types to `datalens-core` unless the
+  inside `crates/adapters/solana`; do not add raw Solana types to `datalens-core` unless the
   contract becomes shared.
 - Update conformance assertions so they are dataset/range-kind parameterized instead of
   EVM-only.

@@ -1,0 +1,23 @@
+[package]
+name = "datalens-solana"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+datalens-chain = { path = "../../chain" }
+datalens-core = { path = "../../core" }
+log.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.11.0"
+
+[dev-dependencies]
+datalens-chain-conformance = { path = "../../testing/chain-conformance" }
+datalens-executor = { path = "../../runtime/executor" }
+datalens-indexer = { path = "../../runtime/indexer" }
+datalens-metrics = { path = "../../metrics" }
+datalens-planner = { path = "../../runtime/planner" }
+datalens-storage = { path = "../../storage" }
+datalens-writer = { path = "../../runtime/writer" }
