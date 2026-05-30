@@ -1643,6 +1643,9 @@ dependencies = [
 name = "datalens-indexer"
 version = "0.1.0"
 dependencies = [
+ "async-graphql",
+ "async-graphql-axum",
+ "axum",
  "datalens-client",
  "datalens-core",
  "serde",
@@ -1651,6 +1654,7 @@ dependencies = [
  "sqlx",
  "tokio",
  "toml",
+ "tower",
 ]
 
 [[package]]

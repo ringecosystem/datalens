@@ -163,10 +163,31 @@ pub enum DatabaseDriver {
     Postgres,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryServiceConfig {
     pub enabled: bool,
-    pub graphql: bool,
+    pub protocol: QueryProtocol,
+    pub bind: String,
+    pub path: String,
+    pub playground: bool,
+}
+
+impl Default for QueryServiceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            protocol: QueryProtocol::Graphql,
+            bind: "127.0.0.1:9090".to_owned(),
+            path: "/graphql".to_owned(),
+            playground: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum QueryProtocol {
+    #[default]
+    Graphql,
 }
 
 #[derive(Debug, Deserialize)]
@@ -238,8 +259,11 @@ struct RawDatabaseOutputConfig {
 struct RawQueryServiceConfig {
     #[serde(default)]
     enabled: bool,
+    protocol: Option<String>,
+    bind: Option<String>,
+    path: Option<String>,
     #[serde(default)]
-    graphql: bool,
+    playground: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -280,7 +304,7 @@ impl TryFrom<RawDatalensIndexConfig> for DatalensIndexConfig {
                 }
             }
         };
-        let query = parse_query(raw.query);
+        let query = parse_query(raw.query, &mut errors);
         validate_output_query_capabilities(&output, &query, &mut errors);
         let checkpoint = match raw.checkpoint {
             Some(raw) => parse_checkpoint(raw, &mut errors).unwrap_or_else(|| {
@@ -496,12 +520,39 @@ fn parse_database_output(
     })
 }
 
-fn parse_query(raw: Option<RawQueryServiceConfig>) -> QueryServiceConfig {
-    raw.map(|raw| QueryServiceConfig {
+fn parse_query(raw: Option<RawQueryServiceConfig>, errors: &mut Vec<String>) -> QueryServiceConfig {
+    let Some(raw) = raw else {
+        return QueryServiceConfig::default();
+    };
+    let default = QueryServiceConfig::default();
+    let protocol = match raw.protocol.as_deref().unwrap_or("graphql") {
+        "graphql" => QueryProtocol::Graphql,
+        value => {
+            errors.push(format!(
+                "query.protocol: unsupported protocol {value}; supported value is graphql"
+            ));
+            QueryProtocol::Graphql
+        }
+    };
+    let bind = raw
+        .bind
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(default.bind);
+    let path = raw
+        .path
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(default.path);
+    if !path.starts_with('/') {
+        errors.push("query.path: must start with /".to_owned());
+    }
+
+    QueryServiceConfig {
         enabled: raw.enabled,
-        graphql: raw.graphql,
-    })
-    .unwrap_or_default()
+        protocol,
+        bind,
+        path,
+        playground: raw.playground,
+    }
 }
 
 fn validate_output_query_capabilities(
@@ -516,9 +567,9 @@ fn validate_output_query_capabilities(
             "query.enabled: output kind {output_kind} does not support query service mode"
         ));
     }
-    if query.graphql && !capability.supports_graphql {
+    if query.enabled && query.protocol == QueryProtocol::Graphql && !capability.supports_graphql {
         errors.push(format!(
-            "query.graphql: output kind {output_kind} does not support GraphQL"
+            "query.protocol: output kind {output_kind} does not support graphql query service"
         ));
     }
 }

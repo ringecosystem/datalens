@@ -3,6 +3,7 @@
 mod checkpoint;
 mod config;
 mod error;
+pub mod graphql;
 mod output;
 mod plan;
 mod runner;
