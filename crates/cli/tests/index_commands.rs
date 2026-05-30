@@ -220,6 +220,10 @@ fn test_index_doctor_prints_stable_json_for_valid_config() {
     assert_eq!(summary["sources"][0]["topics"], 0);
     assert_eq!(summary["output"]["kind"], "jsonl");
     assert_eq!(summary["output"]["path"], ".data/indexes/ormp/events.jsonl");
+    assert_eq!(summary["output"]["capability"]["write"], true);
+    assert_eq!(summary["output"]["capability"]["query"], false);
+    assert_eq!(summary["output"]["capability"]["graphql"], false);
+    assert_eq!(summary["output"]["capability"]["write_mode"], "append_only");
     assert_eq!(
         summary["checkpoint"]["path"],
         ".data/indexes/ormp/checkpoint.json"

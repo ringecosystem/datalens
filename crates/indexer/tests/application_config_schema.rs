@@ -1,6 +1,6 @@
 use datalens_indexer::{
     CheckpointPolicy, DatalensIndexConfig, FinalityRequirement, IndexDataset, OutputConfig,
-    SourceConfig,
+    QueryServiceConfig, SourceConfig,
 };
 
 fn valid_config() -> &'static str {
@@ -70,6 +70,7 @@ fn test_parse_valid_toml_config_returns_typed_schema() {
             path: ".data/indexes/ormp/events.jsonl".into()
         }
     );
+    assert_eq!(config.query, QueryServiceConfig::default());
     assert_eq!(
         config.checkpoint,
         CheckpointPolicy::File {
@@ -148,6 +149,29 @@ fn test_parse_invalid_output_config_returns_field_error() {
 
     assert!(error.contains("output"), "{error}");
     assert!(error.contains("jsonl"), "{error}");
+}
+
+#[test]
+fn test_parse_rejects_query_service_with_jsonl_output() {
+    let input = valid_config().replace("[checkpoint]", "[query]\nenabled = true\n\n[checkpoint]");
+    let error = parse_error(&input);
+
+    assert!(error.contains("query.enabled"), "{error}");
+    assert!(error.contains("jsonl"), "{error}");
+    assert!(
+        error.contains("does not support query service mode"),
+        "{error}"
+    );
+}
+
+#[test]
+fn test_parse_rejects_graphql_with_jsonl_output() {
+    let input = valid_config().replace("[checkpoint]", "[query]\ngraphql = true\n\n[checkpoint]");
+    let error = parse_error(&input);
+
+    assert!(error.contains("query.graphql"), "{error}");
+    assert!(error.contains("jsonl"), "{error}");
+    assert!(error.contains("does not support GraphQL"), "{error}");
 }
 
 #[test]
