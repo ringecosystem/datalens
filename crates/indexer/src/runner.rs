@@ -49,7 +49,10 @@ impl IndexRunner {
             Some(store) if !self.options.from_start => store.load()?,
             _ => IndexCheckpointFile::empty(),
         };
+        let mut output_sink: Option<Box<dyn OutputWriteSink>> = None;
+        let mut output_buffers_records = false;
         let mut tasks = Vec::new();
+        let mut pending_checkpoints = Vec::new();
         let mut checkpoint_skipped_ranges = Vec::new();
 
         for task in self.plan.tasks() {
@@ -115,7 +118,18 @@ impl IndexRunner {
                         &task.dataset,
                         rows,
                     );
-                    self.output.write_records(&records).map_err(|error| {
+                    if output_sink.is_none() {
+                        let sink = self.output.open_write_sink().map_err(|error| {
+                            let output_kind = self.output.capability().kind.as_str();
+                            IndexerError::Runner(format!(
+                                "failed to open {output_kind} output: {error}"
+                            ))
+                        })?;
+                        output_buffers_records = sink.buffers_records();
+                        output_sink = Some(sink);
+                    }
+                    let output_sink = output_sink.as_ref().expect("output sink was opened");
+                    output_sink.write_records(&records).map_err(|error| {
                         let output_kind = self.output.capability().kind.as_str();
                         IndexerError::Runner(format!(
                             "task {} failed to write {output_kind} output: {error}",
@@ -164,7 +178,23 @@ impl IndexRunner {
                 full_durable_hit,
             });
             if let Some(store) = &checkpoint_store {
-                store.advance(task, range.end())?;
+                if output_buffers_records {
+                    pending_checkpoints.push((task.clone(), range.end()));
+                } else {
+                    store.advance(task, range.end())?;
+                }
+            }
+        }
+
+        if let Some(output_sink) = &output_sink {
+            output_sink.flush().map_err(|error| {
+                let output_kind = self.output.capability().kind.as_str();
+                IndexerError::Runner(format!("failed to flush {output_kind} output: {error}"))
+            })?;
+        }
+        if let Some(store) = &checkpoint_store {
+            for (task, completed_block) in pending_checkpoints {
+                store.advance(&task, completed_block)?;
             }
         }
 

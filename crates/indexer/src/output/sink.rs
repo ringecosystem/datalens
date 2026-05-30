@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::ParquetOutputConfig;
 
 use super::{
-    jsonl::write_records_jsonl, parquet::write_records_parquet, postgres::PostgresOutputStore,
+    jsonl::write_records_jsonl, parquet::ParquetOutputSink, postgres::PostgresOutputStore,
     sqlite::SqliteOutputStore, webhook::write_records_webhook,
 };
 
@@ -50,6 +50,17 @@ pub struct OutputWriteReceipt {
 
 pub trait OutputWriteSink {
     fn write_records(&self, records: &[IndexedRecord]) -> io::Result<OutputWriteResult>;
+
+    fn flush(&self) -> io::Result<OutputWriteResult> {
+        Ok(OutputWriteResult {
+            written_rows: 0,
+            receipt: None,
+        })
+    }
+
+    fn buffers_records(&self) -> bool {
+        false
+    }
 }
 
 impl OutputWriteSink for OutputSinkConfig {
@@ -64,8 +75,38 @@ impl OutputWriteSink for OutputSinkConfig {
             Self::DatabasePostgres { url } => {
                 PostgresOutputStore::connect(url)?.write_records(records)
             }
-            Self::Parquet { config } => write_records_parquet(config, records),
+            Self::Parquet { config } => {
+                let sink = ParquetOutputSink::new(config.clone());
+                let mut result = sink.write_records(records)?;
+                let flush = sink.flush()?;
+                if let (Some(receipt), Some(flush_receipt)) =
+                    (result.receipt.as_mut(), flush.receipt)
+                {
+                    receipt.flushed_rows += flush_receipt.flushed_rows;
+                    receipt.files_written += flush_receipt.files_written;
+                    receipt.batches_attempted += flush_receipt.batches_attempted;
+                    receipt.batches_delivered += flush_receipt.batches_delivered;
+                    if flush_receipt.highest_position.is_some() {
+                        receipt.highest_position = flush_receipt.highest_position;
+                        receipt.last_record = flush_receipt.last_record;
+                    }
+                }
+                Ok(result)
+            }
             Self::Webhook { webhook } => write_records_webhook(webhook, records),
+        }
+    }
+}
+
+impl OutputSinkConfig {
+    pub fn open_write_sink(&self) -> io::Result<Box<dyn OutputWriteSink>> {
+        match self {
+            Self::StdoutJson | Self::FileJson { .. } | Self::Webhook { .. } => {
+                Ok(Box::new(self.clone()))
+            }
+            Self::DatabaseSqlite { url } => Ok(Box::new(SqliteOutputStore::connect(url)?)),
+            Self::DatabasePostgres { url } => Ok(Box::new(PostgresOutputStore::connect(url)?)),
+            Self::Parquet { config } => Ok(Box::new(ParquetOutputSink::new(config.clone()))),
         }
     }
 }
