@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use async_graphql::{Request as GraphqlRequest, Variables};
 use axum::{
@@ -6,7 +9,7 @@ use axum::{
     http::{Request, StatusCode},
 };
 use datalens_indexer::{
-    IndexedRecord, OutputWriteSink, SqliteOutputStore,
+    IndexedRecord, OutputWriteSink, PostgresOutputStore, SqliteOutputStore,
     graphql::{graphql_router, graphql_schema},
 };
 use tokio::runtime::Runtime;
@@ -112,6 +115,88 @@ fn test_graphql_events_query_filters_sqlite_store_and_returns_stable_fields() {
 }
 
 #[test]
+fn test_graphql_events_query_filters_postgres_store_when_url_is_configured() {
+    let Ok(url) = std::env::var("DATALENS_POSTGRES_TEST_URL") else {
+        return;
+    };
+    let store = PostgresOutputStore::connect(&url).expect("postgres store connects");
+    let base_block = unique_block_base();
+    let matching_address = "0x0000000000000000000000000000000000000001";
+    store
+        .write_records(&[
+            record(base_block, 0, matching_address),
+            record(base_block + 10, 1, matching_address),
+            record(
+                base_block + 20,
+                2,
+                "0x0000000000000000000000000000000000000002",
+            ),
+        ])
+        .expect("write records");
+    let schema = graphql_schema(Arc::new(store));
+
+    let response = Runtime::new().expect("runtime").block_on(async {
+        schema
+            .execute(
+                GraphqlRequest::new(
+                    r#"
+                query Events($address: String!, $fromBlock: BigInt!, $toBlock: BigInt!) {
+                  events(
+                    indexName: "ormp"
+                    chain: "ethereum"
+                    chainId: 1
+                    dataset: "evm.logs"
+                    address: $address
+                    fromBlock: $fromBlock
+                    toBlock: $toBlock
+                    topic0: "0x0000000000000000000000000000000000000000000000000000000000000000"
+                    limit: 5
+                  ) {
+                    indexName
+                    chain
+                    chainId
+                    dataset
+                    blockNumber
+                    eventIndex
+                    address
+                    selector
+                    topics
+                    topic0
+                    data
+                    payload
+                    createdAt
+                  }
+                }
+                "#,
+                )
+                .variables(Variables::from_json(serde_json::json!({
+                    "address": matching_address,
+                    "fromBlock": base_block + 5,
+                    "toBlock": base_block + 15,
+                }))),
+            )
+            .await
+    });
+
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let body = response.data.into_json().expect("graphql data");
+    let events = body["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["indexName"], "ormp");
+    assert_eq!(events[0]["chain"], "ethereum");
+    assert_eq!(events[0]["chainId"], 1);
+    assert_eq!(events[0]["dataset"], "evm.logs");
+    assert_eq!(events[0]["blockNumber"], base_block + 10);
+    assert_eq!(events[0]["eventIndex"], 1);
+    assert_eq!(events[0]["address"], matching_address);
+    assert_eq!(events[0]["selector"], matching_address);
+    assert_eq!(events[0]["topic0"], events[0]["topics"][0]);
+    assert_eq!(events[0]["data"], "0x010203");
+    assert_eq!(events[0]["payload"]["block_number"], base_block + 10);
+    assert!(events[0]["createdAt"].as_str().is_some());
+}
+
+#[test]
 fn test_graphql_events_query_rejects_limit_above_maximum() {
     let schema = graphql_schema(Arc::new(
         SqliteOutputStore::connect("sqlite::memory:").expect("sqlite store connects"),
@@ -178,4 +263,11 @@ fn test_graphql_router_serves_playground_only_when_enabled() {
             .expect("disabled response");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     });
+}
+
+fn unique_block_base() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_secs()
 }
