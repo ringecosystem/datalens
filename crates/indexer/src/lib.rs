@@ -7,6 +7,7 @@ pub mod graphql;
 mod output;
 mod plan;
 mod runner;
+mod webhook_config;
 
 pub use checkpoint::*;
 pub use config::*;

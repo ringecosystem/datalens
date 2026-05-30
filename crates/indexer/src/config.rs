@@ -2,7 +2,11 @@ use std::{env, fmt, path::PathBuf};
 
 use serde::Deserialize;
 
-use crate::IndexerError;
+use crate::{
+    IndexerError,
+    output::WebhookOutputConfig,
+    webhook_config::{RawWebhookOutputConfig, parse_webhook_output},
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DatalensIndexConfig {
@@ -149,6 +153,7 @@ pub struct EvmSourceConfig {
 pub enum OutputConfig {
     Jsonl { path: PathBuf },
     Database { database: DatabaseOutputConfig },
+    Webhook { webhook: WebhookOutputConfig },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -239,6 +244,7 @@ struct RawOutputConfig {
     kind: Option<String>,
     jsonl: Option<RawJsonlOutputConfig>,
     database: Option<RawDatabaseOutputConfig>,
+    webhook: Option<RawWebhookOutputConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -467,10 +473,11 @@ fn parse_source(
 fn parse_output(raw: RawOutputConfig, errors: &mut Vec<String>) -> Option<OutputConfig> {
     match raw.kind.as_deref() {
         Some("database") => parse_database_output(raw.database, errors),
+        Some("webhook") => parse_webhook_output(raw.webhook, errors),
         Some("jsonl") | None => parse_jsonl_output(raw.jsonl, errors),
         Some(value) => {
             errors.push(format!(
-                "output.kind: unsupported output kind {value}; supported values are jsonl and database"
+                "output.kind: unsupported output kind {value}; supported values are jsonl, database, and webhook"
             ));
             None
         }

@@ -7,6 +7,7 @@ use crate::{OutputConfig, OutputSinkConfig};
 pub enum OutputKind {
     Jsonl,
     Database,
+    Webhook,
 }
 
 impl OutputKind {
@@ -14,6 +15,7 @@ impl OutputKind {
         match self {
             Self::Jsonl => "jsonl",
             Self::Database => "database",
+            Self::Webhook => "webhook",
         }
     }
 }
@@ -54,6 +56,16 @@ impl OutputCapability {
             write_mode: OutputWriteMode::IdempotentUpsert,
         }
     }
+
+    pub const fn webhook() -> Self {
+        Self {
+            kind: OutputKind::Webhook,
+            supports_write: true,
+            supports_query: false,
+            supports_graphql: false,
+            write_mode: OutputWriteMode::IdempotentUpsert,
+        }
+    }
 }
 
 impl OutputConfig {
@@ -61,6 +73,7 @@ impl OutputConfig {
         match self {
             Self::Jsonl { .. } => OutputKind::Jsonl,
             Self::Database { .. } => OutputKind::Database,
+            Self::Webhook { .. } => OutputKind::Webhook,
         }
     }
 
@@ -68,6 +81,7 @@ impl OutputConfig {
         match self {
             Self::Jsonl { .. } => OutputCapability::jsonl(),
             Self::Database { .. } => OutputCapability::database(),
+            Self::Webhook { .. } => OutputCapability::webhook(),
         }
     }
 }
@@ -77,6 +91,7 @@ impl OutputSinkConfig {
         match self {
             Self::StdoutJson | Self::FileJson { .. } => OutputKind::Jsonl,
             Self::DatabaseSqlite { .. } | Self::DatabasePostgres { .. } => OutputKind::Database,
+            Self::Webhook { .. } => OutputKind::Webhook,
         }
     }
 
@@ -86,6 +101,7 @@ impl OutputSinkConfig {
             Self::DatabaseSqlite { .. } | Self::DatabasePostgres { .. } => {
                 OutputCapability::database()
             }
+            Self::Webhook { .. } => OutputCapability::webhook(),
         }
     }
 }

@@ -6,6 +6,7 @@ mod postgres;
 mod query;
 mod sink;
 mod sqlite;
+mod webhook;
 
 pub use capability::*;
 pub use postgres::*;
