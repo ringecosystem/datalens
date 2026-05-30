@@ -1649,6 +1649,7 @@ dependencies = [
  "datalens-client",
  "datalens-core",
  "log",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2 0.11.0",

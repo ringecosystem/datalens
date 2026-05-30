@@ -1,5 +1,6 @@
 use datalens_indexer::{
     DatabaseDriver, DatabaseOutputConfig, OutputConfig, OutputKind, OutputWriteMode,
+    WebhookOutputConfig,
 };
 
 #[test]
@@ -47,5 +48,27 @@ fn test_postgres_database_output_capability_is_queryable_idempotent() {
     assert!(capability.supports_write);
     assert!(capability.supports_query);
     assert!(capability.supports_graphql);
+    assert_eq!(capability.write_mode, OutputWriteMode::IdempotentUpsert);
+}
+
+#[test]
+fn test_webhook_output_capability_is_write_only_idempotent_delivery() {
+    let output = OutputConfig::Webhook {
+        webhook: WebhookOutputConfig {
+            url: "https://example.invalid/indexed-events".to_owned(),
+            headers: Vec::new(),
+            timeout_ms: 5_000,
+            max_rows_per_request: 500,
+            max_bytes_per_request: 1_000_000,
+            retry: Default::default(),
+            idempotency_key_header: Some("Idempotency-Key".to_owned()),
+        },
+    };
+    let capability = output.capability();
+
+    assert_eq!(capability.kind, OutputKind::Webhook);
+    assert!(capability.supports_write);
+    assert!(!capability.supports_query);
+    assert!(!capability.supports_graphql);
     assert_eq!(capability.write_mode, OutputWriteMode::IdempotentUpsert);
 }

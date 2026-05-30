@@ -1,7 +1,7 @@
 use datalens_indexer::{
     CheckpointPolicy, DatabaseDriver, DatabaseOutputConfig, DatalensIndexConfig,
     FinalityRequirement, IndexDataset, OutputConfig, QueryProtocol, QueryServiceConfig,
-    SourceConfig,
+    SourceConfig, WebhookHeaderConfig, WebhookOutputConfig, WebhookRetryConfig,
 };
 
 fn valid_config() -> &'static str {
@@ -294,6 +294,109 @@ fn test_parse_valid_postgres_database_output_allows_query_service() {
             path: "/graphql".to_owned(),
             playground: false,
         }
+    );
+}
+
+#[test]
+fn test_parse_valid_webhook_output_returns_typed_schema() {
+    let input = valid_config().replace(
+        "[output.jsonl]\npath = \".data/indexes/ormp/events.jsonl\"",
+        r#"[output]
+kind = "webhook"
+
+[output.webhook]
+url = "https://example.invalid/indexed-events"
+timeout_ms = 2500
+max_rows_per_request = 250
+max_bytes_per_request = 65536
+idempotency_key_header = "Idempotency-Key"
+
+[output.webhook.retry]
+max_attempts = 4
+initial_backoff_ms = 25
+max_backoff_ms = 250
+retry_429 = true
+
+[[output.webhook.headers]]
+name = "Authorization"
+env = "PATH"
+
+[[output.webhook.headers]]
+name = "X-Datalens-Source"
+value = "indexer"
+"#,
+    );
+
+    let config = DatalensIndexConfig::from_toml_str(&input).expect("valid webhook config");
+
+    assert_eq!(
+        config.output,
+        OutputConfig::Webhook {
+            webhook: WebhookOutputConfig {
+                url: "https://example.invalid/indexed-events".to_owned(),
+                timeout_ms: 2500,
+                max_rows_per_request: 250,
+                max_bytes_per_request: 65536,
+                retry: WebhookRetryConfig {
+                    max_attempts: 4,
+                    initial_backoff_ms: 25,
+                    max_backoff_ms: 250,
+                    retry_429: true,
+                },
+                idempotency_key_header: Some("Idempotency-Key".to_owned()),
+                headers: vec![
+                    WebhookHeaderConfig {
+                        name: "Authorization".to_owned(),
+                        value: std::env::var("PATH").expect("PATH should exist for tests"),
+                        secret: true,
+                    },
+                    WebhookHeaderConfig {
+                        name: "X-Datalens-Source".to_owned(),
+                        value: "indexer".to_owned(),
+                        secret: false,
+                    },
+                ],
+            },
+        }
+    );
+}
+
+#[test]
+fn test_parse_rejects_query_service_with_webhook_output() {
+    let input = valid_config()
+        .replace(
+            "[output.jsonl]\npath = \".data/indexes/ormp/events.jsonl\"",
+            "[output]\nkind = \"webhook\"\n\n[output.webhook]\nurl = \"https://example.invalid/indexed-events\"",
+        )
+        .replace("[checkpoint]", "[query]\nenabled = true\n\n[checkpoint]");
+    let error = parse_error(&input);
+
+    assert!(error.contains("query.enabled"), "{error}");
+    assert!(error.contains("webhook"), "{error}");
+    assert!(
+        error.contains("does not support query service mode"),
+        "{error}"
+    );
+}
+
+#[test]
+fn test_parse_rejects_graphql_with_webhook_output() {
+    let input = valid_config()
+        .replace(
+            "[output.jsonl]\npath = \".data/indexes/ormp/events.jsonl\"",
+            "[output]\nkind = \"webhook\"\n\n[output.webhook]\nurl = \"https://example.invalid/indexed-events\"",
+        )
+        .replace(
+            "[checkpoint]",
+            "[query]\nenabled = true\nprotocol = \"graphql\"\n\n[checkpoint]",
+        );
+    let error = parse_error(&input);
+
+    assert!(error.contains("query.protocol"), "{error}");
+    assert!(error.contains("webhook"), "{error}");
+    assert!(
+        error.contains("does not support graphql query service"),
+        "{error}"
     );
 }
 
