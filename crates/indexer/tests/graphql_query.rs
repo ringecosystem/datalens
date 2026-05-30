@@ -1,6 +1,6 @@
 use std::{
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use async_graphql::{Request as GraphqlRequest, Variables};
@@ -9,10 +9,12 @@ use axum::{
     http::{Request, StatusCode, header},
 };
 use datalens_indexer::{
-    IndexedRecord, OutputWriteSink, PostgresOutputStore, SqliteOutputStore,
+    IndexedRecord, IndexerError, OutputWriteSink, PostgresOutputStore, QueryAuthApplicationConfig,
+    QueryAuthConfig, QueryAuthQuotaConfig, QueryableStore, SqliteOutputStore, StoreQuery,
+    StoreQueryResult,
     graphql::{
         IndexerGraphqlMetricLabels, IndexerGraphqlMetrics, MetricsEndpointConfig, graphql_router,
-        graphql_router_with_metrics, graphql_schema,
+        graphql_router_with_auth, graphql_router_with_metrics, graphql_schema,
     },
 };
 use datalens_metrics::MetricsRecorder;
@@ -479,6 +481,244 @@ fn test_graphql_metrics_include_rate_limited_events() {
     ));
 }
 
+#[test]
+fn test_graphql_auth_disabled_allows_query_without_token() {
+    let store = SqliteOutputStore::connect("sqlite::memory:").expect("sqlite store connects");
+    store
+        .write_records(&[record(10, 0, "0x0000000000000000000000000000000000000001")])
+        .expect("write records");
+    let store = Arc::new(store);
+    let _store_keepalive = store.clone();
+    let app = graphql_router_with_auth(store, "/graphql", false, QueryAuthConfig::default(), None);
+
+    Runtime::new().expect("runtime").block_on(async {
+        let response = app
+            .oneshot(graphql_http_request(
+                r#"{ events(dataset: "evm.logs") { blockNumber } }"#,
+            ))
+            .await
+            .expect("graphql response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    });
+}
+
+#[test]
+fn test_graphql_auth_rejects_missing_and_invalid_token() {
+    let app = graphql_router_with_auth(
+        Arc::new(SqliteOutputStore::connect("sqlite::memory:").expect("sqlite store connects")),
+        "/graphql",
+        false,
+        auth_config(None),
+        None,
+    );
+
+    Runtime::new().expect("runtime").block_on(async {
+        let missing = app
+            .clone()
+            .oneshot(graphql_http_request(
+                r#"{ events(dataset: "evm.logs") { blockNumber } }"#,
+            ))
+            .await
+            .expect("missing token response");
+        let invalid = app
+            .clone()
+            .oneshot(
+                graphql_http_request(r#"{ events(dataset: "evm.logs") { blockNumber } }"#)
+                    .map(|body| body)
+                    .tap_header(header::AUTHORIZATION, "Bearer wrong-token"),
+            )
+            .await
+            .expect("invalid token response");
+
+        assert_auth_error(missing, StatusCode::UNAUTHORIZED, "AuthenticationFailed").await;
+        assert_auth_error(invalid, StatusCode::UNAUTHORIZED, "AuthenticationFailed").await;
+    });
+}
+
+#[test]
+fn test_graphql_auth_rejects_disabled_application() {
+    let mut config = auth_config(None);
+    config.applications[0].enabled = false;
+    let store =
+        Arc::new(SqliteOutputStore::connect("sqlite::memory:").expect("sqlite store connects"));
+    let _store_keepalive = store.clone();
+    let app = graphql_router_with_auth(store, "/graphql", false, config, None);
+
+    Runtime::new().expect("runtime").block_on(async {
+        let response = app
+            .oneshot(
+                graphql_http_request(r#"{ events(dataset: "evm.logs") { blockNumber } }"#)
+                    .tap_header(header::AUTHORIZATION, "Bearer query-token"),
+            )
+            .await
+            .expect("disabled application response");
+
+        assert_auth_error(response, StatusCode::FORBIDDEN, "Unauthorized").await;
+    });
+}
+
+#[test]
+fn test_graphql_auth_accepts_valid_token_and_records_application_metrics() {
+    let store = SqliteOutputStore::connect("sqlite::memory:").expect("sqlite store connects");
+    store
+        .write_records(&[record(10, 0, "0x0000000000000000000000000000000000000001")])
+        .expect("write records");
+    let store = Arc::new(store);
+    let _store_keepalive = store.clone();
+    let recorder = MetricsRecorder::new().expect("metrics recorder");
+    let app = graphql_router_with_auth(
+        store,
+        "/graphql",
+        false,
+        auth_config(None),
+        Some(IndexerGraphqlMetrics {
+            recorder: recorder.clone(),
+            labels: metric_labels(),
+            endpoint: Some(MetricsEndpointConfig {
+                path: "/metrics".to_owned(),
+                bearer_token: None,
+            }),
+        }),
+    );
+
+    Runtime::new().expect("runtime").block_on(async {
+        let response = app
+            .clone()
+            .oneshot(
+                graphql_http_request(r#"{ events(dataset: "evm.logs") { blockNumber } }"#)
+                    .tap_header(header::AUTHORIZATION, "Bearer query-token"),
+            )
+            .await
+            .expect("graphql response");
+        let metrics = app
+            .oneshot(
+                Request::get("/metrics")
+                    .body(Body::empty())
+                    .expect("metrics request"),
+            )
+            .await
+            .expect("metrics response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let text = response_text(metrics).await;
+        assert!(text.contains(
+            r#"datalens_indexer_graphql_query_total{application="query_app",chain="ethereum",dataset="evm.logs",index="ormp",outcome="success",output="sqlite"} 1"#
+        ));
+    });
+}
+
+#[test]
+fn test_graphql_auth_rate_limit_exceeded_returns_stable_error() {
+    let app = graphql_router_with_auth(
+        Arc::new(SqliteOutputStore::connect("sqlite::memory:").expect("sqlite store connects")),
+        "/graphql",
+        false,
+        auth_config(Some(QueryAuthQuotaConfig {
+            max_requests_per_minute: Some(1),
+            max_concurrent_requests: None,
+        })),
+        None,
+    );
+
+    Runtime::new().expect("runtime").block_on(async {
+        let first = app
+            .clone()
+            .oneshot(
+                graphql_http_request(r#"{ events(dataset: "evm.logs") { blockNumber } }"#)
+                    .tap_header(header::AUTHORIZATION, "Bearer query-token"),
+            )
+            .await
+            .expect("first response");
+        let second = app
+            .clone()
+            .oneshot(
+                graphql_http_request(r#"{ events(dataset: "evm.logs") { blockNumber } }"#)
+                    .tap_header(header::AUTHORIZATION, "Bearer query-token"),
+            )
+            .await
+            .expect("second response");
+
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_auth_error(second, StatusCode::TOO_MANY_REQUESTS, "RateLimited").await;
+    });
+}
+
+#[test]
+fn test_graphql_auth_concurrent_limit_exceeded_returns_stable_error() {
+    let store = Arc::new(DelayedStore {
+        delay: Duration::from_millis(150),
+    });
+    let app = graphql_router_with_auth(
+        store,
+        "/graphql",
+        false,
+        auth_config(Some(QueryAuthQuotaConfig {
+            max_requests_per_minute: None,
+            max_concurrent_requests: Some(1),
+        })),
+        None,
+    );
+
+    Runtime::new().expect("runtime").block_on(async {
+        let first = tokio::spawn(
+            app.clone().oneshot(
+                graphql_http_request(r#"{ events(dataset: "evm.logs") { blockNumber } }"#)
+                    .tap_header(header::AUTHORIZATION, "Bearer query-token"),
+            ),
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let second = app
+            .clone()
+            .oneshot(
+                graphql_http_request(r#"{ events(dataset: "evm.logs") { blockNumber } }"#)
+                    .tap_header(header::AUTHORIZATION, "Bearer query-token"),
+            )
+            .await
+            .expect("second response");
+        let first = first.await.expect("first task").expect("first response");
+
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_auth_error(second, StatusCode::TOO_MANY_REQUESTS, "RateLimited").await;
+    });
+}
+
+#[test]
+fn test_graphql_auth_protects_playground() {
+    let app = graphql_router_with_auth(
+        Arc::new(SqliteOutputStore::connect("sqlite::memory:").expect("sqlite store connects")),
+        "/graphql",
+        true,
+        auth_config(None),
+        None,
+    );
+
+    Runtime::new().expect("runtime").block_on(async {
+        let missing = app
+            .clone()
+            .oneshot(
+                Request::get("/graphql/playground")
+                    .body(Body::empty())
+                    .expect("playground request"),
+            )
+            .await
+            .expect("missing token response");
+        let accepted = app
+            .clone()
+            .oneshot(
+                Request::get("/graphql/playground")
+                    .header(header::AUTHORIZATION, "Bearer query-token")
+                    .body(Body::empty())
+                    .expect("playground request"),
+            )
+            .await
+            .expect("accepted response");
+
+        assert_auth_error(missing, StatusCode::UNAUTHORIZED, "AuthenticationFailed").await;
+        assert_eq!(accepted.status(), StatusCode::OK);
+    });
+}
+
 fn metric_labels() -> IndexerGraphqlMetricLabels {
     IndexerGraphqlMetricLabels {
         application: "ormp".to_owned(),
@@ -496,6 +736,58 @@ fn graphql_http_request(query: &str) -> Request<Body> {
             serde_json::json!({ "query": query }).to_string(),
         ))
         .expect("graphql request")
+}
+
+trait RequestHeaderExt {
+    fn tap_header(self, name: header::HeaderName, value: &str) -> Self;
+}
+
+impl RequestHeaderExt for Request<Body> {
+    fn tap_header(mut self, name: header::HeaderName, value: &str) -> Self {
+        self.headers_mut()
+            .insert(name, value.parse().expect("header value"));
+        self
+    }
+}
+
+fn auth_config(quota: Option<QueryAuthQuotaConfig>) -> QueryAuthConfig {
+    QueryAuthConfig {
+        enabled: true,
+        applications: vec![QueryAuthApplicationConfig {
+            id: "Query_App".to_owned(),
+            enabled: true,
+            token: "query-token".to_owned(),
+            quota,
+        }],
+    }
+}
+
+async fn assert_auth_error(response: axum::response::Response, status: StatusCode, kind: &str) {
+    assert_eq!(response.status(), status);
+    let body: serde_json::Value =
+        serde_json::from_str(&response_text(response).await).expect("error JSON");
+    assert_eq!(body["error"]["kind"], kind);
+    assert!(!body.to_string().contains("query-token"));
+}
+
+struct DelayedStore {
+    delay: Duration,
+}
+
+impl QueryableStore for DelayedStore {
+    fn query(&self, _query: StoreQuery) -> Result<StoreQueryResult, IndexerError> {
+        std::thread::sleep(self.delay);
+        Ok(StoreQueryResult {
+            rows: vec![serde_json::json!({
+                "index": "ormp",
+                "chain": "ethereum",
+                "chain_id": 1,
+                "dataset": "evm.logs",
+                "block_number": 10,
+                "topics": [],
+            })],
+        })
+    }
 }
 
 async fn response_text(response: axum::response::Response) -> String {

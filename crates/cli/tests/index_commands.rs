@@ -256,6 +256,93 @@ fn test_index_doctor_prints_stable_json_for_valid_config() {
 }
 
 #[test]
+fn test_index_doctor_reports_query_auth_without_printing_token() {
+    let root = temp_storage_root("index-doctor-query-auth");
+    let config_path = root.join("app.index.toml");
+    std::fs::create_dir_all(&root).expect("create config root");
+    std::fs::write(
+        &config_path,
+        r#"
+[client]
+endpoint = "http://127.0.0.1:3000"
+application = "ormp"
+token_env = "DATALENS_INDEX_TOKEN"
+
+[index]
+name = "ormp"
+dataset = "evm.logs"
+finality = "durable"
+chunk_blocks = 1000
+
+[[sources]]
+chain = "ethereum"
+family = "evm"
+chain_id = 1
+from_block = 20009590
+to_block = 20059589
+addresses = []
+topics = []
+
+[output]
+kind = "database"
+
+[output.database]
+driver = "sqlite"
+url = "sqlite:.data/indexes/ormp/index.db"
+
+[query]
+enabled = true
+protocol = "graphql"
+bind = "127.0.0.1:9090"
+path = "/graphql"
+playground = true
+
+[query.auth]
+enabled = true
+
+[[query.auth.applications]]
+id = "Query_App"
+token_env = "DATALENS_QUERY_TOKEN"
+max_requests_per_minute = 60
+max_concurrent_requests = 2
+
+[checkpoint]
+path = ".data/indexes/ormp/checkpoint.json"
+"#,
+    )
+    .expect("write index config");
+
+    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_datalens"))
+        .args(["index", "doctor", "--config"])
+        .arg(&config_path)
+        .env("DATALENS_INDEX_TOKEN", "super-secret-index-token")
+        .env("DATALENS_QUERY_TOKEN", "super-secret-query-token")
+        .output()
+        .expect("run index doctor");
+
+    assert!(
+        output.status.success(),
+        "index doctor failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("index doctor JSON");
+    assert_eq!(summary["query"]["enabled"], true);
+    assert_eq!(summary["query"]["auth"]["enabled"], true);
+    assert_eq!(summary["query"]["auth"]["applications"], 1);
+    assert_eq!(summary["query"]["auth"]["max_requests_per_minute"], 60);
+    assert_eq!(summary["query"]["auth"]["max_concurrent_requests"], 2);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stdout.contains("super-secret-index-token"));
+    assert!(!stdout.contains("super-secret-query-token"));
+    assert!(!stderr.contains("super-secret-index-token"));
+    assert!(!stderr.contains("super-secret-query-token"));
+}
+
+#[test]
 fn test_index_doctor_redacts_database_url_credentials() {
     let root = temp_storage_root("index-doctor-database-redaction");
     let config = write_declarative_index_config("index-doctor-database-redaction", &root);
