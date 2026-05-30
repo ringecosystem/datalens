@@ -1,4 +1,8 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    fs,
+    process::Command as ProcessCommand,
+    sync::{Arc, Mutex},
+};
 
 use clap::Parser;
 
@@ -58,6 +62,100 @@ fn test_index_backfill_accepts_required_inputs_and_dry_run() {
         },
         command => panic!("expected index backfill command, got {command:?}"),
     }
+}
+
+#[test]
+fn test_index_doctor_accepts_config_path() {
+    let cli = Cli::parse_from(["datalens", "index", "doctor", "--config", "app.index.toml"]);
+
+    match cli.command {
+        Command::Index(command) => match *command {
+            IndexCommand {
+                command: IndexSubcommand::Doctor(command),
+            } => {
+                assert_eq!(command.config, "app.index.toml");
+            }
+            command => panic!("expected index doctor command, got {command:?}"),
+        },
+        command => panic!("expected index doctor command, got {command:?}"),
+    }
+}
+
+#[test]
+fn test_index_doctor_prints_stable_json_for_valid_config() {
+    let root = temp_storage_root("index-doctor-valid");
+    let config = write_declarative_index_config("index-doctor-valid", &root);
+
+    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_datalens"))
+        .args(["index", "doctor", "--config", &config])
+        .env("DATALENS_INDEX_TOKEN", "super-secret-token")
+        .output()
+        .expect("run index doctor");
+
+    assert!(
+        output.status.success(),
+        "index doctor failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let summary: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("index doctor JSON");
+    assert_eq!(summary["status"], "ok");
+    assert_eq!(summary["index"], "ormp");
+    assert_eq!(summary["client"]["endpoint"], "http://127.0.0.1:3000");
+    assert_eq!(summary["client"]["application"], "ormp");
+    assert_eq!(summary["dataset"], "evm.logs");
+    assert_eq!(summary["finality"], "durable");
+    assert_eq!(summary["chunk_blocks"], 1000);
+    assert_eq!(summary["source_count"], 1);
+    assert_eq!(summary["sources"][0]["chain"], "ethereum");
+    assert_eq!(summary["sources"][0]["family"], "evm");
+    assert_eq!(summary["sources"][0]["chain_id"], 1);
+    assert_eq!(summary["sources"][0]["from_block"], 20009590);
+    assert_eq!(summary["sources"][0]["to_block"], 20059589);
+    assert_eq!(summary["sources"][0]["addresses"], 2);
+    assert_eq!(summary["sources"][0]["topics"], 0);
+    assert_eq!(summary["output"]["kind"], "jsonl");
+    assert_eq!(summary["output"]["path"], ".data/indexes/ormp/events.jsonl");
+    assert_eq!(
+        summary["checkpoint"]["path"],
+        ".data/indexes/ormp/checkpoint.json"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stdout.contains("super-secret-token"));
+    assert!(!stderr.contains("super-secret-token"));
+}
+
+#[test]
+fn test_index_doctor_rejects_invalid_config_without_leaking_token() {
+    let root = temp_storage_root("index-doctor-invalid");
+    let config = write_declarative_index_config("index-doctor-invalid", &root);
+    let invalid = fs::read_to_string(&config)
+        .expect("read config")
+        .replace("chunk_blocks = 1000", "chunk_blocks = 0");
+    fs::write(&config, invalid).expect("write invalid config");
+
+    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_datalens"))
+        .args(["index", "doctor", "--config", &config])
+        .env("DATALENS_INDEX_TOKEN", "super-secret-token")
+        .output()
+        .expect("run index doctor");
+
+    assert!(
+        !output.status.success(),
+        "index doctor unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("index.chunk_blocks"), "{stderr}");
+    assert!(!stdout.contains("super-secret-token"));
+    assert!(!stderr.contains("super-secret-token"));
 }
 
 #[test]
@@ -733,6 +831,45 @@ fn write_config(name: &str, storage_root: &std::path::Path) -> String {
     config_path.to_string_lossy().into_owned()
 }
 
+fn write_declarative_index_config(name: &str, storage_root: &std::path::Path) -> String {
+    let config_path = storage_root.with_file_name(format!("{name}.index.toml"));
+    fs::write(
+        &config_path,
+        r#"
+[client]
+endpoint = "http://127.0.0.1:3000"
+application = "ormp"
+token_env = "DATALENS_INDEX_TOKEN"
+
+[index]
+name = "ormp"
+dataset = "evm.logs"
+finality = "durable"
+chunk_blocks = 1000
+
+[[sources]]
+chain = "ethereum"
+family = "evm"
+chain_id = 1
+from_block = 20009590
+to_block = 20059589
+addresses = [
+  "0x1111111111111111111111111111111111111111",
+  "0x2222222222222222222222222222222222222222",
+]
+topics = []
+
+[output.jsonl]
+path = ".data/indexes/ormp/events.jsonl"
+
+[checkpoint]
+path = ".data/indexes/ormp/checkpoint.json"
+"#,
+    )
+    .expect("write declarative index config");
+    config_path.to_string_lossy().into_owned()
+}
+
 fn write_tron_config(name: &str, storage_root: &std::path::Path) -> String {
     let config_path = storage_root.with_file_name(format!("{name}.toml"));
     std::fs::write(
@@ -864,6 +1001,9 @@ fn index_test_common(command: &IndexWorkflowCommand) -> &IndexCommonCommand {
         IndexWorkflowCommand::Resume(command) => &command.common,
         IndexWorkflowCommand::Repair(command) => &command.common,
         IndexWorkflowCommand::Verify(command) => &command.common,
+        IndexWorkflowCommand::Doctor(_) => {
+            unreachable!("index doctor does not use runtime index common options")
+        }
     }
 }
 
