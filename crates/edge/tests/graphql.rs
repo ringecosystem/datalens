@@ -30,7 +30,7 @@ async fn test_graphql_discovery_lists_registered_chains() {
             non_evm_chain_config("tron"),
         ))
         .expect("register tron");
-    let app = router(registry);
+    let app = graphql_router(registry);
 
     let body = graphql_json(
         app.clone(),
@@ -113,7 +113,7 @@ async fn test_graphql_native_evm_blocks_and_logs_query_match_rest_contract() {
             source.clone(),
         ))
         .expect("register service");
-    let app = router(registry);
+    let app = graphql_router(registry);
 
     let body = graphql_json(
         app.clone(),
@@ -223,7 +223,7 @@ async fn test_graphql_query_enforces_application_auth_like_rest_query() {
             source,
         ))
         .expect("register service");
-    let app = router(registry);
+    let app = graphql_router(registry);
     let body = serde_json::to_vec(&serde_json::json!({
         "query": r#"
             query($input: QueryInput!) {
@@ -292,7 +292,7 @@ async fn test_graphql_native_solana_query_uses_native_contract() {
             non_evm_chain_config("solana"),
         ))
         .expect("register solana");
-    let app = router(registry);
+    let app = graphql_router(registry);
 
     let body = graphql_json(
         app,
@@ -351,7 +351,7 @@ async fn test_graphql_native_tron_blocks_query_uses_typed_inputs() {
             non_evm_chain_config("tron"),
         ))
         .expect("register tron");
-    let app = router(registry);
+    let app = graphql_router(registry);
 
     let body = graphql_json(
         app,
@@ -405,7 +405,7 @@ async fn test_graphql_query_records_metrics_with_application_header() {
             source,
         ))
         .expect("register service");
-    let app = router(registry);
+    let app = graphql_router(registry);
 
     let response = app
         .clone()
@@ -464,7 +464,7 @@ async fn test_graphql_errors_include_stable_extensions() {
             MockSource::default(),
         ))
         .expect("register service");
-    let app = router(registry);
+    let app = graphql_router(registry);
 
     let body = graphql_json(
         app,
@@ -498,7 +498,7 @@ async fn test_graphql_schema_exposes_typed_request_inputs() {
             MockSource::default(),
         ))
         .expect("register service");
-    let app = router(registry);
+    let app = graphql_router(registry);
 
     let body = graphql_json(
         app,

@@ -14,6 +14,6 @@ pub use inspect::{InspectCommand, InspectSubcommand, InspectUsageCommand, inspec
 pub(crate) use query::query_command;
 pub use query::{QueryBlocksCommand, QueryCommand, QueryLogsCommand, QuerySubcommand};
 pub use root::{Cli, Command, ConfigCommand, run};
-pub use serve::serve_command;
+pub use serve::{ServeCommand, serve_command, serve_edge_config};
 
 pub use helpers::redact_url;
