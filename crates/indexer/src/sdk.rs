@@ -20,6 +20,70 @@ pub trait ApplicationProcessor: Send + Sync {
     ) -> ProcessorFuture<'a, Result<ProcessResult, ProcessorError>>;
 }
 
+pub trait ApplicationSchemaInitializer: Send + Sync {
+    fn initialize_schema<'a>(
+        &'a self,
+        context: SchemaInitializationContext<'a>,
+    ) -> ProcessorFuture<'a, Result<(), ProcessorError>>;
+}
+
+pub trait ApplicationSchemaStore: Send + Sync {
+    fn database_kind(&self) -> ApplicationDatabaseKind;
+
+    fn execute_sql<'a>(
+        &'a self,
+        statement: &'a str,
+    ) -> ProcessorFuture<'a, Result<(), ProcessorError>>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApplicationDatabaseKind {
+    Postgres,
+    Sqlite,
+}
+
+impl ApplicationDatabaseKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Postgres => "postgres",
+            Self::Sqlite => "sqlite",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct SchemaInitializationContext<'a> {
+    application: &'a str,
+    index: &'a str,
+    store: &'a dyn ApplicationSchemaStore,
+}
+
+impl<'a> SchemaInitializationContext<'a> {
+    pub fn new(
+        application: &'a str,
+        index: &'a str,
+        store: &'a dyn ApplicationSchemaStore,
+    ) -> Self {
+        Self {
+            application,
+            index,
+            store,
+        }
+    }
+
+    pub fn application(&self) -> &'a str {
+        self.application
+    }
+
+    pub fn index(&self) -> &'a str {
+        self.index
+    }
+
+    pub fn store(&self) -> &'a dyn ApplicationSchemaStore {
+        self.store
+    }
+}
+
 pub trait ApplicationStore: Send + Sync {
     fn upsert_json<'a>(
         &'a self,
@@ -37,6 +101,10 @@ pub trait ApplicationStoreTransaction: ApplicationStore {
 }
 
 pub trait TransactionalApplicationStore: Send + Sync {
+    fn schema_store(&self) -> Option<&dyn ApplicationSchemaStore> {
+        None
+    }
+
     fn begin_transaction<'a>(
         &'a self,
     ) -> ProcessorFuture<

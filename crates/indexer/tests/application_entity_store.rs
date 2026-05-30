@@ -1,6 +1,7 @@
 use datalens_indexer::{
     ApplicationEntityQueryStore, ApplicationEntityReadQuery, CheckpointCursor,
     PostgresApplicationEntityStore, ProcessorError, SqliteApplicationEntityStore,
+    sdk::{ApplicationSchemaInitializer, ProcessorFuture, SchemaInitializationContext},
 };
 use sqlx::Row;
 
@@ -126,6 +127,37 @@ fn test_sqlite_application_entity_query_store_rejects_write_statements() {
 }
 
 #[test]
+fn test_sqlite_application_schema_initializer_creates_application_tables_idempotently() {
+    let store = SqliteApplicationEntityStore::connect(&sqlite_test_url("schema-init"))
+        .expect("sqlite application store connects");
+    tokio_runtime().block_on(async {
+        let initializer = SqlitePaymentSchemaInitializer;
+
+        store
+            .initialize_application_schema("payments", "transfers", &initializer)
+            .await
+            .expect("first schema initialization");
+        store
+            .initialize_application_schema("payments", "transfers", &initializer)
+            .await
+            .expect("second schema initialization");
+
+        let mut transaction = store.begin().await.expect("begin read transaction");
+        let row_count: i64 = sqlx::query("SELECT COUNT(*) AS count FROM payment_transfers")
+            .fetch_one(transaction.sqlite())
+            .await
+            .expect("query application table")
+            .get("count");
+        transaction
+            .rollback()
+            .await
+            .expect("rollback read transaction");
+
+        assert_eq!(row_count, 0);
+    });
+}
+
+#[test]
 fn test_sqlite_application_entity_query_store_returns_json_rows() {
     let store = SqliteApplicationEntityStore::connect(&sqlite_test_url("query-json"))
         .expect("sqlite application store connects");
@@ -156,6 +188,28 @@ fn test_sqlite_application_entity_query_store_returns_json_rows() {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["event_id"], "ethereum:45:0:1");
         assert_eq!(rows[0]["amount"], 13);
+    });
+}
+
+#[test]
+fn test_sqlite_application_schema_is_separate_from_datalens_metadata_schema() {
+    let store = SqliteApplicationEntityStore::connect(&sqlite_test_url("schema-separation"))
+        .expect("sqlite application store connects");
+    tokio_runtime().block_on(async {
+        store
+            .initialize_application_schema("payments", "transfers", &SqlitePaymentSchemaInitializer)
+            .await
+            .expect("schema initialization");
+        let mut transaction = store.begin().await.expect("begin read transaction");
+        let tables = sqlite_table_names(transaction.sqlite()).await;
+        transaction
+            .rollback()
+            .await
+            .expect("rollback read transaction");
+
+        assert!(tables.contains(&"payment_transfers".to_owned()));
+        assert!(tables.contains(&"datalens_processor_checkpoints".to_owned()));
+        assert!(!tables.contains(&"processor_checkpoints".to_owned()));
     });
 }
 
@@ -258,4 +312,46 @@ fn sqlite_test_url(name: &str) -> String {
     ));
     let _ = std::fs::remove_file(&path);
     format!("sqlite:{}", path.display())
+}
+
+struct SqlitePaymentSchemaInitializer;
+
+impl ApplicationSchemaInitializer for SqlitePaymentSchemaInitializer {
+    fn initialize_schema<'a>(
+        &'a self,
+        context: SchemaInitializationContext<'a>,
+    ) -> ProcessorFuture<'a, Result<(), ProcessorError>> {
+        Box::pin(async move {
+            assert_eq!(context.application(), "payments");
+            assert_eq!(context.index(), "transfers");
+            context
+                .store()
+                .execute_sql(
+                    r#"
+                    CREATE TABLE IF NOT EXISTS payment_transfers (
+                        event_id TEXT PRIMARY KEY,
+                        amount INTEGER NOT NULL
+                    )
+                    "#,
+                )
+                .await
+        })
+    }
+}
+
+async fn sqlite_table_names(connection: &mut sqlx::SqliteConnection) -> Vec<String> {
+    sqlx::query(
+        r#"
+        SELECT name
+        FROM sqlite_schema
+        WHERE type = 'table'
+        ORDER BY name
+        "#,
+    )
+    .fetch_all(connection)
+    .await
+    .expect("list sqlite tables")
+    .into_iter()
+    .map(|row| row.get::<String, _>("name"))
+    .collect()
 }

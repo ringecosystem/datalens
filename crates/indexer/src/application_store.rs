@@ -14,7 +14,10 @@ use sqlx::{
 };
 use tokio::runtime::Runtime;
 
-use crate::sdk::{CheckpointCursor, ProcessorError, ProcessorFuture};
+use crate::sdk::{
+    ApplicationDatabaseKind, ApplicationSchemaInitializer, ApplicationSchemaStore,
+    CheckpointCursor, ProcessorError, ProcessorFuture, SchemaInitializationContext,
+};
 
 pub trait ProcessorApplicationEntityStore: Send + Sync {
     type Transaction<'store>
@@ -101,7 +104,7 @@ impl SqliteApplicationEntityStore {
         let row = sqlx::query_as::<_, (String,)>(
             r#"
             SELECT checkpoint_value
-            FROM processor_checkpoints
+            FROM datalens_processor_checkpoints
             WHERE checkpoint_key = ?
             "#,
         )
@@ -111,10 +114,21 @@ impl SqliteApplicationEntityStore {
         Ok(row.map(|(value,)| CheckpointCursor::new(key, value)))
     }
 
+    pub async fn initialize_application_schema(
+        &self,
+        application: &str,
+        index: &str,
+        initializer: &dyn ApplicationSchemaInitializer,
+    ) -> Result<(), ProcessorError> {
+        initializer
+            .initialize_schema(SchemaInitializationContext::new(application, index, self))
+            .await
+    }
+
     async fn initialize_schema(&self) -> io::Result<()> {
         sqlx::query(
             r#"
-            CREATE TABLE IF NOT EXISTS processor_checkpoints (
+            CREATE TABLE IF NOT EXISTS datalens_processor_checkpoints (
                 checkpoint_key TEXT PRIMARY KEY,
                 checkpoint_value TEXT NOT NULL,
                 updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
@@ -155,6 +169,24 @@ impl ApplicationEntityQueryStore for SqliteApplicationEntityStore {
     }
 }
 
+impl ApplicationSchemaStore for SqliteApplicationEntityStore {
+    fn database_kind(&self) -> ApplicationDatabaseKind {
+        ApplicationDatabaseKind::Sqlite
+    }
+
+    fn execute_sql<'a>(
+        &'a self,
+        statement: &'a str,
+    ) -> ProcessorFuture<'a, Result<(), ProcessorError>> {
+        Box::pin(async move {
+            sqlx::raw_sql(sqlx::AssertSqlSafe(statement))
+                .execute(&self.pool)
+                .await?;
+            Ok(())
+        })
+    }
+}
+
 impl fmt::Debug for SqliteApplicationEntityStore {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -179,7 +211,7 @@ impl SqliteApplicationEntityTransaction<'_> {
     ) -> Result<SqliteQueryResult, ProcessorError> {
         Ok(sqlx::query(
             r#"
-            INSERT INTO processor_checkpoints (checkpoint_key, checkpoint_value, updated_at)
+            INSERT INTO datalens_processor_checkpoints (checkpoint_key, checkpoint_value, updated_at)
             VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
             ON CONFLICT(checkpoint_key) DO UPDATE SET
                 checkpoint_value = excluded.checkpoint_value,
@@ -237,7 +269,7 @@ impl PostgresApplicationEntityStore {
         let row = sqlx::query_as::<_, (String,)>(
             r#"
             SELECT checkpoint_value
-            FROM processor_checkpoints
+            FROM datalens_processor_checkpoints
             WHERE checkpoint_key = $1
             "#,
         )
@@ -247,10 +279,21 @@ impl PostgresApplicationEntityStore {
         Ok(row.map(|(value,)| CheckpointCursor::new(key, value)))
     }
 
+    pub async fn initialize_application_schema(
+        &self,
+        application: &str,
+        index: &str,
+        initializer: &dyn ApplicationSchemaInitializer,
+    ) -> Result<(), ProcessorError> {
+        initializer
+            .initialize_schema(SchemaInitializationContext::new(application, index, self))
+            .await
+    }
+
     async fn initialize_schema(&self) -> io::Result<()> {
         sqlx::query(
             r#"
-            CREATE TABLE IF NOT EXISTS processor_checkpoints (
+            CREATE TABLE IF NOT EXISTS datalens_processor_checkpoints (
                 checkpoint_key TEXT PRIMARY KEY,
                 checkpoint_value TEXT NOT NULL,
                 updated_at TEXT NOT NULL DEFAULT (
@@ -293,6 +336,24 @@ impl ApplicationEntityQueryStore for PostgresApplicationEntityStore {
     }
 }
 
+impl ApplicationSchemaStore for PostgresApplicationEntityStore {
+    fn database_kind(&self) -> ApplicationDatabaseKind {
+        ApplicationDatabaseKind::Postgres
+    }
+
+    fn execute_sql<'a>(
+        &'a self,
+        statement: &'a str,
+    ) -> ProcessorFuture<'a, Result<(), ProcessorError>> {
+        Box::pin(async move {
+            sqlx::raw_sql(sqlx::AssertSqlSafe(statement))
+                .execute(&self.pool)
+                .await?;
+            Ok(())
+        })
+    }
+}
+
 impl fmt::Debug for PostgresApplicationEntityStore {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -317,7 +378,7 @@ impl PostgresApplicationEntityTransaction<'_> {
     ) -> Result<PgQueryResult, ProcessorError> {
         Ok(sqlx::query(
             r#"
-            INSERT INTO processor_checkpoints (checkpoint_key, checkpoint_value, updated_at)
+            INSERT INTO datalens_processor_checkpoints (checkpoint_key, checkpoint_value, updated_at)
             VALUES ($1, $2, to_char(clock_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'))
             ON CONFLICT(checkpoint_key) DO UPDATE SET
                 checkpoint_value = excluded.checkpoint_value,

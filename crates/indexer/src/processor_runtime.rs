@@ -1,14 +1,15 @@
 use datalens_client::{DatalensClient, HttpTransport};
 use datalens_core::{DatasetKey, LedgerRange, QueryFinalityRequirement, QueryRows, missing_ranges};
 use serde::Serialize;
-use std::{collections::BTreeMap, path::PathBuf, time::Instant};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Instant};
 
 use crate::{
     CheckpointPolicy, CheckpointSkippedRange, ExecutedRange, IndexCheckpointFile,
     IndexCheckpointFileStore, IndexPlan, IndexRunTaskSummary, IndexerError, PlannedIndexTask,
     sdk::{
         ApplicationProcessor, CheckpointCursor, EventBatch, EventOrderingKey, EventRecord,
-        ProcessorContext, ProcessorError, TransactionalApplicationStore,
+        ProcessorContext, ProcessorError, SchemaInitializationContext,
+        TransactionalApplicationStore,
     },
     task_chain_identity, task_ledger_range, task_query_selector,
 };
@@ -19,6 +20,7 @@ pub struct ProcessorRuntime<P, S> {
     processor: P,
     store: S,
     options: ProcessorRuntimeOptions,
+    schema_initializer: Option<Arc<dyn crate::sdk::ApplicationSchemaInitializer>>,
 }
 
 impl<P, S> ProcessorRuntime<P, S>
@@ -32,11 +34,20 @@ where
             processor,
             store,
             options: ProcessorRuntimeOptions::default(),
+            schema_initializer: None,
         }
     }
 
     pub fn with_options(mut self, options: ProcessorRuntimeOptions) -> Self {
         self.options = options;
+        self
+    }
+
+    pub fn with_schema_initializer(
+        mut self,
+        initializer: impl crate::sdk::ApplicationSchemaInitializer + 'static,
+    ) -> Self {
+        self.schema_initializer = Some(Arc::new(initializer));
         self
     }
 
@@ -51,6 +62,8 @@ where
     where
         T: HttpTransport,
     {
+        self.initialize_application_schema().await?;
+
         let checkpoint_store = self.options.checkpoint_store();
         let checkpoint = match &checkpoint_store {
             Some(store) if !self.options.from_start => store.load()?,
@@ -243,6 +256,28 @@ where
             failures,
             final_checkpoint,
         })
+    }
+
+    async fn initialize_application_schema(&self) -> Result<(), IndexerError> {
+        let Some(initializer) = &self.schema_initializer else {
+            return Ok(());
+        };
+        let schema_store = self.store.schema_store().ok_or_else(|| {
+            IndexerError::Runner(
+                "processor schema initialization failed: application store does not expose schema initialization capability".to_owned(),
+            )
+        })?;
+        let context = SchemaInitializationContext::new(
+            self.plan.application(),
+            self.plan.index(),
+            schema_store,
+        );
+        initializer
+            .initialize_schema(context)
+            .await
+            .map_err(|error| {
+                IndexerError::Runner(format!("processor schema initialization failed: {error}"))
+            })
     }
 }
 
