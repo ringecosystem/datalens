@@ -1,9 +1,10 @@
 use datalens_indexer::{
     CheckpointPolicy, DatabaseDriver, DatabaseOutputConfig, DatalensIndexConfig, DecodeConfig,
-    DecodeEventConfig, DecodeEventInputConfig, FinalityRequirement, IndexDataset,
-    MetricsServiceConfig, OutputConfig, ParquetOutputConfig, QueryAuthApplicationConfig,
-    QueryAuthConfig, QueryAuthQuotaConfig, QueryProtocol, QueryServiceConfig, SourceConfig,
-    WebhookHeaderConfig, WebhookOutboxConfig, WebhookOutputConfig, WebhookRetryConfig,
+    DecodeEventConfig, DecodeEventInputConfig, FinalityRequirement, GraphqlViewConfig,
+    GraphqlViewFieldConfig, GraphqlViewFilterConfig, IndexDataset, MetricsServiceConfig,
+    OutputConfig, ParquetOutputConfig, QueryAuthApplicationConfig, QueryAuthConfig,
+    QueryAuthQuotaConfig, QueryProtocol, QueryServiceConfig, SourceConfig, WebhookHeaderConfig,
+    WebhookOutboxConfig, WebhookOutputConfig, WebhookRetryConfig,
 };
 
 fn valid_config() -> &'static str {
@@ -383,7 +384,132 @@ fn test_parse_valid_sqlite_database_output_allows_query_service() {
             playground: true,
             metrics: MetricsServiceConfig::default(),
             auth: QueryAuthConfig::default(),
+            views: Vec::new(),
         }
+    );
+}
+
+#[test]
+fn test_parse_graphql_view_config_returns_application_view_schema() {
+    let input = valid_config()
+        .replace(
+            "[output.jsonl]\npath = \".data/indexes/ormp/events.jsonl\"",
+            "[output]\nkind = \"database\"\n\n[output.database]\ndriver = \"sqlite\"\nurl = \"sqlite:.data/indexes/ormp/index.db\"",
+        )
+        .replace(
+            "[checkpoint]",
+            r#"[query]
+enabled = true
+protocol = "graphql"
+
+[[query.views]]
+name = "messageAccepted"
+dataset = "evm.logs"
+event_name = "MessageAccepted"
+signature = "MessageAccepted(bytes32,uint256,address,address)"
+default_limit = 25
+max_limit = 100
+
+[[query.views.fields]]
+name = "msgHash"
+path = "decoded.msgHash"
+
+[[query.views.fields]]
+name = "sourceChain"
+path = "decoded.fromChainId"
+
+[[query.views.filters]]
+field = "address"
+equals = "0x2cd1867fb8016f93710b6386f7f9f1d540a60812"
+
+[checkpoint]"#,
+        );
+
+    let config = DatalensIndexConfig::from_toml_str(&input).expect("valid graphql view config");
+
+    assert_eq!(
+        config.query.views,
+        vec![GraphqlViewConfig {
+            name: "messageAccepted".to_owned(),
+            dataset: "evm.logs".to_owned(),
+            event_name: Some("MessageAccepted".to_owned()),
+            signature: Some("MessageAccepted(bytes32,uint256,address,address)".to_owned()),
+            fields: vec![
+                GraphqlViewFieldConfig {
+                    name: "msgHash".to_owned(),
+                    path: "decoded.msgHash".to_owned(),
+                },
+                GraphqlViewFieldConfig {
+                    name: "sourceChain".to_owned(),
+                    path: "decoded.fromChainId".to_owned(),
+                },
+            ],
+            filters: vec![GraphqlViewFilterConfig {
+                field: "address".to_owned(),
+                equals: "0x2cd1867fb8016f93710b6386f7f9f1d540a60812".to_owned(),
+            }],
+            default_limit: 25,
+            max_limit: 100,
+        }]
+    );
+}
+
+#[test]
+fn test_parse_graphql_view_config_rejects_invalid_graphql_identifiers() {
+    let input = valid_config()
+        .replace(
+            "[output.jsonl]\npath = \".data/indexes/ormp/events.jsonl\"",
+            "[output]\nkind = \"database\"\n\n[output.database]\ndriver = \"sqlite\"\nurl = \"sqlite:.data/indexes/ormp/index.db\"",
+        )
+        .replace(
+            "[checkpoint]",
+            r#"[query]
+enabled = true
+protocol = "graphql"
+
+[[query.views]]
+name = "message-accepted"
+dataset = "evm.logs"
+
+[[query.views.fields]]
+name = "from-chain"
+path = "decoded.fromChainId"
+
+[checkpoint]"#,
+        );
+
+    let error = parse_error(&input);
+
+    assert!(error.contains("query.views[0].name"), "{error}");
+    assert!(error.contains("query.views[0].fields[0].name"), "{error}");
+    assert!(error.contains("GraphQL identifier"), "{error}");
+}
+
+#[test]
+fn test_parse_graphql_view_config_rejects_nonqueryable_output() {
+    let input = valid_config().replace(
+        "[checkpoint]",
+        r#"[query]
+enabled = true
+
+[[query.views]]
+name = "messageAccepted"
+dataset = "evm.logs"
+
+[[query.views.fields]]
+name = "msgHash"
+path = "decoded.msgHash"
+
+[checkpoint]"#,
+    );
+
+    let error = parse_error(&input);
+
+    assert!(error.contains("query.views"), "{error}");
+    assert!(error.contains("jsonl"), "{error}");
+    assert!(
+        error.contains("does not support graphql query service"),
+        "{error}"
     );
 }
 
@@ -605,6 +731,7 @@ fn test_parse_valid_postgres_database_output_allows_query_service() {
             playground: false,
             metrics: MetricsServiceConfig::default(),
             auth: QueryAuthConfig::default(),
+            views: Vec::new(),
         }
     );
 }
