@@ -1,7 +1,8 @@
 use std::process::ExitCode;
 
+use clap::Parser;
 use datalens_client::DatalensClient;
-use datalens_example_ormp::{OrmpConfig, query_with_client, summarize_response};
+use datalens_example_ormp::{OrmpCli, OrmpConfig, query_with_client, summarize_response};
 
 fn main() -> ExitCode {
     match run() {
@@ -14,6 +15,7 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    OrmpCli::parse();
     let config = OrmpConfig::from_env()?;
     let client = DatalensClient::new(config.client_config())?;
     let response = query_with_client(&client, &config)?;
