@@ -34,6 +34,8 @@ impl IndexPlan {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PlannedIndexTask {
     pub label: String,
+    #[serde(skip_serializing)]
+    pub index: String,
     pub source_identity: String,
     pub chain: String,
     pub family: String,
@@ -145,6 +147,7 @@ fn plan_source(
                             "{}.{planned_source_index:03}.{chunk_index:06}",
                             config.index.name
                         ),
+                        index: config.index.name.clone(),
                         source_identity: source_identity.clone(),
                         chain: evm_source.chain.clone(),
                         family: "evm".to_owned(),

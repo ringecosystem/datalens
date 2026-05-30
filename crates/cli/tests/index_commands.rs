@@ -37,8 +37,17 @@ fn test_index_plan_accepts_config_path() {
 }
 
 #[test]
-fn test_index_run_accepts_config_path() {
-    let cli = Cli::parse_from(["datalens", "index", "run", "--config", "evm.toml"]);
+fn test_index_run_accepts_config_path_and_checkpoint_options() {
+    let cli = Cli::parse_from([
+        "datalens",
+        "index",
+        "run",
+        "--config",
+        "evm.toml",
+        "--from-start",
+        "--no-checkpoint",
+        "--dry-run",
+    ]);
 
     match cli.command {
         Command::Index(command) => match *command {
@@ -46,6 +55,9 @@ fn test_index_run_accepts_config_path() {
                 command: IndexSubcommand::Run(command),
             } => {
                 assert_eq!(command.config, "evm.toml");
+                assert!(command.from_start);
+                assert!(command.no_checkpoint);
+                assert!(command.dry_run);
             }
             command => panic!("expected index run command, got {command:?}"),
         },
