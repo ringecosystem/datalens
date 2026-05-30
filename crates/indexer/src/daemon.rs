@@ -183,6 +183,13 @@ pub struct IndexDaemonReport {
 pub struct QueryServiceReport {
     pub bind: SocketAddr,
     pub graphql_path: String,
+    pub auth: QueryServiceAuthReport,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct QueryServiceAuthReport {
+    pub enabled: bool,
+    pub applications: usize,
 }
 
 struct RunningQueryService {
@@ -260,15 +267,13 @@ async fn start_graphql_service(
     } else {
         None
     };
-    let app = match metrics {
-        Some(metrics) => graphql::graphql_router_with_metrics(
-            store,
-            &config.query.path,
-            config.query.playground,
-            metrics,
-        ),
-        None => graphql::graphql_router(store, &config.query.path, config.query.playground),
-    };
+    let app = graphql::graphql_router_with_auth(
+        store,
+        &config.query.path,
+        config.query.playground,
+        config.query.auth.clone(),
+        metrics,
+    );
     let graphql_path = config.query.path.clone();
     let (shutdown, shutdown_receiver) = oneshot::channel();
     let handle = tokio::spawn(async move {
@@ -281,7 +286,14 @@ async fn start_graphql_service(
     });
     log::info!("index daemon GraphQL query service listening on {bind}");
     Ok(RunningQueryService {
-        report: QueryServiceReport { bind, graphql_path },
+        report: QueryServiceReport {
+            bind,
+            graphql_path,
+            auth: QueryServiceAuthReport {
+                enabled: config.query.auth.enabled,
+                applications: config.query.auth.applications.len(),
+            },
+        },
         shutdown,
         handle,
     })

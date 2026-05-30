@@ -1,4 +1,8 @@
-use std::{sync::Arc, time::Instant};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use async_graphql::{
     Context, EmptyMutation, EmptySubscription, Error, Json, Object, Schema, SimpleObject,
@@ -12,11 +16,14 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
+use datalens_core::{DatalensError, DatalensErrorKind};
 pub use datalens_metrics::IndexerGraphqlMetricLabels;
 use datalens_metrics::{IndexerGraphqlQueryOutcome, MetricsRecorder};
 use serde_json::{Map, Value};
 
-use crate::{IndexerError, QueryableStore, StoreQuery};
+use crate::{
+    IndexerError, QueryAuthApplicationConfig, QueryAuthConfig, QueryableStore, StoreQuery,
+};
 
 pub const DEFAULT_EVENT_LIMIT: u64 = 100;
 pub const MAX_EVENT_LIMIT: u64 = 1000;
@@ -49,6 +56,16 @@ fn graphql_router_internal(
     playground: bool,
     metrics: Option<IndexerGraphqlMetrics>,
 ) -> Router {
+    graphql_router_with_auth(store, path, playground, QueryAuthConfig::default(), metrics)
+}
+
+pub fn graphql_router_with_auth(
+    store: SharedStore,
+    path: &str,
+    playground: bool,
+    auth: QueryAuthConfig,
+    metrics: Option<IndexerGraphqlMetrics>,
+) -> Router {
     let schema = graphql_schema(store);
     let mut router = Router::new().route(path, post(graphql_handler));
     if playground {
@@ -65,6 +82,7 @@ fn graphql_router_internal(
         schema,
         endpoint: path.to_owned(),
         metrics,
+        auth: QueryAuthRegistry::new(auth),
     })
 }
 
@@ -73,6 +91,7 @@ struct GraphqlState {
     schema: IndexerGraphqlSchema,
     endpoint: String,
     metrics: Option<IndexerGraphqlMetrics>,
+    auth: QueryAuthRegistry,
 }
 
 #[derive(Clone)]
@@ -90,9 +109,17 @@ pub struct MetricsEndpointConfig {
 
 async fn graphql_handler(
     State(state): State<GraphqlState>,
+    headers: HeaderMap,
     request: GraphQLRequest,
-) -> GraphQLResponse {
+) -> Response {
     let started = Instant::now();
+    let application = match state.auth.authenticate(&headers) {
+        Ok(application) => application,
+        Err(error) => {
+            record_auth_error(&state, &error);
+            return auth_error_response(error);
+        }
+    };
     let response = state.schema.execute(request.into_inner()).await;
     if let Some(metrics) = &state.metrics {
         let outcome = if response.errors.is_empty() {
@@ -100,18 +127,22 @@ async fn graphql_handler(
         } else {
             IndexerGraphqlQueryOutcome::Error
         };
+        let labels = request_labels(metrics, application.as_ref());
         metrics
             .recorder
-            .record_indexer_graphql_query(&metrics.labels, outcome);
-        metrics.recorder.observe_indexer_graphql_query_duration(
-            &metrics.labels,
-            started.elapsed().as_secs_f64(),
-        );
+            .record_indexer_graphql_query(&labels, outcome);
+        metrics
+            .recorder
+            .observe_indexer_graphql_query_duration(&labels, started.elapsed().as_secs_f64());
     }
-    response.into()
+    GraphQLResponse::from(response).into_response()
 }
 
-async fn playground_handler(State(state): State<GraphqlState>) -> Response {
+async fn playground_handler(State(state): State<GraphqlState>, headers: HeaderMap) -> Response {
+    if let Err(error) = state.auth.authenticate(&headers) {
+        record_auth_error(&state, &error);
+        return auth_error_response(error);
+    }
     Html(GraphiQLSource::build().endpoint(&state.endpoint).finish()).into_response()
 }
 
@@ -144,6 +175,208 @@ async fn metrics_handler(State(state): State<GraphqlState>, headers: HeaderMap) 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     value.strip_prefix("Bearer ")
+}
+
+#[derive(Clone, Debug)]
+struct QueryAuthRegistry {
+    enabled: bool,
+    applications: Arc<BTreeMap<String, QueryAuthApplicationConfig>>,
+    quota_state: Arc<Mutex<BTreeMap<String, QueryAuthState>>>,
+}
+
+impl QueryAuthRegistry {
+    fn new(config: QueryAuthConfig) -> Self {
+        Self {
+            enabled: config.enabled,
+            applications: Arc::new(
+                config
+                    .applications
+                    .into_iter()
+                    .map(|mut application| {
+                        application.id = normalize_application_id(&application.id);
+                        (application.id.clone(), application)
+                    })
+                    .collect(),
+            ),
+            quota_state: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    fn authenticate(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<Option<QueryApplicationPermit>, DatalensError> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        let token = bearer_token(headers).ok_or_else(|| {
+            DatalensError::new(
+                DatalensErrorKind::AuthenticationFailed,
+                "application credentials are required",
+            )
+        })?;
+        let application = self
+            .applications
+            .values()
+            .find(|application| application.token == token)
+            .ok_or_else(|| {
+                DatalensError::new(
+                    DatalensErrorKind::AuthenticationFailed,
+                    "application credentials are invalid",
+                )
+            })?;
+        if !application.enabled {
+            return Err(DatalensError::new(
+                DatalensErrorKind::Unauthorized,
+                "application is disabled",
+            ));
+        }
+        self.acquire_permit(application).map(Some)
+    }
+
+    fn acquire_permit(
+        &self,
+        application: &QueryAuthApplicationConfig,
+    ) -> Result<QueryApplicationPermit, DatalensError> {
+        let Some(quota) = &application.quota else {
+            return Ok(QueryApplicationPermit::noop(application.id.clone()));
+        };
+        let mut states = self.quota_state.lock().expect("query auth quota state");
+        let state = states.entry(application.id.clone()).or_default();
+        let now = Instant::now();
+        if now.duration_since(state.window_started_at) >= Duration::from_secs(60) {
+            state.window_started_at = now;
+            state.requests_in_window = 0;
+        }
+        if let Some(limit) = quota.max_requests_per_minute
+            && state.requests_in_window >= limit
+        {
+            return Err(DatalensError::new(
+                DatalensErrorKind::RateLimited,
+                "application request rate quota exceeded",
+            ));
+        }
+        if let Some(limit) = quota.max_concurrent_requests
+            && state.in_flight >= limit
+        {
+            return Err(DatalensError::new(
+                DatalensErrorKind::RateLimited,
+                "application concurrent request quota exceeded",
+            ));
+        }
+        if quota.max_requests_per_minute.is_some() {
+            state.requests_in_window += 1;
+        }
+        let release = quota.max_concurrent_requests.is_some();
+        if release {
+            state.in_flight += 1;
+        }
+        Ok(QueryApplicationPermit {
+            application_id: application.id.clone(),
+            quota_state: self.quota_state.clone(),
+            release,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct QueryApplicationPermit {
+    application_id: String,
+    quota_state: Arc<Mutex<BTreeMap<String, QueryAuthState>>>,
+    release: bool,
+}
+
+impl QueryApplicationPermit {
+    fn noop(application_id: String) -> Self {
+        Self {
+            application_id,
+            quota_state: Arc::new(Mutex::new(BTreeMap::new())),
+            release: false,
+        }
+    }
+
+    fn application_id(&self) -> &str {
+        &self.application_id
+    }
+}
+
+impl Drop for QueryApplicationPermit {
+    fn drop(&mut self) {
+        if !self.release {
+            return;
+        }
+        let mut states = self.quota_state.lock().expect("query auth quota state");
+        if let Some(state) = states.get_mut(&self.application_id) {
+            state.in_flight = state.in_flight.saturating_sub(1);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct QueryAuthState {
+    window_started_at: Instant,
+    requests_in_window: u64,
+    in_flight: u64,
+}
+
+impl Default for QueryAuthState {
+    fn default() -> Self {
+        Self {
+            window_started_at: Instant::now(),
+            requests_in_window: 0,
+            in_flight: 0,
+        }
+    }
+}
+
+fn request_labels(
+    metrics: &IndexerGraphqlMetrics,
+    application: Option<&QueryApplicationPermit>,
+) -> IndexerGraphqlMetricLabels {
+    let mut labels = metrics.labels.clone();
+    if let Some(application) = application {
+        labels.application = application.application_id().to_owned();
+    }
+    labels
+}
+
+fn record_auth_error(state: &GraphqlState, error: &DatalensError) {
+    let Some(metrics) = &state.metrics else {
+        return;
+    };
+    match error.kind {
+        DatalensErrorKind::RateLimited => metrics
+            .recorder
+            .record_indexer_graphql_rate_limited(&metrics.labels),
+        _ => metrics
+            .recorder
+            .record_indexer_graphql_auth_failure(&metrics.labels),
+    }
+}
+
+fn auth_error_response(error: DatalensError) -> Response {
+    let status = match error.kind {
+        DatalensErrorKind::AuthenticationFailed => StatusCode::UNAUTHORIZED,
+        DatalensErrorKind::Unauthorized => StatusCode::FORBIDDEN,
+        DatalensErrorKind::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+        _ => StatusCode::BAD_REQUEST,
+    };
+    (
+        status,
+        [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+        serde_json::json!({
+            "error": {
+                "kind": format!("{:?}", error.kind),
+                "message": error.message,
+            }
+        })
+        .to_string(),
+    )
+        .into_response()
+}
+
+fn normalize_application_id(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
 }
 
 pub struct QueryRoot;

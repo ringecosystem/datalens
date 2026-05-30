@@ -1,4 +1,4 @@
-use std::{env, fmt, path::PathBuf};
+use std::{collections::BTreeSet, env, fmt, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -176,6 +176,7 @@ pub struct QueryServiceConfig {
     pub path: String,
     pub playground: bool,
     pub metrics: MetricsServiceConfig,
+    pub auth: QueryAuthConfig,
 }
 
 impl Default for QueryServiceConfig {
@@ -187,8 +188,51 @@ impl Default for QueryServiceConfig {
             path: "/graphql".to_owned(),
             playground: false,
             metrics: MetricsServiceConfig::default(),
+            auth: QueryAuthConfig::default(),
         }
     }
+}
+
+#[derive(Clone, Default, Eq, PartialEq)]
+pub struct QueryAuthConfig {
+    pub enabled: bool,
+    pub applications: Vec<QueryAuthApplicationConfig>,
+}
+
+impl fmt::Debug for QueryAuthConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("QueryAuthConfig")
+            .field("enabled", &self.enabled)
+            .field("applications", &self.applications)
+            .finish()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct QueryAuthApplicationConfig {
+    pub id: String,
+    pub enabled: bool,
+    pub token: String,
+    pub quota: Option<QueryAuthQuotaConfig>,
+}
+
+impl fmt::Debug for QueryAuthApplicationConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("QueryAuthApplicationConfig")
+            .field("id", &self.id)
+            .field("enabled", &self.enabled)
+            .field("token", &"<redacted>")
+            .field("quota", &self.quota)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryAuthQuotaConfig {
+    pub max_requests_per_minute: Option<u64>,
+    pub max_concurrent_requests: Option<u64>,
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -325,6 +369,7 @@ struct RawQueryServiceConfig {
     #[serde(default)]
     playground: bool,
     metrics: Option<RawMetricsServiceConfig>,
+    auth: Option<RawQueryAuthConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -335,6 +380,31 @@ struct RawMetricsServiceConfig {
     path: Option<String>,
     bearer_token: Option<String>,
     token_env: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawQueryAuthConfig {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    applications: Vec<RawQueryAuthApplicationConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawQueryAuthApplicationConfig {
+    id: Option<String>,
+    #[serde(default = "default_enabled")]
+    enabled: bool,
+    token: Option<String>,
+    token_env: Option<String>,
+    max_requests_per_minute: Option<u64>,
+    max_concurrent_requests: Option<u64>,
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -633,6 +703,7 @@ fn parse_query(raw: Option<RawQueryServiceConfig>, errors: &mut Vec<String>) -> 
         errors.push("query.path: must start with /".to_owned());
     }
     let metrics = parse_query_metrics(raw.metrics, &path, errors);
+    let auth = parse_query_auth(raw.auth, errors);
 
     QueryServiceConfig {
         enabled: raw.enabled,
@@ -641,6 +712,7 @@ fn parse_query(raw: Option<RawQueryServiceConfig>, errors: &mut Vec<String>) -> 
         path,
         playground: raw.playground,
         metrics,
+        auth,
     }
 }
 
@@ -683,6 +755,89 @@ fn parse_query_metrics(
         path,
         bearer_token,
     }
+}
+
+fn parse_query_auth(raw: Option<RawQueryAuthConfig>, errors: &mut Vec<String>) -> QueryAuthConfig {
+    let Some(raw) = raw else {
+        return QueryAuthConfig::default();
+    };
+    let applications = raw
+        .applications
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, application)| parse_query_auth_application(index, application, errors))
+        .collect::<Vec<_>>();
+    let mut ids = BTreeSet::new();
+    for application in &applications {
+        if !ids.insert(application.id.clone()) {
+            errors.push(format!(
+                "query.auth.applications: application id {} is registered more than once",
+                application.id
+            ));
+        }
+    }
+    if raw.enabled && applications.is_empty() {
+        errors.push(
+            "query.auth.applications: at least one application is required when query auth is enabled"
+                .to_owned(),
+        );
+    }
+    QueryAuthConfig {
+        enabled: raw.enabled,
+        applications,
+    }
+}
+
+fn parse_query_auth_application(
+    index: usize,
+    raw: RawQueryAuthApplicationConfig,
+    errors: &mut Vec<String>,
+) -> Option<QueryAuthApplicationConfig> {
+    let field = format!("query.auth.applications[{index}]");
+    let id = required_non_empty(&format!("{field}.id"), raw.id, errors)
+        .and_then(|value| normalize_application_id(&format!("{field}.id"), &value, errors));
+    let token = match raw.token_env {
+        Some(token_env) if !token_env.trim().is_empty() => env::var(&token_env)
+            .map_err(|_| {
+                errors.push(format!(
+                    "{field}.token_env: environment variable {token_env} is not set"
+                ));
+            })
+            .ok(),
+        Some(_) => {
+            errors.push(format!("{field}.token_env: must not be empty"));
+            None
+        }
+        None => raw.token.filter(|value| !value.trim().is_empty()),
+    };
+    if token.is_none() {
+        errors.push(format!("{field}.token: token or token_env is required"));
+    }
+    validate_optional_positive_u64(
+        &format!("{field}.max_requests_per_minute"),
+        raw.max_requests_per_minute,
+        errors,
+    );
+    validate_optional_positive_u64(
+        &format!("{field}.max_concurrent_requests"),
+        raw.max_concurrent_requests,
+        errors,
+    );
+    let quota = if raw.max_requests_per_minute.is_some() || raw.max_concurrent_requests.is_some() {
+        Some(QueryAuthQuotaConfig {
+            max_requests_per_minute: raw.max_requests_per_minute,
+            max_concurrent_requests: raw.max_concurrent_requests,
+        })
+    } else {
+        None
+    };
+
+    Some(QueryAuthApplicationConfig {
+        id: id?,
+        enabled: raw.enabled,
+        token: token?,
+        quota,
+    })
 }
 
 fn parse_decode(raw: Option<RawDecodeConfig>, errors: &mut Vec<String>) -> DecodeConfig {
@@ -846,6 +1001,32 @@ fn validate_optional_positive_usize(field: &str, value: Option<usize>, errors: &
     if value == Some(0) {
         errors.push(format!("{field}: must be greater than 0"));
     }
+}
+
+fn validate_optional_positive_u64(field: &str, value: Option<u64>, errors: &mut Vec<String>) {
+    if value == Some(0) {
+        errors.push(format!("{field}: must be greater than 0"));
+    }
+}
+
+fn normalize_application_id(field: &str, value: &str, errors: &mut Vec<String>) -> Option<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty()
+        || normalized.starts_with('.')
+        || normalized.ends_with('.')
+        || normalized.contains('/')
+        || normalized.contains('\\')
+        || normalized.len() > 64
+        || !normalized.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+        })
+    {
+        errors.push(format!(
+            "{field}: application id must be 1-64 characters using lowercase letters, digits, dot, underscore, or hyphen"
+        ));
+        return None;
+    }
+    Some(normalized)
 }
 
 fn expand_env_vars(text: &str) -> Result<String, IndexerError> {

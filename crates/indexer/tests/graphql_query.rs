@@ -9,10 +9,11 @@ use axum::{
     http::{Request, StatusCode, header},
 };
 use datalens_indexer::{
-    IndexedRecord, OutputWriteSink, PostgresOutputStore, SqliteOutputStore,
+    IndexedRecord, OutputWriteSink, PostgresOutputStore, QueryAuthApplicationConfig,
+    QueryAuthConfig, QueryAuthQuotaConfig, SqliteOutputStore,
     graphql::{
         IndexerGraphqlMetricLabels, IndexerGraphqlMetrics, MetricsEndpointConfig, graphql_router,
-        graphql_router_with_metrics, graphql_schema,
+        graphql_router_with_auth, graphql_router_with_metrics, graphql_schema,
     },
 };
 use datalens_metrics::MetricsRecorder;
@@ -479,6 +480,77 @@ fn test_graphql_metrics_include_rate_limited_events() {
     ));
 }
 
+#[test]
+fn test_graphql_auth_failures_and_rate_limits_are_exposed_in_metrics() {
+    let recorder = MetricsRecorder::new().expect("metrics recorder");
+    let store =
+        Arc::new(SqliteOutputStore::connect("sqlite::memory:").expect("sqlite store connects"));
+    let _store_keepalive = store.clone();
+    let app = graphql_router_with_auth(
+        store,
+        "/graphql",
+        false,
+        auth_config(Some(QueryAuthQuotaConfig {
+            max_requests_per_minute: Some(1),
+            max_concurrent_requests: None,
+        })),
+        Some(IndexerGraphqlMetrics {
+            recorder: recorder.clone(),
+            labels: metric_labels(),
+            endpoint: Some(MetricsEndpointConfig {
+                path: "/metrics".to_owned(),
+                bearer_token: None,
+            }),
+        }),
+    );
+
+    Runtime::new().expect("runtime").block_on(async {
+        let unauthorized = app
+            .clone()
+            .oneshot(graphql_http_request(
+                r#"{ events(dataset: "evm.logs") { blockNumber } }"#,
+            ))
+            .await
+            .expect("unauthorized response");
+        let first = app
+            .clone()
+            .oneshot(
+                graphql_http_request(r#"{ events(dataset: "evm.logs") { blockNumber } }"#)
+                    .tap_header(header::AUTHORIZATION, "Bearer query-token"),
+            )
+            .await
+            .expect("first response");
+        let rate_limited = app
+            .clone()
+            .oneshot(
+                graphql_http_request(r#"{ events(dataset: "evm.logs") { blockNumber } }"#)
+                    .tap_header(header::AUTHORIZATION, "Bearer query-token"),
+            )
+            .await
+            .expect("rate-limited response");
+        let metrics = app
+            .oneshot(
+                Request::get("/metrics")
+                    .body(Body::empty())
+                    .expect("metrics request"),
+            )
+            .await
+            .expect("metrics response");
+
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(rate_limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        let text = response_text(metrics).await;
+        assert!(text.contains(
+            r#"datalens_indexer_graphql_auth_failure_total{application="ormp",chain="ethereum",dataset="evm.logs",index="ormp",output="sqlite"} 1"#
+        ));
+        assert!(text.contains(
+            r#"datalens_indexer_graphql_rate_limited_total{application="ormp",chain="ethereum",dataset="evm.logs",index="ormp",output="sqlite"} 1"#
+        ));
+        assert!(!text.contains("query-token"));
+    });
+}
+
 fn metric_labels() -> IndexerGraphqlMetricLabels {
     IndexerGraphqlMetricLabels {
         application: "ormp".to_owned(),
@@ -496,6 +568,30 @@ fn graphql_http_request(query: &str) -> Request<Body> {
             serde_json::json!({ "query": query }).to_string(),
         ))
         .expect("graphql request")
+}
+
+trait RequestHeaderExt {
+    fn tap_header(self, name: header::HeaderName, value: &str) -> Self;
+}
+
+impl RequestHeaderExt for Request<Body> {
+    fn tap_header(mut self, name: header::HeaderName, value: &str) -> Self {
+        self.headers_mut()
+            .insert(name, value.parse().expect("header value"));
+        self
+    }
+}
+
+fn auth_config(quota: Option<QueryAuthQuotaConfig>) -> QueryAuthConfig {
+    QueryAuthConfig {
+        enabled: true,
+        applications: vec![QueryAuthApplicationConfig {
+            id: "Query_App".to_owned(),
+            enabled: true,
+            token: "query-token".to_owned(),
+            quota,
+        }],
+    }
 }
 
 async fn response_text(response: axum::response::Response) -> String {
