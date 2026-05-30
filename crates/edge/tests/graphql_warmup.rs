@@ -10,7 +10,7 @@ async fn test_graphql_warmup_submit_list_and_cancel_task() {
     let registry = QueryServiceRegistry::new()
         .with_service(service)
         .expect("register service");
-    let app = router(registry);
+    let app = graphql_router(registry);
 
     let submit = graphql_json(
         app.clone(),

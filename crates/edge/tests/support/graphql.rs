@@ -58,6 +58,19 @@ pub(crate) async fn graphql_json(
         .expect("json body")
 }
 
+pub(crate) fn graphql_router(registry: QueryServiceRegistry) -> axum::Router {
+    router_with_edge_config(
+        registry,
+        EdgeConfig {
+            graphql: GraphqlConfig {
+                enabled: true,
+                playground_enabled: false,
+            },
+            ..Default::default()
+        },
+    )
+}
+
 pub(crate) async fn body_json(body: Body) -> serde_json::Value {
     serde_json::from_slice(&to_bytes(body, usize::MAX).await.expect("body bytes"))
         .expect("json body")

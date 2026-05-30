@@ -246,11 +246,11 @@ fn default_metrics_application() -> String {
 }
 
 fn default_graphql_enabled() -> bool {
-    true
+    false
 }
 
 fn default_graphql_playground_enabled() -> bool {
-    true
+    false
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

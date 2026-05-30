@@ -1,8 +1,8 @@
 use clap::{Args, Parser, Subcommand};
 
 use super::{
-    IndexCommand, InspectCommand, QueryCommand, doctor_command, index_command, inspect_command,
-    query_command, serve_command,
+    IndexCommand, InspectCommand, QueryCommand, ServeCommand, doctor_command, index_command,
+    inspect_command, query_command, serve_command,
 };
 
 #[derive(Debug, Parser)]
@@ -14,7 +14,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    Serve(ConfigCommand),
+    Serve(ServeCommand),
     Doctor(ConfigCommand),
     Query(QueryCommand),
     Inspect(InspectCommand),

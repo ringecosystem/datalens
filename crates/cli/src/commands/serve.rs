@@ -1,14 +1,23 @@
 use datalens_chain::ChainAdapter;
+use datalens_edge::config::{DatalensConfig, EdgeConfig};
 use datalens_evm::{EvmAdapter, EvmAdapterMetadata};
 use tracing_subscriber::EnvFilter;
 
 use crate::config::{load_config, validate_config};
 use crate::runtime::build_service_registry;
 
-use super::{ConfigCommand, parse_bind};
+use super::parse_bind;
+
+#[derive(Debug, clap::Args)]
+pub struct ServeCommand {
+    #[arg(long, default_value = "datalens.toml")]
+    pub config: String,
+    #[arg(long)]
+    pub enable_graphql: bool,
+}
 
 pub fn serve_command(
-    command: ConfigCommand,
+    command: ServeCommand,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging()?;
     log::info!("starting datalens");
@@ -30,7 +39,8 @@ pub fn serve_command(
     let _capabilities = adapter.capabilities();
 
     log::info!("serving datalens edge on {bind}");
-    let lifecycle = datalens_edge::ServiceLifecycle::new_with_edge_config(registry, config.edge);
+    let edge = serve_edge_config(&config, &command);
+    let lifecycle = datalens_edge::ServiceLifecycle::new_with_edge_config(registry, edge);
     let runtime = tokio::runtime::Runtime::new()?;
     if let Some(scheduler) = warmup_scheduler {
         runtime.block_on(datalens_edge::serve_lifecycle(
@@ -41,6 +51,14 @@ pub fn serve_command(
         runtime.block_on(datalens_edge::serve_lifecycle(bind, lifecycle))?;
     }
     Ok(())
+}
+
+pub fn serve_edge_config(config: &DatalensConfig, command: &ServeCommand) -> EdgeConfig {
+    let mut edge = config.edge.clone();
+    if command.enable_graphql {
+        edge.graphql.enabled = true;
+    }
+    edge
 }
 
 fn init_logging() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

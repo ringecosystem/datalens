@@ -31,9 +31,74 @@ fn test_serve_accepts_config_path() {
     let cli = Cli::parse_from(["datalens", "serve", "--config", "custom.toml"]);
 
     match cli.command {
-        Command::Serve(command) => assert_eq!(command.config, "custom.toml"),
+        Command::Serve(command) => {
+            assert_eq!(command.config, "custom.toml");
+            assert!(!command.enable_graphql);
+        }
         command => panic!("expected serve command, got {command:?}"),
     }
+}
+
+#[test]
+fn test_serve_accepts_enable_graphql_flag() {
+    let cli = Cli::parse_from(["datalens", "serve", "--enable-graphql"]);
+
+    match cli.command {
+        Command::Serve(command) => assert!(command.enable_graphql),
+        command => panic!("expected serve command, got {command:?}"),
+    }
+}
+
+#[test]
+fn test_serve_enable_graphql_overrides_config_default() {
+    let config: DatalensConfig =
+        toml::from_str(&minimal_config_text()).expect("minimal config should parse");
+    let command = ServeCommand {
+        config: "datalens.toml".to_owned(),
+        enable_graphql: true,
+    };
+
+    let edge = serve_edge_config(&config, &command);
+
+    assert!(edge.graphql.enabled);
+    assert!(!edge.graphql.playground_enabled);
+}
+
+fn minimal_config_text() -> String {
+    r#"
+    [server]
+    bind = "127.0.0.1:0"
+
+    [storage]
+    backend = "local"
+
+    [storage.local]
+    root = ".tmp/datalens-cli-test"
+
+    [planner]
+    max_query_range_blocks = 100
+    default_chunk_range_blocks = 10
+
+    [writer]
+    target_object_bytes = 1024
+    min_object_rows = 1
+    record_empty_coverage = true
+
+    [chains.ethereum]
+    kind = "evm"
+    chain_id = 1
+    rpc_urls = ["http://example.invalid"]
+
+    [chains.ethereum.datasets.blocks]
+    enabled = true
+    max_batch_blocks = 10
+
+    [chains.ethereum.datasets.logs]
+    enabled = true
+    max_get_logs_range_blocks = 10
+    max_addresses_per_query = 2
+    "#
+    .to_owned()
 }
 
 #[test]

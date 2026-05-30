@@ -3,6 +3,50 @@ mod support;
 use support::graphql::*;
 
 #[tokio::test]
+async fn test_graphql_routes_are_disabled_by_default() {
+    let registry = QueryServiceRegistry::new()
+        .with_service(service(
+            LocalStorage::new(temp_storage_root("gql-default-disabled")),
+            MockSource::default(),
+        ))
+        .expect("register service");
+    let app = router(registry);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/graphql")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"query":"{ chains }"}"#))
+                .expect("request"),
+        )
+        .await
+        .expect("graphql response");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/graphql/playground")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("playground response");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let response = app
+        .oneshot(
+            Request::get("/health")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("health response");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn test_graphql_playground_respects_config() {
     let registry = QueryServiceRegistry::new()
         .with_service(service(
