@@ -1,7 +1,7 @@
 use datalens_indexer::{DatalensIndexConfig, IndexPlanBuilder, IndexRunner, OutputSinkConfig};
 
 #[test]
-fn test_index_config_builds_empty_plan_without_generating_tasks() {
+fn test_index_config_builds_plan_without_executing_tasks() {
     let config = DatalensIndexConfig::from_toml_str(
         r#"
 [client]
@@ -36,7 +36,8 @@ path = ".data/indexes/ormp/checkpoint.json"
     let plan = IndexPlanBuilder::new().build(&config).unwrap();
 
     assert_eq!(plan.application(), "ormp-watcher");
-    assert!(plan.queries().is_empty());
+    assert_eq!(plan.tasks().len(), 1);
+    assert_eq!(plan.tasks()[0].label, "ormp.000.000000");
 }
 
 #[test]

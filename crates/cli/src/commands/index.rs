@@ -9,8 +9,8 @@ use datalens_core::{
 use datalens_edge::auth::normalize_application_id;
 use datalens_evm::EvmRpcClient;
 use datalens_indexer::{
-    CheckpointPolicy, DatalensIndexConfig, FinalityRequirement, IndexDataset, OutputConfig,
-    SourceConfig,
+    CheckpointPolicy, DatalensIndexConfig, FinalityRequirement, IndexDataset, IndexPlanBuilder,
+    OutputConfig, SourceConfig,
 };
 use datalens_metrics::ApplicationIdentity;
 use datalens_runtime_indexer::{
@@ -40,6 +40,7 @@ pub struct IndexCommand {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum IndexWorkflowCommand {
+    Plan(IndexPlanCommand),
     Backfill(IndexBackfillCommand),
     Resume(IndexResumeCommand),
     Repair(IndexRepairCommand),
@@ -48,6 +49,12 @@ pub enum IndexWorkflowCommand {
 }
 
 pub type IndexSubcommand = IndexWorkflowCommand;
+
+#[derive(Debug, Clone, Args)]
+pub struct IndexPlanCommand {
+    #[arg(long, default_value = "app.index.toml")]
+    pub config: String,
+}
 
 #[derive(Debug, Clone, Args)]
 pub struct IndexBackfillCommand {
@@ -142,6 +149,12 @@ pub struct IndexCommonCommand {
 pub fn index_command(
     command: IndexCommand,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let IndexWorkflowCommand::Plan(command) = command.command {
+        let plan = index_plan(command)?;
+        println!("{}", serde_json::to_string_pretty(&plan)?);
+        return Ok(());
+    }
+
     if let IndexWorkflowCommand::Doctor(command) = command.command {
         let summary = index_doctor_summary(&command)?;
         println!("{}", serde_json::to_string_pretty(&summary)?);
@@ -167,6 +180,14 @@ pub fn index_command(
         );
     }
     Ok(())
+}
+
+fn index_plan(
+    command: IndexPlanCommand,
+) -> Result<datalens_indexer::IndexPlan, Box<dyn std::error::Error + Send + Sync>> {
+    let input = fs::read_to_string(&command.config)?;
+    let config = DatalensIndexConfig::from_toml_str(&input)?;
+    Ok(IndexPlanBuilder::new().build(&config)?)
 }
 
 pub fn index_doctor_summary(
@@ -815,6 +836,9 @@ fn index_common(command: &IndexWorkflowCommand) -> &IndexCommonCommand {
         IndexWorkflowCommand::Resume(command) => &command.common,
         IndexWorkflowCommand::Repair(command) => &command.common,
         IndexWorkflowCommand::Verify(command) => &command.common,
+        IndexWorkflowCommand::Plan(_) => {
+            unreachable!("index plan does not use runtime index common options")
+        }
         IndexWorkflowCommand::Doctor(_) => {
             unreachable!("index doctor does not use runtime index common options")
         }
@@ -827,6 +851,9 @@ fn index_dry_run(command: &IndexWorkflowCommand) -> bool {
         IndexWorkflowCommand::Resume(command) => command.dry_run,
         IndexWorkflowCommand::Repair(command) => command.dry_run,
         IndexWorkflowCommand::Verify(_) => false,
+        IndexWorkflowCommand::Plan(_) => {
+            unreachable!("index plan does not use runtime index dry-run options")
+        }
         IndexWorkflowCommand::Doctor(_) => {
             unreachable!("index doctor does not use runtime index dry-run options")
         }
@@ -839,6 +866,9 @@ fn index_run_mode(command: &IndexWorkflowCommand) -> IndexRunMode {
         IndexWorkflowCommand::Resume(_) => IndexRunMode::Resume,
         IndexWorkflowCommand::Repair(_) => IndexRunMode::Repair,
         IndexWorkflowCommand::Verify(_) => IndexRunMode::Verify,
+        IndexWorkflowCommand::Plan(_) => {
+            unreachable!("index plan does not use runtime index run modes")
+        }
         IndexWorkflowCommand::Doctor(_) => {
             unreachable!("index doctor does not use runtime index run modes")
         }

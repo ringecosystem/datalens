@@ -20,6 +20,79 @@ use datalens_solana::SolanaAdapter;
 use datalens_storage::{LocalStorage, StorageWriteRequest};
 
 #[test]
+fn test_index_plan_accepts_config_path() {
+    let cli = Cli::parse_from(["datalens", "index", "plan", "--config", "app.index.toml"]);
+
+    match cli.command {
+        Command::Index(command) => match *command {
+            IndexCommand {
+                command: IndexSubcommand::Plan(command),
+            } => {
+                assert_eq!(command.config, "app.index.toml");
+            }
+            command => panic!("expected index plan command, got {command:?}"),
+        },
+        command => panic!("expected index plan command, got {command:?}"),
+    }
+}
+
+#[test]
+fn test_index_plan_prints_json_from_declarative_config() {
+    let root = temp_storage_root("index-plan-json");
+    let config_path = root.join("app.index.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[client]
+endpoint = "http://127.0.0.1:3000"
+application = "ormp"
+token_env = "PATH"
+
+[index]
+name = "ormp"
+dataset = "evm.logs"
+finality = "durable"
+chunk_blocks = 2
+
+[[sources]]
+chain = "ethereum"
+family = "evm"
+chain_id = 1
+from_block = 10
+to_block = 12
+addresses = []
+topics = []
+
+[output.jsonl]
+path = ".data/indexes/ormp/events.jsonl"
+
+[checkpoint]
+path = ".data/indexes/ormp/checkpoint.json"
+"#,
+    )
+    .expect("write index config");
+
+    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_datalens"))
+        .args(["index", "plan", "--config"])
+        .arg(&config_path)
+        .output()
+        .expect("run datalens index plan");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: serde_json::Value = serde_json::from_slice(&output.stdout).expect("plan JSON");
+
+    assert_eq!(summary["application"], "ormp");
+    assert_eq!(summary["tasks"].as_array().expect("tasks").len(), 2);
+    assert_eq!(summary["tasks"][0]["label"], "ormp.000.000000");
+    assert_eq!(summary["tasks"][1]["range"]["start"], 12);
+    assert_eq!(summary["tasks"][1]["range"]["end"], 12);
+}
+
+#[test]
 fn test_index_backfill_accepts_required_inputs_and_dry_run() {
     let cli = Cli::parse_from([
         "datalens",
@@ -1001,6 +1074,9 @@ fn index_test_common(command: &IndexWorkflowCommand) -> &IndexCommonCommand {
         IndexWorkflowCommand::Resume(command) => &command.common,
         IndexWorkflowCommand::Repair(command) => &command.common,
         IndexWorkflowCommand::Verify(command) => &command.common,
+        IndexWorkflowCommand::Plan(_) => {
+            unreachable!("index plan does not use runtime index common options")
+        }
         IndexWorkflowCommand::Doctor(_) => {
             unreachable!("index doctor does not use runtime index common options")
         }
