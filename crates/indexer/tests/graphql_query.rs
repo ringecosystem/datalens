@@ -9,12 +9,14 @@ use axum::{
     http::{Request, StatusCode, header},
 };
 use datalens_indexer::{
-    IndexedRecord, IndexerError, OutputWriteSink, PostgresOutputStore, QueryAuthApplicationConfig,
+    GraphqlViewConfig, GraphqlViewFieldConfig, GraphqlViewFilterConfig, IndexedRecord,
+    IndexerError, OutputWriteSink, PostgresOutputStore, QueryAuthApplicationConfig,
     QueryAuthConfig, QueryAuthQuotaConfig, QueryableStore, SqliteOutputStore, StoreQuery,
     StoreQueryResult,
     graphql::{
         IndexerGraphqlMetricLabels, IndexerGraphqlMetrics, MetricsEndpointConfig, graphql_router,
         graphql_router_with_auth, graphql_router_with_metrics, graphql_schema,
+        graphql_schema_with_views,
     },
 };
 use datalens_metrics::MetricsRecorder;
@@ -225,6 +227,82 @@ fn test_graphql_events_query_filters_signature_and_returns_decoded_shape() {
     assert_eq!(events[0]["eventName"], "MessageAccepted");
     assert_eq!(events[0]["decoded"]["msgHash"], "0xabc");
     assert_eq!(events[0]["decoded"]["fromChainId"], "1");
+}
+
+#[test]
+fn test_graphql_application_view_queries_decoded_event_fields() {
+    let store = SqliteOutputStore::connect("sqlite::memory:").expect("sqlite store connects");
+    store
+        .write_records(&[
+            decoded_record(10, 0, "MessageAccepted(bytes32,uint256,address,address)"),
+            decoded_record(20, 1, "MessageDispatched(bytes32,uint256,address,address)"),
+        ])
+        .expect("write records");
+    let schema = graphql_schema_with_views(
+        Arc::new(store),
+        vec![GraphqlViewConfig {
+            name: "messageAccepted".to_owned(),
+            dataset: "evm.logs".to_owned(),
+            event_name: Some("MessageAccepted".to_owned()),
+            signature: Some("MessageAccepted(bytes32,uint256,address,address)".to_owned()),
+            fields: vec![
+                GraphqlViewFieldConfig {
+                    name: "msgHash".to_owned(),
+                    path: "decoded.msgHash".to_owned(),
+                },
+                GraphqlViewFieldConfig {
+                    name: "sourceChain".to_owned(),
+                    path: "decoded.fromChainId".to_owned(),
+                },
+                GraphqlViewFieldConfig {
+                    name: "blockNumber".to_owned(),
+                    path: "block_number".to_owned(),
+                },
+            ],
+            filters: vec![GraphqlViewFilterConfig {
+                field: "address".to_owned(),
+                equals: "0x2cd1867fb8016f93710b6386f7f9f1d540a60812".to_owned(),
+            }],
+            default_limit: 10,
+            max_limit: 25,
+        }],
+    )
+    .expect("graphql schema");
+
+    let response = Runtime::new().expect("runtime").block_on(async {
+        schema
+            .execute(
+                r#"
+            {
+              messageAccepted(limit: 5) {
+                msgHash
+                sourceChain
+                blockNumber
+                payload
+              }
+              events(
+                dataset: "evm.logs"
+                signature: "MessageAccepted(bytes32,uint256,address,address)"
+              ) {
+                eventName
+              }
+            }
+            "#,
+            )
+            .await
+    });
+
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let body = response.data.into_json().expect("graphql data");
+    let view_rows = body["messageAccepted"]
+        .as_array()
+        .expect("application view rows");
+    assert_eq!(view_rows.len(), 1);
+    assert_eq!(view_rows[0]["msgHash"], "0xabc");
+    assert_eq!(view_rows[0]["sourceChain"], "1");
+    assert_eq!(view_rows[0]["blockNumber"], 10);
+    assert_eq!(view_rows[0]["payload"]["event_name"], "MessageAccepted");
+    assert_eq!(body["events"].as_array().expect("generic events").len(), 1);
 }
 
 #[test]

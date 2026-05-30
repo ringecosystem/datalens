@@ -178,6 +178,7 @@ pub struct QueryServiceConfig {
     pub playground: bool,
     pub metrics: MetricsServiceConfig,
     pub auth: QueryAuthConfig,
+    pub views: Vec<GraphqlViewConfig>,
 }
 
 impl Default for QueryServiceConfig {
@@ -190,8 +191,33 @@ impl Default for QueryServiceConfig {
             playground: false,
             metrics: MetricsServiceConfig::default(),
             auth: QueryAuthConfig::default(),
+            views: Vec::new(),
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GraphqlViewConfig {
+    pub name: String,
+    pub dataset: String,
+    pub event_name: Option<String>,
+    pub signature: Option<String>,
+    pub fields: Vec<GraphqlViewFieldConfig>,
+    pub filters: Vec<GraphqlViewFilterConfig>,
+    pub default_limit: u64,
+    pub max_limit: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GraphqlViewFieldConfig {
+    pub name: String,
+    pub path: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GraphqlViewFilterConfig {
+    pub field: String,
+    pub equals: String,
 }
 
 #[derive(Clone, Default, Eq, PartialEq)]
@@ -384,6 +410,37 @@ struct RawQueryServiceConfig {
     playground: bool,
     metrics: Option<RawMetricsServiceConfig>,
     auth: Option<RawQueryAuthConfig>,
+    #[serde(default)]
+    views: Vec<RawGraphqlViewConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawGraphqlViewConfig {
+    name: Option<String>,
+    dataset: Option<String>,
+    event_name: Option<String>,
+    signature: Option<String>,
+    #[serde(default)]
+    fields: Vec<RawGraphqlViewFieldConfig>,
+    #[serde(default)]
+    filters: Vec<RawGraphqlViewFilterConfig>,
+    default_limit: Option<u64>,
+    max_limit: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawGraphqlViewFieldConfig {
+    name: Option<String>,
+    path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawGraphqlViewFilterConfig {
+    field: Option<String>,
+    equals: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -733,6 +790,7 @@ fn parse_query(raw: Option<RawQueryServiceConfig>, errors: &mut Vec<String>) -> 
     }
     let metrics = parse_query_metrics(raw.metrics, &path, errors);
     let auth = parse_query_auth(raw.auth, errors);
+    let views = parse_graphql_views(raw.views, errors);
 
     QueryServiceConfig {
         enabled: raw.enabled,
@@ -742,7 +800,125 @@ fn parse_query(raw: Option<RawQueryServiceConfig>, errors: &mut Vec<String>) -> 
         playground: raw.playground,
         metrics,
         auth,
+        views,
     }
+}
+
+fn parse_graphql_views(
+    raw: Vec<RawGraphqlViewConfig>,
+    errors: &mut Vec<String>,
+) -> Vec<GraphqlViewConfig> {
+    let views = raw
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, view)| parse_graphql_view(index, view, errors))
+        .collect::<Vec<_>>();
+    let mut names = BTreeSet::new();
+    for view in &views {
+        if !names.insert(view.name.clone()) {
+            errors.push(format!(
+                "query.views: GraphQL view name {} is registered more than once",
+                view.name
+            ));
+        }
+    }
+    views
+}
+
+fn parse_graphql_view(
+    index: usize,
+    raw: RawGraphqlViewConfig,
+    errors: &mut Vec<String>,
+) -> Option<GraphqlViewConfig> {
+    let field = format!("query.views[{index}]");
+    let name = required_non_empty(&format!("{field}.name"), raw.name, errors)
+        .and_then(|value| validate_graphql_identifier(&format!("{field}.name"), value, errors));
+    let dataset = required_non_empty(&format!("{field}.dataset"), raw.dataset, errors);
+    let event_name = optional_non_empty(&format!("{field}.event_name"), raw.event_name, errors);
+    let signature = optional_non_empty(&format!("{field}.signature"), raw.signature, errors);
+    let fields = raw
+        .fields
+        .into_iter()
+        .enumerate()
+        .filter_map(|(field_index, raw_field)| {
+            parse_graphql_view_field(&format!("{field}.fields[{field_index}]"), raw_field, errors)
+        })
+        .collect::<Vec<_>>();
+    if fields.is_empty() {
+        errors.push(format!("{field}.fields: at least one field is required"));
+    }
+    let mut field_names = BTreeSet::new();
+    for view_field in &fields {
+        if !field_names.insert(view_field.name.clone()) {
+            errors.push(format!(
+                "{field}.fields: GraphQL field name {} is registered more than once",
+                view_field.name
+            ));
+        }
+    }
+    let filters = raw
+        .filters
+        .into_iter()
+        .enumerate()
+        .filter_map(|(filter_index, raw_filter)| {
+            parse_graphql_view_filter(
+                &format!("{field}.filters[{filter_index}]"),
+                raw_filter,
+                errors,
+            )
+        })
+        .collect::<Vec<_>>();
+    let default_limit = raw
+        .default_limit
+        .unwrap_or(crate::graphql::DEFAULT_EVENT_LIMIT);
+    let max_limit = raw.max_limit.unwrap_or(crate::graphql::MAX_EVENT_LIMIT);
+    if default_limit == 0 {
+        errors.push(format!("{field}.default_limit: must be greater than 0"));
+    }
+    if max_limit == 0 {
+        errors.push(format!("{field}.max_limit: must be greater than 0"));
+    }
+    if default_limit > max_limit {
+        errors.push(format!(
+            "{field}.default_limit: must be less than or equal to max_limit"
+        ));
+    }
+
+    Some(GraphqlViewConfig {
+        name: name?,
+        dataset: dataset?,
+        event_name,
+        signature,
+        fields,
+        filters,
+        default_limit,
+        max_limit,
+    })
+}
+
+fn parse_graphql_view_field(
+    field: &str,
+    raw: RawGraphqlViewFieldConfig,
+    errors: &mut Vec<String>,
+) -> Option<GraphqlViewFieldConfig> {
+    let name = required_non_empty(&format!("{field}.name"), raw.name, errors)
+        .and_then(|value| validate_graphql_identifier(&format!("{field}.name"), value, errors));
+    let path = required_non_empty(&format!("{field}.path"), raw.path, errors);
+    Some(GraphqlViewFieldConfig {
+        name: name?,
+        path: path?,
+    })
+}
+
+fn parse_graphql_view_filter(
+    field: &str,
+    raw: RawGraphqlViewFilterConfig,
+    errors: &mut Vec<String>,
+) -> Option<GraphqlViewFilterConfig> {
+    Some(GraphqlViewFilterConfig {
+        field: required_non_empty(&format!("{field}.field"), raw.field, errors)?,
+        equals: required_non_empty(&format!("{field}.equals"), raw.equals, errors)?,
+    })
 }
 
 fn parse_query_metrics(
@@ -1025,6 +1201,11 @@ fn validate_output_query_capabilities(
             "query.protocol: output kind {output_kind} does not support graphql query service"
         ));
     }
+    if !query.views.is_empty() && !capability.supports_graphql {
+        errors.push(format!(
+            "query.views: output kind {output_kind} does not support graphql query service"
+        ));
+    }
 }
 
 fn parse_checkpoint(
@@ -1119,6 +1300,25 @@ fn normalize_application_id(field: &str, value: &str, errors: &mut Vec<String>) 
         return None;
     }
     Some(normalized)
+}
+
+fn validate_graphql_identifier(
+    field: &str,
+    value: String,
+    errors: &mut Vec<String>,
+) -> Option<String> {
+    let mut bytes = value.bytes();
+    let valid_start = bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_');
+    let valid_rest = bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+    if !valid_start || !valid_rest || value.starts_with("__") {
+        errors.push(format!(
+            "{field}: must be a GraphQL identifier matching [_A-Za-z][_0-9A-Za-z]* and must not start with __"
+        ));
+        return None;
+    }
+    Some(value)
 }
 
 fn validate_optional_positive_u64(field: &str, value: Option<u64>, errors: &mut Vec<String>) {
