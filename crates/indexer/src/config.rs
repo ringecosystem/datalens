@@ -163,10 +163,30 @@ pub enum DatabaseDriver {
     Postgres,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+impl DatabaseDriver {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Sqlite => "sqlite",
+            Self::Postgres => "postgres",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryServiceConfig {
     pub enabled: bool,
     pub graphql: bool,
+    pub bind: String,
+}
+
+impl Default for QueryServiceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            graphql: false,
+            bind: "127.0.0.1:8081".to_owned(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -240,6 +260,7 @@ struct RawQueryServiceConfig {
     enabled: bool,
     #[serde(default)]
     graphql: bool,
+    bind: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -500,6 +521,7 @@ fn parse_query(raw: Option<RawQueryServiceConfig>) -> QueryServiceConfig {
     raw.map(|raw| QueryServiceConfig {
         enabled: raw.enabled,
         graphql: raw.graphql,
+        bind: raw.bind.unwrap_or_else(|| "127.0.0.1:8081".to_owned()),
     })
     .unwrap_or_default()
 }
