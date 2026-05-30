@@ -122,8 +122,16 @@ impl OutputWriteSink for PostgresOutputStore {
 impl QueryableStore for PostgresOutputStore {
     fn query(&self, query: StoreQuery) -> Result<StoreQueryResult, IndexerError> {
         self.runtime
-            .block_on(query_records_postgres(&self.pool, query))
+            .block_on(query_records_postgres(&self.pool, query, false))
             .map_err(|error| IndexerError::Runner(format!("postgres query failed: {error}")))
+    }
+
+    fn query_decoded_events(&self, query: StoreQuery) -> Result<StoreQueryResult, IndexerError> {
+        self.runtime
+            .block_on(query_records_postgres(&self.pool, query, true))
+            .map_err(|error| {
+                IndexerError::Runner(format!("postgres decoded query failed: {error}"))
+            })
     }
 }
 
@@ -244,11 +252,16 @@ async fn insert_record(
 async fn query_records_postgres(
     pool: &PgPool,
     query: StoreQuery,
+    decoded_only: bool,
 ) -> Result<StoreQueryResult, sqlx::Error> {
     let filter = StoreQueryFilter::from_query(&query);
     let mut builder =
         sqlx::QueryBuilder::<Postgres>::new("SELECT * FROM indexed_events WHERE dataset = ");
     builder.push_bind(query.dataset);
+    if decoded_only {
+        builder
+            .push(" AND raw_payload::jsonb ?| array['decoded', 'decode_status', 'decode_error']");
+    }
     if let Some(index) = filter.index {
         builder.push(" AND index_name = ").push_bind(index);
     }

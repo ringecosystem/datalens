@@ -47,6 +47,33 @@ fn record_with_event(
     }
 }
 
+fn decoded_record(block_number: u64, log_index: u64, event_name: &str) -> IndexedRecord {
+    IndexedRecord {
+        index: "ormp".to_owned(),
+        chain: "ethereum".to_owned(),
+        chain_id: 1,
+        dataset: "evm.logs".to_owned(),
+        payload: serde_json::json!({
+            "block_number": block_number,
+            "block_hash": format!("0xblock{block_number:064x}"),
+            "transaction_hash": format!("0xtx{block_number:064x}"),
+            "transaction_index": 2,
+            "log_index": log_index,
+            "address": "0x0000000000000000000000000000000000000001",
+            "topics": [
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ],
+            "signature": format!("{event_name}(bytes32)"),
+            "event_name": event_name,
+            "decoded": {
+                "msgHash": "0xabc"
+            },
+            "decode_status": "decoded",
+            "removed": false,
+        }),
+    }
+}
+
 #[test]
 fn test_sqlite_output_initializes_parent_directory_and_schema() {
     let path = temp_path("init").join("nested").join("index.db");
@@ -180,6 +207,48 @@ fn test_sqlite_output_filters_topic0_event_name_and_orders_with_limit() {
     assert_eq!(rows.rows[1]["block_number"], 20);
     assert_eq!(rows.rows[0]["event_name"], "Transfer");
     assert_eq!(rows.rows[1]["event_name"], "Transfer");
+}
+
+#[test]
+fn test_sqlite_output_queries_decoded_events_only_with_filters_and_pagination() {
+    let store = SqliteOutputStore::connect("sqlite::memory:").expect("sqlite store connects");
+    store
+        .write_records(&[
+            record_with_event(
+                5,
+                0,
+                "0x0000000000000000000000000000000000000001",
+                Some("MessageAccepted"),
+            ),
+            decoded_record(10, 1, "MessageAccepted"),
+            decoded_record(20, 2, "MessageAccepted"),
+            decoded_record(30, 3, "MessageDispatched"),
+        ])
+        .expect("write records");
+
+    let rows = store
+        .query_decoded_events(StoreQuery {
+            dataset: "evm.logs".to_owned(),
+            filter: serde_json::json!({
+                "index": "ormp",
+                "chain": "ethereum",
+                "chain_id": 1,
+                "address": "0x0000000000000000000000000000000000000001",
+                "event_name": "MessageAccepted",
+                "signature": "MessageAccepted(bytes32)",
+                "topic0": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "from_block": 1,
+                "to_block": 25,
+                "limit": 1,
+                "after": 1,
+            }),
+        })
+        .expect("decoded query");
+
+    assert_eq!(rows.rows.len(), 1);
+    assert_eq!(rows.rows[0]["block_number"], 20);
+    assert_eq!(rows.rows[0]["decoded"]["msgHash"], "0xabc");
+    assert_eq!(rows.rows[0]["decode_status"], "decoded");
 }
 
 #[test]

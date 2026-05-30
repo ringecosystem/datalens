@@ -13,4 +13,11 @@ pub struct StoreQueryResult {
 
 pub trait QueryableStore: Send + Sync {
     fn query(&self, query: StoreQuery) -> Result<StoreQueryResult, IndexerError>;
+
+    fn query_decoded_events(&self, query: StoreQuery) -> Result<StoreQueryResult, IndexerError> {
+        let _ = query;
+        Err(IndexerError::Runner(
+            "decoded event queries are not supported by this output store".to_owned(),
+        ))
+    }
 }

@@ -48,6 +48,35 @@ fn record_with_event(
     }
 }
 
+fn decoded_record(index: &str, block_number: u64, log_index: u64) -> IndexedRecord {
+    IndexedRecord {
+        index: index.to_owned(),
+        chain: "ethereum".to_owned(),
+        chain_id: 1,
+        dataset: "evm.logs".to_owned(),
+        payload: serde_json::json!({
+            "block_number": block_number,
+            "unique_key": format!("{index}:decoded:{block_number}:{log_index}"),
+            "block_hash": format!("0xblock{block_number:064x}"),
+            "transaction_hash": format!("0xtx{block_number:064x}"),
+            "transaction_index": 2,
+            "log_index": log_index,
+            "address": "0x0000000000000000000000000000000000000001",
+            "topics": [
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ],
+            "signature": "MessageAccepted(bytes32)",
+            "event_name": "MessageAccepted",
+            "decoded": {
+                "msgHash": "0xabc"
+            },
+            "decode_status": "decoded",
+            "data": "0x010203",
+            "removed": false,
+        }),
+    }
+}
+
 #[test]
 fn test_postgres_output_batch_insert_is_idempotent_when_url_is_configured() {
     let Some(url) = postgres_test_url() else {
@@ -253,6 +282,83 @@ fn test_postgres_graphql_events_query_filters_rows_when_url_is_configured() {
     assert_eq!(events[0]["signature"], "Transfer(address,address,uint256)");
     assert_eq!(events[0]["payload"]["block_number"], base_block + 10);
     assert!(events[0]["createdAt"].as_str().is_some());
+}
+
+#[test]
+fn test_postgres_graphql_decoded_events_query_when_url_is_configured() {
+    let Some(url) = postgres_test_url() else {
+        return;
+    };
+    let store = PostgresOutputStore::connect(&url).expect("postgres store connects");
+    let base_block = unique_block_base();
+    let index = unique_index_name("postgres-decoded-graphql");
+    store
+        .write_records(&[
+            record(
+                &index,
+                base_block,
+                0,
+                "0x0000000000000000000000000000000000000001",
+            ),
+            decoded_record(&index, base_block + 10, 1),
+        ])
+        .expect("write records");
+    let schema = graphql_schema(Arc::new(store));
+
+    let response = Runtime::new().expect("runtime").block_on(async {
+        schema
+            .execute(
+                GraphqlRequest::new(
+                    r#"
+                query DecodedEvents($indexName: String!, $fromBlock: Int!, $toBlock: Int!) {
+                  decodedEvents(
+                    indexName: $indexName
+                    chain: "ethereum"
+                    chainId: 1
+                    dataset: "evm.logs"
+                    eventName: "MessageAccepted"
+                    signature: "MessageAccepted(bytes32)"
+                    topic0: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    fromBlock: $fromBlock
+                    toBlock: $toBlock
+                    limit: 5
+                  ) {
+                    indexName
+                    blockNumber
+                    logIndex
+                    eventName
+                    signature
+                    topic0
+                    decodedArgs
+                    decodeStatus
+                    payload
+                  }
+                }
+                "#,
+                )
+                .variables(Variables::from_json(serde_json::json!({
+                    "indexName": index,
+                    "fromBlock": base_block,
+                    "toBlock": base_block + 20,
+                }))),
+            )
+            .await
+    });
+
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let body = response.data.into_json().expect("graphql data");
+    let events = body["decodedEvents"]
+        .as_array()
+        .expect("decodedEvents array");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["indexName"], index);
+    assert_eq!(events[0]["blockNumber"], base_block + 10);
+    assert_eq!(events[0]["logIndex"], 1);
+    assert_eq!(events[0]["eventName"], "MessageAccepted");
+    assert_eq!(events[0]["signature"], "MessageAccepted(bytes32)");
+    assert_eq!(events[0]["decodedArgs"]["msgHash"], "0xabc");
+    assert_eq!(events[0]["decodeStatus"], "decoded");
+    assert_eq!(events[0]["payload"]["decoded"]["msgHash"], "0xabc");
 }
 
 #[test]
