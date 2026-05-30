@@ -284,7 +284,11 @@ async fn start_graphql_service(
             .await
             .map_err(|error| IndexerError::Runner(format!("query service failed: {error}")))
     });
-    log::info!("index daemon GraphQL query service listening on {bind}");
+    log::info!(
+        "index daemon GraphQL query service listening on {bind} auth_enabled={} auth_applications={}",
+        config.query.auth.enabled,
+        config.query.auth.applications.len()
+    );
     Ok(RunningQueryService {
         report: QueryServiceReport {
             bind,

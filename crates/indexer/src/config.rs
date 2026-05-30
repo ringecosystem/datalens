@@ -1,4 +1,5 @@
-use std::{collections::BTreeSet, env, fmt, path::PathBuf};
+use std::collections::BTreeSet;
+use std::{env, fmt, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -997,18 +998,6 @@ fn required_path(field: &str, value: Option<PathBuf>, errors: &mut Vec<String>) 
     }
 }
 
-fn validate_optional_positive_usize(field: &str, value: Option<usize>, errors: &mut Vec<String>) {
-    if value == Some(0) {
-        errors.push(format!("{field}: must be greater than 0"));
-    }
-}
-
-fn validate_optional_positive_u64(field: &str, value: Option<u64>, errors: &mut Vec<String>) {
-    if value == Some(0) {
-        errors.push(format!("{field}: must be greater than 0"));
-    }
-}
-
 fn normalize_application_id(field: &str, value: &str, errors: &mut Vec<String>) -> Option<String> {
     let normalized = value.trim().to_ascii_lowercase();
     if normalized.is_empty()
@@ -1027,6 +1016,18 @@ fn normalize_application_id(field: &str, value: &str, errors: &mut Vec<String>) 
         return None;
     }
     Some(normalized)
+}
+
+fn validate_optional_positive_u64(field: &str, value: Option<u64>, errors: &mut Vec<String>) {
+    if value == Some(0) {
+        errors.push(format!("{field}: must be greater than 0"));
+    }
+}
+
+fn validate_optional_positive_usize(field: &str, value: Option<usize>, errors: &mut Vec<String>) {
+    if value == Some(0) {
+        errors.push(format!("{field}: must be greater than 0"));
+    }
 }
 
 fn expand_env_vars(text: &str) -> Result<String, IndexerError> {

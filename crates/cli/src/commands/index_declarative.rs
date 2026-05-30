@@ -94,7 +94,51 @@ fn declarative_index_summary(config: &DatalensIndexConfig) -> serde_json::Value 
         "sources": config.sources.iter().map(declarative_source_summary).collect::<Vec<_>>(),
         "decode": declarative_decode_summary(&config.decode),
         "output": declarative_output_summary(&config.output),
+        "query": declarative_query_summary(&config.query),
         "checkpoint": declarative_checkpoint_summary(&config.checkpoint),
+    })
+}
+
+fn declarative_query_summary(query: &datalens_indexer::QueryServiceConfig) -> serde_json::Value {
+    let max_requests_per_minute = query
+        .auth
+        .applications
+        .iter()
+        .filter_map(|application| {
+            application
+                .quota
+                .as_ref()
+                .and_then(|quota| quota.max_requests_per_minute)
+        })
+        .max();
+    let max_concurrent_requests = query
+        .auth
+        .applications
+        .iter()
+        .filter_map(|application| {
+            application
+                .quota
+                .as_ref()
+                .and_then(|quota| quota.max_concurrent_requests)
+        })
+        .max();
+    serde_json::json!({
+        "enabled": query.enabled,
+        "protocol": "graphql",
+        "bind": query.bind,
+        "path": query.path,
+        "playground": query.playground,
+        "auth": {
+            "enabled": query.auth.enabled,
+            "applications": query.auth.applications.len(),
+            "max_requests_per_minute": max_requests_per_minute,
+            "max_concurrent_requests": max_concurrent_requests,
+        },
+        "metrics": {
+            "enabled": query.metrics.enabled,
+            "path": query.metrics.path,
+            "token_configured": query.metrics.bearer_token.is_some(),
+        },
     })
 }
 

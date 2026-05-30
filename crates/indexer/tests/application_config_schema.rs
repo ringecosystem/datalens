@@ -388,6 +388,74 @@ fn test_parse_valid_sqlite_database_output_allows_query_service() {
 }
 
 #[test]
+fn test_parse_query_auth_config_supports_token_env_and_quota() {
+    let input = valid_config()
+        .replace(
+            "[output.jsonl]\npath = \".data/indexes/ormp/events.jsonl\"",
+            "[output]\nkind = \"database\"\n\n[output.database]\ndriver = \"sqlite\"\nurl = \"sqlite:.data/indexes/ormp/index.db\"",
+        )
+        .replace(
+            "[checkpoint]",
+            r#"[query]
+enabled = true
+protocol = "graphql"
+
+[query.auth]
+enabled = true
+
+[[query.auth.applications]]
+id = "Query_App"
+token_env = "PATH"
+max_requests_per_minute = 60
+max_concurrent_requests = 2
+
+[checkpoint]"#,
+        );
+
+    let config = DatalensIndexConfig::from_toml_str(&input).expect("valid database config");
+
+    assert_eq!(
+        config.query.auth,
+        QueryAuthConfig {
+            enabled: true,
+            applications: vec![QueryAuthApplicationConfig {
+                id: "query_app".to_owned(),
+                enabled: true,
+                token: std::env::var("PATH").expect("PATH should exist for tests"),
+                quota: Some(QueryAuthQuotaConfig {
+                    max_requests_per_minute: Some(60),
+                    max_concurrent_requests: Some(2),
+                }),
+            }],
+        }
+    );
+    assert!(
+        !format!("{:?}", config.query.auth)
+            .contains(&std::env::var("PATH").expect("PATH should exist for tests"))
+    );
+}
+
+#[test]
+fn test_parse_query_auth_rejects_enabled_without_applications() {
+    let input = valid_config()
+        .replace(
+            "[output.jsonl]\npath = \".data/indexes/ormp/events.jsonl\"",
+            "[output]\nkind = \"database\"\n\n[output.database]\ndriver = \"sqlite\"\nurl = \"sqlite:.data/indexes/ormp/index.db\"",
+        )
+        .replace(
+            "[checkpoint]",
+            "[query]\nenabled = true\n\n[query.auth]\nenabled = true\n\n[checkpoint]",
+        );
+
+    let error = parse_error(&input);
+
+    assert!(
+        error.contains("query.auth.applications") && error.contains("at least one application"),
+        "{error}"
+    );
+}
+
+#[test]
 fn test_parse_evm_decode_config_returns_minimal_event_abi_fragments() {
     let input = valid_config()
         .replace(
@@ -465,74 +533,6 @@ fn test_parse_sqlite_query_config_captures_bind_address() {
     assert_eq!(
         datalens_indexer::validate_daemon_config(&config).expect("daemon config"),
         datalens_indexer::DaemonQueryMode::Graphql
-    );
-}
-
-#[test]
-fn test_parse_query_auth_config_supports_token_env_and_quota() {
-    let input = valid_config()
-        .replace(
-            "[output.jsonl]\npath = \".data/indexes/ormp/events.jsonl\"",
-            "[output]\nkind = \"database\"\n\n[output.database]\ndriver = \"sqlite\"\nurl = \"sqlite:.data/indexes/ormp/index.db\"",
-        )
-        .replace(
-            "[checkpoint]",
-            r#"[query]
-enabled = true
-protocol = "graphql"
-
-[query.auth]
-enabled = true
-
-[[query.auth.applications]]
-id = "Query_App"
-token_env = "PATH"
-max_requests_per_minute = 60
-max_concurrent_requests = 2
-
-[checkpoint]"#,
-        );
-
-    let config = DatalensIndexConfig::from_toml_str(&input).expect("valid database config");
-
-    assert_eq!(
-        config.query.auth,
-        QueryAuthConfig {
-            enabled: true,
-            applications: vec![QueryAuthApplicationConfig {
-                id: "query_app".to_owned(),
-                enabled: true,
-                token: std::env::var("PATH").expect("PATH should exist for tests"),
-                quota: Some(QueryAuthQuotaConfig {
-                    max_requests_per_minute: Some(60),
-                    max_concurrent_requests: Some(2),
-                }),
-            }],
-        }
-    );
-    assert!(
-        !format!("{:?}", config.query.auth)
-            .contains(&std::env::var("PATH").expect("PATH should exist for tests"))
-    );
-}
-
-#[test]
-fn test_parse_query_auth_rejects_enabled_without_applications() {
-    let input = valid_config()
-        .replace(
-            "[output.jsonl]\npath = \".data/indexes/ormp/events.jsonl\"",
-            "[output]\nkind = \"database\"\n\n[output.database]\ndriver = \"sqlite\"\nurl = \"sqlite:.data/indexes/ormp/index.db\"",
-        )
-        .replace(
-            "[checkpoint]",
-            "[query]\nenabled = true\n\n[query.auth]\nenabled = true\n\n[checkpoint]",
-        );
-
-    let error = parse_error(&input);
-
-    assert!(
-        error.contains("query.auth.applications") && error.contains("at least one application"),
-        "{error}"
     );
 }
 

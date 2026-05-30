@@ -142,10 +142,10 @@ path = ".data/indexes/ormp/checkpoint.json"
 }
 
 #[test]
-fn test_index_backfill_accepts_required_inputs_and_dry_run() {
+fn test_cache_backfill_accepts_required_inputs_and_dry_run() {
     let cli = Cli::parse_from([
         "datalens",
-        "index",
+        "cache",
         "backfill",
         "--config",
         "custom.toml",
@@ -166,9 +166,9 @@ fn test_index_backfill_accepts_required_inputs_and_dry_run() {
     ]);
 
     match cli.command {
-        Command::Index(command) => match *command {
-            IndexCommand {
-                command: IndexSubcommand::Backfill(command),
+        Command::Cache(command) => match *command {
+            CacheCommand {
+                command: CacheWorkflowCommand::Backfill(command),
             } => {
                 assert_eq!(command.common.config, "custom.toml");
                 assert_eq!(command.common.chain, "ethereum");
@@ -180,10 +180,15 @@ fn test_index_backfill_accepts_required_inputs_and_dry_run() {
                 assert!(command.dry_run);
                 assert!(command.common.json);
             }
-            command => panic!("expected index backfill command, got {command:?}"),
+            command => panic!("expected cache backfill command, got {command:?}"),
         },
-        command => panic!("expected index backfill command, got {command:?}"),
+        command => panic!("expected cache backfill command, got {command:?}"),
     }
+}
+
+#[test]
+fn test_index_backfill_is_not_accepted() {
+    assert!(Cli::try_parse_from(["datalens", "index", "backfill"]).is_err());
 }
 
 #[test]
@@ -253,6 +258,93 @@ fn test_index_doctor_prints_stable_json_for_valid_config() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stdout.contains("super-secret-token"));
     assert!(!stderr.contains("super-secret-token"));
+}
+
+#[test]
+fn test_index_doctor_reports_query_auth_without_printing_token() {
+    let root = temp_storage_root("index-doctor-query-auth");
+    let config_path = root.join("app.index.toml");
+    std::fs::create_dir_all(&root).expect("create config root");
+    std::fs::write(
+        &config_path,
+        r#"
+[client]
+endpoint = "http://127.0.0.1:3000"
+application = "ormp"
+token_env = "DATALENS_INDEX_TOKEN"
+
+[index]
+name = "ormp"
+dataset = "evm.logs"
+finality = "durable"
+chunk_blocks = 1000
+
+[[sources]]
+chain = "ethereum"
+family = "evm"
+chain_id = 1
+from_block = 20009590
+to_block = 20059589
+addresses = []
+topics = []
+
+[output]
+kind = "database"
+
+[output.database]
+driver = "sqlite"
+url = "sqlite:.data/indexes/ormp/index.db"
+
+[query]
+enabled = true
+protocol = "graphql"
+bind = "127.0.0.1:9090"
+path = "/graphql"
+playground = true
+
+[query.auth]
+enabled = true
+
+[[query.auth.applications]]
+id = "Query_App"
+token_env = "DATALENS_QUERY_TOKEN"
+max_requests_per_minute = 60
+max_concurrent_requests = 2
+
+[checkpoint]
+path = ".data/indexes/ormp/checkpoint.json"
+"#,
+    )
+    .expect("write index config");
+
+    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_datalens"))
+        .args(["index", "doctor", "--config"])
+        .arg(&config_path)
+        .env("DATALENS_INDEX_TOKEN", "super-secret-index-token")
+        .env("DATALENS_QUERY_TOKEN", "super-secret-query-token")
+        .output()
+        .expect("run index doctor");
+
+    assert!(
+        output.status.success(),
+        "index doctor failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("index doctor JSON");
+    assert_eq!(summary["query"]["enabled"], true);
+    assert_eq!(summary["query"]["auth"]["enabled"], true);
+    assert_eq!(summary["query"]["auth"]["applications"], 1);
+    assert_eq!(summary["query"]["auth"]["max_requests_per_minute"], 60);
+    assert_eq!(summary["query"]["auth"]["max_concurrent_requests"], 2);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stdout.contains("super-secret-index-token"));
+    assert!(!stdout.contains("super-secret-query-token"));
+    assert!(!stderr.contains("super-secret-index-token"));
+    assert!(!stderr.contains("super-secret-query-token"));
 }
 
 #[test]
@@ -589,10 +681,10 @@ fn test_index_doctor_rejects_invalid_config_without_leaking_token() {
 }
 
 #[test]
-fn test_index_backfill_accepts_tron_event_names() {
+fn test_cache_backfill_accepts_tron_event_names() {
     let cli = Cli::parse_from([
         "datalens",
-        "index",
+        "cache",
         "backfill",
         "--config",
         "custom.toml",
@@ -622,9 +714,9 @@ fn test_index_backfill_accepts_tron_event_names() {
     ]);
 
     match cli.command {
-        Command::Index(command) => match *command {
-            IndexCommand {
-                command: IndexSubcommand::Backfill(command),
+        Command::Cache(command) => match *command {
+            CacheCommand {
+                command: CacheWorkflowCommand::Backfill(command),
             } => {
                 assert_eq!(command.common.chain, "tron-mainnet");
                 assert_eq!(command.common.datasets, vec!["events"]);
@@ -634,24 +726,24 @@ fn test_index_backfill_accepts_tron_event_names() {
                     vec!["MessageAccepted", "MessageDispatched"]
                 );
             }
-            command => panic!("expected index backfill command, got {command:?}"),
+            command => panic!("expected cache backfill command, got {command:?}"),
         },
-        command => panic!("expected index backfill command, got {command:?}"),
+        command => panic!("expected cache backfill command, got {command:?}"),
     }
 }
 
 #[test]
-fn test_index_backfill_tron_events_builds_tron_event_selector() {
+fn test_cache_backfill_tron_events_builds_tron_event_selector() {
     let root = temp_storage_root("index-tron-events-selector");
     let config = write_tron_config("index-tron-events-selector", &root);
-    let mut common = index_common(config, 10, 12);
+    let mut common = cache_common(config, 10, 12);
     common.chain = "tron-mainnet".to_owned();
     common.datasets = vec!["events".to_owned()];
     common.addresses = vec!["0xabcdefabcdefabcdefabcdefabcdefabcdefabcd".to_owned()];
     common.event_names = vec!["Transfer".to_owned()];
 
-    let output = index_summary_with_adapter(
-        IndexWorkflowCommand::Backfill(IndexBackfillCommand {
+    let output = cache_summary_with_adapter(
+        CacheWorkflowCommand::Backfill(CacheBackfillCommand {
             common,
             dry_run: true,
         }),
@@ -671,17 +763,17 @@ fn test_index_backfill_tron_events_builds_tron_event_selector() {
 }
 
 #[test]
-fn test_index_backfill_solana_instructions_builds_program_selector() {
+fn test_cache_backfill_solana_instructions_builds_program_selector() {
     let root = temp_storage_root("index-solana-program-selector");
     let config = write_solana_config("index-solana-program-selector", &root);
-    let mut common = index_common(config, 10, 12);
+    let mut common = cache_common(config, 10, 12);
     common.chain = "solana-mainnet-beta".to_owned();
     common.datasets = vec!["instructions".to_owned()];
     common.range_kind = "slot".to_owned();
     common.program_id = Some("program1111111111111111111111111111111111".to_owned());
 
-    let output = index_summary_with_adapter(
-        IndexWorkflowCommand::Backfill(IndexBackfillCommand {
+    let output = cache_summary_with_adapter(
+        CacheWorkflowCommand::Backfill(CacheBackfillCommand {
             common,
             dry_run: true,
         }),
@@ -697,17 +789,17 @@ fn test_index_backfill_solana_instructions_builds_program_selector() {
 }
 
 #[test]
-fn test_index_backfill_solana_transactions_builds_address_selector() {
+fn test_cache_backfill_solana_transactions_builds_address_selector() {
     let root = temp_storage_root("index-solana-address-selector");
     let config = write_solana_config("index-solana-address-selector", &root);
-    let mut common = index_common(config, 10, 12);
+    let mut common = cache_common(config, 10, 12);
     common.chain = "solana-mainnet-beta".to_owned();
     common.datasets = vec!["transactions".to_owned()];
     common.range_kind = "slot".to_owned();
     common.addresses = vec!["Account111111111111111111111111111111111".to_owned()];
 
-    let output = index_summary_with_adapter(
-        IndexWorkflowCommand::Backfill(IndexBackfillCommand {
+    let output = cache_summary_with_adapter(
+        CacheWorkflowCommand::Backfill(CacheBackfillCommand {
             common,
             dry_run: true,
         }),
@@ -723,17 +815,17 @@ fn test_index_backfill_solana_transactions_builds_address_selector() {
 }
 
 #[test]
-fn test_index_backfill_solana_transactions_builds_signature_selector() {
+fn test_cache_backfill_solana_transactions_builds_signature_selector() {
     let root = temp_storage_root("index-solana-signature-selector");
     let config = write_solana_config("index-solana-signature-selector", &root);
-    let mut common = index_common(config, 10, 12);
+    let mut common = cache_common(config, 10, 12);
     common.chain = "solana-mainnet-beta".to_owned();
     common.datasets = vec!["transactions".to_owned()];
     common.range_kind = "slot".to_owned();
     common.signature = Some("sigslot10".to_owned());
 
-    let output = index_summary_with_adapter(
-        IndexWorkflowCommand::Backfill(IndexBackfillCommand {
+    let output = cache_summary_with_adapter(
+        CacheWorkflowCommand::Backfill(CacheBackfillCommand {
             common,
             dry_run: true,
         }),
@@ -749,17 +841,17 @@ fn test_index_backfill_solana_transactions_builds_signature_selector() {
 }
 
 #[test]
-fn test_index_backfill_solana_account_updates_builds_account_selector() {
+fn test_cache_backfill_solana_account_updates_builds_account_selector() {
     let root = temp_storage_root("index-solana-account-selector");
     let config = write_solana_config("index-solana-account-selector", &root);
-    let mut common = index_common(config, 10, 12);
+    let mut common = cache_common(config, 10, 12);
     common.chain = "solana-mainnet-beta".to_owned();
     common.datasets = vec!["account_updates".to_owned()];
     common.range_kind = "slot".to_owned();
     common.account = Some("Account111111111111111111111111111111111".to_owned());
 
-    let output = index_summary_with_adapter(
-        IndexWorkflowCommand::Backfill(IndexBackfillCommand {
+    let output = cache_summary_with_adapter(
+        CacheWorkflowCommand::Backfill(CacheBackfillCommand {
             common,
             dry_run: true,
         }),
@@ -775,18 +867,18 @@ fn test_index_backfill_solana_account_updates_builds_account_selector() {
 }
 
 #[test]
-fn test_index_backfill_rejects_solana_selectors_for_blocks_and_slots() {
+fn test_cache_backfill_rejects_solana_selectors_for_blocks_and_slots() {
     for dataset in ["blocks", "slots"] {
         let root = temp_storage_root(&format!("index-solana-reject-{dataset}"));
         let config = write_solana_config(&format!("index-solana-reject-{dataset}"), &root);
-        let mut common = index_common(config, 10, 12);
+        let mut common = cache_common(config, 10, 12);
         common.chain = "solana-mainnet-beta".to_owned();
         common.datasets = vec![dataset.to_owned()];
         common.range_kind = "slot".to_owned();
         common.program_id = Some("program1111111111111111111111111111111111".to_owned());
 
-        let error = index_summary_with_adapter(
-            IndexWorkflowCommand::Backfill(IndexBackfillCommand {
+        let error = cache_summary_with_adapter(
+            CacheWorkflowCommand::Backfill(CacheBackfillCommand {
                 common,
                 dry_run: true,
             }),
@@ -804,11 +896,11 @@ fn test_index_backfill_rejects_solana_selectors_for_blocks_and_slots() {
 }
 
 #[test]
-fn test_index_resume_repair_and_verify_parse_required_inputs() {
+fn test_cache_resume_repair_and_verify_parse_required_inputs() {
     for workflow in ["resume", "repair", "verify"] {
         let cli = Cli::parse_from([
             "datalens",
-            "index",
+            "cache",
             workflow,
             "--config",
             "custom.toml",
@@ -827,13 +919,13 @@ fn test_index_resume_repair_and_verify_parse_required_inputs() {
         ]);
 
         match cli.command {
-            Command::Index(index) => {
-                let IndexCommand { command } = *index;
-                assert_eq!(index_test_common(&command).config, "custom.toml");
-                assert_eq!(index_test_common(&command).chain, "ethereum");
-                assert_eq!(index_test_common(&command).datasets, vec!["blocks"]);
+            Command::Cache(cache) => {
+                let CacheCommand { command } = *cache;
+                assert_eq!(cache_test_common(&command).config, "custom.toml");
+                assert_eq!(cache_test_common(&command).chain, "ethereum");
+                assert_eq!(cache_test_common(&command).datasets, vec!["blocks"]);
             }
-            command => panic!("expected index {workflow} command, got {command:?}"),
+            command => panic!("expected cache {workflow} command, got {command:?}"),
         }
     }
 }
@@ -952,14 +1044,14 @@ fn test_index_config_accepts_trongrid_without_api_key() {
 }
 
 #[test]
-fn test_index_dry_run_plans_chunks_without_writing() {
+fn test_cache_dry_run_plans_chunks_without_writing() {
     let root = temp_storage_root("index-dry-run");
     let config = write_config("index-dry-run", &root);
     let adapter = IndexFixtureAdapter::default().with_blocks(vec![block(1), block(2), block(3)]);
 
-    let output = index_summary_with_adapter(
-        IndexWorkflowCommand::Backfill(IndexBackfillCommand {
-            common: index_common(config, 1, 3),
+    let output = cache_summary_with_adapter(
+        CacheWorkflowCommand::Backfill(CacheBackfillCommand {
+            common: cache_common(config, 1, 3),
             dry_run: true,
         }),
         adapter.clone(),
@@ -982,14 +1074,14 @@ fn test_index_dry_run_plans_chunks_without_writing() {
 }
 
 #[test]
-fn test_index_backfill_runs_fixture_runtime() {
+fn test_cache_backfill_runs_fixture_runtime() {
     let root = temp_storage_root("index-backfill");
     let config = write_config("index-backfill", &root);
     let adapter = IndexFixtureAdapter::default().with_blocks(vec![block(1), block(2), block(3)]);
 
-    let output = index_summary_with_adapter(
-        IndexWorkflowCommand::Backfill(IndexBackfillCommand {
-            common: index_common(config, 1, 3),
+    let output = cache_summary_with_adapter(
+        CacheWorkflowCommand::Backfill(CacheBackfillCommand {
+            common: cache_common(config, 1, 3),
             dry_run: false,
         }),
         adapter.clone(),
@@ -1017,14 +1109,14 @@ fn test_index_backfill_runs_fixture_runtime() {
 }
 
 #[test]
-fn test_index_backfill_persists_cursor_under_configured_cursor_path() {
+fn test_cache_backfill_persists_cursor_under_configured_cursor_path() {
     let root = temp_storage_root("index-backfill-cursor");
     let config = write_config("index-backfill-cursor", &root);
     let adapter = IndexFixtureAdapter::default().with_blocks(vec![block(1), block(2), block(3)]);
 
-    let output = index_summary_with_adapter(
-        IndexWorkflowCommand::Backfill(IndexBackfillCommand {
-            common: index_common(config, 1, 3),
+    let output = cache_summary_with_adapter(
+        CacheWorkflowCommand::Backfill(CacheBackfillCommand {
+            common: cache_common(config, 1, 3),
             dry_run: false,
         }),
         adapter,
@@ -1048,14 +1140,14 @@ fn test_index_backfill_persists_cursor_under_configured_cursor_path() {
 }
 
 #[test]
-fn test_index_resume_uses_persisted_cursor_after_process_restart() {
+fn test_cache_resume_uses_persisted_cursor_after_process_restart() {
     let root = temp_storage_root("index-resume-cursor");
     let config = write_config("index-resume-cursor", &root);
     let first_adapter = IndexFixtureAdapter::default().with_blocks(vec![block(1), block(2)]);
 
-    index_summary_with_adapter(
-        IndexWorkflowCommand::Backfill(IndexBackfillCommand {
-            common: index_common(config.clone(), 1, 2),
+    cache_summary_with_adapter(
+        CacheWorkflowCommand::Backfill(CacheBackfillCommand {
+            common: cache_common(config.clone(), 1, 2),
             dry_run: false,
         }),
         first_adapter,
@@ -1063,9 +1155,9 @@ fn test_index_resume_uses_persisted_cursor_after_process_restart() {
     .expect("backfill");
 
     let resumed_adapter = IndexFixtureAdapter::default().with_blocks(vec![block(1), block(2)]);
-    let output = index_summary_with_adapter(
-        IndexWorkflowCommand::Resume(IndexResumeCommand {
-            common: index_common(config, 1, 2),
+    let output = cache_summary_with_adapter(
+        CacheWorkflowCommand::Resume(CacheResumeCommand {
+            common: cache_common(config, 1, 2),
             dry_run: false,
         }),
         resumed_adapter.clone(),
@@ -1081,16 +1173,16 @@ fn test_index_resume_uses_persisted_cursor_after_process_restart() {
 }
 
 #[test]
-fn test_index_verify_does_not_persist_cursor() {
+fn test_cache_verify_does_not_persist_cursor() {
     let root = temp_storage_root("index-verify-cursor");
     let storage = LocalStorage::new(&root);
     write_block_coverage(&storage, 1, 2);
     let config = write_config("index-verify-cursor", &root);
     let adapter = IndexFixtureAdapter::default().with_blocks(vec![block(1), block(2)]);
 
-    index_summary_with_adapter(
-        IndexWorkflowCommand::Verify(IndexVerifyCommand {
-            common: index_common(config, 1, 2),
+    cache_summary_with_adapter(
+        CacheWorkflowCommand::Verify(CacheVerifyCommand {
+            common: cache_common(config, 1, 2),
             verify_only: true,
         }),
         adapter,
@@ -1104,16 +1196,16 @@ fn test_index_verify_does_not_persist_cursor() {
 }
 
 #[test]
-fn test_index_verify_does_not_write_data() {
+fn test_cache_verify_does_not_write_data() {
     let root = temp_storage_root("index-verify");
     let storage = LocalStorage::new(&root);
     write_block_coverage(&storage, 1, 2);
     let config = write_config("index-verify", &root);
     let adapter = IndexFixtureAdapter::default().with_blocks(vec![block(1), block(2)]);
 
-    let output = index_summary_with_adapter(
-        IndexWorkflowCommand::Verify(IndexVerifyCommand {
-            common: index_common(config, 1, 2),
+    let output = cache_summary_with_adapter(
+        CacheWorkflowCommand::Verify(CacheVerifyCommand {
+            common: cache_common(config, 1, 2),
             verify_only: true,
         }),
         adapter.clone(),
@@ -1177,15 +1269,15 @@ fn test_validate_config_rejects_unsafe_index_finality() {
 }
 
 #[test]
-fn test_index_command_rejects_unsafe_finality_override() {
+fn test_cache_command_rejects_unsafe_finality_override() {
     let root = temp_storage_root("index-unsafe-finality");
     let config = write_config("index-unsafe-finality", &root);
     let adapter = IndexFixtureAdapter::default().with_blocks(vec![block(1)]);
-    let mut common = index_common(config, 1, 1);
+    let mut common = cache_common(config, 1, 1);
     common.finality = Some("latest".to_owned());
 
-    let error = index_summary_with_adapter(
-        IndexWorkflowCommand::Backfill(IndexBackfillCommand {
+    let error = cache_summary_with_adapter(
+        CacheWorkflowCommand::Backfill(CacheBackfillCommand {
             common,
             dry_run: true,
         }),
@@ -1199,7 +1291,7 @@ fn test_index_command_rejects_unsafe_finality_override() {
 
 fn temp_storage_root(name: &str) -> std::path::PathBuf {
     let root = std::env::temp_dir().join(format!(
-        "datalens-cli-index-{name}-{}",
+        "datalens-cli-cache-{name}-{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
@@ -1352,8 +1444,8 @@ fn write_tron_config(name: &str, storage_root: &std::path::Path) -> String {
     config_path.to_string_lossy().into_owned()
 }
 
-fn index_common(config: String, start: u64, end: u64) -> IndexCommonCommand {
-    IndexCommonCommand {
+fn cache_common(config: String, start: u64, end: u64) -> CacheCommonCommand {
+    CacheCommonCommand {
         config,
         chain: "ethereum".to_owned(),
         datasets: vec!["blocks".to_owned()],
@@ -1425,24 +1517,12 @@ fn write_solana_config(name: &str, storage_root: &std::path::Path) -> String {
     config_path.to_string_lossy().into_owned()
 }
 
-fn index_test_common(command: &IndexWorkflowCommand) -> &IndexCommonCommand {
+fn cache_test_common(command: &CacheWorkflowCommand) -> &CacheCommonCommand {
     match command {
-        IndexWorkflowCommand::Backfill(command) => &command.common,
-        IndexWorkflowCommand::Resume(command) => &command.common,
-        IndexWorkflowCommand::Repair(command) => &command.common,
-        IndexWorkflowCommand::Verify(command) => &command.common,
-        IndexWorkflowCommand::Plan(_) => {
-            unreachable!("index plan does not use runtime index common options")
-        }
-        IndexWorkflowCommand::Run(_) => {
-            unreachable!("index run does not use runtime index common options")
-        }
-        IndexWorkflowCommand::Daemon(_) => {
-            unreachable!("index daemon does not use runtime index common options")
-        }
-        IndexWorkflowCommand::Doctor(_) => {
-            unreachable!("index doctor does not use runtime index common options")
-        }
+        CacheWorkflowCommand::Backfill(command) => &command.common,
+        CacheWorkflowCommand::Resume(command) => &command.common,
+        CacheWorkflowCommand::Repair(command) => &command.common,
+        CacheWorkflowCommand::Verify(command) => &command.common,
     }
 }
 
