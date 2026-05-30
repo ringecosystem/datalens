@@ -1,6 +1,7 @@
 mod support;
 
 use datalens_edge::{
+    auth::ApplicationRegistry,
     config::{EdgeConfig, MetricsEndpointConfig},
     router_with_edge_config,
 };
@@ -113,6 +114,32 @@ async fn test_operation_allowlist_does_not_let_query_credentials_read_discovery(
 
     assert_eq!(query.status(), StatusCode::OK);
     assert_eq!(discovery.status(), StatusCode::FORBIDDEN);
+}
+
+#[test]
+fn test_application_registry_rejects_empty_operations_when_required() {
+    let error = ApplicationRegistry::from_config(ApplicationRegistryConfig {
+        required: true,
+        applications: vec![ApplicationConfig {
+            id: "empty-ops".to_owned(),
+            name: "empty-ops".to_owned(),
+            enabled: true,
+            display_name: None,
+            token: "secret-token".to_owned(),
+            chains: vec!["ethereum".to_owned()],
+            datasets: vec!["evm.blocks".to_owned()],
+            operations: Vec::new(),
+            quota: None,
+        }],
+    })
+    .expect_err("empty operation allowlist rejected");
+
+    assert_eq!(error.kind, DatalensErrorKind::InvalidInput);
+    assert!(
+        error
+            .message
+            .contains("must declare at least one operation when application auth is required")
+    );
 }
 
 #[tokio::test]

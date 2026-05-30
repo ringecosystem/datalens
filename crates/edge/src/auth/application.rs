@@ -5,7 +5,7 @@ use std::{
 };
 
 use axum::http::{HeaderMap, header};
-use datalens_core::{DatalensError, DatalensErrorKind, QueryFinalityRequirement};
+use datalens_core::{DatalensError, DatalensErrorKind, DatasetKey, QueryFinalityRequirement};
 use datalens_metrics::ApplicationIdentity;
 
 use crate::{config, contract::query::QueryApiRequest};
@@ -73,6 +73,26 @@ impl ApplicationRegistry {
                     DatalensErrorKind::InvalidInput,
                     format!("application {} token must not be empty", application.id),
                 ));
+            }
+            if config.required && application.operations.is_empty() {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::InvalidInput,
+                    format!(
+                        "application {} must declare at least one operation when application auth is required",
+                        application.id
+                    ),
+                ));
+            }
+            for dataset in &mut application.datasets {
+                *dataset = normalize_application_dataset_key(dataset).map_err(|_| {
+                    DatalensError::new(
+                        DatalensErrorKind::InvalidInput,
+                        format!(
+                            "application {} references unknown dataset {dataset}",
+                            application.id
+                        ),
+                    )
+                })?;
             }
             if applications
                 .insert(application.id.clone(), application)
@@ -463,7 +483,7 @@ fn authorize_application_operation(
     application: &config::ApplicationConfig,
     operation: config::ApplicationOperationConfig,
 ) -> Result<(), DatalensError> {
-    if application.operations.is_empty() || application.operations.contains(&operation) {
+    if application.operations.contains(&operation) {
         return Ok(());
     }
     Err(DatalensError::new(
@@ -556,4 +576,62 @@ pub fn normalize_application_id(value: &str) -> Result<String, DatalensError> {
         ));
     }
     Ok(normalized)
+}
+
+pub fn normalize_application_dataset_key(value: &str) -> Result<String, DatalensError> {
+    let key = DatasetKey::parse(value)?;
+    let value = key.as_str();
+    if !supported_application_dataset_keys().contains(&value) {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "application dataset must be a supported canonical dataset key",
+        ));
+    }
+    Ok(value.to_owned())
+}
+
+pub fn supported_application_dataset_keys() -> &'static [&'static str] {
+    &[
+        "evm.blocks",
+        "evm.transactions",
+        "evm.receipts",
+        "evm.logs",
+        "solana.slots",
+        "solana.blocks",
+        "solana.transactions",
+        "solana.instructions",
+        "solana.account_updates",
+        "tron.blocks",
+        "tron.transactions",
+        "tron.transaction_infos",
+        "tron.events",
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_authorize_application_operation_rejects_empty_allowlist() {
+        let application = config::ApplicationConfig {
+            id: "empty-ops".to_owned(),
+            name: "empty-ops".to_owned(),
+            enabled: true,
+            display_name: None,
+            token: "secret-token".to_owned(),
+            chains: vec!["ethereum".to_owned()],
+            datasets: vec!["evm.blocks".to_owned()],
+            operations: Vec::new(),
+            quota: None,
+        };
+
+        let error = authorize_application_operation(
+            &application,
+            config::ApplicationOperationConfig::Query,
+        )
+        .expect_err("empty operation allowlist rejected");
+
+        assert_eq!(error.kind, DatalensErrorKind::Unauthorized);
+    }
 }
