@@ -142,8 +142,14 @@ impl OutputWriteSink for SqliteOutputStore {
 impl QueryableStore for SqliteOutputStore {
     fn query(&self, query: StoreQuery) -> Result<StoreQueryResult, IndexerError> {
         self.runtime
-            .block_on(query_records_sqlite(&self.pool, query))
+            .block_on(query_records_sqlite(&self.pool, query, false))
             .map_err(|error| IndexerError::Runner(format!("sqlite query failed: {error}")))
+    }
+
+    fn query_decoded_events(&self, query: StoreQuery) -> Result<StoreQueryResult, IndexerError> {
+        self.runtime
+            .block_on(query_records_sqlite(&self.pool, query, true))
+            .map_err(|error| IndexerError::Runner(format!("sqlite decoded query failed: {error}")))
     }
 }
 
@@ -262,10 +268,20 @@ async fn insert_record(
 async fn query_records_sqlite(
     pool: &SqlitePool,
     query: StoreQuery,
+    decoded_only: bool,
 ) -> Result<StoreQueryResult, sqlx::Error> {
     let filter = StoreQueryFilter::from_query(&query);
     let mut builder = sqlx::QueryBuilder::new(sqlite_query_prefix(&filter));
     builder.push_bind(query.dataset);
+    if decoded_only {
+        builder.push(
+            " AND (
+                json_type(raw_payload, '$.decoded') IS NOT NULL
+                OR json_type(raw_payload, '$.decode_status') IS NOT NULL
+                OR json_type(raw_payload, '$.decode_error') IS NOT NULL
+            )",
+        );
+    }
     if let Some(index) = filter.index {
         builder.push(" AND index_name = ").push_bind(index);
     }

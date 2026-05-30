@@ -562,6 +562,52 @@ impl QueryRoot {
             .map(IndexedEvent::try_from)
             .collect()
     }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn decoded_events(
+        &self,
+        ctx: &Context<'_>,
+        index_name: Option<String>,
+        chain: Option<String>,
+        chain_id: Option<u64>,
+        dataset: String,
+        address: Option<String>,
+        event_name: Option<String>,
+        signature: Option<String>,
+        from_block: Option<u64>,
+        to_block: Option<u64>,
+        topic0: Option<String>,
+        limit: Option<u64>,
+        after: Option<String>,
+    ) -> async_graphql::Result<Vec<DecodedEvent>> {
+        let limit = bounded_limit(limit)?;
+        let after = parse_after(after)?;
+        let filter = event_filter(EventFilter {
+            index_name,
+            chain,
+            chain_id,
+            address,
+            event_name,
+            signature,
+            from_block,
+            to_block,
+            topic0,
+            limit,
+            after,
+        });
+        let store = store(ctx)?.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            store.query_decoded_events(StoreQuery { dataset, filter })
+        })
+        .await
+        .map_err(|error| Error::new(format!("graphql decoded query task failed: {error}")))?
+        .map_err(graphql_error)?;
+        result
+            .rows
+            .into_iter()
+            .map(DecodedEvent::try_from)
+            .collect()
+    }
 }
 
 #[derive(SimpleObject)]
@@ -621,6 +667,62 @@ impl TryFrom<Value> for IndexedEvent {
             payload: Json(value),
             created_at,
             topics,
+        })
+    }
+}
+
+#[derive(SimpleObject)]
+pub struct DecodedEvent {
+    pub index_name: Option<String>,
+    pub chain: Option<String>,
+    pub chain_id: Option<u64>,
+    pub dataset: Option<String>,
+    pub block_number: Option<u64>,
+    pub block_hash: Option<String>,
+    pub transaction_hash: Option<String>,
+    pub transaction_index: Option<u64>,
+    pub log_index: Option<u64>,
+    pub address: Option<String>,
+    pub event_name: Option<String>,
+    pub signature: Option<String>,
+    pub topic0: Option<String>,
+    pub decoded_args: Json<Value>,
+    pub decode_status: Option<String>,
+    pub decode_error: Option<String>,
+    pub payload: Json<Value>,
+    pub created_at: Option<String>,
+}
+
+impl TryFrom<Value> for DecodedEvent {
+    type Error = Error;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        let object = value
+            .as_object()
+            .ok_or_else(|| Error::new("decoded event row must be a JSON object"))?;
+        let topics = string_array(object, "topics");
+        let decoded_args = object.get("decoded").cloned().unwrap_or(Value::Null);
+        let created_at = string_field(object, "created_at");
+        Ok(Self {
+            index_name: string_field(object, "index"),
+            chain: string_field(object, "chain"),
+            chain_id: u64_field(object, "chain_id"),
+            dataset: string_field(object, "dataset"),
+            block_number: u64_field(object, "block_number"),
+            block_hash: string_field(object, "block_hash"),
+            transaction_hash: string_field(object, "transaction_hash"),
+            transaction_index: u64_field(object, "transaction_index"),
+            log_index: u64_field(object, "log_index").or_else(|| u64_field(object, "event_index")),
+            address: string_field(object, "address"),
+            event_name: string_field(object, "event_name"),
+            signature: string_field(object, "signature"),
+            topic0: string_field(object, "topic0").or_else(|| topics.first().cloned()),
+            decoded_args: Json(decoded_args),
+            decode_status: string_field(object, "decode_status")
+                .or_else(|| Some("decoded".to_owned())),
+            decode_error: string_field(object, "decode_error"),
+            payload: Json(value),
+            created_at,
         })
     }
 }

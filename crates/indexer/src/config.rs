@@ -302,7 +302,17 @@ pub enum QueryProtocol {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DecodeConfig {
     pub enabled: bool,
+    pub abis: Vec<DecodeAbiConfig>,
     pub events: Vec<DecodeEventConfig>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DecodeAbiConfig {
+    pub chain: String,
+    pub index: String,
+    pub dataset: String,
+    pub path: Option<PathBuf>,
+    pub json: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -310,6 +320,9 @@ pub struct DecodeEventConfig {
     pub name: String,
     pub signature: String,
     pub topic0: String,
+    pub chain: Option<String>,
+    pub index: Option<String>,
+    pub dataset: Option<String>,
     pub contract: Option<String>,
     pub inputs: Vec<DecodeEventInputConfig>,
 }
@@ -471,7 +484,19 @@ struct RawDecodeConfig {
     #[serde(default)]
     enabled: bool,
     #[serde(default)]
+    abis: Vec<RawDecodeAbiConfig>,
+    #[serde(default)]
     events: Vec<RawDecodeEventConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDecodeAbiConfig {
+    chain: Option<String>,
+    index: Option<String>,
+    dataset: Option<String>,
+    path: Option<PathBuf>,
+    json: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -480,6 +505,9 @@ struct RawDecodeEventConfig {
     name: Option<String>,
     signature: Option<String>,
     topic0: Option<String>,
+    chain: Option<String>,
+    index: Option<String>,
+    dataset: Option<String>,
     contract: Option<String>,
     #[serde(default)]
     inputs: Vec<RawDecodeEventInputConfig>,
@@ -1021,21 +1049,72 @@ fn parse_decode(raw: Option<RawDecodeConfig>, errors: &mut Vec<String>) -> Decod
     let Some(raw) = raw else {
         return DecodeConfig::default();
     };
+    let abis = raw
+        .abis
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, abi)| parse_decode_abi(index, abi, errors))
+        .collect::<Vec<_>>();
     let events = raw
         .events
         .into_iter()
         .enumerate()
         .filter_map(|(index, event)| parse_decode_event(index, event, errors))
         .collect::<Vec<_>>();
-    if raw.enabled && events.is_empty() {
+    if raw.enabled && abis.is_empty() && events.is_empty() {
         errors.push(
-            "decode.events: at least one event is required when decode is enabled".to_owned(),
+            "decode: at least one ABI or event is required when decode is enabled".to_owned(),
         );
     }
     DecodeConfig {
         enabled: raw.enabled,
+        abis,
         events,
     }
+}
+
+fn parse_decode_abi(
+    abi_index: usize,
+    raw: RawDecodeAbiConfig,
+    errors: &mut Vec<String>,
+) -> Option<DecodeAbiConfig> {
+    let prefix = format!("decode.abis[{abi_index}]");
+    let chain = required_non_empty(&format!("{prefix}.chain"), raw.chain, errors);
+    let index = required_non_empty(&format!("{prefix}.index"), raw.index, errors);
+    let dataset = required_non_empty(&format!("{prefix}.dataset"), raw.dataset, errors)
+        .and_then(|value| parse_dataset(&format!("{prefix}.dataset"), &value, errors))
+        .map(|dataset| dataset.as_str().to_owned());
+    let path = raw.path.and_then(|path| {
+        if path.as_os_str().is_empty() {
+            errors.push(format!("{prefix}.path: must not be empty"));
+            None
+        } else {
+            Some(path)
+        }
+    });
+    let json = raw.json.and_then(|value| {
+        let value = value.trim();
+        if value.is_empty() {
+            errors.push(format!("{prefix}.json: must not be empty"));
+            None
+        } else {
+            Some(value.to_owned())
+        }
+    });
+    if path.is_none() && json.is_none() {
+        errors.push(format!("{prefix}: path or json is required"));
+    }
+    if path.is_some() && json.is_some() {
+        errors.push(format!("{prefix}: path and json are mutually exclusive"));
+    }
+
+    Some(DecodeAbiConfig {
+        chain: chain?,
+        index: index?,
+        dataset: dataset?,
+        path,
+        json,
+    })
 }
 
 fn parse_decode_event(
@@ -1048,6 +1127,11 @@ fn parse_decode_event(
     let signature = required_non_empty(&format!("{prefix}.signature"), raw.signature, errors);
     let topic0 = required_non_empty(&format!("{prefix}.topic0"), raw.topic0, errors)
         .and_then(|value| validate_topic0(&format!("{prefix}.topic0"), value, errors));
+    let chain = optional_non_empty(&format!("{prefix}.chain"), raw.chain, errors);
+    let index = optional_non_empty(&format!("{prefix}.index"), raw.index, errors);
+    let dataset = optional_non_empty(&format!("{prefix}.dataset"), raw.dataset, errors)
+        .and_then(|value| parse_dataset(&format!("{prefix}.dataset"), &value, errors))
+        .map(|dataset| dataset.as_str().to_owned());
     let contract = raw.contract.and_then(|value| {
         let value = value.trim();
         if value.is_empty() {
@@ -1070,6 +1154,9 @@ fn parse_decode_event(
         name: name?,
         signature: signature?,
         topic0: topic0?,
+        chain,
+        index,
+        dataset,
         contract,
         inputs,
     })

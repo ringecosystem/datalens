@@ -1,10 +1,10 @@
 use datalens_indexer::{
-    CheckpointPolicy, DatabaseDriver, DatabaseOutputConfig, DatalensIndexConfig, DecodeConfig,
-    DecodeEventConfig, DecodeEventInputConfig, FinalityRequirement, GraphqlViewConfig,
-    GraphqlViewFieldConfig, GraphqlViewFilterConfig, IndexDataset, MetricsServiceConfig,
-    OutputConfig, ParquetOutputConfig, QueryAuthApplicationConfig, QueryAuthConfig,
-    QueryAuthQuotaConfig, QueryProtocol, QueryServiceConfig, SourceConfig, WebhookHeaderConfig,
-    WebhookOutboxConfig, WebhookOutputConfig, WebhookRetryConfig,
+    CheckpointPolicy, DatabaseDriver, DatabaseOutputConfig, DatalensIndexConfig, DecodeAbiConfig,
+    DecodeConfig, DecodeEventConfig, DecodeEventInputConfig, FinalityRequirement,
+    GraphqlViewConfig, GraphqlViewFieldConfig, GraphqlViewFilterConfig, IndexDataset,
+    MetricsServiceConfig, OutputConfig, ParquetOutputConfig, QueryAuthApplicationConfig,
+    QueryAuthConfig, QueryAuthQuotaConfig, QueryProtocol, QueryServiceConfig, SourceConfig,
+    WebhookHeaderConfig, WebhookOutboxConfig, WebhookOutputConfig, WebhookRetryConfig,
 };
 
 fn valid_config() -> &'static str {
@@ -618,11 +618,15 @@ indexed = false
         config.decode,
         DecodeConfig {
             enabled: true,
+            abis: Vec::new(),
             events: vec![DecodeEventConfig {
                 name: "MessageAccepted".to_owned(),
                 signature: "MessageAccepted(bytes32,uint256,address,address)".to_owned(),
                 topic0: "0x9e6c1c44f7b2b36245897f9be35a5500f3a9e0d5b8f29f89dbf04b54053bb7d1"
                     .to_owned(),
+                chain: None,
+                index: None,
+                dataset: None,
                 contract: Some("ormp".to_owned()),
                 inputs: vec![
                     DecodeEventInputConfig {
@@ -638,6 +642,68 @@ indexed = false
                 ],
             }],
         }
+    );
+}
+
+#[test]
+fn test_parse_evm_decode_config_accepts_inline_abi_scoped_to_chain_index_dataset() {
+    let input = valid_config()
+        .replace(
+            "[output.jsonl]\npath = \".data/indexes/ormp/events.jsonl\"",
+            "[output]\nkind = \"database\"\n\n[output.database]\ndriver = \"sqlite\"\nurl = \"sqlite:.data/indexes/ormp/index.db\"",
+        )
+        .replace(
+            "[checkpoint]",
+            r#"[decode]
+enabled = true
+
+[[decode.abis]]
+chain = "ethereum"
+index = "ormp"
+dataset = "evm.logs"
+json = '''
+[
+  {
+    "type": "event",
+    "name": "Transfer",
+    "anonymous": false,
+    "inputs": [
+      { "name": "from", "type": "address", "indexed": true },
+      { "name": "to", "type": "address", "indexed": true },
+      { "name": "value", "type": "uint256", "indexed": false }
+    ]
+  }
+]
+'''
+
+[checkpoint]"#,
+        );
+
+    let config = DatalensIndexConfig::from_toml_str(&input).expect("valid inline ABI config");
+
+    assert_eq!(
+        config.decode.abis,
+        vec![DecodeAbiConfig {
+            chain: "ethereum".to_owned(),
+            index: "ormp".to_owned(),
+            dataset: "evm.logs".to_owned(),
+            path: None,
+            json: Some(
+                r#"[
+  {
+    "type": "event",
+    "name": "Transfer",
+    "anonymous": false,
+    "inputs": [
+      { "name": "from", "type": "address", "indexed": true },
+      { "name": "to", "type": "address", "indexed": true },
+      { "name": "value", "type": "uint256", "indexed": false }
+    ]
+  }
+]"#
+                .to_owned()
+            ),
+        }]
     );
 }
 
