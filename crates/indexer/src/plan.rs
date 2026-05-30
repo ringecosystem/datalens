@@ -1,9 +1,10 @@
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::fs;
 
 use crate::{
-    DatalensIndexConfig, DecodeEventConfig, DecodeEventInputConfig, IndexerError,
-    SolanaSelectorConfig, SourceConfig,
+    DatalensIndexConfig, DecodeEventInputConfig, IndexerError, SolanaSelectorConfig, SourceConfig,
+    evm_decode::{DecodeScope, planned_events_from_abi_json},
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -93,6 +94,12 @@ pub struct PlannedDecodeEvent {
     pub signature: String,
     pub topic0: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub chain: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dataset: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub contract: Option<String>,
     pub inputs: Vec<PlannedDecodeEventInput>,
 }
@@ -129,23 +136,51 @@ impl IndexPlanBuilder {
         Ok(IndexPlan {
             application: config.client.application.clone(),
             index: config.index.name.clone(),
-            decode_events: planned_decode_events(&config.decode.events),
+            decode_events: planned_decode_events(config)?,
             tasks,
         })
     }
 }
 
-fn planned_decode_events(events: &[DecodeEventConfig]) -> Vec<PlannedDecodeEvent> {
-    events
+fn planned_decode_events(
+    config: &DatalensIndexConfig,
+) -> Result<Vec<PlannedDecodeEvent>, IndexerError> {
+    if !config.decode.enabled {
+        return Ok(Vec::new());
+    }
+    let mut events = config
+        .decode
+        .events
         .iter()
         .map(|event| PlannedDecodeEvent {
             name: event.name.clone(),
             signature: event.signature.clone(),
             topic0: event.topic0.clone(),
+            chain: event.chain.clone(),
+            index: event.index.clone(),
+            dataset: event.dataset.clone(),
             contract: event.contract.clone(),
             inputs: planned_decode_event_inputs(&event.inputs),
         })
-        .collect()
+        .collect::<Vec<_>>();
+    for abi in &config.decode.abis {
+        let json = match (&abi.path, &abi.json) {
+            (Some(path), None) => fs::read_to_string(path).map_err(|error| {
+                IndexerError::Config(format!("decode.abis path {}: {error}", path.display()))
+            })?,
+            (None, Some(json)) => json.clone(),
+            _ => continue,
+        };
+        events.extend(planned_events_from_abi_json(
+            DecodeScope {
+                chain: abi.chain.clone(),
+                index: abi.index.clone(),
+                dataset: abi.dataset.clone(),
+            },
+            &json,
+        )?);
+    }
+    Ok(events)
 }
 
 fn planned_decode_event_inputs(inputs: &[DecodeEventInputConfig]) -> Vec<PlannedDecodeEventInput> {
