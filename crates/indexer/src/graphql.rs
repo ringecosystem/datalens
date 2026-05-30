@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use async_graphql::{
     Context, EmptyMutation, EmptySubscription, Error, Json, Object, Schema, SimpleObject,
@@ -8,9 +8,12 @@ use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 use axum::{
     Router,
     extract::State,
+    http::{HeaderMap, StatusCode, header},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
+pub use datalens_metrics::IndexerGraphqlMetricLabels;
+use datalens_metrics::{IndexerGraphqlQueryOutcome, MetricsRecorder};
 use serde_json::{Map, Value};
 
 use crate::{IndexerError, QueryableStore, StoreQuery};
@@ -28,15 +31,40 @@ pub fn graphql_schema(store: SharedStore) -> IndexerGraphqlSchema {
 }
 
 pub fn graphql_router(store: SharedStore, path: &str, playground: bool) -> Router {
+    graphql_router_internal(store, path, playground, None)
+}
+
+pub fn graphql_router_with_metrics(
+    store: SharedStore,
+    path: &str,
+    playground: bool,
+    metrics: IndexerGraphqlMetrics,
+) -> Router {
+    graphql_router_internal(store, path, playground, Some(metrics))
+}
+
+fn graphql_router_internal(
+    store: SharedStore,
+    path: &str,
+    playground: bool,
+    metrics: Option<IndexerGraphqlMetrics>,
+) -> Router {
     let schema = graphql_schema(store);
     let mut router = Router::new().route(path, post(graphql_handler));
     if playground {
         let playground_path = format!("{path}/playground");
         router = router.route(&playground_path, get(playground_handler));
     }
+    if let Some(endpoint) = metrics
+        .as_ref()
+        .and_then(|metrics| metrics.endpoint.as_ref())
+    {
+        router = router.route(&endpoint.path, get(metrics_handler));
+    }
     router.with_state(GraphqlState {
         schema,
         endpoint: path.to_owned(),
+        metrics,
     })
 }
 
@@ -44,17 +72,78 @@ pub fn graphql_router(store: SharedStore, path: &str, playground: bool) -> Route
 struct GraphqlState {
     schema: IndexerGraphqlSchema,
     endpoint: String,
+    metrics: Option<IndexerGraphqlMetrics>,
+}
+
+#[derive(Clone)]
+pub struct IndexerGraphqlMetrics {
+    pub recorder: MetricsRecorder,
+    pub labels: IndexerGraphqlMetricLabels,
+    pub endpoint: Option<MetricsEndpointConfig>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetricsEndpointConfig {
+    pub path: String,
+    pub bearer_token: Option<String>,
 }
 
 async fn graphql_handler(
     State(state): State<GraphqlState>,
     request: GraphQLRequest,
 ) -> GraphQLResponse {
-    state.schema.execute(request.into_inner()).await.into()
+    let started = Instant::now();
+    let response = state.schema.execute(request.into_inner()).await;
+    if let Some(metrics) = &state.metrics {
+        let outcome = if response.errors.is_empty() {
+            IndexerGraphqlQueryOutcome::Success
+        } else {
+            IndexerGraphqlQueryOutcome::Error
+        };
+        metrics
+            .recorder
+            .record_indexer_graphql_query(&metrics.labels, outcome);
+        metrics.recorder.observe_indexer_graphql_query_duration(
+            &metrics.labels,
+            started.elapsed().as_secs_f64(),
+        );
+    }
+    response.into()
 }
 
 async fn playground_handler(State(state): State<GraphqlState>) -> Response {
     Html(GraphiQLSource::build().endpoint(&state.endpoint).finish()).into_response()
+}
+
+async fn metrics_handler(State(state): State<GraphqlState>, headers: HeaderMap) -> Response {
+    let Some(metrics) = state.metrics else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if let Some(token) = metrics
+        .endpoint
+        .as_ref()
+        .and_then(|endpoint| endpoint.bearer_token.as_deref())
+        .filter(|token| !token.trim().is_empty())
+        && bearer_token(&headers) != Some(token)
+    {
+        metrics
+            .recorder
+            .record_indexer_graphql_auth_failure(&metrics.labels);
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match metrics.recorder.encode() {
+        Ok(text) => ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], text).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("encode metrics: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    value.strip_prefix("Bearer ")
 }
 
 pub struct QueryRoot;

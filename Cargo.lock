@@ -1649,6 +1649,7 @@ dependencies = [
  "axum",
  "datalens-client",
  "datalens-core",
+ "datalens-metrics",
  "log",
  "parquet",
  "reqwest",
