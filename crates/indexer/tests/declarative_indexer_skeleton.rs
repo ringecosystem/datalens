@@ -7,7 +7,8 @@ use datalens_client::{
 use datalens_core::{DatasetKey, DatasetRows, QueryRows};
 use datalens_indexer::{
     DatalensIndexConfig, IndexCheckpointFileStore, IndexPlanBuilder, IndexRunner,
-    IndexRunnerOptions, OutputSinkConfig, QueryableStore, SqliteOutputStore, StoreQuery,
+    IndexRunnerOptions, OutputSinkConfig, ParquetOutputConfig, QueryableStore, SqliteOutputStore,
+    StoreQuery,
 };
 
 #[test]
@@ -530,6 +531,48 @@ fn test_index_runner_does_not_advance_checkpoint_when_output_write_fails() {
     assert!(
         !checkpoint_path.exists(),
         "checkpoint must not be created after output failure"
+    );
+}
+
+#[test]
+fn test_index_runner_does_not_advance_checkpoint_when_final_parquet_flush_fails() {
+    let config = index_config(10);
+    let plan = IndexPlanBuilder::new().build(&config).unwrap();
+    let checkpoint_path = temp_path("checkpoint-parquet-flush-failure").join("checkpoint.json");
+    let output_root = temp_path("checkpoint-parquet-flush-failure-output").join("file");
+    std::fs::write(&output_root, "not a directory").expect("seed output root file");
+    let transport = QueueTransport::new(vec![HttpResponse::json(
+        200,
+        response_json(10, 12, 1, true),
+    )]);
+    let client = DatalensClient::with_transport(
+        config.client.to_datalens_client_config(),
+        transport.clone(),
+    )
+    .expect("client config");
+    let runner = IndexRunner::new(
+        plan,
+        OutputSinkConfig::Parquet {
+            config: ParquetOutputConfig {
+                path: output_root,
+                max_rows_per_file: Some(100),
+                max_bytes_per_file: None,
+                partition_by: vec![],
+                compression: None,
+            },
+        },
+    )
+    .with_options(IndexRunnerOptions::default().with_checkpoint_path(checkpoint_path.clone()));
+
+    let error = runner.run(&client).expect_err("final parquet flush fails");
+
+    assert!(
+        error.to_string().contains("flush parquet output"),
+        "{error}"
+    );
+    assert!(
+        !checkpoint_path.exists(),
+        "checkpoint must not be created after buffered parquet flush failure"
     );
 }
 

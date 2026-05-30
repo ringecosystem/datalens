@@ -1,7 +1,8 @@
 use std::{
+    collections::BTreeMap,
     fs, io,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -20,44 +21,154 @@ use crate::ParquetOutputConfig;
 use super::{
     IndexedRecord, OutputWriteReceipt, OutputWriteResult,
     event::{EventPosition, NormalizedIndexedEvent, max_position},
+    sink::OutputWriteSink,
 };
 
-pub fn write_records_parquet(
-    config: &ParquetOutputConfig,
-    records: &[IndexedRecord],
-) -> io::Result<OutputWriteResult> {
-    let rows = records
-        .iter()
-        .map(NormalizedIndexedEvent::from_record)
-        .collect::<Vec<_>>();
-    let created_at = created_at_utc();
-    let mut files_written = 0;
-    let mut flushed_rows = 0;
-    let mut highest_position = None;
+pub struct ParquetOutputSink {
+    config: ParquetOutputConfig,
+    buffers: Mutex<BTreeMap<PathBuf, ParquetPartitionBuffer>>,
+}
 
-    for chunk in parquet_chunks(config, &rows) {
-        let chunk_highest = write_chunk(config, chunk, &created_at)?;
-        files_written += 1;
-        flushed_rows += chunk.len();
-        highest_position = max_position(highest_position, chunk_highest);
+impl ParquetOutputSink {
+    pub fn new(config: ParquetOutputConfig) -> Self {
+        Self {
+            config,
+            buffers: Mutex::new(BTreeMap::new()),
+        }
     }
 
-    Ok(OutputWriteResult {
-        written_rows: records.len(),
-        receipt: Some(OutputWriteReceipt {
-            accepted_rows: records.len(),
-            flushed_rows,
-            inserted_rows: records.len(),
-            skipped_or_replaced_rows: 0,
-            files_written,
-            batches_attempted: files_written,
-            batches_delivered: files_written,
-            highest_position: highest_position
-                .clone()
-                .map(|position| position.receipt_key),
-            last_record: highest_position.map(|position| position.receipt_key),
-        }),
-    })
+    fn flush_all_buffers(
+        &self,
+        buffers: &mut BTreeMap<PathBuf, ParquetPartitionBuffer>,
+    ) -> io::Result<ParquetFlushSummary> {
+        let keys = buffers.keys().cloned().collect::<Vec<_>>();
+        self.flush_buffers(buffers, keys)
+    }
+
+    fn flush_buffers(
+        &self,
+        buffers: &mut BTreeMap<PathBuf, ParquetPartitionBuffer>,
+        keys: Vec<PathBuf>,
+    ) -> io::Result<ParquetFlushSummary> {
+        let created_at = created_at_utc();
+        let mut summary = ParquetFlushSummary::default();
+
+        for key in keys {
+            let Some(buffer) = buffers.get(&key) else {
+                continue;
+            };
+            if buffer.rows.is_empty() {
+                continue;
+            }
+            let rows = buffer.rows.clone();
+            let chunk_highest = write_chunk(&self.config, &rows, &created_at)?;
+            summary.files_written += 1;
+            summary.flushed_rows += rows.len();
+            summary.highest_position = max_position(summary.highest_position, chunk_highest);
+            buffers.remove(&key);
+        }
+
+        Ok(summary)
+    }
+}
+
+impl OutputWriteSink for ParquetOutputSink {
+    fn write_records(&self, records: &[IndexedRecord]) -> io::Result<OutputWriteResult> {
+        let rows = records
+            .iter()
+            .map(NormalizedIndexedEvent::from_record)
+            .collect::<Vec<_>>();
+        let mut highest_position = None;
+        let mut flushed_summary = ParquetFlushSummary::default();
+        let mut buffers = self
+            .buffers
+            .lock()
+            .map_err(|error| io::Error::other(format!("parquet buffer lock poisoned: {error}")))?;
+
+        for row in rows {
+            highest_position = max_position(highest_position, row.position.clone());
+            let key = partition_dir(&self.config.path, &self.config.partition_by, &row);
+            let should_flush = {
+                let buffer = buffers.entry(key.clone()).or_default();
+                buffer.push(row);
+                buffer.should_flush(&self.config)
+            };
+            if should_flush {
+                let flush = self.flush_buffers(&mut buffers, vec![key])?;
+                flushed_summary = flushed_summary.merge(flush);
+            }
+        }
+
+        Ok(OutputWriteResult {
+            written_rows: records.len(),
+            receipt: Some(write_receipt(
+                records.len(),
+                records.len(),
+                flushed_summary.flushed_rows,
+                flushed_summary.files_written,
+                highest_position.or(flushed_summary.highest_position),
+            )),
+        })
+    }
+
+    fn flush(&self) -> io::Result<OutputWriteResult> {
+        let mut buffers = self
+            .buffers
+            .lock()
+            .map_err(|error| io::Error::other(format!("parquet buffer lock poisoned: {error}")))?;
+        let flush = self.flush_all_buffers(&mut buffers)?;
+        Ok(OutputWriteResult {
+            written_rows: flush.flushed_rows,
+            receipt: Some(write_receipt(
+                0,
+                0,
+                flush.flushed_rows,
+                flush.files_written,
+                flush.highest_position,
+            )),
+        })
+    }
+
+    fn buffers_records(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Default)]
+struct ParquetPartitionBuffer {
+    rows: Vec<NormalizedIndexedEvent>,
+    estimated_bytes: usize,
+}
+
+impl ParquetPartitionBuffer {
+    fn push(&mut self, row: NormalizedIndexedEvent) {
+        self.estimated_bytes = self
+            .estimated_bytes
+            .saturating_add(estimated_row_bytes(&row));
+        self.rows.push(row);
+    }
+
+    fn should_flush(&self, config: &ParquetOutputConfig) -> bool {
+        let max_rows = max_rows_per_file(config);
+        let max_bytes = max_bytes_per_file(config);
+        self.rows.len() >= max_rows || (self.rows.len() > 1 && self.estimated_bytes >= max_bytes)
+    }
+}
+
+#[derive(Default)]
+struct ParquetFlushSummary {
+    flushed_rows: usize,
+    files_written: usize,
+    highest_position: Option<EventPosition>,
+}
+
+impl ParquetFlushSummary {
+    fn merge(mut self, other: Self) -> Self {
+        self.flushed_rows += other.flushed_rows;
+        self.files_written += other.files_written;
+        self.highest_position = max_position(self.highest_position, other.highest_position);
+        self
+    }
 }
 
 fn write_chunk(
@@ -83,38 +194,6 @@ fn write_chunk(
     Ok(rows.iter().fold(None, |current, row| {
         max_position(current, row.position.clone())
     }))
-}
-
-fn parquet_chunks<'a>(
-    config: &ParquetOutputConfig,
-    rows: &'a [NormalizedIndexedEvent],
-) -> Vec<&'a [NormalizedIndexedEvent]> {
-    if rows.is_empty() {
-        return Vec::new();
-    }
-
-    let max_rows = config.max_rows_per_file.unwrap_or(50_000).max(1);
-    let max_bytes = config
-        .max_bytes_per_file
-        .unwrap_or(128 * 1024 * 1024)
-        .max(1);
-    let mut chunks = Vec::new();
-    let mut start = 0;
-    let mut estimated_bytes = 0;
-
-    for (index, row) in rows.iter().enumerate() {
-        estimated_bytes += estimated_row_bytes(row);
-        let row_count = index + 1 - start;
-        if row_count >= max_rows || (row_count > 1 && estimated_bytes >= max_bytes) {
-            chunks.push(&rows[start..=index]);
-            start = index + 1;
-            estimated_bytes = 0;
-        }
-    }
-    if start < rows.len() {
-        chunks.push(&rows[start..]);
-    }
-    chunks
 }
 
 fn record_batch(rows: &[NormalizedIndexedEvent], created_at: &str) -> io::Result<RecordBatch> {
@@ -273,6 +352,39 @@ fn estimated_row_bytes(row: &NormalizedIndexedEvent) -> usize {
         + row.raw_payload.len()
         + row.finality.as_ref().map(String::len).unwrap_or_default()
         + 96
+}
+
+fn max_rows_per_file(config: &ParquetOutputConfig) -> usize {
+    config.max_rows_per_file.unwrap_or(50_000).max(1)
+}
+
+fn max_bytes_per_file(config: &ParquetOutputConfig) -> usize {
+    config
+        .max_bytes_per_file
+        .unwrap_or(128 * 1024 * 1024)
+        .max(1)
+}
+
+fn write_receipt(
+    accepted_rows: usize,
+    inserted_rows: usize,
+    flushed_rows: usize,
+    files_written: usize,
+    highest_position: Option<EventPosition>,
+) -> OutputWriteReceipt {
+    OutputWriteReceipt {
+        accepted_rows,
+        flushed_rows,
+        inserted_rows,
+        skipped_or_replaced_rows: 0,
+        files_written,
+        batches_attempted: files_written,
+        batches_delivered: files_written,
+        highest_position: highest_position
+            .clone()
+            .map(|position| position.receipt_key),
+        last_record: highest_position.map(|position| position.receipt_key),
+    }
 }
 
 fn created_at_utc() -> String {
