@@ -82,6 +82,7 @@ fn test_webhook_output_capability_is_write_only_idempotent_delivery() {
             max_bytes_per_request: 1_000_000,
             retry: Default::default(),
             idempotency_key_header: Some("Idempotency-Key".to_owned()),
+            outbox: Default::default(),
         },
     };
     let capability = output.capability();

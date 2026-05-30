@@ -316,6 +316,11 @@ kind = "webhook"
 [output.webhook]
 url = "https://hooks.example.invalid/indexed-events?token=webhook-token&batch=evm&signature=webhook-signature"
 
+[output.webhook.outbox]
+enabled = true
+path = ".data/indexes/ormp/webhook-outbox.sqlite"
+max_attempts = 7
+
 [[output.webhook.headers]]
 name = "Authorization"
 value = "Bearer header-token"
@@ -355,6 +360,12 @@ value = "indexer""#,
         "X-Datalens-Source"
     );
     assert_eq!(summary["output"]["webhook"]["headers"][1]["secret"], false);
+    assert_eq!(summary["output"]["webhook"]["outbox"]["enabled"], true);
+    assert_eq!(
+        summary["output"]["webhook"]["outbox"]["path"],
+        ".data/indexes/ormp/webhook-outbox.sqlite"
+    );
+    assert_eq!(summary["output"]["webhook"]["outbox"]["max_attempts"], 7);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);

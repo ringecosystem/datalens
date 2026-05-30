@@ -1,15 +1,19 @@
 use std::{
+    fs,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
+    path::PathBuf,
     thread,
     time::Duration,
 };
 
 use datalens_indexer::{
-    IndexedRecord, OutputSinkConfig, OutputWriteSink, WebhookHeaderConfig, WebhookOutputConfig,
-    WebhookRetryConfig,
+    IndexedRecord, OutputSinkConfig, OutputWriteSink, WebhookHeaderConfig, WebhookOutboxConfig,
+    WebhookOutputConfig, WebhookRetryConfig,
 };
 use serde_json::Value;
+use sqlx::{Row, sqlite::SqliteConnectOptions};
+use tokio::runtime::Runtime;
 
 fn record(block_number: u64, log_index: u64) -> IndexedRecord {
     IndexedRecord {
@@ -188,6 +192,94 @@ fn test_webhook_output_does_not_retry_permanent_4xx_and_redacts_secrets() {
     assert!(!error.contains("abc123"), "{error}");
 }
 
+#[test]
+fn test_webhook_outbox_persists_pending_batch_and_retries_after_reopen() {
+    let outbox_path = temp_path("webhook-outbox-reopen").join("outbox.sqlite");
+    let first_server = MockWebhookServer::start(vec![MockResponse::new(503, "temporary")]);
+    let mut first_sink = webhook_sink(&first_server.endpoint(), 100, Some("Idempotency-Key"));
+    enable_outbox(&mut first_sink, outbox_path.clone(), 2);
+
+    let first = first_sink
+        .write_records(&[record(100, 0)])
+        .expect("persist failed webhook batch");
+    let first_requests = first_server.join();
+    drop(first_sink);
+
+    assert_eq!(first.receipt.expect("receipt").batches_delivered, 0);
+    assert_eq!(
+        outbox_status_counts(&outbox_path),
+        vec![("pending".to_owned(), 1)]
+    );
+
+    let second_server = MockWebhookServer::start(vec![MockResponse::ok()]);
+    let mut second_sink = webhook_sink(&second_server.endpoint(), 100, Some("Idempotency-Key"));
+    enable_outbox(&mut second_sink, outbox_path.clone(), 2);
+
+    let second = second_sink.flush().expect("retry pending webhook batch");
+    assert_eq!(second.receipt.expect("receipt").batches_delivered, 1);
+    let second_requests = second_server.join();
+
+    assert_eq!(
+        outbox_status_counts(&outbox_path),
+        Vec::<(String, i64)>::new()
+    );
+    assert_eq!(first_requests.len(), 1);
+    assert_eq!(second_requests.len(), 1);
+    assert_eq!(
+        first_requests[0].header("idempotency-key"),
+        second_requests[0].header("idempotency-key")
+    );
+}
+
+#[test]
+fn test_webhook_outbox_removes_successfully_delivered_batch() {
+    let outbox_path = temp_path("webhook-outbox-success").join("outbox.sqlite");
+    let server = MockWebhookServer::start(vec![MockResponse::ok()]);
+    let mut sink = webhook_sink(&server.endpoint(), 100, Some("Idempotency-Key"));
+    enable_outbox(&mut sink, outbox_path.clone(), 3);
+
+    sink.write_records(&[record(100, 0)])
+        .expect("deliver webhook batch");
+    let requests = server.join();
+
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        outbox_status_counts(&outbox_path),
+        Vec::<(String, i64)>::new()
+    );
+}
+
+#[test]
+fn test_webhook_outbox_dead_letters_permanent_failure_with_redacted_error() {
+    let outbox_path = temp_path("webhook-outbox-dead-letter").join("outbox.sqlite");
+    let server = MockWebhookServer::start(vec![MockResponse::new(
+        400,
+        "bad secret top-secret-token bearer abc123",
+    )]);
+    let mut sink = webhook_sink(&server.endpoint(), 100, None);
+    if let OutputSinkConfig::Webhook { webhook } = &mut sink {
+        webhook.headers.push(WebhookHeaderConfig {
+            name: "Authorization".to_owned(),
+            value: "Bearer top-secret-token".to_owned(),
+            secret: true,
+        });
+    }
+    enable_outbox(&mut sink, outbox_path.clone(), 3);
+
+    let result = sink
+        .write_records(&[record(100, 0)])
+        .expect("dead-letter permanent webhook failure");
+    let requests = server.join();
+    let dead_letter = outbox_record(&outbox_path).expect("dead-letter record");
+
+    assert_eq!(requests.len(), 1);
+    assert_eq!(result.receipt.expect("receipt").batches_delivered, 0);
+    assert_eq!(dead_letter.status, "dead_letter");
+    assert!(dead_letter.last_error.contains("status 400"));
+    assert!(!dead_letter.last_error.contains("top-secret-token"));
+    assert!(!dead_letter.last_error.contains("abc123"));
+}
+
 fn webhook_sink(
     url: &str,
     max_rows_per_request: usize,
@@ -206,8 +298,80 @@ fn webhook_sink(
             max_bytes_per_request: 1_000_000,
             retry: WebhookRetryConfig::default(),
             idempotency_key_header: idempotency_header.map(str::to_owned),
+            outbox: WebhookOutboxConfig::default(),
         },
     }
+}
+
+fn enable_outbox(sink: &mut OutputSinkConfig, path: PathBuf, max_attempts: usize) {
+    if let OutputSinkConfig::Webhook { webhook } = sink {
+        webhook.retry.initial_backoff_ms = 1;
+        webhook.retry.max_backoff_ms = 1;
+        webhook.retry.max_attempts = 1;
+        webhook.outbox.enabled = true;
+        webhook.outbox.path = Some(path);
+        webhook.outbox.max_attempts = max_attempts;
+    }
+}
+
+fn temp_path(name: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(format!("datalens-{name}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&path);
+    fs::create_dir_all(&path).expect("create temp dir");
+    path
+}
+
+fn outbox_status_counts(path: &std::path::Path) -> Vec<(String, i64)> {
+    with_outbox_runtime(path, |runtime, pool| {
+        runtime.block_on(async {
+            sqlx::query("SELECT status, COUNT(*) AS count FROM webhook_outbox GROUP BY status ORDER BY status")
+                .fetch_all(pool)
+                .await
+                .expect("query outbox")
+                .into_iter()
+                .map(|row| {
+                    (
+                        row.get::<String, _>("status"),
+                        row.get::<i64, _>("count"),
+                    )
+                })
+                .collect()
+        })
+    })
+}
+
+fn outbox_record(path: &std::path::Path) -> Option<OutboxRecord> {
+    with_outbox_runtime(path, |runtime, pool| {
+        runtime.block_on(async {
+            sqlx::query("SELECT status, last_error FROM webhook_outbox LIMIT 1")
+                .fetch_optional(pool)
+                .await
+                .expect("query outbox")
+                .map(|row| OutboxRecord {
+                    status: row.get("status"),
+                    last_error: row.get("last_error"),
+                })
+        })
+    })
+}
+
+fn with_outbox_runtime<T>(
+    path: &std::path::Path,
+    f: impl FnOnce(&Runtime, &sqlx::SqlitePool) -> T,
+) -> T {
+    let runtime = Runtime::new().expect("runtime");
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(false);
+    let pool = runtime
+        .block_on(sqlx::sqlite::SqlitePoolOptions::new().connect_with(options))
+        .expect("connect outbox");
+    f(&runtime, &pool)
+}
+
+struct OutboxRecord {
+    status: String,
+    last_error: String,
 }
 
 struct MockWebhookServer {
