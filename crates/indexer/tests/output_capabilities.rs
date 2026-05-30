@@ -1,4 +1,6 @@
-use datalens_indexer::{OutputConfig, OutputKind, OutputWriteMode};
+use datalens_indexer::{
+    DatabaseDriver, DatabaseOutputConfig, OutputConfig, OutputKind, OutputWriteMode,
+};
 
 #[test]
 fn test_jsonl_output_capability_is_write_only_append_only() {
@@ -12,4 +14,21 @@ fn test_jsonl_output_capability_is_write_only_append_only() {
     assert!(!capability.supports_query);
     assert!(!capability.supports_graphql);
     assert_eq!(capability.write_mode, OutputWriteMode::AppendOnly);
+}
+
+#[test]
+fn test_sqlite_database_output_capability_is_queryable_idempotent() {
+    let output = OutputConfig::Database {
+        database: DatabaseOutputConfig {
+            driver: DatabaseDriver::Sqlite,
+            url: "sqlite:.data/indexes/ormp/index.db".to_owned(),
+        },
+    };
+    let capability = output.capability();
+
+    assert_eq!(capability.kind, OutputKind::Database);
+    assert!(capability.supports_write);
+    assert!(capability.supports_query);
+    assert!(capability.supports_graphql);
+    assert_eq!(capability.write_mode, OutputWriteMode::IdempotentUpsert);
 }

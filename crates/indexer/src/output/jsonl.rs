@@ -32,7 +32,13 @@ pub(super) fn write_records_jsonl(
 
     Ok(OutputWriteResult {
         written_rows: records.len(),
-        receipt: Some(OutputWriteReceipt { last_record }),
+        receipt: Some(OutputWriteReceipt {
+            accepted_rows: records.len(),
+            inserted_rows: records.len(),
+            skipped_or_replaced_rows: 0,
+            highest_position: last_record.clone(),
+            last_record,
+        }),
     })
 }
 

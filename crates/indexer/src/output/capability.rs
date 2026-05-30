@@ -6,12 +6,14 @@ use crate::{OutputConfig, OutputSinkConfig};
 #[serde(rename_all = "snake_case")]
 pub enum OutputKind {
     Jsonl,
+    Database,
 }
 
 impl OutputKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Jsonl => "jsonl",
+            Self::Database => "database",
         }
     }
 }
@@ -42,18 +44,30 @@ impl OutputCapability {
             write_mode: OutputWriteMode::AppendOnly,
         }
     }
+
+    pub const fn database() -> Self {
+        Self {
+            kind: OutputKind::Database,
+            supports_write: true,
+            supports_query: true,
+            supports_graphql: true,
+            write_mode: OutputWriteMode::IdempotentUpsert,
+        }
+    }
 }
 
 impl OutputConfig {
     pub fn kind(&self) -> OutputKind {
         match self {
             Self::Jsonl { .. } => OutputKind::Jsonl,
+            Self::Database { .. } => OutputKind::Database,
         }
     }
 
     pub fn capability(&self) -> OutputCapability {
         match self {
             Self::Jsonl { .. } => OutputCapability::jsonl(),
+            Self::Database { .. } => OutputCapability::database(),
         }
     }
 }
@@ -62,12 +76,14 @@ impl OutputSinkConfig {
     pub fn kind(&self) -> OutputKind {
         match self {
             Self::StdoutJson | Self::FileJson { .. } => OutputKind::Jsonl,
+            Self::DatabaseSqlite { .. } => OutputKind::Database,
         }
     }
 
     pub fn capability(&self) -> OutputCapability {
         match self {
             Self::StdoutJson | Self::FileJson { .. } => OutputCapability::jsonl(),
+            Self::DatabaseSqlite { .. } => OutputCapability::database(),
         }
     }
 }

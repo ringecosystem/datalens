@@ -1,6 +1,6 @@
 use datalens_indexer::{
-    CheckpointPolicy, DatalensIndexConfig, FinalityRequirement, IndexDataset, OutputConfig,
-    QueryServiceConfig, SourceConfig,
+    CheckpointPolicy, DatabaseDriver, DatabaseOutputConfig, DatalensIndexConfig,
+    FinalityRequirement, IndexDataset, OutputConfig, QueryServiceConfig, SourceConfig,
 };
 
 fn valid_config() -> &'static str {
@@ -172,6 +172,46 @@ fn test_parse_rejects_graphql_with_jsonl_output() {
     assert!(error.contains("query.graphql"), "{error}");
     assert!(error.contains("jsonl"), "{error}");
     assert!(error.contains("does not support GraphQL"), "{error}");
+}
+
+#[test]
+fn test_parse_valid_sqlite_database_output_allows_query_service() {
+    let input = valid_config().replace(
+        "[output.jsonl]\npath = \".data/indexes/ormp/events.jsonl\"",
+        "[output]\nkind = \"database\"\n\n[output.database]\ndriver = \"sqlite\"\nurl = \"sqlite:.data/indexes/ormp/index.db\"",
+    )
+    .replace("[checkpoint]", "[query]\nenabled = true\ngraphql = true\n\n[checkpoint]");
+
+    let config = DatalensIndexConfig::from_toml_str(&input).expect("valid database config");
+
+    assert_eq!(
+        config.output,
+        OutputConfig::Database {
+            database: DatabaseOutputConfig {
+                driver: DatabaseDriver::Sqlite,
+                url: "sqlite:.data/indexes/ormp/index.db".to_owned(),
+            },
+        }
+    );
+    assert_eq!(
+        config.query,
+        QueryServiceConfig {
+            enabled: true,
+            graphql: true,
+        }
+    );
+}
+
+#[test]
+fn test_parse_rejects_unsupported_database_driver() {
+    let input = valid_config().replace(
+        "[output.jsonl]\npath = \".data/indexes/ormp/events.jsonl\"",
+        "[output]\nkind = \"database\"\n\n[output.database]\ndriver = \"postgres\"\nurl = \"postgres://localhost/datalens\"",
+    );
+    let error = parse_error(&input);
+
+    assert!(error.contains("output.database.driver"), "{error}");
+    assert!(error.contains("sqlite"), "{error}");
 }
 
 #[test]
