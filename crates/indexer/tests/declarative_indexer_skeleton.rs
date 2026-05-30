@@ -1,32 +1,42 @@
-use datalens_core::{BlockRange, ChainFamily};
-use datalens_indexer::{
-    CheckpointPolicy, DatalensIndexConfig, IndexPlanBuilder, IndexRunner, OutputSinkConfig,
-};
+use datalens_indexer::{DatalensIndexConfig, IndexPlanBuilder, IndexRunner, OutputSinkConfig};
 
 #[test]
-fn test_index_config_builds_plan_with_explicit_responsibilities() {
-    let config = DatalensIndexConfig {
-        application: "ormp-watcher".to_owned(),
-        datalens_endpoint: "http://127.0.0.1:8080".to_owned(),
-        chains: vec![datalens_indexer::IndexChainConfig {
-            name: "ethereum-mainnet".to_owned(),
-            family: ChainFamily::Evm,
-            network: "1".to_owned(),
-        }],
-        queries: vec![datalens_indexer::IndexQueryConfig {
-            name: "message-accepted".to_owned(),
-            chain: "ethereum-mainnet".to_owned(),
-            dataset: "evm.logs".to_owned(),
-            range: BlockRange::expect_new(10, 20),
-        }],
-        output: OutputSinkConfig::StdoutJson,
-        checkpoint: CheckpointPolicy::Disabled,
-    };
+fn test_index_config_builds_empty_plan_without_generating_tasks() {
+    let config = DatalensIndexConfig::from_toml_str(
+        r#"
+[client]
+endpoint = "http://127.0.0.1:3000"
+application = "ormp-watcher"
+token_env = "PATH"
+
+[index]
+name = "ormp"
+dataset = "evm.logs"
+finality = "durable"
+chunk_blocks = 1000
+
+[[sources]]
+chain = "ethereum-mainnet"
+family = "evm"
+chain_id = 1
+from_block = 10
+to_block = 20
+addresses = []
+topics = []
+
+[output.jsonl]
+path = ".data/indexes/ormp/events.jsonl"
+
+[checkpoint]
+path = ".data/indexes/ormp/checkpoint.json"
+"#,
+    )
+    .expect("valid config");
 
     let plan = IndexPlanBuilder::new().build(&config).unwrap();
 
     assert_eq!(plan.application(), "ormp-watcher");
-    assert_eq!(plan.queries().len(), 1);
+    assert!(plan.queries().is_empty());
 }
 
 #[test]
