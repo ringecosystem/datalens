@@ -1,7 +1,8 @@
 use datalens_indexer::{
     CheckpointPolicy, DatabaseDriver, DatabaseOutputConfig, DatalensIndexConfig,
     FinalityRequirement, IndexDataset, OutputConfig, ParquetOutputConfig, QueryProtocol,
-    QueryServiceConfig, SourceConfig, WebhookHeaderConfig, WebhookOutputConfig, WebhookRetryConfig,
+    QueryServiceConfig, SourceConfig, WebhookHeaderConfig, WebhookOutboxConfig,
+    WebhookOutputConfig, WebhookRetryConfig,
 };
 
 fn valid_config() -> &'static str {
@@ -375,6 +376,11 @@ initial_backoff_ms = 25
 max_backoff_ms = 250
 retry_429 = true
 
+[output.webhook.outbox]
+enabled = true
+path = ".data/indexes/ormp/webhook-outbox.sqlite"
+max_attempts = 12
+
 [[output.webhook.headers]]
 name = "Authorization"
 env = "PATH"
@@ -402,6 +408,11 @@ value = "indexer"
                     retry_429: true,
                 },
                 idempotency_key_header: Some("Idempotency-Key".to_owned()),
+                outbox: WebhookOutboxConfig {
+                    enabled: true,
+                    path: Some(".data/indexes/ormp/webhook-outbox.sqlite".into()),
+                    max_attempts: 12,
+                },
                 headers: vec![
                     WebhookHeaderConfig {
                         name: "Authorization".to_owned(),

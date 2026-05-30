@@ -6,7 +6,7 @@ use crate::ParquetOutputConfig;
 
 use super::{
     jsonl::write_records_jsonl, parquet::ParquetOutputSink, postgres::PostgresOutputStore,
-    sqlite::SqliteOutputStore, webhook::write_records_webhook,
+    sqlite::SqliteOutputStore, webhook::WebhookOutputSink,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -93,7 +93,19 @@ impl OutputWriteSink for OutputSinkConfig {
                 }
                 Ok(result)
             }
-            Self::Webhook { webhook } => write_records_webhook(webhook, records),
+            Self::Webhook { webhook } => {
+                WebhookOutputSink::connect(webhook.clone())?.write_records(records)
+            }
+        }
+    }
+
+    fn flush(&self) -> io::Result<OutputWriteResult> {
+        match self {
+            Self::Webhook { webhook } => WebhookOutputSink::connect(webhook.clone())?.flush(),
+            _ => Ok(OutputWriteResult {
+                written_rows: 0,
+                receipt: None,
+            }),
         }
     }
 }
@@ -101,9 +113,8 @@ impl OutputWriteSink for OutputSinkConfig {
 impl OutputSinkConfig {
     pub fn open_write_sink(&self) -> io::Result<Box<dyn OutputWriteSink>> {
         match self {
-            Self::StdoutJson | Self::FileJson { .. } | Self::Webhook { .. } => {
-                Ok(Box::new(self.clone()))
-            }
+            Self::StdoutJson | Self::FileJson { .. } => Ok(Box::new(self.clone())),
+            Self::Webhook { webhook } => Ok(Box::new(WebhookOutputSink::connect(webhook.clone())?)),
             Self::DatabaseSqlite { url } => Ok(Box::new(SqliteOutputStore::connect(url)?)),
             Self::DatabasePostgres { url } => Ok(Box::new(PostgresOutputStore::connect(url)?)),
             Self::Parquet { config } => Ok(Box::new(ParquetOutputSink::new(config.clone()))),
@@ -156,6 +167,23 @@ impl Default for WebhookRetryConfig {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WebhookOutboxConfig {
+    pub enabled: bool,
+    pub path: Option<PathBuf>,
+    pub max_attempts: usize,
+}
+
+impl Default for WebhookOutboxConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: None,
+            max_attempts: 12,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WebhookOutputConfig {
     pub url: String,
     pub headers: Vec<WebhookHeaderConfig>,
@@ -164,4 +192,5 @@ pub struct WebhookOutputConfig {
     pub max_bytes_per_request: usize,
     pub retry: WebhookRetryConfig,
     pub idempotency_key_header: Option<String>,
+    pub outbox: WebhookOutboxConfig,
 }

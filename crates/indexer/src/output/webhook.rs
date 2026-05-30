@@ -8,52 +8,243 @@ use reqwest::{
 use serde::Serialize;
 
 use super::{
-    IndexedRecord, OutputWriteReceipt, OutputWriteResult, WebhookOutputConfig,
+    IndexedRecord, OutputWriteReceipt, OutputWriteResult, OutputWriteSink, WebhookOutputConfig,
     event::{NormalizedIndexedEvent, max_position},
+    webhook_outbox::{WebhookOutboxBatch, WebhookOutboxRecord, WebhookOutboxStore},
 };
 
-pub(super) fn write_records_webhook(
-    config: &WebhookOutputConfig,
-    records: &[IndexedRecord],
-) -> io::Result<OutputWriteResult> {
-    let client = Client::builder()
-        .timeout(Duration::from_millis(config.timeout_ms))
-        .build()
-        .map_err(io::Error::other)?;
-    let headers = request_headers(config)?;
-    let secret_values = config
-        .headers
-        .iter()
-        .filter(|header| header.secret)
-        .map(|header| header.value.as_str())
-        .collect::<Vec<_>>();
-    let batches = build_batches(config, records)?;
-    let mut batches_attempted = 0;
-    let mut batches_delivered = 0;
-    let mut highest_position = None;
+pub struct WebhookOutputSink {
+    config: WebhookOutputConfig,
+    client: Client,
+    headers: HeaderMap,
+    secret_values: Vec<String>,
+    outbox: Option<WebhookOutboxStore>,
+}
 
-    for batch in &batches {
-        let attempts = deliver_batch(
-            &client,
+impl WebhookOutputSink {
+    pub fn connect(config: WebhookOutputConfig) -> io::Result<Self> {
+        let client = Client::builder()
+            .timeout(Duration::from_millis(config.timeout_ms))
+            .build()
+            .map_err(io::Error::other)?;
+        let headers = request_headers(&config)?;
+        let secret_values = config
+            .headers
+            .iter()
+            .filter(|header| header.secret)
+            .map(|header| header.value.clone())
+            .collect::<Vec<_>>();
+        let outbox = if config.outbox.enabled {
+            Some(WebhookOutboxStore::connect(
+                config
+                    .outbox
+                    .path
+                    .as_deref()
+                    .ok_or_else(|| io::Error::other("webhook outbox path is required"))?,
+            )?)
+        } else {
+            None
+        };
+
+        Ok(Self {
             config,
-            &headers,
-            &secret_values,
-            batch,
-            &mut batches_attempted,
-        )?;
-        if attempts > 0 {
-            batches_delivered += 1;
-        }
-        highest_position = max_position(highest_position, batch.highest_position.clone());
+            client,
+            headers,
+            secret_values,
+            outbox,
+        })
     }
 
+    fn write_without_outbox(&self, records: &[IndexedRecord]) -> io::Result<OutputWriteResult> {
+        let batches = build_batches(&self.config, records)?;
+        let mut batches_attempted = 0;
+        let mut batches_delivered = 0;
+        let mut highest_position = None;
+
+        for batch in &batches {
+            let attempts = deliver_batch(
+                &self.client,
+                &self.config,
+                &self.headers,
+                &self.secret_values,
+                batch,
+                &mut batches_attempted,
+            )?;
+            if attempts > 0 {
+                batches_delivered += 1;
+            }
+            highest_position = max_position(highest_position, batch.highest_position.clone());
+        }
+
+        Ok(write_result(
+            records.len(),
+            batches_attempted,
+            batches_delivered,
+            highest_position,
+        ))
+    }
+
+    fn write_with_outbox(&self, records: &[IndexedRecord]) -> io::Result<OutputWriteResult> {
+        let replay = self.flush_outbox()?;
+        let batches = build_batches(&self.config, records)?;
+        let outbox = self.outbox.as_ref().expect("outbox enabled");
+        let mut batches_attempted = replay
+            .receipt
+            .as_ref()
+            .map(|receipt| receipt.batches_attempted)
+            .unwrap_or_default();
+        let mut batches_delivered = replay
+            .receipt
+            .as_ref()
+            .map(|receipt| receipt.batches_delivered)
+            .unwrap_or_default();
+        let mut highest_position = None;
+
+        for batch in &batches {
+            outbox.upsert_pending(self.outbox_batch(batch)?)?;
+            let delivery = self.deliver_outbox_batch(batch)?;
+            batches_attempted += delivery.attempts;
+            if delivery.delivered {
+                batches_delivered += 1;
+            }
+            highest_position = max_position(highest_position, batch.highest_position.clone());
+        }
+
+        Ok(write_result(
+            records.len(),
+            batches_attempted,
+            batches_delivered,
+            highest_position,
+        ))
+    }
+
+    fn flush_outbox(&self) -> io::Result<OutputWriteResult> {
+        let Some(outbox) = &self.outbox else {
+            return Ok(OutputWriteResult {
+                written_rows: 0,
+                receipt: None,
+            });
+        };
+        let records = outbox.pending_records()?;
+        let mut batches_attempted = 0;
+        let mut batches_delivered = 0;
+
+        for record in &records {
+            let delivery = self.deliver_outbox_record(record)?;
+            batches_attempted += delivery.attempts;
+            if delivery.delivered {
+                batches_delivered += 1;
+            }
+        }
+
+        Ok(write_result(0, batches_attempted, batches_delivered, None))
+    }
+
+    fn deliver_outbox_batch(&self, batch: &WebhookBatch) -> io::Result<OutboxDelivery> {
+        let payload = serde_json::to_value(batch.payload()).map_err(io::Error::other)?;
+        self.deliver_outbox_payload(&batch.id, payload)
+    }
+
+    fn deliver_outbox_record(&self, record: &WebhookOutboxRecord) -> io::Result<OutboxDelivery> {
+        self.deliver_outbox_payload(&record.batch_id, record.payload.clone())
+    }
+
+    fn deliver_outbox_payload(
+        &self,
+        batch_id: &str,
+        payload: serde_json::Value,
+    ) -> io::Result<OutboxDelivery> {
+        let outbox = self.outbox.as_ref().expect("outbox enabled");
+        let mut attempts = 0;
+        let mut delivered = false;
+
+        loop {
+            let current_attempts = outbox.attempt_count(batch_id)?;
+            if current_attempts >= self.config.outbox.max_attempts {
+                outbox.mark_dead_letter(batch_id, "webhook delivery attempts exhausted")?;
+                break;
+            }
+
+            attempts += 1;
+            let outcome = send_payload(
+                &self.client,
+                &self.config,
+                &self.headers,
+                batch_id,
+                &payload,
+                &self.secret_values,
+            );
+            outbox.record_attempt(batch_id, outcome.error.as_deref().unwrap_or_default())?;
+            if outcome.delivered {
+                outbox.delete(batch_id)?;
+                delivered = true;
+                break;
+            }
+            if !outcome.retryable {
+                outbox.mark_dead_letter(batch_id, outcome.error.as_deref().unwrap_or_default())?;
+                break;
+            }
+            if attempts >= max_attempts(&self.config) {
+                break;
+            }
+            sleep(backoff(&self.config, attempts));
+        }
+
+        Ok(OutboxDelivery {
+            attempts,
+            delivered,
+        })
+    }
+
+    fn outbox_batch(&self, batch: &WebhookBatch) -> io::Result<WebhookOutboxBatch> {
+        let payload_json = serde_json::to_string(&batch.payload()).map_err(io::Error::other)?;
+        let header_names = self
+            .config
+            .headers
+            .iter()
+            .map(|header| HeaderReference {
+                name: header.name.clone(),
+                secret: header.secret,
+            })
+            .collect::<Vec<_>>();
+        let header_names_json = serde_json::to_string(&header_names).map_err(io::Error::other)?;
+        Ok(WebhookOutboxBatch {
+            batch_id: batch.id.clone(),
+            idempotency_key: batch.id.clone(),
+            endpoint_url: redact_url(&self.config.url),
+            header_names_json,
+            payload_json,
+        })
+    }
+}
+
+impl OutputWriteSink for WebhookOutputSink {
+    fn write_records(&self, records: &[IndexedRecord]) -> io::Result<OutputWriteResult> {
+        if self.outbox.is_some() {
+            self.write_with_outbox(records)
+        } else {
+            self.write_without_outbox(records)
+        }
+    }
+
+    fn flush(&self) -> io::Result<OutputWriteResult> {
+        self.flush_outbox()
+    }
+}
+
+fn write_result(
+    written_rows: usize,
+    batches_attempted: usize,
+    batches_delivered: usize,
+    highest_position: Option<super::event::EventPosition>,
+) -> OutputWriteResult {
     let highest_position = highest_position.map(|position| position.receipt_key);
-    Ok(OutputWriteResult {
-        written_rows: records.len(),
+    OutputWriteResult {
+        written_rows,
         receipt: Some(OutputWriteReceipt {
-            accepted_rows: records.len(),
-            flushed_rows: records.len(),
-            inserted_rows: records.len(),
+            accepted_rows: written_rows,
+            flushed_rows: written_rows,
+            inserted_rows: written_rows,
             skipped_or_replaced_rows: 0,
             files_written: 0,
             batches_attempted,
@@ -61,7 +252,7 @@ pub(super) fn write_records_webhook(
             highest_position: highest_position.clone(),
             last_record: highest_position,
         }),
-    })
+    }
 }
 
 fn request_headers(config: &WebhookOutputConfig) -> io::Result<HeaderMap> {
@@ -111,7 +302,7 @@ fn deliver_batch(
     client: &Client,
     config: &WebhookOutputConfig,
     headers: &HeaderMap,
-    secret_values: &[&str],
+    secret_values: &[String],
     batch: &WebhookBatch,
     batches_attempted: &mut usize,
 ) -> io::Result<usize> {
@@ -178,7 +369,7 @@ fn backoff(config: &WebhookOutputConfig, attempts: usize) -> Duration {
     Duration::from_millis(millis)
 }
 
-fn sanitize(value: &str, secret_values: &[&str]) -> String {
+fn sanitize(value: &str, secret_values: &[String]) -> String {
     let mut sanitized = value.to_owned();
     for secret in secret_values {
         if !secret.is_empty() {
@@ -209,6 +400,76 @@ fn redact_bearer_tokens(value: &str) -> String {
             .unwrap_or(rest.len());
         rest = &rest[token_end..];
     }
+}
+
+#[derive(Serialize)]
+struct HeaderReference {
+    name: String,
+    secret: bool,
+}
+
+struct OutboxDelivery {
+    attempts: usize,
+    delivered: bool,
+}
+
+struct DeliveryOutcome {
+    delivered: bool,
+    retryable: bool,
+    error: Option<String>,
+}
+
+fn send_payload(
+    client: &Client,
+    config: &WebhookOutputConfig,
+    headers: &HeaderMap,
+    batch_id: &str,
+    payload: &serde_json::Value,
+    secret_values: &[String],
+) -> DeliveryOutcome {
+    let mut request = client
+        .post(&config.url)
+        .headers(headers.clone())
+        .json(payload);
+    if let Some(header) = &config.idempotency_key_header {
+        request = request.header(header, batch_id);
+    }
+
+    match request.send() {
+        Ok(response) if response.status().is_success() => DeliveryOutcome {
+            delivered: true,
+            retryable: false,
+            error: None,
+        },
+        Ok(response) => {
+            let status = response.status();
+            let body = response.text().unwrap_or_default();
+            DeliveryOutcome {
+                delivered: false,
+                retryable: is_retryable_status(status, config),
+                error: Some(format!(
+                    "webhook delivery failed with status {}: {}",
+                    status.as_u16(),
+                    sanitize(&body, secret_values)
+                )),
+            }
+        }
+        Err(error) => DeliveryOutcome {
+            delivered: false,
+            retryable: is_retryable_error(&error),
+            error: Some(format!(
+                "webhook delivery failed: {}",
+                sanitize(&error.to_string(), secret_values)
+            )),
+        },
+    }
+}
+
+fn redact_url(url: &str) -> String {
+    let Some((base, _)) = url.split_once('?') else {
+        return url.to_owned();
+    };
+    format!("{base}?<redacted>")
 }
 
 #[derive(Clone)]
