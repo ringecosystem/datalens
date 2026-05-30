@@ -163,6 +163,15 @@ pub enum DatabaseDriver {
     Postgres,
 }
 
+impl DatabaseDriver {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Sqlite => "sqlite",
+            Self::Postgres => "postgres",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryServiceConfig {
     pub enabled: bool,
