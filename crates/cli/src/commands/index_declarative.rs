@@ -101,11 +101,48 @@ fn declarative_source_summary(source: &SourceConfig) -> serde_json::Value {
             "chain": source.chain,
             "family": "evm",
             "chain_id": source.chain_id,
+            "dataset": "evm.logs",
             "from_block": source.from_block,
             "to_block": source.to_block,
             "addresses": source.addresses.len(),
             "topics": source.topics.len(),
         }),
+        SourceConfig::Solana(source) => serde_json::json!({
+            "chain": source.chain,
+            "family": "solana",
+            "network_id": source.network_id,
+            "dataset": index_dataset_name(source.dataset),
+            "from_slot": source.from_slot,
+            "to_slot": source.to_slot,
+            "selector": solana_selector_summary(&source.selector),
+        }),
+        SourceConfig::Tron(source) => serde_json::json!({
+            "chain": source.chain,
+            "family": "tron",
+            "chain_id": source.chain_id,
+            "dataset": index_dataset_name(source.dataset),
+            "from_block": source.from_block,
+            "to_block": source.to_block,
+            "contracts": source.contracts.len(),
+            "events": source.events.len(),
+        }),
+    }
+}
+
+fn solana_selector_summary(selector: &datalens_indexer::SolanaSelectorConfig) -> serde_json::Value {
+    match selector {
+        datalens_indexer::SolanaSelectorConfig::All => {
+            serde_json::json!({ "kind": "all", "values": 0 })
+        }
+        datalens_indexer::SolanaSelectorConfig::Address(_) => {
+            serde_json::json!({ "kind": "address", "values": 1 })
+        }
+        datalens_indexer::SolanaSelectorConfig::Program(_) => {
+            serde_json::json!({ "kind": "program", "values": 1 })
+        }
+        datalens_indexer::SolanaSelectorConfig::Signature(_) => {
+            serde_json::json!({ "kind": "signature", "values": 1 })
+        }
     }
 }
 
@@ -203,6 +240,10 @@ fn declarative_checkpoint_summary(checkpoint: &CheckpointPolicy) -> serde_json::
 fn index_dataset_name(dataset: IndexDataset) -> &'static str {
     match dataset {
         IndexDataset::EvmLogs => "evm.logs",
+        IndexDataset::SolanaTransactions => "solana.transactions",
+        IndexDataset::SolanaInstructions => "solana.instructions",
+        IndexDataset::SolanaAccountUpdates => "solana.account_updates",
+        IndexDataset::TronEvents => "tron.events",
     }
 }
 

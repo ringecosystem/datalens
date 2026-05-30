@@ -1,7 +1,7 @@
 use datalens_client::{DatalensClient, HttpTransport};
 use datalens_core::{
-    BlockRange, ChainFamily, ChainIdentity, DatasetKey, LedgerRange, LedgerRangeKind, LogFilter,
-    NetworkId, QueryFinalityRequirement, QueryRows, missing_ranges,
+    ChainFamily, ChainIdentity, DatasetKey, LedgerRange, LedgerRangeKind, LogFilter, NetworkId,
+    QueryFinalityRequirement, QueryRows, missing_ranges,
 };
 use serde::Serialize;
 use std::{collections::BTreeMap, path::PathBuf, time::Instant};
@@ -69,37 +69,18 @@ impl IndexRunner {
                 continue;
             }
 
-            let range = LedgerRange::blocks(range.start, range.end)
+            let range = task_ledger_range(task, range.start, range.end)?;
+            let chain = task_chain_identity(task)?;
+            let dataset_key = DatasetKey::parse(&task.dataset)
                 .map_err(|error| IndexerError::Runner(error.to_string()))?;
-            let block_range = BlockRange::try_new(range.start(), range.end())
-                .map_err(|error| IndexerError::Runner(error.to_string()))?;
-            let chain = ChainIdentity::try_new(
-                ChainFamily::Evm,
-                task.chain.clone(),
-                Some(NetworkId::numeric(task.chain_id)),
-            )
-            .map_err(|error| IndexerError::Runner(error.to_string()))?;
-            let filter = LogFilter {
-                addresses: task.selector.addresses.clone(),
-                topics: task
-                    .selector
-                    .topics
-                    .iter()
-                    .cloned()
-                    .map(|topic| Some(vec![topic]))
-                    .collect(),
-            };
+            let selector = task_query_selector(task)?;
             let started = Instant::now();
             let response = client
                 .query(
-                    datalens_client::QueryRequest::new(
-                        chain,
-                        DatasetKey::evm_logs(),
-                        LedgerRange::from_block_range(block_range),
-                    )
-                    .with_selector(datalens_client::QuerySelector::EvmLogs(filter))
-                    .with_finality(QueryFinalityRequirement::DurableOnly)
-                    .with_fields(datalens_client::FieldSelection::All),
+                    datalens_client::QueryRequest::new(chain, dataset_key, range.clone())
+                        .with_selector(selector)
+                        .with_finality(QueryFinalityRequirement::DurableOnly)
+                        .with_fields(datalens_client::FieldSelection::All),
                 )
                 .map_err(|error| {
                     IndexerError::Runner(format!("task {} failed: {error}", task.label))
@@ -111,13 +92,30 @@ impl IndexRunner {
                     && response.cache.missing_ranges.is_empty();
             match response.rows.rows() {
                 QueryRows::EvmLogs(rows) => {
-                    let records = evm_log_records(
-                        self.plan.index(),
-                        &task.chain,
-                        task.chain_id,
-                        &task.dataset,
-                        rows,
-                    );
+                    let records = evm_log_records(self.plan.index(), task, rows);
+                    if output_sink.is_none() {
+                        let sink = self.output.open_write_sink().map_err(|error| {
+                            let output_kind = self.output.capability().kind.as_str();
+                            IndexerError::Runner(format!(
+                                "failed to open {output_kind} output: {error}"
+                            ))
+                        })?;
+                        output_buffers_records = sink.buffers_records();
+                        output_sink = Some(sink);
+                    }
+                    let output_sink = output_sink.as_ref().expect("output sink was opened");
+                    output_sink.write_records(&records).map_err(|error| {
+                        let output_kind = self.output.capability().kind.as_str();
+                        IndexerError::Runner(format!(
+                            "task {} failed to write {output_kind} output: {error}",
+                            task.label
+                        ))
+                    })?;
+                }
+                QueryRows::AdapterJson { dataset_key, rows }
+                    if dataset_key.as_str() == task.dataset =>
+                {
+                    let records = adapter_json_records(self.plan.index(), task, rows);
                     if output_sink.is_none() {
                         let sink = self.output.open_write_sink().map_err(|error| {
                             let output_kind = self.output.capability().kind.as_str();
@@ -217,17 +215,15 @@ impl IndexRunner {
 
 fn evm_log_records(
     index: &str,
-    chain: &str,
-    chain_id: u64,
-    dataset: &str,
+    task: &PlannedIndexTask,
     rows: &[datalens_core::LogRecord],
 ) -> Vec<IndexedRecord> {
     rows.iter()
         .map(|row| IndexedRecord {
             index: index.to_owned(),
-            chain: chain.to_owned(),
-            chain_id,
-            dataset: dataset.to_owned(),
+            chain: task.chain.to_owned(),
+            chain_id: task.chain_id,
+            dataset: task.dataset.to_owned(),
             payload: serde_json::json!({
                 "block_number": row.block_number,
                 "block_hash": row.block_hash,
@@ -241,6 +237,175 @@ fn evm_log_records(
             }),
         })
         .collect()
+}
+
+fn adapter_json_records(
+    index: &str,
+    task: &PlannedIndexTask,
+    rows: &[serde_json::Value],
+) -> Vec<IndexedRecord> {
+    rows.iter()
+        .map(|row| IndexedRecord {
+            index: index.to_owned(),
+            chain: task.chain.to_owned(),
+            chain_id: task.chain_id,
+            dataset: task.dataset.to_owned(),
+            payload: generic_payload(task, row),
+        })
+        .collect()
+}
+
+fn generic_payload(task: &PlannedIndexTask, row: &serde_json::Value) -> serde_json::Value {
+    let position_value = row
+        .get("slot")
+        .or_else(|| row.get("block_number"))
+        .or_else(|| row.get("height"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(task.range.start);
+    let position_kind = if row.get("slot").is_some() {
+        "slot"
+    } else if row.get("height").is_some() {
+        "height"
+    } else {
+        task.range.kind.as_str()
+    };
+    let transaction_id = row
+        .get("transaction_hash")
+        .or_else(|| row.get("transaction_id"))
+        .or_else(|| row.get("signature"))
+        .and_then(serde_json::Value::as_str);
+    let event_id = row
+        .get("event_index")
+        .or_else(|| row.get("log_index"))
+        .and_then(serde_json::Value::as_u64);
+
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "chain_family".to_owned(),
+        serde_json::Value::String(task.family.clone()),
+    );
+    if let Some(network_id) = &task.network_id {
+        payload.insert(
+            "network_id".to_owned(),
+            serde_json::Value::String(network_id.clone()),
+        );
+    }
+    payload.insert(
+        "position".to_owned(),
+        serde_json::json!({ "kind": position_kind, "value": position_value }),
+    );
+    if let Some(transaction_id) = transaction_id {
+        payload.insert(
+            "transaction_id".to_owned(),
+            serde_json::Value::String(transaction_id.to_owned()),
+        );
+    }
+    if let Some(signature) = row.get("signature").and_then(serde_json::Value::as_str) {
+        payload.insert(
+            "signature".to_owned(),
+            serde_json::Value::String(signature.to_owned()),
+        );
+    }
+    if let Some(event_id) = event_id {
+        payload.insert("event_id".to_owned(), serde_json::Value::from(event_id));
+    }
+    payload.insert("selector".to_owned(), selector_metadata(task));
+    payload.insert(
+        "finality".to_owned(),
+        serde_json::Value::String(task.finality.clone()),
+    );
+    payload.insert("raw".to_owned(), row.clone());
+    serde_json::Value::Object(payload)
+}
+
+fn task_ledger_range(
+    task: &PlannedIndexTask,
+    start: u64,
+    end: u64,
+) -> Result<LedgerRange, IndexerError> {
+    match task.range.kind.as_str() {
+        "block" => LedgerRange::blocks(start, end),
+        "slot" => LedgerRange::slots(start, end),
+        "height" => LedgerRange::heights(start, end),
+        value => LedgerRange::try_new(LedgerRangeKind::Other(value.to_owned()), start, end),
+    }
+    .map_err(|error| IndexerError::Runner(error.to_string()))
+}
+
+fn task_chain_identity(task: &PlannedIndexTask) -> Result<ChainIdentity, IndexerError> {
+    let family = match task.family.as_str() {
+        "evm" => ChainFamily::Evm,
+        value => ChainFamily::Other(value.to_owned()),
+    };
+    let network_id = if let Some(network_id) = &task.network_id {
+        Some(
+            NetworkId::textual(network_id.clone())
+                .map_err(|error| IndexerError::Runner(error.to_string()))?,
+        )
+    } else if task.chain_id == 0 {
+        None
+    } else {
+        Some(NetworkId::numeric(task.chain_id))
+    };
+    ChainIdentity::try_new(family, task.chain.clone(), network_id)
+        .map_err(|error| IndexerError::Runner(error.to_string()))
+}
+
+fn task_query_selector(
+    task: &PlannedIndexTask,
+) -> Result<datalens_client::QuerySelector, IndexerError> {
+    match task.selector.kind.as_str() {
+        "evm_logs" => Ok(datalens_client::QuerySelector::EvmLogs(LogFilter {
+            addresses: task.selector.addresses.clone(),
+            topics: task
+                .selector
+                .topics
+                .iter()
+                .cloned()
+                .map(|topic| Some(vec![topic]))
+                .collect(),
+        })),
+        "solana_all" => Ok(datalens_client::QuerySelector::solana_all()),
+        "solana_address" => datalens_client::QuerySelector::solana_address(
+            task.selector
+                .values
+                .first()
+                .map(String::as_str)
+                .unwrap_or_default(),
+        ),
+        "solana_program" => datalens_client::QuerySelector::solana_program(
+            task.selector
+                .values
+                .first()
+                .map(String::as_str)
+                .unwrap_or_default(),
+        ),
+        "solana_signature" => datalens_client::QuerySelector::solana_signature(
+            task.selector
+                .values
+                .first()
+                .map(String::as_str)
+                .unwrap_or_default(),
+        ),
+        "tron_events" => {
+            datalens_client::QuerySelector::tron_event(datalens_client::TronEventSelector {
+                contract_addresses: task.selector.addresses.clone(),
+                event_names: task.selector.topics.clone(),
+            })
+        }
+        value => Err(datalens_client::ClientError::InvalidInput(format!(
+            "unsupported selector kind {value}"
+        ))),
+    }
+    .map_err(|error| IndexerError::Runner(error.to_string()))
+}
+
+fn selector_metadata(task: &PlannedIndexTask) -> serde_json::Value {
+    serde_json::json!({
+        "kind": task.selector.kind,
+        "fingerprint": task.selector.fingerprint,
+        "canonical_key": task.selector.canonical_key,
+    })
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
