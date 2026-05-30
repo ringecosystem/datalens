@@ -11,7 +11,7 @@ RUN cargo build --locked --release --package datalens-cli
 FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system datalens \
     && useradd --system --gid datalens --home-dir /var/lib/datalens datalens \

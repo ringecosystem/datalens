@@ -1,0 +1,88 @@
+[server]
+bind = "0.0.0.0:3000"
+
+[storage]
+backend = "s3"
+
+[storage.s3]
+bucket = "${DATALENS_S3_BUCKET}"
+prefix = "${DATALENS_S3_PREFIX}"
+region = "${DATALENS_S3_REGION}"
+endpoint_url = "${DATALENS_S3_ENDPOINT_URL}"
+force_path_style = true
+
+[planner]
+max_query_range_blocks = 100000
+default_chunk_range_blocks = 10000
+
+[writer]
+target_object_bytes = 16777216
+min_object_rows = 1
+record_empty_coverage = true
+
+[writer.staging]
+enabled = true
+min_rows = 1000
+target_object_bytes = 16777216
+max_staged_ranges = 32
+max_staged_rows = 10000
+max_staged_age_ms = 60000
+flush_on_shutdown = true
+max_staged_bytes = 33554432
+
+[metrics]
+enabled = true
+default_application = "local-compose"
+
+[edge.graphql]
+enabled = true
+playground_enabled = true
+
+[edge.metrics]
+bearer_token = "${DATALENS_METRICS_TOKEN}"
+
+[warmup]
+enabled = false
+registry_path = "indexes/warmup"
+scheduler_interval_ms = 1000
+max_global_tasks = 1
+max_per_chain_tasks = 1
+max_fetches_per_loop = 1
+flush_on_shutdown = true
+
+[applications]
+required = true
+
+[[applications.applications]]
+id = "ormp"
+name = "ormp"
+enabled = true
+display_name = "ORMP Local Example"
+token = "${DATALENS_ORMP_TOKEN}"
+chains = ["ethereum"]
+datasets = ["evm.blocks", "evm.logs"]
+operations = ["query", "discovery"]
+
+[applications.applications.quota]
+max_query_range_blocks = 10000
+max_requests_per_minute = 120
+max_concurrent_requests = 8
+
+[chains.ethereum]
+kind = "evm"
+chain_id = 1
+rpc_urls = ["${DATALENS_ETHEREUM_RPC_URL}"]
+
+[chains.ethereum.finality]
+mode = "lag"
+safe_lag_blocks = 32
+finalized_lag_blocks = 96
+
+[chains.ethereum.datasets.blocks]
+enabled = true
+max_batch_blocks = 1000
+
+[chains.ethereum.datasets.logs]
+enabled = true
+max_get_logs_range_blocks = 10000
+max_addresses_per_query = 32
