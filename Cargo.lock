@@ -1586,6 +1586,7 @@ dependencies = [
 name = "datalens-example-ormp"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "datalens-client",
  "datalens-core",
  "serde",

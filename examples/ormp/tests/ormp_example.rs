@@ -9,8 +9,8 @@ use datalens_core::{
     QueryFinalityRequirement, QueryRows,
 };
 use datalens_example_ormp::{
-    MSGPORT_ADDRESS, ORMP_ADDRESS, OrmpConfig, build_query_request, query_with_client,
-    summarize_response,
+    MSGPORT_ADDRESS, ORMP_ADDRESS, ORMP_START_BLOCK, OrmpConfig, build_query_request,
+    query_with_client, summarize_response,
 };
 
 #[test]
@@ -75,6 +75,63 @@ fn test_query_with_client_passes_application_auth_headers() {
         Some("Bearer public-token")
     );
     assert_eq!(request.path, "/v1/query");
+}
+
+#[test]
+fn test_config_from_pairs_uses_smoke_defaults_and_optional_token() {
+    let config = OrmpConfig::from_pairs([
+        ("ORMP_TO_BLOCK", "20009600"),
+        ("DATALENS_PUBLIC_APP_TOKEN", " public-token "),
+    ])
+    .expect("config");
+
+    assert_eq!(config.endpoint, "http://127.0.0.1:3000");
+    assert_eq!(config.application, "public");
+    assert_eq!(config.bearer_token, Some("public-token".to_owned()));
+    assert_eq!(config.from_block, ORMP_START_BLOCK);
+    assert_eq!(config.to_block, 20009600);
+}
+
+#[test]
+fn test_config_from_pairs_allows_explicit_values() {
+    let config = OrmpConfig::from_pairs([
+        ("DATALENS_ENDPOINT", " http://datalens.invalid "),
+        ("DATALENS_APPLICATION", " smoke "),
+        ("ORMP_FROM_BLOCK", "20009595"),
+        ("ORMP_TO_BLOCK", "20009600"),
+    ])
+    .expect("config");
+
+    assert_eq!(config.endpoint, "http://datalens.invalid");
+    assert_eq!(config.application, "smoke");
+    assert_eq!(config.bearer_token, None);
+    assert_eq!(config.from_block, 20009595);
+    assert_eq!(config.to_block, 20009600);
+}
+
+#[test]
+fn test_config_from_pairs_requires_to_block() {
+    let error = OrmpConfig::from_pairs([]).expect_err("missing to block");
+
+    assert_eq!(
+        error.to_string(),
+        "missing required environment variable ORMP_TO_BLOCK"
+    );
+}
+
+#[test]
+fn test_cli_help_exits_successfully_without_env() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_datalens-example-ormp"))
+        .arg("--help")
+        .env_clear()
+        .output()
+        .expect("help command");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    assert!(stdout.contains("ORMP_TO_BLOCK"));
+    assert!(stdout.contains("http://127.0.0.1:3000"));
+    assert!(stdout.contains("20009590"));
 }
 
 #[test]

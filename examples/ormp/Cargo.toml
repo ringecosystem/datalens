@@ -5,6 +5,7 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
+clap.workspace = true
 datalens-client = { path = "../../crates/client" }
 datalens-core = { path = "../../crates/core" }
 serde = { workspace = true }
