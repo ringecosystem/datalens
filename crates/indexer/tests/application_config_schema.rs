@@ -1,8 +1,9 @@
 use datalens_indexer::{
-    CheckpointPolicy, DatabaseDriver, DatabaseOutputConfig, DatalensIndexConfig,
-    FinalityRequirement, IndexDataset, MetricsServiceConfig, OutputConfig, ParquetOutputConfig,
-    QueryProtocol, QueryServiceConfig, SourceConfig, WebhookHeaderConfig, WebhookOutboxConfig,
-    WebhookOutputConfig, WebhookRetryConfig,
+    CheckpointPolicy, DatabaseDriver, DatabaseOutputConfig, DatalensIndexConfig, DecodeConfig,
+    DecodeEventConfig, DecodeEventInputConfig, FinalityRequirement, IndexDataset,
+    MetricsServiceConfig, OutputConfig, ParquetOutputConfig, QueryProtocol, QueryServiceConfig,
+    SourceConfig, WebhookHeaderConfig, WebhookOutboxConfig, WebhookOutputConfig,
+    WebhookRetryConfig,
 };
 
 fn valid_config() -> &'static str {
@@ -381,6 +382,66 @@ fn test_parse_valid_sqlite_database_output_allows_query_service() {
             path: "/query".to_owned(),
             playground: true,
             metrics: MetricsServiceConfig::default(),
+        }
+    );
+}
+
+#[test]
+fn test_parse_evm_decode_config_returns_minimal_event_abi_fragments() {
+    let input = valid_config()
+        .replace(
+            "[output.jsonl]\npath = \".data/indexes/ormp/events.jsonl\"",
+            "[output]\nkind = \"database\"\n\n[output.database]\ndriver = \"sqlite\"\nurl = \"sqlite:.data/indexes/ormp/index.db\"",
+        )
+        .replace(
+            "[checkpoint]",
+            r#"[decode]
+enabled = true
+
+[[decode.events]]
+name = "MessageAccepted"
+signature = "MessageAccepted(bytes32,uint256,address,address)"
+topic0 = "0x9e6c1c44f7b2b36245897f9be35a5500f3a9e0d5b8f29f89dbf04b54053bb7d1"
+contract = "ormp"
+
+[[decode.events.inputs]]
+name = "msgHash"
+kind = "bytes32"
+indexed = true
+
+[[decode.events.inputs]]
+name = "fromChainId"
+kind = "uint256"
+indexed = false
+
+[checkpoint]"#,
+        );
+
+    let config = DatalensIndexConfig::from_toml_str(&input).expect("valid decode config");
+
+    assert_eq!(
+        config.decode,
+        DecodeConfig {
+            enabled: true,
+            events: vec![DecodeEventConfig {
+                name: "MessageAccepted".to_owned(),
+                signature: "MessageAccepted(bytes32,uint256,address,address)".to_owned(),
+                topic0: "0x9e6c1c44f7b2b36245897f9be35a5500f3a9e0d5b8f29f89dbf04b54053bb7d1"
+                    .to_owned(),
+                contract: Some("ormp".to_owned()),
+                inputs: vec![
+                    DecodeEventInputConfig {
+                        name: "msgHash".to_owned(),
+                        kind: "bytes32".to_owned(),
+                        indexed: true,
+                    },
+                    DecodeEventInputConfig {
+                        name: "fromChainId".to_owned(),
+                        kind: "uint256".to_owned(),
+                        indexed: false,
+                    },
+                ],
+            }],
         }
     );
 }

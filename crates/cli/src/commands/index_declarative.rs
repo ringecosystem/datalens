@@ -92,8 +92,24 @@ fn declarative_index_summary(config: &DatalensIndexConfig) -> serde_json::Value 
         "chunk_blocks": config.index.chunk_blocks,
         "source_count": config.sources.len(),
         "sources": config.sources.iter().map(declarative_source_summary).collect::<Vec<_>>(),
+        "decode": declarative_decode_summary(&config.decode),
         "output": declarative_output_summary(&config.output),
         "checkpoint": declarative_checkpoint_summary(&config.checkpoint),
+    })
+}
+
+fn declarative_decode_summary(decode: &datalens_indexer::DecodeConfig) -> serde_json::Value {
+    serde_json::json!({
+        "enabled": decode.enabled,
+        "events": decode.events.iter().map(|event| {
+            serde_json::json!({
+                "name": event.name,
+                "signature": event.signature,
+                "topic0": event.topic0,
+                "contract": event.contract,
+                "inputs": event.inputs.len(),
+            })
+        }).collect::<Vec<_>>(),
     })
 }
 

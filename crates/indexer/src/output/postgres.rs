@@ -54,6 +54,7 @@ impl PostgresOutputStore {
                         selector TEXT,
                         topics_json TEXT,
                         signature TEXT,
+                        event_name TEXT,
                         data_payload TEXT,
                         raw_payload TEXT NOT NULL,
                         removed BIGINT,
@@ -66,6 +67,7 @@ impl PostgresOutputStore {
                 )
                 .execute(&self.pool)
                 .await?;
+                ensure_event_name_column_postgres(&self.pool).await?;
                 for statement in INDEX_STATEMENTS {
                     sqlx::query(*statement).execute(&self.pool).await?;
                 }
@@ -73,6 +75,13 @@ impl PostgresOutputStore {
             })
             .map_err(io::Error::other)
     }
+}
+
+async fn ensure_event_name_column_postgres(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query("ALTER TABLE indexed_events ADD COLUMN IF NOT EXISTS event_name TEXT")
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 impl OutputWriteSink for PostgresOutputStore {
@@ -99,6 +108,7 @@ const INDEX_STATEMENTS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_indexed_events_pg_block_range ON indexed_events(chain_identity, dataset, block_number)",
     "CREATE INDEX IF NOT EXISTS idx_indexed_events_pg_transaction ON indexed_events(transaction_hash)",
     "CREATE INDEX IF NOT EXISTS idx_indexed_events_pg_signature ON indexed_events(signature)",
+    "CREATE INDEX IF NOT EXISTS idx_indexed_events_pg_event_name ON indexed_events(event_name)",
     "CREATE INDEX IF NOT EXISTS idx_indexed_events_pg_ordering ON indexed_events(chain_identity, dataset, block_number, transaction_index, event_index)",
 ];
 
@@ -160,12 +170,13 @@ async fn insert_record(
             selector,
             topics_json,
             signature,
+            event_name,
             data_payload,
             raw_payload,
             removed,
             finality
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
         ON CONFLICT (unique_key) DO NOTHING
         "#,
     )
@@ -184,6 +195,7 @@ async fn insert_record(
     .bind(&row.selector)
     .bind(&row.topics_json)
     .bind(&row.signature)
+    .bind(&row.event_name)
     .bind(&row.data_payload)
     .bind(&row.raw_payload)
     .bind(row.removed)
@@ -225,6 +237,9 @@ async fn query_records_postgres(
     }
     if let Some(signature) = filter.signature {
         builder.push(" AND signature = ").push_bind(signature);
+    }
+    if let Some(event_name) = filter.event_name {
+        builder.push(" AND event_name = ").push_bind(event_name);
     }
     if let Some(topic0) = filter.topic0 {
         builder

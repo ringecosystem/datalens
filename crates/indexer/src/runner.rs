@@ -8,7 +8,7 @@ use std::{collections::BTreeMap, path::PathBuf, time::Instant};
 
 use crate::{
     CheckpointPolicy, IndexCheckpointFile, IndexCheckpointFileStore, IndexPlan, IndexedRecord,
-    IndexerError, OutputSinkConfig, OutputWriteSink, PlannedIndexTask,
+    IndexerError, OutputSinkConfig, OutputWriteSink, PlannedDecodeEvent, PlannedIndexTask,
 };
 
 #[derive(Clone)]
@@ -92,7 +92,8 @@ impl IndexRunner {
                     && response.cache.missing_ranges.is_empty();
             match response.rows.rows() {
                 QueryRows::EvmLogs(rows) => {
-                    let records = evm_log_records(self.plan.index(), task, rows);
+                    let records =
+                        evm_log_records(self.plan.index(), self.plan.decode_events(), task, rows);
                     if output_sink.is_none() {
                         let sink = self.output.open_write_sink().map_err(|error| {
                             let output_kind = self.output.capability().kind.as_str();
@@ -215,16 +216,13 @@ impl IndexRunner {
 
 fn evm_log_records(
     index: &str,
+    decode_events: &[PlannedDecodeEvent],
     task: &PlannedIndexTask,
     rows: &[datalens_core::LogRecord],
 ) -> Vec<IndexedRecord> {
     rows.iter()
-        .map(|row| IndexedRecord {
-            index: index.to_owned(),
-            chain: task.chain.to_owned(),
-            chain_id: task.chain_id,
-            dataset: task.dataset.to_owned(),
-            payload: serde_json::json!({
+        .map(|row| {
+            let mut payload = serde_json::json!({
                 "block_number": row.block_number,
                 "block_hash": row.block_hash,
                 "transaction_hash": row.transaction_hash,
@@ -234,9 +232,39 @@ fn evm_log_records(
                 "topics": row.topics,
                 "data": row.data,
                 "removed": row.removed,
-            }),
+            });
+            if let Some(event) = decoded_event_for_log(decode_events, row)
+                && let Some(object) = payload.as_object_mut()
+            {
+                object.insert(
+                    "signature".to_owned(),
+                    serde_json::Value::String(event.signature.clone()),
+                );
+                object.insert(
+                    "event_name".to_owned(),
+                    serde_json::Value::String(event.name.clone()),
+                );
+                object.insert("decoded".to_owned(), serde_json::json!({}));
+            }
+            IndexedRecord {
+                index: index.to_owned(),
+                chain: task.chain.to_owned(),
+                chain_id: task.chain_id,
+                dataset: task.dataset.to_owned(),
+                payload,
+            }
         })
         .collect()
+}
+
+fn decoded_event_for_log<'a>(
+    decode_events: &'a [PlannedDecodeEvent],
+    row: &datalens_core::LogRecord,
+) -> Option<&'a PlannedDecodeEvent> {
+    let topic0 = row.topics.first()?;
+    decode_events
+        .iter()
+        .find(|event| event.topic0.eq_ignore_ascii_case(topic0))
 }
 
 fn adapter_json_records(

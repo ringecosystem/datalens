@@ -1,12 +1,17 @@
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::{DatalensIndexConfig, IndexerError, SolanaSelectorConfig, SourceConfig};
+use crate::{
+    DatalensIndexConfig, DecodeEventConfig, DecodeEventInputConfig, IndexerError,
+    SolanaSelectorConfig, SourceConfig,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct IndexPlan {
     application: String,
     index: String,
+    #[serde(skip_serializing)]
+    decode_events: Vec<PlannedDecodeEvent>,
     tasks: Vec<PlannedIndexTask>,
 }
 
@@ -15,6 +20,7 @@ impl IndexPlan {
         Self {
             application: application.into(),
             index: String::new(),
+            decode_events: Vec::new(),
             tasks: Vec::new(),
         }
     }
@@ -29,6 +35,10 @@ impl IndexPlan {
 
     pub fn tasks(&self) -> &[PlannedIndexTask] {
         &self.tasks
+    }
+
+    pub fn decode_events(&self) -> &[PlannedDecodeEvent] {
+        &self.decode_events
     }
 }
 
@@ -77,6 +87,23 @@ pub struct PlannedSelector {
     pub canonical_key: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PlannedDecodeEvent {
+    pub name: String,
+    pub signature: String,
+    pub topic0: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contract: Option<String>,
+    pub inputs: Vec<PlannedDecodeEventInput>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PlannedDecodeEventInput {
+    pub name: String,
+    pub kind: String,
+    pub indexed: bool,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct IndexPlanBuilder;
 
@@ -102,9 +129,34 @@ impl IndexPlanBuilder {
         Ok(IndexPlan {
             application: config.client.application.clone(),
             index: config.index.name.clone(),
+            decode_events: planned_decode_events(&config.decode.events),
             tasks,
         })
     }
+}
+
+fn planned_decode_events(events: &[DecodeEventConfig]) -> Vec<PlannedDecodeEvent> {
+    events
+        .iter()
+        .map(|event| PlannedDecodeEvent {
+            name: event.name.clone(),
+            signature: event.signature.clone(),
+            topic0: event.topic0.clone(),
+            contract: event.contract.clone(),
+            inputs: planned_decode_event_inputs(&event.inputs),
+        })
+        .collect()
+}
+
+fn planned_decode_event_inputs(inputs: &[DecodeEventInputConfig]) -> Vec<PlannedDecodeEventInput> {
+    inputs
+        .iter()
+        .map(|input| PlannedDecodeEventInput {
+            name: input.name.clone(),
+            kind: input.kind.clone(),
+            indexed: input.indexed,
+        })
+        .collect()
 }
 
 struct PlannedSource<'a> {

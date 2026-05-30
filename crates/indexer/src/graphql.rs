@@ -159,6 +159,8 @@ impl QueryRoot {
         chain_id: Option<u64>,
         dataset: String,
         address: Option<String>,
+        event_name: Option<String>,
+        signature: Option<String>,
         from_block: Option<u64>,
         to_block: Option<u64>,
         topic0: Option<String>,
@@ -172,6 +174,8 @@ impl QueryRoot {
             chain,
             chain_id,
             address,
+            event_name,
+            signature,
             from_block,
             to_block,
             topic0,
@@ -208,6 +212,8 @@ pub struct IndexedEvent {
     pub topics: Vec<String>,
     pub topic0: Option<String>,
     pub signature: Option<String>,
+    pub event_name: Option<String>,
+    pub decoded: Json<Value>,
     pub data: Option<String>,
     pub payload: Json<Value>,
     pub created_at: Option<String>,
@@ -241,6 +247,8 @@ impl TryFrom<Value> for IndexedEvent {
             selector,
             topic0: topics.first().cloned(),
             signature: string_field(object, "signature"),
+            event_name: string_field(object, "event_name"),
+            decoded: Json(object.get("decoded").cloned().unwrap_or(Value::Null)),
             data: string_field(object, "data"),
             payload: Json(value),
             created_at,
@@ -254,6 +262,8 @@ struct EventFilter {
     chain: Option<String>,
     chain_id: Option<u64>,
     address: Option<String>,
+    event_name: Option<String>,
+    signature: Option<String>,
     from_block: Option<u64>,
     to_block: Option<u64>,
     topic0: Option<String>,
@@ -267,6 +277,8 @@ fn event_filter(input: EventFilter) -> Value {
         chain,
         chain_id,
         address,
+        event_name,
+        signature,
         from_block,
         to_block,
         topic0,
@@ -278,6 +290,8 @@ fn event_filter(input: EventFilter) -> Value {
     insert_string(&mut filter, "chain", chain);
     insert_u64(&mut filter, "chain_id", chain_id);
     insert_string(&mut filter, "address", address);
+    insert_string(&mut filter, "event_name", event_name);
+    insert_string(&mut filter, "signature", signature);
     insert_u64(&mut filter, "from_block", from_block);
     insert_u64(&mut filter, "to_block", to_block);
     insert_string(&mut filter, "topic0", topic0);
