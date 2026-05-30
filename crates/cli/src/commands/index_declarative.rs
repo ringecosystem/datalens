@@ -4,8 +4,10 @@ use datalens_client::DatalensClient;
 use datalens_indexer::{
     CheckpointPolicy, DatabaseDriver, DatalensIndexConfig, FinalityRequirement, IndexDaemon,
     IndexDataset, IndexPlanBuilder, IndexRunner, IndexRunnerOptions, OutputConfig,
-    OutputSinkConfig, SourceConfig,
+    OutputSinkConfig, SourceConfig, WebhookHeaderConfig,
 };
+
+use crate::redact_url;
 
 use super::{IndexDaemonCommand, IndexDoctorCommand, IndexPlanCommand, IndexRunCommand};
 
@@ -130,7 +132,7 @@ fn declarative_output_summary(output: &OutputConfig) -> serde_json::Value {
                 "kind": capability.kind.as_str(),
                 "database": {
                     "driver": database_driver_name(database.driver),
-                    "url": database.url,
+                    "url": redact_url(&database.url),
                 },
                 "capability": {
                     "write": capability.supports_write,
@@ -164,8 +166,8 @@ fn declarative_output_summary(output: &OutputConfig) -> serde_json::Value {
             serde_json::json!({
                 "kind": capability.kind.as_str(),
                 "webhook": {
-                    "url": webhook.url,
-                    "headers": webhook.headers.iter().map(|header| header.name.clone()).collect::<Vec<_>>(),
+                    "url": redact_url(&webhook.url),
+                    "headers": webhook.headers.iter().map(webhook_header_summary).collect::<Vec<_>>(),
                     "timeout_ms": webhook.timeout_ms,
                     "max_rows_per_request": webhook.max_rows_per_request,
                     "max_bytes_per_request": webhook.max_bytes_per_request,
@@ -180,6 +182,13 @@ fn declarative_output_summary(output: &OutputConfig) -> serde_json::Value {
             })
         }
     }
+}
+
+fn webhook_header_summary(header: &WebhookHeaderConfig) -> serde_json::Value {
+    serde_json::json!({
+        "name": header.name,
+        "secret": header.secret,
+    })
 }
 
 fn database_driver_name(driver: DatabaseDriver) -> &'static str {
