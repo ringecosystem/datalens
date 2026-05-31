@@ -19,7 +19,9 @@ use datalens_solana::{
     solana_signature_selector,
 };
 use datalens_storage::StorageRepository;
-use datalens_tron::{TronAdapter, TronEventFilter, TronHttpProvider, tron_event_selector};
+use datalens_tron::{
+    TronAdapter, TronEventFilter, TronHttpProvider, tron_all_selector, tron_event_selector,
+};
 use datalens_writer::DurableWriterConfig;
 
 use crate::{
@@ -425,6 +427,9 @@ fn dataset_selector(
             contract_addresses: common.addresses.clone(),
             event_names: common.event_names.clone(),
         });
+    }
+    if chain.kind == "tron" {
+        return tron_all_selector();
     }
     if chain.kind == "solana" {
         return solana_dataset_selector(dataset, common);
