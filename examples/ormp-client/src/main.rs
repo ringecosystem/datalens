@@ -1,34 +1,26 @@
-use std::{env, time::Duration};
-
-use datalens_example_ormp_client::fetch_message_accepted_page;
-use datalens_sdk::{ClientConfig, DatalensClient};
+use datalens_example_ormp_client::{
+    config::AppConfig, datalens::DatalensOrmpClient, db::AppDatabase,
+};
+use datalens_sdk::DatalensClient;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let endpoint = env::var("DATALENS_INDEX_GRAPHQL_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:8080/index/graphql".to_owned());
-    let bearer_token = env::var("DATALENS_TOKEN").ok();
-    let after = env::var("DATALENS_AFTER_CURSOR").ok();
-    let client = DatalensClient::new(ClientConfig {
-        endpoint,
-        bearer_token,
-        timeout: Some(Duration::from_secs(10)),
-        user_agent: Some("datalens-ormp-client-example".to_owned()),
-    })?;
+    let config = AppConfig::from_env()?;
+    let db = AppDatabase::open(&config.database_url)?;
+    db.migrate()?;
 
-    let page = fetch_message_accepted_page(&client, after, 25)?;
-    for event in page.events {
-        println!(
-            "{} {} {}",
-            event.cursor,
-            event.block_number.unwrap_or_default(),
-            event.message_hash.unwrap_or_default()
-        );
-    }
-    if page.has_next_page
-        && let Some(cursor) = page.next_cursor
-    {
-        eprintln!("next cursor: {cursor}");
-    }
+    let sdk = DatalensClient::new(config.sdk_config())?;
+    let client = DatalensOrmpClient::new(sdk);
+    let summary = datalens_example_ormp_client::run_once(&config, &db, &client)?;
+
+    println!(
+        "fetched={} inserted={} duplicates={} invalid={} checkpoint={} has_next_page={}",
+        summary.fetched_rows,
+        summary.inserted_rows,
+        summary.skipped_duplicates,
+        summary.skipped_invalid,
+        summary.checkpoint_cursor.as_deref().unwrap_or("<none>"),
+        summary.has_next_page,
+    );
 
     Ok(())
 }
