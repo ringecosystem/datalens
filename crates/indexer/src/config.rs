@@ -20,6 +20,7 @@ pub(crate) use validation::{parse_dataset, required_u64};
 pub struct DatalensIndexConfig {
     pub client: ClientConfig,
     pub index: IndexConfig,
+    pub retry: IndexRetryConfig,
     pub sources: Vec<SourceConfig>,
     pub decode: DecodeConfig,
     pub output: OutputConfig,
@@ -104,6 +105,23 @@ pub struct IndexConfig {
     pub dataset: IndexDataset,
     pub finality: FinalityRequirement,
     pub chunk_blocks: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IndexRetryConfig {
+    pub max_attempts: u32,
+    pub initial_backoff_ms: u64,
+    pub max_backoff_ms: u64,
+}
+
+impl Default for IndexRetryConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            initial_backoff_ms: 250,
+            max_backoff_ms: 30_000,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -363,6 +381,15 @@ struct RawIndexConfig {
     dataset: Option<String>,
     finality: Option<String>,
     chunk_blocks: Option<u64>,
+    retry: Option<RawIndexRetryConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawIndexRetryConfig {
+    max_attempts: Option<u32>,
+    initial_backoff_ms: Option<u64>,
+    max_backoff_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
