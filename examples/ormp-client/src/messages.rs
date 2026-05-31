@@ -60,7 +60,8 @@ pub fn fetch_message_accepted_page(
 fn message_hash(event: &DecodedEvent) -> Option<String> {
     event
         .decoded_args
-        .get("messageHash")
+        .get("msgHash")
+        .or_else(|| event.decoded_args.get("messageHash"))
         .and_then(|value| value.as_str())
         .map(str::to_owned)
 }
