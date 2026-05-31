@@ -12,7 +12,7 @@ arrow.workspace = true
 async-graphql.workspace = true
 async-graphql-axum.workspace = true
 axum.workspace = true
-datalens-client = { path = "../client" }
+datalens-client = { package = "datalens-internal-client", path = "../client" }
 datalens-core = { path = "../core" }
 datalens-metrics = { path = "../metrics" }
 log.workspace = true

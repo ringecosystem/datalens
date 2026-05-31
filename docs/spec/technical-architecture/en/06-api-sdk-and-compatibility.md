@@ -60,38 +60,36 @@ requires that direct RPC indexing remains a legitimate workflow.
 
 ## Rust Client Contract
 
-The first stable Rust client contract is the `datalens-client` crate.
+The external Rust SDK is the `datalens-sdk` package under `sdks/rust`. It is a
+GraphQL/HTTP client only and must not depend on any workspace crate under `crates/`,
+including `datalens-core`.
 
 Production dependencies:
 
-- `datalens-core`
 - `reqwest`
 - `serde`
 - `serde_json`
 
-The client crate must not depend on executor, storage, writer, or API server runtime
-construction crates.
+The internal REST client package is `datalens-internal-client` under `crates/client`.
+It is for workspace crate implementation use, not the external SDK package.
 
-The default client behavior is service-client only and uses the same native request shape
-as the edge. `DatalensClient::query(QueryRequest)` is the first-class Rust client API:
+The default SDK behavior is service-client only and uses the native GraphQL request
+shape exposed by the edge. `DatalensClient::native().query(QueryInput)` is the
+first-class native Rust SDK API:
 
-- `QueryRequest::new(chain, dataset_key, range)` creates a native request with
-  `selector: all`, `finality: durable_only`, and `fields: all`.
-- Builder methods such as `with_selector`, `with_range`, `with_finality`, and
-  `with_fields` adjust native request fields without changing the wire contract.
-- `QueryResponse` exposes `DatasetKey` and `LedgerRange` values while preserving the
-  REST JSON shape of `dataset_key: "family.name"` and typed ledger ranges.
+- SDK-owned input structs mirror the checked-in `schemas/native.graphql` SDL.
+- `QueryResponse` preserves GraphQL JSON scalar values for chain, range, cache, and
+  rows instead of exposing internal server/runtime models.
 - Non-EVM datasets such as `solana.slots` and `tron.blocks` are queried through the
   same native method.
 
-EVM helpers are convenience wrappers over the native request:
+The SDK also exposes `DatalensClient::index()` wrappers over the checked-in
+`schemas/index.graphql` SDL:
 
-- `DatalensClient::query_blocks` sends a JSON request to `POST /v1/query` with
-  `dataset_key: "evm.blocks"` and `selector: { "kind": "all" }`.
-- `DatalensClient::query_logs` sends a JSON request to `POST /v1/query` with
-  `dataset_key: "evm.logs"` and `selector: { "kind": "evm_logs", ... }`.
-- `DatalensClient::discover` reads `GET /v1/discovery`.
-- The client must not call executor, storage, writer, chain adapters, or RPC providers
+- Raw indexed events use `events` and `eventsConnection`.
+- Decoded indexed events use `decodedEvents` and `decodedEventsConnection`.
+- Cursor pagination exposes `pageInfo`, `edges`, and `nodes`.
+- The SDK must not call executor, storage, writer, chain adapters, or RPC providers
   directly.
 
 ## HTTP Contract

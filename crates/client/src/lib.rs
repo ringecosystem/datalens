@@ -1,4 +1,4 @@
-//! Stable Rust client contract for datalens.
+//! Internal REST client used by datalens workspace crates.
 
 mod client;
 mod selectors;

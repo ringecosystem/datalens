@@ -1,15 +1,13 @@
 [package]
-name = "datalens-internal-client"
+name = "datalens-sdk"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
 
-[lib]
-name = "datalens_client"
-
 [dependencies]
-datalens-core = { path = "../core" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2 = "0.11.0"
+
+[dev-dependencies]
+toml.workspace = true
