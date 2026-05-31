@@ -19,6 +19,22 @@ type DecodedEvent {
 	createdAt: String
 }
 
+type DecodedEventConnection {
+	edges: [DecodedEventEdge!]!
+	nodes: [DecodedEvent!]!
+	pageInfo: EventPageInfo!
+}
+
+type DecodedEventEdge {
+	cursor: String!
+	node: DecodedEvent!
+}
+
+type EventPageInfo {
+	endCursor: String
+	hasNextPage: Boolean!
+}
+
 type IndexedEvent {
 	indexName: String
 	chain: String
@@ -41,14 +57,39 @@ type IndexedEvent {
 	createdAt: String
 }
 
+type IndexedEventConnection {
+	edges: [IndexedEventEdge!]!
+	nodes: [IndexedEvent!]!
+	pageInfo: EventPageInfo!
+}
+
+type IndexedEventEdge {
+	cursor: String!
+	node: IndexedEvent!
+}
+
 """
 A scalar that can represent any JSON value.
 """
 scalar JSON
 
 type QueryRoot {
+	"""
+	Raw indexed events ordered by blockNumber, transactionIndex, eventIndex, and storage id.
+	"""
 	events(indexName: String, chain: String, chainId: Int, dataset: String!, address: String, eventName: String, signature: String, fromBlock: Int, toBlock: Int, topic0: String, limit: Int, after: String): [IndexedEvent!]!
+	"""
+	Cursor-paginated raw indexed events with deterministic event ordering.
+	"""
+	eventsConnection(indexName: String, chain: String, chainId: Int, dataset: String!, address: String, eventName: String, signature: String, fromBlock: Int, toBlock: Int, topic0: String, first: Int, after: String): IndexedEventConnection!
+	"""
+	Decoded indexed events ordered by blockNumber, transactionIndex, eventIndex, and storage id.
+	"""
 	decodedEvents(indexName: String, chain: String, chainId: Int, dataset: String!, address: String, eventName: String, signature: String, fromBlock: Int, toBlock: Int, topic0: String, limit: Int, after: String): [DecodedEvent!]!
+	"""
+	Cursor-paginated decoded indexed events with deterministic event ordering.
+	"""
+	decodedEventsConnection(indexName: String, chain: String, chainId: Int, dataset: String!, address: String, eventName: String, signature: String, fromBlock: Int, toBlock: Int, topic0: String, first: Int, after: String): DecodedEventConnection!
 }
 
 """
