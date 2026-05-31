@@ -16,9 +16,6 @@ use datalens_core::{
     BlockHeader, BlockRange, ChainFamily, ChainIdentity, DatalensError, DatasetKey, DatasetRows,
     LedgerRange, NetworkId, QueryRows,
 };
-use datalens_indexer::{
-    CheckpointPolicy, DaemonQueryMode, DatalensIndexConfig, OutputConfig, QueryProtocol,
-};
 use datalens_solana::SolanaAdapter;
 use datalens_storage::{LocalStorage, StorageWriteRequest};
 
@@ -460,96 +457,47 @@ value = "indexer""#,
 }
 
 #[test]
-fn test_ormp_example_is_declarative_multi_chain_config() {
+fn test_ormp_client_example_is_sdk_client_only() {
     let example_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples/ormp")
+        .join("../../examples")
+        .join("ormp-client")
         .canonicalize()
         .expect("example dir");
-    let config_path = example_dir.join("ormp.index.toml");
+    let manifest_path = example_dir.join("Cargo.toml");
 
     assert!(example_dir.join("README.md").is_file());
-    assert!(!example_dir.join("Cargo.toml").exists());
+    assert!(manifest_path.is_file());
+    assert!(!example_dir.join("ormp.index.toml").exists());
 
-    unsafe {
-        std::env::set_var("DATALENS_ORMP_TOKEN", "example-token");
-    }
-    let input = fs::read_to_string(&config_path).expect("read ORMP example config");
-    let config = DatalensIndexConfig::from_toml_str(&input).expect("parse ORMP example config");
-    match &config.output {
-        OutputConfig::Database { database } => {
-            assert_eq!(database.driver.as_str(), "sqlite");
-            assert_eq!(database.url, "sqlite:.data/indexes/ormp/index.db");
-        }
-        output => panic!("expected database output, got {output:?}"),
-    }
-    assert!(config.query.enabled);
-    assert_eq!(config.query.protocol, QueryProtocol::Graphql);
-    assert_eq!(config.query.bind, "127.0.0.1:9090");
-    assert_eq!(config.query.path, "/graphql");
-    assert!(config.decode.enabled);
-    assert_eq!(config.decode.events.len(), 4);
-    assert!(
-        config
-            .decode
-            .events
-            .iter()
-            .any(|event| event.name == "MessageAccepted")
-    );
+    let manifest: toml::Value =
+        toml::from_str(&fs::read_to_string(&manifest_path).expect("read ORMP client manifest"))
+            .expect("parse ORMP client manifest");
     assert_eq!(
-        datalens_indexer::validate_daemon_config(&config).expect("daemon config"),
-        DaemonQueryMode::Graphql
+        manifest["package"]["name"].as_str(),
+        Some("datalens-example-ormp-client")
     );
-    match &config.checkpoint {
-        CheckpointPolicy::File { path } => assert!(path.starts_with(".data/indexes/ormp")),
-        checkpoint => panic!("expected file checkpoint, got {checkpoint:?}"),
+
+    let dependencies = manifest["dependencies"]
+        .as_table()
+        .expect("dependencies table");
+    assert!(dependencies.contains_key("datalens-sdk"));
+    assert!(!dependencies.contains_key("datalens-indexer"));
+    assert!(!dependencies.contains_key("datalens-runtime-indexer"));
+    assert!(!dependencies.contains_key("datalens-processor-sdk"));
+
+    for path in [
+        "src/lib.rs",
+        "src/main.rs",
+        "src/messages.rs",
+        "tests/client_smoke.rs",
+        "tests/support/mod.rs",
+        "tests/support/server.rs",
+    ] {
+        let source = fs::read_to_string(example_dir.join(path)).expect("read ORMP client source");
+        assert!(!source.contains("datalens_indexer"), "{path}");
+        assert!(!source.contains("datalens_runtime"), "{path}");
+        assert!(!source.contains("datalens_processor"), "{path}");
     }
-
-    let doctor_output = ProcessCommand::new(env!("CARGO_BIN_EXE_datalens"))
-        .args(["index", "doctor", "--config"])
-        .arg(&config_path)
-        .env("DATALENS_ORMP_TOKEN", "example-token")
-        .output()
-        .expect("run ORMP example doctor");
-
-    assert!(
-        doctor_output.status.success(),
-        "ORMP example doctor failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&doctor_output.stdout),
-        String::from_utf8_lossy(&doctor_output.stderr)
-    );
-    let doctor: serde_json::Value =
-        serde_json::from_slice(&doctor_output.stdout).expect("doctor JSON");
-    assert_eq!(doctor["index"], "ormp");
-    assert_eq!(doctor["dataset"], "evm.logs");
-    assert!(
-        doctor["source_count"].as_u64().expect("source count") >= 2,
-        "{doctor}"
-    );
-    assert_eq!(doctor["output"]["kind"], "database");
-    assert_eq!(doctor["output"]["database"]["driver"], "sqlite");
-    assert_eq!(doctor["output"]["capability"]["query"], true);
-    assert_eq!(doctor["output"]["capability"]["graphql"], true);
-    assert_eq!(doctor["decode"]["enabled"], true);
-    assert_eq!(
-        doctor["decode"]["events"].as_array().expect("events").len(),
-        4
-    );
-
-    let plan_output = ProcessCommand::new(env!("CARGO_BIN_EXE_datalens"))
-        .args(["index", "plan", "--config"])
-        .arg(&config_path)
-        .env("DATALENS_ORMP_TOKEN", "example-token")
-        .output()
-        .expect("run ORMP example plan");
-
-    assert!(
-        plan_output.status.success(),
-        "ORMP example plan failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&plan_output.stdout),
-        String::from_utf8_lossy(&plan_output.stderr)
-    );
-    let plan: serde_json::Value = serde_json::from_slice(&plan_output.stdout).expect("plan JSON");
-    assert!(plan["tasks"].as_array().expect("tasks").len() >= 2);
 }
 
 #[test]
