@@ -17,6 +17,7 @@ members = [
   "crates/adapters/tron",
   "crates/runtime/warmup",
   "crates/runtime/writer",
+  "examples/bridge-processor",
   "examples/event-counter-processor",
 ]
 resolver = "3"
