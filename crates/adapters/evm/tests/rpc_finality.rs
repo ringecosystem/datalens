@@ -1,6 +1,6 @@
 use std::{
     io::{Read, Write},
-    net::TcpListener,
+    net::{SocketAddr, TcpListener},
     sync::{Arc, Mutex},
     thread,
 };
@@ -40,6 +40,44 @@ fn test_classify_provider_error_maps_known_failure_modes() {
         classify_provider_error(429, "too many requests").kind,
         DatalensErrorKind::RateLimited
     );
+}
+
+#[test]
+fn test_transport_error_redacts_rpc_url_credentials() {
+    let address = unused_local_address();
+    let url = format!(
+        "http://user:password@{address}/rpc/path?token=query-token&secret=query-secret&batch=evm"
+    );
+    let client = EvmRpcClient::new(vec![url]);
+
+    let error = client.latest_height().expect_err("connect failure");
+
+    assert_eq!(error.kind, DatalensErrorKind::ProviderFailure);
+    assert!(error.message.contains("http://<redacted>@"));
+    assert!(error.message.contains("token=<redacted>"));
+    assert!(error.message.contains("secret=<redacted>"));
+    assert!(!error.message.contains("password"));
+    assert!(!error.message.contains("query-token"));
+    assert!(!error.message.contains("query-secret"));
+}
+
+#[test]
+fn test_provider_error_redacts_rpc_url_credentials_in_message() {
+    let error = classify_provider_error(
+        -32000,
+        "upstream failed at https://user:password@rpc.example.invalid/path?api_key=query-key&signature=query-signature",
+    );
+
+    assert!(
+        error
+            .message
+            .contains("https://<redacted>@rpc.example.invalid/path")
+    );
+    assert!(error.message.contains("api_key=<redacted>"));
+    assert!(error.message.contains("signature=<redacted>"));
+    assert!(!error.message.contains("password"));
+    assert!(!error.message.contains("query-key"));
+    assert!(!error.message.contains("query-signature"));
 }
 
 #[test]
@@ -362,6 +400,11 @@ fn test_canonical_block_fetches_provider_hash_at_height() {
 fn ethereum_identity() -> ChainIdentity {
     ChainIdentity::try_new(ChainFamily::Evm, "ethereum", Some(NetworkId::numeric(1)))
         .expect("valid chain")
+}
+
+fn unused_local_address() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind unused address");
+    listener.local_addr().expect("unused address")
 }
 
 fn unsupported_tag_response() -> Value {

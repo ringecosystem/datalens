@@ -1,4 +1,4 @@
-use datalens_core::{DatalensError, DatalensErrorKind};
+use datalens_core::{DatalensError, DatalensErrorKind, redact_url, redact_urls_in_text};
 use reqwest::blocking::Client;
 use serde_json::{Value, json};
 
@@ -46,22 +46,30 @@ impl TronHttpProvider {
     }
 
     fn post(&self, path: &str, body: Value) -> Result<Value, DatalensError> {
+        let endpoint = self.endpoint(path);
         let response = self
             .client
-            .post(self.endpoint(path))
+            .post(&endpoint)
             .json(&body)
             .send()
             .map_err(|error| {
                 DatalensError::new(
                     DatalensErrorKind::ProviderFailure,
-                    format!("Tron provider request failed: {error}"),
+                    format!(
+                        "Tron provider request failed endpoint={}: {}",
+                        redact_url(&endpoint),
+                        redact_urls_in_text(&error.to_string())
+                    ),
                 )
             })?;
         let status = response.status();
         let body: Value = response.json().map_err(|error| {
             DatalensError::new(
                 DatalensErrorKind::ProviderFailure,
-                format!("decode Tron provider response: {error}"),
+                format!(
+                    "decode Tron provider response: {}",
+                    redact_urls_in_text(&error.to_string())
+                ),
             )
         })?;
         if !status.is_success() {
@@ -172,20 +180,27 @@ impl TronProvider for TronHttpProvider {
         );
         let response = self
             .client
-            .get(url)
+            .get(&url)
             .header("TRON-PRO-API-KEY", api_key)
             .send()
             .map_err(|error| {
                 DatalensError::new(
                     DatalensErrorKind::ProviderFailure,
-                    format!("TronGrid contract events request failed: {error}"),
+                    format!(
+                        "TronGrid contract events request failed endpoint={}: {}",
+                        redact_url(&url),
+                        redact_urls_in_text(&error.to_string())
+                    ),
                 )
             })?;
         let status = response.status();
         let body: Value = response.json().map_err(|error| {
             DatalensError::new(
                 DatalensErrorKind::InvalidRequest,
-                format!("decode TronGrid contract events response: {error}"),
+                format!(
+                    "decode TronGrid contract events response: {}",
+                    redact_urls_in_text(&error.to_string())
+                ),
             )
         })?;
         if status.as_u16() == 401 || status.as_u16() == 403 {

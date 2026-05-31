@@ -1,6 +1,6 @@
 use std::{
     io::{Read, Write},
-    net::TcpListener,
+    net::{SocketAddr, TcpListener},
     sync::{Arc, Mutex},
     thread,
 };
@@ -60,6 +60,53 @@ fn test_trongrid_missing_api_key_disables_contract_events() {
         TronHttpProvider::new("http://unused").with_trongrid("http://trongrid.invalid", None);
 
     assert!(!provider.supports_contract_event_query());
+}
+
+#[test]
+fn test_tron_transport_error_redacts_rpc_url_credentials() {
+    let address = unused_local_address();
+    let url = format!("http://user:password@{address}/tron?token=query-token&secret=query-secret");
+
+    let error = TronHttpProvider::new(url)
+        .latest_block(datalens_tron::TronFinality::Latest)
+        .expect_err("connect failure");
+
+    assert_eq!(error.kind, DatalensErrorKind::ProviderFailure);
+    assert!(error.message.contains("http://<redacted>@"));
+    assert!(error.message.contains("token=<redacted>"));
+    assert!(error.message.contains("secret=<redacted>"));
+    assert!(!error.message.contains("user:password"));
+    assert!(!error.message.contains("query-token"));
+    assert!(!error.message.contains("query-secret"));
+}
+
+#[test]
+fn test_trongrid_transport_error_redacts_rpc_url_credentials() {
+    let address = unused_local_address();
+    let url = format!(
+        "http://user:password@{address}/trongrid?apikey=query-key&signature=query-signature"
+    );
+    let provider =
+        TronHttpProvider::new("http://unused").with_trongrid(url, Some("secret-key".to_owned()));
+
+    let error = provider
+        .get_contract_events(TronContractEventRequest {
+            contract_address: "T111111111111111111111111111111111".to_owned(),
+            event_name: Some("MessageAccepted".to_owned()),
+            range: LedgerRange::blocks(123, 123).expect("range"),
+            only_confirmed: true,
+            limit: 20,
+            fingerprint: None,
+        })
+        .expect_err("connect failure");
+
+    assert_eq!(error.kind, DatalensErrorKind::ProviderFailure);
+    assert!(error.message.contains("http://<redacted>@"));
+    assert!(error.message.contains("apikey=<redacted>"));
+    assert!(error.message.contains("signature=<redacted>"));
+    assert!(!error.message.contains("user:password"));
+    assert!(!error.message.contains("query-key"));
+    assert!(!error.message.contains("query-signature"));
 }
 
 #[test]
@@ -169,6 +216,11 @@ impl TestServer {
     fn url(&self) -> String {
         self.address.clone()
     }
+}
+
+fn unused_local_address() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind unused address");
+    listener.local_addr().expect("unused address")
 }
 
 impl Drop for TestServer {

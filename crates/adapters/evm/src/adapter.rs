@@ -6,7 +6,7 @@ use datalens_chain::{
 use datalens_core::{
     BlockHeader, BlockRange, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, Dataset,
     DatasetKey, EvmLogFilter, EvmReceipt, EvmTransaction, LedgerRange, LogFilter, LogRecord,
-    QueryRows,
+    QueryRows, redact_urls_in_text,
 };
 use reqwest::blocking::Client;
 use serde_json::{Value, json};
@@ -275,7 +275,7 @@ impl EvmRpcClient {
             }))
             .send()
             .map_err(|error| {
-                let error = classify_transport_error(error);
+                let error = classify_transport_error(error, url);
                 log::warn!(
                     "provider transport failed method={method} kind={:?}",
                     error.kind
@@ -287,7 +287,10 @@ impl EvmRpcClient {
             log::warn!("failed to decode provider response method={method}: {error}");
             DatalensError::new(
                 DatalensErrorKind::ProviderFailure,
-                format!("decode JSON-RPC response: {error}"),
+                format!(
+                    "decode JSON-RPC response: {}",
+                    redact_urls_in_text(&error.to_string())
+                ),
             )
         })?;
         if !status.is_success() {

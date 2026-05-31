@@ -14,6 +14,8 @@ pub mod result;
 
 pub mod query;
 
+pub mod redaction;
+
 pub use chain::{ChainFamily, ChainIdentity, NetworkId};
 pub use coverage::CoverageLevel;
 pub use dataset::{Dataset, DatasetId, DatasetKey};
@@ -23,6 +25,7 @@ pub use query::{
     QueryRows, TopicFilter,
 };
 pub use range::{BlockRange, LedgerRange, LedgerRangeKind, TimeRange, missing_ranges};
+pub use redaction::{redact_url, redact_urls_in_text};
 pub use result::{
     QueryDataFinality, QueryFinalityRequirement, QuerySegmentMetadata, QuerySegmentSource,
     ResultEnvelope,

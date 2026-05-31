@@ -1,6 +1,6 @@
 use datalens_core::{
     BlockRange, DatalensError, DatalensErrorKind, EvmLogFilter, EvmReceipt, EvmTransaction,
-    LogRecord, NetworkId, TopicFilter,
+    LogRecord, NetworkId, TopicFilter, redact_url, redact_urls_in_text,
 };
 use serde_json::{Value, json};
 
@@ -106,16 +106,23 @@ pub(crate) fn evm_log_filter(range: BlockRange, filter: &EvmLogFilter) -> Value 
     Value::Object(value)
 }
 
-pub(crate) fn classify_transport_error(error: reqwest::Error) -> DatalensError {
+pub(crate) fn classify_transport_error(error: reqwest::Error, endpoint: &str) -> DatalensError {
+    let endpoint = redact_url(endpoint);
     if error.is_timeout() {
         DatalensError::new(
             DatalensErrorKind::ProviderTimeout,
-            format!("provider timeout: {error}"),
+            format!(
+                "provider timeout endpoint={endpoint}: {}",
+                redact_urls_in_text(&error.to_string())
+            ),
         )
     } else {
         DatalensError::new(
             DatalensErrorKind::ProviderFailure,
-            format!("provider request failed: {error}"),
+            format!(
+                "provider request failed endpoint={endpoint}: {}",
+                redact_urls_in_text(&error.to_string())
+            ),
         )
     }
 }
@@ -173,7 +180,7 @@ pub fn classify_provider_error(code: i64, message: &str) -> DatalensError {
     } else {
         DatalensErrorKind::ProviderFailure
     };
-    DatalensError::new(kind, message)
+    DatalensError::new(kind, redact_urls_in_text(message))
 }
 
 pub(crate) fn string_field(value: &Value, field: &str) -> Result<String, DatalensError> {
