@@ -8,8 +8,8 @@ use std::{
 use datalens_client::{DatalensClient, HttpRequest, HttpResponse, HttpTransport};
 use datalens_core::{DatasetKey, DatasetRows, QueryRows};
 use datalens_indexer::{
-    DatalensIndexConfig, IndexPlanBuilder, IndexRunner, IndexRunnerOptions, OutputSinkConfig,
-    ParquetOutputConfig, QueryableStore, SqliteOutputStore, StoreQuery,
+    DatalensIndexConfig, IndexPlanBuilder, IndexRetryConfig, IndexRunner, IndexRunnerOptions,
+    OutputSinkConfig, ParquetOutputConfig, QueryableStore, SqliteOutputStore, StoreQuery,
 };
 
 #[test]
@@ -21,7 +21,9 @@ fn test_chain_fetch_failure_preserves_last_durable_checkpoint_and_resume_indexes
     let output = OutputSinkConfig::DatabaseSqlite {
         url: sqlite_url.clone(),
     };
-    let options = IndexRunnerOptions::default().with_checkpoint_path(&checkpoint_path);
+    let options = IndexRunnerOptions::default()
+        .with_checkpoint_path(&checkpoint_path)
+        .with_retry_policy(test_retry_policy(1));
     let first_transport = QueueTransport::new(vec![
         Ok(HttpResponse::json(200, response_json(10, 11))),
         Ok(HttpResponse::json(
@@ -63,6 +65,88 @@ fn test_chain_fetch_failure_preserves_last_durable_checkpoint_and_resume_indexes
     assert_eq!(checkpoint_completed_block(&checkpoint_path), Some(13));
     assert_eq!(sqlite_blocks(&sqlite_url), vec![10, 11, 12, 13]);
     assert_eq!(request_ranges(&second_transport), vec![(12, 13)]);
+}
+
+#[test]
+fn test_transient_provider_timeout_retries_chunk_without_advancing_checkpoint_until_success() {
+    let root = temp_path("provider-timeout-retry");
+    let sqlite_url = format!("sqlite:{}", root.join("index.db").display());
+    let checkpoint_path = root.join("checkpoint.json");
+    let plan = plan(50, 53, 2);
+    let transport = QueueTransport::new(vec![
+        Ok(HttpResponse::json(200, response_json(50, 51))),
+        Ok(HttpResponse::json(
+            504,
+            serde_json::json!({
+                "error": {
+                    "kind": "provider_timeout",
+                    "message": "provider transport failed method=eth_getLogs kind=ProviderTimeout"
+                }
+            }),
+        )),
+        Ok(HttpResponse::json(200, response_json(52, 53))),
+    ]);
+    let client = client(transport.clone());
+
+    let report = IndexRunner::new(
+        plan.clone(),
+        OutputSinkConfig::DatabaseSqlite {
+            url: sqlite_url.clone(),
+        },
+    )
+    .with_options(
+        IndexRunnerOptions::default()
+            .with_checkpoint_path(&checkpoint_path)
+            .with_retry_policy(test_retry_policy(2)),
+    )
+    .run(&client)
+    .expect("transient timeout retry succeeds");
+
+    assert_eq!(report.summary.executed_queries, 2);
+    assert_eq!(checkpoint_completed_block(&checkpoint_path), Some(53));
+    assert_eq!(sqlite_blocks(&sqlite_url), vec![50, 51, 52, 53]);
+    assert_eq!(
+        request_ranges(&transport),
+        vec![(50, 51), (52, 53), (52, 53)]
+    );
+}
+
+#[test]
+fn test_repeated_transient_provider_timeouts_stop_after_max_attempts_without_advancing_checkpoint()
+{
+    let root = temp_path("provider-timeout-max-attempts");
+    let sqlite_url = format!("sqlite:{}", root.join("index.db").display());
+    let checkpoint_path = root.join("checkpoint.json");
+    let plan = plan(60, 63, 2);
+    let transport = QueueTransport::new(vec![
+        Ok(HttpResponse::json(200, response_json(60, 61))),
+        Ok(provider_timeout_response()),
+        Ok(provider_timeout_response()),
+    ]);
+    let client = client(transport.clone());
+
+    let error = IndexRunner::new(
+        plan,
+        OutputSinkConfig::DatabaseSqlite {
+            url: sqlite_url.clone(),
+        },
+    )
+    .with_options(
+        IndexRunnerOptions::default()
+            .with_checkpoint_path(&checkpoint_path)
+            .with_retry_policy(test_retry_policy(2)),
+    )
+    .run(&client)
+    .expect_err("max attempts are exhausted");
+
+    assert!(error.to_string().contains("attempts exhausted"), "{error}");
+    assert!(error.to_string().contains("provider_timeout"), "{error}");
+    assert_eq!(checkpoint_completed_block(&checkpoint_path), Some(61));
+    assert_eq!(sqlite_blocks(&sqlite_url), vec![60, 61]);
+    assert_eq!(
+        request_ranges(&transport),
+        vec![(60, 61), (62, 63), (62, 63)]
+    );
 }
 
 #[test]
@@ -253,6 +337,26 @@ fn response_json(start: u64, end: u64) -> serde_json::Value {
             }).collect()),
         ).expect("rows")).expect("rows json")
     })
+}
+
+fn provider_timeout_response() -> HttpResponse {
+    HttpResponse::json(
+        504,
+        serde_json::json!({
+            "error": {
+                "kind": "provider_timeout",
+                "message": "provider timeout"
+            }
+        }),
+    )
+}
+
+fn test_retry_policy(max_attempts: u32) -> IndexRetryConfig {
+    IndexRetryConfig {
+        max_attempts,
+        initial_backoff_ms: 0,
+        max_backoff_ms: 0,
+    }
 }
 
 fn parquet_config(path: PathBuf) -> ParquetOutputConfig {

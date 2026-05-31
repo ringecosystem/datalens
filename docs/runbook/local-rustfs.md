@@ -64,6 +64,90 @@ The Datalens service listens on `http://localhost:3000`. Native GraphQL is expos
 `/native/graphql` when enabled. Application index GraphQL endpoints are served by
 external application services, not by `datalens serve`.
 
+## Live Smoke
+
+Set the RPC endpoint for each chain you want to exercise:
+
+```sh
+export DATALENS_ETHEREUM_RPC_URL=https://ethereum-rpc.example.invalid
+export DATALENS_SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
+export DATALENS_TRON_RPC_URL=https://api.trongrid.io
+export DATALENS_TRONGRID_API_KEY=
+export DATALENS_LIVE_SMOKE_TOKEN=replace-with-live-smoke-token
+```
+
+Run the Solana durable cache smoke:
+
+```sh
+cargo run -p datalens-cli -- cache backfill \
+  --config config/datalens.compose.toml \
+  --chain solana-mainnet-beta \
+  --dataset transactions \
+  --range-kind block \
+  --range-start 250000000 \
+  --range-end 250000001 \
+  --application live-smoke \
+  --json
+
+cargo run -p datalens-cli -- cache verify \
+  --config config/datalens.compose.toml \
+  --chain solana-mainnet-beta \
+  --dataset transactions \
+  --range-kind block \
+  --range-start 250000000 \
+  --range-end 250000001 \
+  --application live-smoke \
+  --json
+```
+
+Run the Tron durable cache smoke:
+
+```sh
+cargo run -p datalens-cli -- cache backfill \
+  --config config/datalens.compose.toml \
+  --chain tron-mainnet \
+  --dataset events \
+  --range-kind block \
+  --range-start 60000000 \
+  --range-end 60000001 \
+  --application live-smoke \
+  --address 0xa614f803b6fd780986a42c78ec9c7f77e6ded13c \
+  --event-name Transfer \
+  --json
+
+cargo run -p datalens-cli -- cache verify \
+  --config config/datalens.compose.toml \
+  --chain tron-mainnet \
+  --dataset events \
+  --range-kind block \
+  --range-start 60000000 \
+  --range-end 60000001 \
+  --application live-smoke \
+  --address 0xa614f803b6fd780986a42c78ec9c7f77e6ded13c \
+  --event-name Transfer \
+  --json
+```
+
+Run the smoke-specific application index configs:
+
+```sh
+cargo run -p datalens-cli -- index doctor --config config/datalens.solana-live-smoke.index.toml
+cargo run -p datalens-cli -- index run --config config/datalens.solana-live-smoke.index.toml
+cargo run -p datalens-cli -- index doctor --config config/datalens.tron-live-smoke.index.toml
+cargo run -p datalens-cli -- index run --config config/datalens.tron-live-smoke.index.toml
+```
+
+Run the three chain smokes together after setting the endpoints:
+
+```sh
+for DATALENS_SMOKE_CHAIN in ethereum solana-mainnet-beta tron-mainnet; do
+  echo "smoke ${DATALENS_SMOKE_CHAIN}"
+done
+```
+
+Use the JSON summaries to verify `status: "ok"` and the second pass reports existing
+durable coverage instead of writing a new range.
+
 ## Test Configuration
 
 Use these variables for S3 integration tests:

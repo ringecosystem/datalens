@@ -6,11 +6,12 @@ use super::{
     ClientConfig, ClientToken, DatabaseDriver, DatabaseOutputConfig, DatalensIndexConfig,
     DecodeAbiConfig, DecodeConfig, DecodeEventConfig, DecodeEventInputConfig, FinalityRequirement,
     GraphqlViewConfig, GraphqlViewFieldConfig, GraphqlViewFilterConfig, IndexConfig,
-    MetricsServiceConfig, OutputConfig, ParquetOutputConfig, QueryAuthApplicationConfig,
-    QueryAuthConfig, QueryAuthQuotaConfig, QueryProtocol, QueryServiceConfig, RawCheckpointConfig,
-    RawClientConfig, RawDatabaseOutputConfig, RawDatalensIndexConfig, RawDecodeAbiConfig,
-    RawDecodeConfig, RawDecodeEventConfig, RawDecodeEventInputConfig, RawGraphqlViewConfig,
-    RawGraphqlViewFieldConfig, RawGraphqlViewFilterConfig, RawIndexConfig, RawJsonlOutputConfig,
+    IndexRetryConfig, MetricsServiceConfig, OutputConfig, ParquetOutputConfig,
+    QueryAuthApplicationConfig, QueryAuthConfig, QueryAuthQuotaConfig, QueryProtocol,
+    QueryServiceConfig, RawCheckpointConfig, RawClientConfig, RawDatabaseOutputConfig,
+    RawDatalensIndexConfig, RawDecodeAbiConfig, RawDecodeConfig, RawDecodeEventConfig,
+    RawDecodeEventInputConfig, RawGraphqlViewConfig, RawGraphqlViewFieldConfig,
+    RawGraphqlViewFilterConfig, RawIndexConfig, RawIndexRetryConfig, RawJsonlOutputConfig,
     RawMetricsServiceConfig, RawOutputConfig, RawParquetOutputConfig,
     RawQueryAuthApplicationConfig, RawQueryAuthConfig, RawQueryServiceConfig, SecretString,
     source_config::parse_sources, validation::*,
@@ -29,11 +30,17 @@ pub(super) fn parse_index_config(
             empty_client()
         }
     };
-    let index = match raw.index {
-        Some(raw) => parse_index(raw, &mut errors).unwrap_or_else(empty_index),
+    let (index, retry) = match raw.index {
+        Some(raw) => {
+            let retry = parse_index_retry(raw.retry.clone(), &mut errors);
+            (
+                parse_index(raw, &mut errors).unwrap_or_else(empty_index),
+                retry,
+            )
+        }
         None => {
             errors.push("index: missing required table".to_owned());
-            empty_index()
+            (empty_index(), IndexRetryConfig::default())
         }
     };
     let sources = parse_sources(raw.sources, &mut errors);
@@ -72,6 +79,7 @@ pub(super) fn parse_index_config(
     Ok(DatalensIndexConfig {
         client,
         index,
+        retry,
         sources,
         decode,
         output,
@@ -137,6 +145,30 @@ fn parse_index(raw: RawIndexConfig, errors: &mut Vec<String>) -> Option<IndexCon
         finality: finality?,
         chunk_blocks: chunk_blocks?,
     })
+}
+
+fn parse_index_retry(
+    raw: Option<RawIndexRetryConfig>,
+    errors: &mut Vec<String>,
+) -> IndexRetryConfig {
+    let Some(raw) = raw else {
+        return IndexRetryConfig::default();
+    };
+    let default = IndexRetryConfig::default();
+    if raw.max_attempts == Some(0) {
+        errors.push("index.retry.max_attempts: must be greater than 0".to_owned());
+    }
+    validate_optional_positive_u64(
+        "index.retry.initial_backoff_ms",
+        raw.initial_backoff_ms,
+        errors,
+    );
+    validate_optional_positive_u64("index.retry.max_backoff_ms", raw.max_backoff_ms, errors);
+    IndexRetryConfig {
+        max_attempts: raw.max_attempts.unwrap_or(default.max_attempts),
+        initial_backoff_ms: raw.initial_backoff_ms.unwrap_or(default.initial_backoff_ms),
+        max_backoff_ms: raw.max_backoff_ms.unwrap_or(default.max_backoff_ms),
+    }
 }
 
 fn parse_output(raw: RawOutputConfig, errors: &mut Vec<String>) -> Option<OutputConfig> {

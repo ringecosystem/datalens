@@ -156,7 +156,9 @@ where
                 config.query.enabled
             );
             let plan = IndexPlanBuilder::new().build(&config)?;
-            let options = IndexRunnerOptions::default().with_checkpoint_policy(config.checkpoint);
+            let options = IndexRunnerOptions::default()
+                .with_checkpoint_policy(config.checkpoint)
+                .with_retry_policy(config.retry);
             let runner =
                 IndexRunner::new(plan, output_sink_config(&config.output)).with_options(options);
             let report = runner.run(&client)?;

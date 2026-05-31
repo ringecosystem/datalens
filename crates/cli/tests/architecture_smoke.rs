@@ -160,7 +160,10 @@ fn local_compose_deployment_artifacts_are_declared() {
     assert!(compose.contains("condition: service_healthy"));
 
     assert!(env_example.contains("DATALENS_SERVER_CONFIG=/etc/datalens/datalens.toml"));
-    assert!(!env_example.contains(&format!("DATALENS_{}=", "INDEX_DATABASE_URL")));
+    assert!(env_example.contains("DATALENS_INDEX_DATABASE_URL="));
+    assert!(env_example.contains("DATALENS_SOLANA_RPC_URL="));
+    assert!(env_example.contains("DATALENS_TRON_RPC_URL="));
+    assert!(env_example.contains("DATALENS_TRONGRID_API_KEY="));
 
     assert!(dev_config.contains("root = \".tmp/datalens-dev\""));
     assert!(compose_config.contains("bucket = \"${DATALENS_S3_BUCKET}\""));
@@ -168,10 +171,22 @@ fn local_compose_deployment_artifacts_are_declared() {
     assert!(compose_config.contains("token = \"${DATALENS_ORMP_TOKEN}\""));
     assert!(!compose_config.contains("[index.application"));
     assert!(!compose_config.contains(&format!("DATALENS_{}", "INDEX_DATABASE_URL")));
+    assert!(compose_config.contains("[chains.solana-mainnet-beta]"));
+    assert!(compose_config.contains("rpc_urls = [\"${DATALENS_SOLANA_RPC_URL}\"]"));
+    assert!(compose_config.contains("[chains.tron-mainnet]"));
+    assert!(compose_config.contains("rpc_urls = [\"${DATALENS_TRON_RPC_URL}\"]"));
+    assert!(compose_config.contains("api_key = \"${DATALENS_TRONGRID_API_KEY}\""));
+    assert!(
+        compose_config
+            .contains("chains = [\"ethereum\", \"solana-mainnet-beta\", \"tron-mainnet\"]")
+    );
+    assert!(compose_config.contains("datasets = [\"evm.blocks\", \"evm.logs\", \"solana.slots\", \"solana.transactions\", \"solana.instructions\", \"tron.blocks\", \"tron.events\"]"));
 
     assert!(gitignore.contains(".data/"));
     assert!(runbook.contains("docker compose up -d rustfs-init postgres"));
     assert!(runbook.contains("docker compose --profile datalens up -d --build"));
+    assert!(runbook.contains("--chain solana-mainnet-beta"));
+    assert!(runbook.contains("--chain tron-mainnet"));
 }
 
 #[test]
