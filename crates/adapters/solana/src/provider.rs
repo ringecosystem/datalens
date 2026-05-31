@@ -1,4 +1,4 @@
-use datalens_core::{DatalensError, DatalensErrorKind};
+use datalens_core::{DatalensError, DatalensErrorKind, redact_url, redact_urls_in_text};
 use reqwest::blocking::Client;
 use serde_json::{Value, json};
 
@@ -35,21 +35,31 @@ impl SolanaHttpRpc {
             .map_err(|error| {
                 DatalensError::new(
                     DatalensErrorKind::ProviderFailure,
-                    format!("Solana provider request failed: {error}"),
+                    format!(
+                        "Solana provider request failed endpoint={}: {}",
+                        redact_url(&self.url),
+                        redact_urls_in_text(&error.to_string())
+                    ),
                 )
             })?;
         let status = response.status();
         let body = response.text().map_err(|error| {
             DatalensError::new(
                 DatalensErrorKind::ProviderFailure,
-                format!("read Solana JSON-RPC response: {error}"),
+                format!(
+                    "read Solana JSON-RPC response: {}",
+                    redact_urls_in_text(&error.to_string())
+                ),
             )
         })?;
         let body: Value = serde_json::from_str(&body).map_err(|error| {
             if status.is_success() {
                 DatalensError::new(
                     DatalensErrorKind::ProviderFailure,
-                    format!("decode Solana JSON-RPC response: {error}"),
+                    format!(
+                        "decode Solana JSON-RPC response: {}",
+                        redact_urls_in_text(&error.to_string())
+                    ),
                 )
             } else {
                 classify_provider_error(status.as_u16() as i64, "")
@@ -103,7 +113,7 @@ fn classify_provider_error(code: i64, message: &str) -> DatalensError {
     } else {
         DatalensErrorKind::ProviderFailure
     };
-    DatalensError::new(kind, message)
+    DatalensError::new(kind, redact_urls_in_text(message))
 }
 
 impl SolanaRpc for SolanaHttpRpc {

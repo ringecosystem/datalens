@@ -1,6 +1,6 @@
 use std::{
     io::{Read, Write},
-    net::TcpListener,
+    net::{SocketAddr, TcpListener},
     thread,
 };
 
@@ -319,6 +319,55 @@ fn test_solana_http_rpc_classifies_unsupported_json_rpc_method() {
 }
 
 #[test]
+fn test_solana_transport_error_redacts_rpc_url_credentials() {
+    let address = unused_local_address();
+    let url =
+        format!("http://user:password@{address}/solana?token=query-token&password=query-password");
+
+    let error = SolanaHttpRpc::new(url)
+        .get_slot(datalens_solana::SolanaCommitment::Finalized)
+        .expect_err("connect failure");
+
+    assert_eq!(error.kind, DatalensErrorKind::ProviderFailure);
+    assert!(error.message.contains("http://<redacted>@"));
+    assert!(error.message.contains("token=<redacted>"));
+    assert!(error.message.contains("password=<redacted>"));
+    assert!(!error.message.contains("user:password"));
+    assert!(!error.message.contains("query-token"));
+    assert!(!error.message.contains("query-password"));
+}
+
+#[test]
+fn test_solana_provider_error_redacts_rpc_url_credentials_in_message() {
+    let url = start_rpc_server(vec![rpc_response(
+        200,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {
+                "code": -32000,
+                "message": "backend failed at https://user:password@rpc.example.invalid/path?access_token=query-token&key=query-key"
+            }
+        }),
+    )]);
+
+    let error = SolanaHttpRpc::new(url)
+        .get_slot(datalens_solana::SolanaCommitment::Finalized)
+        .expect_err("provider error");
+
+    assert!(
+        error
+            .message
+            .contains("https://<redacted>@rpc.example.invalid/path")
+    );
+    assert!(error.message.contains("access_token=<redacted>"));
+    assert!(error.message.contains("key=<redacted>"));
+    assert!(!error.message.contains("password"));
+    assert!(!error.message.contains("query-token"));
+    assert!(!error.message.contains("query-key"));
+}
+
+#[test]
 fn test_http_429_from_signature_discovery_falls_back_to_slot_scan() {
     let url = start_rpc_server(vec![
         rpc_response(
@@ -617,6 +666,11 @@ fn default_chain() -> datalens_core::ChainIdentity {
         Some(datalens_core::NetworkId::textual("mainnet-beta").expect("network id")),
     )
     .expect("chain")
+}
+
+fn unused_local_address() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind unused address");
+    listener.local_addr().expect("unused address")
 }
 
 struct RpcResponse {
