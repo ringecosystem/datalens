@@ -2,12 +2,20 @@ use std::sync::{Arc, Mutex};
 
 use datalens_client::{DatalensClient, HttpRequest, HttpResponse, HttpTransport};
 use datalens_core::{DatasetKey, DatasetRows, QueryRows};
-use datalens_indexer::{DatalensIndexConfig, IndexPlanBuilder, IndexRunner, OutputSinkConfig};
+use datalens_indexer::{
+    DatalensIndexConfig, IndexPlanBuilder, IndexRunner, OutputSinkConfig, PlannedDecodeEvent,
+    PlannedDecodeEventInput,
+};
 
 const TRANSFER_TOPIC0: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 const FROM_TOPIC: &str = "0x0000000000000000000000001111111111111111111111111111111111111111";
 const TO_TOPIC: &str = "0x0000000000000000000000002222222222222222222222222222222222222222";
 const VALUE_DATA: &str = "0x000000000000000000000000000000000000000000000000000000000000007b";
+const ORMP_MESSAGE_ACCEPTED_TOPIC0: &str =
+    "0xcfb9b3466878aff0c7df17da215fd57d59eb245a5d03f5a7b57294d54581eb18";
+const ORMP_MESSAGE_ACCEPTED_MSG_HASH: &str =
+    "0x60f5743a8b3bbe4e4bd99607b19985203a9310f4859e03912ed086f4d32bdff8";
+const ORMP_MESSAGE_ACCEPTED_DATA: &str = "0x000000000000000000000000000000000000000000000000000000000000002000000000000000000000000013b2211a7ca45db2808f6db05557ce5347e3634e000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000002cd1867fb8016f93710b6386f7f9f1d540a60812000000000000000000000000000000000000000000000000000000000000002e0000000000000000000000002cd1867fb8016f93710b6386f7f9f1d540a60812000000000000000000000000000000000000000000000000000000000001d874000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000a4394d1bca0000000000000000000000009f33a4809aa708d7a399fedba514e0a0d15efa850000000000000000000000009f33a4809aa708d7a399fedba514e0a0d15efa8500000000000000000000000000000000000000000000000000000000000000600000000000000000000000000000000000000000000000000000000000000008844866883501484100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
 
 #[test]
 fn test_index_runner_decodes_evm_logs_from_inline_abi() {
@@ -169,6 +177,68 @@ fn test_index_runner_omits_decode_metadata_when_decoder_disabled() {
     assert!(row.get("decode_status").is_none());
     assert!(row.get("decoded").is_none());
     assert_eq!(row["topics"][0], TRANSFER_TOPIC0);
+}
+
+#[test]
+fn test_ormp_message_accepted_fragment_decodes_live_smoke_log() {
+    let events = vec![PlannedDecodeEvent {
+        name: "MessageAccepted".to_owned(),
+        signature:
+            "MessageAccepted(bytes32,(address,uint256,uint256,address,uint256,address,uint256,bytes))"
+                .to_owned(),
+        topic0: ORMP_MESSAGE_ACCEPTED_TOPIC0.to_owned(),
+        chain: Some("ethereum".to_owned()),
+        index: Some("ormp".to_owned()),
+        dataset: Some("evm.logs".to_owned()),
+        contract: Some("0x13b2211a7ca45db2808f6db05557ce5347e3634e".to_owned()),
+        inputs: vec![
+            PlannedDecodeEventInput {
+                name: "msgHash".to_owned(),
+                kind: "bytes32".to_owned(),
+                indexed: true,
+            },
+            PlannedDecodeEventInput {
+                name: "message".to_owned(),
+                kind: "(address,uint256,uint256,address,uint256,address,uint256,bytes)"
+                    .to_owned(),
+                indexed: false,
+            },
+        ],
+    }];
+
+    let decoded = datalens_indexer::decode_evm_log(
+        &events,
+        "ormp",
+        "ethereum",
+        "evm.logs",
+        "0x13b2211a7ca45db2808f6db05557ce5347e3634e",
+        &[
+            ORMP_MESSAGE_ACCEPTED_TOPIC0.to_owned(),
+            ORMP_MESSAGE_ACCEPTED_MSG_HASH.to_owned(),
+        ],
+        ORMP_MESSAGE_ACCEPTED_DATA,
+    );
+
+    assert_eq!(decoded.status.as_str(), "decoded");
+    assert_eq!(decoded.event_name.as_deref(), Some("MessageAccepted"));
+    assert_eq!(
+        decoded.signature.as_deref(),
+        Some(
+            "MessageAccepted(bytes32,(address,uint256,uint256,address,uint256,address,uint256,bytes))"
+        )
+    );
+    let arguments = decoded.arguments.expect("decoded arguments");
+    assert_eq!(arguments["msgHash"], ORMP_MESSAGE_ACCEPTED_MSG_HASH);
+    assert_eq!(
+        arguments["message"][0],
+        "0x13b2211a7ca45db2808f6db05557ce5347e3634e"
+    );
+    assert_eq!(arguments["message"][2], "1");
+    assert_eq!(
+        arguments["message"][3],
+        "0x2cd1867fb8016f93710b6386f7f9f1d540a60812"
+    );
+    assert_eq!(arguments["message"][4], "46");
 }
 
 fn index_config(decode_enabled: bool) -> DatalensIndexConfig {

@@ -30,7 +30,7 @@ fn test_fetch_message_accepted_page_queries_sdk_connection_with_cursor() {
                         "eventName": "MessageAccepted",
                         "signature": "MessageAccepted(bytes32,(address,uint256,uint256,address,uint256,address,uint256,bytes))",
                         "topic0": "0xtopic0",
-                        "decodedArgs": {"messageHash": "0xhash"},
+                        "decodedArgs": {"msgHash": "0xhash"},
                         "decodeStatus": "decoded",
                         "decodeError": null,
                         "payload": {"source": "mock"},

@@ -164,6 +164,11 @@ fn local_compose_deployment_artifacts_are_declared() {
     assert!(compose_config.contains("endpoint_url = \"${DATALENS_S3_ENDPOINT_URL}\""));
     assert!(compose_config.contains("token = \"${DATALENS_ORMP_TOKEN}\""));
     assert!(compose_config.contains("[index.application.client]"));
+    assert!(compose_config.contains("[index.application.decode]"));
+    assert!(compose_config.contains("name = \"MessageAccepted\""));
+    assert!(compose_config.contains(
+        "topic0 = \"0xcfb9b3466878aff0c7df17da215fd57d59eb245a5d03f5a7b57294d54581eb18\""
+    ));
     assert!(compose_config.contains("url = \"${DATALENS_INDEX_DATABASE_URL}\""));
     assert!(compose_config.contains("token_env = \"DATALENS_ORMP_TOKEN\""));
 
