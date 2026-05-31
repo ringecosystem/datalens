@@ -189,6 +189,28 @@ fn test_runtime_verify_reads_coverage_without_fetch_or_write() {
 }
 
 #[test]
+fn test_runtime_verify_uses_manifest_coverage_when_provider_finality_is_unavailable() {
+    let storage = LocalStorage::new(temp_storage_root("verify-provider-finality"));
+    seed_blocks(&storage, 1, 2, vec![block(1), block(2)]);
+    let source = FixtureAdapter::default()
+        .with_blocks(vec![block(1), block(2)])
+        .with_finality_failure(DatalensErrorKind::ProviderFailure, "context canceled");
+
+    let result = runtime(
+        source.clone(),
+        storage.clone(),
+        InMemoryIndexCursorStore::default(),
+    )
+    .run(block_job(1, 2, IndexRunMode::Verify))
+    .expect("verify uses cached coverage");
+
+    assert_eq!(result.status, IndexRunStatus::Completed);
+    assert_eq!(source.calls(), Vec::<SourceCall>::new());
+    assert_eq!(result.accounting.provider_calls, 0);
+    assert_eq!(result.accounting.chunks_written, 0);
+}
+
+#[test]
 fn test_runtime_retries_transient_provider_failure_with_bound() {
     let storage = LocalStorage::new(temp_storage_root("retry"));
     let source = FixtureAdapter::default()
@@ -545,6 +567,7 @@ struct FixtureAdapter {
     safe_height: Arc<Mutex<ChainHeight>>,
     transient_failures: Arc<Mutex<Vec<DatalensErrorKind>>>,
     fail_after_calls: Arc<Mutex<Option<(usize, DatalensErrorKind)>>>,
+    finality_failure: Arc<Mutex<Option<(DatalensErrorKind, String)>>>,
     provider_limit_len: Arc<Mutex<Option<u64>>>,
 }
 
@@ -561,6 +584,7 @@ impl Default for FixtureAdapter {
             )),
             transient_failures: Arc::new(Mutex::new(Vec::new())),
             fail_after_calls: Arc::new(Mutex::new(None)),
+            finality_failure: Arc::new(Mutex::new(None)),
             provider_limit_len: Arc::new(Mutex::new(None)),
         }
     }
@@ -602,6 +626,11 @@ impl FixtureAdapter {
         self
     }
 
+    fn with_finality_failure(self, kind: DatalensErrorKind, message: impl Into<String>) -> Self {
+        *self.finality_failure.lock().expect("finality failure") = Some((kind, message.into()));
+        self
+    }
+
     fn with_provider_limit_for_ranges_larger_than(self, max_len: u64) -> Self {
         *self.provider_limit_len.lock().expect("provider limit") = Some(max_len);
         self
@@ -636,10 +665,26 @@ impl ChainAdapter for FixtureAdapter {
     }
 
     fn cache_safe_height(&self) -> Result<ChainHeight, DatalensError> {
+        if let Some((kind, message)) = self
+            .finality_failure
+            .lock()
+            .expect("finality failure")
+            .clone()
+        {
+            return Err(DatalensError::new(kind, message));
+        }
         Ok(self.safe_height.lock().expect("safe height").clone())
     }
 
     fn finalized_height(&self) -> Result<ChainHeight, DatalensError> {
+        if let Some((kind, message)) = self
+            .finality_failure
+            .lock()
+            .expect("finality failure")
+            .clone()
+        {
+            return Err(DatalensError::new(kind, message));
+        }
         Ok(self.safe_height.lock().expect("safe height").clone())
     }
 

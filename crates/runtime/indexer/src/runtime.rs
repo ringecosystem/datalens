@@ -6,7 +6,7 @@ use std::{
 };
 
 use datalens_chain::{
-    ChainAdapter, ChainFetchRequest, DatasetSelector, FinalityLevel, SelectorKind,
+    ChainAdapter, ChainFetchRequest, ChainHeight, DatasetSelector, FinalityLevel, SelectorKind,
     validate_durable_range,
 };
 use datalens_core::{DatalensError, DatalensErrorKind};
@@ -107,10 +107,6 @@ where
     }
 
     pub fn run(&self, job: IndexJob) -> Result<IndexRunResult, DatalensError> {
-        let finality_boundary = match job.finality_requirement {
-            IndexFinalityRequirement::Safe => self.adapter.cache_safe_height()?,
-            IndexFinalityRequirement::Finalized => self.adapter.finalized_height()?,
-        };
         let capabilities = self.adapter.capabilities();
         if capabilities.chain() != &job.chain {
             return Err(DatalensError::new(
@@ -127,22 +123,39 @@ where
         for dataset in &datasets {
             // Planning is anchored to durable manifest coverage, not cursor
             // progress, so a stale or lost cursor cannot claim data exists.
-            covered_ranges.extend(
-                self.storage
-                    .covered_ranges(
-                        &job.chain,
-                        &dataset.dataset_key,
-                        &dataset.selector,
-                        job.range.clone(),
-                    )?
-                    .into_iter()
-                    .map(|range| IndexDatasetCoverage {
+            match self.storage.covered_ranges(
+                &job.chain,
+                &dataset.dataset_key,
+                &dataset.selector,
+                job.range.clone(),
+            ) {
+                Ok(ranges) => {
+                    covered_ranges.extend(ranges.into_iter().map(|range| IndexDatasetCoverage {
                         dataset_key: dataset.dataset_key.clone(),
                         selector: dataset.selector.clone(),
                         range,
-                    }),
-            );
+                    }))
+                }
+                Err(error) if job.run_mode == IndexRunMode::Verify => {
+                    return Err(verify_storage_error(
+                        &job.chain,
+                        &dataset.dataset_key,
+                        &job.range,
+                        "manifest coverage",
+                        error,
+                    ));
+                }
+                Err(error) => return Err(error),
+            }
         }
+        let finality_boundary = if job.run_mode == IndexRunMode::Verify {
+            verify_finality_boundary(&job)
+        } else {
+            match job.finality_requirement {
+                IndexFinalityRequirement::Safe => self.adapter.cache_safe_height()?,
+                IndexFinalityRequirement::Finalized => self.adapter.finalized_height()?,
+            }
+        };
         let provider_limits =
             provider_limits(&capabilities, &datasets, job.runtime_config.max_chunk_len);
         let plan = IndexPlan::try_new_with_dataset_coverage(
@@ -326,16 +339,12 @@ where
                     range.range.clone(),
                 )
                 .map_err(|error| {
-                    DatalensError::new(
-                        error.kind,
-                        format!(
-                            "verify failed for chain {} dataset {} range {}-{}: {}",
-                            plan.job.chain.configured_name(),
-                            range.dataset_key.as_str(),
-                            range.range.start(),
-                            range.range.end(),
-                            error.message,
-                        ),
+                    verify_storage_error(
+                        &plan.job.chain,
+                        &range.dataset_key,
+                        &range.range,
+                        "read",
+                        error,
                     )
                 })?;
             accounting.chunks_fetched += 1;
@@ -453,6 +462,46 @@ where
             rows_written,
         ))
     }
+}
+
+fn verify_finality_boundary(job: &IndexJob) -> ChainHeight {
+    // Verify mode checks existing durable manifest coverage only. It must not
+    // call the provider to authorize writes because it never writes.
+    ChainHeight {
+        range_kind: job.range.kind(),
+        value: job.range.end(),
+        finality: match job.finality_requirement {
+            IndexFinalityRequirement::Safe => FinalityLevel::Safe,
+            IndexFinalityRequirement::Finalized => FinalityLevel::Finalized,
+        },
+    }
+}
+
+fn verify_storage_error(
+    chain: &datalens_core::ChainIdentity,
+    dataset_key: &datalens_core::DatasetKey,
+    range: &datalens_core::LedgerRange,
+    subsystem: &str,
+    error: DatalensError,
+) -> DatalensError {
+    let kind = match error.kind {
+        DatalensErrorKind::ProviderFailure
+        | DatalensErrorKind::ProviderTimeout
+        | DatalensErrorKind::RateLimited => DatalensErrorKind::StorageReadFailure,
+        kind => kind,
+    };
+    let retryable = kind.is_retryable();
+    DatalensError::new(
+        kind,
+        format!(
+            "verify storage {subsystem} failed for chain {} dataset {} range {}-{} retryable={retryable}: {}",
+            chain.configured_name(),
+            dataset_key.as_str(),
+            range.start(),
+            range.end(),
+            error.message,
+        ),
+    )
 }
 
 fn provider_limits(
