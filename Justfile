@@ -54,11 +54,15 @@ multi-chain-e2e:
   cargo test -p datalens-runtime-indexer --test full_indexing_e2e
   cargo test -p datalens-cli --test index_commands
 
+_cli-index-command-test test:
+  cargo test -p datalens-cli --test index_commands {{test}} -- --exact --list | grep -F -x "{{test}}: test"
+  cargo test -p datalens-cli --test index_commands {{test}} -- --exact
+
 production-readiness:
   cargo test -p datalens-edge --test production_readiness
-  cargo test -p datalens-cli --test index_commands test_index_backfill_persists_cursor_under_configured_cursor_path
-  cargo test -p datalens-cli --test index_commands test_index_resume_uses_persisted_cursor_after_process_restart
-  cargo test -p datalens-cli --test index_commands test_index_verify_does_not_write_data
+  just _cli-index-command-test test_cache_backfill_persists_cursor_under_configured_cursor_path
+  just _cli-index-command-test test_cache_resume_uses_persisted_cursor_after_process_restart
+  just _cli-index-command-test test_cache_verify_does_not_write_data
 
 s3-e2e:
   cargo test -p datalens-storage --test object_store test_s3_object_store_put_get_exists_list_delete_with_prefix
