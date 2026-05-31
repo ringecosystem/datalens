@@ -60,6 +60,11 @@ dataset = "evm.logs"
 finality = "durable"
 chunk_blocks = 1000
 
+[index.application.index.retry]
+max_attempts = 5
+initial_backoff_ms = 250
+max_backoff_ms = 30000
+
 [[index.application.sources]]
 chain = "ethereum"
 family = "evm"

@@ -2,9 +2,10 @@ use datalens_indexer::{
     CheckpointPolicy, DatabaseDriver, DatabaseOutputConfig, DatalensIndexConfig, DecodeAbiConfig,
     DecodeConfig, DecodeEventConfig, DecodeEventInputConfig, FinalityRequirement,
     GraphqlViewConfig, GraphqlViewFieldConfig, GraphqlViewFilterConfig, IndexDataset,
-    MetricsServiceConfig, OutputConfig, ParquetOutputConfig, QueryAuthApplicationConfig,
-    QueryAuthConfig, QueryAuthQuotaConfig, QueryProtocol, QueryServiceConfig, SourceConfig,
-    WebhookHeaderConfig, WebhookOutboxConfig, WebhookOutputConfig, WebhookRetryConfig,
+    IndexRetryConfig, MetricsServiceConfig, OutputConfig, ParquetOutputConfig,
+    QueryAuthApplicationConfig, QueryAuthConfig, QueryAuthQuotaConfig, QueryProtocol,
+    QueryServiceConfig, SourceConfig, WebhookHeaderConfig, WebhookOutboxConfig,
+    WebhookOutputConfig, WebhookRetryConfig,
 };
 
 fn valid_config() -> &'static str {
@@ -120,6 +121,7 @@ fn test_parse_valid_toml_config_returns_typed_schema() {
     assert_eq!(config.index.dataset, IndexDataset::EvmLogs);
     assert_eq!(config.index.finality, FinalityRequirement::Durable);
     assert_eq!(config.index.chunk_blocks, 1000);
+    assert_eq!(config.retry, IndexRetryConfig::default());
     assert_eq!(config.sources.len(), 1);
     assert_eq!(
         config.sources[0],
@@ -146,6 +148,48 @@ fn test_parse_valid_toml_config_returns_typed_schema() {
         CheckpointPolicy::File {
             path: ".data/indexes/ormp/checkpoint.json".into()
         }
+    );
+}
+
+#[test]
+fn test_parse_index_retry_policy_returns_typed_schema() {
+    let input = valid_config().replace(
+        "chunk_blocks = 1000",
+        "chunk_blocks = 1000\n\n[index.retry]\nmax_attempts = 5\ninitial_backoff_ms = 25\nmax_backoff_ms = 250",
+    );
+
+    let config = DatalensIndexConfig::from_toml_str(&input).expect("valid retry config");
+
+    assert_eq!(
+        config.retry,
+        IndexRetryConfig {
+            max_attempts: 5,
+            initial_backoff_ms: 25,
+            max_backoff_ms: 250,
+        }
+    );
+}
+
+#[test]
+fn test_parse_index_retry_rejects_zero_values() {
+    let input = valid_config().replace(
+        "chunk_blocks = 1000",
+        "chunk_blocks = 1000\n\n[index.retry]\nmax_attempts = 0\ninitial_backoff_ms = 0\nmax_backoff_ms = 0",
+    );
+
+    let error = parse_error(&input);
+
+    assert!(
+        error.contains("index.retry.max_attempts: must be greater than 0"),
+        "{error}"
+    );
+    assert!(
+        error.contains("index.retry.initial_backoff_ms: must be greater than 0"),
+        "{error}"
+    );
+    assert!(
+        error.contains("index.retry.max_backoff_ms: must be greater than 0"),
+        "{error}"
     );
 }
 

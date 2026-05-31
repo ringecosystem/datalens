@@ -1,3 +1,5 @@
+mod retry;
+
 use datalens_client::{DatalensClient, HttpTransport};
 use datalens_core::{
     ChainFamily, ChainIdentity, DatasetKey, LedgerRange, LedgerRangeKind, LogFilter, NetworkId,
@@ -7,10 +9,12 @@ use serde::Serialize;
 use std::{collections::BTreeMap, path::PathBuf, time::Instant};
 
 use crate::{
-    CheckpointPolicy, IndexCheckpointFile, IndexCheckpointFileStore, IndexPlan, IndexedRecord,
-    IndexerError, OutputSinkConfig, OutputWriteSink, PlannedDecodeEvent, PlannedIndexTask,
-    decode_evm_log,
+    CheckpointPolicy, IndexCheckpointFile, IndexCheckpointFileStore, IndexPlan, IndexRetryConfig,
+    IndexedRecord, IndexerError, OutputSinkConfig, OutputWriteSink, PlannedDecodeEvent,
+    PlannedIndexTask, decode_evm_log,
 };
+
+use retry::query_with_retry;
 
 #[derive(Clone)]
 pub struct IndexRunner {
@@ -76,16 +80,11 @@ impl IndexRunner {
                 .map_err(|error| IndexerError::Runner(error.to_string()))?;
             let selector = task_query_selector(task)?;
             let started = Instant::now();
-            let response = client
-                .query(
-                    datalens_client::QueryRequest::new(chain, dataset_key, range.clone())
-                        .with_selector(selector)
-                        .with_finality(QueryFinalityRequirement::DurableOnly)
-                        .with_fields(datalens_client::FieldSelection::All),
-                )
-                .map_err(|error| {
-                    IndexerError::Runner(format!("task {} failed: {error}", task.label))
-                })?;
+            let request = datalens_client::QueryRequest::new(chain, dataset_key, range.clone())
+                .with_selector(selector)
+                .with_finality(QueryFinalityRequirement::DurableOnly)
+                .with_fields(datalens_client::FieldSelection::All);
+            let response = query_with_retry(client, request, task, &range, &self.options.retry)?;
             let elapsed_ms = started.elapsed().as_millis();
             let full_durable_hit =
                 missing_ranges(range.clone(), &response.cache.durable_hit_ranges).is_empty()
@@ -479,6 +478,7 @@ pub struct IndexRunnerOptions {
     pub checkpoint: Option<CheckpointPolicy>,
     pub from_start: bool,
     pub dry_run: bool,
+    pub retry: IndexRetryConfig,
 }
 
 impl IndexRunnerOptions {
@@ -506,6 +506,11 @@ impl IndexRunnerOptions {
 
     pub fn with_dry_run(mut self, dry_run: bool) -> Self {
         self.dry_run = dry_run;
+        self
+    }
+
+    pub fn with_retry_policy(mut self, retry: IndexRetryConfig) -> Self {
+        self.retry = retry;
         self
     }
 
