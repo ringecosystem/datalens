@@ -2053,6 +2053,7 @@ name = "datalens-example-degov-client"
 version = "0.1.0"
 dependencies = [
  "datalens-sdk",
+ "rusqlite",
  "serde_json",
 ]
 

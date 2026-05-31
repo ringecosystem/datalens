@@ -9,6 +9,7 @@ use serde_json::Value;
 
 #[derive(Clone, Debug)]
 pub struct RecordedRequest {
+    #[allow(dead_code)]
     pub query: String,
     pub variables: Value,
 }
@@ -43,10 +44,16 @@ impl MockGraphqlServer {
         format!("http://{}", self.address)
     }
 
+    #[allow(dead_code)]
     pub fn only_request(&self) -> RecordedRequest {
         let requests = self.requests.lock().expect("recorded requests");
         assert_eq!(requests.len(), 1);
         requests[0].clone()
+    }
+
+    #[allow(dead_code)]
+    pub fn requests(&self) -> Vec<RecordedRequest> {
+        self.requests.lock().expect("recorded requests").clone()
     }
 }
 
