@@ -1,5 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 
+pub const DEFAULT_SERVER_CONFIG: &str = "config/datalens.dev.toml";
+
 use super::{
     BenchmarkCommand, CacheCommand, IndexCommand, InspectCommand, QueryCommand, ServeCommand,
     benchmark_command, cache_command, doctor_command, index_command, inspect_command, plan_command,
@@ -27,7 +29,7 @@ pub enum Command {
 
 #[derive(Debug, Args)]
 pub struct ConfigCommand {
-    #[arg(long, default_value = "datalens.toml")]
+    #[arg(long, default_value = DEFAULT_SERVER_CONFIG, help = "Datalens server config path")]
     pub config: String,
 }
 

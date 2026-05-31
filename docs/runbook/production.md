@@ -64,8 +64,8 @@ runtime settings, and detected safe/finalized height for every configured chain.
 
 ```bash
 export DATALENS_ETHEREUM_RPC_URL="http://127.0.0.1:8545"
-cargo run -p datalens-cli -- doctor --config config/datalens.local.toml
-cargo run -p datalens-cli -- serve --config config/datalens.local.toml
+cargo run -p datalens-cli -- doctor --config config/datalens.dev.toml
+cargo run -p datalens-cli -- serve --config config/datalens.dev.toml
 ```
 
 Expected output: doctor succeeds against the configured local RPC fixture or node, and

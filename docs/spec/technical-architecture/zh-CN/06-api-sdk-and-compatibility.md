@@ -40,7 +40,7 @@ Authentication token 不能出现在日志或 API error response 中。
 ## HTTP Contract
 
 Edge 通过 REST 和 GraphQL 暴露同一份原生查询能力。REST 使用 `POST /v1/query`。GraphQL 在
-`POST /graphql` 上使用 `query(input:)`。两种入口必须使用相同的 application identity、相同的
+`POST /native/graphql` 上使用 `query(input:)`。两种入口必须使用相同的 application identity、相同的
 原生请求校验、相同的 `NativeQueryInput` 执行路径，并返回相同的 cache 和 row 语义。GraphQL
 可以为了客户端易用性包装 JSON scalar，但不能引入独立的 planner、storage contract 或 dataset
 词汇。

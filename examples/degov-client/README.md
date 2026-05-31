@@ -11,7 +11,7 @@ server, edge, storage, or indexer runtime crates.
 Start Datalens separately:
 
 ```sh
-cargo run -p datalens-cli -- serve --config path/to/datalens.toml
+cargo run -p datalens-cli -- serve --config config/datalens.dev.toml
 ```
 
 Run the Degov consumer:

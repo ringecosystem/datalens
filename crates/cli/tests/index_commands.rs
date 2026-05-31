@@ -1,5 +1,6 @@
 use std::{
     fs,
+    path::PathBuf,
     process::Command as ProcessCommand,
     sync::{Arc, Mutex},
 };
@@ -485,23 +486,35 @@ fn test_ormp_client_example_is_sdk_client_only() {
     assert!(!dependencies.contains_key("datalens-runtime-indexer"));
     assert!(!dependencies.contains_key("datalens-processor-sdk"));
 
-    for path in [
-        "src/lib.rs",
-        "src/main.rs",
-        "src/messages.rs",
-        "tests/client_smoke.rs",
-        "tests/support/mod.rs",
-        "tests/support/server.rs",
-    ] {
-        let source = fs::read_to_string(example_dir.join(path)).expect("read ORMP client source");
+    let mut sources = vec![example_dir.join("src"), example_dir.join("tests")];
+    while let Some(path) = sources.pop() {
+        if path.is_dir() {
+            for entry in fs::read_dir(&path).expect("read ORMP client source directory") {
+                sources.push(entry.expect("read ORMP client source entry").path());
+            }
+            continue;
+        }
+        if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
+            continue;
+        }
+
+        let source = fs::read_to_string(&path).expect("read ORMP client source");
+        let path = relative_path(&example_dir, path);
         assert!(!source.contains("datalens_indexer"), "{path}");
         assert!(!source.contains("datalens_runtime"), "{path}");
         assert!(!source.contains("datalens_processor"), "{path}");
     }
 }
 
+fn relative_path(root: &std::path::Path, path: PathBuf) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(&path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
 #[test]
-fn test_compose_service_config_embeds_application_index_environment() {
+fn test_compose_service_config_is_server_only() {
     let config_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../config/datalens.compose.toml")
         .canonicalize()
@@ -520,14 +533,6 @@ fn test_compose_service_config_embeds_application_index_environment() {
         std::env::set_var("DATALENS_ORMP_TOKEN", "replace-with-ormp-token");
         std::env::set_var("DATALENS_LIVE_SMOKE_TOKEN", "replace-with-live-smoke-token");
         std::env::set_var("DATALENS_METRICS_TOKEN", "replace-with-metrics-token");
-        std::env::set_var(
-            "DATALENS_INDEX_DATABASE_URL",
-            "postgres://datalens:replace-with-password@postgres.example.invalid:5432/datalens",
-        );
-        std::env::set_var(
-            "DATALENS_INDEX_QUERY_METRICS_TOKEN",
-            "replace-with-index-metrics-token",
-        );
     }
 
     let plan_output = ProcessCommand::new(env!("CARGO_BIN_EXE_datalens"))
@@ -545,14 +550,6 @@ fn test_compose_service_config_embeds_application_index_environment() {
         .env("DATALENS_ORMP_TOKEN", "replace-with-ormp-token")
         .env("DATALENS_LIVE_SMOKE_TOKEN", "replace-with-live-smoke-token")
         .env("DATALENS_METRICS_TOKEN", "replace-with-metrics-token")
-        .env(
-            "DATALENS_INDEX_DATABASE_URL",
-            "postgres://datalens:replace-with-password@postgres.example.invalid:5432/datalens",
-        )
-        .env(
-            "DATALENS_INDEX_QUERY_METRICS_TOKEN",
-            "replace-with-index-metrics-token",
-        )
         .output()
         .expect("run compose service plan");
 
@@ -564,8 +561,7 @@ fn test_compose_service_config_embeds_application_index_environment() {
     );
     let plan: serde_json::Value = serde_json::from_slice(&plan_output.stdout).expect("plan JSON");
     assert_eq!(plan["status"], "planned");
-    assert_eq!(plan["service"]["index"]["application_configured"], true);
-    assert_eq!(plan["service"]["query"]["index"]["graphql_enabled"], true);
+    assert_eq!(plan["service"]["query"]["index"]["graphql_enabled"], false);
     assert_eq!(plan["service"]["query"]["index"]["path"], "/index/graphql");
 }
 
