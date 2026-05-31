@@ -1,0 +1,32 @@
+export { DatalensClient } from "./client.js";
+export {
+  DatalensAuthError,
+  DatalensError,
+  DatalensGraphQLError,
+  DatalensHttpError,
+  DatalensRateLimitError,
+  DatalensTimeoutError,
+} from "./errors.js";
+export type {
+  ChainDiscovery,
+  ChainFamilyInput,
+  ChainIdentityInput,
+  ConnectionEdge,
+  ConnectionPage,
+  DatasetDiscovery,
+  DatasetKeyInput,
+  DatalensClientOptions,
+  DecodedEvent,
+  Discovery,
+  EventPageInfo,
+  EventQuery,
+  FetchLike,
+  FieldSelectionInput,
+  JsonValue,
+  NativeQueryInput,
+  NativeQueryResponse,
+  NetworkIdInput,
+  QueryRangeInput,
+  QuerySelectorInput,
+  RawIndexedEvent,
+} from "./types.js";
