@@ -17,6 +17,8 @@ members = [
   "crates/adapters/tron",
   "crates/runtime/warmup",
   "crates/runtime/writer",
+  "examples/degov-client",
+  "examples/ormp-client",
   "sdks/rust",
 ]
 resolver = "3"

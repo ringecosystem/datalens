@@ -1,0 +1,12 @@
+[package]
+name = "datalens-example-ormp-client"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+publish = false
+
+[dependencies]
+datalens-sdk = { path = "../../sdks/rust" }
+
+[dev-dependencies]
+serde_json.workspace = true
