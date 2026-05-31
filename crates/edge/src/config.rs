@@ -204,6 +204,7 @@ impl Default for WarmupConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IndexConfig {
     #[serde(default = "default_index_chunk_range")]
     pub default_chunk_range: u64,
@@ -215,8 +216,6 @@ pub struct IndexConfig {
     pub default_finality: String,
     #[serde(default = "default_index_cursor_path")]
     pub cursor_path: String,
-    #[serde(default)]
-    pub application: Option<toml::Value>,
 }
 
 impl Default for IndexConfig {
@@ -227,7 +226,6 @@ impl Default for IndexConfig {
             retry: IndexRetryConfig::default(),
             default_finality: default_index_finality(),
             cursor_path: default_index_cursor_path(),
-            application: None,
         }
     }
 }

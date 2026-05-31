@@ -24,7 +24,7 @@ pub use inspect::{InspectCommand, InspectSubcommand, InspectUsageCommand, inspec
 pub(crate) use plan::plan_command;
 pub(crate) use query::query_command;
 pub use query::{QueryBlocksCommand, QueryCommand, QueryLogsCommand, QuerySubcommand};
-pub use root::{Cli, Command, ConfigCommand, run};
+pub use root::{Cli, Command, ConfigCommand, DEFAULT_SERVER_CONFIG, run};
 pub use serve::{ServeCommand, serve_command, serve_edge_config};
 
 pub use helpers::redact_url;

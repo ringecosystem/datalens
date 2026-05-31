@@ -11,13 +11,14 @@ example is a separate application process. It uses only `datalens-sdk` and the
 public `/index/graphql` protocol; it does not link Datalens server, edge,
 storage, indexer, or runtime crates.
 
-Start Datalens separately with index GraphQL enabled:
+Start the shared Datalens service separately:
 
 ```sh
-cargo run -p datalens-cli -- serve --config path/to/datalens.toml
+cargo run -p datalens-cli -- serve --config config/datalens.dev.toml
 ```
 
-Run the ORMP application consumer against that service:
+Run the ORMP application consumer against its external application index GraphQL
+endpoint:
 
 ```sh
 DATALENS_INDEX_GRAPHQL_URL=http://127.0.0.1:3000/index/graphql \
@@ -25,9 +26,9 @@ ORMP_DATABASE_URL=sqlite:.tmp/ormp-client.sqlite \
   cargo run -p datalens-example-ormp-client
 ```
 
-The default endpoint is `http://127.0.0.1:3000/index/graphql`, matching the
-local Datalens serve default. Use `DATALENS_TOKEN` when the service requires an
-application token.
+The default endpoint is `http://127.0.0.1:3000/index/graphql`. Use
+`DATALENS_TOKEN` when the external application service requires an application
+token.
 
 ## Configuration
 

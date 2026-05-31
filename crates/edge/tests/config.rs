@@ -37,8 +37,8 @@ fn test_config_query_index_namespace_controls_index_graphql_settings() {
 }
 
 #[test]
-fn test_config_embeds_application_index_config_under_service_index() {
-    let config: DatalensConfig = toml::from_str(&config_text("[query.native]").replace(
+fn test_config_rejects_embedded_application_index_config_under_service_index() {
+    let error = toml::from_str::<DatalensConfig>(&config_text("[query.native]").replace(
         r#"
         [chains.ethereum]"#,
         r#"
@@ -70,9 +70,9 @@ fn test_config_embeds_application_index_config_under_service_index() {
 
         [chains.ethereum]"#,
     ))
-    .expect("service config with embedded application index should parse");
+    .expect_err("service config must not embed application index config");
 
-    assert!(config.index.application.is_some());
+    assert!(error.to_string().contains("unknown field `application`"));
 }
 
 #[test]
