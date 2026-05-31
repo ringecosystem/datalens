@@ -2049,6 +2049,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "datalens-example-degov-client"
+version = "0.1.0"
+dependencies = [
+ "datalens-sdk",
+ "serde_json",
+]
+
+[[package]]
+name = "datalens-example-ormp-client"
+version = "0.1.0"
+dependencies = [
+ "datalens-sdk",
+ "serde_json",
+]
+
+[[package]]
 name = "datalens-executor"
 version = "0.1.0"
 dependencies = [
