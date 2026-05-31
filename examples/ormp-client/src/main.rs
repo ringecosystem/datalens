@@ -5,7 +5,7 @@ use datalens_sdk::{ClientConfig, DatalensClient};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let endpoint = env::var("DATALENS_INDEX_GRAPHQL_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:8080/index/graphql".to_owned());
+        .unwrap_or_else(|_| "http://127.0.0.1:8080/graphql".to_owned());
     let bearer_token = env::var("DATALENS_TOKEN").ok();
     let after = env::var("DATALENS_AFTER_CURSOR").ok();
     let client = DatalensClient::new(ClientConfig {

@@ -6,7 +6,7 @@ use datalens_planner::{FieldSelection, NativeQueryInput};
 use crate::config::{load_config, validate_config};
 use crate::runtime::build_service;
 
-use super::{chain_identity, configured_chain};
+use super::{DEFAULT_SERVER_CONFIG, chain_identity, configured_chain};
 
 #[derive(Debug, Args)]
 pub struct QueryCommand {
@@ -22,7 +22,7 @@ pub enum QuerySubcommand {
 
 #[derive(Debug, Args)]
 pub struct QueryBlocksCommand {
-    #[arg(long, default_value = "datalens.toml")]
+    #[arg(long, default_value = DEFAULT_SERVER_CONFIG, help = "Datalens server config path")]
     pub config: String,
 
     #[arg(long)]
@@ -37,7 +37,7 @@ pub struct QueryBlocksCommand {
 
 #[derive(Debug, Args)]
 pub struct QueryLogsCommand {
-    #[arg(long, default_value = "datalens.toml")]
+    #[arg(long, default_value = DEFAULT_SERVER_CONFIG, help = "Datalens server config path")]
     pub config: String,
 
     #[arg(long)]

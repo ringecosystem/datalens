@@ -86,7 +86,7 @@ pub struct CacheVerifyCommand {
 
 #[derive(Debug, Clone, Args)]
 pub struct CacheCommonCommand {
-    #[arg(long, default_value = "datalens.toml")]
+    #[arg(long, default_value = super::DEFAULT_SERVER_CONFIG, help = "Datalens server config path")]
     pub config: String,
 
     #[arg(long)]

@@ -6,14 +6,14 @@ Datalens service through the Rust SDK.
 Run Datalens as the public service owner:
 
 ```sh
-datalens serve --config path/to/datalens.toml
+datalens serve --config config/datalens.dev.toml
 ```
 
-Applications do not embed Datalens internals. They call the index GraphQL
-endpoint served at `/index/graphql`:
+Applications do not embed Datalens internals. They call an external application index
+GraphQL endpoint:
 
 ```sh
-DATALENS_INDEX_GRAPHQL_URL=http://127.0.0.1:8080/index/graphql \
+DATALENS_INDEX_GRAPHQL_URL=http://127.0.0.1:8080/graphql \
   cargo run -p datalens-example-ormp-client
 ```
 

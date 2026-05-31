@@ -39,6 +39,18 @@ fn test_serve_accepts_config_path() {
 }
 
 #[test]
+fn test_serve_defaults_to_dev_server_config() {
+    let cli = Cli::parse_from(["datalens", "serve"]);
+
+    match cli.command {
+        Command::Serve(command) => {
+            assert_eq!(command.config, "config/datalens.dev.toml");
+        }
+        command => panic!("expected serve command, got {command:?}"),
+    }
+}
+
+#[test]
 fn test_serve_accepts_enable_graphql_flag() {
     assert!(Cli::try_parse_from(["datalens", "serve", "--enable-graphql"]).is_err());
 }
@@ -54,11 +66,21 @@ fn test_plan_accepts_config_path() {
 }
 
 #[test]
+fn test_plan_defaults_to_dev_server_config() {
+    let cli = Cli::parse_from(["datalens", "plan"]);
+
+    match cli.command {
+        Command::Plan(command) => assert_eq!(command.config, "config/datalens.dev.toml"),
+        command => panic!("expected plan command, got {command:?}"),
+    }
+}
+
+#[test]
 fn test_serve_uses_unified_query_config() {
     let config: DatalensConfig =
         toml::from_str(&minimal_config_text()).expect("minimal config should parse");
     let command = ServeCommand {
-        config: "datalens.toml".to_owned(),
+        config: "config/datalens.dev.toml".to_owned(),
     };
 
     let edge = serve_edge_config(&config, &command);
@@ -68,6 +90,53 @@ fn test_serve_uses_unified_query_config() {
     assert!(!edge.query.native.playground_enabled);
     assert!(!edge.query.index.graphql_enabled);
     assert_eq!(edge.query.index.path, "/index/graphql");
+}
+
+#[test]
+fn test_validate_config_rejects_server_index_graphql_surface() {
+    let config: DatalensConfig = toml::from_str(&minimal_config_text().replace(
+        r#"
+    [chains.ethereum]"#,
+        r#"
+    [query.index]
+    graphql_enabled = true
+    path = "/index/graphql"
+    playground_enabled = true
+    playground_path = "/index/graphiql"
+
+    [chains.ethereum]"#,
+    ))
+    .expect("config parses");
+
+    let error = validate_config(&config).expect_err("index graphql is not a server surface");
+
+    assert!(error.message.contains("query.index.graphql_enabled"));
+    assert!(error.message.contains("external application service"));
+}
+
+#[test]
+fn test_authoritative_server_configs_parse_and_validate() {
+    unsafe {
+        std::env::set_var("DATALENS_ETHEREUM_RPC_URL", "http://example.invalid");
+        std::env::set_var("DATALENS_S3_BUCKET", "datalens");
+        std::env::set_var("DATALENS_S3_PREFIX", "test");
+        std::env::set_var("DATALENS_S3_REGION", "auto");
+        std::env::set_var("DATALENS_S3_ENDPOINT_URL", "http://127.0.0.1:9000");
+        std::env::set_var("DATALENS_PUBLIC_APP_TOKEN", "replace-with-public-token");
+        std::env::set_var("DATALENS_ORMP_TOKEN", "replace-with-ormp-token");
+        std::env::set_var("DATALENS_METRICS_TOKEN", "replace-with-metrics-token");
+    }
+
+    for path in [
+        "config/datalens.dev.toml",
+        "config/datalens.compose.toml",
+        "config/datalens.production.toml",
+    ] {
+        let config = DatalensConfig::from_file(workspace_root().join(path))
+            .unwrap_or_else(|error| panic!("{path} should parse: {error}"));
+
+        validate_config(&config).unwrap_or_else(|error| panic!("{path} should validate: {error}"));
+    }
 }
 
 fn minimal_config_text() -> String {
@@ -1067,11 +1136,7 @@ fn test_production_config_doctor_smoke_uses_nonsecret_environment() {
     })]);
 
     let output = ProcessCommand::new(env!("CARGO_BIN_EXE_datalens"))
-        .args([
-            "doctor",
-            "--config",
-            "examples/config/datalens.server.production.toml",
-        ])
+        .args(["doctor", "--config", "config/datalens.production.toml"])
         .current_dir(workspace_root())
         .env("DATALENS_ETHEREUM_RPC_URL", url)
         .env("DATALENS_S3_BUCKET", "datalens-production")

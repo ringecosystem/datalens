@@ -501,7 +501,7 @@ fn test_ormp_client_example_is_sdk_client_only() {
 }
 
 #[test]
-fn test_compose_service_config_embeds_application_index_environment() {
+fn test_compose_service_config_is_server_only() {
     let config_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../config/datalens.compose.toml")
         .canonicalize()
@@ -516,14 +516,6 @@ fn test_compose_service_config_embeds_application_index_environment() {
         std::env::set_var("DATALENS_PUBLIC_APP_TOKEN", "replace-with-public-token");
         std::env::set_var("DATALENS_ORMP_TOKEN", "replace-with-ormp-token");
         std::env::set_var("DATALENS_METRICS_TOKEN", "replace-with-metrics-token");
-        std::env::set_var(
-            "DATALENS_INDEX_DATABASE_URL",
-            "postgres://datalens:replace-with-password@postgres.example.invalid:5432/datalens",
-        );
-        std::env::set_var(
-            "DATALENS_INDEX_QUERY_METRICS_TOKEN",
-            "replace-with-index-metrics-token",
-        );
     }
 
     let plan_output = ProcessCommand::new(env!("CARGO_BIN_EXE_datalens"))
@@ -537,14 +529,6 @@ fn test_compose_service_config_embeds_application_index_environment() {
         .env("DATALENS_PUBLIC_APP_TOKEN", "replace-with-public-token")
         .env("DATALENS_ORMP_TOKEN", "replace-with-ormp-token")
         .env("DATALENS_METRICS_TOKEN", "replace-with-metrics-token")
-        .env(
-            "DATALENS_INDEX_DATABASE_URL",
-            "postgres://datalens:replace-with-password@postgres.example.invalid:5432/datalens",
-        )
-        .env(
-            "DATALENS_INDEX_QUERY_METRICS_TOKEN",
-            "replace-with-index-metrics-token",
-        )
         .output()
         .expect("run compose service plan");
 
@@ -556,8 +540,7 @@ fn test_compose_service_config_embeds_application_index_environment() {
     );
     let plan: serde_json::Value = serde_json::from_slice(&plan_output.stdout).expect("plan JSON");
     assert_eq!(plan["status"], "planned");
-    assert_eq!(plan["service"]["index"]["application_configured"], true);
-    assert_eq!(plan["service"]["query"]["index"]["graphql_enabled"], true);
+    assert_eq!(plan["service"]["query"]["index"]["graphql_enabled"], false);
     assert_eq!(plan["service"]["query"]["index"]["path"], "/index/graphql");
 }
 

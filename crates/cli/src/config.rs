@@ -113,7 +113,6 @@ pub fn validate_config(config: &DatalensConfig) -> Result<(), DatalensError> {
     }
     validate_index_config(config)?;
     validate_query_config(config)?;
-    validate_application_index_config(config)?;
     validate_warmup_config(config)?;
     validate_applications(config)?;
     for (name, chain) in &config.chains {
@@ -122,45 +121,15 @@ pub fn validate_config(config: &DatalensConfig) -> Result<(), DatalensError> {
     Ok(())
 }
 
-pub(crate) fn application_index_config(
-    config: &DatalensConfig,
-) -> Result<Option<datalens_indexer::DatalensIndexConfig>, DatalensError> {
-    let Some(application) = &config.index.application else {
-        return Ok(None);
-    };
-    let input = toml::to_string(application).map_err(|error| {
-        DatalensError::new(
-            DatalensErrorKind::InvalidInput,
-            format!("index.application: serialize embedded config: {error}"),
-        )
-    })?;
-    datalens_indexer::DatalensIndexConfig::from_toml_str(&input)
-        .map(Some)
-        .map_err(|error| {
-            DatalensError::new(
-                DatalensErrorKind::InvalidInput,
-                format!("index.application: {error}"),
-            )
-        })
-}
-
-fn validate_application_index_config(config: &DatalensConfig) -> Result<(), DatalensError> {
-    let Some(application) = application_index_config(config)? else {
-        if config.query.index.graphql_enabled {
-            return Err(DatalensError::new(
-                DatalensErrorKind::InvalidInput,
-                "query.index.graphql_enabled requires index.application",
-            ));
-        }
-        return Ok(());
-    };
-    let _ = application;
-    Ok(())
-}
-
 fn validate_query_config(config: &DatalensConfig) -> Result<(), DatalensError> {
     validate_query_surface("query.native", &config.query.native)?;
     validate_query_surface("query.index", &config.query.index)?;
+    if config.query.index.graphql_enabled {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "query.index.graphql_enabled is not a Datalens server surface; run application index GraphQL as an external application service",
+        ));
+    }
     let paths = [
         ("query.native.path", &config.query.native.path),
         (

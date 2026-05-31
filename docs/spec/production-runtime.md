@@ -37,8 +37,9 @@ release gates.
 
 ## Configuration And Secrets
 
-- `config/datalens.production.toml` is the production configuration schema example.
-- `config/datalens.local.toml` is the local development profile example.
+- `config/datalens.dev.toml` is the local development Datalens server profile.
+- `config/datalens.compose.toml` is the Docker Compose Datalens server profile.
+- `config/datalens.production.toml` is the production Datalens server template.
 - Production must set `storage.backend = "s3"` and configure `[storage.s3]`.
 - Local development may set `storage.backend = "local"` and configure
   `[storage.local]`.
@@ -74,12 +75,9 @@ release gates.
   `query.native.graphql_enabled = true`.
 - `GET /native/graphiql` exposes native GraphiQL when native GraphQL and
   `query.native.playground_enabled` are both enabled.
-- `POST /index/graphql` is the application index GraphQL query transport when
-  `query.index.graphql_enabled = true` and `index.application` is configured.
-- `GET /index/graphiql` exposes application index GraphiQL when index GraphQL and
-  `query.index.playground_enabled` are both enabled.
-- Native and application index GraphQL schemas are separate query surfaces. They must not
-  be merged into one ambiguous schema.
+- Application-specific index GraphQL endpoints are owned by external application
+  services. They must not be configured through Datalens server config or launched by
+  `datalens serve`.
 - REST and GraphQL query operations must expose equivalent query capability over the
   same native contract: `chain`, `dataset_key`, `selector`, `range`, `finality`, and
   `fields`. GraphQL may reshape inputs and outputs for GraphQL clients, but it must not

@@ -6,14 +6,14 @@ and keeping application-owned state outside Datalens.
 Run one shared Datalens service:
 
 ```sh
-datalens serve --config path/to/datalens.toml
+datalens serve --config config/datalens.dev.toml
 ```
 
-The application consumes `/index/graphql` through `sdks/rust`; it does not link
-server-side indexing crates.
+The application consumes an external application index GraphQL service through
+`sdks/rust`; it does not link server-side indexing crates.
 
 ```sh
-DATALENS_INDEX_GRAPHQL_URL=http://127.0.0.1:8080/index/graphql \
+DATALENS_INDEX_GRAPHQL_URL=http://127.0.0.1:8080/graphql \
   cargo run -p datalens-example-degov-client
 ```
 

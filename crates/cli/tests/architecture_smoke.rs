@@ -81,6 +81,9 @@ fn serve_path_builds_registry_without_first_chain_selection() {
 
     assert!(source.contains("build_service_registry(&config)?"));
     assert!(!source.contains("fn first_chain("));
+    assert!(!source.contains("application_index_config"));
+    assert!(!source.contains("IndexDaemon"));
+    assert!(!source.contains("with_extra_router"));
 }
 
 #[test]
@@ -147,32 +150,65 @@ fn production_boundary_artifacts_are_declared() {
 fn local_compose_deployment_artifacts_are_declared() {
     let compose = include_str!("../../../docker-compose.yml");
     let env_example = include_str!("../../../.env.example");
+    let dev_config = include_str!("../../../config/datalens.dev.toml");
     let compose_config = include_str!("../../../config/datalens.compose.toml");
     let gitignore = include_str!("../../../.gitignore");
     let runbook = include_str!("../../../docs/runbook/local-rustfs.md");
 
     assert!(compose.contains("datalens-server:"));
     assert!(!compose.contains("datalens-index-daemon:"));
-    assert!(compose.contains(".data/indexes:/var/lib/datalens/indexes"));
     assert!(compose.contains("condition: service_healthy"));
-    assert!(compose.contains("DATALENS_INDEX_DATABASE_URL"));
 
     assert!(env_example.contains("DATALENS_SERVER_CONFIG=/etc/datalens/datalens.toml"));
-    assert!(env_example.contains("DATALENS_INDEX_DATABASE_URL="));
+    assert!(!env_example.contains(&format!("DATALENS_{}=", "INDEX_DATABASE_URL")));
 
+    assert!(dev_config.contains("root = \".tmp/datalens-dev\""));
     assert!(compose_config.contains("bucket = \"${DATALENS_S3_BUCKET}\""));
     assert!(compose_config.contains("endpoint_url = \"${DATALENS_S3_ENDPOINT_URL}\""));
     assert!(compose_config.contains("token = \"${DATALENS_ORMP_TOKEN}\""));
-    assert!(compose_config.contains("[index.application.client]"));
-    assert!(compose_config.contains("[index.application.decode]"));
-    assert!(compose_config.contains("name = \"MessageAccepted\""));
-    assert!(compose_config.contains(
-        "topic0 = \"0xcfb9b3466878aff0c7df17da215fd57d59eb245a5d03f5a7b57294d54581eb18\""
-    ));
-    assert!(compose_config.contains("url = \"${DATALENS_INDEX_DATABASE_URL}\""));
-    assert!(compose_config.contains("token_env = \"DATALENS_ORMP_TOKEN\""));
+    assert!(!compose_config.contains("[index.application"));
+    assert!(!compose_config.contains(&format!("DATALENS_{}", "INDEX_DATABASE_URL")));
 
     assert!(gitignore.contains(".data/"));
     assert!(runbook.contains("docker compose up -d rustfs-init postgres"));
     assert!(runbook.contains("docker compose --profile datalens up -d --build"));
+}
+
+#[test]
+fn authoritative_server_config_files_are_declared() {
+    for path in [
+        "../../config/datalens.dev.toml",
+        "../../config/datalens.compose.toml",
+        "../../config/datalens.production.toml",
+    ] {
+        let source =
+            std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path))
+                .expect("read authoritative server config");
+        assert!(!source.contains("[index.application"));
+    }
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    assert!(!root.join("datalens.toml").exists());
+    assert!(
+        !root
+            .join(
+                ["config", &["datalens", "local", "toml"].join(".")]
+                    .iter()
+                    .collect::<std::path::PathBuf>(),
+            )
+            .exists()
+    );
+    assert!(
+        !root
+            .join(
+                [
+                    "examples",
+                    "config",
+                    &["datalens", "server", "production", "toml"].join(".")
+                ]
+                .iter()
+                .collect::<std::path::PathBuf>(),
+            )
+            .exists()
+    );
 }

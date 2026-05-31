@@ -12,7 +12,7 @@ development secrets are copied from `.env.example` to `.env` if defaults should 
 overridden.
 
 Depends on: `docker-compose.yml` for RustFS, PostgreSQL, bucket initialization, and the
-unified Datalens service.
+shared Datalens server.
 
 Verification: `docker compose up -d rustfs-init` creates `.data/oss`, starts RustFS, and
 creates the configured bucket.
@@ -48,7 +48,7 @@ Start object storage and PostgreSQL:
 docker compose up -d rustfs-init postgres
 ```
 
-Build and start the local Datalens service with the embedded ORMP index example:
+Build and start the local shared Datalens server:
 
 ```sh
 docker compose --profile datalens up -d --build
@@ -61,8 +61,8 @@ docker compose --profile datalens ps
 ```
 
 The Datalens service listens on `http://localhost:3000`. Native GraphQL is exposed at
-`/native/graphql` when enabled, and the ORMP application index GraphQL surface is exposed
-at `/index/graphql` when enabled.
+`/native/graphql` when enabled. Application index GraphQL endpoints are served by
+external application services, not by `datalens serve`.
 
 ## Test Configuration
 
@@ -100,5 +100,4 @@ rm -rf .data/oss
 ```
 
 `.data/oss` is local persisted object data and must not be committed.
-`.data/postgres` and `.data/indexes` are local PostgreSQL and application index data and
-must not be committed.
+`.data/postgres` is local PostgreSQL data and must not be committed.

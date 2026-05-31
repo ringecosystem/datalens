@@ -95,7 +95,7 @@ The SDK also exposes `DatalensClient::index()` wrappers over the checked-in
 ## HTTP Contract
 
 The edge exposes the native query contract through REST and GraphQL transports. REST
-uses `POST /v1/query`. GraphQL uses the `query(input:)` field on `POST /graphql`. Both
+uses `POST /v1/query`. GraphQL uses the `query(input:)` field on `POST /native/graphql`. Both
 transports must authorize the same application identity, enforce the same native request
 validation, call the same `NativeQueryInput` execution path, and return the same cache
 and row semantics. GraphQL may wrap chain identity, range, cache, and rows in JSON
