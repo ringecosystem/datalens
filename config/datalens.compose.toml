@@ -298,6 +298,21 @@ max_query_range_blocks = 10000
 max_requests_per_minute = 120
 max_concurrent_requests = 8
 
+[[applications.applications]]
+id = "live-smoke"
+name = "live-smoke"
+enabled = true
+display_name = "Live Smoke"
+token = "${DATALENS_LIVE_SMOKE_TOKEN}"
+chains = ["ethereum", "solana-mainnet-beta", "tron-mainnet"]
+datasets = ["evm.blocks", "evm.logs", "solana.slots", "solana.transactions", "solana.instructions", "tron.blocks", "tron.events"]
+operations = ["query", "discovery"]
+
+[applications.applications.quota]
+max_query_range_blocks = 1000
+max_requests_per_minute = 120
+max_concurrent_requests = 8
+
 [chains.ethereum]
 kind = "evm"
 chain_id = 1
@@ -316,3 +331,42 @@ max_batch_blocks = 1000
 enabled = true
 max_get_logs_range_blocks = 10000
 max_addresses_per_query = 32
+
+[chains.solana-mainnet-beta]
+kind = "solana"
+chain_id = 101
+rpc_urls = ["${DATALENS_SOLANA_RPC_URL}"]
+
+[chains.solana-mainnet-beta.finality]
+mode = "auto"
+
+[chains.solana-mainnet-beta.datasets.blocks]
+enabled = true
+max_batch_blocks = 8
+
+[chains.solana-mainnet-beta.datasets.logs]
+enabled = false
+max_get_logs_range_blocks = 1
+max_addresses_per_query = 1
+
+[chains.tron-mainnet]
+kind = "tron"
+chain_id = 728126428
+rpc_urls = ["${DATALENS_TRON_RPC_URL}"]
+
+[chains.tron-mainnet.trongrid]
+enabled = true
+base_url = "https://api.trongrid.io"
+api_key = "${DATALENS_TRONGRID_API_KEY}"
+
+[chains.tron-mainnet.finality]
+mode = "auto"
+
+[chains.tron-mainnet.datasets.blocks]
+enabled = true
+max_batch_blocks = 8
+
+[chains.tron-mainnet.datasets.logs]
+enabled = true
+max_get_logs_range_blocks = 8
+max_addresses_per_query = 4

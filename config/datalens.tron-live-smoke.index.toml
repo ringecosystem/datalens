@@ -1,0 +1,30 @@
+[client]
+endpoint = "http://127.0.0.1:3000"
+application = "live-smoke"
+token_env = "DATALENS_LIVE_SMOKE_TOKEN"
+
+[index]
+name = "tron-live-smoke"
+dataset = "tron.events"
+finality = "durable"
+chunk_blocks = 2
+
+[[sources]]
+chain = "tron-mainnet"
+family = "tron"
+chain_id = 728126428
+dataset = "tron.events"
+from_block = 60000000
+to_block = 60000001
+contracts = ["0xa614f803b6fd780986a42c78ec9c7f77e6ded13c"]
+events = ["Transfer"]
+
+[output]
+kind = "database"
+
+[output.database]
+driver = "postgres"
+url = "${DATALENS_INDEX_DATABASE_URL}"
+
+[checkpoint]
+path = ".data/indexes/tron-live-smoke/checkpoint.json"
