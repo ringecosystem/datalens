@@ -47,6 +47,18 @@ fn test_slots_fetch_skips_missing_slots_and_keeps_ordered_adapter_json_rows() {
 }
 
 #[test]
+fn test_transport_error_redacts_rpc_url_credentials() {
+    let url = unavailable_rpc_url("secret=solana-secret&token=solana-token");
+    let error = SolanaHttpRpc::new(url)
+        .get_slot(datalens_solana::SolanaCommitment::Finalized)
+        .expect_err("transport error");
+
+    assert!(!error.message.contains("solana-secret"));
+    assert!(!error.message.contains("solana-token"));
+    assert!(!error.message.contains("secret="));
+}
+
+#[test]
 fn test_program_selector_fetches_transactions_and_instructions() {
     let adapter = SolanaAdapter::with_fixture_defaults();
     let selector = solana_program_selector("program1111111111111111111111111111111111")
@@ -652,6 +664,13 @@ fn start_rpc_server(responses: Vec<RpcResponse>) -> String {
     });
 
     format!("http://{address}")
+}
+
+fn unavailable_rpc_url(query: &str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind unused port");
+    let address = listener.local_addr().expect("unused port address");
+    drop(listener);
+    format!("http://{address}/rpc?{query}")
 }
 
 fn rpc_block(slot: u64) -> Value {

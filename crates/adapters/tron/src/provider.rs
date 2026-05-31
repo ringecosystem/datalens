@@ -52,6 +52,7 @@ impl TronHttpProvider {
             .json(&body)
             .send()
             .map_err(|error| {
+                let error = error.without_url();
                 DatalensError::new(
                     DatalensErrorKind::ProviderFailure,
                     format!("Tron provider request failed: {error}"),
@@ -176,6 +177,7 @@ impl TronProvider for TronHttpProvider {
             .header("TRON-PRO-API-KEY", api_key)
             .send()
             .map_err(|error| {
+                let error = error.without_url();
                 DatalensError::new(
                     DatalensErrorKind::ProviderFailure,
                     format!("TronGrid contract events request failed: {error}"),

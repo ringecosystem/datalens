@@ -43,6 +43,18 @@ fn test_classify_provider_error_maps_known_failure_modes() {
 }
 
 #[test]
+fn test_transport_error_redacts_rpc_url_credentials() {
+    let url = unavailable_rpc_url("secret=evm-secret&token=evm-token");
+    let error = EvmRpcClient::new(vec![url])
+        .latest_height()
+        .expect_err("transport error");
+
+    assert!(!error.message.contains("evm-secret"));
+    assert!(!error.message.contains("evm-token"));
+    assert!(!error.message.contains("secret="));
+}
+
+#[test]
 fn test_parse_log_record_canonicalizes_provider_hex_values() {
     let record = parse_log_record(&json!({
         "blockNumber": "0xa",
@@ -404,4 +416,11 @@ fn start_rpc_server(responses: Vec<Value>) -> (String, Arc<Mutex<Vec<Value>>>) {
     });
 
     (format!("http://{address}"), requests)
+}
+
+fn unavailable_rpc_url(query: &str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind unused port");
+    let address = listener.local_addr().expect("unused port address");
+    drop(listener);
+    format!("http://{address}/rpc?{query}")
 }

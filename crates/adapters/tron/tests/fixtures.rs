@@ -2,7 +2,11 @@ use datalens_chain::{
     ChainAdapter, ChainFetchRequest, DatasetSelector, FinalityKind, HeightRangeKind,
 };
 use datalens_core::{DatalensErrorKind, DatasetKey, LedgerRange, QueryRows};
-use datalens_tron::{TronAdapter, TronFixtureProviderRpc, tron_all_selector};
+use datalens_tron::{
+    TronAdapter, TronFinality, TronFixtureProviderRpc, TronHttpProvider, TronProvider,
+    tron_all_selector,
+};
+use std::net::TcpListener;
 
 #[test]
 fn test_blocks_fetch_returns_ordered_adapter_json_rows() {
@@ -40,11 +44,30 @@ fn test_blocks_fetch_returns_ordered_adapter_json_rows() {
 }
 
 #[test]
+fn test_transport_error_redacts_rpc_url_credentials() {
+    let url = unavailable_rpc_url("secret=tron-secret&token=tron-token");
+    let error = TronHttpProvider::new(url)
+        .latest_block(TronFinality::Finalized)
+        .expect_err("transport error");
+
+    assert!(!error.message.contains("tron-secret"));
+    assert!(!error.message.contains("tron-token"));
+    assert!(!error.message.contains("secret="));
+}
+
+#[test]
 fn test_all_selector_uses_storage_safe_fingerprint() {
     let selector = tron_all_selector().expect("selector");
 
     assert_eq!(selector.canonical_key(), "all");
     assert_eq!(selector.fingerprint(), "tron-all/all");
+}
+
+fn unavailable_rpc_url(query: &str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind unused port");
+    let address = listener.local_addr().expect("unused port address");
+    drop(listener);
+    format!("http://{address}/rpc?{query}")
 }
 
 #[test]

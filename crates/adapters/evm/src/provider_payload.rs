@@ -107,7 +107,9 @@ pub(crate) fn evm_log_filter(range: BlockRange, filter: &EvmLogFilter) -> Value 
 }
 
 pub(crate) fn classify_transport_error(error: reqwest::Error) -> DatalensError {
-    if error.is_timeout() {
+    let is_timeout = error.is_timeout();
+    let error = error.without_url();
+    if is_timeout {
         DatalensError::new(
             DatalensErrorKind::ProviderTimeout,
             format!("provider timeout: {error}"),

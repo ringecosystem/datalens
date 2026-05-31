@@ -33,6 +33,7 @@ impl SolanaHttpRpc {
             }))
             .send()
             .map_err(|error| {
+                let error = error.without_url();
                 DatalensError::new(
                     DatalensErrorKind::ProviderFailure,
                     format!("Solana provider request failed: {error}"),
