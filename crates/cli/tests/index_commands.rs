@@ -175,6 +175,53 @@ fn test_cache_backfill_accepts_required_inputs_and_dry_run() {
 }
 
 #[test]
+fn test_local_rustfs_solana_smoke_commands_use_slot_range_kind() {
+    let runbook = include_str!("../../../docs/runbook/local-rustfs.md");
+
+    for workflow in ["backfill", "verify"] {
+        let snippet = format!(
+            "cargo run -p datalens-cli -- cache {workflow} \\\n  --config config/datalens.compose.toml \\\n  --chain solana-mainnet-beta \\\n  --dataset transactions \\\n  --range-kind slot"
+        );
+        assert!(
+            runbook.contains(&snippet),
+            "missing Solana {workflow} slot smoke command"
+        );
+
+        let cli = Cli::parse_from([
+            "datalens",
+            "cache",
+            workflow,
+            "--config",
+            "config/datalens.compose.toml",
+            "--chain",
+            "solana-mainnet-beta",
+            "--dataset",
+            "transactions",
+            "--range-kind",
+            "slot",
+            "--range-start",
+            "250000000",
+            "--range-end",
+            "250000001",
+            "--application",
+            "live-smoke",
+            "--json",
+        ]);
+
+        match cli.command {
+            Command::Cache(cache) => {
+                let CacheCommand { command } = *cache;
+                let common = cache_test_common(&command);
+                assert_eq!(common.chain, "solana-mainnet-beta");
+                assert_eq!(common.datasets, vec!["transactions"]);
+                assert_eq!(common.range_kind, "slot");
+            }
+            command => panic!("expected cache {workflow} command, got {command:?}"),
+        }
+    }
+}
+
+#[test]
 fn test_index_backfill_is_not_accepted() {
     assert!(Cli::try_parse_from(["datalens", "index", "backfill"]).is_err());
 }
