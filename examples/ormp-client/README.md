@@ -6,35 +6,50 @@ database and checkpoint.
 
 ## Runtime model
 
-`datalens serve` runs independently as the shared cache and query service. This
-example is a separate application process. It uses only `datalens-sdk` and the
-public `/index/graphql` protocol; it does not link Datalens server, edge,
-storage, indexer, or runtime crates.
+`datalens serve` runs independently as the shared cache service. It exposes the
+native Datalens REST and GraphQL surfaces, such as `/v1/query` and
+`/native/graphql`; `datalens serve` does not expose `/index/graphql`.
 
-Start the shared Datalens service separately:
+This example is a separate application process. It uses only `datalens-sdk` and
+an application-owned index GraphQL endpoint; it does not link Datalens server,
+edge, storage, indexer, or runtime crates.
+
+Start the shared Datalens cache service separately:
 
 ```sh
 cargo run -p datalens-cli -- serve --config config/datalens.dev.toml
 ```
 
-Run the ORMP application consumer against its external application index GraphQL
-endpoint:
+Start the ORMP application index GraphQL service separately before running this
+client. This repository does not currently ship a stable ORMP service command or
+checked-in ORMP index service config. The service must be an already-running
+external application process, configured by that application, and it must expose
+the index GraphQL schema at the endpoint you pass to
+`DATALENS_INDEX_GRAPHQL_URL`.
+
+For the local Datalens service setup, see `../../docs/runbook/local-rustfs.md`.
+For the runtime ownership boundary, see `../../docs/spec/production-runtime.md`.
+
+Run the ORMP application consumer against the external application-owned index
+GraphQL endpoint:
 
 ```sh
-DATALENS_INDEX_GRAPHQL_URL=http://127.0.0.1:3000/index/graphql \
+DATALENS_INDEX_GRAPHQL_URL=http://127.0.0.1:3100/graphql \
 ORMP_DATABASE_URL=sqlite:.tmp/ormp-client.sqlite \
   cargo run -p datalens-example-ormp-client
 ```
 
-The default endpoint is `http://127.0.0.1:3000/index/graphql`. Use
-`DATALENS_TOKEN` when the external application service requires an application
-token.
+Set `DATALENS_INDEX_GRAPHQL_URL` to the exact endpoint exposed by the ORMP
+application service. The example binary's fallback URL is a local convention
+only; it is not provided by `datalens serve`. Use `DATALENS_TOKEN` when the
+external application service requires an application token.
 
 ## Configuration
 
 The executable reads:
 
-- `DATALENS_INDEX_GRAPHQL_URL`: Datalens index GraphQL endpoint.
+- `DATALENS_INDEX_GRAPHQL_URL`: external ORMP application-owned index GraphQL
+  endpoint.
 - `DATALENS_TOKEN`: optional bearer token.
 - `ORMP_DATABASE_URL`: SQLite database URL, defaulting to
   `sqlite:.tmp/ormp-client.sqlite`.

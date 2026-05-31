@@ -4,7 +4,7 @@ use datalens_sdk::ClientConfig;
 
 use crate::{AppError, AppResult};
 
-pub const DEFAULT_INDEX_GRAPHQL_URL: &str = "http://127.0.0.1:3000/index/graphql";
+pub const DEFAULT_INDEX_GRAPHQL_URL: &str = "http://127.0.0.1:3100/graphql";
 pub const DEFAULT_DATABASE_URL: &str = "sqlite:.tmp/ormp-client.sqlite";
 pub const DEFAULT_PAGE_SIZE: u32 = 25;
 pub const DEFAULT_CONSUMER_NAME: &str = "ormp-message-consumer";

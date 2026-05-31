@@ -553,6 +553,43 @@ fn test_ormp_client_example_is_sdk_client_only() {
     }
 }
 
+#[test]
+fn test_application_client_readmes_document_external_index_graphql_runtime() {
+    for example in ["ormp-client", "degov-client"] {
+        let readme_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples")
+            .join(example)
+            .join("README.md");
+        let readme = fs::read_to_string(&readme_path)
+            .unwrap_or_else(|error| panic!("read {example} README: {error}"));
+
+        assert!(
+            readme.contains("application-owned index GraphQL"),
+            "{example} README should describe index GraphQL as application-owned"
+        );
+        assert!(
+            readme.contains("docs/runbook/local-rustfs.md"),
+            "{example} README should link the local runtime runbook"
+        );
+        assert!(
+            readme.contains("docs/spec/production-runtime.md"),
+            "{example} README should link the production runtime boundary"
+        );
+        assert!(
+            readme.contains("datalens serve` does not expose `/index/graphql"),
+            "{example} README should explicitly separate datalens serve from index GraphQL"
+        );
+        assert!(
+            !readme.contains("Datalens index GraphQL endpoint"),
+            "{example} README should not call the application endpoint a Datalens endpoint"
+        );
+        assert!(
+            !readme.contains("local Datalens serve default"),
+            "{example} README should not describe /index/graphql as a datalens serve default"
+        );
+    }
+}
+
 fn relative_path(root: &std::path::Path, path: PathBuf) -> String {
     path.strip_prefix(root)
         .unwrap_or(&path)
