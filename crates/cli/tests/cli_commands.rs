@@ -699,7 +699,7 @@ fn test_validate_config_accepts_supported_application_dataset_keys() {
 }
 
 #[test]
-fn test_validate_config_rejects_unknown_and_legacy_application_dataset_keys() {
+fn test_validate_config_rejects_unknown_and_removed_application_dataset_keys() {
     for dataset in ["not-a-dataset", "blocks", "logs"] {
         let config = toml::from_str::<DatalensConfig>(&format!(
             r#"
