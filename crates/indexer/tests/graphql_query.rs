@@ -456,6 +456,129 @@ fn test_graphql_decoded_events_query_supports_empty_result_pagination_and_filter
 }
 
 #[test]
+fn test_graphql_events_connection_paginates_with_stable_cursor_shape_and_ordering() {
+    let store = SqliteOutputStore::connect("sqlite::memory:").expect("sqlite store connects");
+    store
+        .write_records(&[
+            record(30, 2, "0x0000000000000000000000000000000000000001"),
+            record(10, 0, "0x0000000000000000000000000000000000000001"),
+            record(20, 1, "0x0000000000000000000000000000000000000001"),
+        ])
+        .expect("write records");
+    let schema = graphql_schema(Arc::new(store));
+
+    let first = Runtime::new().expect("runtime").block_on(async {
+        schema
+            .execute(
+                r#"
+            {
+              eventsConnection(dataset: "evm.logs", first: 2) {
+                edges {
+                  cursor
+                  node { blockNumber eventIndex }
+                }
+                nodes { blockNumber eventIndex }
+                pageInfo { endCursor hasNextPage }
+              }
+            }
+            "#,
+            )
+            .await
+    });
+
+    assert!(first.errors.is_empty(), "{:?}", first.errors);
+    let first_body = first.data.into_json().expect("graphql data");
+    let first_page = &first_body["eventsConnection"];
+    assert_eq!(first_page["edges"].as_array().expect("edges").len(), 2);
+    assert_eq!(first_page["edges"][0]["cursor"], "0");
+    assert_eq!(first_page["edges"][0]["node"]["blockNumber"], 10);
+    assert_eq!(first_page["edges"][1]["cursor"], "1");
+    assert_eq!(first_page["edges"][1]["node"]["blockNumber"], 20);
+    assert_eq!(first_page["nodes"][0]["eventIndex"], 0);
+    assert_eq!(first_page["nodes"][1]["eventIndex"], 1);
+    assert_eq!(first_page["pageInfo"]["endCursor"], "1");
+    assert_eq!(first_page["pageInfo"]["hasNextPage"], true);
+
+    let second = Runtime::new().expect("runtime").block_on(async {
+        schema
+            .execute(
+                r#"
+            {
+              eventsConnection(dataset: "evm.logs", first: 2, after: "1") {
+                nodes { blockNumber eventIndex }
+                pageInfo { endCursor hasNextPage }
+              }
+            }
+            "#,
+            )
+            .await
+    });
+
+    assert!(second.errors.is_empty(), "{:?}", second.errors);
+    let second_body = second.data.into_json().expect("graphql data");
+    let second_page = &second_body["eventsConnection"];
+    assert_eq!(second_page["nodes"].as_array().expect("nodes").len(), 1);
+    assert_eq!(second_page["nodes"][0]["blockNumber"], 30);
+    assert_eq!(second_page["nodes"][0]["eventIndex"], 2);
+    assert_eq!(second_page["pageInfo"]["endCursor"], "2");
+    assert_eq!(second_page["pageInfo"]["hasNextPage"], false);
+}
+
+#[test]
+fn test_graphql_decoded_events_connection_supports_sdk_filters_and_page_info() {
+    let store = SqliteOutputStore::connect("sqlite::memory:").expect("sqlite store connects");
+    store
+        .write_records(&[
+            decoded_record(10, 0, "MessageAccepted(bytes32,uint256,address,address)"),
+            decoded_record(20, 1, "MessageAccepted(bytes32,uint256,address,address)"),
+            decoded_record(30, 2, "MessageDispatched(bytes32,uint256,address,address)"),
+        ])
+        .expect("write records");
+    let schema = graphql_schema(Arc::new(store));
+
+    let response = Runtime::new().expect("runtime").block_on(async {
+        schema
+            .execute(
+                r#"
+            {
+              decodedEventsConnection(
+                indexName: "ormp"
+                chain: "ethereum"
+                chainId: 1
+                dataset: "evm.logs"
+                address: "0x2cd1867fb8016f93710b6386f7f9f1d540a60812"
+                eventName: "MessageAccepted"
+                signature: "MessageAccepted(bytes32,uint256,address,address)"
+                topic0: "0x9e6c1c44f7b2b36245897f9be35a5500f3a9e0d5b8f29f89dbf04b54053bb7d1"
+                fromBlock: 1
+                toBlock: 25
+                first: 1
+              ) {
+                edges {
+                  cursor
+                  node { blockNumber logIndex decodedArgs }
+                }
+                pageInfo { endCursor hasNextPage }
+              }
+            }
+            "#,
+            )
+            .await
+    });
+
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let body = response.data.into_json().expect("graphql data");
+    let page = &body["decodedEventsConnection"];
+    assert_eq!(page["edges"].as_array().expect("edges").len(), 1);
+    assert_eq!(page["edges"][0]["cursor"], "0");
+    assert_eq!(page["edges"][0]["node"]["blockNumber"], 10);
+    assert_eq!(page["edges"][0]["node"]["logIndex"], 0);
+    assert_eq!(page["edges"][0]["node"]["decodedArgs"]["msgHash"], "0xabc");
+    assert_eq!(page["pageInfo"]["endCursor"], "0");
+    assert_eq!(page["pageInfo"]["hasNextPage"], true);
+}
+
+#[test]
 fn test_graphql_events_query_filters_postgres_store_when_url_is_configured() {
     let Ok(url) = std::env::var("DATALENS_POSTGRES_TEST_URL") else {
         return;
@@ -564,6 +687,45 @@ fn test_graphql_events_query_rejects_limit_above_maximum() {
             .contains("limit must be less than or equal to 1000"),
         "{:?}",
         response.errors
+    );
+    assert_eq!(
+        graphql_extension_string(&response.errors[0], "code"),
+        Some("INVALID_INPUT")
+    );
+    assert_eq!(
+        graphql_extension_string(&response.errors[0], "kind"),
+        Some("InvalidInput")
+    );
+}
+
+#[test]
+fn test_graphql_events_connection_rejects_unsupported_dataset_with_stable_error() {
+    let schema = graphql_schema(Arc::new(
+        SqliteOutputStore::connect("sqlite::memory:").expect("sqlite store connects"),
+    ));
+
+    let response = Runtime::new().expect("runtime").block_on(async {
+        schema
+            .execute(
+                r#"
+            {
+              eventsConnection(dataset: "evm.blocks", first: 10) {
+                nodes { blockNumber }
+              }
+            }
+            "#,
+            )
+            .await
+    });
+
+    assert_eq!(response.errors.len(), 1);
+    assert_eq!(
+        graphql_extension_string(&response.errors[0], "code"),
+        Some("UNSUPPORTED_DATASET")
+    );
+    assert_eq!(
+        graphql_extension_string(&response.errors[0], "kind"),
+        Some("UnsupportedDataset")
     );
 }
 
@@ -1086,7 +1248,31 @@ async fn assert_auth_error(response: axum::response::Response, status: StatusCod
     let body: serde_json::Value =
         serde_json::from_str(&response_text(response).await).expect("error JSON");
     assert_eq!(body["error"]["kind"], kind);
+    assert_eq!(body["error"]["code"], auth_error_code(kind));
     assert!(!body.to_string().contains("query-token"));
+}
+
+fn auth_error_code(kind: &str) -> &str {
+    match kind {
+        "AuthenticationFailed" => "AUTHENTICATION_FAILED",
+        "RateLimited" => "RATE_LIMITED",
+        "Unauthorized" => "AUTHORIZATION_FAILED",
+        _ => "INTERNAL",
+    }
+}
+
+fn graphql_extension_string<'a>(
+    error: &'a async_graphql::ServerError,
+    key: &str,
+) -> Option<&'a str> {
+    error
+        .extensions
+        .as_ref()
+        .and_then(|extensions| extensions.get(key))
+        .and_then(|value| match value {
+            async_graphql::Value::String(value) => Some(value.as_str()),
+            _ => None,
+        })
 }
 
 struct DelayedStore {
