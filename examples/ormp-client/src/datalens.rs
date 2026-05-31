@@ -1,7 +1,9 @@
 use datalens_sdk::{
-    DatalensClient, Error,
+    DatalensClient,
     index::{DecodedEvent, EventFilter, PageRequest},
 };
+
+use crate::AppResult;
 
 pub const DATASET: &str = "evm.logs";
 pub const INDEX_NAME: &str = "ormp";
@@ -9,26 +11,42 @@ pub const MESSAGE_ACCEPTED: &str = "MessageAccepted";
 pub const MESSAGE_ACCEPTED_SIGNATURE: &str =
     "MessageAccepted(bytes32,(address,uint256,uint256,address,uint256,address,uint256,bytes))";
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OrmpEventPage {
-    pub events: Vec<OrmpMessageAccepted>,
+pub struct DatalensOrmpClient {
+    client: DatalensClient,
+}
+
+impl DatalensOrmpClient {
+    pub fn new(client: DatalensClient) -> Self {
+        Self { client }
+    }
+
+    pub fn fetch_message_accepted_page(
+        &self,
+        after: Option<String>,
+        page_size: u32,
+    ) -> AppResult<MessageAcceptedPage> {
+        fetch_message_accepted_page(&self.client, after, page_size)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MessageAcceptedPage {
+    pub events: Vec<MessageAcceptedEvent>,
     pub next_cursor: Option<String>,
     pub has_next_page: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OrmpMessageAccepted {
+#[derive(Clone, Debug, PartialEq)]
+pub struct MessageAcceptedEvent {
     pub cursor: String,
-    pub block_number: Option<i32>,
-    pub transaction_hash: Option<String>,
-    pub message_hash: Option<String>,
+    pub event: DecodedEvent,
 }
 
 pub fn fetch_message_accepted_page(
     client: &DatalensClient,
     after: Option<String>,
     page_size: u32,
-) -> Result<OrmpEventPage, Error> {
+) -> AppResult<MessageAcceptedPage> {
     let filter = EventFilter::new(DATASET)
         .with_index_name(INDEX_NAME)
         .with_event_name(MESSAGE_ACCEPTED)
@@ -42,26 +60,15 @@ pub fn fetch_message_accepted_page(
     let events = connection
         .edges
         .into_iter()
-        .map(|edge| OrmpMessageAccepted {
+        .map(|edge| MessageAcceptedEvent {
             cursor: edge.cursor,
-            block_number: edge.node.block_number,
-            message_hash: message_hash(&edge.node),
-            transaction_hash: edge.node.transaction_hash,
+            event: edge.node,
         })
         .collect();
 
-    Ok(OrmpEventPage {
+    Ok(MessageAcceptedPage {
         events,
         next_cursor: connection.page_info.end_cursor,
         has_next_page: connection.page_info.has_next_page,
     })
-}
-
-fn message_hash(event: &DecodedEvent) -> Option<String> {
-    event
-        .decoded_args
-        .get("msgHash")
-        .or_else(|| event.decoded_args.get("messageHash"))
-        .and_then(|value| value.as_str())
-        .map(str::to_owned)
 }

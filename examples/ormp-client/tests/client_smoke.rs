@@ -51,7 +51,10 @@ fn test_fetch_message_accepted_page_queries_sdk_connection_with_cursor() {
         .expect("message accepted page");
 
     assert_eq!(page.events.len(), 1);
-    assert_eq!(page.events[0].message_hash.as_deref(), Some("0xhash"));
+    assert_eq!(
+        page.events[0].event.decoded_args["msgHash"].as_str(),
+        Some("0xhash")
+    );
     assert_eq!(page.next_cursor.as_deref(), Some("cursor-2"));
     assert!(!page.has_next_page);
 
