@@ -1,4 +1,4 @@
-use datalens_example_degov_client::{ProposalMaterializer, ProposalProjection, consume_vote_page};
+use datalens_example_degov_client::datalens::DatalensDegovClient;
 use datalens_sdk::{ClientConfig, DatalensClient};
 use serde_json::json;
 
@@ -7,7 +7,7 @@ mod support;
 use support::MockGraphqlServer;
 
 #[test]
-fn test_consume_vote_page_updates_application_checkpoint_and_projection() {
+fn test_fetch_vote_cast_page_uses_decoded_events_connection_shape() {
     let server = MockGraphqlServer::new(vec![json!({
         "data": {
             "decodedEventsConnection": {
@@ -48,16 +48,15 @@ fn test_consume_vote_page_updates_application_checkpoint_and_projection() {
             }
         }
     })]);
-    let client = client(&server);
-    let mut projection = ProposalProjection::default();
-    let mut materializer = ProposalMaterializer::default();
+    let client = DatalensDegovClient::new(client(&server));
 
-    let checkpoint = consume_vote_page(&client, &mut materializer, &mut projection, None, 25)
+    let page = client
+        .fetch_vote_cast_page(None, 25)
         .expect("consume vote page");
 
-    assert_eq!(checkpoint.cursor.as_deref(), Some("vote-cursor-1"));
-    assert!(checkpoint.has_next_page);
-    assert_eq!(projection.for_votes("42"), 7);
+    assert_eq!(page.next_cursor.as_deref(), Some("vote-cursor-1"));
+    assert!(page.has_next_page);
+    assert_eq!(page.events.len(), 1);
 
     let request = server.only_request();
     assert!(request.query.contains("decodedEventsConnection("));
