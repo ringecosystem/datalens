@@ -83,7 +83,7 @@ cargo run -p datalens-cli -- cache backfill \
   --config config/datalens.compose.toml \
   --chain solana-mainnet-beta \
   --dataset transactions \
-  --range-kind block \
+  --range-kind slot \
   --range-start 250000000 \
   --range-end 250000001 \
   --application live-smoke \
@@ -93,7 +93,7 @@ cargo run -p datalens-cli -- cache verify \
   --config config/datalens.compose.toml \
   --chain solana-mainnet-beta \
   --dataset transactions \
-  --range-kind block \
+  --range-kind slot \
   --range-start 250000000 \
   --range-end 250000001 \
   --application live-smoke \
