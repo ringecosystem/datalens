@@ -19,6 +19,7 @@ use datalens_core::{
 };
 use datalens_solana::SolanaAdapter;
 use datalens_storage::{LocalStorage, StorageWriteRequest};
+use datalens_tron::{TronAdapter, TronFixtureProviderRpc};
 
 #[test]
 fn test_index_plan_accepts_config_path() {
@@ -807,6 +808,56 @@ fn test_cache_backfill_tron_events_builds_tron_event_selector() {
             .next(),
         Some("tron-events")
     );
+}
+
+#[test]
+fn test_cache_backfill_tron_blocks_builds_tron_all_selector() {
+    let root = temp_storage_root("index-tron-blocks-selector");
+    let config = write_tron_config("index-tron-blocks-selector", &root);
+    let mut common = cache_common(config, 10, 12);
+    common.chain = "tron-mainnet".to_owned();
+    common.datasets = vec!["blocks".to_owned()];
+
+    let output = cache_summary_with_adapter(
+        CacheWorkflowCommand::Backfill(CacheBackfillCommand {
+            common,
+            dry_run: true,
+        }),
+        TronAdapter::with_provider(tron_chain(), TronFixtureProviderRpc),
+    )
+    .expect("dry-run");
+
+    assert_eq!(output["datasets"][0]["key"], "tron.blocks");
+    assert_eq!(output["datasets"][0]["selector_kind"], "tron_all");
+    assert_eq!(
+        output["datasets"][0]["selector_fingerprint"],
+        "tron-all/all"
+    );
+    assert_eq!(output["datasets"][0]["selector_canonical_key"], "all");
+}
+
+#[test]
+fn test_cache_backfill_tron_blocks_runs_fixture_runtime() {
+    let root = temp_storage_root("index-tron-blocks-runtime");
+    let config = write_tron_config("index-tron-blocks-runtime", &root);
+    let mut common = cache_common(config, 10, 12);
+    common.chain = "tron-mainnet".to_owned();
+    common.datasets = vec!["blocks".to_owned()];
+
+    let output = cache_summary_with_adapter(
+        CacheWorkflowCommand::Backfill(CacheBackfillCommand {
+            common,
+            dry_run: false,
+        }),
+        TronAdapter::with_provider(tron_chain(), TronFixtureProviderRpc)
+            .with_max_block_range_len(2),
+    )
+    .expect("backfill");
+
+    assert_eq!(output["status"], "completed");
+    assert_eq!(output["accounting"]["chunks_written"], 2);
+    assert_eq!(output["accounting"]["rows_written"], 3);
+    assert_eq!(output["accounting"]["provider_calls"], 3);
 }
 
 #[test]
