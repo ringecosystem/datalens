@@ -44,6 +44,12 @@ pub fn graphql_schema(store: SharedStore) -> IndexerGraphqlSchema {
         .finish()
 }
 
+pub fn index_graphql_schema_sdl() -> String {
+    Schema::build(QueryRoot, EmptyMutation, EmptySubscription)
+        .finish()
+        .sdl()
+}
+
 pub fn graphql_schema_with_views(
     store: SharedStore,
     views: Vec<GraphqlViewConfig>,

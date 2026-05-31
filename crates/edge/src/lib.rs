@@ -21,6 +21,7 @@ pub use contract::{
         WarmupTaskListApiResponse, WarmupTaskListQuery, WarmupTaskView,
     },
 };
+pub use graphql::native_graphql_schema_sdl;
 pub use http::router::{router, router_with_edge_config};
 pub use service::{
     lifecycle::{

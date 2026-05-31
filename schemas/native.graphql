@@ -1,0 +1,208 @@
+type ChainDiscoveryGraphql {
+	identity: JSON!
+	datasets: [DatasetDiscoveryGraphql!]!
+}
+
+input ChainFamilyInput {
+	kind: ChainFamilyKindInput!
+	other: String
+}
+
+enum ChainFamilyKindInput {
+	evm
+	other
+}
+
+input ChainIdentityInput {
+	family: ChainFamilyInput!
+	configuredName: String!
+	networkId: NetworkIdInput
+}
+
+type DatasetDiscoveryGraphql {
+	datasetKey: String!
+	rangeKinds: JSON!
+	selectors: [String!]!
+	enabled: Boolean!
+}
+
+input DatasetKeyInput {
+	family: String!
+	name: String!
+}
+
+type Discovery {
+	chains: [ChainDiscoveryGraphql!]!
+}
+
+input EvmLogsSelectorInput {
+	addresses: [String!]
+	topics: [[String!]]
+}
+
+input FieldSelectionInput {
+	include: [String!]
+}
+
+"""
+A scalar that can represent any JSON value.
+"""
+scalar JSON
+
+type MutationRoot {
+	submitWarmupTask(input: WarmupSubmitInput!): WarmupSubmitPayload!
+	pauseWarmupTask(id: ID!): WarmupTask!
+	cancelWarmupTask(id: ID!): WarmupTask!
+	retryWarmupTask(id: ID!): WarmupTask!
+	runWarmupOnce: WarmupRunOncePayload!
+}
+
+input NetworkIdInput {
+	numeric: Int
+	textual: String
+}
+
+input OtherSelectorInput {
+	kind: String!
+	fingerprint: String!
+	canonicalKey: String!
+}
+
+input QueryInput {
+	chain: ChainIdentityInput!
+	datasetKey: DatasetKeyInput!
+	selector: QuerySelectorInput!
+	range: QueryRangeInput!
+	finality: String
+	fields: FieldSelectionInput
+}
+
+input QueryRangeInput {
+	kind: QueryRangeKindInput!
+	start: Int!
+	end: Int!
+}
+
+enum QueryRangeKindInput {
+	block
+	slot
+	height
+}
+
+type QueryResponse {
+	chain: JSON!
+	datasetKey: String!
+	range: JSON!
+	cache: JSON!
+	rows: JSON!
+}
+
+type QueryRoot {
+	chains: [String!]!
+	discovery: Discovery!
+	query(input: QueryInput!): QueryResponse!
+	warmupTask(id: ID!): WarmupTask
+	warmupTasks(filter: WarmupTaskFilterInput): [WarmupTask!]!
+}
+
+input QuerySelectorInput {
+	kind: SelectorKindInput!
+	evmLogs: EvmLogsSelectorInput
+	other: OtherSelectorInput
+}
+
+input RangeKindInput {
+	kind: RangeKindValueInput!
+	other: String
+}
+
+enum RangeKindValueInput {
+	block
+	slot
+	height
+	other
+}
+
+enum SelectorKindInput {
+	all
+	evm_logs
+	other
+}
+
+input WarmupChunkPolicyInput {
+	maxRangeLen: Int
+	targetRowsHint: Int
+}
+
+input WarmupDatasetKeyInput {
+	family: String!
+	name: String!
+}
+
+input WarmupRetryPolicyInput {
+	maxAttempts: Int
+	initialBackoffMs: Int
+	maxBackoffMs: Int
+}
+
+type WarmupRunOncePayload {
+	results: JSON!
+}
+
+input WarmupSelectorInput {
+	kind: SelectorKindInput!
+	evmLogs: EvmLogsSelectorInput
+	other: OtherSelectorInput
+}
+
+input WarmupSubmitInput {
+	chain: ChainIdentityInput!
+	datasetKey: WarmupDatasetKeyInput!
+	selector: WarmupSelectorInput!
+	rangeKind: RangeKindInput!
+	start: Int!
+	end: Int
+	mode: String
+	chunkPolicy: WarmupChunkPolicyInput
+	retryPolicy: WarmupRetryPolicyInput
+}
+
+type WarmupSubmitPayload {
+	taskId: ID!
+	created: Boolean!
+}
+
+type WarmupTask {
+	taskId: ID!
+	applicationId: String!
+	chain: JSON!
+	datasetKey: String!
+	rangeKind: JSON!
+	start: Int!
+	end: Int
+	mode: String!
+	state: String!
+	createdAt: Int!
+	updatedAt: Int!
+	lastError: String
+	stats: JSON!
+}
+
+input WarmupTaskFilterInput {
+	applicationId: String
+	chain: String
+	state: String
+}
+
+"""
+Directs the executor to include this field or fragment only when the `if` argument is true.
+"""
+directive @include(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+"""
+Directs the executor to skip this field or fragment when the `if` argument is true.
+"""
+directive @skip(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+schema {
+	query: QueryRoot
+	mutation: MutationRoot
+}

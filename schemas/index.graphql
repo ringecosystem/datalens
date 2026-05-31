@@ -1,0 +1,64 @@
+type DecodedEvent {
+	indexName: String
+	chain: String
+	chainId: Int
+	dataset: String
+	blockNumber: Int
+	blockHash: String
+	transactionHash: String
+	transactionIndex: Int
+	logIndex: Int
+	address: String
+	eventName: String
+	signature: String
+	topic0: String
+	decodedArgs: JSON!
+	decodeStatus: String
+	decodeError: String
+	payload: JSON!
+	createdAt: String
+}
+
+type IndexedEvent {
+	indexName: String
+	chain: String
+	chainId: Int
+	dataset: String
+	blockNumber: Int
+	blockHash: String
+	transactionHash: String
+	transactionIndex: Int
+	eventIndex: Int
+	address: String
+	selector: String
+	topics: [String!]!
+	topic0: String
+	signature: String
+	eventName: String
+	decoded: JSON!
+	data: String
+	payload: JSON!
+	createdAt: String
+}
+
+"""
+A scalar that can represent any JSON value.
+"""
+scalar JSON
+
+type QueryRoot {
+	events(indexName: String, chain: String, chainId: Int, dataset: String!, address: String, eventName: String, signature: String, fromBlock: Int, toBlock: Int, topic0: String, limit: Int, after: String): [IndexedEvent!]!
+	decodedEvents(indexName: String, chain: String, chainId: Int, dataset: String!, address: String, eventName: String, signature: String, fromBlock: Int, toBlock: Int, topic0: String, limit: Int, after: String): [DecodedEvent!]!
+}
+
+"""
+Directs the executor to include this field or fragment only when the `if` argument is true.
+"""
+directive @include(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+"""
+Directs the executor to skip this field or fragment when the `if` argument is true.
+"""
+directive @skip(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+schema {
+	query: QueryRoot
+}
