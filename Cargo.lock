@@ -1977,11 +1977,11 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "datalens-chain",
- "datalens-client",
  "datalens-core",
  "datalens-edge",
  "datalens-evm",
  "datalens-indexer",
+ "datalens-internal-client",
  "datalens-metrics",
  "datalens-planner",
  "datalens-runtime-indexer",
@@ -1998,17 +1998,6 @@ dependencies = [
  "toml",
  "tracing-log",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "datalens-client"
-version = "0.1.0"
-dependencies = [
- "datalens-core",
- "reqwest",
- "serde",
- "serde_json",
- "sha2 0.11.0",
 ]
 
 [[package]]
@@ -2029,9 +2018,9 @@ dependencies = [
  "async-graphql-axum",
  "axum",
  "datalens-chain",
- "datalens-client",
  "datalens-core",
  "datalens-executor",
+ "datalens-internal-client",
  "datalens-metrics",
  "datalens-planner",
  "datalens-solana",
@@ -2084,8 +2073,8 @@ dependencies = [
  "async-graphql",
  "async-graphql-axum",
  "axum",
- "datalens-client",
  "datalens-core",
+ "datalens-internal-client",
  "datalens-metrics",
  "log",
  "parquet",
@@ -2097,6 +2086,17 @@ dependencies = [
  "tokio",
  "toml",
  "tower",
+]
+
+[[package]]
+name = "datalens-internal-client"
+version = "0.1.0"
+dependencies = [
+ "datalens-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
 ]
 
 [[package]]
@@ -2128,6 +2128,16 @@ dependencies = [
  "datalens-writer",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "datalens-sdk"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "toml",
 ]
 
 [[package]]

@@ -119,25 +119,26 @@ Rust client 可以发送 service-side hot/latest contract fields。它不实现 
 `FallbackMode::Rpc` 仍返回 `UnsupportedFallback`，并且不能写 durable cache。Service-side hot/latest
 read-through 和未来任何 client-side RPC fallback 都必须与 durable safe/finalized cache write 隔离。
 
-第一版 Rust client contract 是 `datalens-client` crate。默认行为是 service-client only。
-`DatalensClient::query(QueryRequest)` 是第一类 Rust client API：
+外部 Rust SDK 是 `sdks/rust` 下的 `datalens-sdk` package。它只能作为 GraphQL/HTTP
+client，不能依赖任何 `crates/` 下的 workspace crate，包括 `datalens-core`。
 
-- `QueryRequest::new(chain, dataset_key, range)` 创建原生请求，默认
-  `selector: all`、`finality: durable_only`、`fields: all`。
-- `with_selector`、`with_range`、`with_finality` 和 `with_fields` 等 builder 方法调整原生
-  request 字段，但不改变 wire contract。
-- `QueryResponse` 暴露 `DatasetKey` 和 `LedgerRange`，同时保持 REST JSON 中
-  `dataset_key: "family.name"` 和 typed ledger range 的形态。
+`crates/client` 下的内部 REST client package 是 `datalens-internal-client`。它只供
+workspace crate 实现使用，不是外部 SDK package。
+
+默认 SDK 行为是 service-client only，并使用 edge 暴露的 native GraphQL request shape。
+`DatalensClient::native().query(QueryInput)` 是第一类 native Rust SDK API：
+
+- SDK 自有 input struct 镜像 checked-in `schemas/native.graphql` SDL。
+- `QueryResponse` 为 chain、range、cache 和 rows 保留 GraphQL JSON scalar，不暴露内部
+  server/runtime model。
 - `solana.slots`、`tron.blocks` 等非 EVM dataset 通过同一个原生方法查询。
 
-EVM helper 只是原生请求上的 convenience wrapper：
+SDK 也通过 `DatalensClient::index()` 暴露 checked-in `schemas/index.graphql` SDL 的 wrapper：
 
-- `DatalensClient::query_blocks` 向 `POST /v1/query` 发送
-  `dataset_key: "evm.blocks"` 和 `selector: { "kind": "all" }`。
-- `DatalensClient::query_logs` 向 `POST /v1/query` 发送
-  `dataset_key: "evm.logs"` 和 `selector: { "kind": "evm_logs", ... }`。
-- `DatalensClient::discover` 读取 `GET /v1/discovery`。
-- Client 不能直接调用 executor、storage、writer、chain adapter 或 RPC provider。
+- Raw indexed events 使用 `events` 和 `eventsConnection`。
+- Decoded indexed events 使用 `decodedEvents` 和 `decodedEventsConnection`。
+- Cursor pagination 暴露 `pageInfo`、`edges` 和 `nodes`。
+- SDK 不能直接调用 executor、storage、writer、chain adapter 或 RPC provider。
 
 ## 未来兼容适配面
 
