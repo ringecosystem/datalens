@@ -4,8 +4,13 @@ Purpose: Show a Go application querying token activity through an independently
 running Datalens service.
 
 `datalens serve` runs separately as the shared cache and query service. This
-example uses only `sdks/go` and the public `/index/graphql` and
-`/native/graphql` APIs.
+live example uses only `sdks/go` and the public `/native/graphql` API exposed
+by `datalens serve`.
+
+`datalens serve` does not expose `/index/graphql`. Application-specific index
+GraphQL endpoints are owned by external application services. The Ethereum
+decoded-transfer query in this example is kept as mock-covered SDK query
+construction only; it is not part of the live smoke command.
 
 ## Token targets
 
@@ -46,21 +51,22 @@ hit metadata for the Solana and TRON native queries.
 | `DATALENS_ENDPOINT` | `http://127.0.0.1:3000` | Datalens service endpoint |
 | `DATALENS_TOKEN` | unset | Optional bearer token |
 | `DATALENS_APPLICATION` | `token-sdk-go` | Application header value |
-| `DATALENS_ETHEREUM_FROM_BLOCK` | `19000000` | Ethereum bounded start block |
-| `DATALENS_ETHEREUM_TO_BLOCK` | `19000010` | Ethereum bounded end block |
-| `DATALENS_ETHEREUM_FIRST` | `10` | Ethereum result page size |
+| `DATALENS_ETHEREUM_FROM_BLOCK` | `19000000` | Mock-covered Ethereum index query bounded start block |
+| `DATALENS_ETHEREUM_TO_BLOCK` | `19000010` | Mock-covered Ethereum index query bounded end block |
+| `DATALENS_ETHEREUM_FIRST` | `10` | Mock-covered Ethereum index query page size |
 | `DATALENS_SOLANA_FROM_SLOT` | `250000000` | Solana bounded start slot |
 | `DATALENS_SOLANA_TO_SLOT` | `250000003` | Solana bounded end slot |
 | `DATALENS_TRON_FROM_BLOCK` | `60000000` | TRON bounded start block |
 | `DATALENS_TRON_TO_BLOCK` | `60000002` | TRON bounded end block |
 
-Live smoke requires Datalens to be configured with RPC access for Ethereum,
-Solana, and TRON. Do not commit real RPC URLs, API keys, or tokens.
+Live smoke requires Datalens to be configured with RPC access for Solana and
+TRON. Do not commit real RPC URLs, API keys, or tokens.
 
 ## Tests
 
-Tests use mock data and query construction only, so CI does not need live RPC or
-a running Datalens service:
+Tests lock that the executable live smoke path calls only native Solana/TRON
+queries. They also cover mock data and Ethereum index query construction, so CI
+does not need live RPC, `/index/graphql`, or a running Datalens service:
 
 ```sh
 cd examples/token-sdk-go

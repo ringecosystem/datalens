@@ -3,8 +3,7 @@ import { DatalensClient } from "@helixbox/datalens";
 import {
   buildExampleQueries,
   buildRuntimeConfig,
-  formatDecodedTransfers,
-  formatNativeRows,
+  runExample,
 } from "./example.js";
 
 async function main(): Promise<void> {
@@ -16,18 +15,7 @@ async function main(): Promise<void> {
     application: config.application,
   });
 
-  const ethereum = await client.index.queryDecodedEvents(queries.ethereum);
-  for (const line of formatDecodedTransfers(ethereum.nodes)) {
-    console.log(line);
-  }
-
-  const solana = await client.native.query(queries.solana);
-  for (const line of formatNativeRows("solana-usdc", solana)) {
-    console.log(line);
-  }
-
-  const tron = await client.native.query(queries.tron);
-  for (const line of formatNativeRows("tron-usdt", tron)) {
+  for (const line of await runExample(client, queries)) {
     console.log(line);
   }
 }

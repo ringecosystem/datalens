@@ -7,7 +7,49 @@ import {
   buildRuntimeConfig,
   formatDecodedTransfers,
   formatNativeRows,
+  runExample,
 } from "../src/example.js";
+
+test("runExample uses native queries only for live smoke", async () => {
+  const calls: string[] = [];
+  const queries = buildExampleQueries({
+    endpoint: "http://127.0.0.1:3000",
+    application: "token-sdk-typescript",
+    ethereum: { fromBlock: 19000000, toBlock: 19000010, first: 3 },
+    solana: { fromSlot: 250000000, toSlot: 250000003 },
+    tron: { fromBlock: 60000000, toBlock: 60000002 },
+  });
+
+  const lines = await runExample(
+    {
+      index: {
+        async queryDecodedEvents() {
+          calls.push("index");
+          return { edges: [], nodes: [], pageInfo: { hasNextPage: false, hasPreviousPage: false } };
+        },
+      },
+      native: {
+        async query(input) {
+          calls.push(`${input.datasetKey.family}.${input.datasetKey.name}`);
+          return {
+            chain: { configuredName: input.chain.configuredName },
+            datasetKey: `${input.datasetKey.family}.${input.datasetKey.name}`,
+            range: input.range,
+            cache: { outcome: "miss" },
+            rows: [],
+          };
+        },
+      },
+    },
+    queries,
+  );
+
+  assert.deepEqual(calls, ["solana.account_updates", "tron.events"]);
+  assert.deepEqual(lines, [
+    "solana-usdc cache={\"outcome\":\"miss\"}",
+    "tron-usdt cache={\"outcome\":\"miss\"}",
+  ]);
+});
 
 test("buildExampleQueries uses official token targets and bounded ranges", () => {
   const queries = buildExampleQueries({
