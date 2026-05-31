@@ -16,6 +16,23 @@ schema-check:
   cargo test -p datalens-edge --test schema_contract
   cargo test -p datalens-indexer --test schema_contract
 
+sdk-rust-test:
+  cargo test -p datalens-sdk
+  cargo test -p datalens-sdk --test dependency_boundary
+
+sdk-typescript-test:
+  cd sdks/typescript && npm ci
+  cd sdks/typescript && npm run build
+  cd sdks/typescript && npm test
+
+sdk-go-test:
+  cd sdks/go && go test ./...
+
+sdk-test:
+  just sdk-rust-test
+  just sdk-typescript-test
+  just sdk-go-test
+
 clippy:
   cargo clippy --workspace --all-targets -- -D warnings
 
@@ -66,6 +83,8 @@ benchmark:
 release-check:
   just fmt-check
   just check
+  just schema-check
+  just sdk-test
   just clippy
   just e2e-lifecycle
   just multi-chain-e2e
