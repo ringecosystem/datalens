@@ -1,5 +1,6 @@
 use std::{
     fs,
+    path::PathBuf,
     process::Command as ProcessCommand,
     sync::{Arc, Mutex},
 };
@@ -485,19 +486,31 @@ fn test_ormp_client_example_is_sdk_client_only() {
     assert!(!dependencies.contains_key("datalens-runtime-indexer"));
     assert!(!dependencies.contains_key("datalens-processor-sdk"));
 
-    for path in [
-        "src/lib.rs",
-        "src/main.rs",
-        "src/messages.rs",
-        "tests/client_smoke.rs",
-        "tests/support/mod.rs",
-        "tests/support/server.rs",
-    ] {
-        let source = fs::read_to_string(example_dir.join(path)).expect("read ORMP client source");
+    let mut sources = vec![example_dir.join("src"), example_dir.join("tests")];
+    while let Some(path) = sources.pop() {
+        if path.is_dir() {
+            for entry in fs::read_dir(&path).expect("read ORMP client source directory") {
+                sources.push(entry.expect("read ORMP client source entry").path());
+            }
+            continue;
+        }
+        if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
+            continue;
+        }
+
+        let source = fs::read_to_string(&path).expect("read ORMP client source");
+        let path = relative_path(&example_dir, path);
         assert!(!source.contains("datalens_indexer"), "{path}");
         assert!(!source.contains("datalens_runtime"), "{path}");
         assert!(!source.contains("datalens_processor"), "{path}");
     }
+}
+
+fn relative_path(root: &std::path::Path, path: PathBuf) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(&path)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 #[test]
