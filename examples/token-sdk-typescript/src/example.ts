@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
 import type {
+  ConnectionPage,
   DecodedEvent,
   EventQuery,
   JsonValue,
@@ -38,6 +39,15 @@ export type ExampleQueries = {
   ethereum: EventQuery;
   solana: NativeQueryInput;
   tron: NativeQueryInput;
+};
+
+export type ExampleClient = {
+  index: {
+    queryDecodedEvents(query: EventQuery): Promise<ConnectionPage<DecodedEvent>>;
+  };
+  native: {
+    query(query: NativeQueryInput): Promise<NativeQueryResponse>;
+  };
 };
 
 type Environment = Record<string, string | undefined>;
@@ -130,6 +140,16 @@ export function formatNativeRows(label: string, response: NativeQueryResponse): 
   for (const row of rowsFrom(response.rows)) {
     lines.push(`${label} row=${stableJson(row)}`);
   }
+  return lines;
+}
+
+export async function runExample(client: ExampleClient, queries: ExampleQueries): Promise<string[]> {
+  const solana = await client.native.query(queries.solana);
+  const lines = formatNativeRows("solana-usdc", solana);
+
+  const tron = await client.native.query(queries.tron);
+  lines.push(...formatNativeRows("tron-usdt", tron));
+
   return lines;
 }
 

@@ -1,12 +1,58 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"reflect"
 	"testing"
 
 	"github.com/helixbox/datalens/sdks/go/datalens"
 )
+
+type recordingTokenClient struct {
+	calls []string
+}
+
+func (client *recordingTokenClient) DecodedEventsConnection(context.Context, datalens.EventFilter) (datalens.DecodedEventConnection, error) {
+	client.calls = append(client.calls, "index")
+	return datalens.DecodedEventConnection{}, nil
+}
+
+func (client *recordingTokenClient) QueryNative(_ context.Context, input datalens.QueryInput) (datalens.QueryResponse, error) {
+	client.calls = append(client.calls, input.DatasetKey.Family+"."+input.DatasetKey.Name)
+	return datalens.QueryResponse{
+		Cache: json.RawMessage(`{"outcome":"miss"}`),
+		Rows:  json.RawMessage(`[]`),
+	}, nil
+}
+
+func TestRunExampleUsesNativeQueriesOnlyForLiveSmoke(t *testing.T) {
+	client := &recordingTokenClient{}
+	queries := buildExampleQueries(runtimeConfig{
+		Endpoint:    "http://127.0.0.1:3000",
+		Application: "token-sdk-go",
+		Ethereum:    rangeConfig{Start: 19000000, End: 19000010, First: 3},
+		Solana:      rangeConfig{Start: 250000000, End: 250000003},
+		Tron:        rangeConfig{Start: 60000000, End: 60000002},
+	})
+
+	lines, err := runExample(context.Background(), client, queries)
+	if err != nil {
+		t.Fatalf("run example: %v", err)
+	}
+
+	wantCalls := []string{"solana.account_updates", "tron.events"}
+	if !reflect.DeepEqual(client.calls, wantCalls) {
+		t.Fatalf("calls = %#v, want %#v", client.calls, wantCalls)
+	}
+	wantLines := []string{
+		`solana-usdc cache={"outcome":"miss"}`,
+		`tron-usdt cache={"outcome":"miss"}`,
+	}
+	if !reflect.DeepEqual(lines, wantLines) {
+		t.Fatalf("lines = %#v, want %#v", lines, wantLines)
+	}
+}
 
 func TestBuildExampleQueriesUsesOfficialTokenTargetsAndBoundedRanges(t *testing.T) {
 	queries := buildExampleQueries(runtimeConfig{

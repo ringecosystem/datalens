@@ -43,6 +43,11 @@ type exampleQueries struct {
 	Tron     datalens.QueryInput
 }
 
+type tokenClient interface {
+	DecodedEventsConnection(context.Context, datalens.EventFilter) (datalens.DecodedEventConnection, error)
+	QueryNative(context.Context, datalens.QueryInput) (datalens.QueryResponse, error)
+}
+
 func main() {
 	config, err := buildRuntimeConfig(osEnv())
 	if err != nil {
@@ -60,34 +65,30 @@ func main() {
 	}
 
 	queries := buildExampleQueries(config)
-	ctx := context.Background()
-
-	ethereum, err := client.DecodedEventsConnection(ctx, queries.Ethereum)
+	lines, err := runExample(context.Background(), client, queries)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	for _, line := range formatDecodedTransfers(ethereum.Nodes) {
+	for _, line := range lines {
 		fmt.Println(line)
 	}
+}
 
+func runExample(ctx context.Context, client tokenClient, queries exampleQueries) ([]string, error) {
 	solana, err := client.QueryNative(ctx, queries.Solana)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		return nil, err
 	}
-	for _, line := range formatNativeRows("solana-usdc", solana) {
-		fmt.Println(line)
-	}
+	lines := formatNativeRows("solana-usdc", solana)
 
 	tron, err := client.QueryNative(ctx, queries.Tron)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		return nil, err
 	}
-	for _, line := range formatNativeRows("tron-usdt", tron) {
-		fmt.Println(line)
-	}
+	lines = append(lines, formatNativeRows("tron-usdt", tron)...)
+
+	return lines, nil
 }
 
 func buildRuntimeConfig(env map[string]string) (runtimeConfig, error) {
