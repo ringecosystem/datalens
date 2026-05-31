@@ -27,39 +27,16 @@ use datalens_metrics::{IndexerGraphqlQueryOutcome, MetricsRecorder};
 use serde_json::{Map, Value};
 
 use crate::{
-    ApplicationEntityQueryStore, GraphqlViewConfig, GraphqlViewFieldConfig, IndexerError,
-    QueryAuthApplicationConfig, QueryAuthConfig, QueryableStore, StoreQuery,
+    GraphqlViewConfig, GraphqlViewFieldConfig, IndexerError, QueryAuthApplicationConfig,
+    QueryAuthConfig, QueryableStore, StoreQuery,
 };
 
 pub const DEFAULT_EVENT_LIMIT: u64 = 100;
 pub const MAX_EVENT_LIMIT: u64 = 1000;
 
 pub type IndexerGraphqlSchema = Schema<QueryRoot, EmptyMutation, EmptySubscription>;
-pub type IndexerGraphqlApplicationSchema = DynamicSchema;
+pub type IndexerGraphqlDynamicSchema = DynamicSchema;
 type SharedStore = Arc<dyn QueryableStore>;
-type SharedApplicationEntityStore = Arc<dyn ApplicationEntityQueryStore>;
-
-pub trait ApplicationGraphqlSchemaHook: Send + Sync {
-    fn build_schema(
-        &self,
-        context: ApplicationGraphqlSchemaContext,
-    ) -> Result<IndexerGraphqlApplicationSchema, IndexerError>;
-}
-
-#[derive(Clone)]
-pub struct ApplicationGraphqlSchemaContext {
-    entity_store: SharedApplicationEntityStore,
-}
-
-impl ApplicationGraphqlSchemaContext {
-    pub fn new(entity_store: SharedApplicationEntityStore) -> Self {
-        Self { entity_store }
-    }
-
-    pub fn entity_store(&self) -> SharedApplicationEntityStore {
-        self.entity_store.clone()
-    }
-}
 
 pub fn graphql_schema(store: SharedStore) -> IndexerGraphqlSchema {
     Schema::build(QueryRoot, EmptyMutation, EmptySubscription)
@@ -70,7 +47,7 @@ pub fn graphql_schema(store: SharedStore) -> IndexerGraphqlSchema {
 pub fn graphql_schema_with_views(
     store: SharedStore,
     views: Vec<GraphqlViewConfig>,
-) -> Result<IndexerGraphqlApplicationSchema, IndexerError> {
+) -> Result<IndexerGraphqlDynamicSchema, IndexerError> {
     build_dynamic_schema(store, views)
 }
 
@@ -186,45 +163,6 @@ pub fn graphql_router_with_views_auth_path(
     }))
 }
 
-pub fn graphql_application_router_with_auth(
-    schema: IndexerGraphqlApplicationSchema,
-    path: &str,
-    playground: bool,
-    auth: QueryAuthConfig,
-    metrics: Option<IndexerGraphqlMetrics>,
-) -> Router {
-    graphql_application_router_with_auth_path(schema, path, playground, None, auth, metrics)
-}
-
-pub fn graphql_application_router_with_auth_path(
-    schema: IndexerGraphqlApplicationSchema,
-    path: &str,
-    playground: bool,
-    playground_path: Option<&str>,
-    auth: QueryAuthConfig,
-    metrics: Option<IndexerGraphqlMetrics>,
-) -> Router {
-    let mut router = Router::new().route(path, post(graphql_dynamic_handler));
-    if playground {
-        let path = playground_path
-            .map(str::to_owned)
-            .unwrap_or_else(|| format!("{path}/playground"));
-        router = router.route(&path, get(playground_dynamic_handler));
-    }
-    if let Some(endpoint) = metrics
-        .as_ref()
-        .and_then(|metrics| metrics.endpoint.as_ref())
-    {
-        router = router.route(&endpoint.path, get(metrics_dynamic_handler));
-    }
-    router.with_state(DynamicGraphqlState {
-        schema,
-        endpoint: path.to_owned(),
-        metrics,
-        auth: QueryAuthRegistry::new(auth),
-    })
-}
-
 #[derive(Clone)]
 struct GraphqlState {
     schema: IndexerGraphqlSchema,
@@ -235,7 +173,7 @@ struct GraphqlState {
 
 #[derive(Clone)]
 struct DynamicGraphqlState {
-    schema: IndexerGraphqlApplicationSchema,
+    schema: IndexerGraphqlDynamicSchema,
     endpoint: String,
     metrics: Option<IndexerGraphqlMetrics>,
     auth: QueryAuthRegistry,
@@ -941,7 +879,7 @@ struct DynamicEventRow {
 fn build_dynamic_schema(
     store: SharedStore,
     views: Vec<GraphqlViewConfig>,
-) -> Result<IndexerGraphqlApplicationSchema, IndexerError> {
+) -> Result<IndexerGraphqlDynamicSchema, IndexerError> {
     let mut query = DynamicObject::new("Query").field(dynamic_events_field());
     let mut builder = DynamicSchema::build("Query", None, None)
         .data(store)
