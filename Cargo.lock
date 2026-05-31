@@ -1956,19 +1956,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 
 [[package]]
-name = "datalens-bridge-processor"
-version = "0.1.0"
-dependencies = [
- "async-graphql",
- "datalens-core",
- "datalens-indexer",
- "serde",
- "serde_json",
- "sqlx",
- "tokio",
-]
-
-[[package]]
 name = "datalens-chain"
 version = "0.1.0"
 dependencies = [
@@ -2058,23 +2045,6 @@ dependencies = [
  "tokio",
  "toml",
  "tower",
-]
-
-[[package]]
-name = "datalens-event-counter-processor"
-version = "0.1.0"
-dependencies = [
- "async-graphql",
- "axum",
- "clap",
- "datalens-client",
- "datalens-core",
- "datalens-indexer",
- "serde",
- "serde_json",
- "sqlx",
- "tokio",
- "toml",
 ]
 
 [[package]]

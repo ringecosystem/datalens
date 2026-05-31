@@ -3,24 +3,20 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use async_graphql::dynamic::{
-    Field, FieldFuture, FieldValue, Object as DynamicObject, Schema as DynamicSchema, TypeRef,
-};
 use async_graphql::{Request as GraphqlRequest, Variables};
 use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode, header},
 };
 use datalens_indexer::{
-    ApplicationEntityQueryStore, ApplicationEntityReadQuery, ApplicationGraphqlSchemaContext,
-    ApplicationGraphqlSchemaHook, GraphqlViewConfig, GraphqlViewFieldConfig,
-    GraphqlViewFilterConfig, IndexedRecord, IndexerError, OutputWriteSink, PostgresOutputStore,
-    QueryAuthApplicationConfig, QueryAuthConfig, QueryAuthQuotaConfig, QueryableStore,
-    SqliteApplicationEntityStore, SqliteOutputStore, StoreQuery, StoreQueryResult,
+    GraphqlViewConfig, GraphqlViewFieldConfig, GraphqlViewFilterConfig, IndexedRecord,
+    IndexerError, OutputWriteSink, PostgresOutputStore, QueryAuthApplicationConfig,
+    QueryAuthConfig, QueryAuthQuotaConfig, QueryableStore, SqliteOutputStore, StoreQuery,
+    StoreQueryResult,
     graphql::{
-        IndexerGraphqlMetricLabels, IndexerGraphqlMetrics, MetricsEndpointConfig,
-        graphql_application_router_with_auth, graphql_router, graphql_router_with_auth,
-        graphql_router_with_metrics, graphql_schema, graphql_schema_with_views,
+        IndexerGraphqlMetricLabels, IndexerGraphqlMetrics, MetricsEndpointConfig, graphql_router,
+        graphql_router_with_auth, graphql_router_with_metrics, graphql_schema,
+        graphql_schema_with_views,
     },
 };
 use datalens_metrics::MetricsRecorder;
@@ -307,161 +303,6 @@ fn test_graphql_application_view_queries_decoded_event_fields() {
     assert_eq!(view_rows[0]["blockNumber"], 10);
     assert_eq!(view_rows[0]["payload"]["event_name"], "MessageAccepted");
     assert_eq!(body["events"].as_array().expect("generic events").len(), 1);
-}
-
-#[test]
-fn test_application_graphql_hook_queries_application_entity_store() {
-    let entity_store = Arc::new(
-        SqliteApplicationEntityStore::connect(&sqlite_entity_test_url("graphql-hook"))
-            .expect("sqlite entity store connects"),
-    );
-    Runtime::new().expect("runtime").block_on(async {
-        let mut transaction = entity_store.begin().await.expect("begin transaction");
-        sqlx::query(
-            "CREATE TABLE payment_transfers (id TEXT PRIMARY KEY, account TEXT NOT NULL, amount INTEGER NOT NULL)",
-        )
-        .execute(transaction.sqlite())
-        .await
-        .expect("create application table");
-        sqlx::query("INSERT INTO payment_transfers (id, account, amount) VALUES (?, ?, ?)")
-            .bind("transfer-1")
-            .bind("alice")
-            .bind(42_i64)
-            .execute(transaction.sqlite())
-            .await
-            .expect("insert first application row");
-        sqlx::query("INSERT INTO payment_transfers (id, account, amount) VALUES (?, ?, ?)")
-            .bind("transfer-2")
-            .bind("bob")
-            .bind(9_i64)
-            .execute(transaction.sqlite())
-            .await
-            .expect("insert second application row");
-        transaction.commit().await.expect("commit application rows");
-    });
-    let schema = PaymentTransferSchema
-        .build_schema(ApplicationGraphqlSchemaContext::new(entity_store))
-        .expect("application schema");
-
-    let response = Runtime::new().expect("runtime").block_on(async {
-        schema
-            .execute(
-                r#"
-            {
-              paymentTransfers(account: "alice") {
-                id
-                account
-                amount
-              }
-            }
-            "#,
-            )
-            .await
-    });
-
-    assert!(response.errors.is_empty(), "{:?}", response.errors);
-    let body = response.data.into_json().expect("graphql data");
-    let transfers = body["paymentTransfers"]
-        .as_array()
-        .expect("paymentTransfers array");
-    assert_eq!(transfers.len(), 1);
-    assert_eq!(transfers[0]["id"], "transfer-1");
-    assert_eq!(transfers[0]["account"], "alice");
-    assert_eq!(transfers[0]["amount"], 42);
-}
-
-#[test]
-fn test_application_graphql_router_uses_existing_auth_rate_limit_and_metrics_boundaries() {
-    let entity_store = Arc::new(
-        SqliteApplicationEntityStore::connect(&sqlite_entity_test_url("graphql-auth"))
-            .expect("sqlite entity store connects"),
-    );
-    Runtime::new().expect("runtime").block_on(async {
-        let mut transaction = entity_store.begin().await.expect("begin transaction");
-        sqlx::query(
-            "CREATE TABLE payment_transfers (id TEXT PRIMARY KEY, account TEXT NOT NULL, amount INTEGER NOT NULL)",
-        )
-        .execute(transaction.sqlite())
-        .await
-        .expect("create application table");
-        sqlx::query("INSERT INTO payment_transfers (id, account, amount) VALUES (?, ?, ?)")
-            .bind("transfer-1")
-            .bind("alice")
-            .bind(42_i64)
-            .execute(transaction.sqlite())
-            .await
-            .expect("insert application row");
-        transaction.commit().await.expect("commit application rows");
-    });
-    let schema = PaymentTransferSchema
-        .build_schema(ApplicationGraphqlSchemaContext::new(entity_store))
-        .expect("application schema");
-    let recorder = MetricsRecorder::new().expect("metrics recorder");
-    let app = graphql_application_router_with_auth(
-        schema,
-        "/graphql",
-        false,
-        auth_config(Some(QueryAuthQuotaConfig {
-            max_requests_per_minute: Some(1),
-            max_concurrent_requests: None,
-        })),
-        Some(IndexerGraphqlMetrics {
-            recorder: recorder.clone(),
-            labels: metric_labels(),
-            endpoint: Some(MetricsEndpointConfig {
-                path: "/metrics".to_owned(),
-                bearer_token: None,
-            }),
-        }),
-    );
-
-    Runtime::new().expect("runtime").block_on(async {
-        let missing = app
-            .clone()
-            .oneshot(graphql_http_request(
-                r#"{ paymentTransfers(account: "alice") { id } }"#,
-            ))
-            .await
-            .expect("missing token response");
-        let accepted = app
-            .clone()
-            .oneshot(
-                graphql_http_request(r#"{ paymentTransfers(account: "alice") { id } }"#)
-                    .tap_header(header::AUTHORIZATION, "Bearer query-token"),
-            )
-            .await
-            .expect("accepted response");
-        let rate_limited = app
-            .clone()
-            .oneshot(
-                graphql_http_request(r#"{ paymentTransfers(account: "alice") { id } }"#)
-                    .tap_header(header::AUTHORIZATION, "Bearer query-token"),
-            )
-            .await
-            .expect("rate limited response");
-        let metrics = app
-            .oneshot(
-                Request::get("/metrics")
-                    .body(Body::empty())
-                    .expect("metrics request"),
-            )
-            .await
-            .expect("metrics response");
-
-        assert_auth_error(missing, StatusCode::UNAUTHORIZED, "AuthenticationFailed").await;
-        assert_eq!(accepted.status(), StatusCode::OK);
-        assert_auth_error(rate_limited, StatusCode::TOO_MANY_REQUESTS, "RateLimited").await;
-        let text = response_text(metrics).await;
-        assert!(text.contains(
-            r#"datalens_indexer_graphql_query_total{application="query_app",chain="ethereum",dataset="evm.logs",index="ormp",outcome="success",output="sqlite"} 1"#
-        ));
-        assert!(text.contains(
-            r#"datalens_indexer_graphql_auth_failure_total{application="ormp",chain="ethereum",dataset="evm.logs",index="ormp",output="sqlite"} 1"#
-        ));
-        assert!(text.contains(
-            r#"datalens_indexer_graphql_rate_limited_total{application="ormp",chain="ethereum",dataset="evm.logs",index="ormp",output="sqlite"} 1"#
-        ));
-    });
 }
 
 #[test]
@@ -1283,119 +1124,4 @@ fn unique_block_base() -> u64 {
         .duration_since(UNIX_EPOCH)
         .expect("clock after epoch")
         .as_secs()
-}
-
-struct PaymentTransferSchema;
-
-impl ApplicationGraphqlSchemaHook for PaymentTransferSchema {
-    fn build_schema(
-        &self,
-        context: ApplicationGraphqlSchemaContext,
-    ) -> Result<DynamicSchema, IndexerError> {
-        let transfer = DynamicObject::new("PaymentTransfer")
-            .field(Field::new(
-                "id",
-                TypeRef::named_nn(TypeRef::STRING),
-                |ctx| {
-                    FieldFuture::new(async move {
-                        Ok(Some(FieldValue::value(json_string(
-                            ctx.parent_value.try_downcast_ref::<serde_json::Value>()?,
-                            "id",
-                        ))))
-                    })
-                },
-            ))
-            .field(Field::new(
-                "account",
-                TypeRef::named_nn(TypeRef::STRING),
-                |ctx| {
-                    FieldFuture::new(async move {
-                        Ok(Some(FieldValue::value(json_string(
-                            ctx.parent_value.try_downcast_ref::<serde_json::Value>()?,
-                            "account",
-                        ))))
-                    })
-                },
-            ))
-            .field(Field::new(
-                "amount",
-                TypeRef::named_nn(TypeRef::INT),
-                |ctx| {
-                    FieldFuture::new(async move {
-                        Ok(Some(FieldValue::value(json_i32(
-                            ctx.parent_value.try_downcast_ref::<serde_json::Value>()?,
-                            "amount",
-                        ))))
-                    })
-                },
-            ));
-        let query = DynamicObject::new("Query").field(
-            Field::new(
-                "paymentTransfers",
-                TypeRef::named_nn_list_nn("PaymentTransfer"),
-                |ctx| {
-                    let store = ctx
-                        .data::<Arc<dyn ApplicationEntityQueryStore>>()
-                        .expect("entity store")
-                        .clone();
-                    let account = ctx
-                        .args
-                        .try_get("account")
-                        .and_then(|value| value.string())
-                        .expect("account argument")
-                        .to_owned();
-                    FieldFuture::new(async move {
-                        let rows = store
-                            .query_json(
-                                ApplicationEntityReadQuery::new(
-                                    "SELECT id, account, amount FROM payment_transfers WHERE account = ? ORDER BY id",
-                                )
-                                .bind(account),
-                            )
-                            .await
-                            .map_err(|error| async_graphql::Error::new(error.to_string()))?;
-                        Ok(Some(FieldValue::list(
-                            rows.into_iter().map(FieldValue::owned_any),
-                        )))
-                    })
-                },
-            )
-            .argument(async_graphql::dynamic::InputValue::new(
-                "account",
-                TypeRef::named_nn(TypeRef::STRING),
-            )),
-        );
-
-        DynamicSchema::build("Query", None, None)
-            .data(context.entity_store())
-            .register(query)
-            .register(transfer)
-            .finish()
-            .map_err(|error| IndexerError::Config(format!("application graphql schema: {error}")))
-    }
-}
-
-fn sqlite_entity_test_url(name: &str) -> String {
-    let path = std::env::temp_dir().join(format!(
-        "datalens-application-graphql-{name}-{}.sqlite",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_file(&path);
-    format!("sqlite:{}", path.display())
-}
-
-fn json_string(value: &serde_json::Value, field: &str) -> String {
-    value
-        .get(field)
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_owned()
-}
-
-fn json_i32(value: &serde_json::Value, field: &str) -> i32 {
-    value
-        .get(field)
-        .and_then(serde_json::Value::as_i64)
-        .and_then(|value| i32::try_from(value).ok())
-        .unwrap_or_default()
 }
