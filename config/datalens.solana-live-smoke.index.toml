@@ -1,0 +1,31 @@
+[client]
+endpoint = "http://127.0.0.1:3000"
+application = "live-smoke"
+token_env = "DATALENS_LIVE_SMOKE_TOKEN"
+
+[index]
+name = "solana-live-smoke"
+dataset = "solana.transactions"
+finality = "durable"
+chunk_blocks = 2
+
+[[sources]]
+chain = "solana-mainnet-beta"
+family = "solana"
+network_id = "101"
+dataset = "solana.transactions"
+from_slot = 250000000
+to_slot = 250000001
+
+[sources.selector]
+kind = "all"
+
+[output]
+kind = "database"
+
+[output.database]
+driver = "postgres"
+url = "${DATALENS_INDEX_DATABASE_URL}"
+
+[checkpoint]
+path = ".data/indexes/solana-live-smoke/checkpoint.json"

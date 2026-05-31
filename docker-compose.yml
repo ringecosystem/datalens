@@ -80,10 +80,14 @@ services:
       DATALENS_S3_PREFIX: ${DATALENS_S3_PREFIX:-local-compose}
       DATALENS_S3_REGION: ${DATALENS_S3_REGION:-auto}
       DATALENS_ETHEREUM_RPC_URL: ${DATALENS_ETHEREUM_RPC_URL:-http://host.docker.internal:8545}
+      DATALENS_SOLANA_RPC_URL: ${DATALENS_SOLANA_RPC_URL:-https://api.mainnet-beta.solana.com}
+      DATALENS_TRON_RPC_URL: ${DATALENS_TRON_RPC_URL:-https://api.trongrid.io}
+      DATALENS_TRONGRID_API_KEY: ${DATALENS_TRONGRID_API_KEY:-}
       DATALENS_INDEX_DATABASE_URL: ${DATALENS_INDEX_DATABASE_URL:-postgres://datalens:datalens@postgres:5432/datalens_test}
       DATALENS_INDEX_QUERY_METRICS_TOKEN: ${DATALENS_INDEX_QUERY_METRICS_TOKEN:-replace-with-index-metrics-token}
       DATALENS_PUBLIC_APP_TOKEN: ${DATALENS_PUBLIC_APP_TOKEN:-replace-with-public-app-token}
       DATALENS_ORMP_TOKEN: ${DATALENS_ORMP_TOKEN:-replace-with-local-token}
+      DATALENS_LIVE_SMOKE_TOKEN: ${DATALENS_LIVE_SMOKE_TOKEN:-replace-with-live-smoke-token}
       DATALENS_METRICS_TOKEN: ${DATALENS_METRICS_TOKEN:-replace-with-metrics-token}
       RUST_LOG: ${RUST_LOG:-datalens=info}
     ports:

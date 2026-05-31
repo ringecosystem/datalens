@@ -513,8 +513,12 @@ fn test_compose_service_config_embeds_application_index_environment() {
         std::env::set_var("DATALENS_S3_REGION", "auto");
         std::env::set_var("DATALENS_S3_ENDPOINT_URL", "http://127.0.0.1:9000");
         std::env::set_var("DATALENS_ETHEREUM_RPC_URL", "http://example.invalid");
+        std::env::set_var("DATALENS_SOLANA_RPC_URL", "http://example.invalid/solana");
+        std::env::set_var("DATALENS_TRON_RPC_URL", "http://example.invalid/tron");
+        std::env::set_var("DATALENS_TRONGRID_API_KEY", "replace-with-trongrid-token");
         std::env::set_var("DATALENS_PUBLIC_APP_TOKEN", "replace-with-public-token");
         std::env::set_var("DATALENS_ORMP_TOKEN", "replace-with-ormp-token");
+        std::env::set_var("DATALENS_LIVE_SMOKE_TOKEN", "replace-with-live-smoke-token");
         std::env::set_var("DATALENS_METRICS_TOKEN", "replace-with-metrics-token");
         std::env::set_var(
             "DATALENS_INDEX_DATABASE_URL",
@@ -534,8 +538,12 @@ fn test_compose_service_config_embeds_application_index_environment() {
         .env("DATALENS_S3_REGION", "auto")
         .env("DATALENS_S3_ENDPOINT_URL", "http://127.0.0.1:9000")
         .env("DATALENS_ETHEREUM_RPC_URL", "http://example.invalid")
+        .env("DATALENS_SOLANA_RPC_URL", "http://example.invalid/solana")
+        .env("DATALENS_TRON_RPC_URL", "http://example.invalid/tron")
+        .env("DATALENS_TRONGRID_API_KEY", "replace-with-trongrid-token")
         .env("DATALENS_PUBLIC_APP_TOKEN", "replace-with-public-token")
         .env("DATALENS_ORMP_TOKEN", "replace-with-ormp-token")
+        .env("DATALENS_LIVE_SMOKE_TOKEN", "replace-with-live-smoke-token")
         .env("DATALENS_METRICS_TOKEN", "replace-with-metrics-token")
         .env(
             "DATALENS_INDEX_DATABASE_URL",
@@ -559,6 +567,55 @@ fn test_compose_service_config_embeds_application_index_environment() {
     assert_eq!(plan["service"]["index"]["application_configured"], true);
     assert_eq!(plan["service"]["query"]["index"]["graphql_enabled"], true);
     assert_eq!(plan["service"]["query"]["index"]["path"], "/index/graphql");
+}
+
+#[test]
+fn test_live_smoke_index_configs_cover_solana_and_tron() {
+    let config_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../config")
+        .canonicalize()
+        .expect("config dir");
+    let cases = [
+        (
+            "datalens.solana-live-smoke.index.toml",
+            "solana-live-smoke",
+            "solana.transactions",
+            "solana",
+        ),
+        (
+            "datalens.tron-live-smoke.index.toml",
+            "tron-live-smoke",
+            "tron.events",
+            "tron",
+        ),
+    ];
+
+    for (file, index_name, dataset, family) in cases {
+        let output = ProcessCommand::new(env!("CARGO_BIN_EXE_datalens"))
+            .args(["index", "doctor", "--config"])
+            .arg(config_dir.join(file))
+            .env("DATALENS_LIVE_SMOKE_TOKEN", "replace-with-live-smoke-token")
+            .env(
+                "DATALENS_INDEX_DATABASE_URL",
+                "postgres://datalens:replace-with-password@postgres.example.invalid:5432/datalens",
+            )
+            .output()
+            .expect("run live smoke index doctor");
+
+        assert!(
+            output.status.success(),
+            "{file} index doctor failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let summary: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("index doctor JSON");
+        assert_eq!(summary["index"], index_name);
+        assert_eq!(summary["dataset"], dataset);
+        assert_eq!(summary["source_count"], 1);
+        assert_eq!(summary["sources"][0]["family"], family);
+        assert_eq!(summary["chunk_blocks"], 2);
+    }
 }
 
 #[test]
