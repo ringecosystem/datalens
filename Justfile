@@ -7,6 +7,15 @@ fmt-check:
 check:
   cargo check --workspace
 
+export-schemas:
+  mkdir -p schemas
+  cargo run -p datalens-edge --bin export-native-schema > schemas/native.graphql
+  cargo run -p datalens-indexer --bin export-index-schema > schemas/index.graphql
+
+schema-check:
+  cargo test -p datalens-edge --test schema_contract
+  cargo test -p datalens-indexer --test schema_contract
+
 clippy:
   cargo clippy --workspace --all-targets -- -D warnings
 

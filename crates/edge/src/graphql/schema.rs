@@ -41,6 +41,12 @@ pub(crate) fn schema(registry: QueryServiceRegistry) -> DatalensGraphqlSchema {
         .finish()
 }
 
+pub fn native_graphql_schema_sdl() -> String {
+    Schema::build(QueryRoot, MutationRoot, EmptySubscription)
+        .finish()
+        .sdl()
+}
+
 pub(crate) async fn graphql_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
