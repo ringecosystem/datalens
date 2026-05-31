@@ -160,6 +160,9 @@ fn local_compose_deployment_artifacts_are_declared() {
     assert!(compose.contains("condition: service_healthy"));
 
     assert!(env_example.contains("DATALENS_SERVER_CONFIG=/etc/datalens/datalens.toml"));
+    assert!(env_example.contains("# Optional external application index service examples"));
+    assert!(!env_example.contains("http://127.0.0.1:8080/graphql"));
+    assert!(env_example.contains("DATALENS_INDEX_GRAPHQL_URL=http://127.0.0.1:3000/index/graphql"));
     assert!(env_example.contains("DATALENS_INDEX_DATABASE_URL="));
     assert!(env_example.contains("DATALENS_SOLANA_RPC_URL="));
     assert!(env_example.contains("DATALENS_TRON_RPC_URL="));
