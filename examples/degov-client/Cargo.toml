@@ -6,9 +6,10 @@ version.workspace = true
 publish = false
 
 [dependencies]
+alloy-dyn-abi = "1.6.0"
+alloy-primitives = "1.6.0"
 datalens-sdk = { path = "../../sdks/rust" }
 rusqlite = { version = "0.37.0", features = ["bundled"] }
 serde_json.workspace = true
 
 [dev-dependencies]
-alloy-primitives = "1.6.0"

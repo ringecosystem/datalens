@@ -9,6 +9,9 @@ mod support;
 
 use support::MockGraphqlServer;
 
+const VOTER_TOPIC: &str = "0x0000000000000000000000001111111111111111111111111111111111111111";
+const VOTE_CAST_DATA: &str = "0x000000000000000000000000000000000000000000000000000000000000002a0000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000700000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000007626563617573650000000000000000000000000000000000000000000000000000";
+
 #[test]
 fn test_fetch_vote_cast_page_uses_decoded_events_connection_shape() {
     let server = MockGraphqlServer::new(vec![json!({
@@ -29,14 +32,9 @@ fn test_fetch_vote_cast_page_uses_decoded_events_connection_shape() {
                             "transaction_index": 0,
                             "log_index": 1,
                             "address": "0xgovernor",
-                            "topics": [DEFAULT_EVENT_TOPIC0],
-                            "data": "0x",
-                            "removed": false,
-                            "decodedArgs": {
-                                "proposalId": "42",
-                                "support": 1,
-                                "weight": "7"
-                            }
+                            "topics": [DEFAULT_EVENT_TOPIC0, VOTER_TOPIC],
+                            "data": VOTE_CAST_DATA,
+                            "removed": false
                         }]
                     }
                 }
@@ -53,6 +51,15 @@ fn test_fetch_vote_cast_page_uses_decoded_events_connection_shape() {
     assert_eq!(page.next_cursor.as_deref(), Some("125"));
     assert!(page.has_next_page);
     assert_eq!(page.events.len(), 1);
+    assert_eq!(
+        page.events[0].event.decode_status.as_deref(),
+        Some("decoded")
+    );
+    assert_eq!(page.events[0].event.decoded_args["proposalId"], "42");
+    assert_eq!(
+        page.events[0].event.decoded_args["voter"],
+        "0x1111111111111111111111111111111111111111"
+    );
 
     let request = server.only_request();
     assert!(request.query.contains("query($input: QueryInput!)"));

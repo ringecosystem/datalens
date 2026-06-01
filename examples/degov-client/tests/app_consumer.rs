@@ -12,6 +12,11 @@ mod support;
 
 use support::MockGraphqlServer;
 
+const VOTER_TOPIC: &str = "0x0000000000000000000000001111111111111111111111111111111111111111";
+const VOTE_CAST_FOR_DATA: &str = "0x000000000000000000000000000000000000000000000000000000000000002a0000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000700000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000007626563617573650000000000000000000000000000000000000000000000000000";
+const VOTE_CAST_AGAINST_DATA: &str = "0x000000000000000000000000000000000000000000000000000000000000002a0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000300000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000007626563617573650000000000000000000000000000000000000000000000000000";
+const VOTE_CAST_ABSTAIN_DATA: &str = "0x000000000000000000000000000000000000000000000000000000000000002a0000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000007626563617573650000000000000000000000000000000000000000000000000000";
+
 #[test]
 fn test_migrations_create_application_tables_and_indexes() {
     let db = AppDatabase::open("sqlite::memory:").expect("open database");
@@ -37,7 +42,7 @@ fn test_migrations_create_application_tables_and_indexes() {
 fn test_handle_vote_cast_page_writes_vote_projection_and_checkpoint() {
     let db = migrated_db();
     let handler = VoteCastHandler::new("degov-vote-consumer");
-    let page = vote_page("vote-cursor-2", "42", Some(1), Some("7"));
+    let page = vote_page("vote-cursor-2", VOTE_CAST_FOR_DATA);
 
     let summary = handle_vote_cast_page(&db, &handler, page).expect("handle page");
 
@@ -55,6 +60,32 @@ fn test_handle_vote_cast_page_writes_vote_projection_and_checkpoint() {
         db.checkpoint("degov-vote-consumer").expect("checkpoint"),
         Some("101".to_owned())
     );
+    let row = db
+        .transaction(|tx| {
+            Ok(tx.query_row(
+                "SELECT proposal_id, voter, support, weight, reason, raw_event_json FROM degov_votes",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )?)
+        })
+        .expect("vote row");
+    assert_eq!(row.0, "42");
+    assert_eq!(row.1, "0x1111111111111111111111111111111111111111");
+    assert_eq!(row.2, 1);
+    assert_eq!(row.3, 7);
+    assert_eq!(row.4, "because");
+    let raw_event: serde_json::Value = serde_json::from_str(&row.5).expect("raw event json");
+    assert_eq!(raw_event["decodeStatus"], "decoded");
+    assert_eq!(raw_event["payload"]["data"], VOTE_CAST_FOR_DATA);
 }
 
 #[test]
@@ -64,14 +95,14 @@ fn test_handle_vote_cast_page_is_idempotent_for_duplicate_events() {
     handle_vote_cast_page(
         &db,
         &handler,
-        vote_page("vote-cursor-2", "42", Some(1), Some("7")),
+        vote_page("vote-cursor-2", VOTE_CAST_FOR_DATA),
     )
     .expect("first page");
 
     let summary = handle_vote_cast_page(
         &db,
         &handler,
-        vote_page("vote-cursor-2", "42", Some(1), Some("7")),
+        vote_page("vote-cursor-2", VOTE_CAST_FOR_DATA),
     )
     .expect("duplicate page");
 
@@ -93,9 +124,9 @@ fn test_handle_vote_cast_page_updates_support_buckets() {
         &db,
         &handler,
         degov_page(vec![
-            vote_edge("for-cursor", "42", Some(1), Some("7")),
-            vote_edge("against-cursor", "42", Some(0), Some("3")),
-            vote_edge("abstain-cursor", "42", Some(2), Some("2")),
+            vote_edge("for-cursor", VOTE_CAST_FOR_DATA),
+            vote_edge("against-cursor", VOTE_CAST_AGAINST_DATA),
+            vote_edge("abstain-cursor", VOTE_CAST_ABSTAIN_DATA),
         ]),
     )
     .expect("handle page");
@@ -110,12 +141,8 @@ fn test_handle_vote_cast_page_updates_support_buckets() {
 fn test_handle_vote_cast_page_skips_missing_required_fields() {
     let db = migrated_db();
     let handler = VoteCastHandler::new("degov-vote-consumer");
-    let summary = handle_vote_cast_page(
-        &db,
-        &handler,
-        vote_page("vote-cursor-2", "42", Some(1), None),
-    )
-    .expect("handle page");
+    let summary = handle_vote_cast_page(&db, &handler, vote_page("vote-cursor-2", "0x1234"))
+        .expect("handle page");
 
     assert_eq!(summary.fetched_rows, 1);
     assert_eq!(summary.inserted_rows, 0);
@@ -161,7 +188,7 @@ fn test_checkpoint_does_not_advance_when_projection_write_fails() {
     let err = handle_vote_cast_page(
         &db,
         &handler,
-        vote_page("vote-cursor-2", "42", Some(1), Some("7")),
+        vote_page("vote-cursor-2", VOTE_CAST_FOR_DATA),
     )
     .expect_err("cursor conflict should fail");
 
@@ -178,12 +205,7 @@ fn test_run_once_resumes_with_stored_checkpoint_cursor() {
     db.insert_checkpoint("degov-vote-consumer", "101")
         .expect("seed checkpoint");
     let server = MockGraphqlServer::new(vec![graphql_page(
-        vec![vote_edge(
-            "101:0xtx-vote-cursor-2:1",
-            "42",
-            Some(1),
-            Some("7"),
-        )],
+        vec![vote_edge("101:0xtx-vote-cursor-2:1", VOTE_CAST_FOR_DATA)],
         false,
     )]);
     let client = DatalensDegovClient::new(sdk_client(&server));
@@ -252,16 +274,8 @@ fn test_config(
     }
 }
 
-fn vote_page(
-    cursor: &str,
-    proposal_id: &str,
-    support: Option<u64>,
-    weight: Option<&str>,
-) -> datalens_example_degov_client::datalens::VoteCastPage {
-    let server = MockGraphqlServer::new(vec![graphql_page(
-        vec![vote_edge(cursor, proposal_id, support, weight)],
-        false,
-    )]);
+fn vote_page(cursor: &str, data: &str) -> datalens_example_degov_client::datalens::VoteCastPage {
+    let server = MockGraphqlServer::new(vec![graphql_page(vec![vote_edge(cursor, data)], false)]);
     let client = DatalensDegovClient::new(sdk_client(&server));
     let config = test_config(&server, 100, Some(100), 1);
     client
@@ -300,12 +314,7 @@ fn graphql_page(edges: Vec<serde_json::Value>, _has_next_page: bool) -> serde_js
     })
 }
 
-fn vote_edge(
-    cursor: &str,
-    proposal_id: &str,
-    support: Option<u64>,
-    weight: Option<&str>,
-) -> serde_json::Value {
+fn vote_edge(cursor: &str, data: &str) -> serde_json::Value {
     let transaction_hash = cursor
         .split(':')
         .nth(1)
@@ -318,15 +327,8 @@ fn vote_edge(
         "transaction_index": 0,
         "log_index": 1,
         "address": "0xgovernor",
-        "topics": [DEFAULT_EVENT_TOPIC0],
-        "data": "0x",
-        "removed": false,
-        "decodedArgs": {
-            "voter": "0xvoter",
-            "proposalId": proposal_id,
-            "support": support,
-            "weight": weight,
-            "reason": "because"
-        }
+        "topics": [DEFAULT_EVENT_TOPIC0, VOTER_TOPIC],
+        "data": data,
+        "removed": false
     })
 }

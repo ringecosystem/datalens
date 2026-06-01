@@ -1,3 +1,8 @@
+use alloy_dyn_abi::{DynSolEvent, DynSolType, DynSolValue};
+use alloy_primitives::{
+    B256,
+    hex::{self, FromHex},
+};
 use datalens_sdk::{
     DatalensClient,
     index::DecodedEvent,
@@ -7,7 +12,7 @@ use datalens_sdk::{
         QuerySelectorInput, SelectorKindInput,
     },
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::{AppError, AppResult, config::AppConfig};
 
@@ -151,6 +156,7 @@ fn row_to_vote_cast_event(row: &Value, config: &AppConfig) -> AppResult<VoteCast
         transaction_hash.as_deref().unwrap_or("<missing-tx>"),
         log_index
     );
+    let decoded = decode_vote_cast(row, config);
 
     Ok(VoteCastEvent {
         cursor,
@@ -173,13 +179,9 @@ fn row_to_vote_cast_event(row: &Value, config: &AppConfig) -> AppResult<VoteCast
                 .and_then(|topics| topics.first())
                 .and_then(Value::as_str)
                 .map(str::to_owned),
-            decoded_args: row
-                .get("decodedArgs")
-                .or_else(|| row.get("decoded_args"))
-                .cloned()
-                .unwrap_or(Value::Null),
-            decode_status: Some("decoded".to_owned()),
-            decode_error: None,
+            decoded_args: decoded.args,
+            decode_status: Some(decoded.status),
+            decode_error: decoded.error,
             payload: row.clone(),
             created_at: None,
         },
@@ -199,4 +201,140 @@ fn i32_field(row: &Value, name: &str) -> AppResult<i32> {
                 .and_then(|value| i32::try_from(value).ok())
         })
         .ok_or_else(|| AppError::Handler(format!("native log row is missing {name}")))
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct LocalDecode {
+    args: Value,
+    status: String,
+    error: Option<String>,
+}
+
+fn decode_vote_cast(row: &Value, config: &AppConfig) -> LocalDecode {
+    match decode_vote_cast_args(row, config) {
+        Ok(args) => LocalDecode {
+            args,
+            status: "decoded".to_owned(),
+            error: None,
+        },
+        Err(error) => LocalDecode {
+            args: Value::Null,
+            status: "failed".to_owned(),
+            error: Some(format!("decode failed: {error}")),
+        },
+    }
+}
+
+fn decode_vote_cast_args(row: &Value, config: &AppConfig) -> Result<Value, String> {
+    let topics = topics(row)?;
+    let event = DynSolEvent::new(
+        Some(parse_topic(&config.event_topic0)?),
+        vec![
+            "address"
+                .parse::<DynSolType>()
+                .map_err(|error| error.to_string())?,
+        ],
+        DynSolType::Tuple(vec![
+            "uint256"
+                .parse::<DynSolType>()
+                .map_err(|error| error.to_string())?,
+            "uint8"
+                .parse::<DynSolType>()
+                .map_err(|error| error.to_string())?,
+            "uint256"
+                .parse::<DynSolType>()
+                .map_err(|error| error.to_string())?,
+            "string"
+                .parse::<DynSolType>()
+                .map_err(|error| error.to_string())?,
+        ]),
+    )
+    .ok_or_else(|| "invalid VoteCast ABI".to_owned())?;
+    let decoded = event
+        .decode_log_parts(topics, &data(row)?)
+        .map_err(|error| error.to_string())?;
+    let voter = decoded
+        .indexed
+        .first()
+        .map(sol_value_to_json)
+        .ok_or_else(|| "decoded log is missing voter".to_owned())?;
+    let proposal_id = decoded
+        .body
+        .first()
+        .map(sol_value_to_json)
+        .ok_or_else(|| "decoded log is missing proposalId".to_owned())?;
+    let support = decoded
+        .body
+        .get(1)
+        .map(sol_value_to_json)
+        .ok_or_else(|| "decoded log is missing support".to_owned())?;
+    let weight = decoded
+        .body
+        .get(2)
+        .map(sol_value_to_json)
+        .ok_or_else(|| "decoded log is missing weight".to_owned())?;
+    let reason = decoded
+        .body
+        .get(3)
+        .map(sol_value_to_json)
+        .ok_or_else(|| "decoded log is missing reason".to_owned())?;
+
+    Ok(json!({
+        "voter": voter,
+        "proposalId": proposal_id,
+        "support": support,
+        "weight": weight,
+        "reason": reason,
+    }))
+}
+
+fn topics(row: &Value) -> Result<Vec<B256>, String> {
+    row.get("topics")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "log row is missing topics".to_owned())?
+        .iter()
+        .map(|topic| {
+            topic
+                .as_str()
+                .ok_or_else(|| "log topic is not a string".to_owned())
+                .and_then(parse_topic)
+        })
+        .collect()
+}
+
+fn data(row: &Value) -> Result<Vec<u8>, String> {
+    let value = row
+        .get("data")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "log row is missing data".to_owned())?;
+    let hex = value
+        .strip_prefix("0x")
+        .ok_or_else(|| "data must start with 0x".to_owned())?;
+    Vec::from_hex(hex).map_err(|error| format!("invalid data: {error}"))
+}
+
+fn parse_topic(value: &str) -> Result<B256, String> {
+    value
+        .parse::<B256>()
+        .map_err(|error| format!("invalid topic: {error}"))
+}
+
+fn sol_value_to_json(value: &DynSolValue) -> Value {
+    match value {
+        DynSolValue::Bool(value) => Value::Bool(*value),
+        DynSolValue::Int(value, _) => Value::String(value.to_string()),
+        DynSolValue::Uint(value, _) => Value::String(value.to_string()),
+        DynSolValue::FixedBytes(value, size) => {
+            Value::String(format!("0x{}", hex::encode(&value[..*size])))
+        }
+        DynSolValue::Address(value) => Value::String(format!("{value:#x}")),
+        DynSolValue::Function(value) => Value::String(format!("0x{}", hex::encode(value))),
+        DynSolValue::Bytes(value) => Value::String(format!("0x{}", hex::encode(value))),
+        DynSolValue::String(value) => Value::String(value.clone()),
+        DynSolValue::Array(values)
+        | DynSolValue::FixedArray(values)
+        | DynSolValue::Tuple(values) => {
+            Value::Array(values.iter().map(sol_value_to_json).collect())
+        }
+    }
 }
