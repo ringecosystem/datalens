@@ -158,6 +158,82 @@ fn test_query_logs_miss_persists_then_equivalent_hit_uses_cache() {
 }
 
 #[test]
+fn test_query_staged_non_empty_range_survives_service_restart() {
+    let root = temp_storage_root("staged-restart-non-empty");
+    let source = MockSource::default().with_blocks(vec![block(10, "0x10")]);
+    let service = service_with_writer_config(
+        LocalStorage::new(&root),
+        source.clone(),
+        staging_writer_config(),
+    );
+
+    let first = service
+        .query_native(blocks_request(10, 10))
+        .expect("first query succeeds");
+    assert_eq!(block_numbers(&first), vec![10]);
+    assert_eq!(
+        source.calls(),
+        vec![SourceCall::Blocks(BlockRange::expect_new(10, 10))]
+    );
+    source.clear_calls();
+
+    let restarted = service_with_writer_config(
+        LocalStorage::new(&root),
+        source.clone(),
+        staging_writer_config(),
+    );
+    let second = restarted
+        .query_native(blocks_request(10, 10))
+        .expect("restarted query reads durable cache");
+
+    assert_eq!(
+        second.cache.hit_ranges,
+        vec![LedgerRange::blocks(10, 10).expect("valid range")]
+    );
+    assert_eq!(second.cache.missing_ranges, Vec::<LedgerRange>::new());
+    assert_eq!(source.calls(), Vec::<SourceCall>::new());
+    assert_eq!(block_numbers(&second), vec![10]);
+}
+
+#[test]
+fn test_query_empty_coverage_survives_service_restart() {
+    let root = temp_storage_root("staged-restart-empty");
+    let source = MockSource::default();
+    let request = logs_request(50, 50, vec!["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]);
+    let service = service_with_writer_config(
+        LocalStorage::new(&root),
+        source.clone(),
+        staging_writer_config(),
+    );
+
+    service
+        .query_native(request.clone())
+        .expect("first empty query succeeds");
+    assert_eq!(
+        source.calls(),
+        vec![SourceCall::Logs(BlockRange::expect_new(50, 50))]
+    );
+    source.clear_calls();
+
+    let restarted = service_with_writer_config(
+        LocalStorage::new(&root),
+        source.clone(),
+        staging_writer_config(),
+    );
+    let second = restarted
+        .query_native(request)
+        .expect("restarted empty query reads durable coverage");
+
+    assert_eq!(
+        second.cache.hit_ranges,
+        vec![LedgerRange::blocks(50, 50).expect("valid range")]
+    );
+    assert_eq!(second.cache.missing_ranges, Vec::<LedgerRange>::new());
+    assert_eq!(source.calls(), Vec::<SourceCall>::new());
+    assert_eq!(log_indexes(&second), Vec::<u64>::new());
+}
+
+#[test]
 fn test_query_range_limit_rejection_returns_invalid_input() {
     let service = service(
         LocalStorage::new(temp_storage_root("range-limit")),
