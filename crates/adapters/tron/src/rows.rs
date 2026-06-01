@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use datalens_chain::{ChainFetchRequest, DatasetSelector};
 use datalens_core::{DatalensError, DatalensErrorKind, LedgerRange};
@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 use crate::adapter::{
     TRON_EVENTS_KIND, TronAdapter, TronBlock, TronContractEvent, TronContractEventRequest,
-    TronEventFilter, TronProvider, normalize_tron_contract_address,
+    TronEventFilter, TronFinality, TronProvider, normalize_tron_contract_address,
 };
 
 pub(crate) fn block_rows(blocks: &[TronBlock]) -> Vec<Value> {
@@ -213,6 +213,7 @@ where
         let filter = selector_event_filter(&request.selector);
         let mut rows = Vec::new();
         let mut calls = 0;
+        let mut blocks = HashMap::new();
         for contract_address in &filter.contract_addresses {
             let event_names = if filter.event_names.is_empty() {
                 vec![None]
@@ -240,17 +241,41 @@ where
                             })?;
                         pages += 1;
                         calls += page.provider_calls;
-                        rows.extend(
-                            page.events
-                                .into_iter()
-                                .filter(|event| {
-                                    filter.matches(
-                                        &event.contract_address,
-                                        event.event_name.as_deref(),
-                                    )
-                                })
-                                .map(contract_event_row),
-                        );
+                        for event in page.events.into_iter().filter(|event| {
+                            filter.matches(&event.contract_address, event.event_name.as_deref())
+                        }) {
+                            let block = if let Some(block) = blocks.get(&event.block_number) {
+                                block
+                            } else {
+                                let block = self
+                                    .provider
+                                    .get_block_by_number(event.block_number, TronFinality::Finalized)?
+                                    .ok_or_else(|| {
+                                        DatalensError::new(
+                                            DatalensErrorKind::ProviderFailure,
+                                            format!(
+                                                "provider returned no finalized Tron block metadata for block {}",
+                                                event.block_number
+                                            ),
+                                        )
+                                    })?;
+                                calls += 1;
+                                blocks.insert(event.block_number, block);
+                                blocks.get(&event.block_number).expect("inserted block")
+                            };
+                            if let Some(block_hash) = &event.block_hash
+                                && !block_hash.eq_ignore_ascii_case(&block.hash)
+                            {
+                                return Err(DatalensError::new(
+                                    DatalensErrorKind::ProviderFailure,
+                                    format!(
+                                        "TronGrid contract event block hash {} did not match finalized block hash {} for block {}",
+                                        block_hash, block.hash, event.block_number
+                                    ),
+                                ));
+                            }
+                            rows.push(contract_event_row(event, block));
+                        }
                         let Some(next) = page.next_fingerprint else {
                             break;
                         };
@@ -286,7 +311,7 @@ where
     }
 }
 
-fn contract_event_row(event: TronContractEvent) -> Value {
+fn contract_event_row(event: TronContractEvent, block: &TronBlock) -> Value {
     let contract_address =
         normalize_tron_contract_address(&event.contract_address).unwrap_or(event.contract_address);
     json!({
@@ -297,7 +322,9 @@ fn contract_event_row(event: TronContractEvent) -> Value {
         "non_indexed_fields": event.non_indexed_fields,
         "transaction_id": event.transaction_id,
         "block_number": event.block_number,
-        "block_hash": event.block_hash,
+        "block_hash": block.hash,
+        "parent_hash": block.parent_hash,
+        "block_timestamp": block.timestamp,
         "transaction_index": event.transaction_index,
         "event_index": event.event_index,
         "confirmed": event.confirmed,

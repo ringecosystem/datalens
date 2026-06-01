@@ -6,7 +6,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::adapter::{
     FINALIZED, SOLANA_ADDRESS_KIND, SOLANA_ALL_KIND, SOLANA_PROGRAM_KIND, SOLANA_SIGNATURE_KIND,
     SolanaBlock, SolanaInstruction, SolanaTokenBalance, SolanaTransaction,
-    SolanaTransactionWithSlot,
 };
 
 pub(crate) fn slot_rows(blocks: &[SolanaBlock]) -> Vec<Value> {
@@ -58,19 +57,6 @@ pub(crate) fn block_rows(blocks: &[SolanaBlock]) -> Vec<Value> {
             })
         })
         .collect()
-}
-
-pub(crate) fn block_from_transaction(transaction: SolanaTransactionWithSlot) -> SolanaBlock {
-    SolanaBlock {
-        slot: transaction.slot,
-        block_height: None,
-        blockhash: transaction.blockhash,
-        previous_blockhash: String::new(),
-        parent_slot: transaction.slot.saturating_sub(1),
-        block_time: transaction.block_time,
-        transactions: vec![transaction.transaction],
-        raw: transaction.raw,
-    }
 }
 
 pub(crate) fn can_fallback_selector_fetch(error: &DatalensError) -> bool {

@@ -352,7 +352,7 @@ fn test_tron_contract_event_provider_matches_base58_response_address() {
             "value": "256860200"
         }),
         transaction_id: Some("tron-grid-tx".to_owned()),
-        block_number: 83_200_000,
+        block_number: 10,
         block_hash: None,
         transaction_index: 0,
         event_index: 0,
@@ -379,7 +379,7 @@ fn test_tron_contract_event_provider_matches_base58_response_address() {
         .fetch(datalens_chain::ChainFetchRequest::new(
             adapter.capabilities().chain().clone(),
             DatasetKey::tron_events(),
-            LedgerRange::blocks(83_200_000, 83_200_000).expect("range"),
+            LedgerRange::blocks(10, 10).expect("range"),
             selector,
         ))
         .expect("fetch events");
@@ -392,6 +392,8 @@ fn test_tron_contract_event_provider_matches_base58_response_address() {
         rows[0]["contract_address"],
         "41a614f803b6fd780986a42c78ec9c7f77e6ded13c"
     );
+    assert_eq!(rows[0]["parent_hash"], "0000000000000009-tron-hash");
+    assert_eq!(rows[0]["block_timestamp"], 1_700_000_010_u64);
 }
 
 #[test]
@@ -493,7 +495,13 @@ fn test_tron_contract_event_provider_multi_page_success_uses_all_pages() {
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0]["transaction_id"], "tron-grid-tx-1");
     assert_eq!(rows[1]["transaction_id"], "tron-grid-tx-2");
+    for row in rows {
+        assert_eq!(row["block_hash"], "000000000000000a-tron-hash");
+        assert_eq!(row["parent_hash"], "0000000000000009-tron-hash");
+        assert_eq!(row["block_timestamp"], 1_700_000_010_u64);
+    }
     assert_eq!(provider.contract_event_calls(), 2);
+    assert_eq!(response.provider_diagnostics.calls, 3);
 }
 
 #[test]
@@ -1100,7 +1108,7 @@ fn contract_event(transaction_id: &str) -> TronContractEvent {
         non_indexed_fields: serde_json::json!({"value":"1"}),
         transaction_id: Some(transaction_id.to_owned()),
         block_number: 10,
-        block_hash: Some("tron-grid-block".to_owned()),
+        block_hash: Some("000000000000000a-tron-hash".to_owned()),
         transaction_index: 4,
         event_index: 5,
         confirmed: true,
