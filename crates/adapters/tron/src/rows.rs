@@ -210,61 +210,65 @@ where
                 filter.event_names.iter().cloned().map(Some).collect()
             };
             for event_name in event_names {
-                let mut fingerprint = None;
-                let mut pages = 0;
-                let mut seen_fingerprints = HashSet::new();
-                loop {
-                    // Pagination is capped and fingerprint loops are rejected so
-                    // a TronGrid query cannot run forever or duplicate coverage.
-                    let page = self
-                        .provider
-                        .get_contract_events(TronContractEventRequest {
-                            contract_address: contract_address.clone(),
-                            event_name: event_name.clone(),
-                            range: range.clone(),
-                            only_confirmed: true,
-                            limit: 200,
-                            fingerprint: fingerprint.clone(),
-                        })?;
-                    pages += 1;
-                    calls += page.provider_calls;
-                    rows.extend(
-                        page.events
-                            .into_iter()
-                            .filter(|event| {
-                                filter.matches(&event.contract_address, event.event_name.as_deref())
-                            })
-                            .map(contract_event_row),
-                    );
-                    let Some(next) = page.next_fingerprint else {
-                        break;
-                    };
-                    if !seen_fingerprints.insert(next.clone()) {
-                        return Err(DatalensError::new(
-                            DatalensErrorKind::ProviderLimit,
-                            format!(
-                                "repeated TronGrid contract event fingerprint for contract {} event {} range {}-{}",
-                                contract_address,
-                                event_name.as_deref().unwrap_or("all"),
-                                range.start(),
-                                range.end()
-                            ),
-                        ));
+                for block_number in range.start()..=range.end() {
+                    let block_range = LedgerRange::blocks(block_number, block_number)?;
+                    let mut fingerprint = None;
+                    let mut pages = 0;
+                    let mut seen_fingerprints = HashSet::new();
+                    loop {
+                        // Pagination is capped and fingerprint loops are rejected so
+                        // a TronGrid query cannot run forever or duplicate coverage.
+                        let page = self
+                            .provider
+                            .get_contract_events(TronContractEventRequest {
+                                contract_address: contract_address.clone(),
+                                event_name: event_name.clone(),
+                                range: block_range.clone(),
+                                only_confirmed: true,
+                                limit: 200,
+                                fingerprint: fingerprint.clone(),
+                            })?;
+                        pages += 1;
+                        calls += page.provider_calls;
+                        rows.extend(
+                            page.events
+                                .into_iter()
+                                .filter(|event| {
+                                    filter.matches(
+                                        &event.contract_address,
+                                        event.event_name.as_deref(),
+                                    )
+                                })
+                                .map(contract_event_row),
+                        );
+                        let Some(next) = page.next_fingerprint else {
+                            break;
+                        };
+                        if !seen_fingerprints.insert(next.clone()) {
+                            return Err(DatalensError::new(
+                                DatalensErrorKind::ProviderLimit,
+                                format!(
+                                    "repeated TronGrid contract event fingerprint for contract {} event {} block {}",
+                                    contract_address,
+                                    event_name.as_deref().unwrap_or("all"),
+                                    block_number
+                                ),
+                            ));
+                        }
+                        if pages >= self.max_contract_event_pages {
+                            return Err(DatalensError::new(
+                                DatalensErrorKind::ProviderLimit,
+                                format!(
+                                    "TronGrid contract event page limit {} reached for contract {} event {} block {}",
+                                    self.max_contract_event_pages,
+                                    contract_address,
+                                    event_name.as_deref().unwrap_or("all"),
+                                    block_number
+                                ),
+                            ));
+                        }
+                        fingerprint = Some(next);
                     }
-                    if pages >= self.max_contract_event_pages {
-                        return Err(DatalensError::new(
-                            DatalensErrorKind::ProviderLimit,
-                            format!(
-                                "TronGrid contract event page limit {} reached for contract {} event {} range {}-{}",
-                                self.max_contract_event_pages,
-                                contract_address,
-                                event_name.as_deref().unwrap_or("all"),
-                                range.start(),
-                                range.end()
-                            ),
-                        ));
-                    }
-                    fingerprint = Some(next);
                 }
             }
         }

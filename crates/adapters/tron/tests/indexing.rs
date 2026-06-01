@@ -240,6 +240,63 @@ fn test_tron_contract_event_provider_success_uses_trongrid_rows() {
 }
 
 #[test]
+fn test_tron_contract_event_provider_splits_multi_block_ranges() {
+    let provider = ContractEventFixtureProvider::with_contract_event_pages(vec![
+        TronContractEventPage {
+            events: Vec::new(),
+            next_fingerprint: None,
+            provider_calls: 1,
+        },
+        TronContractEventPage {
+            events: Vec::new(),
+            next_fingerprint: None,
+            provider_calls: 1,
+        },
+        TronContractEventPage {
+            events: Vec::new(),
+            next_fingerprint: None,
+            provider_calls: 1,
+        },
+    ]);
+    let adapter = TronAdapter::with_provider(
+        TronAdapter::with_fixture_defaults()
+            .capabilities()
+            .chain()
+            .clone(),
+        provider.clone(),
+    );
+    let selector = tron_event_selector(TronEventFilter {
+        contract_addresses: vec!["0xabcdefabcdefabcdefabcdefabcdefabcdefabcd".to_owned()],
+        event_names: vec!["Transfer".to_owned()],
+    })
+    .expect("selector");
+
+    adapter
+        .fetch(datalens_chain::ChainFetchRequest::new(
+            adapter.capabilities().chain().clone(),
+            DatasetKey::tron_events(),
+            LedgerRange::blocks(10, 12).expect("range"),
+            selector,
+        ))
+        .expect("fetch events");
+
+    let requests = provider.contract_event_requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests[0].range,
+        LedgerRange::blocks(10, 10).expect("range")
+    );
+    assert_eq!(
+        requests[1].range,
+        LedgerRange::blocks(11, 11).expect("range")
+    );
+    assert_eq!(
+        requests[2].range,
+        LedgerRange::blocks(12, 12).expect("range")
+    );
+}
+
+#[test]
 fn test_tron_contract_event_provider_multi_page_success_uses_all_pages() {
     let provider = ContractEventFixtureProvider::with_contract_event_pages(vec![
         TronContractEventPage {
@@ -689,6 +746,7 @@ struct ContractEventFixtureProvider {
     error: Option<DatalensErrorKind>,
     loop_guard: Option<usize>,
     contract_event_calls: Arc<Mutex<usize>>,
+    contract_event_requests: Arc<Mutex<Vec<TronContractEventRequest>>>,
 }
 
 impl ContractEventFixtureProvider {
@@ -706,6 +764,7 @@ impl ContractEventFixtureProvider {
             error: None,
             loop_guard: None,
             contract_event_calls: Arc::new(Mutex::new(0)),
+            contract_event_requests: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -715,6 +774,7 @@ impl ContractEventFixtureProvider {
             error: Some(error),
             loop_guard: None,
             contract_event_calls: Arc::new(Mutex::new(0)),
+            contract_event_requests: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -728,6 +788,13 @@ impl ContractEventFixtureProvider {
             .contract_event_calls
             .lock()
             .expect("contract event calls")
+    }
+
+    fn contract_event_requests(&self) -> Vec<TronContractEventRequest> {
+        self.contract_event_requests
+            .lock()
+            .expect("contract event requests")
+            .clone()
     }
 }
 
@@ -757,7 +824,7 @@ impl TronProvider for ContractEventFixtureProvider {
 
     fn get_contract_events(
         &self,
-        _request: TronContractEventRequest,
+        request: TronContractEventRequest,
     ) -> Result<TronContractEventPage, DatalensError> {
         let mut contract_event_calls = self
             .contract_event_calls
@@ -765,6 +832,10 @@ impl TronProvider for ContractEventFixtureProvider {
             .expect("contract event calls");
         *contract_event_calls += 1;
         let call_index = *contract_event_calls - 1;
+        self.contract_event_requests
+            .lock()
+            .expect("contract event requests")
+            .push(request);
         if let Some(error) = &self.error {
             return Err(DatalensError::new(error.clone(), "contract event failure"));
         }
