@@ -93,7 +93,7 @@ fn test_executor_miss_fetches_and_persists_through_writer() {
 }
 
 #[test]
-fn test_executor_miss_returns_provider_rows_when_writer_stages_below_threshold() {
+fn test_executor_flushes_staged_query_fill_before_returning() {
     let storage = LocalStorage::new(temp_storage_root("executor-staged-miss"));
     let source = MockSource::default().with_blocks(vec![block(10, "0x10")]);
     let executor = NativeQueryExecutor::new(
@@ -118,18 +118,13 @@ fn test_executor_miss_returns_provider_rows_when_writer_stages_below_threshold()
 
     let first = executor
         .execute(blocks_input(10, 10))
-        .expect("staged miss returns provider rows");
+        .expect("query miss returns provider rows");
     assert_eq!(block_numbers(&first.rows), vec![10]);
-    assert!(storage.manifest().expect("manifest").entries.is_empty());
+    assert_eq!(storage.manifest().expect("manifest").entries.len(), 1);
 
     let second = executor
         .execute(blocks_input(10, 10))
-        .expect("same-process query reads staged rows");
-    assert!(storage.manifest().expect("manifest").entries.is_empty());
-    executor.flush_staged_writes().expect("flush staged writes");
-    let third = executor
-        .execute(blocks_input(10, 10))
-        .expect("flushed staged rows hit durable cache");
+        .expect("same-process query reads durable rows");
 
     assert_eq!(block_numbers(&second.rows), vec![10]);
     assert_eq!(
@@ -140,15 +135,10 @@ fn test_executor_miss_returns_provider_rows_when_writer_stages_below_threshold()
         source.calls(),
         vec![SourceCall::Blocks(BlockRange::expect_new(10, 10))]
     );
-    assert_eq!(
-        third.cache.hit_ranges,
-        vec![LedgerRange::blocks(10, 10).expect("valid range")]
-    );
-    assert_eq!(block_numbers(&third.rows), vec![10]);
 }
 
 #[test]
-fn test_executor_usage_ledger_separates_provider_fill_from_staged_write() {
+fn test_executor_usage_ledger_records_query_staging_flush_as_durable_write() {
     let root = temp_storage_root("executor-ledger-staged");
     let storage = LocalStorage::new(&root);
     let ledger = UsageLedgerStore::new(LocalObjectStore::new(&root));
@@ -176,7 +166,7 @@ fn test_executor_usage_ledger_separates_provider_fill_from_staged_write() {
 
     executor
         .execute(blocks_input(10, 10))
-        .expect("staged miss succeeds");
+        .expect("query miss succeeds");
 
     let events = ledger
         .read_application("analytics-api")
@@ -185,7 +175,7 @@ fn test_executor_usage_ledger_separates_provider_fill_from_staged_write() {
     assert_eq!(events[0].fill_outcome, FillOutcome::LiveFetch);
     assert_eq!(
         events[0].durable_write_outcome,
-        datalens_storage::DurableWriteOutcome::Staged
+        datalens_storage::DurableWriteOutcome::Flushed
     );
     assert_eq!(events[0].row_count, 1);
 }

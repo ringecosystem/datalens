@@ -207,6 +207,21 @@ pub(crate) fn service_named_with_datasets(
     )
 }
 
+pub(crate) fn service_with_writer_config(
+    storage: impl StorageRepository + 'static,
+    source: MockSource,
+    writer: WriterConfig,
+) -> QueryService<MockSource> {
+    QueryService::new_named(
+        storage,
+        source,
+        planner_config(),
+        writer,
+        "ethereum",
+        chain_config(1),
+    )
+}
+
 pub(crate) fn chain_config(chain_id: u64) -> ChainConfig {
     ChainConfig {
         kind: "evm".to_owned(),
@@ -243,6 +258,20 @@ pub(crate) fn writer_config() -> WriterConfig {
         min_object_rows: 1,
         record_empty_coverage: true,
         staging: Default::default(),
+    }
+}
+
+pub(crate) fn staging_writer_config() -> WriterConfig {
+    WriterConfig {
+        target_object_bytes: 1024 * 1024,
+        min_object_rows: 3,
+        record_empty_coverage: true,
+        staging: datalens_edge::config::WriterStagingConfig {
+            enabled: true,
+            min_rows: Some(3),
+            target_object_bytes: Some(1024 * 1024),
+            ..Default::default()
+        },
     }
 }
 

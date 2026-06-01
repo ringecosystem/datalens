@@ -459,12 +459,38 @@ where
                 finality_level,
                 segments: fetched_segments,
             }) {
-                Ok(write_result) => {
-                    durable_write_outcome = ledger_durable_write_outcome(&write_result);
-                    self.record_durable_write(
-                        &labels,
-                        metrics_durable_write_outcome(&write_result),
-                    );
+                Ok(mut write_result) => {
+                    let mut write_failed = false;
+                    if !write_result.staged_ranges.is_empty() {
+                        match self.writer.flush() {
+                            Ok(flush_result) => {
+                                write_result = flush_result;
+                            }
+                            Err(error) => {
+                                log::error!(
+                                    "cache write flush failed dataset={} range={}-{} kind={:?}",
+                                    plan.dataset_key.as_str(),
+                                    plan.ledger_range.start(),
+                                    plan.ledger_range.end(),
+                                    error.kind
+                                );
+                                self.record_error(&labels, &error);
+                                self.record_durable_write(
+                                    &labels,
+                                    MetricsDurableWriteOutcome::StorageError,
+                                );
+                                durable_write_outcome = LedgerDurableWriteOutcome::StorageError;
+                                write_failed = true;
+                            }
+                        }
+                    }
+                    if !write_failed {
+                        durable_write_outcome = ledger_durable_write_outcome(&write_result);
+                        self.record_durable_write(
+                            &labels,
+                            metrics_durable_write_outcome(&write_result),
+                        );
+                    }
                 }
                 Err(error) => {
                     log::error!(
