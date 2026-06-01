@@ -555,7 +555,7 @@ fn test_ormp_client_example_is_sdk_client_only() {
 }
 
 #[test]
-fn test_application_client_readmes_document_external_index_graphql_runtime() {
+fn test_application_client_readmes_document_native_datalens_runtime() {
     for example in ["ormp-client", "degov-client"] {
         let readme_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../examples")
@@ -565,8 +565,8 @@ fn test_application_client_readmes_document_external_index_graphql_runtime() {
             .unwrap_or_else(|error| panic!("read {example} README: {error}"));
 
         assert!(
-            readme.contains("application-owned index GraphQL"),
-            "{example} README should describe index GraphQL as application-owned"
+            readme.contains("query `datalens serve` through `/native/graphql`"),
+            "{example} README should describe the native datalens serve runtime"
         );
         assert!(
             readme.contains("docs/runbook/local-rustfs.md"),
@@ -577,16 +577,16 @@ fn test_application_client_readmes_document_external_index_graphql_runtime() {
             "{example} README should link the production runtime boundary"
         );
         assert!(
-            readme.contains("datalens serve` does not expose `/index/graphql"),
-            "{example} README should explicitly separate datalens serve from index GraphQL"
+            readme.contains("DATALENS_ENDPOINT"),
+            "{example} README should document the datalens endpoint"
         );
         assert!(
-            !readme.contains("Datalens index GraphQL endpoint"),
-            "{example} README should not call the application endpoint a Datalens endpoint"
+            !readme.contains("DATALENS_INDEX_GRAPHQL_URL"),
+            "{example} README should not depend on the removed upstream index GraphQL URL"
         );
         assert!(
-            !readme.contains("local Datalens serve default"),
-            "{example} README should not describe /index/graphql as a datalens serve default"
+            !readme.contains("application-owned index GraphQL endpoint"),
+            "{example} README should not describe the old application index GraphQL model"
         );
     }
 }

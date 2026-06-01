@@ -84,6 +84,8 @@ Outputs:
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | <ormp-client> | <first_run> | <ethereum> | <evm> | <evm.logs> | <contract/event/topic> | <redacted or public selector> | <number> | <number or unbounded> | <number> | <ranges> |
 | <ormp-client> | <second_run> | <ethereum> | <evm> | <evm.logs> | <contract/event/topic> | <same selector> | <number> | <number or unbounded> | <number> | <ranges> |
+| <degov-client> | <first_run> | <ethereum> | <evm> | <evm.logs> | <contract/event/topic> | <redacted or public selector> | <number> | <number or unbounded> | <number> | <ranges> |
+| <degov-client> | <second_run> | <ethereum> | <evm> | <evm.logs> | <contract/event/topic> | <same selector> | <number> | <number or unbounded> | <number> | <ranges> |
 
 ## Per-Workload Metrics
 
@@ -203,6 +205,9 @@ rows when useful.
 ## Completeness Checklist
 
 - Every example under `examples/` is present.
+- Include Rust SDK business indexer examples such as `ormp-client` and `degov-client`
+  when they have chain, contract, event topic, start block, and optional end block
+  configured for `datalens serve`.
 - Every chain used by each example is present with chain name and chain kind.
 - Every dataset key used by each example is present.
 - Every selector is described by selector kind and value or redacted public-safe summary.
@@ -211,4 +216,8 @@ rows when useful.
 - The comparison table includes total duration, provider calls, rows processed, cache hit
   ratio, new storage bytes, business rows inserted, duplicate rows skipped, and
   errors/retries.
+- For `ormp-client` and `degov-client`, record the application checkpoint as the
+  next block number. If `*_RESET_CHECKPOINT=true` is used for a second-run replay,
+  record duplicate business writes separately from normal resume runs that skip
+  already completed ranges.
 - RPC provider identifiers are names or aliases only, and all secrets are redacted.

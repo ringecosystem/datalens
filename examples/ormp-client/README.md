@@ -10,9 +10,9 @@ database and checkpoint.
 native Datalens REST and GraphQL surfaces, such as `/v1/query` and
 `/native/graphql`; `datalens serve` does not expose `/index/graphql`.
 
-This example is a separate application process. It uses only `datalens-sdk` and
-an application-owned index GraphQL endpoint; it does not link Datalens server,
-edge, storage, indexer, or runtime crates.
+This example is a separate application process. It uses only `datalens-sdk` to
+query `datalens serve` through `/native/graphql`; it does not link Datalens
+server, edge, storage, indexer, or runtime crates.
 
 Start the shared Datalens cache service separately:
 
@@ -20,59 +20,68 @@ Start the shared Datalens cache service separately:
 cargo run -p datalens-cli -- serve --config config/datalens.dev.toml
 ```
 
-Start the ORMP application index GraphQL service separately before running this
-client. This repository does not currently ship a stable ORMP service command or
-checked-in ORMP index service config. The service must be an already-running
-external application process, configured by that application, and it must expose
-the index GraphQL schema at the endpoint you pass to
-`DATALENS_INDEX_GRAPHQL_URL`.
-
 For the local Datalens service setup, see `../../docs/runbook/local-rustfs.md`.
 For the runtime ownership boundary, see `../../docs/spec/production-runtime.md`.
 
-Run the ORMP application consumer against the external application-owned index
-GraphQL endpoint:
+Run the ORMP application indexer against `datalens serve`:
 
 ```sh
-DATALENS_INDEX_GRAPHQL_URL=http://127.0.0.1:3100/graphql \
+DATALENS_ENDPOINT=http://127.0.0.1:3000 \
+DATALENS_APPLICATION=ormp-client \
+ORMP_CHAIN_NAME=ethereum \
+ORMP_CHAIN_ID=1 \
+ORMP_CONTRACT_ADDRESS=0x13b2211a7ca45db2808f6db05557ce5347e3634e \
+ORMP_EVENT_TOPIC0=0x0aa912fb8d4a847fff42b3406d9581df47d263a5a2c1f91e586f3dc9d213808a \
+ORMP_START_BLOCK=20009590 \
+ORMP_END_BLOCK=20009690 \
 ORMP_DATABASE_URL=sqlite:.tmp/ormp-client.sqlite \
   cargo run -p datalens-example-ormp-client
 ```
 
-Set `DATALENS_INDEX_GRAPHQL_URL` to the exact endpoint exposed by the ORMP
-application service. The example binary's fallback URL is a local convention
-only; it is not provided by `datalens serve`. Use `DATALENS_TOKEN` when the
-external application service requires an application token.
+Set `DATALENS_ENDPOINT` to the base service URL, not `/native/graphql`; the
+Rust SDK client appends the native GraphQL path. Use `DATALENS_TOKEN` when the
+service requires a bearer token.
 
 ## Configuration
 
 The executable reads:
 
-- `DATALENS_INDEX_GRAPHQL_URL`: external ORMP application-owned index GraphQL
-  endpoint.
+- `DATALENS_ENDPOINT`: Datalens service base URL, defaulting to
+  `http://127.0.0.1:3000`.
 - `DATALENS_TOKEN`: optional bearer token.
+- `DATALENS_APPLICATION`: application identity header, defaulting to
+  `ormp-client`.
 - `ORMP_DATABASE_URL`: SQLite database URL, defaulting to
   `sqlite:.tmp/ormp-client.sqlite`.
-- `ORMP_PAGE_SIZE`: page size for `decodedEventsConnection`, defaulting to `25`.
-- `ORMP_START_CURSOR`: optional explicit cursor override for one run.
+- `ORMP_CHAIN_NAME` and `ORMP_CHAIN_ID`: native Datalens chain identity.
+- `ORMP_DATASET_FAMILY` and `ORMP_DATASET_NAME`: default to `evm` and `logs`.
+- `ORMP_CONTRACT_ADDRESS`: ORMP contract address to query.
+- `ORMP_EVENT_TOPIC0`: `MessageAccepted` topic selector.
+- `ORMP_EVENT_SIGNATURE`: business event signature stored with decoded rows.
+- `ORMP_START_BLOCK` and optional `ORMP_END_BLOCK`: inclusive configured block
+  range.
+- `ORMP_CHUNK_SIZE`: maximum blocks queried per run, defaulting to `100`.
+- `ORMP_RESET_CHECKPOINT`: set to `true` to intentionally replay from
+  `ORMP_START_BLOCK`.
 - `ORMP_CONSUMER_NAME`: checkpoint owner, defaulting to
   `ormp-message-consumer`.
 
-By default the application resumes from its stored checkpoint. `ORMP_START_CURSOR`
-is an explicit override for testing or controlled replay.
+By default the application resumes from its stored next-block checkpoint. It
+does not reprocess completed ranges unless `ORMP_RESET_CHECKPOINT=true`.
 
 ## Application database
 
 Migrations live in `examples/ormp-client/migrations/`.
 
-`consumer_checkpoints` stores the application-owned cursor for each consumer
+`consumer_checkpoints` stores the application-owned next block for each consumer
 name. Datalens does not own this state.
 
 `ormp_messages` stores ORMP business data derived from `MessageAccepted` events:
 `message_hash`, source and target chain identifiers when present, sender and
 receiver when present, transaction hash, block number, event cursor, and a JSON
-snapshot of the decoded SDK event. `message_hash` is the primary key, and
-`event_cursor` is unique, so rerunning the same page does not duplicate rows.
+snapshot of the decoded SDK event. `message_hash` is the primary key, and the
+synthesized event cursor is unique, so replaying the same range does not
+duplicate rows.
 
 The handler writes ORMP rows and the checkpoint in one SQLite transaction. If a
 business write fails, the checkpoint is not advanced. Events missing
@@ -81,7 +90,7 @@ business write fails, the checkpoint is not advanced. Events missing
 The executable prints a concise one-page summary:
 
 ```text
-fetched=1 inserted=1 duplicates=0 invalid=0 checkpoint=cursor-2 has_next_page=false
+fetched=1 inserted=1 duplicates=0 invalid=0 checkpoint=20009691 has_next_page=false
 ```
 
 ## Tests
