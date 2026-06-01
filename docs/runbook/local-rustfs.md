@@ -77,6 +77,7 @@ export DATALENS_ETHEREUM_RPC_URL=https://ethereum-rpc.example.invalid
 export DATALENS_SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
 export DATALENS_TRON_RPC_URL=https://api.trongrid.io
 export DATALENS_TRONGRID_API_KEY=
+export DATALENS_ORMP_TOKEN=replace-with-ormp-token
 export DATALENS_LIVE_SMOKE_TOKEN=replace-with-live-smoke-token
 export DATALENS_SERVER_PORT=3100
 ```
@@ -156,6 +157,23 @@ cd ../token-sdk-typescript
 npm install
 npm run build
 npm start
+```
+
+Run the ORMP live E2E fixture against the compose `ormp` application:
+
+```sh
+export DATALENS_ENDPOINT=http://127.0.0.1:${DATALENS_SERVER_PORT}
+export DATALENS_APPLICATION=ormp
+export DATALENS_TOKEN=$DATALENS_ORMP_TOKEN
+export ORMP_CHAIN_NAME=base
+export ORMP_CHAIN_ID=8453
+export ORMP_CONTRACT_ADDRESS="${ORMP_CONTRACT_ADDRESS:?set the ORMP contract address}"
+export ORMP_START_BLOCK="${ORMP_START_BLOCK:?set the first block in the ORMP range}"
+export ORMP_END_BLOCK="${ORMP_END_BLOCK:?set the last block in the ORMP range}"
+export ORMP_DATABASE_URL=sqlite:.tmp/ormp-client-live.sqlite
+export ORMP_RESET_CHECKPOINT=true
+
+cargo run -p datalens-example-ormp-client
 ```
 
 Run the three chain smokes together after setting the endpoints:

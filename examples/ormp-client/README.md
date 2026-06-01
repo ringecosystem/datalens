@@ -28,11 +28,13 @@ cargo run -p datalens-cli -- serve --config config/datalens.dev.toml
 For the local Datalens service setup, see `../../docs/runbook/local-rustfs.md`.
 For the runtime ownership boundary, see `../../docs/spec/production-runtime.md`.
 
-Run the ORMP application indexer against the checked-in live fixture:
+Run the ORMP application indexer against the checked-in Compose ORMP
+application and live fixture:
 
 ```sh
 DATALENS_ENDPOINT=http://127.0.0.1:3000 \
-DATALENS_APPLICATION=ormp-client \
+DATALENS_APPLICATION=ormp \
+DATALENS_TOKEN="$DATALENS_ORMP_TOKEN" \
 ORMP_DATABASE_URL=sqlite:.tmp/ormp-client.sqlite \
 ORMP_FIXTURES_PATH=examples/ormp-client/fixtures/live-message-accepted.toml \
   cargo run -p datalens-example-ormp-client
@@ -51,7 +53,8 @@ against the same SQLite database with checkpoint reset enabled:
 
 ```sh
 DATALENS_ENDPOINT=http://127.0.0.1:3000 \
-DATALENS_APPLICATION=ormp-client \
+DATALENS_APPLICATION=ormp \
+DATALENS_TOKEN="$DATALENS_ORMP_TOKEN" \
 ORMP_DATABASE_URL=sqlite:.tmp/ormp-client.sqlite \
 ORMP_FIXTURES_PATH=examples/ormp-client/fixtures/live-message-accepted.toml \
 ORMP_RESET_CHECKPOINT=true \
@@ -66,13 +69,14 @@ The env-only mode still supports one explicitly configured workload:
 
 ```sh
 DATALENS_ENDPOINT=http://127.0.0.1:3000 \
-DATALENS_APPLICATION=ormp-client \
-ORMP_CHAIN_NAME=ethereum \
-ORMP_CHAIN_ID=1 \
-ORMP_CONTRACT_ADDRESS=0x13b2211a7ca45db2808f6db05557ce5347e3634e \
+DATALENS_APPLICATION=ormp \
+DATALENS_TOKEN="$DATALENS_ORMP_TOKEN" \
+ORMP_CHAIN_NAME=base \
+ORMP_CHAIN_ID=8453 \
+ORMP_CONTRACT_ADDRESS="${ORMP_CONTRACT_ADDRESS:?set the ORMP contract address}" \
 ORMP_EVENT_TOPIC0=0xcfb9b3466878aff0c7df17da215fd57d59eb245a5d03f5a7b57294d54581eb18 \
-ORMP_START_BLOCK=20009590 \
-ORMP_END_BLOCK=20009690 \
+ORMP_START_BLOCK="${ORMP_START_BLOCK:?set the first block in the ORMP range}" \
+ORMP_END_BLOCK="${ORMP_END_BLOCK:?set the last block in the ORMP range}" \
 ORMP_DATABASE_URL=sqlite:.tmp/ormp-client.sqlite \
   cargo run -p datalens-example-ormp-client
 ```
