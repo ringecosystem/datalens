@@ -12,3 +12,4 @@ datalens-sdk = { path = "../../sdks/rust" }
 rusqlite = { version = "0.37.0", features = ["bundled"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+toml.workspace = true

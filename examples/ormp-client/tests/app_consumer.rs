@@ -127,6 +127,57 @@ fn test_run_once_resumes_with_stored_checkpoint_cursor() {
     assert_eq!(requests[0].variables["input"]["range"]["end"], 12);
 }
 
+#[test]
+fn test_run_until_complete_reads_all_chunks_and_advances_checkpoint() {
+    let db = migrated_db();
+    let server = MockGraphqlServer::new(vec![
+        graphql_page("10:0xtx-one:3", true, false),
+        graphql_page("11:0xtx-two:3", true, false),
+    ]);
+    let client = DatalensOrmpClient::new(sdk_client(&server));
+    let config = test_config(&server, 10, Some(11), 1);
+
+    let summary =
+        datalens_example_ormp_client::run_until_complete(&config, &db, &client).expect("run all");
+
+    assert_eq!(summary.fetched_rows, 2);
+    assert_eq!(summary.inserted_rows, 2);
+    assert_eq!(summary.skipped_duplicates, 0);
+    assert_eq!(summary.skipped_invalid, 0);
+    assert_eq!(summary.checkpoint_cursor.as_deref(), Some("12"));
+    assert!(!summary.has_next_page);
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].variables["input"]["range"]["start"], 10);
+    assert_eq!(requests[0].variables["input"]["range"]["end"], 10);
+    assert_eq!(requests[1].variables["input"]["range"]["start"], 11);
+    assert_eq!(requests[1].variables["input"]["range"]["end"], 11);
+}
+
+#[test]
+fn test_run_until_complete_with_reset_replays_duplicate_events() {
+    let db = migrated_db();
+    let server = MockGraphqlServer::new(vec![
+        graphql_page("10:0xtx-one:3", true, false),
+        graphql_page("10:0xtx-one:3", true, false),
+    ]);
+    let client = DatalensOrmpClient::new(sdk_client(&server));
+    let mut config = test_config(&server, 10, Some(10), 1);
+    config.reset_checkpoint = true;
+
+    let first =
+        datalens_example_ormp_client::run_until_complete(&config, &db, &client).expect("first run");
+    let second = datalens_example_ormp_client::run_until_complete(&config, &db, &client)
+        .expect("duplicate run");
+
+    assert_eq!(first.inserted_rows, 1);
+    assert_eq!(first.skipped_duplicates, 0);
+    assert_eq!(second.inserted_rows, 0);
+    assert_eq!(second.skipped_duplicates, 1);
+    assert_eq!(second.skipped_invalid, 0);
+    assert_eq!(db.message_count().expect("message count"), 1);
+}
+
 fn migrated_db() -> AppDatabase {
     let db = AppDatabase::open("sqlite::memory:").expect("open database");
     db.migrate().expect("run migrations");
@@ -184,6 +235,12 @@ fn message_page(
 }
 
 fn graphql_page(cursor: &str, valid_data: bool, _has_next_page: bool) -> serde_json::Value {
+    let block_number = cursor
+        .split(':')
+        .next()
+        .and_then(|value| value.parse::<i32>().ok())
+        .unwrap_or(11);
+    let message_hash = message_hash_for_cursor(cursor);
     json!({
         "data": {
             "query": {
@@ -196,13 +253,13 @@ fn graphql_page(cursor: &str, valid_data: bool, _has_next_page: bool) -> serde_j
                     "rows": {
                         "dataset": "logs",
                         "rows": [{
-                            "block_number": 11,
+                            "block_number": block_number,
                             "block_hash": "0xblock",
                             "transaction_hash": cursor.split(':').nth(1).unwrap_or("0xtx"),
                             "transaction_index": 0,
                             "log_index": 3,
                             "address": "0x13b2211a7ca45db2808f6db05557ce5347e3634e",
-                            "topics": [MESSAGE_ACCEPTED_TOPIC0, MESSAGE_ACCEPTED_MSG_HASH],
+                            "topics": [MESSAGE_ACCEPTED_TOPIC0, message_hash],
                             "data": if valid_data { MESSAGE_ACCEPTED_DATA } else { "0x" },
                             "removed": false
                         }]
@@ -211,4 +268,12 @@ fn graphql_page(cursor: &str, valid_data: bool, _has_next_page: bool) -> serde_j
             }
         }
     })
+}
+
+fn message_hash_for_cursor(cursor: &str) -> &'static str {
+    if cursor.contains("two") {
+        "0x70f5743a8b3bbe4e4bd99607b19985203a9310f4859e03912ed086f4d32bdff8"
+    } else {
+        MESSAGE_ACCEPTED_MSG_HASH
+    }
 }

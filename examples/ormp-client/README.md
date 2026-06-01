@@ -29,8 +29,43 @@ For the local Datalens service setup, see `../../docs/runbook/local-rustfs.md`.
 For the runtime ownership boundary, see `../../docs/spec/production-runtime.md`.
 
 Run the ORMP application indexer against the checked-in Compose ORMP
-application. The Base range is the live E2E shape; set the contract and block
-range to the verified ORMP fixture for the run:
+application and live fixture:
+
+```sh
+DATALENS_ENDPOINT=http://127.0.0.1:3000 \
+DATALENS_APPLICATION=ormp \
+DATALENS_TOKEN="$DATALENS_ORMP_TOKEN" \
+ORMP_DATABASE_URL=sqlite:.tmp/ormp-client.sqlite \
+ORMP_FIXTURES_PATH=examples/ormp-client/fixtures/live-message-accepted.toml \
+  cargo run -p datalens-example-ormp-client
+```
+
+The fixture includes a verified Base `MessageAccepted` workload for contract
+`0x13b2211a7ca45db2808f6db05557ce5347e3634e`, blocks
+`30519000-30520999`, with one known live event at block `30519957`.
+
+Set `DATALENS_ENDPOINT` to the base service URL, not `/native/graphql`; the
+Rust SDK client appends the native GraphQL path. Use `DATALENS_TOKEN` when the
+service requires a bearer token.
+
+To validate duplicate handling after the first run, run the fixture again
+against the same SQLite database with checkpoint reset enabled:
+
+```sh
+DATALENS_ENDPOINT=http://127.0.0.1:3000 \
+DATALENS_APPLICATION=ormp \
+DATALENS_TOKEN="$DATALENS_ORMP_TOKEN" \
+ORMP_DATABASE_URL=sqlite:.tmp/ormp-client.sqlite \
+ORMP_FIXTURES_PATH=examples/ormp-client/fixtures/live-message-accepted.toml \
+ORMP_RESET_CHECKPOINT=true \
+  cargo run -p datalens-example-ormp-client
+```
+
+The first fixture run should report `fetched=1 inserted=1 invalid=0`. Replaying
+the same application database with reset enabled should report
+`inserted=0 duplicates=1 invalid=0`.
+
+The env-only mode still supports one explicitly configured workload:
 
 ```sh
 DATALENS_ENDPOINT=http://127.0.0.1:3000 \
@@ -45,15 +80,6 @@ ORMP_END_BLOCK="${ORMP_END_BLOCK:?set the last block in the ORMP range}" \
 ORMP_DATABASE_URL=sqlite:.tmp/ormp-client.sqlite \
   cargo run -p datalens-example-ormp-client
 ```
-
-Set `DATALENS_ENDPOINT` to the base service URL, not `/native/graphql`; the
-Rust SDK client appends the native GraphQL path. Use `DATALENS_TOKEN` when the
-service requires a bearer token.
-
-To validate duplicate handling after the first run, run the same command again
-against the same SQLite database. The application resumes from its stored
-next-block checkpoint and reports idempotent writes without depending on an
-application index GraphQL service.
 
 ## Configuration
 
@@ -79,9 +105,27 @@ The executable reads:
   `ORMP_START_BLOCK`.
 - `ORMP_CONSUMER_NAME`: checkpoint owner, defaulting to
   `ormp-message-consumer`.
+- `ORMP_FIXTURES_PATH`: optional TOML fixture path. When set, the executable
+  runs every `[[workloads]]` entry until its configured range is complete.
 
 By default the application resumes from its stored next-block checkpoint. It
 does not reprocess completed ranges unless `ORMP_RESET_CHECKPOINT=true`.
+
+Fixture workload entries use this shape:
+
+```toml
+[[workloads]]
+name = "base"
+chain_name = "base"
+chain_id = 8453
+contract_address = "0x13b2211a7ca45db2808f6db05557ce5347e3634e"
+start_block = 30519000
+end_block = 30520999
+chunk_size = 2000
+```
+
+`chunk_size` and `consumer_name` are optional. If `consumer_name` is omitted,
+the application scopes checkpoints as `ormp-message-consumer:<fixture-name>`.
 
 ## Application database
 
@@ -106,7 +150,7 @@ handler.
 The executable prints a concise one-page summary:
 
 ```text
-fetched=1 inserted=1 duplicates=0 invalid=0 checkpoint=20009691 has_next_page=false
+fixture=base chain=base range=30519000-30520999 elapsed_ms=1234 fetched=1 inserted=1 duplicates=0 invalid=0 checkpoint=30521000 has_next_page=false
 ```
 
 For live E2E reporting, `fetched=0 inserted=0` can still prove service/cache
