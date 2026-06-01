@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, env, fs, path::Path};
 
 use datalens_core::{DatalensError, DatalensErrorKind, QueryStrategy};
-use datalens_storage::S3ObjectStoreConfig;
+use datalens_storage::{DurableStorageConfig, ParquetCompression, S3ObjectStoreConfig};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -57,12 +57,29 @@ pub struct StorageConfig {
     pub local: Option<LocalStorageConfig>,
     #[serde(default)]
     pub s3: Option<S3ObjectStoreConfig>,
+    #[serde(default)]
+    pub parquet: StorageParquetConfig,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LocalStorageConfig {
     pub root: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageParquetConfig {
+    #[serde(default)]
+    pub compression: ParquetCompression,
+}
+
+impl From<StorageParquetConfig> for DurableStorageConfig {
+    fn from(config: StorageParquetConfig) -> Self {
+        Self {
+            parquet_compression: config.compression,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

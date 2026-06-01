@@ -82,6 +82,8 @@ A coverage entry should include:
 - Covered ledger range, including range kind, start, and end.
 - Schema or normalization version.
 - Object encoding, for example `parquet-v1`.
+- Object compression for durable Parquet data objects, for example `zstd`,
+  `snappy`, or `none`.
 - Selector fingerprint for lookup and selector canonical key for audit.
 - Field coverage or canonical chunk shape.
 - Object key for the durable chunk.
@@ -224,9 +226,11 @@ that exact combined coverage through storage.
 
 The first implementation uses `min_object_rows` as the primary sparse-result merge
 threshold and a conservative JSON-encoded row estimate for `target_object_bytes` before
-the final object encoding is written. The recorded manifest metadata stores the actual
-encoded object size and SHA-256 checksum after storage encodes the object. Empty coverage
-continues to be manifest-only and must not synthesize object size, checksum, or write
+the final object encoding is written. Durable Parquet data object compression is a storage
+writer setting and must use Parquet writer compression, not external gzip wrapping. The
+recorded manifest metadata stores the actual encoded object size, object compression, and
+SHA-256 checksum after storage encodes the object. Empty coverage continues to be
+manifest-only and must not synthesize object size, checksum, compression, or write
 timestamp fields.
 
 This means `018000000-018099999` is not a universal rule. It is an example of a range key.

@@ -7,9 +7,9 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::{
-    LocalObjectStore, ObjectEncoding, ObjectStore, checksum_hex, decode_object_rows,
-    encode_object_rows, filter_rows, merge_ranges, object_encoding_for_dataset, range_kind_key,
-    validate_object_key,
+    LocalObjectStore, ObjectEncoding, ObjectStore, ParquetCompression, checksum_hex,
+    decode_object_rows, encode_object_rows, filter_rows, merge_ranges, object_encoding_for_dataset,
+    range_kind_key, validate_object_key,
 };
 
 mod helpers;
@@ -386,7 +386,7 @@ where
             metadata.height,
             &metadata.block_hash,
         )?;
-        let bytes = encode_object_rows(encoding, rows)?;
+        let bytes = encode_object_rows(encoding, rows, ParquetCompression::None)?;
 
         if metadata.candidate_status == HotCacheCandidateStatus::Active {
             self.demote_active_candidates(

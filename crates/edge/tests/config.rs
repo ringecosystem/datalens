@@ -1,4 +1,5 @@
 use datalens_edge::config::DatalensConfig;
+use datalens_storage::ParquetCompression;
 
 #[test]
 fn test_config_query_native_namespace_controls_native_graphql_settings() {
@@ -97,6 +98,67 @@ fn test_config_storage_root_field_is_not_supported() {
         .expect_err("top-level storage root should be rejected");
 
     assert!(error.to_string().contains("unknown field `root`"));
+}
+
+#[test]
+fn test_config_storage_parquet_compression_defaults_to_disabled() {
+    let config: DatalensConfig =
+        toml::from_str(&config_text("[query.native]")).expect("config should parse");
+
+    assert_eq!(config.storage.parquet.compression, ParquetCompression::None);
+}
+
+#[test]
+fn test_config_storage_parquet_compression_accepts_zstd_and_snappy() {
+    for codec in ["zstd", "snappy"] {
+        let input = config_text("[query.native]").replace(
+            r#"
+        [planner]"#,
+            &format!(
+                r#"
+        [storage.parquet]
+        compression = "{codec}"
+
+        [planner]"#
+            ),
+        );
+        let config: DatalensConfig = toml::from_str(&input).expect("config should parse");
+
+        assert_eq!(config.storage.parquet.compression.as_str(), codec);
+    }
+}
+
+#[test]
+fn test_config_storage_parquet_compression_accepts_none() {
+    let input = config_text("[query.native]").replace(
+        r#"
+        [planner]"#,
+        r#"
+        [storage.parquet]
+        compression = "none"
+
+        [planner]"#,
+    );
+    let config: DatalensConfig = toml::from_str(&input).expect("config should parse");
+
+    assert_eq!(config.storage.parquet.compression, ParquetCompression::None);
+}
+
+#[test]
+fn test_config_storage_parquet_compression_rejects_unknown_codec() {
+    let input = config_text("[query.native]").replace(
+        r#"
+        [planner]"#,
+        r#"
+        [storage.parquet]
+        compression = "gzip"
+
+        [planner]"#,
+    );
+    let error =
+        toml::from_str::<DatalensConfig>(&input).expect_err("unknown codec should be rejected");
+
+    assert!(error.to_string().contains("unknown variant `gzip`"));
 }
 
 fn config_text(query_header: &str) -> String {

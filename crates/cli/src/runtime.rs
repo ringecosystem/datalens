@@ -243,7 +243,10 @@ pub(crate) fn build_storage(
                     "storage.local.root must be set",
                 )
             })?;
-            Ok(Box::new(LocalStorage::new(&local.root)))
+            Ok(Box::new(LocalStorage::new_with_config(
+                &local.root,
+                config.storage.parquet.into(),
+            )))
         }
         "s3" => {
             let s3 = config.storage.s3.clone().ok_or_else(|| {
@@ -253,7 +256,10 @@ pub(crate) fn build_storage(
                 )
             })?;
             let store = S3ObjectStore::from_config(s3)?;
-            Ok(Box::new(DurableStorage::from_object_store(store)))
+            Ok(Box::new(DurableStorage::from_object_store_with_config(
+                store,
+                config.storage.parquet.into(),
+            )))
         }
         _ => Err(DatalensError::new(
             DatalensErrorKind::UnsupportedDataset,

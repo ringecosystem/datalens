@@ -167,6 +167,9 @@ fn inspect_object(entry: &ManifestEntry) -> serde_json::Value {
     serde_json::json!({
         "key": object_key,
         "encoding": entry.object_encoding,
+        "compression": entry
+            .object_compression
+            .map(|compression| compression.as_str()),
         "size_bytes": entry.object_size_bytes,
         "checksum": entry.checksum,
         "checksum_algorithm": entry.checksum_algorithm,

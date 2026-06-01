@@ -5,7 +5,7 @@ use datalens_core::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::{ManifestEntry, ObjectEncoding, StorageDataObject, parquet_codec};
+use crate::{ManifestEntry, ObjectEncoding, ParquetCompression, StorageDataObject, parquet_codec};
 
 pub fn coverage_key(
     chain: &ChainIdentity,
@@ -85,6 +85,9 @@ pub(crate) fn validate_existing_data_object(
             .checksum_algorithm
             .as_deref()
             .is_some_and(|algorithm| algorithm != data_object.checksum_algorithm)
+        || existing
+            .object_compression
+            .is_some_and(|compression| Some(compression) != data_object.object_compression)
     {
         return Err(DatalensError::new(
             DatalensErrorKind::StorageWriteFailure,
@@ -187,6 +190,7 @@ pub(crate) fn object_encoding_for_dataset(dataset_key: &DatasetKey) -> ObjectEnc
 pub(crate) fn encode_object_rows(
     encoding: ObjectEncoding,
     rows: &DatasetRows,
+    parquet_compression: ParquetCompression,
 ) -> Result<Vec<u8>, DatalensError> {
     match encoding {
         ObjectEncoding::Json => serde_json::to_vec(rows).map_err(|error| {
@@ -195,7 +199,7 @@ pub(crate) fn encode_object_rows(
                 format!("encode cached rows: {error}"),
             )
         }),
-        ObjectEncoding::ParquetV1 => parquet_codec::encode_rows(rows),
+        ObjectEncoding::ParquetV1 => parquet_codec::encode_rows(rows, parquet_compression),
     }
 }
 

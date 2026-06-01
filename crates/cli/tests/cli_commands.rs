@@ -371,6 +371,7 @@ fn test_inspect_manifest_reads_local_storage_manifest() {
     assert_eq!(entry["coverage_type"], "data_object");
     assert_eq!(entry["row_count"], 1);
     assert!(entry["object"]["key"].as_str().is_some());
+    assert_eq!(entry["object"]["compression"], "none");
     assert!(entry["object"]["size_bytes"].as_u64().expect("size") > 0);
     assert_eq!(entry["object"]["checksum_algorithm"], "sha256");
     assert!(

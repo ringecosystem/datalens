@@ -11,6 +11,9 @@ region = "${DATALENS_S3_REGION}"
 endpoint_url = "${DATALENS_S3_ENDPOINT_URL}"
 force_path_style = true
 
+[storage.parquet]
+compression = "zstd"
+
 [planner]
 max_query_range_blocks = 100000
 default_chunk_range_blocks = 10000
