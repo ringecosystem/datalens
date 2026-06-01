@@ -61,10 +61,12 @@ docker compose --profile datalens ps
 ```
 
 The Datalens service listens on `http://localhost:${DATALENS_SERVER_PORT:-3000}`.
-Use `DATALENS_SERVER_PORT=3100 DATALENS_SERVER_BIND=0.0.0.0:3000` when port 3000
-is already occupied on the host. Native GraphQL is exposed at `/native/graphql`
-when enabled. Application index GraphQL endpoints are served by external
-application services, not by `datalens serve`.
+Use `DATALENS_SERVER_PORT=3100` for Compose when host port 3000 is already
+occupied; the service bind address remains the container-local default
+`0.0.0.0:3000`. For a native CLI run outside Compose, use
+`datalens serve --bind 127.0.0.1:3100`. Native GraphQL is exposed at
+`/native/graphql` when enabled. Application index GraphQL endpoints are served by
+external application services, not by `datalens serve`.
 
 ## Live Smoke
 
