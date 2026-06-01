@@ -78,6 +78,58 @@ fn test_fetch_vote_cast_page_decodes_raw_native_log() {
     assert_eq!(request.variables["input"]["range"]["end"], 124);
 }
 
+#[test]
+fn test_fetch_vote_cast_page_decodes_empty_vote_reason() {
+    let topic0 = vote_cast_topic0();
+    let server = MockGraphqlServer::new(vec![json!({
+        "data": {
+            "query": {
+                "chain": {"configuredName": "ethereum"},
+                "datasetKey": "evm.logs",
+                "range": {"kind": "block", "start": 23900088, "end": 23900088},
+                "cache": {"hitRanges": [], "missingRanges": []},
+                "rows": {
+                    "rows": [{
+                        "block_number": 23900088,
+                        "block_hash": "0xblock1",
+                        "transaction_hash": "0x4ef5f45365991e7ea15d604679623d5d401a37578d7bad24512bd750c3f443e9",
+                        "transaction_index": 0,
+                        "log_index": 391,
+                        "address": "0x309a862bbC1A00e45506cB8A802D1ff10004c8C0",
+                        "topics": [
+                            topic0,
+                            "0x000000000000000000000000b933aee47c438f22de0747d57fc239fe37878dd1"
+                        ],
+                        "data": "0x00000000000000000000000000000000000000000000000000000000000001f90000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000003581f7dc0e8a88e2be6800000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000000",
+                        "removed": false
+                    }]
+                }
+            }
+        }
+    })]);
+    let client = DatalensDegovClient::new(client(&server));
+    let config = test_config(&server);
+
+    let page = client
+        .fetch_vote_cast_page(&config, 23900088, 23900088)
+        .expect("consume vote page");
+
+    assert_eq!(
+        page.events[0].event.decoded_args,
+        json!({
+            "voter": "0xb933aee47c438f22de0747d57fc239fe37878dd1",
+            "proposalId": "505",
+            "support": "1",
+            "weight": "252682913743810137865832",
+            "reason": ""
+        })
+    );
+    assert_eq!(
+        page.events[0].event.decode_status.as_deref(),
+        Some("decoded")
+    );
+}
+
 fn client(server: &MockGraphqlServer) -> DatalensClient {
     DatalensClient::new(ClientConfig {
         endpoint: server.endpoint(),

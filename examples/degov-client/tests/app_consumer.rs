@@ -49,7 +49,7 @@ fn test_handle_vote_cast_page_writes_vote_projection_and_checkpoint() {
     assert_eq!(db.vote_count().expect("vote count"), 1);
     assert_eq!(
         db.proposal_totals("42").expect("proposal totals"),
-        Some((7, 0, 0))
+        Some(("7".to_owned(), "0".to_owned(), "0".to_owned()))
     );
     assert_eq!(
         db.checkpoint("degov-vote-consumer").expect("checkpoint"),
@@ -81,7 +81,7 @@ fn test_handle_vote_cast_page_is_idempotent_for_duplicate_events() {
     assert_eq!(db.vote_count().expect("vote count"), 1);
     assert_eq!(
         db.proposal_totals("42").expect("proposal totals"),
-        Some((7, 0, 0))
+        Some(("7".to_owned(), "0".to_owned(), "0".to_owned()))
     );
 }
 
@@ -102,7 +102,33 @@ fn test_handle_vote_cast_page_updates_support_buckets() {
 
     assert_eq!(
         db.proposal_totals("42").expect("proposal totals"),
-        Some((7, 3, 2))
+        Some(("7".to_owned(), "3".to_owned(), "2".to_owned()))
+    );
+}
+
+#[test]
+fn test_handle_vote_cast_page_preserves_uint256_vote_weight() {
+    let db = migrated_db();
+    let handler = VoteCastHandler::new("degov-vote-consumer");
+    let weight = "252682913743810137865832";
+
+    let summary = handle_vote_cast_page(
+        &db,
+        &handler,
+        degov_page(vec![vote_edge(
+            "large-weight-cursor",
+            "505",
+            Some(1),
+            Some(weight),
+        )]),
+    )
+    .expect("handle page");
+
+    assert_eq!(summary.inserted_rows, 1);
+    assert_eq!(summary.skipped_invalid, 0);
+    assert_eq!(
+        db.proposal_totals("505").expect("proposal totals"),
+        Some((weight.to_owned(), "0".to_owned(), "0".to_owned()))
     );
 }
 
@@ -149,7 +175,7 @@ fn test_checkpoint_does_not_advance_when_projection_write_fails() {
                 "vote-cursor-2",
                 "different-proposal",
                 1_i64,
-                7_i64,
+                "7",
                 "100:0xtx-vote-cursor-2:1",
                 "{}",
             ),
@@ -207,6 +233,79 @@ fn test_run_once_resumes_with_stored_checkpoint_cursor() {
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].variables["input"]["range"]["start"], 101);
     assert_eq!(requests[0].variables["input"]["range"]["end"], 102);
+}
+
+#[test]
+fn test_run_until_complete_reads_all_chunks_and_advances_checkpoint() {
+    let db = migrated_db();
+    let server = MockGraphqlServer::new(vec![
+        graphql_page(
+            vec![vote_edge(
+                "100:0xtx-vote-cursor-1:1",
+                "42",
+                Some(1),
+                Some("7"),
+            )],
+            true,
+        ),
+        graphql_page(
+            vec![vote_edge(
+                "101:0xtx-vote-cursor-2:1",
+                "42",
+                Some(0),
+                Some("3"),
+            )],
+            false,
+        ),
+    ]);
+    let client = DatalensDegovClient::new(sdk_client(&server));
+    let config = test_config(&server, 100, Some(101), 1);
+
+    let summary =
+        datalens_example_degov_client::run_until_complete(&config, &db, &client).expect("run all");
+
+    assert_eq!(summary.fetched_rows, 2);
+    assert_eq!(summary.inserted_rows, 2);
+    assert_eq!(summary.updated_proposals, 2);
+    assert_eq!(summary.checkpoint_cursor.as_deref(), Some("102"));
+    assert!(!summary.has_next_page);
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].variables["input"]["range"]["start"], 100);
+    assert_eq!(requests[0].variables["input"]["range"]["end"], 100);
+    assert_eq!(requests[1].variables["input"]["range"]["start"], 101);
+    assert_eq!(requests[1].variables["input"]["range"]["end"], 101);
+}
+
+#[test]
+fn test_run_until_complete_retries_transient_provider_failure() {
+    let db = migrated_db();
+    let server = MockGraphqlServer::new(vec![
+        json!({
+            "errors": [{
+                "message": "failed to fetch block header for log block",
+                "extensions": {"kind": "provider_failure", "status": 502}
+            }]
+        }),
+        graphql_page(
+            vec![vote_edge(
+                "100:0xtx-vote-cursor-1:1",
+                "42",
+                Some(1),
+                Some("7"),
+            )],
+            false,
+        ),
+    ]);
+    let client = DatalensDegovClient::new(sdk_client(&server));
+    let config = test_config(&server, 100, Some(100), 1);
+
+    let summary =
+        datalens_example_degov_client::run_until_complete(&config, &db, &client).expect("retry");
+
+    assert_eq!(summary.fetched_rows, 1);
+    assert_eq!(summary.inserted_rows, 1);
+    assert_eq!(server.requests().len(), 2);
 }
 
 fn migrated_db() -> AppDatabase {

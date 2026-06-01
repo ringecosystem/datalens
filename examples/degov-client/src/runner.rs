@@ -66,6 +66,82 @@ pub fn run_once(
     })
 }
 
+pub fn run_until_complete(
+    config: &config::AppConfig,
+    db: &db::AppDatabase,
+    client: &datalens::DatalensDegovClient,
+) -> AppResult<RunSummary> {
+    let mut page_config = config.clone();
+    let mut total = RunSummary {
+        fetched_rows: 0,
+        inserted_rows: 0,
+        skipped_duplicates: 0,
+        skipped_invalid: 0,
+        updated_proposals: 0,
+        checkpoint_cursor: None,
+        has_next_page: false,
+    };
+
+    loop {
+        let page = run_once_with_retry(&page_config, db, client)?;
+        total.fetched_rows += page.fetched_rows;
+        total.inserted_rows += page.inserted_rows;
+        total.skipped_duplicates += page.skipped_duplicates;
+        total.skipped_invalid += page.skipped_invalid;
+        total.updated_proposals += page.updated_proposals;
+        total.checkpoint_cursor = page.checkpoint_cursor.clone();
+        total.has_next_page = page.has_next_page;
+
+        if !page.has_next_page {
+            break;
+        }
+        page_config.reset_checkpoint = false;
+    }
+
+    Ok(total)
+}
+
+fn run_once_with_retry(
+    config: &config::AppConfig,
+    db: &db::AppDatabase,
+    client: &datalens::DatalensDegovClient,
+) -> AppResult<RunSummary> {
+    let max_attempts = std::env::var("DEGOV_PAGE_RETRIES")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(3);
+    let backoff_ms = std::env::var("DEGOV_RETRY_BACKOFF_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(250);
+
+    let mut attempt = 1;
+    loop {
+        match run_once(config, db, client) {
+            Ok(summary) => return Ok(summary),
+            Err(error) if attempt < max_attempts && is_retryable(&error) => {
+                attempt += 1;
+                if backoff_ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn is_retryable(error: &AppError) -> bool {
+    if matches!(error, AppError::Datalens(_) | AppError::Io(_)) {
+        return true;
+    }
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("provider_failure")
+        || message.contains("transport")
+        || message.contains("timeout")
+        || message.contains("temporarily unavailable")
+}
+
 fn parse_checkpoint_block(value: &str) -> AppResult<i32> {
     value.parse().map_err(|error| {
         AppError::Config(format!(
