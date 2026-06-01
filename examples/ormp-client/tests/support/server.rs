@@ -10,8 +10,9 @@ use serde_json::Value;
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct RecordedRequest {
-    pub query: String,
-    pub variables: Value,
+    pub method: String,
+    pub path: String,
+    pub body: Value,
 }
 
 pub struct MockGraphqlServer {
@@ -73,8 +74,13 @@ fn handle_connection(
 ) {
     let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
     let mut content_length = 0usize;
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read request line");
+    let mut request_parts = line.split_whitespace();
+    let method = request_parts.next().expect("request method").to_owned();
+    let path = request_parts.next().expect("request path").to_owned();
     loop {
-        let mut line = String::new();
+        line.clear();
         reader.read_line(&mut line).expect("read header");
         let trimmed = line.trim_end();
         if trimmed.is_empty() {
@@ -91,10 +97,7 @@ fn handle_connection(
     requests
         .lock()
         .expect("record requests")
-        .push(RecordedRequest {
-            query: body["query"].as_str().unwrap_or_default().to_owned(),
-            variables: body["variables"].clone(),
-        });
+        .push(RecordedRequest { method, path, body });
 
     let response_body = response.to_string();
     let reason = if status == 200 { "OK" } else { "ERROR" };

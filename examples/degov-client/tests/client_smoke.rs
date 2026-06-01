@@ -14,29 +14,33 @@ fn test_fetch_vote_cast_page_decodes_raw_native_log() {
     let topic0 = vote_cast_topic0();
     assert_eq!(DEFAULT_EVENT_TOPIC0, topic0);
     let server = MockGraphqlServer::new(vec![json!({
-        "data": {
-            "query": {
-                "chain": {"configuredName": "ethereum"},
-                "datasetKey": "evm.logs",
-                "range": {"kind": "block", "start": 100, "end": 124},
-                "cache": {"hitRanges": [], "missingRanges": []},
-                "rows": {
-                    "dataset_key": "evm.logs",
-                    "rows": {
-                        "dataset": "logs",
-                        "rows": [{
-                            "block_number": 100,
-                            "block_hash": "0xblock1",
-                            "transaction_hash": "0xtx1",
-                            "transaction_index": 0,
-                            "log_index": 1,
-                            "address": "0xgovernor",
-                            "topics": [topic0, padded_address_topic("0x1111111111111111111111111111111111111111")],
-                            "data": vote_cast_data("42", 1, "7", "because"),
-                            "removed": false
-                        }]
-                    }
-                }
+        "chain": {"configuredName": "ethereum"},
+        "dataset_key": "evm.logs",
+        "range": {"kind": "block", "start": 100, "end": 124},
+        "cache": {
+            "hit_ranges": [],
+            "missing_ranges": [],
+            "durable_hit_ranges": [],
+            "hot_hit_ranges": [],
+            "provider_fill_ranges": [],
+            "promotion_pending_ranges": [],
+            "segments": []
+        },
+        "rows": {
+            "dataset_key": "evm.logs",
+            "rows": {
+                "dataset": "logs",
+                "rows": [{
+                    "block_number": 100,
+                    "block_hash": "0xblock1",
+                    "transaction_hash": "0xtx1",
+                    "transaction_index": 0,
+                    "log_index": 1,
+                    "address": "0xgovernor",
+                    "topics": [topic0, padded_address_topic("0x1111111111111111111111111111111111111111")],
+                    "data": vote_cast_data("42", 1, "7", "because"),
+                    "removed": false
+                }]
             }
         }
     })]);
@@ -66,45 +70,47 @@ fn test_fetch_vote_cast_page_decodes_raw_native_log() {
     );
 
     let request = server.only_request();
-    assert!(request.query.contains("query($input: QueryInput!)"));
-    assert_eq!(
-        request.variables["input"]["chain"]["configuredName"],
-        "ethereum"
-    );
-    assert_eq!(request.variables["input"]["datasetKey"]["family"], "evm");
-    assert_eq!(request.variables["input"]["datasetKey"]["name"], "logs");
-    assert_eq!(request.variables["input"]["selector"]["kind"], "evm_logs");
-    assert_eq!(request.variables["input"]["range"]["start"], 100);
-    assert_eq!(request.variables["input"]["range"]["end"], 124);
+    assert_eq!(request.method, "POST");
+    assert_eq!(request.path, "/v1/query");
+    assert_eq!(request.body["chain"]["configuredName"], "ethereum");
+    assert_eq!(request.body["dataset_key"], "evm.logs");
+    assert_eq!(request.body["selector"]["kind"], "evm_logs");
+    assert_eq!(request.body["range"]["start"], 100);
+    assert_eq!(request.body["range"]["end"], 124);
+    assert_eq!(request.body["fields"], "all");
 }
 
 #[test]
 fn test_fetch_vote_cast_page_decodes_empty_vote_reason() {
     let topic0 = vote_cast_topic0();
     let server = MockGraphqlServer::new(vec![json!({
-        "data": {
-            "query": {
-                "chain": {"configuredName": "ethereum"},
-                "datasetKey": "evm.logs",
-                "range": {"kind": "block", "start": 23900088, "end": 23900088},
-                "cache": {"hitRanges": [], "missingRanges": []},
-                "rows": {
-                    "rows": [{
-                        "block_number": 23900088,
-                        "block_hash": "0xblock1",
-                        "transaction_hash": "0x4ef5f45365991e7ea15d604679623d5d401a37578d7bad24512bd750c3f443e9",
-                        "transaction_index": 0,
-                        "log_index": 391,
-                        "address": "0x309a862bbC1A00e45506cB8A802D1ff10004c8C0",
-                        "topics": [
-                            topic0,
-                            "0x000000000000000000000000b933aee47c438f22de0747d57fc239fe37878dd1"
-                        ],
-                        "data": "0x00000000000000000000000000000000000000000000000000000000000001f90000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000003581f7dc0e8a88e2be6800000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000000",
-                        "removed": false
-                    }]
-                }
-            }
+        "chain": {"configuredName": "ethereum"},
+        "dataset_key": "evm.logs",
+        "range": {"kind": "block", "start": 23900088, "end": 23900088},
+        "cache": {
+            "hit_ranges": [],
+            "missing_ranges": [],
+            "durable_hit_ranges": [],
+            "hot_hit_ranges": [],
+            "provider_fill_ranges": [],
+            "promotion_pending_ranges": [],
+            "segments": []
+        },
+        "rows": {
+            "rows": [{
+                "block_number": 23900088,
+                "block_hash": "0xblock1",
+                "transaction_hash": "0x4ef5f45365991e7ea15d604679623d5d401a37578d7bad24512bd750c3f443e9",
+                "transaction_index": 0,
+                "log_index": 391,
+                "address": "0x309a862bbC1A00e45506cB8A802D1ff10004c8C0",
+                "topics": [
+                    topic0,
+                    "0x000000000000000000000000b933aee47c438f22de0747d57fc239fe37878dd1"
+                ],
+                "data": "0x00000000000000000000000000000000000000000000000000000000000001f90000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000003581f7dc0e8a88e2be6800000000000000000000000000000000000000000000000000000000000000800000000000000000000000000000000000000000000000000000000000000000",
+                "removed": false
+            }]
         }
     })]);
     let client = DatalensDegovClient::new(client(&server));

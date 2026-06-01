@@ -16,7 +16,7 @@ native Datalens REST and GraphQL surfaces, such as `/v1/query` and
 `/native/graphql`; `datalens serve` does not expose `/index/graphql`.
 
 This example is a separate application process. It uses only `datalens-sdk` to
-query `datalens serve` through `/native/graphql`; it does not link Datalens
+query `datalens serve` through REST `/v1/query`; it does not link Datalens
 server, edge, storage, indexer, or runtime crates.
 
 Start the shared Datalens cache service separately:
@@ -45,8 +45,8 @@ The fixture includes a verified Base `MessageAccepted` workload for contract
 `30519000-30520999`, with one known live event at block `30519957`.
 
 Set `DATALENS_ENDPOINT` to the base service URL, not `/native/graphql`; the
-Rust SDK client appends the native GraphQL path. Use `DATALENS_TOKEN` when the
-service requires a bearer token.
+Rust SDK client posts native cache queries to `/v1/query`. Use `DATALENS_TOKEN`
+when the service requires a bearer token.
 
 To validate duplicate handling after the first run, run the fixture again
 against the same SQLite database with checkpoint reset enabled:
@@ -159,7 +159,7 @@ business-row insertion positivity.
 
 ## Tests
 
-Tests use mock GraphQL responses and local SQLite databases, so CI does not need
+Tests use mock REST responses and local SQLite databases, so CI does not need
 live RPC or a running Datalens service:
 
 ```sh

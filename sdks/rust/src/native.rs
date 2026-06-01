@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{DatalensClient, Error};
+use crate::{DatalensClient, Error, client::NativeTransport};
 
 pub struct NativeClient<'a> {
     client: &'a DatalensClient,
@@ -19,8 +19,18 @@ impl<'a> NativeClient<'a> {
     }
 
     pub fn query(&self, input: QueryInput) -> Result<QueryResponse, Error> {
-        let data: QueryData = self.client.execute(QUERY_QUERY, QueryVariables { input })?;
-        Ok(data.query)
+        match self.client.native_transport() {
+            NativeTransport::Rest => {
+                let response: RestQueryResponse = self
+                    .client
+                    .post_json("/v1/query", &RestQueryInput::from(input))?;
+                Ok(response.into())
+            }
+            NativeTransport::Graphql => {
+                let data: QueryData = self.client.execute(QUERY_QUERY, QueryVariables { input })?;
+                Ok(data.query)
+            }
+        }
     }
 }
 
@@ -172,6 +182,129 @@ struct DiscoveryData {
 #[derive(Deserialize)]
 struct QueryData {
     query: QueryResponse,
+}
+
+#[derive(Serialize)]
+struct RestQueryInput {
+    chain: ChainIdentityInput,
+    dataset_key: String,
+    selector: RestQuerySelectorInput,
+    range: RestQueryRangeInput,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    finality: Option<String>,
+    fields: RestFieldSelectionInput,
+}
+
+impl From<QueryInput> for RestQueryInput {
+    fn from(input: QueryInput) -> Self {
+        Self {
+            chain: input.chain,
+            dataset_key: format!("{}.{}", input.dataset_key.family, input.dataset_key.name),
+            selector: RestQuerySelectorInput::from(input.selector),
+            range: RestQueryRangeInput::from(input.range),
+            finality: input.finality,
+            fields: input.fields.into(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+enum RestQuerySelectorInput {
+    All,
+    EvmLogs(EvmLogsSelectorInput),
+    Other {
+        kind: String,
+        fingerprint: String,
+        canonical_key: String,
+    },
+}
+
+impl From<QuerySelectorInput> for RestQuerySelectorInput {
+    fn from(input: QuerySelectorInput) -> Self {
+        match input.kind {
+            SelectorKindInput::All => Self::All,
+            SelectorKindInput::EvmLogs => {
+                Self::EvmLogs(input.evm_logs.unwrap_or_else(|| EvmLogsSelectorInput {
+                    addresses: Vec::new(),
+                    topics: Vec::new(),
+                }))
+            }
+            SelectorKindInput::Other => {
+                let other = input.other.unwrap_or_else(|| OtherSelectorInput {
+                    kind: "other".to_owned(),
+                    fingerprint: String::new(),
+                    canonical_key: String::new(),
+                });
+                Self::Other {
+                    kind: other.kind,
+                    fingerprint: other.fingerprint,
+                    canonical_key: other.canonical_key,
+                }
+            }
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum RestQueryRangeInput {
+    Block { start: i32, end: i32 },
+    Slot { start: i32, end: i32 },
+    Height { start: i32, end: i32 },
+}
+
+impl From<QueryRangeInput> for RestQueryRangeInput {
+    fn from(input: QueryRangeInput) -> Self {
+        match input.kind {
+            QueryRangeKindInput::Block => Self::Block {
+                start: input.start,
+                end: input.end,
+            },
+            QueryRangeKindInput::Slot => Self::Slot {
+                start: input.start,
+                end: input.end,
+            },
+            QueryRangeKindInput::Height => Self::Height {
+                start: input.start,
+                end: input.end,
+            },
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum RestFieldSelectionInput {
+    All(String),
+    Include(FieldSelectionInput),
+}
+
+impl From<Option<FieldSelectionInput>> for RestFieldSelectionInput {
+    fn from(fields: Option<FieldSelectionInput>) -> Self {
+        fields.map_or_else(|| Self::All("all".to_owned()), Self::Include)
+    }
+}
+
+#[derive(Deserialize)]
+struct RestQueryResponse {
+    chain: serde_json::Value,
+    dataset_key: String,
+    range: serde_json::Value,
+    cache: serde_json::Value,
+    rows: serde_json::Value,
+}
+
+impl From<RestQueryResponse> for QueryResponse {
+    fn from(response: RestQueryResponse) -> Self {
+        Self {
+            chain: response.chain,
+            dataset_key: response.dataset_key,
+            range: response.range,
+            cache: response.cache,
+            rows: response.rows,
+        }
+    }
 }
 
 const DISCOVERY_QUERY: &str = r#"

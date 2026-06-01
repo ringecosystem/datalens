@@ -238,7 +238,7 @@ fn test_http_unauthorized_is_auth_error() {
 }
 
 fn client(server: &MockGraphqlServer, bearer_token: Option<&str>) -> DatalensClient {
-    DatalensClient::new(ClientConfig {
+    DatalensClient::with_graphql_endpoint(ClientConfig {
         endpoint: server.endpoint(),
         bearer_token: bearer_token.map(str::to_owned),
         application: Some("query-app".to_owned()),

@@ -31,10 +31,10 @@ impl fmt::Display for Error {
             | Self::Decode(message)
             | Self::Transport(message) => formatter.write_str(message),
             Self::Unauthorized { status, body } => {
-                write!(formatter, "datalens GraphQL auth error {status}: {body}")
+                write!(formatter, "datalens auth error {status}: {body}")
             }
             Self::HttpStatus { status, body } => {
-                write!(formatter, "datalens GraphQL HTTP error {status}: {body}")
+                write!(formatter, "datalens HTTP error {status}: {body}")
             }
             Self::Graphql(errors) => {
                 let message = errors
