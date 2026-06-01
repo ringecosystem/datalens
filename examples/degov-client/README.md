@@ -13,7 +13,7 @@ native Datalens REST and GraphQL surfaces, such as `/v1/query` and
 `/native/graphql`; `datalens serve` does not expose `/index/graphql`.
 
 This example is an external application indexer. It uses only `datalens-sdk` to
-query `datalens serve` through `/native/graphql`, and it does not link Datalens
+query `datalens serve` through REST `/v1/query`, and it does not link Datalens
 server, edge, storage, or indexer runtime crates.
 
 Start the shared Datalens cache service separately:
@@ -54,8 +54,8 @@ DEGOV_RESET_CHECKPOINT=true \
 ```
 
 Set `DATALENS_ENDPOINT` to the base service URL, not `/native/graphql`; the Rust
-SDK client appends the native GraphQL path. Use `DATALENS_TOKEN` when the
-service requires an authorization token.
+SDK client posts native cache queries to `/v1/query`. Use `DATALENS_TOKEN` when
+the service requires an authorization token.
 
 For live E2E reporting, `fetched=0 inserted=0` can still prove service/cache
 correctness for a bounded native query, but it must not be counted as
@@ -120,7 +120,7 @@ double-count proposal totals. Logs that cannot be decoded are marked with
 
 ## Tests
 
-Smoke and application tests use mock GraphQL responses, so CI does not require
+Smoke and application tests use mock REST responses, so CI does not require
 live RPC or a running Datalens service:
 
 ```sh

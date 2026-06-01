@@ -203,7 +203,7 @@ fn test_run_once_resumes_with_stored_checkpoint_cursor() {
     let db = migrated_db();
     db.insert_checkpoint("degov-vote-consumer", "101")
         .expect("seed checkpoint");
-    let server = MockGraphqlServer::new(vec![graphql_page(
+    let server = MockGraphqlServer::new(vec![rest_page(
         vec![vote_edge(
             "101:0xtx-vote-cursor-2:1",
             "42",
@@ -231,15 +231,15 @@ fn test_run_once_resumes_with_stored_checkpoint_cursor() {
     );
     let requests = server.requests();
     assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].variables["input"]["range"]["start"], 101);
-    assert_eq!(requests[0].variables["input"]["range"]["end"], 102);
+    assert_eq!(requests[0].body["range"]["start"], 101);
+    assert_eq!(requests[0].body["range"]["end"], 102);
 }
 
 #[test]
 fn test_run_until_complete_reads_all_chunks_and_advances_checkpoint() {
     let db = migrated_db();
     let server = MockGraphqlServer::new(vec![
-        graphql_page(
+        rest_page(
             vec![vote_edge(
                 "100:0xtx-vote-cursor-1:1",
                 "42",
@@ -248,7 +248,7 @@ fn test_run_until_complete_reads_all_chunks_and_advances_checkpoint() {
             )],
             true,
         ),
-        graphql_page(
+        rest_page(
             vec![vote_edge(
                 "101:0xtx-vote-cursor-2:1",
                 "42",
@@ -271,10 +271,10 @@ fn test_run_until_complete_reads_all_chunks_and_advances_checkpoint() {
     assert!(!summary.has_next_page);
     let requests = server.requests();
     assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0].variables["input"]["range"]["start"], 100);
-    assert_eq!(requests[0].variables["input"]["range"]["end"], 100);
-    assert_eq!(requests[1].variables["input"]["range"]["start"], 101);
-    assert_eq!(requests[1].variables["input"]["range"]["end"], 101);
+    assert_eq!(requests[0].body["range"]["start"], 100);
+    assert_eq!(requests[0].body["range"]["end"], 100);
+    assert_eq!(requests[1].body["range"]["start"], 101);
+    assert_eq!(requests[1].body["range"]["end"], 101);
 }
 
 #[test]
@@ -287,7 +287,7 @@ fn test_run_until_complete_retries_transient_provider_failure() {
                 "extensions": {"kind": "provider_failure", "status": 502}
             }]
         }),
-        graphql_page(
+        rest_page(
             vec![vote_edge(
                 "100:0xtx-vote-cursor-1:1",
                 "42",
@@ -357,7 +357,7 @@ fn vote_page(
     support: Option<u64>,
     weight: Option<&str>,
 ) -> datalens_example_degov_client::datalens::VoteCastPage {
-    let server = MockGraphqlServer::new(vec![graphql_page(
+    let server = MockGraphqlServer::new(vec![rest_page(
         vec![vote_edge(cursor, proposal_id, support, weight)],
         false,
     )]);
@@ -371,7 +371,7 @@ fn vote_page(
 fn degov_page(
     edges: Vec<serde_json::Value>,
 ) -> datalens_example_degov_client::datalens::VoteCastPage {
-    let server = MockGraphqlServer::new(vec![graphql_page(edges, false)]);
+    let server = MockGraphqlServer::new(vec![rest_page(edges, false)]);
     let client = DatalensDegovClient::new(sdk_client(&server));
     let config = test_config(&server, 100, Some(100), 10);
     client
@@ -379,21 +379,25 @@ fn degov_page(
         .expect("vote page")
 }
 
-fn graphql_page(edges: Vec<serde_json::Value>, _has_next_page: bool) -> serde_json::Value {
+fn rest_page(edges: Vec<serde_json::Value>, _has_next_page: bool) -> serde_json::Value {
     json!({
-        "data": {
-            "query": {
-                "chain": {"configuredName": "ethereum"},
-                "datasetKey": "evm.logs",
-                "range": {"kind": "block", "start": 100, "end": 100},
-                "cache": {"hitRanges": [], "missingRanges": []},
-                "rows": {
-                    "dataset_key": "evm.logs",
-                    "rows": {
-                        "dataset": "logs",
-                        "rows": edges
-                    }
-                }
+        "chain": {"configuredName": "ethereum"},
+        "dataset_key": "evm.logs",
+        "range": {"kind": "block", "start": 100, "end": 100},
+        "cache": {
+            "hit_ranges": [],
+            "missing_ranges": [],
+            "durable_hit_ranges": [],
+            "hot_hit_ranges": [],
+            "provider_fill_ranges": [],
+            "promotion_pending_ranges": [],
+            "segments": []
+        },
+        "rows": {
+            "dataset_key": "evm.logs",
+            "rows": {
+                "dataset": "logs",
+                "rows": edges
             }
         }
     })

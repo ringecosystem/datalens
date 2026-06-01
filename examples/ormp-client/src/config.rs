@@ -180,10 +180,7 @@ impl AppConfig {
 
     pub fn sdk_config(&self) -> ClientConfig {
         ClientConfig {
-            endpoint: format!(
-                "{}/native/graphql",
-                self.datalens_endpoint.trim_end_matches('/')
-            ),
+            endpoint: self.datalens_endpoint.trim_end_matches('/').to_owned(),
             bearer_token: self.token.clone(),
             application: Some(self.application.clone()),
             timeout: Some(Duration::from_secs(10)),

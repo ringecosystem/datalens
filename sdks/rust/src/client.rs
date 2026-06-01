@@ -15,7 +15,9 @@ pub struct ClientConfig {
 
 #[derive(Clone)]
 pub struct DatalensClient {
-    endpoint: String,
+    base_url: String,
+    graphql_endpoint: String,
+    native_transport: NativeTransport,
     bearer_token: Option<String>,
     application: Option<String>,
     user_agent: Option<String>,
@@ -27,10 +29,35 @@ impl DatalensClient {
         let endpoint = config.endpoint.trim().trim_end_matches('/').to_owned();
         if endpoint.is_empty() {
             return Err(Error::InvalidConfig(
+                "datalens endpoint must not be empty".to_owned(),
+            ));
+        }
+
+        Self::build(
+            endpoint.clone(),
+            format!("{endpoint}/native/graphql"),
+            NativeTransport::Rest,
+            config,
+        )
+    }
+
+    pub fn with_graphql_endpoint(config: ClientConfig) -> Result<Self, Error> {
+        let endpoint = config.endpoint.trim().trim_end_matches('/').to_owned();
+        if endpoint.is_empty() {
+            return Err(Error::InvalidConfig(
                 "datalens GraphQL endpoint must not be empty".to_owned(),
             ));
         }
 
+        Self::build(endpoint.clone(), endpoint, NativeTransport::Graphql, config)
+    }
+
+    fn build(
+        base_url: String,
+        graphql_endpoint: String,
+        native_transport: NativeTransport,
+        config: ClientConfig,
+    ) -> Result<Self, Error> {
         let mut builder = reqwest::blocking::Client::builder();
         if let Some(timeout) = config.timeout {
             builder = builder.timeout(timeout);
@@ -38,7 +65,9 @@ impl DatalensClient {
         if let Some(user_agent) = normalize_optional(config.user_agent) {
             builder = builder.user_agent(user_agent.clone());
             Ok(Self {
-                endpoint,
+                base_url,
+                graphql_endpoint,
+                native_transport,
                 bearer_token: normalize_optional(config.bearer_token),
                 application: normalize_optional(config.application),
                 user_agent: Some(user_agent),
@@ -48,7 +77,9 @@ impl DatalensClient {
             })
         } else {
             Ok(Self {
-                endpoint,
+                base_url,
+                graphql_endpoint,
+                native_transport,
                 bearer_token: normalize_optional(config.bearer_token),
                 application: normalize_optional(config.application),
                 user_agent: None,
@@ -67,13 +98,17 @@ impl DatalensClient {
         IndexClient::new(self)
     }
 
+    pub(crate) fn native_transport(&self) -> NativeTransport {
+        self.native_transport
+    }
+
     pub(crate) fn execute<T, V>(&self, query: &'static str, variables: V) -> Result<T, Error>
     where
         T: DeserializeOwned,
         V: Serialize,
     {
         let request = GraphqlRequest { query, variables };
-        let mut builder = self.http.post(&self.endpoint).json(&request);
+        let mut builder = self.http.post(&self.graphql_endpoint).json(&request);
         if let Some(token) = &self.bearer_token {
             builder = builder.bearer_auth(token);
         }
@@ -109,6 +144,51 @@ impl DatalensClient {
             Error::Decode("datalens GraphQL response did not include data".to_owned())
         })
     }
+
+    pub(crate) fn post_json<T, V>(&self, path: &str, request: &V) -> Result<T, Error>
+    where
+        T: DeserializeOwned,
+        V: Serialize,
+    {
+        let mut builder = self
+            .http
+            .post(format!("{}{}", self.base_url, path))
+            .json(request);
+        if let Some(token) = &self.bearer_token {
+            builder = builder.bearer_auth(token);
+        }
+        if let Some(application) = &self.application {
+            builder = builder.header("x-datalens-application", application);
+        }
+        if let Some(user_agent) = &self.user_agent {
+            builder = builder.header(reqwest::header::USER_AGENT, user_agent);
+        }
+
+        let response = builder
+            .send()
+            .map_err(|error| Error::Transport(format!("send datalens REST request: {error}")))?;
+        let status = response.status().as_u16();
+        let body = response
+            .text()
+            .map_err(|error| Error::Transport(format!("read datalens REST response: {error}")))?;
+
+        if !(200..300).contains(&status) {
+            return if status == 401 || status == 403 {
+                Err(Error::Unauthorized { status, body })
+            } else {
+                Err(Error::HttpStatus { status, body })
+            };
+        }
+
+        serde_json::from_str(&body)
+            .map_err(|error| Error::Decode(format!("decode datalens REST response: {error}")))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativeTransport {
+    Rest,
+    Graphql,
 }
 
 #[derive(Serialize)]

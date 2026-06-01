@@ -104,7 +104,7 @@ fn test_run_once_resumes_with_stored_checkpoint_cursor() {
     let db = migrated_db();
     db.insert_checkpoint("ormp-message-consumer", "11")
         .expect("seed checkpoint");
-    let server = MockGraphqlServer::new(vec![graphql_page("11:0xtx:3", true, false)]);
+    let server = MockGraphqlServer::new(vec![rest_page("11:0xtx:3", true, false)]);
     let client = DatalensOrmpClient::new(sdk_client(&server));
     let config = test_config(&server, 10, Some(12), 2);
 
@@ -123,16 +123,16 @@ fn test_run_once_resumes_with_stored_checkpoint_cursor() {
     );
     let requests = server.requests();
     assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].variables["input"]["range"]["start"], 11);
-    assert_eq!(requests[0].variables["input"]["range"]["end"], 12);
+    assert_eq!(requests[0].body["range"]["start"], 11);
+    assert_eq!(requests[0].body["range"]["end"], 12);
 }
 
 #[test]
 fn test_run_until_complete_reads_all_chunks_and_advances_checkpoint() {
     let db = migrated_db();
     let server = MockGraphqlServer::new(vec![
-        graphql_page("10:0xtx-one:3", true, false),
-        graphql_page("11:0xtx-two:3", true, false),
+        rest_page("10:0xtx-one:3", true, false),
+        rest_page("11:0xtx-two:3", true, false),
     ]);
     let client = DatalensOrmpClient::new(sdk_client(&server));
     let config = test_config(&server, 10, Some(11), 1);
@@ -148,18 +148,18 @@ fn test_run_until_complete_reads_all_chunks_and_advances_checkpoint() {
     assert!(!summary.has_next_page);
     let requests = server.requests();
     assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0].variables["input"]["range"]["start"], 10);
-    assert_eq!(requests[0].variables["input"]["range"]["end"], 10);
-    assert_eq!(requests[1].variables["input"]["range"]["start"], 11);
-    assert_eq!(requests[1].variables["input"]["range"]["end"], 11);
+    assert_eq!(requests[0].body["range"]["start"], 10);
+    assert_eq!(requests[0].body["range"]["end"], 10);
+    assert_eq!(requests[1].body["range"]["start"], 11);
+    assert_eq!(requests[1].body["range"]["end"], 11);
 }
 
 #[test]
 fn test_run_until_complete_with_reset_replays_duplicate_events() {
     let db = migrated_db();
     let server = MockGraphqlServer::new(vec![
-        graphql_page("10:0xtx-one:3", true, false),
-        graphql_page("10:0xtx-one:3", true, false),
+        rest_page("10:0xtx-one:3", true, false),
+        rest_page("10:0xtx-one:3", true, false),
     ]);
     let client = DatalensOrmpClient::new(sdk_client(&server));
     let mut config = test_config(&server, 10, Some(10), 1);
@@ -226,7 +226,7 @@ fn message_page(
     cursor: &str,
     valid_data: bool,
 ) -> datalens_example_ormp_client::datalens::MessageAcceptedPage {
-    let server = MockGraphqlServer::new(vec![graphql_page(cursor, valid_data, false)]);
+    let server = MockGraphqlServer::new(vec![rest_page(cursor, valid_data, false)]);
     let client = DatalensOrmpClient::new(sdk_client(&server));
     let config = test_config(&server, 10, Some(10), 1);
     client
@@ -234,7 +234,7 @@ fn message_page(
         .expect("message page")
 }
 
-fn graphql_page(cursor: &str, valid_data: bool, _has_next_page: bool) -> serde_json::Value {
+fn rest_page(cursor: &str, valid_data: bool, _has_next_page: bool) -> serde_json::Value {
     let block_number = cursor
         .split(':')
         .next()
@@ -242,29 +242,33 @@ fn graphql_page(cursor: &str, valid_data: bool, _has_next_page: bool) -> serde_j
         .unwrap_or(11);
     let message_hash = message_hash_for_cursor(cursor);
     json!({
-        "data": {
-            "query": {
-                "chain": {"configuredName": "ethereum"},
-                "datasetKey": "evm.logs",
-                "range": {"kind": "block", "start": 10, "end": 10},
-                "cache": {"hitRanges": [], "missingRanges": []},
-                "rows": {
-                    "dataset_key": "evm.logs",
-                    "rows": {
-                        "dataset": "logs",
-                        "rows": [{
-                            "block_number": block_number,
-                            "block_hash": "0xblock",
-                            "transaction_hash": cursor.split(':').nth(1).unwrap_or("0xtx"),
-                            "transaction_index": 0,
-                            "log_index": 3,
-                            "address": "0x13b2211a7ca45db2808f6db05557ce5347e3634e",
-                            "topics": [MESSAGE_ACCEPTED_TOPIC0, message_hash],
-                            "data": if valid_data { MESSAGE_ACCEPTED_DATA } else { "0x" },
-                            "removed": false
-                        }]
-                    }
-                }
+        "chain": {"configuredName": "ethereum"},
+        "dataset_key": "evm.logs",
+        "range": {"kind": "block", "start": 10, "end": 10},
+        "cache": {
+            "hit_ranges": [],
+            "missing_ranges": [],
+            "durable_hit_ranges": [],
+            "hot_hit_ranges": [],
+            "provider_fill_ranges": [],
+            "promotion_pending_ranges": [],
+            "segments": []
+        },
+        "rows": {
+            "dataset_key": "evm.logs",
+            "rows": {
+                "dataset": "logs",
+                "rows": [{
+                    "block_number": block_number,
+                    "block_hash": "0xblock",
+                    "transaction_hash": cursor.split(':').nth(1).unwrap_or("0xtx"),
+                    "transaction_index": 0,
+                    "log_index": 3,
+                    "address": "0x13b2211a7ca45db2808f6db05557ce5347e3634e",
+                    "topics": [MESSAGE_ACCEPTED_TOPIC0, message_hash],
+                    "data": if valid_data { MESSAGE_ACCEPTED_DATA } else { "0x" },
+                    "removed": false
+                }]
             }
         }
     })

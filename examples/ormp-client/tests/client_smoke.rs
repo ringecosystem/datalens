@@ -17,29 +17,33 @@ const MESSAGE_ACCEPTED_DATA: &str = "0x00000000000000000000000000000000000000000
 fn test_fetch_message_accepted_page_decodes_raw_native_log() {
     assert_eq!(DEFAULT_EVENT_TOPIC0, MESSAGE_ACCEPTED_TOPIC0);
     let server = MockGraphqlServer::new(vec![json!({
-        "data": {
-            "query": {
-                "chain": {"configuredName": "ethereum"},
-                "datasetKey": "evm.logs",
-                "range": {"kind": "block", "start": 10, "end": 11},
-                "cache": {"hitRanges": [], "missingRanges": []},
-                "rows": {
-                    "dataset_key": "evm.logs",
-                    "rows": {
-                        "dataset": "logs",
-                        "rows": [{
-                            "block_number": 10,
-                            "block_hash": "0xblock",
-                            "transaction_hash": "0xtx",
-                            "transaction_index": 0,
-                            "log_index": 3,
-                            "address": "0x13b2211a7ca45db2808f6db05557ce5347e3634e",
-                            "topics": [MESSAGE_ACCEPTED_TOPIC0, MESSAGE_ACCEPTED_MSG_HASH],
-                            "data": MESSAGE_ACCEPTED_DATA,
-                            "removed": false
-                        }]
-                    }
-                }
+        "chain": {"configuredName": "ethereum"},
+        "dataset_key": "evm.logs",
+        "range": {"kind": "block", "start": 10, "end": 11},
+        "cache": {
+            "hit_ranges": [],
+            "missing_ranges": [],
+            "durable_hit_ranges": [],
+            "hot_hit_ranges": [],
+            "provider_fill_ranges": [],
+            "promotion_pending_ranges": [],
+            "segments": []
+        },
+        "rows": {
+            "dataset_key": "evm.logs",
+            "rows": {
+                "dataset": "logs",
+                "rows": [{
+                    "block_number": 10,
+                    "block_hash": "0xblock",
+                    "transaction_hash": "0xtx",
+                    "transaction_index": 0,
+                    "log_index": 3,
+                    "address": "0x13b2211a7ca45db2808f6db05557ce5347e3634e",
+                    "topics": [MESSAGE_ACCEPTED_TOPIC0, MESSAGE_ACCEPTED_MSG_HASH],
+                    "data": MESSAGE_ACCEPTED_DATA,
+                    "removed": false
+                }]
             }
         }
     })]);
@@ -71,28 +75,23 @@ fn test_fetch_message_accepted_page_decodes_raw_native_log() {
     assert!(!page.has_next_page);
 
     let request = server.only_request();
-    assert!(request.query.contains("query($input: QueryInput!)"));
+    assert_eq!(request.method, "POST");
+    assert_eq!(request.path, "/v1/query");
+    assert_eq!(request.body["chain"]["configuredName"], "ethereum");
+    assert_eq!(request.body["chain"]["networkId"]["numeric"], 1);
+    assert_eq!(request.body["dataset_key"], "evm.logs");
+    assert_eq!(request.body["selector"]["kind"], "evm_logs");
     assert_eq!(
-        request.variables["input"]["chain"]["configuredName"],
-        "ethereum"
-    );
-    assert_eq!(
-        request.variables["input"]["chain"]["networkId"]["numeric"],
-        1
-    );
-    assert_eq!(request.variables["input"]["datasetKey"]["family"], "evm");
-    assert_eq!(request.variables["input"]["datasetKey"]["name"], "logs");
-    assert_eq!(request.variables["input"]["selector"]["kind"], "evm_logs");
-    assert_eq!(
-        request.variables["input"]["selector"]["evmLogs"]["addresses"][0],
+        request.body["selector"]["value"]["addresses"][0],
         "0x13b2211a7ca45db2808f6db05557ce5347e3634e"
     );
     assert_eq!(
-        request.variables["input"]["selector"]["evmLogs"]["topics"][0][0],
+        request.body["selector"]["value"]["topics"][0][0],
         MESSAGE_ACCEPTED_TOPIC0
     );
-    assert_eq!(request.variables["input"]["range"]["start"], 10);
-    assert_eq!(request.variables["input"]["range"]["end"], 11);
+    assert_eq!(request.body["range"]["start"], 10);
+    assert_eq!(request.body["range"]["end"], 11);
+    assert_eq!(request.body["fields"], "all");
 }
 
 fn client(server: &MockGraphqlServer) -> DatalensClient {
