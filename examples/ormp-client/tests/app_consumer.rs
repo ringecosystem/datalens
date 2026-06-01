@@ -43,7 +43,7 @@ fn test_handle_message_accepted_page_writes_business_rows_and_checkpoint() {
     assert_eq!(db.message_count().expect("message count"), 1);
     assert_eq!(
         db.checkpoint("ormp-message-consumer").expect("checkpoint"),
-        Some("cursor-2".to_owned())
+        Some("11".to_owned())
     );
 }
 
@@ -77,7 +77,7 @@ fn test_checkpoint_does_not_advance_when_business_write_fails() {
                 raw_event_json,
                 created_at
             ) VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP)",
-            ("0xother", "cursor-2", "{}"),
+            ("0xother", "11:0xtx:3", "{}"),
         )?;
         Ok(())
     })
@@ -97,18 +97,11 @@ fn test_checkpoint_does_not_advance_when_business_write_fails() {
 #[test]
 fn test_run_once_resumes_with_stored_checkpoint_cursor() {
     let db = migrated_db();
-    db.insert_checkpoint("ormp-message-consumer", "cursor-1")
+    db.insert_checkpoint("ormp-message-consumer", "11")
         .expect("seed checkpoint");
-    let server = MockGraphqlServer::new(vec![graphql_page("cursor-2", Some("0xhash"), false)]);
+    let server = MockGraphqlServer::new(vec![graphql_page("11:0xtx:3", Some("0xhash"), false)]);
     let client = DatalensOrmpClient::new(sdk_client(&server));
-    let config = AppConfig {
-        index_graphql_url: server.endpoint(),
-        token: None,
-        database_url: "sqlite::memory:".to_owned(),
-        page_size: 2,
-        start_cursor: None,
-        consumer_name: "ormp-message-consumer".to_owned(),
-    };
+    let config = test_config(&server, 10, Some(12), 2);
 
     let summary = datalens_example_ormp_client::run_once(&config, &db, &client).expect("run once");
 
@@ -119,13 +112,14 @@ fn test_run_once_resumes_with_stored_checkpoint_cursor() {
             inserted_rows: 1,
             skipped_duplicates: 0,
             skipped_invalid: 0,
-            checkpoint_cursor: Some("cursor-2".to_owned()),
+            checkpoint_cursor: Some("13".to_owned()),
             has_next_page: false,
         }
     );
     let requests = server.requests();
     assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].variables["after"], "cursor-1");
+    assert_eq!(requests[0].variables["input"]["range"]["start"], 11);
+    assert_eq!(requests[0].variables["input"]["range"]["end"], 12);
 }
 
 fn migrated_db() -> AppDatabase {
@@ -138,10 +132,38 @@ fn sdk_client(server: &MockGraphqlServer) -> DatalensClient {
     DatalensClient::new(ClientConfig {
         endpoint: server.endpoint(),
         bearer_token: None,
+        application: Some("ormp-client-test".to_owned()),
         timeout: None,
         user_agent: Some("datalens-ormp-client-example-tests".to_owned()),
     })
     .expect("client config")
+}
+
+fn test_config(
+    server: &MockGraphqlServer,
+    start_block: i32,
+    end_block: Option<i32>,
+    chunk_size: u32,
+) -> AppConfig {
+    AppConfig {
+        datalens_endpoint: server.endpoint(),
+        token: None,
+        application: "ormp-client-test".to_owned(),
+        database_url: "sqlite::memory:".to_owned(),
+        chain_name: "ethereum".to_owned(),
+        chain_id: 1,
+        dataset_family: "evm".to_owned(),
+        dataset_name: "logs".to_owned(),
+        contract_address: "0x13b2211a7ca45db2808f6db05557ce5347e3634e".to_owned(),
+        event_topic0: "0xtopic0".to_owned(),
+        event_signature: datalens_example_ormp_client::datalens::MESSAGE_ACCEPTED_SIGNATURE
+            .to_owned(),
+        start_block,
+        end_block,
+        chunk_size,
+        reset_checkpoint: false,
+        consumer_name: "ormp-message-consumer".to_owned(),
+    }
 }
 
 fn message_page(
@@ -150,52 +172,47 @@ fn message_page(
 ) -> datalens_example_ormp_client::datalens::MessageAcceptedPage {
     let server = MockGraphqlServer::new(vec![graphql_page(cursor, message_hash, false)]);
     let client = DatalensOrmpClient::new(sdk_client(&server));
+    let config = test_config(&server, 10, Some(10), 1);
     client
-        .fetch_message_accepted_page(None, 1)
+        .fetch_message_accepted_page(&config, 10, 10)
         .expect("message page")
 }
 
 fn graphql_page(
     cursor: &str,
     message_hash: Option<&str>,
-    has_next_page: bool,
+    _has_next_page: bool,
 ) -> serde_json::Value {
     json!({
         "data": {
-            "decodedEventsConnection": {
-                "edges": [{
-                    "cursor": cursor,
-                    "node": {
-                        "indexName": "ormp",
-                        "chain": "ethereum",
-                        "chainId": 1,
-                        "dataset": "evm.logs",
-                        "blockNumber": 20009590,
-                        "blockHash": "0xblock",
-                        "transactionHash": "0xtx",
-                        "transactionIndex": 0,
-                        "logIndex": 3,
-                        "address": "0x13b2211a7ca45db2808f6db05557ce5347e3634e",
-                        "eventName": "MessageAccepted",
-                        "signature": "MessageAccepted(bytes32,(address,uint256,uint256,address,uint256,address,uint256,bytes))",
-                        "topic0": "0xtopic0",
-                        "decodedArgs": {
-                            "msgHash": message_hash,
-                            "sourceChainId": 1,
-                            "targetChainId": 137,
-                            "sender": "0xsender",
-                            "receiver": "0xreceiver"
-                        },
-                        "decodeStatus": "decoded",
-                        "decodeError": null,
-                        "payload": {"source": "mock"},
-                        "createdAt": "2026-05-31T00:00:00Z"
+            "query": {
+                "chain": {"configuredName": "ethereum"},
+                "datasetKey": "evm.logs",
+                "range": {"kind": "block", "start": 10, "end": 10},
+                "cache": {"hitRanges": [], "missingRanges": []},
+                "rows": {
+                    "dataset_key": "evm.logs",
+                    "rows": {
+                        "dataset": "logs",
+                        "rows": [{
+                            "block_number": 11,
+                            "block_hash": "0xblock",
+                            "transaction_hash": cursor.split(':').nth(1).unwrap_or("0xtx"),
+                            "transaction_index": 0,
+                            "log_index": 3,
+                            "address": "0x13b2211a7ca45db2808f6db05557ce5347e3634e",
+                            "topics": ["0xtopic0"],
+                            "data": "0x",
+                            "removed": false,
+                            "decodedArgs": {
+                                "msgHash": message_hash,
+                                "sourceChainId": 1,
+                                "targetChainId": 137,
+                                "sender": "0xsender",
+                                "receiver": "0xreceiver"
+                            }
+                        }]
                     }
-                }],
-                "nodes": [],
-                "pageInfo": {
-                    "endCursor": cursor,
-                    "hasNextPage": has_next_page
                 }
             }
         }

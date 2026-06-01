@@ -7,8 +7,8 @@ checkpoint, and proposal projections while consuming decoded Datalens events.
 native Datalens REST and GraphQL surfaces, such as `/v1/query` and
 `/native/graphql`; `datalens serve` does not expose `/index/graphql`.
 
-This example is an external application consumer. It uses only `datalens-sdk`
-and an application-owned index GraphQL endpoint, and it does not link Datalens
+This example is an external application indexer. It uses only `datalens-sdk` to
+query `datalens serve` through `/native/graphql`, and it does not link Datalens
 server, edge, storage, or indexer runtime crates.
 
 Start the shared Datalens cache service separately:
@@ -17,45 +17,32 @@ Start the shared Datalens cache service separately:
 cargo run -p datalens-cli -- serve --config config/datalens.dev.toml
 ```
 
-Start a Degov application index GraphQL service separately before running this
-client. For local e2e, this example ships an app-owned fixture service that
-exposes the decoded-event GraphQL contract consumed by the client:
-
-```sh
-DEGOV_FIXTURE_ADDR=127.0.0.1:3101 \
-  cargo run -p datalens-example-degov-client --bin degov-app-index-fixture
-```
-
-The fixture is not `datalens serve` and does not perform production indexing. It
-serves deterministic `VoteCast` pages, cursors, and pagination for client
-checkpoint and idempotency testing.
-
 For the local Datalens service setup, see `../../docs/runbook/local-rustfs.md`.
 For the runtime ownership boundary, see `../../docs/spec/production-runtime.md`.
 
-Run the Degov consumer against the external application-owned index GraphQL
-endpoint:
+Run the Degov application indexer against `datalens serve`:
 
 ```sh
-DATALENS_INDEX_GRAPHQL_URL=http://127.0.0.1:3101/graphql \
+DATALENS_ENDPOINT=http://127.0.0.1:3000 \
+DATALENS_APPLICATION=degov-client \
+DEGOV_CHAIN_NAME=ethereum \
+DEGOV_CHAIN_ID=1 \
+DEGOV_CONTRACT_ADDRESS=0x0000000000000000000000000000000000000000 \
+DEGOV_EVENT_TOPIC0=0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef \
+DEGOV_START_BLOCK=100 \
+DEGOV_END_BLOCK=200 \
 DEGOV_DATABASE_URL=sqlite:.tmp/degov-client.sqlite \
   cargo run -p datalens-example-degov-client
 ```
 
-Set `DATALENS_INDEX_GRAPHQL_URL` to the exact endpoint exposed by the Degov
-application service. The example binary's fallback URL is a local convention
-only; it is not provided by `datalens serve`. Use `DATALENS_TOKEN` when the
-external application service requires an authorization token.
+Set `DATALENS_ENDPOINT` to the base service URL, not `/native/graphql`; the Rust
+SDK client appends the native GraphQL path. Use `DATALENS_TOKEN` when the
+service requires an authorization token.
 
-To validate duplicate handling after the first run, replay from the fixture's
-start cursor against the same SQLite database:
-
-```sh
-DATALENS_INDEX_GRAPHQL_URL=http://127.0.0.1:3101/graphql \
-DEGOV_DATABASE_URL=sqlite:.tmp/degov-client.sqlite \
-DEGOV_START_CURSOR=degov-cursor-0 \
-  cargo run -p datalens-example-degov-client
-```
+To validate duplicate handling after the first run, run the same command again
+against the same SQLite database. The application resumes from its stored
+next-block checkpoint and reports idempotent writes without depending on an
+application index GraphQL service.
 
 ## Configuration
 
@@ -63,15 +50,22 @@ The application reads:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `DATALENS_INDEX_GRAPHQL_URL` | `http://127.0.0.1:3100/graphql` | Degov application-owned index GraphQL endpoint |
+| `DATALENS_ENDPOINT` | `http://127.0.0.1:3000` | Datalens service base URL |
 | `DATALENS_TOKEN` | unset | Optional bearer token |
+| `DATALENS_APPLICATION` | `degov-client` | Application identity header |
 | `DEGOV_DATABASE_URL` | `sqlite:.tmp/degov-client.sqlite` | Application-owned SQLite database |
-| `DEGOV_PAGE_SIZE` | `25` | VoteCast page size |
-| `DEGOV_START_CURSOR` | unset | Explicit cursor override for one run |
+| `DEGOV_CHAIN_NAME` / `DEGOV_CHAIN_ID` | `ethereum` / `1` | Native Datalens chain identity |
+| `DEGOV_DATASET_FAMILY` / `DEGOV_DATASET_NAME` | `evm` / `logs` | Native dataset key |
+| `DEGOV_CONTRACT_ADDRESS` | zero address placeholder | Governance contract address |
+| `DEGOV_EVENT_TOPIC0` | configured placeholder | `VoteCast` topic selector |
+| `DEGOV_EVENT_SIGNATURE` | `VoteCast(address,uint256,uint8,uint256,string)` | Business event signature stored with decoded rows |
+| `DEGOV_START_BLOCK` / `DEGOV_END_BLOCK` | `0` / unset | Inclusive configured block range |
+| `DEGOV_CHUNK_SIZE` | `100` | Maximum blocks queried per run |
+| `DEGOV_RESET_CHECKPOINT` | unset | Set to `true` to replay from `DEGOV_START_BLOCK` |
 | `DEGOV_CONSUMER_NAME` | `degov-vote-consumer` | Checkpoint identity |
 
-By default the consumer resumes from its stored checkpoint. Set
-`DEGOV_START_CURSOR` only when intentionally overriding that resume cursor.
+By default the consumer resumes from its stored next-block checkpoint and does
+not reprocess completed ranges unless `DEGOV_RESET_CHECKPOINT=true`.
 
 ## Application Schema
 
@@ -80,7 +74,7 @@ tables:
 
 | Table | Responsibility |
 | --- | --- |
-| `consumer_checkpoints` | Stores the last durable Datalens cursor per consumer name. |
+| `consumer_checkpoints` | Stores the next block per consumer name. |
 | `degov_votes` | Stores normalized vote data plus the raw decoded event JSON. `event_cursor` is unique and the vote key is derived from transaction hash plus log index when available. |
 | `degov_proposals` | Stores proposal projection totals for for, against, and abstain votes. |
 

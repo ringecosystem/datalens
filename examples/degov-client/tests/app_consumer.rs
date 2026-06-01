@@ -53,7 +53,7 @@ fn test_handle_vote_cast_page_writes_vote_projection_and_checkpoint() {
     );
     assert_eq!(
         db.checkpoint("degov-vote-consumer").expect("checkpoint"),
-        Some("vote-cursor-2".to_owned())
+        Some("101".to_owned())
     );
 }
 
@@ -124,7 +124,7 @@ fn test_handle_vote_cast_page_skips_missing_required_fields() {
     assert_eq!(db.vote_count().expect("vote count"), 0);
     assert_eq!(
         db.checkpoint("degov-vote-consumer").expect("checkpoint"),
-        Some("vote-cursor-2".to_owned())
+        Some("101".to_owned())
     );
 }
 
@@ -150,7 +150,7 @@ fn test_checkpoint_does_not_advance_when_projection_write_fails() {
                 "different-proposal",
                 1_i64,
                 7_i64,
-                "vote-cursor-2",
+                "100:0xtx-vote-cursor-2:1",
                 "{}",
             ),
         )?;
@@ -175,21 +175,19 @@ fn test_checkpoint_does_not_advance_when_projection_write_fails() {
 #[test]
 fn test_run_once_resumes_with_stored_checkpoint_cursor() {
     let db = migrated_db();
-    db.insert_checkpoint("degov-vote-consumer", "vote-cursor-1")
+    db.insert_checkpoint("degov-vote-consumer", "101")
         .expect("seed checkpoint");
     let server = MockGraphqlServer::new(vec![graphql_page(
-        vec![vote_edge("vote-cursor-2", "42", Some(1), Some("7"))],
+        vec![vote_edge(
+            "101:0xtx-vote-cursor-2:1",
+            "42",
+            Some(1),
+            Some("7"),
+        )],
         false,
     )]);
     let client = DatalensDegovClient::new(sdk_client(&server));
-    let config = AppConfig {
-        index_graphql_url: server.endpoint(),
-        token: None,
-        database_url: "sqlite::memory:".to_owned(),
-        page_size: 2,
-        start_cursor: None,
-        consumer_name: "degov-vote-consumer".to_owned(),
-    };
+    let config = test_config(&server, 100, Some(102), 2);
 
     let summary = datalens_example_degov_client::run_once(&config, &db, &client).expect("run once");
 
@@ -201,13 +199,14 @@ fn test_run_once_resumes_with_stored_checkpoint_cursor() {
             skipped_duplicates: 0,
             skipped_invalid: 0,
             updated_proposals: 1,
-            checkpoint_cursor: Some("vote-cursor-2".to_owned()),
+            checkpoint_cursor: Some("103".to_owned()),
             has_next_page: false,
         }
     );
     let requests = server.requests();
     assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].variables["after"], "vote-cursor-1");
+    assert_eq!(requests[0].variables["input"]["range"]["start"], 101);
+    assert_eq!(requests[0].variables["input"]["range"]["end"], 102);
 }
 
 fn migrated_db() -> AppDatabase {
@@ -220,10 +219,37 @@ fn sdk_client(server: &MockGraphqlServer) -> DatalensClient {
     DatalensClient::new(ClientConfig {
         endpoint: server.endpoint(),
         bearer_token: None,
+        application: Some("degov-client-test".to_owned()),
         timeout: None,
         user_agent: Some("datalens-degov-client-example-tests".to_owned()),
     })
     .expect("client config")
+}
+
+fn test_config(
+    server: &MockGraphqlServer,
+    start_block: i32,
+    end_block: Option<i32>,
+    chunk_size: u32,
+) -> AppConfig {
+    AppConfig {
+        datalens_endpoint: server.endpoint(),
+        token: None,
+        application: "degov-client-test".to_owned(),
+        database_url: "sqlite::memory:".to_owned(),
+        chain_name: "ethereum".to_owned(),
+        chain_id: 1,
+        dataset_family: "evm".to_owned(),
+        dataset_name: "logs".to_owned(),
+        contract_address: "0xgovernor".to_owned(),
+        event_topic0: "0xtopic0".to_owned(),
+        event_signature: datalens_example_degov_client::datalens::VOTE_CAST_SIGNATURE.to_owned(),
+        start_block,
+        end_block,
+        chunk_size,
+        reset_checkpoint: false,
+        consumer_name: "degov-vote-consumer".to_owned(),
+    }
 }
 
 fn vote_page(
@@ -237,7 +263,10 @@ fn vote_page(
         false,
     )]);
     let client = DatalensDegovClient::new(sdk_client(&server));
-    client.fetch_vote_cast_page(None, 1).expect("vote page")
+    let config = test_config(&server, 100, Some(100), 1);
+    client
+        .fetch_vote_cast_page(&config, 100, 100)
+        .expect("vote page")
 }
 
 fn degov_page(
@@ -245,23 +274,26 @@ fn degov_page(
 ) -> datalens_example_degov_client::datalens::VoteCastPage {
     let server = MockGraphqlServer::new(vec![graphql_page(edges, false)]);
     let client = DatalensDegovClient::new(sdk_client(&server));
-    client.fetch_vote_cast_page(None, 10).expect("vote page")
+    let config = test_config(&server, 100, Some(100), 10);
+    client
+        .fetch_vote_cast_page(&config, 100, 100)
+        .expect("vote page")
 }
 
-fn graphql_page(edges: Vec<serde_json::Value>, has_next_page: bool) -> serde_json::Value {
-    let end_cursor = edges
-        .last()
-        .and_then(|edge| edge["cursor"].as_str())
-        .unwrap_or_default();
-
+fn graphql_page(edges: Vec<serde_json::Value>, _has_next_page: bool) -> serde_json::Value {
     json!({
         "data": {
-            "decodedEventsConnection": {
-                "edges": edges,
-                "nodes": [],
-                "pageInfo": {
-                    "endCursor": end_cursor,
-                    "hasNextPage": has_next_page
+            "query": {
+                "chain": {"configuredName": "ethereum"},
+                "datasetKey": "evm.logs",
+                "range": {"kind": "block", "start": 100, "end": 100},
+                "cache": {"hitRanges": [], "missingRanges": []},
+                "rows": {
+                    "dataset_key": "evm.logs",
+                    "rows": {
+                        "dataset": "logs",
+                        "rows": edges
+                    }
                 }
             }
         }
@@ -274,34 +306,27 @@ fn vote_edge(
     support: Option<u64>,
     weight: Option<&str>,
 ) -> serde_json::Value {
-    let transaction_hash = format!("0xtx-{cursor}");
+    let transaction_hash = cursor
+        .split(':')
+        .nth(1)
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("0xtx-{cursor}"));
     json!({
-        "cursor": cursor,
-        "node": {
-            "indexName": "degov",
-            "chain": "ethereum",
-            "chainId": 1,
-            "dataset": "evm.logs",
-            "blockNumber": 100,
-            "blockHash": "0xblock1",
-            "transactionHash": transaction_hash,
-            "transactionIndex": 0,
-            "logIndex": 1,
-            "address": "0xgovernor",
-            "eventName": "VoteCast",
-            "signature": "VoteCast(address,uint256,uint8,uint256,string)",
-            "topic0": "0xtopic0",
-            "decodedArgs": {
-                "voter": "0xvoter",
-                "proposalId": proposal_id,
-                "support": support,
-                "weight": weight,
-                "reason": "because"
-            },
-            "decodeStatus": "decoded",
-            "decodeError": null,
-            "payload": {},
-            "createdAt": "2026-05-31T00:00:00Z"
+        "block_number": 100,
+        "block_hash": "0xblock1",
+        "transaction_hash": transaction_hash,
+        "transaction_index": 0,
+        "log_index": 1,
+        "address": "0xgovernor",
+        "topics": ["0xtopic0"],
+        "data": "0x",
+        "removed": false,
+        "decodedArgs": {
+            "voter": "0xvoter",
+            "proposalId": proposal_id,
+            "support": support,
+            "weight": weight,
+            "reason": "because"
         }
     })
 }

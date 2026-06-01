@@ -8,6 +8,7 @@ use crate::{Error, GraphqlError, index::IndexClient, native::NativeClient};
 pub struct ClientConfig {
     pub endpoint: String,
     pub bearer_token: Option<String>,
+    pub application: Option<String>,
     pub timeout: Option<Duration>,
     pub user_agent: Option<String>,
 }
@@ -16,6 +17,7 @@ pub struct ClientConfig {
 pub struct DatalensClient {
     endpoint: String,
     bearer_token: Option<String>,
+    application: Option<String>,
     user_agent: Option<String>,
     http: reqwest::blocking::Client,
 }
@@ -38,6 +40,7 @@ impl DatalensClient {
             Ok(Self {
                 endpoint,
                 bearer_token: normalize_optional(config.bearer_token),
+                application: normalize_optional(config.application),
                 user_agent: Some(user_agent),
                 http: builder
                     .build()
@@ -47,6 +50,7 @@ impl DatalensClient {
             Ok(Self {
                 endpoint,
                 bearer_token: normalize_optional(config.bearer_token),
+                application: normalize_optional(config.application),
                 user_agent: None,
                 http: builder
                     .build()
@@ -72,6 +76,9 @@ impl DatalensClient {
         let mut builder = self.http.post(&self.endpoint).json(&request);
         if let Some(token) = &self.bearer_token {
             builder = builder.bearer_auth(token);
+        }
+        if let Some(application) = &self.application {
+            builder = builder.header("x-datalens-application", application);
         }
         if let Some(user_agent) = &self.user_agent {
             builder = builder.header(reqwest::header::USER_AGENT, user_agent);

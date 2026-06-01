@@ -68,6 +68,7 @@ fn test_index_raw_events_sends_bearer_token_and_decodes_nodes() {
         request.headers.user_agent.as_deref(),
         Some("datalens-sdk-tests")
     );
+    assert_eq!(request.headers.application.as_deref(), Some("query-app"));
     assert!(request.query.contains("events("), "{}", request.query);
     assert_eq!(request.variables["dataset"], "evm.logs");
     assert_eq!(request.variables["indexName"], "ormp");
@@ -240,6 +241,7 @@ fn client(server: &MockGraphqlServer, bearer_token: Option<&str>) -> DatalensCli
     DatalensClient::new(ClientConfig {
         endpoint: server.endpoint(),
         bearer_token: bearer_token.map(str::to_owned),
+        application: Some("query-app".to_owned()),
         timeout: Some(Duration::from_secs(5)),
         user_agent: Some("datalens-sdk-tests".to_owned()),
     })
@@ -256,6 +258,7 @@ struct RecordedRequest {
 #[derive(Clone, Debug, Default)]
 struct RecordedHeaders {
     authorization: Option<String>,
+    application: Option<String>,
     user_agent: Option<String>,
 }
 
@@ -330,6 +333,8 @@ fn handle_connection(
             content_length = value.parse().expect("content length");
         } else if lower.starts_with("authorization: ") {
             headers.authorization = Some(trimmed["authorization: ".len()..].to_owned());
+        } else if lower.starts_with("x-datalens-application: ") {
+            headers.application = Some(trimmed["x-datalens-application: ".len()..].to_owned());
         } else if lower.starts_with("user-agent: ") {
             headers.user_agent = Some(trimmed["user-agent: ".len()..].to_owned());
         }

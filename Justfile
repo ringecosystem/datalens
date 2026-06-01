@@ -48,10 +48,6 @@ e2e-lifecycle:
   cargo test -p datalens-cli --test cli_commands test_inspect
   cargo test -p datalens-metrics --test metrics_encoding
 
-examples-app-index-fixture-e2e:
-  cargo test -p datalens-example-ormp-client --test fixture_e2e
-  cargo test -p datalens-example-degov-client --test fixture_e2e
-
 multi-chain-e2e:
   cargo test -p datalens-solana
   cargo test -p datalens-tron

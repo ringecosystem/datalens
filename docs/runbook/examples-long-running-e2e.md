@@ -11,7 +11,6 @@ Inputs:
 
 - Example workload list from `examples/`.
 - Datalens config path and service endpoint.
-- Application-owned index GraphQL fixture endpoint for ORMP and Degov client examples.
 - Storage backend and prefix.
 - RPC provider names with all tokens, query strings, credentials, and secrets redacted.
 - First-run metrics collected against cold or empty relevant cache coverage.
@@ -63,34 +62,9 @@ Outputs:
 | Environment | <local | CI | cluster> |
 | Datalens config path | <path> |
 | Datalens service endpoint | <scheme://host:port or internal service name> |
-| ORMP app index GraphQL fixture endpoint | <scheme://host:port/graphql or n/a> |
-| Degov app index GraphQL fixture endpoint | <scheme://host:port/graphql or n/a> |
 | Storage backend and prefix | <backend, bucket/root, prefix> |
 | RPC providers | <provider names or aliases only; secrets redacted> |
 | Duration target | <normally about 30 minutes per example workload> |
-
-## App-Owned Index Fixture Setup
-
-Use these commands when the run includes the ORMP and Degov application
-consumers and no external application index service is provisioned:
-
-```sh
-ORMP_FIXTURE_ADDR=127.0.0.1:3100 \
-  cargo run -p datalens-example-ormp-client --bin ormp-app-index-fixture
-```
-
-```sh
-DEGOV_FIXTURE_ADDR=127.0.0.1:3101 \
-  cargo run -p datalens-example-degov-client --bin degov-app-index-fixture
-```
-
-These fixtures expose application-owned index GraphQL contracts only. They are
-not `datalens serve` and should be reported separately from the shared Datalens
-service endpoint. For automated local validation, run:
-
-```sh
-just examples-app-index-fixture-e2e
-```
 
 ## Executive Summary
 
@@ -110,6 +84,8 @@ just examples-app-index-fixture-e2e
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | <ormp-client> | <first_run> | <ethereum> | <evm> | <evm.logs> | <contract/event/topic> | <redacted or public selector> | <number> | <number or unbounded> | <number> | <ranges> |
 | <ormp-client> | <second_run> | <ethereum> | <evm> | <evm.logs> | <contract/event/topic> | <same selector> | <number> | <number or unbounded> | <number> | <ranges> |
+| <degov-client> | <first_run> | <ethereum> | <evm> | <evm.logs> | <contract/event/topic> | <redacted or public selector> | <number> | <number or unbounded> | <number> | <ranges> |
+| <degov-client> | <second_run> | <ethereum> | <evm> | <evm.logs> | <contract/event/topic> | <same selector> | <number> | <number or unbounded> | <number> | <ranges> |
 
 ## Per-Workload Metrics
 
@@ -142,11 +118,6 @@ Repeat this section for every `(example, chain, dataset, selector)` tuple.
 | Invalid or skipped rows | <count> | <count> |  |
 | Checkpoint before | <block/slot/range/cursor> | <block/slot/range/cursor> |  |
 | Checkpoint after | <block/slot/range/cursor> | <block/slot/range/cursor> |  |
-
-For ORMP and Degov fixture-backed runs, the second run may intentionally set
-`ORMP_START_CURSOR=ormp-cursor-0` or `DEGOV_START_CURSOR=degov-cursor-0` against
-the same application SQLite database to replay fixture pages and validate
-duplicate skipping. Record that explicit replay cursor in the checkpoint notes.
 
 #### Cache Behavior Metrics
 
@@ -234,6 +205,9 @@ rows when useful.
 ## Completeness Checklist
 
 - Every example under `examples/` is present.
+- Include Rust SDK business indexer examples such as `ormp-client` and `degov-client`
+  when they have chain, contract, event topic, start block, and optional end block
+  configured for `datalens serve`.
 - Every chain used by each example is present with chain name and chain kind.
 - Every dataset key used by each example is present.
 - Every selector is described by selector kind and value or redacted public-safe summary.
@@ -242,4 +216,8 @@ rows when useful.
 - The comparison table includes total duration, provider calls, rows processed, cache hit
   ratio, new storage bytes, business rows inserted, duplicate rows skipped, and
   errors/retries.
+- For `ormp-client` and `degov-client`, record the application checkpoint as the
+  next block number. If `*_RESET_CHECKPOINT=true` is used for a second-run replay,
+  record duplicate business writes separately from normal resume runs that skip
+  already completed ranges.
 - RPC provider identifiers are names or aliases only, and all secrets are redacted.
