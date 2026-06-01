@@ -27,17 +27,19 @@ DATALENS_ENDPOINT=http://127.0.0.1:3000 \
 DATALENS_APPLICATION=degov-client \
 DEGOV_CHAIN_NAME=ethereum \
 DEGOV_CHAIN_ID=1 \
-DEGOV_CONTRACT_ADDRESS=0x0000000000000000000000000000000000000000 \
-DEGOV_EVENT_TOPIC0=0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef \
-DEGOV_START_BLOCK=100 \
-DEGOV_END_BLOCK=200 \
+DEGOV_CONTRACT_ADDRESS="${DEGOV_CONTRACT_ADDRESS:?set a governance contract that emits VoteCast}" \
+DEGOV_EVENT_TOPIC0=0xb8e138887d0aa13bab447e82de9d5c1777041ecd21ca36ba824ff1e6c07ddda4 \
+DEGOV_START_BLOCK="${DEGOV_START_BLOCK:?set the first block in a VoteCast range}" \
+DEGOV_END_BLOCK="${DEGOV_END_BLOCK:?set the last block in a VoteCast range}" \
 DEGOV_DATABASE_URL=sqlite:.tmp/degov-client.sqlite \
   cargo run -p datalens-example-degov-client
 ```
 
 Set `DATALENS_ENDPOINT` to the base service URL, not `/native/graphql`; the Rust
 SDK client appends the native GraphQL path. Use `DATALENS_TOKEN` when the
-service requires an authorization token.
+service requires an authorization token. A reliable public live VoteCast range
+is intentionally not baked into the example; provide a governance contract and
+block range that are valid for your indexed EVM log dataset.
 
 To validate duplicate handling after the first run, run the same command again
 against the same SQLite database. The application resumes from its stored
@@ -56,10 +58,10 @@ The application reads:
 | `DEGOV_DATABASE_URL` | `sqlite:.tmp/degov-client.sqlite` | Application-owned SQLite database |
 | `DEGOV_CHAIN_NAME` / `DEGOV_CHAIN_ID` | `ethereum` / `1` | Native Datalens chain identity |
 | `DEGOV_DATASET_FAMILY` / `DEGOV_DATASET_NAME` | `evm` / `logs` | Native dataset key |
-| `DEGOV_CONTRACT_ADDRESS` | zero address placeholder | Governance contract address |
-| `DEGOV_EVENT_TOPIC0` | configured placeholder | `VoteCast` topic selector |
+| `DEGOV_CONTRACT_ADDRESS` | required | Governance contract address |
+| `DEGOV_EVENT_TOPIC0` | required `0xb8e138887d0aa13bab447e82de9d5c1777041ecd21ca36ba824ff1e6c07ddda4` | `VoteCast(address,uint256,uint8,uint256,string)` topic selector |
 | `DEGOV_EVENT_SIGNATURE` | `VoteCast(address,uint256,uint8,uint256,string)` | Business event signature stored with decoded rows |
-| `DEGOV_START_BLOCK` / `DEGOV_END_BLOCK` | `0` / unset | Inclusive configured block range |
+| `DEGOV_START_BLOCK` / `DEGOV_END_BLOCK` | required | Inclusive configured block range |
 | `DEGOV_CHUNK_SIZE` | `100` | Maximum blocks queried per run |
 | `DEGOV_RESET_CHECKPOINT` | unset | Set to `true` to replay from `DEGOV_START_BLOCK` |
 | `DEGOV_CONSUMER_NAME` | `degov-vote-consumer` | Checkpoint identity |

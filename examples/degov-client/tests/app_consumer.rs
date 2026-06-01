@@ -1,6 +1,6 @@
 use datalens_example_degov_client::{
     RunSummary,
-    config::AppConfig,
+    config::{AppConfig, DEFAULT_EVENT_TOPIC0},
     datalens::DatalensDegovClient,
     db::AppDatabase,
     handlers::vote_cast::{VoteCastHandler, handle_vote_cast_page},
@@ -242,7 +242,7 @@ fn test_config(
         dataset_family: "evm".to_owned(),
         dataset_name: "logs".to_owned(),
         contract_address: "0xgovernor".to_owned(),
-        event_topic0: "0xtopic0".to_owned(),
+        event_topic0: DEFAULT_EVENT_TOPIC0.to_owned(),
         event_signature: datalens_example_degov_client::datalens::VOTE_CAST_SIGNATURE.to_owned(),
         start_block,
         end_block,
@@ -318,7 +318,7 @@ fn vote_edge(
         "transaction_index": 0,
         "log_index": 1,
         "address": "0xgovernor",
-        "topics": ["0xtopic0"],
+        "topics": [DEFAULT_EVENT_TOPIC0],
         "data": "0x",
         "removed": false,
         "decodedArgs": {

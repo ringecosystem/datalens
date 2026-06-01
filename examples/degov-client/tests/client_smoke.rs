@@ -1,4 +1,7 @@
-use datalens_example_degov_client::{config::AppConfig, datalens::DatalensDegovClient};
+use datalens_example_degov_client::{
+    config::{AppConfig, DEFAULT_EVENT_TOPIC0},
+    datalens::DatalensDegovClient,
+};
 use datalens_sdk::{ClientConfig, DatalensClient};
 use serde_json::json;
 
@@ -26,7 +29,7 @@ fn test_fetch_vote_cast_page_uses_decoded_events_connection_shape() {
                             "transaction_index": 0,
                             "log_index": 1,
                             "address": "0xgovernor",
-                            "topics": ["0xtopic0"],
+                            "topics": [DEFAULT_EVENT_TOPIC0],
                             "data": "0x",
                             "removed": false,
                             "decodedArgs": {
@@ -86,7 +89,7 @@ fn test_config(server: &MockGraphqlServer) -> AppConfig {
         dataset_family: "evm".to_owned(),
         dataset_name: "logs".to_owned(),
         contract_address: "0xgovernor".to_owned(),
-        event_topic0: "0xtopic0".to_owned(),
+        event_topic0: DEFAULT_EVENT_TOPIC0.to_owned(),
         event_signature: datalens_example_degov_client::datalens::VOTE_CAST_SIGNATURE.to_owned(),
         start_block: 100,
         end_block: Some(200),
