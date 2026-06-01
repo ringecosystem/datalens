@@ -264,6 +264,7 @@ pub(super) fn verify_hot_object_metadata(
         finality_level: crate::ManifestFinalityLevel::Safe,
         object_key: Some(metadata.object_key.clone()),
         object_encoding: metadata.object_encoding,
+        object_compression: None,
         row_count: metadata.row_count,
         object_size_bytes: Some(metadata.object_size_bytes),
         checksum: Some(metadata.checksum.clone()),

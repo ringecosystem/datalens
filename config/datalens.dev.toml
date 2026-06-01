@@ -7,6 +7,9 @@ backend = "local"
 [storage.local]
 root = ".tmp/datalens-dev"
 
+[storage.parquet]
+compression = "zstd"
+
 [planner]
 max_query_range_blocks = 1000
 default_chunk_range_blocks = 100

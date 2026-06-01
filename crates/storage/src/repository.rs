@@ -36,6 +36,7 @@ pub struct StorageWriteOutcome {
 pub struct StorageDataObject {
     pub object_key: String,
     pub object_encoding: ObjectEncoding,
+    pub object_compression: Option<ParquetCompression>,
     pub row_count: usize,
     pub object_size_bytes: u64,
     pub checksum: String,
@@ -80,17 +81,59 @@ pub use crate::usage_ledger::{
 pub struct DurableStorage<S> {
     object_store: S,
     read_through_cache: read_through_cache::ReadThroughCache,
+    config: DurableStorageConfig,
 }
 
 pub type LocalStorage = DurableStorage<LocalObjectStore>;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DurableStorageConfig {
+    #[serde(default)]
+    pub parquet_compression: ParquetCompression,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParquetCompression {
+    #[default]
+    None,
+    Snappy,
+    Zstd,
+}
+
+impl ParquetCompression {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Snappy => "snappy",
+            Self::Zstd => "zstd",
+        }
+    }
+}
+
+fn object_compression_for_encoding(
+    encoding: ObjectEncoding,
+    parquet_compression: ParquetCompression,
+) -> Option<ParquetCompression> {
+    match encoding {
+        ObjectEncoding::ParquetV1 => Some(parquet_compression),
+        ObjectEncoding::Json => None,
+    }
+}
+
 impl DurableStorage<LocalObjectStore> {
     pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self::new_with_config(root, DurableStorageConfig::default())
+    }
+
+    pub fn new_with_config(root: impl Into<PathBuf>, config: DurableStorageConfig) -> Self {
         Self {
             object_store: LocalObjectStore::new(root),
             read_through_cache: read_through_cache::ReadThroughCache::new(
                 ReadThroughCacheConfig::default(),
             ),
+            config,
         }
     }
 
@@ -108,9 +151,14 @@ where
     S: ObjectStore,
 {
     pub fn from_object_store(object_store: S) -> Self {
-        Self::from_object_store_with_read_through_cache_config(
+        Self::from_object_store_with_config(object_store, DurableStorageConfig::default())
+    }
+
+    pub fn from_object_store_with_config(object_store: S, config: DurableStorageConfig) -> Self {
+        Self::from_object_store_with_read_through_cache_and_storage_config(
             object_store,
             ReadThroughCacheConfig::default(),
+            config,
         )
     }
 
@@ -118,11 +166,24 @@ where
         object_store: S,
         read_through_cache_config: ReadThroughCacheConfig,
     ) -> Self {
+        Self::from_object_store_with_read_through_cache_and_storage_config(
+            object_store,
+            read_through_cache_config,
+            DurableStorageConfig::default(),
+        )
+    }
+
+    pub fn from_object_store_with_read_through_cache_and_storage_config(
+        object_store: S,
+        read_through_cache_config: ReadThroughCacheConfig,
+        config: DurableStorageConfig,
+    ) -> Self {
         Self {
             object_store,
             read_through_cache: read_through_cache::ReadThroughCache::new(
                 read_through_cache_config,
             ),
+            config,
         }
     }
 
@@ -272,10 +333,14 @@ where
                 &selector_fingerprint,
                 encoding,
             );
-            let bytes = encode_object_rows(encoding, rows)?;
+            let bytes = encode_object_rows(encoding, rows, self.config.parquet_compression)?;
             let data_object = StorageDataObject {
                 object_key,
                 object_encoding: encoding,
+                object_compression: object_compression_for_encoding(
+                    encoding,
+                    self.config.parquet_compression,
+                ),
                 row_count: rows.row_count(),
                 object_size_bytes: bytes.len() as u64,
                 checksum: checksum_hex(&bytes),
@@ -329,6 +394,9 @@ where
             } else {
                 Some(object_encoding_for_dataset(&dataset_key))
             },
+            object_compression: data_object
+                .as_ref()
+                .and_then(|data_object| data_object.object_compression),
             row_count: rows.row_count(),
             object_size_bytes: data_object
                 .as_ref()

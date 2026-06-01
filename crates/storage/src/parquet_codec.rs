@@ -7,9 +7,18 @@ use datalens_core::{
     BlockHeader, DatalensError, DatalensErrorKind, DatasetKey, DatasetRows, EvmReceipt,
     EvmTransaction, LogRecord, QueryRows,
 };
-use parquet::arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder};
+use parquet::{
+    arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder},
+    basic::{Compression, ZstdLevel},
+    file::properties::WriterProperties,
+};
 
-pub fn encode_rows(rows: &DatasetRows) -> Result<Vec<u8>, DatalensError> {
+use crate::ParquetCompression;
+
+pub fn encode_rows(
+    rows: &DatasetRows,
+    compression: ParquetCompression,
+) -> Result<Vec<u8>, DatalensError> {
     let batch = match rows.rows() {
         QueryRows::EvmBlocks(rows) => evm_blocks_batch(rows)?,
         QueryRows::EvmTransactions(rows) => evm_transactions_batch(rows)?,
@@ -23,12 +32,16 @@ pub fn encode_rows(rows: &DatasetRows) -> Result<Vec<u8>, DatalensError> {
         }
     };
     let mut bytes = Vec::new();
-    let mut writer = ArrowWriter::try_new(&mut bytes, batch.schema(), None).map_err(|error| {
-        DatalensError::new(
-            DatalensErrorKind::Internal,
-            format!("create parquet writer: {error}"),
-        )
-    })?;
+    let properties = WriterProperties::builder()
+        .set_compression(parquet_compression(compression))
+        .build();
+    let mut writer =
+        ArrowWriter::try_new(&mut bytes, batch.schema(), Some(properties)).map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::Internal,
+                format!("create parquet writer: {error}"),
+            )
+        })?;
     writer.write(&batch).map_err(|error| {
         DatalensError::new(
             DatalensErrorKind::Internal,
@@ -42,6 +55,14 @@ pub fn encode_rows(rows: &DatasetRows) -> Result<Vec<u8>, DatalensError> {
         )
     })?;
     Ok(bytes)
+}
+
+fn parquet_compression(compression: ParquetCompression) -> Compression {
+    match compression {
+        ParquetCompression::None => Compression::UNCOMPRESSED,
+        ParquetCompression::Snappy => Compression::SNAPPY,
+        ParquetCompression::Zstd => Compression::ZSTD(ZstdLevel::default()),
+    }
 }
 
 pub fn decode_rows(dataset_key: DatasetKey, bytes: &[u8]) -> Result<DatasetRows, DatalensError> {

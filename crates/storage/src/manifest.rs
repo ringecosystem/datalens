@@ -2,7 +2,7 @@ use datalens_chain::FinalityLevel;
 use datalens_core::{ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey, LedgerRange};
 use serde::{Deserialize, Deserializer, Serialize, de::Error};
 
-use crate::{ObjectEncoding, range_kind_key, validate_object_key};
+use crate::{ObjectEncoding, ParquetCompression, range_kind_key, validate_object_key};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 /// Durable coverage authority for one or more chains. Query planners and
@@ -69,6 +69,8 @@ pub struct ManifestEntry {
     pub object_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub object_encoding: Option<ObjectEncoding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub object_compression: Option<ParquetCompression>,
     pub row_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub object_size_bytes: Option<u64>,
@@ -91,6 +93,8 @@ struct RawManifestEntry {
     object_key: Option<String>,
     #[serde(default)]
     object_encoding: Option<ObjectEncoding>,
+    #[serde(default)]
+    object_compression: Option<ParquetCompression>,
     row_count: usize,
     #[serde(default)]
     object_size_bytes: Option<u64>,
@@ -152,6 +156,7 @@ impl ManifestEntry {
                     finality_level: raw.finality_level,
                     object_key: Some(object_key),
                     object_encoding: Some(object_encoding),
+                    object_compression: raw.object_compression,
                     row_count: raw.row_count,
                     object_size_bytes: Some(object_size_bytes),
                     checksum: Some(checksum),
@@ -175,6 +180,7 @@ impl ManifestEntry {
                     finality_level: raw.finality_level,
                     object_key: None,
                     object_encoding: None,
+                    object_compression: None,
                     row_count: raw.row_count,
                     object_size_bytes: None,
                     checksum: None,

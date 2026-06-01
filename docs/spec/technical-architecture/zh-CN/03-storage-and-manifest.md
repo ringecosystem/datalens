@@ -72,6 +72,8 @@ kind，但在记录持久化覆盖之前，必须暴露等价的 safe/finalized 
 - 已覆盖 ledger range，包括 range kind、start 和 end。
 - Schema 或标准化版本。
 - Object encoding，例如 `parquet-v1`。
+- durable Parquet data object 的 object compression，例如 `zstd`、`snappy` 或
+  `none`。
 - 用于查找的 selector fingerprint，以及用于审计的 selector canonical key。
 - 字段覆盖范围或标准分片形态。
 - 持久化分片的 object key。
@@ -130,6 +132,10 @@ usage attribution 是持久计量要求。第一版采用 append-only：除非�
 如果非空结果仍然太小，staged writer 可以继续累计相邻兼容范围，但前提是数据集、selector 覆盖
 形态、finality level 和 range kind 都兼容。达到配置的 flush threshold 或 shutdown flush 时，再把
 合并范围的一次不可变对象写入委托给 storage，并通过 storage 记录这个对象实际覆盖的合并范围。
+Durable Parquet data object compression 是 storage writer 配置，必须使用 Parquet writer
+compression，不能在整个 Parquet 文件外层包 gzip。Manifest 记录的对象大小、object compression
+和 SHA-256 checksum 必须对应 storage 编码后的实际对象字节。Empty coverage 继续只存在于
+Manifest 中，不能合成 object size、checksum、compression 或 write timestamp 字段。
 
 这意味着 `018000000-018099999` 不是通用规则，它只是范围 key 的示例。实现时应让真实范围大小
 可配置、可观测。

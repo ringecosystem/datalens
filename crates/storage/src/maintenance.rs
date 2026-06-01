@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     DurableStorage, Manifest, ManifestEntry, ManifestFinalityLevel, ObjectEncoding, ObjectStore,
-    StorageDataObject, checksum_hex, decode_object_rows, encode_object_rows, object_key,
-    range_kind_key, unix_seconds_now, verify_manifest_object_metadata,
+    ParquetCompression, StorageDataObject, checksum_hex, decode_object_rows, encode_object_rows,
+    object_key, range_kind_key, unix_seconds_now, verify_manifest_object_metadata,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -354,7 +354,15 @@ where
         }
         rows.sort();
         let rows = DatasetRows::new(candidate.dataset_key.clone(), rows)?;
-        let bytes = encode_object_rows(candidate.object_encoding, &rows)?;
+        let object_compression = match candidate.object_encoding {
+            ObjectEncoding::ParquetV1 => Some(ParquetCompression::None),
+            ObjectEncoding::Json => None,
+        };
+        let bytes = encode_object_rows(
+            candidate.object_encoding,
+            &rows,
+            object_compression.unwrap_or(ParquetCompression::None),
+        )?;
         let object_key = object_key(
             &candidate.chain,
             &candidate.dataset_key,
@@ -365,6 +373,7 @@ where
         let data_object = StorageDataObject {
             object_key: object_key.clone(),
             object_encoding: candidate.object_encoding,
+            object_compression,
             row_count: rows.row_count(),
             object_size_bytes: bytes.len() as u64,
             checksum: checksum_hex(&bytes),
@@ -383,6 +392,7 @@ where
                 finality_level: candidate.finality_level,
                 object_key: Some(data_object.object_key),
                 object_encoding: Some(data_object.object_encoding),
+                object_compression: data_object.object_compression,
                 row_count: data_object.row_count,
                 object_size_bytes: Some(data_object.object_size_bytes),
                 checksum: Some(data_object.checksum),

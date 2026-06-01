@@ -13,7 +13,11 @@ use datalens_core::{
 };
 
 use datalens_storage::*;
-use parquet::arrow::ArrowWriter;
+use parquet::{
+    arrow::ArrowWriter,
+    basic::Compression,
+    file::reader::{FileReader, SerializedFileReader},
+};
 use sha2::{Digest, Sha256};
 
 #[derive(Clone, Debug)]
@@ -410,6 +414,16 @@ fn legacy_evm_logs_parquet_bytes() -> Vec<u8> {
     bytes
 }
 
+fn assert_parquet_compression(bytes: &[u8], expected: Compression) {
+    let reader = SerializedFileReader::new(bytes::Bytes::copy_from_slice(bytes))
+        .expect("parquet file reader");
+    for row_group in reader.metadata().row_groups() {
+        for column in row_group.columns() {
+            assert_eq!(column.compression(), expected);
+        }
+    }
+}
+
 fn hex_sha256(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -475,6 +489,7 @@ fn test_manifest_entry_records_chain_neutral_coverage_identity() {
     assert_eq!(entry.selector_canonical_key, "all");
     assert_eq!(entry.finality_level, ManifestFinalityLevel::Finalized);
     assert_eq!(entry.object_encoding, Some(ObjectEncoding::ParquetV1));
+    assert_eq!(entry.object_compression, Some(ParquetCompression::None));
     assert!(entry.object_size_bytes.expect("object size") > 0);
     assert_eq!(entry.checksum_algorithm.as_deref(), Some("sha256"));
     assert_eq!(entry.checksum.as_deref().expect("checksum").len(), 64);
@@ -485,6 +500,209 @@ fn test_manifest_entry_records_chain_neutral_coverage_identity() {
             .as_deref()
             .expect("object key")
             .starts_with("chains/evm/ethereum/1/datasets/evm.blocks/parquet-v1/block/all/")
+    );
+}
+
+#[test]
+fn test_evm_blocks_rows_write_zstd_parquet_and_read_back() {
+    let storage = LocalStorage::new_with_config(
+        temp_storage_root("blocks-zstd-roundtrip"),
+        DurableStorageConfig {
+            parquet_compression: ParquetCompression::Zstd,
+        },
+    );
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let range = LedgerRange::blocks(10, 12).expect("valid range");
+    let rows = DatasetRows::new(
+        DatasetKey::evm_blocks(),
+        QueryRows::EvmBlocks(vec![
+            BlockHeader {
+                number: 10,
+                hash: "0xblock10".to_owned(),
+                parent_hash: "0xparent09".to_owned(),
+                timestamp: 100,
+            },
+            BlockHeader {
+                number: 12,
+                hash: "0xblock12".to_owned(),
+                parent_hash: "0xparent11".to_owned(),
+                timestamp: 120,
+            },
+        ]),
+    )
+    .expect("dataset rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &selector,
+            range: range.clone(),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write rows");
+
+    let manifest = storage.manifest().expect("manifest");
+    let entry = manifest.entries.first().expect("manifest entry");
+    assert_eq!(entry.object_compression, Some(ParquetCompression::Zstd));
+    let object_key = entry.object_key.as_deref().expect("object key");
+    let object_bytes = std::fs::read(storage.root().join(object_key)).expect("object bytes");
+    assert_parquet_compression(&object_bytes, Compression::ZSTD(Default::default()));
+
+    let read = storage
+        .read_rows(&chain, &DatasetKey::evm_blocks(), &selector, range)
+        .expect("read rows");
+    assert_eq!(read, rows);
+}
+
+#[test]
+fn test_evm_logs_rows_write_snappy_parquet_and_read_back() {
+    let storage = LocalStorage::new_with_config(
+        temp_storage_root("logs-snappy-roundtrip"),
+        DurableStorageConfig {
+            parquet_compression: ParquetCompression::Snappy,
+        },
+    );
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let range = LedgerRange::blocks(10, 10).expect("valid range");
+    let rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![LogRecord {
+            parent_hash: Some("0xparent09".to_owned()),
+            block_timestamp: Some(1_700_000_010),
+            ..LogRecord::try_new(
+                10,
+                "0xblock10".to_owned(),
+                "0xtx10".to_owned(),
+                1,
+                0,
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                vec![
+                    "0x0000000000000000000000000000000000000000000000000000000000000001".to_owned(),
+                ],
+                "0xdeadbeef".to_owned(),
+                false,
+            )
+            .unwrap()
+        }]),
+    )
+    .expect("dataset rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &selector,
+            range: range.clone(),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write rows");
+
+    let manifest = storage.manifest().expect("manifest");
+    let entry = manifest.entries.first().expect("manifest entry");
+    assert_eq!(entry.object_compression, Some(ParquetCompression::Snappy));
+    let object_key = entry.object_key.as_deref().expect("object key");
+    let object_bytes = std::fs::read(storage.root().join(object_key)).expect("object bytes");
+    assert_parquet_compression(&object_bytes, Compression::SNAPPY);
+
+    let read = storage
+        .read_rows(&chain, &DatasetKey::evm_logs(), &selector, range)
+        .expect("read rows");
+    assert_eq!(read, rows);
+}
+
+#[test]
+fn test_manifest_without_compression_metadata_still_decodes_and_reads() {
+    let storage = LocalStorage::new(temp_storage_root("legacy-no-compression-metadata"));
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let range = LedgerRange::blocks(10, 10).expect("valid range");
+    let object_key = "chains/evm/ethereum/1/datasets/evm.logs/parquet-v1/block/all/00000000000000000010-00000000000000000010.parquet";
+    let object_bytes = legacy_evm_logs_parquet_bytes();
+    let object_path = storage.root().join(object_key);
+    std::fs::create_dir_all(object_path.parent().expect("object parent"))
+        .expect("create object parent");
+    std::fs::write(&object_path, &object_bytes).expect("write object");
+    std::fs::create_dir_all(storage.root().join("chains/evm/ethereum/1"))
+        .expect("create manifest parent");
+    std::fs::write(
+        storage.manifest_path(&chain),
+        format!(
+            r#"{{
+                "entries":[{{
+                    "chain":{{"family":"Evm","configured_name":"ethereum","network_id":{{"kind":"numeric","value":1}}}},
+                    "dataset_key":{{"family":"Evm","name":"logs"}},
+                    "range":{{"kind":{{"kind":"block"}},"start":10,"end":10}},
+                    "selector_fingerprint":"all",
+                    "selector_canonical_key":"all",
+                    "finality_level":"safe",
+                    "object_key":"{object_key}",
+                    "object_encoding":"parquet-v1",
+                    "row_count":1,
+                    "object_size_bytes":{},
+                    "checksum":"{}",
+                    "checksum_algorithm":"sha256",
+                    "written_at_unix_seconds":1
+                }}]
+            }}"#,
+            object_bytes.len(),
+            hex_sha256(&object_bytes)
+        ),
+    )
+    .expect("write manifest");
+
+    let manifest = storage.manifest().expect("manifest");
+    assert_eq!(manifest.entries[0].object_compression, None);
+
+    let read = storage
+        .read_rows(&chain, &DatasetKey::evm_logs(), &selector, range)
+        .expect("read legacy rows");
+    assert_eq!(read.row_count(), 1);
+}
+
+#[test]
+fn test_empty_coverage_does_not_record_object_compression() {
+    let storage = LocalStorage::new_with_config(
+        temp_storage_root("empty-no-compression"),
+        DurableStorageConfig {
+            parquet_compression: ParquetCompression::Zstd,
+        },
+    );
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let rows = DatasetRows::new(DatasetKey::evm_logs(), QueryRows::EvmLogs(Vec::new()))
+        .expect("empty log rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &selector,
+            range: LedgerRange::blocks(100, 101).expect("valid range"),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write empty coverage");
+
+    let manifest = storage.manifest().expect("manifest");
+    let entry = manifest.entries.first().expect("manifest entry");
+    assert_eq!(entry.object_key, None);
+    assert_eq!(entry.object_encoding, None);
+    assert_eq!(entry.object_compression, None);
+    assert!(
+        storage
+            .object_store()
+            .list("chains")
+            .expect("list")
+            .iter()
+            .all(|object| !object.key.ends_with(".parquet"))
     );
 }
 
