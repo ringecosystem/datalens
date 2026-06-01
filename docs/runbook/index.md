@@ -27,6 +27,8 @@ outputs.
 - `examples-long-running-e2e.md`: canonical report template for long-running
   `examples/` E2E workloads that compare first-run provider fill behavior with
   second-run cache behavior.
+- `live-e2e.md`: live validation sequence for `datalens serve` plus the DeGov and ORMP
+  business examples, including first-run provider fill and restarted cache-hit checks.
 - `local-rustfs.md`: local RustFS object storage setup, bucket initialization, S3 test
   variables, stop, and cleanup commands.
 - `postgres-indexer-smoke.md`: opt-in PostgreSQL database setup and indexer smoke

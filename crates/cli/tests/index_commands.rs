@@ -611,11 +611,21 @@ fn test_compose_service_config_is_server_only() {
         std::env::set_var("DATALENS_S3_REGION", "auto");
         std::env::set_var("DATALENS_S3_ENDPOINT_URL", "http://127.0.0.1:9000");
         std::env::set_var("DATALENS_ETHEREUM_RPC_URL", "http://example.invalid");
+        std::env::set_var(
+            "DATALENS_ARBITRUM_RPC_URL",
+            "http://example.invalid/arbitrum",
+        );
+        std::env::set_var("DATALENS_BASE_RPC_URL", "http://example.invalid/base");
+        std::env::set_var(
+            "DATALENS_DARWINIA_RPC_URL",
+            "http://example.invalid/darwinia",
+        );
         std::env::set_var("DATALENS_SOLANA_RPC_URL", "http://example.invalid/solana");
         std::env::set_var("DATALENS_TRON_RPC_URL", "http://example.invalid/tron");
         std::env::set_var("DATALENS_TRONGRID_API_KEY", "replace-with-trongrid-token");
         std::env::set_var("DATALENS_PUBLIC_APP_TOKEN", "replace-with-public-token");
         std::env::set_var("DATALENS_ORMP_TOKEN", "replace-with-ormp-token");
+        std::env::set_var("DATALENS_DEGOV_TOKEN", "replace-with-degov-token");
         std::env::set_var("DATALENS_LIVE_SMOKE_TOKEN", "replace-with-live-smoke-token");
         std::env::set_var("DATALENS_METRICS_TOKEN", "replace-with-metrics-token");
     }
@@ -628,11 +638,21 @@ fn test_compose_service_config_is_server_only() {
         .env("DATALENS_S3_REGION", "auto")
         .env("DATALENS_S3_ENDPOINT_URL", "http://127.0.0.1:9000")
         .env("DATALENS_ETHEREUM_RPC_URL", "http://example.invalid")
+        .env(
+            "DATALENS_ARBITRUM_RPC_URL",
+            "http://example.invalid/arbitrum",
+        )
+        .env("DATALENS_BASE_RPC_URL", "http://example.invalid/base")
+        .env(
+            "DATALENS_DARWINIA_RPC_URL",
+            "http://example.invalid/darwinia",
+        )
         .env("DATALENS_SOLANA_RPC_URL", "http://example.invalid/solana")
         .env("DATALENS_TRON_RPC_URL", "http://example.invalid/tron")
         .env("DATALENS_TRONGRID_API_KEY", "replace-with-trongrid-token")
         .env("DATALENS_PUBLIC_APP_TOKEN", "replace-with-public-token")
         .env("DATALENS_ORMP_TOKEN", "replace-with-ormp-token")
+        .env("DATALENS_DEGOV_TOKEN", "replace-with-degov-token")
         .env("DATALENS_LIVE_SMOKE_TOKEN", "replace-with-live-smoke-token")
         .env("DATALENS_METRICS_TOKEN", "replace-with-metrics-token")
         .output()

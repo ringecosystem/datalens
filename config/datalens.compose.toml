@@ -61,7 +61,7 @@ name = "ormp"
 enabled = true
 display_name = "ORMP Local Example"
 token = "${DATALENS_ORMP_TOKEN}"
-chains = ["ethereum"]
+chains = ["ethereum", "base"]
 datasets = ["evm.blocks", "evm.logs"]
 operations = ["query", "discovery"]
 
