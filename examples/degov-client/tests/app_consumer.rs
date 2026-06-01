@@ -113,7 +113,7 @@ fn test_handle_vote_cast_page_skips_missing_required_fields() {
     let summary = handle_vote_cast_page(
         &db,
         &handler,
-        vote_page("vote-cursor-2", "42", Some(1), None),
+        degov_page(vec![malformed_vote_edge("vote-cursor-2")]),
     )
     .expect("handle page");
 
@@ -242,7 +242,7 @@ fn test_config(
         dataset_family: "evm".to_owned(),
         dataset_name: "logs".to_owned(),
         contract_address: "0xgovernor".to_owned(),
-        event_topic0: "0xtopic0".to_owned(),
+        event_topic0: vote_cast_topic0(),
         event_signature: datalens_example_degov_client::datalens::VOTE_CAST_SIGNATURE.to_owned(),
         start_block,
         end_block,
@@ -318,15 +318,54 @@ fn vote_edge(
         "transaction_index": 0,
         "log_index": 1,
         "address": "0xgovernor",
-        "topics": ["0xtopic0"],
-        "data": "0x",
-        "removed": false,
-        "decodedArgs": {
-            "voter": "0xvoter",
-            "proposalId": proposal_id,
-            "support": support,
-            "weight": weight,
-            "reason": "because"
-        }
+        "topics": [vote_cast_topic0(), padded_address_topic("0x1111111111111111111111111111111111111111")],
+        "data": vote_cast_data(proposal_id, support.unwrap_or_default(), weight.unwrap_or("0"), "because"),
+        "removed": false
     })
+}
+
+fn malformed_vote_edge(cursor: &str) -> serde_json::Value {
+    let transaction_hash = cursor
+        .split(':')
+        .nth(1)
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("0xtx-{cursor}"));
+    json!({
+        "block_number": 100,
+        "block_hash": "0xblock1",
+        "transaction_hash": transaction_hash,
+        "transaction_index": 0,
+        "log_index": 1,
+        "address": "0xgovernor",
+        "topics": [vote_cast_topic0(), padded_address_topic("0x1111111111111111111111111111111111111111")],
+        "data": "0x",
+        "removed": false
+    })
+}
+
+fn vote_cast_topic0() -> String {
+    format!(
+        "{:#x}",
+        alloy_primitives::keccak256("VoteCast(address,uint256,uint8,uint256,string)")
+    )
+}
+
+fn padded_address_topic(address: &str) -> String {
+    format!("0x{:0>64}", address.trim_start_matches("0x"))
+}
+
+fn vote_cast_data(proposal_id: &str, support: u64, weight: &str, reason: &str) -> String {
+    let proposal_id = proposal_id.parse::<u128>().expect("proposal id");
+    let weight = weight.parse::<u128>().expect("weight");
+    let reason_hex = reason
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let padded_reason = format!("{reason_hex:0<64}");
+    format!(
+        "0x{proposal_id:0>64x}{support:0>64x}{weight:0>64x}{offset:0>64x}{len:0>64x}{padded_reason}",
+        offset = 128,
+        len = reason.len()
+    )
 }

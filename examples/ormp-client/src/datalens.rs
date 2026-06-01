@@ -1,3 +1,8 @@
+use alloy_dyn_abi::{DynSolEvent, DynSolType, DynSolValue};
+use alloy_primitives::{
+    B256,
+    hex::{self, FromHex},
+};
 use datalens_sdk::{
     DatalensClient,
     index::DecodedEvent,
@@ -60,7 +65,6 @@ pub fn fetch_message_accepted_page(
         .query(query_input(config, start_block, end_block))?;
     let events = rows_from(&response.rows)?
         .into_iter()
-        .filter(|row| topic_matches(row, &config.event_topic0))
         .map(|row| row_to_message_accepted_event(row, config))
         .collect::<AppResult<Vec<_>>>()?;
 
@@ -155,6 +159,7 @@ fn row_to_message_accepted_event(
         transaction_hash.as_deref().unwrap_or("<missing-tx>"),
         log_index
     );
+    let decoded = decode_message_accepted(row, &config.event_topic0);
 
     Ok(MessageAcceptedEvent {
         cursor,
@@ -177,17 +182,145 @@ fn row_to_message_accepted_event(
                 .and_then(|topics| topics.first())
                 .and_then(Value::as_str)
                 .map(str::to_owned),
-            decoded_args: row
-                .get("decodedArgs")
-                .or_else(|| row.get("decoded_args"))
-                .cloned()
-                .unwrap_or(Value::Null),
-            decode_status: Some("decoded".to_owned()),
-            decode_error: None,
+            decoded_args: decoded.args,
+            decode_status: Some(decoded.status.to_owned()),
+            decode_error: decoded.error,
             payload: row.clone(),
             created_at: None,
         },
     })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LocalDecode {
+    status: &'static str,
+    args: Value,
+    error: Option<String>,
+}
+
+fn decode_message_accepted(row: &Value, topic0: &str) -> LocalDecode {
+    if !topic_matches(row, topic0) {
+        return LocalDecode {
+            status: "unsupported",
+            args: Value::Null,
+            error: Some("log topic0 does not match MessageAccepted".to_owned()),
+        };
+    }
+
+    match decode_message_accepted_args(row, topic0) {
+        Ok(args) => LocalDecode {
+            status: "decoded",
+            args,
+            error: None,
+        },
+        Err(error) => LocalDecode {
+            status: "failed",
+            args: Value::Null,
+            error: Some(error),
+        },
+    }
+}
+
+fn decode_message_accepted_args(row: &Value, topic0: &str) -> Result<Value, String> {
+    let topics = topics_from(row)?;
+    let data = data_from(row)?;
+    let event = DynSolEvent::new(
+        Some(parse_topic(topic0)?),
+        vec![
+            "bytes32"
+                .parse::<DynSolType>()
+                .map_err(|error| error.to_string())?,
+        ],
+        DynSolType::Tuple(vec![
+            "(address,uint256,uint256,address,uint256,address,uint256,bytes)"
+                .parse::<DynSolType>()
+                .map_err(|error| error.to_string())?,
+        ]),
+    )
+    .ok_or_else(|| "invalid MessageAccepted event ABI".to_owned())?;
+    let decoded = event
+        .decode_log_parts(topics, &data)
+        .map_err(|error| error.to_string())?;
+    let msg_hash = decoded
+        .indexed
+        .first()
+        .map(sol_value_to_json)
+        .ok_or_else(|| "decoded MessageAccepted log is missing msgHash".to_owned())?;
+    let message = decoded
+        .body
+        .first()
+        .ok_or_else(|| "decoded MessageAccepted log is missing message tuple".to_owned())?;
+    let DynSolValue::Tuple(fields) = message else {
+        return Err("decoded MessageAccepted message is not a tuple".to_owned());
+    };
+
+    let mut object = serde_json::Map::new();
+    object.insert("msgHash".to_owned(), msg_hash.clone());
+    object.insert("messageHash".to_owned(), msg_hash);
+    if let Some(value) = fields.first() {
+        object.insert("sender".to_owned(), sol_value_to_json(value));
+    }
+    if let Some(value) = fields.get(1) {
+        object.insert("sourceChainId".to_owned(), sol_value_to_json(value));
+    }
+    if let Some(value) = fields.get(2) {
+        object.insert("targetChainId".to_owned(), sol_value_to_json(value));
+    }
+    if let Some(value) = fields.get(3) {
+        object.insert("receiver".to_owned(), sol_value_to_json(value));
+    }
+    Ok(Value::Object(object))
+}
+
+fn topics_from(row: &Value) -> Result<Vec<B256>, String> {
+    row.get("topics")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "native log row is missing topics".to_owned())?
+        .iter()
+        .map(|topic| {
+            topic
+                .as_str()
+                .ok_or_else(|| "native log topic is not a string".to_owned())
+                .and_then(parse_topic)
+        })
+        .collect()
+}
+
+fn data_from(row: &Value) -> Result<Vec<u8>, String> {
+    let data = row
+        .get("data")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "native log row is missing data".to_owned())?;
+    let data = data
+        .strip_prefix("0x")
+        .ok_or_else(|| "native log data must start with 0x".to_owned())?;
+    Vec::from_hex(data).map_err(|error| format!("invalid native log data: {error}"))
+}
+
+fn parse_topic(value: &str) -> Result<B256, String> {
+    value
+        .parse::<B256>()
+        .map_err(|error| format!("invalid native log topic: {error}"))
+}
+
+fn sol_value_to_json(value: &DynSolValue) -> Value {
+    match value {
+        DynSolValue::Bool(value) => Value::Bool(*value),
+        DynSolValue::Int(value, _) => Value::String(value.to_string()),
+        DynSolValue::Uint(value, _) => Value::String(value.to_string()),
+        DynSolValue::FixedBytes(value, size) => {
+            Value::String(format!("0x{}", hex::encode(&value[..*size])))
+        }
+        DynSolValue::Address(value) => Value::String(format!("{value:#x}")),
+        DynSolValue::Function(value) => Value::String(format!("0x{}", hex::encode(value))),
+        DynSolValue::Bytes(value) => Value::String(format!("0x{}", hex::encode(value))),
+        DynSolValue::String(value) => Value::String(value.clone()),
+        DynSolValue::Array(values)
+        | DynSolValue::FixedArray(values)
+        | DynSolValue::Tuple(values) => {
+            Value::Array(values.iter().map(sol_value_to_json).collect())
+        }
+    }
 }
 
 fn string_field(row: &Value, name: &str) -> Option<String> {
