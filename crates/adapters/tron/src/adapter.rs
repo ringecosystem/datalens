@@ -10,7 +10,7 @@ use datalens_chain::{
 };
 use datalens_core::{
     ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey, LedgerRange,
-    NetworkId, QueryRows,
+    NetworkId, QueryRows, QueryStrategy,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -123,6 +123,7 @@ pub struct TronAdapter<P> {
     chain: ChainIdentity,
     pub(crate) provider: P,
     max_block_range_len: u64,
+    events_query_strategy: QueryStrategy,
     pub(crate) max_contract_event_pages: usize,
     block_cache: BlockCache,
     transaction_info_cache: TransactionInfoCache,
@@ -137,6 +138,7 @@ where
             chain,
             provider,
             max_block_range_len: 64,
+            events_query_strategy: QueryStrategy::ProviderFilter,
             max_contract_event_pages: DEFAULT_MAX_CONTRACT_EVENT_PAGES,
             block_cache: Arc::new(Mutex::new(HashMap::new())),
             transaction_info_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -145,6 +147,11 @@ where
 
     pub fn with_max_block_range_len(mut self, max_block_range_len: u64) -> Self {
         self.max_block_range_len = max_block_range_len.max(1);
+        self
+    }
+
+    pub fn with_events_query_strategy(mut self, query_strategy: QueryStrategy) -> Self {
+        self.events_query_strategy = query_strategy;
         self
     }
 
@@ -267,6 +274,7 @@ where
         &self,
         request: &ChainFetchRequest,
         calls: usize,
+        warnings: Vec<String>,
     ) -> (SourceMetadata, ProviderDiagnostics) {
         (
             SourceMetadata {
@@ -276,7 +284,7 @@ where
             ProviderDiagnostics {
                 calls,
                 rows_scanned: 0,
-                warnings: Vec::new(),
+                warnings,
             },
         )
     }
@@ -426,6 +434,7 @@ where
         }
         if request.dataset_key == DatasetKey::tron_events()
             && matches!(request.selector.kind(), SelectorKind::Other(kind) if kind.as_str() == TRON_EVENTS_KIND)
+            && self.events_query_strategy == QueryStrategy::ProviderFilter
             && self.provider.supports_contract_event_query()
         {
             // Prefer TronGrid contract events when available; fallback is only
@@ -437,7 +446,8 @@ where
                         dataset_key: request.dataset_key.clone(),
                         rows,
                     };
-                    let (source_metadata, provider_diagnostics) = self.metadata(&request, calls);
+                    let (source_metadata, provider_diagnostics) =
+                        self.metadata(&request, calls, Vec::new());
                     return Ok(ChainFetchResponse::try_new(
                         request.chain,
                         request.dataset_key,
@@ -461,6 +471,12 @@ where
             validate_block_scan_event_filter(&request.selector)?;
         }
 
+        let mut warnings = Vec::new();
+        if request.dataset_key == DatasetKey::tron_events()
+            && self.events_query_strategy == QueryStrategy::BlockRange
+        {
+            warnings.push("tron block_range event query strategy used".to_owned());
+        }
         let (blocks, provider_calls) = self.fetch_blocks_for_range(&range)?;
         let transactions = transaction_refs(&blocks)?;
         let (rows, extra_calls) = if request.dataset_key == DatasetKey::tron_blocks() {
@@ -484,7 +500,7 @@ where
             rows,
         };
         let (source_metadata, provider_diagnostics) =
-            self.metadata(&request, provider_calls + extra_calls);
+            self.metadata(&request, provider_calls + extra_calls, warnings);
         Ok(ChainFetchResponse::try_new(
             request.chain,
             request.dataset_key,

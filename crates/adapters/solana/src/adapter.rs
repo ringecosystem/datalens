@@ -10,7 +10,7 @@ use datalens_chain::{
 };
 use datalens_core::{
     ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey, LedgerRange,
-    NetworkId, QueryRows,
+    NetworkId, QueryRows, QueryStrategy,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -165,6 +165,7 @@ pub struct SolanaAdapter<P> {
     chain: ChainIdentity,
     provider: P,
     max_slot_range_len: u64,
+    query_strategy: QueryStrategy,
     finalized_blocks: FinalizedBlockCache,
 }
 
@@ -177,12 +178,18 @@ where
             chain,
             provider,
             max_slot_range_len: 64,
+            query_strategy: QueryStrategy::ProviderFilter,
             finalized_blocks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub fn with_max_slot_range_len(mut self, max_slot_range_len: u64) -> Self {
         self.max_slot_range_len = max_slot_range_len.max(1);
+        self
+    }
+
+    pub fn with_query_strategy(mut self, query_strategy: QueryStrategy) -> Self {
+        self.query_strategy = query_strategy;
         self
     }
 
@@ -508,7 +515,14 @@ where
         let mut warnings = Vec::new();
         let (blocks, provider_calls) = if request.dataset_key == DatasetKey::solana_slots()
             || request.dataset_key == DatasetKey::solana_blocks()
+            || self.query_strategy == QueryStrategy::BlockRange
         {
+            if self.query_strategy == QueryStrategy::BlockRange
+                && request.dataset_key != DatasetKey::solana_slots()
+                && request.dataset_key != DatasetKey::solana_blocks()
+            {
+                warnings.push("solana block_range query strategy used".to_owned());
+            }
             self.fetch_blocks_for_range(&range)?
         } else {
             match self.fetch_blocks_for_selector(&range, &request.selector) {

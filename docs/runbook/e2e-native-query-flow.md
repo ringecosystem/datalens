@@ -227,7 +227,9 @@ max_batch_blocks = 2
 
 [chains.ethereum.datasets.logs]
 enabled = true
+query_strategy = "provider_filter"
 max_get_logs_range_blocks = 2
+max_block_scan_range_blocks = 2
 max_addresses_per_query = 4
 EOF
 ```

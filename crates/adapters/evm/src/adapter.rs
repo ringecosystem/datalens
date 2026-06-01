@@ -6,7 +6,7 @@ use datalens_chain::{
 use datalens_core::{
     BlockHeader, BlockRange, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, Dataset,
     DatasetKey, EvmLogFilter, EvmReceipt, EvmTransaction, LedgerRange, LogFilter, LogRecord,
-    QueryRows, redact_urls_in_text,
+    QueryRows, QueryStrategy, TopicFilter, redact_urls_in_text,
 };
 use reqwest::blocking::Client;
 use serde_json::{Value, json};
@@ -103,7 +103,9 @@ pub struct EvmRpcClient {
     finality_policy: EvmFinalityPolicy,
     max_block_batch_blocks: u64,
     max_get_logs_range_blocks: u64,
+    max_block_scan_range_blocks: u64,
     max_addresses_per_query: usize,
+    logs_query_strategy: QueryStrategy,
 }
 
 impl EvmRpcClient {
@@ -115,7 +117,9 @@ impl EvmRpcClient {
             finality_policy: EvmFinalityPolicy::Auto,
             max_block_batch_blocks: u64::MAX,
             max_get_logs_range_blocks: u64::MAX,
+            max_block_scan_range_blocks: u64::MAX,
             max_addresses_per_query: usize::MAX,
+            logs_query_strategy: QueryStrategy::ProviderFilter,
         }
     }
 
@@ -125,6 +129,7 @@ impl EvmRpcClient {
         finality_policy: EvmFinalityPolicy,
         max_block_batch_blocks: u64,
         max_get_logs_range_blocks: u64,
+        max_block_scan_range_blocks: u64,
         max_addresses_per_query: usize,
     ) -> Self {
         Self {
@@ -134,8 +139,15 @@ impl EvmRpcClient {
             finality_policy,
             max_block_batch_blocks,
             max_get_logs_range_blocks,
+            max_block_scan_range_blocks,
             max_addresses_per_query,
+            logs_query_strategy: QueryStrategy::ProviderFilter,
         }
+    }
+
+    pub fn with_logs_query_strategy(mut self, query_strategy: QueryStrategy) -> Self {
+        self.logs_query_strategy = query_strategy;
+        self
     }
 
     pub fn fetch_blocks(&self, range: BlockRange) -> Result<Vec<BlockHeader>, DatalensError> {
@@ -241,6 +253,65 @@ impl EvmRpcClient {
             })?;
 
         logs.into_iter().map(|log| parse_log_record(&log)).collect()
+    }
+
+    fn fetch_evm_logs_from_receipts(
+        &self,
+        range: BlockRange,
+        filter: &EvmLogFilter,
+    ) -> Result<(Vec<LogRecord>, usize), DatalensError> {
+        log::info!(
+            "fetching EVM logs with block scan range={}-{} addresses={} topic_slots={}",
+            range.from_block,
+            range.to_block,
+            filter.addresses().len(),
+            filter.topics().len()
+        );
+        let mut logs = Vec::new();
+        let mut provider_calls = 0;
+        for block in self.fetch_full_blocks(range)? {
+            provider_calls += 1;
+            let block_number = hex_u64_field(&block, "number")?;
+            let block_hash = string_field(&block, "hash")?;
+            let transactions = block
+                .get("transactions")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    DatalensError::new(
+                        DatalensErrorKind::ProviderFailure,
+                        "missing full block transactions",
+                    )
+                })?;
+            for transaction in transactions {
+                let transaction = parse_transaction(transaction, block_number, &block_hash)?;
+                let result = self.call("eth_getTransactionReceipt", json!([transaction.hash]))?;
+                provider_calls += 1;
+                let Some(receipt) = result else {
+                    return Err(DatalensError::new(
+                        DatalensErrorKind::ProviderFailure,
+                        "provider returned null receipt",
+                    ));
+                };
+                let receipt_logs =
+                    receipt
+                        .get("logs")
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| {
+                            DatalensError::new(
+                                DatalensErrorKind::ProviderFailure,
+                                "missing receipt logs",
+                            )
+                        })?;
+                for log in receipt_logs {
+                    let log = parse_log_record(log)?;
+                    if log_matches_filter(&log, filter) {
+                        logs.push(log);
+                    }
+                }
+            }
+        }
+        logs.sort_by_key(|log| (log.block_number, log.transaction_index, log.log_index));
+        Ok((logs, provider_calls))
     }
 
     fn finality_tag_height(
@@ -375,7 +446,10 @@ impl ChainAdapter for EvmRpcClient {
                     .with_selector(SelectorKind::All)
                     .with_selector(SelectorKind::EvmLogs)
                     .with_range(HeightRangeKind::Block)
-                    .with_max_range_len(self.max_get_logs_range_blocks)
+                    .with_max_range_len(match self.logs_query_strategy {
+                        QueryStrategy::ProviderFilter => self.max_get_logs_range_blocks,
+                        QueryStrategy::BlockRange => self.max_block_scan_range_blocks,
+                    })
                     .with_max_addresses_per_query(self.max_addresses_per_query)
                     .with_empty_coverage(true)
                     .with_safe_height(true)
@@ -545,7 +619,13 @@ impl ChainAdapter for EvmRpcClient {
             // planners, indexers, and warmup can account for the split policy.
             return Err(DatalensError::new(
                 DatalensErrorKind::ProviderLimit,
-                "request range exceeds EVM provider range limit",
+                if request.dataset_key == DatasetKey::evm_logs()
+                    && self.logs_query_strategy == QueryStrategy::BlockRange
+                {
+                    "request range exceeds EVM block scan range limit"
+                } else {
+                    "request range exceeds EVM provider range limit"
+                },
             ));
         }
         if let DatasetSelector::EvmLogs(filter) = &request.selector {
@@ -568,6 +648,7 @@ impl ChainAdapter for EvmRpcClient {
                 ));
             }
         }
+        let mut warnings = Vec::new();
         let (rows, provider_calls) = match (&request.dataset_key, &request.selector) {
             (dataset, DatasetSelector::All) if *dataset == DatasetKey::evm_blocks() => (
                 QueryRows::EvmBlocks(self.fetch_blocks(range)?),
@@ -583,22 +664,42 @@ impl ChainAdapter for EvmRpcClient {
                 (QueryRows::EvmReceipts(receipts), provider_calls)
             }
             (dataset, DatasetSelector::All) if *dataset == DatasetKey::evm_logs() => {
-                // Full durable log indexing uses eth_getLogs so query-driven log fills and
-                // backfills share one provider source.
                 let filter = EvmLogFilter::try_from(LogFilter {
                     addresses: Vec::new(),
                     topics: Vec::new(),
                 })?;
-                let mut logs = self.fetch_evm_logs(range, &filter)?;
-                logs.retain(|log| range.contains(log.block_number));
-                logs.sort_by_key(|log| (log.block_number, log.transaction_index, log.log_index));
-                (QueryRows::EvmLogs(logs), 1)
+                match self.logs_query_strategy {
+                    QueryStrategy::ProviderFilter => {
+                        let mut logs = self.fetch_evm_logs(range, &filter)?;
+                        logs.retain(|log| range.contains(log.block_number));
+                        logs.sort_by_key(|log| {
+                            (log.block_number, log.transaction_index, log.log_index)
+                        });
+                        (QueryRows::EvmLogs(logs), 1)
+                    }
+                    QueryStrategy::BlockRange => {
+                        warnings.push("evm block_range log query strategy used".to_owned());
+                        let (logs, calls) = self.fetch_evm_logs_from_receipts(range, &filter)?;
+                        (QueryRows::EvmLogs(logs), calls)
+                    }
+                }
             }
             (dataset, DatasetSelector::EvmLogs(filter)) if *dataset == DatasetKey::evm_logs() => {
-                let mut logs = self.fetch_evm_logs(range, filter)?;
-                logs.retain(|log| range.contains(log.block_number));
-                logs.sort_by_key(|log| (log.block_number, log.transaction_index, log.log_index));
-                (QueryRows::EvmLogs(logs), 1)
+                match self.logs_query_strategy {
+                    QueryStrategy::ProviderFilter => {
+                        let mut logs = self.fetch_evm_logs(range, filter)?;
+                        logs.retain(|log| range.contains(log.block_number));
+                        logs.sort_by_key(|log| {
+                            (log.block_number, log.transaction_index, log.log_index)
+                        });
+                        (QueryRows::EvmLogs(logs), 1)
+                    }
+                    QueryStrategy::BlockRange => {
+                        warnings.push("evm block_range log query strategy used".to_owned());
+                        let (logs, calls) = self.fetch_evm_logs_from_receipts(range, filter)?;
+                        (QueryRows::EvmLogs(logs), calls)
+                    }
+                }
             }
             (dataset, _) if *dataset == DatasetKey::evm_blocks() => {
                 return Err(DatalensError::new(
@@ -646,9 +747,29 @@ impl ChainAdapter for EvmRpcClient {
         .with_provider_diagnostics(datalens_chain::ProviderDiagnostics {
             calls: provider_calls,
             rows_scanned: 0,
-            warnings: Vec::new(),
+            warnings,
         }))
     }
+}
+
+fn log_matches_filter(log: &LogRecord, filter: &EvmLogFilter) -> bool {
+    if !filter.addresses().is_empty() && !filter.addresses().contains(&log.address) {
+        return false;
+    }
+    for (slot, topic_filter) in filter.topics().iter().enumerate() {
+        match topic_filter {
+            TopicFilter::Wildcard => {}
+            TopicFilter::AnyOf(values) => {
+                let Some(topic) = log.topics.get(slot) else {
+                    return false;
+                };
+                if !values.contains(topic) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
 }
 
 impl EvmRpcClient {

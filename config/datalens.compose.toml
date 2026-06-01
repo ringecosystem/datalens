@@ -101,7 +101,9 @@ max_batch_blocks = 1000
 
 [chains.ethereum.datasets.logs]
 enabled = true
+query_strategy = "provider_filter"
 max_get_logs_range_blocks = 10000
+max_block_scan_range_blocks = 100
 max_addresses_per_query = 32
 
 [chains.solana-mainnet-beta]
@@ -118,7 +120,9 @@ max_batch_blocks = 8
 
 [chains.solana-mainnet-beta.datasets.logs]
 enabled = false
+query_strategy = "provider_filter"
 max_get_logs_range_blocks = 1
+max_block_scan_range_blocks = 8
 max_addresses_per_query = 1
 
 [chains.tron-mainnet]
@@ -140,5 +144,7 @@ max_batch_blocks = 8
 
 [chains.tron-mainnet.datasets.logs]
 enabled = true
+query_strategy = "provider_filter"
 max_get_logs_range_blocks = 8
+max_block_scan_range_blocks = 8
 max_addresses_per_query = 4

@@ -16,6 +16,7 @@ fn test_evm_adapter_passes_chain_conformance_suite() {
         },
         2,
         3,
+        3,
         1,
     );
 

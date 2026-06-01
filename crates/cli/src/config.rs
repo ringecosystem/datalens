@@ -320,9 +320,6 @@ fn validate_chain(name: &str, chain: &ChainConfig) -> Result<(), DatalensError> 
             format!("chain {name} must define at least one rpc URL"),
         ));
     }
-    if matches!(chain.kind.as_str(), "solana" | "tron") {
-        return Ok(());
-    }
     if chain.datasets.blocks.max_batch_blocks == 0 {
         return Err(DatalensError::new(
             DatalensErrorKind::InvalidInput,
@@ -335,11 +332,20 @@ fn validate_chain(name: &str, chain: &ChainConfig) -> Result<(), DatalensError> 
             format!("chain {name} logs max_get_logs_range_blocks must be greater than zero"),
         ));
     }
+    if chain.datasets.logs.max_block_scan_range_blocks == 0 {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            format!("chain {name} logs max_block_scan_range_blocks must be greater than zero"),
+        ));
+    }
     if chain.datasets.logs.max_addresses_per_query == 0 {
         return Err(DatalensError::new(
             DatalensErrorKind::InvalidInput,
             format!("chain {name} logs max_addresses_per_query must be greater than zero"),
         ));
+    }
+    if matches!(chain.kind.as_str(), "solana" | "tron") {
+        return Ok(());
     }
     validate_finality(name, &chain.finality)?;
     Ok(())
@@ -354,7 +360,8 @@ pub fn doctor_chain_summary(
             chain_identity(name, chain)?,
             SolanaHttpRpc::new(chain.rpc_urls.first().cloned().unwrap_or_default()),
         )
-        .with_max_slot_range_len(chain.datasets.blocks.max_batch_blocks.max(1));
+        .with_max_slot_range_len(chain.datasets.blocks.max_batch_blocks.max(1))
+        .with_query_strategy(chain.datasets.logs.query_strategy);
         let safe_height = source.cache_safe_height().map_err(|error| {
             DatalensError::new(
                 error.kind,
@@ -386,10 +393,17 @@ pub fn doctor_chain_summary(
                 "transactions": {
                     "enabled": true,
                     "max_slot_range_len": chain.datasets.blocks.max_batch_blocks,
+                    "query_strategy": chain.datasets.logs.query_strategy,
                 },
                 "instructions": {
                     "enabled": true,
                     "max_slot_range_len": chain.datasets.blocks.max_batch_blocks,
+                    "query_strategy": chain.datasets.logs.query_strategy,
+                },
+                "account_updates": {
+                    "enabled": true,
+                    "max_slot_range_len": chain.datasets.blocks.max_batch_blocks,
+                    "query_strategy": chain.datasets.logs.query_strategy,
                 }
             }
         }));
@@ -399,7 +413,8 @@ pub fn doctor_chain_summary(
             chain_identity(name, chain)?,
             tron_provider(chain.rpc_urls.first().cloned().unwrap_or_default(), chain),
         )
-        .with_max_block_range_len(chain.datasets.blocks.max_batch_blocks.max(1));
+        .with_max_block_range_len(chain.datasets.blocks.max_batch_blocks.max(1))
+        .with_events_query_strategy(chain.datasets.logs.query_strategy);
         let safe_height = source.cache_safe_height().map_err(|error| {
             DatalensError::new(
                 error.kind,
@@ -426,6 +441,7 @@ pub fn doctor_chain_summary(
                 },
                 "events": {
                     "enabled": true,
+                    "query_strategy": chain.datasets.logs.query_strategy,
                     "selector": "tron_events",
                     "trongrid": {
                         "enabled": chain.trongrid.enabled,
@@ -442,8 +458,10 @@ pub fn doctor_chain_summary(
         evm_finality_policy(&chain.finality),
         chain.datasets.blocks.max_batch_blocks,
         chain.datasets.logs.max_get_logs_range_blocks,
+        chain.datasets.logs.max_block_scan_range_blocks,
         chain.datasets.logs.max_addresses_per_query,
-    );
+    )
+    .with_logs_query_strategy(chain.datasets.logs.query_strategy);
     let safe_height = source.cache_safe_height().map_err(|error| {
         DatalensError::new(
             error.kind,
@@ -470,7 +488,9 @@ pub fn doctor_chain_summary(
             },
             "logs": {
                 "enabled": chain.datasets.logs.enabled,
+                "query_strategy": chain.datasets.logs.query_strategy,
                 "max_get_logs_range_blocks": chain.datasets.logs.max_get_logs_range_blocks,
+                "max_block_scan_range_blocks": chain.datasets.logs.max_block_scan_range_blocks,
                 "max_addresses_per_query": chain.datasets.logs.max_addresses_per_query,
             }
         }

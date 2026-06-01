@@ -173,8 +173,10 @@ pub fn cache_summary(command: CacheWorkflowCommand) -> Result<serde_json::Value,
                 evm_finality_policy(&chain.finality),
                 chain.datasets.blocks.max_batch_blocks,
                 chain.datasets.logs.max_get_logs_range_blocks,
+                chain.datasets.logs.max_block_scan_range_blocks,
                 chain.datasets.logs.max_addresses_per_query,
-            );
+            )
+            .with_logs_query_strategy(chain.datasets.logs.query_strategy);
             cache_summary_with_context(command, config, &chain_name, &chain, adapter)
         }
         "solana" => {
@@ -188,7 +190,8 @@ pub fn cache_summary(command: CacheWorkflowCommand) -> Result<serde_json::Value,
                 chain_identity(&chain_name, &chain)?,
                 SolanaHttpRpc::new(url.clone()),
             )
-            .with_max_slot_range_len(chain.datasets.blocks.max_batch_blocks.max(1));
+            .with_max_slot_range_len(chain.datasets.blocks.max_batch_blocks.max(1))
+            .with_query_strategy(chain.datasets.logs.query_strategy);
             cache_summary_with_context(command, config, &chain_name, &chain, adapter)
         }
         "tron" => {
@@ -202,7 +205,8 @@ pub fn cache_summary(command: CacheWorkflowCommand) -> Result<serde_json::Value,
                 chain_identity(&chain_name, &chain)?,
                 tron_provider(url.clone(), &chain),
             )
-            .with_max_block_range_len(chain.datasets.blocks.max_batch_blocks.max(1));
+            .with_max_block_range_len(chain.datasets.blocks.max_batch_blocks.max(1))
+            .with_events_query_strategy(chain.datasets.logs.query_strategy);
             cache_summary_with_context(command, config, &chain_name, &chain, adapter)
         }
         _ => Err(DatalensError::new(
