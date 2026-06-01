@@ -64,8 +64,9 @@ release gates.
 ## Runtime Endpoints
 
 - `GET /health` is the orchestration liveness and readiness endpoint for the first
-  production boundary. It returns HTTP 200 with `{"status":"ok"}` when the process can
-  serve requests.
+  production boundary. `GET /healthz` is an alias for deployment systems that expect the
+  Kubernetes-style health path. Both return HTTP 200 with `{"status":"ok"}` when the
+  process can serve requests.
 - `GET /metrics` is the Prometheus scrape endpoint. It returns Prometheus text format
   with content type `text/plain; version=0.0.4` when metrics are enabled.
 - `GET /v1/chains` and `GET /v1/discovery` expose configured chain discovery and

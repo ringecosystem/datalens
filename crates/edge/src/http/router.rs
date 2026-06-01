@@ -27,6 +27,7 @@ pub fn router_with_edge_config(registry: QueryServiceRegistry, edge: config::Edg
         .then(|| crate::graphql::schema(registry.clone()));
     let mut router = Router::new()
         .route("/health", get(health))
+        .route("/healthz", get(health))
         .route("/metrics", get(metrics))
         .route("/v1/chains", get(chains))
         .route("/v1/discovery", get(discovery))

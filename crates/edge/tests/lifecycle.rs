@@ -65,7 +65,7 @@ fn test_local_lifecycle_records_metrics_for_miss_fill_hit_and_provider_error() {
 }
 
 #[tokio::test]
-async fn test_api_lifecycle_routes_expose_health_chains_query_and_metrics() {
+async fn test_api_lifecycle_routes_expose_health_aliases_chains_query_and_metrics() {
     let recorder = MetricsRecorder::new().expect("metrics recorder");
     let source = MockSource::default().with_blocks(vec![block(30)]);
     let service = service(
@@ -78,16 +78,18 @@ async fn test_api_lifecycle_routes_expose_health_chains_query_and_metrics() {
         .expect("registry");
     let app = router(registry);
 
-    let health = app
-        .clone()
-        .oneshot(
-            Request::get("/health")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("health response");
-    assert_eq!(health.status(), StatusCode::OK);
+    for path in ["/health", "/healthz"] {
+        let health = app
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty()).expect("request"))
+            .await
+            .expect("health response");
+        assert_eq!(health.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(health.into_body()).await,
+            serde_json::json!({ "status": "ok" })
+        );
+    }
 
     let chains = app
         .clone()
