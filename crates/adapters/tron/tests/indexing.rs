@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use datalens_core::{
     DatalensError, DatalensErrorKind, DatasetKey, LedgerRange, QueryFinalityRequirement, QueryRows,
+    QueryStrategy,
 };
 use datalens_executor::{NativeQueryExecutionConfig, NativeQueryExecutor};
 use datalens_metrics::ApplicationIdentity;
@@ -292,6 +293,46 @@ fn test_tron_contract_event_provider_success_uses_trongrid_rows() {
     assert_eq!(rows[0]["transaction_id"], "tron-grid-tx");
     assert_eq!(rows[0]["source"]["provider"], "trongrid_contract_events");
     assert_eq!(provider.contract_event_calls(), 1);
+}
+
+#[test]
+fn test_tron_block_range_strategy_skips_trongrid_contract_events() {
+    let provider =
+        ContractEventFixtureProvider::with_contract_events(vec![contract_event("tron-grid-tx")]);
+    let adapter = TronAdapter::with_provider(
+        TronAdapter::with_fixture_defaults()
+            .capabilities()
+            .chain()
+            .clone(),
+        provider.clone(),
+    )
+    .with_events_query_strategy(QueryStrategy::BlockRange);
+    let selector = tron_event_selector(TronEventFilter {
+        contract_addresses: vec!["0xabcdefabcdefabcdefabcdefabcdefabcdefabcd".to_owned()],
+        event_names: vec!["Transfer".to_owned()],
+    })
+    .expect("selector");
+
+    let response = adapter
+        .fetch(datalens_chain::ChainFetchRequest::new(
+            adapter.capabilities().chain().clone(),
+            DatasetKey::tron_events(),
+            LedgerRange::blocks(10, 10).expect("range"),
+            selector,
+        ))
+        .expect("fetch events");
+
+    let QueryRows::AdapterJson { rows, .. } = response.rows.rows() else {
+        panic!("expected adapter JSON rows");
+    };
+    assert!(!rows.is_empty());
+    assert_eq!(provider.contract_event_calls(), 0);
+    assert!(
+        response
+            .provider_diagnostics
+            .warnings
+            .contains(&"tron block_range event query strategy used".to_owned())
+    );
 }
 
 #[test]

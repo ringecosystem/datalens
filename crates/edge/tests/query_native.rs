@@ -35,7 +35,9 @@ fn test_query_native_executes_non_evm_plan_without_evm_route_validation() {
                 },
                 logs: LogsDatasetConfig {
                     enabled: false,
+                    query_strategy: Default::default(),
                     max_get_logs_range_blocks: 2,
+                    max_block_scan_range_blocks: 2,
                     max_addresses_per_query: 2,
                 },
             },
@@ -110,7 +112,9 @@ fn test_query_native_reuses_staged_non_evm_rows_before_shutdown_flush() {
                 },
                 logs: LogsDatasetConfig {
                     enabled: false,
+                    query_strategy: Default::default(),
                     max_get_logs_range_blocks: 2,
+                    max_block_scan_range_blocks: 2,
                     max_addresses_per_query: 2,
                 },
             },

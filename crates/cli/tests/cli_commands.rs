@@ -13,7 +13,7 @@ use datalens_chain::{DatasetSelector, FinalityLevel};
 use datalens_cli::*;
 use datalens_core::{
     BlockHeader, ChainFamily, ChainIdentity, DatasetKey, DatasetRows, LedgerRange, LogRecord,
-    NetworkId, QueryRows,
+    NetworkId, QueryRows, QueryStrategy,
 };
 use datalens_storage::{
     CacheOutcome, FillOutcome, ObjectStore, QueryOutcome, UsageLedgerEntry, UsageLedgerRepository,
@@ -1084,6 +1084,165 @@ fn test_validate_config_accepts_evm_and_solana_chains_together() {
 }
 
 #[test]
+fn test_validate_config_accepts_per_chain_log_query_strategy_differences() {
+    let config: DatalensConfig = toml::from_str(
+        r#"
+        [server]
+        bind = "127.0.0.1:8080"
+
+        [storage]
+        backend = "local"
+
+        [storage.local]
+        root = ".datalens/storage"
+
+        [planner]
+        max_query_range_blocks = 100
+        default_chunk_range_blocks = 10
+
+        [writer]
+        target_object_bytes = 1024
+        min_object_rows = 1
+        record_empty_coverage = true
+
+        [chains.ethereum]
+        kind = "evm"
+        chain_id = 1
+        rpc_urls = ["http://example.invalid/ethereum"]
+
+        [chains.ethereum.datasets.blocks]
+        enabled = true
+        max_batch_blocks = 10
+
+        [chains.ethereum.datasets.logs]
+        enabled = true
+        query_strategy = "provider_filter"
+        max_get_logs_range_blocks = 10
+        max_block_scan_range_blocks = 2
+        max_addresses_per_query = 2
+
+        [chains.private]
+        kind = "evm"
+        chain_id = 999
+        rpc_urls = ["http://example.invalid/private"]
+
+        [chains.private.datasets.blocks]
+        enabled = true
+        max_batch_blocks = 10
+
+        [chains.private.datasets.logs]
+        enabled = true
+        query_strategy = "block_range"
+        max_get_logs_range_blocks = 10000
+        max_block_scan_range_blocks = 1
+        max_addresses_per_query = 2
+        "#,
+    )
+    .expect("config parses");
+
+    validate_config(&config).expect("config is valid");
+    assert_eq!(
+        config.chains["ethereum"].datasets.logs.query_strategy,
+        QueryStrategy::ProviderFilter
+    );
+    assert_eq!(
+        config.chains["private"].datasets.logs.query_strategy,
+        QueryStrategy::BlockRange
+    );
+}
+
+#[test]
+fn test_validate_config_rejects_zero_block_scan_range_limit() {
+    let config: DatalensConfig = toml::from_str(
+        r#"
+        [server]
+        bind = "127.0.0.1:8080"
+
+        [storage]
+        backend = "local"
+
+        [storage.local]
+        root = ".datalens/storage"
+
+        [planner]
+        max_query_range_blocks = 100
+        default_chunk_range_blocks = 10
+
+        [writer]
+        target_object_bytes = 1024
+        min_object_rows = 1
+        record_empty_coverage = true
+
+        [chains.private]
+        kind = "evm"
+        chain_id = 999
+        rpc_urls = ["http://example.invalid/private"]
+
+        [chains.private.datasets.blocks]
+        enabled = true
+        max_batch_blocks = 10
+
+        [chains.private.datasets.logs]
+        enabled = true
+        query_strategy = "block_range"
+        max_get_logs_range_blocks = 10000
+        max_block_scan_range_blocks = 0
+        max_addresses_per_query = 2
+        "#,
+    )
+    .expect("config parses");
+
+    let error = validate_config(&config).expect_err("zero block scan limit");
+
+    assert!(error.message.contains("max_block_scan_range_blocks"));
+}
+
+#[test]
+fn test_config_parse_rejects_invalid_log_query_strategy() {
+    let error = toml::from_str::<DatalensConfig>(
+        r#"
+        [server]
+        bind = "127.0.0.1:8080"
+
+        [storage]
+        backend = "local"
+
+        [storage.local]
+        root = ".datalens/storage"
+
+        [planner]
+        max_query_range_blocks = 100
+        default_chunk_range_blocks = 10
+
+        [writer]
+        target_object_bytes = 1024
+        min_object_rows = 1
+        record_empty_coverage = true
+
+        [chains.private]
+        kind = "evm"
+        chain_id = 999
+        rpc_urls = ["http://example.invalid/private"]
+
+        [chains.private.datasets.blocks]
+        enabled = true
+        max_batch_blocks = 10
+
+        [chains.private.datasets.logs]
+        enabled = true
+        query_strategy = "native_magic"
+        max_get_logs_range_blocks = 10000
+        max_block_scan_range_blocks = 1
+        max_addresses_per_query = 2
+        "#,
+    )
+    .expect_err("invalid query strategy");
+
+    assert!(error.to_string().contains("query_strategy"));
+    assert!(error.to_string().contains("provider_filter"));
+}
+
+#[test]
 fn test_validate_config_accepts_tron_chain() {
     let config: DatalensConfig = toml::from_str(
         r#"
@@ -1142,7 +1301,9 @@ fn test_doctor_chain_summary_rejects_unknown_auto_finality_without_profile() {
             },
             logs: datalens_edge::config::LogsDatasetConfig {
                 enabled: true,
+                query_strategy: Default::default(),
                 max_get_logs_range_blocks: 10,
+                max_block_scan_range_blocks: 10,
                 max_addresses_per_query: 2,
             },
         },
@@ -1186,6 +1347,14 @@ fn test_production_config_doctor_smoke_uses_nonsecret_environment() {
     let summary: Value = serde_json::from_slice(&output.stdout).expect("doctor JSON");
     assert_eq!(summary["status"], "ok");
     assert_eq!(summary["chains"][0]["finality"]["detected_height"], 160);
+    assert_eq!(
+        summary["chains"][0]["datasets"]["logs"]["query_strategy"],
+        "provider_filter"
+    );
+    assert_eq!(
+        summary["chains"][0]["datasets"]["logs"]["max_block_scan_range_blocks"],
+        100
+    );
 }
 
 fn unsupported_tag_response() -> Value {

@@ -78,9 +78,12 @@ write task is above that height, the executor must fail before calling storage. 
 not write a data object, manifest coverage, or empty coverage. Fetch tasks for hot/live
 segments must be marked non-durable and must not call the durable writer.
 
-For EVM logs, the first fill implementation can fetch by `eth_getLogs` using the planned
-address/topic/range filters. For block headers, it can fetch by block number batches. For
-transactions or receipts, it can fetch only when the plan requires those datasets.
+For EVM logs, chain dataset config chooses either `provider_filter` (`eth_getLogs`) or
+`block_range` (block plus receipt scan with local address/topic filtering). The durable
+cache key remains the logical selector and range; operators must configure
+`block_range` only for providers where receipt scans are complete for the requested
+range. For block headers, it can fetch by block number batches. For transactions or
+receipts, it can fetch only when the plan requires those datasets.
 
 Fetched data must be normalized before it enters writer or response assembly code. Raw
 adapter payloads are not the durable cache contract.

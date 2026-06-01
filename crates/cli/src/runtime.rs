@@ -96,8 +96,10 @@ fn build_evm_service_with_storage(
         evm_finality_policy(&chain.finality),
         chain.datasets.blocks.max_batch_blocks,
         chain.datasets.logs.max_get_logs_range_blocks,
+        chain.datasets.logs.max_block_scan_range_blocks,
         chain.datasets.logs.max_addresses_per_query,
-    );
+    )
+    .with_logs_query_strategy(chain.datasets.logs.query_strategy);
     let mut service = datalens_edge::QueryService::new_with_metrics_config(
         storage.clone(),
         source.clone(),
@@ -158,7 +160,8 @@ fn build_solana_service_with_storage(
         chain_identity(chain_name, chain).expect("validated chain identity"),
         SolanaHttpRpc::new(url.clone()),
     )
-    .with_max_slot_range_len(chain.datasets.blocks.max_batch_blocks.max(1));
+    .with_max_slot_range_len(chain.datasets.blocks.max_batch_blocks.max(1))
+    .with_query_strategy(chain.datasets.logs.query_strategy);
     Ok(datalens_edge::QueryService::new_with_metrics_config(
         storage,
         source,
@@ -196,7 +199,8 @@ fn build_tron_service_with_storage(
         chain_identity(chain_name, chain).expect("validated chain identity"),
         tron_provider(url.clone(), chain),
     )
-    .with_max_block_range_len(chain.datasets.blocks.max_batch_blocks.max(1));
+    .with_max_block_range_len(chain.datasets.blocks.max_batch_blocks.max(1))
+    .with_events_query_strategy(chain.datasets.logs.query_strategy);
     Ok(datalens_edge::QueryService::new_with_metrics_config(
         storage,
         source,

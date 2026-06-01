@@ -5,6 +5,14 @@ use sha2::{Digest, Sha256};
 
 use crate::{DatalensError, DatalensErrorKind, DatasetKey};
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryStrategy {
+    #[default]
+    ProviderFilter,
+    BlockRange,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BlockHeader {
     pub number: u64,

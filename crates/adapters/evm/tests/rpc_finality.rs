@@ -9,10 +9,9 @@ use datalens_chain::{
     CanonicalBlockRequest, ChainAdapter, ChainFetchRequest, ChainHeight, DatasetSelector,
     FinalityKind,
 };
-use datalens_core::NetworkId;
 use datalens_core::{
     BlockRange, ChainFamily, ChainIdentity, DatalensErrorKind, DatasetKey, LedgerRange,
-    LedgerRangeKind,
+    LedgerRangeKind, LogFilter, NetworkId, QueryRows, QueryStrategy,
 };
 use serde_json::{Value, json};
 
@@ -179,6 +178,7 @@ fn test_fetch_rejects_chain_mismatch_before_provider_call() {
         10,
         10,
         10,
+        10,
     );
     let request = ChainFetchRequest::new(
         ChainIdentity::try_new(ChainFamily::Evm, "polygon", Some(NetworkId::numeric(137)))
@@ -194,6 +194,164 @@ fn test_fetch_rejects_chain_mismatch_before_provider_call() {
 }
 
 #[test]
+fn test_provider_filter_logs_use_eth_get_logs() {
+    let topic = transfer_topic();
+    let address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let (url, requests) = start_rpc_server(vec![json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": [provider_log(10, "0xaaa", topic)]
+    })]);
+    let client = EvmRpcClient::with_chain(
+        vec![url],
+        ethereum_identity(),
+        EvmFinalityPolicy::Auto,
+        10,
+        10,
+        3,
+        10,
+    )
+    .with_logs_query_strategy(QueryStrategy::ProviderFilter);
+    let filter = datalens_core::EvmLogFilter::try_from(LogFilter {
+        addresses: vec![address.to_owned()],
+        topics: vec![Some(vec![topic.to_owned()])],
+    })
+    .expect("filter");
+
+    let response = client
+        .fetch(ChainFetchRequest::new(
+            ethereum_identity(),
+            DatasetKey::evm_logs(),
+            LedgerRange::from_block_range(BlockRange::expect_new(10, 10)),
+            DatasetSelector::EvmLogs(filter),
+        ))
+        .expect("logs");
+
+    let QueryRows::EvmLogs(rows) = response.rows.rows() else {
+        panic!("expected EVM logs");
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].address, address);
+    assert_eq!(response.provider_diagnostics.calls, 1);
+    assert!(response.provider_diagnostics.warnings.is_empty());
+    let requests = requests.lock().expect("requests");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["method"], "eth_getLogs");
+}
+
+#[test]
+fn test_block_range_logs_fetch_receipts_and_filter_locally_without_eth_get_logs() {
+    let topic = transfer_topic();
+    let matching_address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let other_address = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let (url, requests) = start_rpc_server(vec![
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": full_block(10, "0xaaa", ["0xtx0", "0xtx1"])
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": receipt(10, "0xaaa", "0xtx0", 0, vec![
+                provider_log_with_address(10, "0xaaa", "0xtx0", 0, 0, matching_address, topic),
+                provider_log_with_address(10, "0xaaa", "0xtx0", 0, 1, other_address, topic),
+            ])
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": receipt(10, "0xaaa", "0xtx1", 1, vec![
+                provider_log_with_address(10, "0xaaa", "0xtx1", 1, 0, matching_address, unrelated_topic()),
+            ])
+        }),
+    ]);
+    let client = EvmRpcClient::with_chain(
+        vec![url],
+        ethereum_identity(),
+        EvmFinalityPolicy::Auto,
+        10,
+        10,
+        3,
+        10,
+    )
+    .with_logs_query_strategy(QueryStrategy::BlockRange);
+    let filter = datalens_core::EvmLogFilter::try_from(LogFilter {
+        addresses: vec![matching_address.to_owned()],
+        topics: vec![Some(vec![topic.to_owned()])],
+    })
+    .expect("filter");
+
+    let response = client
+        .fetch(ChainFetchRequest::new(
+            ethereum_identity(),
+            DatasetKey::evm_logs(),
+            LedgerRange::from_block_range(BlockRange::expect_new(10, 10)),
+            DatasetSelector::EvmLogs(filter),
+        ))
+        .expect("logs");
+
+    let QueryRows::EvmLogs(rows) = response.rows.rows() else {
+        panic!("expected EVM logs");
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].transaction_hash, "0xtx0");
+    assert_eq!(rows[0].log_index, 0);
+    assert_eq!(response.provider_diagnostics.calls, 3);
+    assert!(
+        response
+            .provider_diagnostics
+            .warnings
+            .contains(&"evm block_range log query strategy used".to_owned())
+    );
+    let methods = requests
+        .lock()
+        .expect("requests")
+        .iter()
+        .map(|request| request["method"].as_str().expect("method").to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        methods,
+        vec![
+            "eth_getBlockByNumber".to_owned(),
+            "eth_getTransactionReceipt".to_owned(),
+            "eth_getTransactionReceipt".to_owned()
+        ]
+    );
+}
+
+#[test]
+fn test_block_range_logs_enforce_independent_block_scan_limit() {
+    let client = EvmRpcClient::with_chain(
+        Vec::new(),
+        ethereum_identity(),
+        EvmFinalityPolicy::Auto,
+        10,
+        10_000,
+        1,
+        10,
+    )
+    .with_logs_query_strategy(QueryStrategy::BlockRange);
+    let filter = datalens_core::EvmLogFilter::try_from(LogFilter {
+        addresses: Vec::new(),
+        topics: Vec::new(),
+    })
+    .expect("filter");
+
+    let error = client
+        .fetch(ChainFetchRequest::new(
+            ethereum_identity(),
+            DatasetKey::evm_logs(),
+            LedgerRange::from_block_range(BlockRange::expect_new(10, 11)),
+            DatasetSelector::EvmLogs(filter),
+        ))
+        .expect_err("range limit");
+
+    assert_eq!(error.kind, DatalensErrorKind::ProviderLimit);
+    assert!(error.message.contains("block scan"));
+}
+
+#[test]
 fn test_safe_height_prefers_rpc_finalized_tag() {
     let (url, requests) = start_rpc_server(vec![json!({
         "jsonrpc": "2.0",
@@ -206,6 +364,7 @@ fn test_safe_height_prefers_rpc_finalized_tag() {
         vec![url],
         ethereum_identity(),
         EvmFinalityPolicy::Auto,
+        10,
         10,
         10,
         10,
@@ -249,6 +408,7 @@ fn test_safe_height_uses_rpc_safe_when_finalized_tag_is_unsupported() {
         10,
         10,
         10,
+        10,
     );
 
     let height = client.cache_safe_height().expect("safe height");
@@ -281,6 +441,7 @@ fn test_safe_height_uses_chain_profile_when_rpc_finality_tags_are_unsupported() 
         10,
         10,
         10,
+        10,
     );
 
     let height = client.cache_safe_height().expect("profile fallback height");
@@ -310,6 +471,7 @@ fn test_safe_height_rejects_unknown_chain_without_rpc_tags_or_override() {
         10,
         10,
         10,
+        10,
     );
 
     let error = client.cache_safe_height().expect_err("unknown finality");
@@ -333,6 +495,7 @@ fn test_safe_height_uses_manual_lag_override_without_rpc_finality_tags() {
             safe_lag_blocks: Some(64),
             finalized_lag_blocks: Some(128),
         },
+        10,
         10,
         10,
         10,
@@ -377,6 +540,7 @@ fn test_canonical_block_fetches_provider_hash_at_height() {
         10,
         10,
         10,
+        10,
     );
 
     let block = client
@@ -415,6 +579,92 @@ fn unsupported_tag_response() -> Value {
             "code": -32602,
             "message": "unsupported block tag"
         }
+    })
+}
+
+fn transfer_topic() -> &'static str {
+    "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+}
+
+fn unrelated_topic() -> &'static str {
+    "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+}
+
+fn full_block<const N: usize>(number: u64, hash: &str, hashes: [&str; N]) -> Value {
+    json!({
+        "number": format!("0x{number:x}"),
+        "hash": hash,
+        "parentHash": "0xparent",
+        "timestamp": "0x1",
+        "transactions": hashes
+            .into_iter()
+            .enumerate()
+            .map(|(index, hash)| json!({
+                "hash": hash,
+                "blockNumber": format!("0x{number:x}"),
+                "blockHash": hash,
+                "transactionIndex": format!("0x{index:x}"),
+                "from": "0x1111111111111111111111111111111111111111",
+                "to": "0x2222222222222222222222222222222222222222",
+                "value": "0x0",
+                "input": "0x",
+                "nonce": "0x0",
+                "gas": "0x5208"
+            }))
+            .collect::<Vec<_>>()
+    })
+}
+
+fn receipt(
+    number: u64,
+    block_hash: &str,
+    tx_hash: &str,
+    transaction_index: u64,
+    logs: Vec<Value>,
+) -> Value {
+    json!({
+        "transactionHash": tx_hash,
+        "blockNumber": format!("0x{number:x}"),
+        "blockHash": block_hash,
+        "transactionIndex": format!("0x{transaction_index:x}"),
+        "status": "0x1",
+        "gasUsed": "0x5208",
+        "cumulativeGasUsed": "0x5208",
+        "logs": logs,
+    })
+}
+
+fn provider_log(number: u64, block_hash: &str, topic: &str) -> Value {
+    provider_log_with_address(
+        number,
+        block_hash,
+        "0xtx",
+        0,
+        0,
+        "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        topic,
+    )
+}
+
+fn provider_log_with_address(
+    number: u64,
+    block_hash: &str,
+    tx_hash: &str,
+    transaction_index: u64,
+    log_index: u64,
+    address: &str,
+    topic: &str,
+) -> Value {
+    json!({
+        "blockNumber": format!("0x{number:x}"),
+        "blockHash": block_hash,
+        "transactionHash": tx_hash,
+        "transactionIndex": format!("0x{transaction_index:x}"),
+        "logIndex": format!("0x{log_index:x}"),
+        "address": address,
+        "topics": [topic],
+        "data": "0x",
+        "removed": false
     })
 }
 

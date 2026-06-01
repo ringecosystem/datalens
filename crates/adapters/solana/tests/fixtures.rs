@@ -7,7 +7,9 @@ use std::{
 use datalens_chain::{
     ChainAdapter, ChainFetchRequest, DatasetSelector, FinalityKind, HeightRangeKind,
 };
-use datalens_core::{DatalensError, DatalensErrorKind, DatasetKey, LedgerRange, QueryRows};
+use datalens_core::{
+    DatalensError, DatalensErrorKind, DatasetKey, LedgerRange, QueryRows, QueryStrategy,
+};
 use datalens_solana::{
     SolanaAdapter, SolanaFixtureRpc, SolanaHttpRpc, SolanaRpc, SolanaSignatureInfo,
     solana_address_selector, solana_all_selector, solana_program_selector,
@@ -86,6 +88,40 @@ fn test_program_selector_fetches_transactions_and_instructions() {
     );
     assert_eq!(rows[0]["instruction_path"], "0");
     assert_eq!(rows[1]["instruction_path"], "0/0");
+}
+
+#[test]
+fn test_block_range_strategy_skips_signature_discovery_and_scans_slots() {
+    let provider = OptimizedSolanaRpc::default();
+    let adapter = SolanaAdapter::with_provider(default_chain(), provider.clone())
+        .with_query_strategy(QueryStrategy::BlockRange);
+    let selector =
+        solana_address_selector("Account111111111111111111111111111111111").expect("selector");
+
+    let response = adapter
+        .fetch(ChainFetchRequest::new(
+            default_chain(),
+            DatasetKey::solana_transactions(),
+            LedgerRange::slots(10, 12).expect("range"),
+            selector,
+        ))
+        .expect("transactions");
+
+    let QueryRows::AdapterJson { rows, .. } = response.rows.rows() else {
+        panic!("expected adapter JSON rows");
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["signature"], "sig-slot-10");
+    assert_eq!(provider.signature_address_calls(), Vec::<String>::new());
+    assert_eq!(provider.transaction_calls(), Vec::<String>::new());
+    assert_eq!(provider.blocks_with_limit_calls(), 1);
+    assert_eq!(provider.block_calls(), vec![10, 12]);
+    assert!(
+        response
+            .provider_diagnostics
+            .warnings
+            .contains(&"solana block_range query strategy used".to_owned())
+    );
 }
 
 #[test]

@@ -397,7 +397,9 @@ async fn test_discovery_route_lists_chain_identities_and_native_dataset_capabili
                     },
                     logs: LogsDatasetConfig {
                         enabled: false,
+                        query_strategy: Default::default(),
                         max_get_logs_range_blocks: 2,
+                        max_block_scan_range_blocks: 2,
                         max_addresses_per_query: 2,
                     },
                 },

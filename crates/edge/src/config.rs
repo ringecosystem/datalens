@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, env, fs, path::Path};
 
-use datalens_core::{DatalensError, DatalensErrorKind};
+use datalens_core::{DatalensError, DatalensErrorKind, QueryStrategy};
 use datalens_storage::S3ObjectStoreConfig;
 use serde::{Deserialize, Serialize};
 
@@ -477,8 +477,16 @@ pub struct BlocksDatasetConfig {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LogsDatasetConfig {
     pub enabled: bool,
+    #[serde(default)]
+    pub query_strategy: QueryStrategy,
     pub max_get_logs_range_blocks: u64,
+    #[serde(default = "default_max_block_scan_range_blocks")]
+    pub max_block_scan_range_blocks: u64,
     pub max_addresses_per_query: usize,
+}
+
+fn default_max_block_scan_range_blocks() -> u64 {
+    100
 }
 
 fn expand_env_vars(text: &str) -> Result<String, DatalensError> {
