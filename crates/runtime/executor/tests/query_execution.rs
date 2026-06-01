@@ -124,7 +124,8 @@ fn test_executor_miss_returns_provider_rows_when_writer_stages_below_threshold()
 
     let second = executor
         .execute(blocks_input(10, 10))
-        .expect("durable planner still misses staged rows");
+        .expect("same-process query reads staged rows");
+    assert!(storage.manifest().expect("manifest").entries.is_empty());
     executor.flush_staged_writes().expect("flush staged writes");
     let third = executor
         .execute(blocks_input(10, 10))
@@ -132,11 +133,12 @@ fn test_executor_miss_returns_provider_rows_when_writer_stages_below_threshold()
 
     assert_eq!(block_numbers(&second.rows), vec![10]);
     assert_eq!(
+        second.cache.hit_ranges,
+        vec![LedgerRange::blocks(10, 10).expect("valid range")]
+    );
+    assert_eq!(
         source.calls(),
-        vec![
-            SourceCall::Blocks(BlockRange::expect_new(10, 10)),
-            SourceCall::Blocks(BlockRange::expect_new(10, 10)),
-        ]
+        vec![SourceCall::Blocks(BlockRange::expect_new(10, 10))]
     );
     assert_eq!(
         third.cache.hit_ranges,

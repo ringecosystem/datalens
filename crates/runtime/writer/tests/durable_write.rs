@@ -393,6 +393,72 @@ fn test_writer_stages_non_empty_segment_below_min_rows_without_manifest_coverage
 }
 
 #[test]
+fn test_writer_exposes_staged_rows_for_matching_coverage_identity_only() {
+    let storage = LocalStorage::new(temp_storage_root("staged-readable"));
+    let writer = DurableWriter::new(
+        storage.clone(),
+        DurableWriterConfig {
+            target_object_bytes: 1024 * 1024,
+            min_object_rows: 3,
+            record_empty_coverage: true,
+            staging: WriteStagingConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        },
+    );
+    let chain = test_chain();
+    let range = LedgerRange::blocks(1, 1).expect("valid range");
+
+    writer
+        .write(DurableWriteRequest {
+            chain: chain.clone(),
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: DatasetSelector::all(),
+            finality_level: FinalityLevel::Safe,
+            segments: vec![DurableWriteSegment {
+                range: range.clone(),
+                rows: block_rows(vec![block(1)]),
+            }],
+        })
+        .expect("stage write");
+
+    assert_eq!(
+        writer
+            .staged_covered_ranges(
+                &chain,
+                &DatasetKey::evm_blocks(),
+                &DatasetSelector::all(),
+                range.clone()
+            )
+            .expect("staged coverage"),
+        vec![range.clone()]
+    );
+    assert!(
+        writer
+            .staged_covered_ranges(
+                &chain,
+                &DatasetKey::evm_logs(),
+                &DatasetSelector::all(),
+                range.clone()
+            )
+            .expect("wrong dataset staged coverage")
+            .is_empty()
+    );
+    let staged = writer
+        .read_staged_rows(
+            &chain,
+            &DatasetKey::evm_blocks(),
+            &DatasetSelector::all(),
+            range,
+        )
+        .expect("read staged rows")
+        .expect("matching staged rows");
+    assert_eq!(staged.row_count(), 1);
+    assert!(storage.manifest().expect("manifest").entries.is_empty());
+}
+
+#[test]
 fn test_writer_flush_persists_staged_segments_as_durable_coverage() {
     let storage = LocalStorage::new(temp_storage_root("flush-staged"));
     let writer = DurableWriter::new(
