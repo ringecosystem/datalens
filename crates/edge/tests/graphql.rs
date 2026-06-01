@@ -2,6 +2,8 @@ mod support;
 
 use support::graphql::*;
 
+use datalens_tron::{TronBlock, TronFinality, TronProvider};
+
 #[tokio::test]
 async fn test_graphql_discovery_lists_registered_chains() {
     let registry = QueryServiceRegistry::new()
@@ -397,6 +399,77 @@ async fn test_graphql_native_tron_blocks_query_uses_typed_inputs() {
 }
 
 #[tokio::test]
+async fn test_graphql_native_tron_blocks_provider_miss_does_not_record_empty_coverage() {
+    let root = temp_storage_root("gql-tron-blocks-provider-miss");
+    let storage = LocalStorage::new(&root);
+    let provider = MissingTronBlockProvider::default();
+    let calls = provider.calls.clone();
+    let tron = TronAdapter::with_provider(tron_identity(), provider).with_max_block_range_len(8);
+    let registry = QueryServiceRegistry::new()
+        .with_service(QueryService::new_named(
+            storage.clone(),
+            tron,
+            planner_config(),
+            writer_config(),
+            "tron-mainnet",
+            non_evm_chain_config("tron"),
+        ))
+        .expect("register tron");
+    let app = graphql_router(registry);
+
+    let variables = serde_json::json!({
+        "input": {
+            "chain": tron_chain_input(),
+            "datasetKey": dataset_key_input("tron", "blocks"),
+            "selector": {
+                "kind": "other",
+                "other": {
+                    "kind": "tron_all",
+                    "fingerprint": "tron-all/all",
+                    "canonicalKey": "all"
+                }
+            },
+            "range": { "kind": "block", "start": 60_000_000, "end": 60_000_001 },
+            "finality": "durable_only",
+            "fields": {}
+        }
+    });
+    let query = r#"
+        query($input: QueryInput!) {
+          query(input: $input) {
+            datasetKey
+            cache
+            rows
+          }
+        }
+    "#;
+
+    let first = graphql_json(app.clone(), query, variables.clone()).await;
+    let second = graphql_json(app, query, variables).await;
+
+    assert_eq!(first["errors"][0]["extensions"]["kind"], "provider_failure");
+    assert_eq!(
+        second["errors"][0]["extensions"]["kind"],
+        "provider_failure"
+    );
+    assert_eq!(
+        storage
+            .covered_ranges(
+                &tron_identity(),
+                &DatasetKey::tron_blocks(),
+                &datalens_tron::tron_all_selector().expect("selector"),
+                LedgerRange::blocks(60_000_000, 60_000_001).expect("range"),
+            )
+            .expect("coverage"),
+        Vec::<LedgerRange>::new()
+    );
+    assert_eq!(
+        *calls.lock().expect("calls"),
+        vec![60_000_000, 60_000_001, 60_000_000, 60_000_001]
+    );
+}
+
+#[tokio::test]
 async fn test_graphql_query_records_metrics_with_application_header() {
     let source = MockSource::default().with_blocks(vec![block(10, "0x10")]);
     let registry = QueryServiceRegistry::new()
@@ -454,6 +527,74 @@ async fn test_graphql_query_records_metrics_with_application_header() {
     assert!(text.contains(
         r#"datalens_query_total{application="wallet-search",chain="ethereum",chain_kind="evm",dataset="evm.blocks",outcome="filled"} 1"#
     ));
+}
+
+#[derive(Clone, Default)]
+struct MissingTronBlockProvider {
+    calls: Arc<Mutex<Vec<u64>>>,
+}
+
+impl TronProvider for MissingTronBlockProvider {
+    fn latest_block(&self, finality: TronFinality) -> Result<TronBlock, DatalensError> {
+        let number = match finality {
+            TronFinality::Latest => 60_000_010,
+            TronFinality::Finalized => 60_000_010,
+        };
+        Ok(tron_block(number))
+    }
+
+    fn get_block_by_number(
+        &self,
+        number: u64,
+        _finality: TronFinality,
+    ) -> Result<Option<TronBlock>, DatalensError> {
+        self.calls.lock().expect("calls").push(number);
+        Ok(None)
+    }
+
+    fn get_transaction_info_by_id(
+        &self,
+        _tx_id: &str,
+    ) -> Result<Option<serde_json::Value>, DatalensError> {
+        Ok(None)
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "missing-tron-block"
+    }
+}
+
+fn tron_identity() -> ChainIdentity {
+    ChainIdentity::try_new(
+        ChainFamily::Other("tron".to_owned()),
+        "tron-mainnet",
+        Some(NetworkId::textual("mainnet").expect("network")),
+    )
+    .expect("valid chain")
+}
+
+fn tron_block(number: u64) -> TronBlock {
+    let hash = format!("{number:016x}-tron-hash");
+    let parent_hash = format!("{:016x}-tron-hash", number.saturating_sub(1));
+    TronBlock {
+        number,
+        hash: hash.clone(),
+        parent_hash: parent_hash.clone(),
+        timestamp: number * 10,
+        witness_address: None,
+        transaction_count: 0,
+        raw: serde_json::json!({
+            "blockID": hash,
+            "block_header": {
+                "raw_data": {
+                    "number": number,
+                    "parentHash": parent_hash,
+                    "timestamp": number * 10,
+                }
+            },
+            "transactions": []
+        }),
+    }
 }
 
 #[tokio::test]

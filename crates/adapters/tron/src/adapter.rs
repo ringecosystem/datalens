@@ -190,10 +190,26 @@ where
             return Ok((blocks, 0));
         }
         let mut blocks = Vec::new();
+        let mut missing_blocks = Vec::new();
         for number in range.start()..=range.end() {
             if let Some(block) = self.provider.get_block_by_number(number, FINALIZED)? {
                 blocks.push(block);
+            } else {
+                missing_blocks.push(number);
             }
+        }
+        if !missing_blocks.is_empty() {
+            return Err(DatalensError::new(
+                DatalensErrorKind::ProviderFailure,
+                format!(
+                    "provider returned no finalized Tron block for requested height(s): {}",
+                    missing_blocks
+                        .iter()
+                        .map(u64::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+            ));
         }
         blocks.sort_by_key(|block| block.number);
         let provider_calls = range.len().min(u128::from(usize::MAX as u64)) as usize;
