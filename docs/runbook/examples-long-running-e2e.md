@@ -91,8 +91,8 @@ Outputs:
 
 | Example | Run mode | Chain | Chain kind | Dataset key | Selector kind | Selector value | Start block/slot | Target end block/slot | Actual end block/slot | Actual covered ranges |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| <ormp-client> | <first_run> | <ethereum> | <evm> | <evm.logs> | <contract/event/topic> | <redacted or public selector> | <number> | <number or unbounded> | <number> | <ranges> |
-| <ormp-client> | <second_run> | <ethereum> | <evm> | <evm.logs> | <contract/event/topic> | <same selector> | <number> | <number or unbounded> | <number> | <ranges> |
+| <ormp-client> | <first_run> | <base> | <evm> | <evm.logs> | <contract/event/topic> | <redacted or public selector> | <number> | <number or unbounded> | <number> | <ranges> |
+| <ormp-client> | <second_run> | <base> | <evm> | <evm.logs> | <contract/event/topic> | <same selector> | <number> | <number or unbounded> | <number> | <ranges> |
 | <degov-client> | <first_run> | <ethereum> | <evm> | <evm.logs> | <contract/event/topic> | <redacted or public selector> | <number> | <number or unbounded> | <number> | <ranges> |
 | <degov-client> | <second_run> | <ethereum> | <evm> | <evm.logs> | <contract/event/topic> | <same selector> | <number> | <number or unbounded> | <number> | <ranges> |
 

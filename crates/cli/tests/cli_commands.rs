@@ -141,6 +141,9 @@ fn test_validate_config_rejects_server_index_graphql_surface() {
 fn test_authoritative_server_configs_parse_and_validate() {
     unsafe {
         std::env::set_var("DATALENS_ETHEREUM_RPC_URL", "http://example.invalid");
+        std::env::set_var("DATALENS_ARBITRUM_RPC_URL", "http://example.invalid");
+        std::env::set_var("DATALENS_BASE_RPC_URL", "http://example.invalid");
+        std::env::set_var("DATALENS_DARWINIA_RPC_URL", "http://example.invalid");
         std::env::set_var("DATALENS_SOLANA_RPC_URL", "http://example.invalid");
         std::env::set_var("DATALENS_TRON_RPC_URL", "http://example.invalid");
         std::env::set_var("DATALENS_TRONGRID_API_KEY", "");
@@ -151,6 +154,7 @@ fn test_authoritative_server_configs_parse_and_validate() {
         std::env::set_var("DATALENS_PUBLIC_APP_TOKEN", "replace-with-public-token");
         std::env::set_var("DATALENS_ORMP_TOKEN", "replace-with-ormp-token");
         std::env::set_var("DATALENS_LIVE_SMOKE_TOKEN", "replace-with-live-smoke-token");
+        std::env::set_var("DATALENS_DEGOV_TOKEN", "replace-with-degov-token");
         std::env::set_var("DATALENS_METRICS_TOKEN", "replace-with-metrics-token");
     }
 
