@@ -5,6 +5,9 @@ WORKDIR /app
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY examples/degov-client ./examples/degov-client
+COPY examples/ormp-client ./examples/ormp-client
+COPY sdks/rust ./sdks/rust
 
 RUN cargo build --locked --release --package datalens-cli
 
