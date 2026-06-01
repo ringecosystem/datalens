@@ -31,14 +31,15 @@ Start Datalens separately:
 
 ```sh
 export DATALENS_LIVE_SMOKE_TOKEN=replace-with-live-smoke-token
-cargo run -p datalens-cli -- serve --config config/datalens.compose.toml
+export DATALENS_SERVER_BIND=127.0.0.1:3100
+cargo run -p datalens-cli -- serve --config config/datalens.compose.toml --bind "$DATALENS_SERVER_BIND"
 ```
 
 Run the example:
 
 ```sh
 cd examples/token-sdk-go
-export DATALENS_ENDPOINT=http://127.0.0.1:3000
+export DATALENS_ENDPOINT=http://$DATALENS_SERVER_BIND
 export DATALENS_APPLICATION=live-smoke
 export DATALENS_TOKEN=$DATALENS_LIVE_SMOKE_TOKEN
 go run .
@@ -60,13 +61,17 @@ hit metadata for the Solana and TRON native queries.
 | `DATALENS_ETHEREUM_FIRST` | `10` | Mock-covered Ethereum index query page size |
 | `DATALENS_SOLANA_FROM_SLOT` | `250000000` | Solana bounded start slot |
 | `DATALENS_SOLANA_TO_SLOT` | `250000003` | Solana bounded end slot |
-| `DATALENS_TRON_FROM_BLOCK` | `60000000` | TRON bounded start block |
-| `DATALENS_TRON_TO_BLOCK` | `60000002` | TRON bounded end block |
+| `DATALENS_TRON_FROM_BLOCK` | `83200000` | Public RPC smoke TRON bounded start block |
+| `DATALENS_TRON_TO_BLOCK` | `83200002` | Public RPC smoke TRON bounded end block |
 
-Live smoke uses `solana.transactions` on Solana chain id `101` and
-`tron.events` on TRON chain id `728126428`. It requires Datalens to be
-configured with RPC access for Solana and TRON. Do not commit real RPC URLs,
-API keys, or tokens.
+Public RPC smoke uses `solana.transactions` on Solana chain id `101` and
+`tron.events` on TRON chain id `728126428`. It requires Datalens to be configured
+with RPC access for Solana and TRON. Do not commit real RPC URLs, API keys, or
+tokens.
+
+Archive/business TRON ranges, including older ranges around block 60000000,
+require an archive-capable TRON provider or a TronGrid-backed path. Keep those
+ranges as explicit environment overrides, not as public RPC smoke defaults.
 
 ## Tests
 

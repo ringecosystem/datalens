@@ -158,6 +158,8 @@ fn local_compose_deployment_artifacts_are_declared() {
     assert!(compose.contains("datalens-server:"));
     assert!(!compose.contains("datalens-index-daemon:"));
     assert!(compose.contains("condition: service_healthy"));
+    assert!(compose.contains("DATALENS_SERVER_BIND:-0.0.0.0:3000"));
+    assert!(compose.contains("--bind"));
 
     assert!(env_example.contains("DATALENS_SERVER_CONFIG=/etc/datalens/datalens.toml"));
     assert!(env_example.contains("# Optional external application index service examples"));
@@ -192,8 +194,12 @@ fn local_compose_deployment_artifacts_are_declared() {
     assert!(gitignore.contains("indexes/"));
     assert!(runbook.contains("docker compose up -d rustfs-init postgres"));
     assert!(runbook.contains("docker compose --profile datalens up -d --build"));
+    assert!(runbook.contains("DATALENS_SERVER_PORT=3100"));
+    assert!(runbook.contains("DATALENS_ENDPOINT=http://127.0.0.1:${DATALENS_SERVER_PORT}"));
     assert!(runbook.contains("--chain solana-mainnet-beta"));
     assert!(runbook.contains("--chain tron-mainnet"));
+    assert!(runbook.contains("--range-start 83200000"));
+    assert!(runbook.contains("archive-capable TRON provider"));
 }
 
 #[test]
@@ -232,12 +238,33 @@ fn token_sdk_live_examples_match_compose_live_smoke_grants() {
     for source in [go_example, typescript_example] {
         assert!(source.contains("solana-mainnet-beta"));
         assert!(source.contains("transactions"));
+        assert!(source.contains("83200000"));
+        assert!(!source.contains("60000000"));
         assert!(!source.contains("account_updates"));
     }
     assert!(go_example.contains("NetworkID:      &datalens.NetworkID{Numeric: intPtr(101)}"));
     assert!(!go_example.contains("Textual: \"mainnet-beta\""));
     assert!(typescript_example.contains("networkId: { numeric: 101 }"));
     assert!(!typescript_example.contains("textual: \"mainnet-beta\""));
+}
+
+#[test]
+fn public_tron_live_smoke_defaults_use_provider_served_range() {
+    let index_config = include_str!("../../../config/datalens.tron-live-smoke.index.toml");
+    let go_readme = include_str!("../../../examples/token-sdk-go/README.md");
+    let typescript_readme = include_str!("../../../examples/token-sdk-typescript/README.md");
+
+    assert!(index_config.contains("from_block = 83200000"));
+    assert!(index_config.contains("to_block = 83200001"));
+    assert!(!index_config.contains("from_block = 60000000"));
+
+    for readme in [go_readme, typescript_readme] {
+        assert!(readme.contains("Public RPC smoke"));
+        assert!(readme.contains("Archive/business TRON ranges"));
+        assert!(readme.contains("archive-capable TRON provider"));
+        assert!(readme.contains("DATALENS_TRON_FROM_BLOCK` | `83200000`"));
+        assert!(!readme.contains("DATALENS_TRON_FROM_BLOCK` | `60000000`"));
+    }
 }
 
 #[test]

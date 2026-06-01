@@ -123,6 +123,12 @@ test("buildRuntimeConfig reads endpoint token application and range overrides", 
   assert.deepEqual(config.tron, { fromBlock: 60100000, toBlock: 60100004 });
 });
 
+test("buildRuntimeConfig defaults TRON to public RPC smoke range", () => {
+  const config = buildRuntimeConfig({});
+
+  assert.deepEqual(config.tron, { fromBlock: 83200000, toBlock: 83200002 });
+});
+
 test("formatters print normalized event and cache summaries", () => {
   const decoded = formatDecodedTransfers([
     {

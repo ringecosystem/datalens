@@ -67,8 +67,8 @@ export function buildRuntimeConfig(env: Environment = process.env): RuntimeConfi
       toSlot: intEnv(env, "DATALENS_SOLANA_TO_SLOT", 250000003),
     },
     tron: {
-      fromBlock: intEnv(env, "DATALENS_TRON_FROM_BLOCK", 60000000),
-      toBlock: intEnv(env, "DATALENS_TRON_TO_BLOCK", 60000002),
+      fromBlock: intEnv(env, "DATALENS_TRON_FROM_BLOCK", 83200000),
+      toBlock: intEnv(env, "DATALENS_TRON_TO_BLOCK", 83200002),
     },
   };
 }

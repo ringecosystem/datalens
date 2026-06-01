@@ -12,6 +12,8 @@ use super::{DEFAULT_SERVER_CONFIG, parse_bind};
 pub struct ServeCommand {
     #[arg(long, default_value = DEFAULT_SERVER_CONFIG, help = "Datalens server config path")]
     pub config: String,
+    #[arg(long, help = "Override server.bind for this serve process")]
+    pub bind: Option<String>,
 }
 
 pub fn serve_command(
@@ -21,7 +23,7 @@ pub fn serve_command(
     log::info!("starting datalens");
     let config = load_config(&command.config)?;
     validate_config(&config)?;
-    let bind = parse_bind(&config.server.bind)?;
+    let bind = parse_bind(command.bind.as_deref().unwrap_or(&config.server.bind))?;
     let registry = build_service_registry(&config)?;
     let warmup_scheduler = if config.warmup.enabled {
         Some(

@@ -106,8 +106,8 @@ func buildRuntimeConfig(env map[string]string) (runtimeConfig, error) {
 			End:   intEnv(env, "DATALENS_SOLANA_TO_SLOT", 250000003),
 		},
 		Tron: rangeConfig{
-			Start: intEnv(env, "DATALENS_TRON_FROM_BLOCK", 60000000),
-			End:   intEnv(env, "DATALENS_TRON_TO_BLOCK", 60000002),
+			Start: intEnv(env, "DATALENS_TRON_FROM_BLOCK", 83200000),
+			End:   intEnv(env, "DATALENS_TRON_TO_BLOCK", 83200002),
 		},
 	}
 	return config, nil

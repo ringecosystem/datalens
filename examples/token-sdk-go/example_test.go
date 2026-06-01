@@ -155,6 +155,18 @@ func TestRuntimeConfigReadsEndpointTokenApplicationAndRanges(t *testing.T) {
 	}
 }
 
+func TestRuntimeConfigDefaultsTronToPublicRPCSmokeRange(t *testing.T) {
+	config, err := buildRuntimeConfig(map[string]string{})
+	if err != nil {
+		t.Fatalf("build config: %v", err)
+	}
+
+	want := rangeConfig{Start: 83200000, End: 83200002}
+	if !reflect.DeepEqual(config.Tron, want) {
+		t.Fatalf("tron range = %#v, want %#v", config.Tron, want)
+	}
+}
+
 func TestFormattersPrintNormalizedEventAndCacheSummaries(t *testing.T) {
 	event := datalens.DecodedEvent{
 		BlockNumber:     19000000,
