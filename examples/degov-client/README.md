@@ -17,12 +17,18 @@ Start the shared Datalens cache service separately:
 cargo run -p datalens-cli -- serve --config config/datalens.dev.toml
 ```
 
-Start the Degov application index GraphQL service separately before running this
-client. This repository does not currently ship a stable Degov service command
-or checked-in Degov index service config. The service must be an already-running
-external application process, configured by that application, and it must expose
-the index GraphQL schema at the endpoint you pass to
-`DATALENS_INDEX_GRAPHQL_URL`.
+Start a Degov application index GraphQL service separately before running this
+client. For local e2e, this example ships an app-owned fixture service that
+exposes the decoded-event GraphQL contract consumed by the client:
+
+```sh
+DEGOV_FIXTURE_ADDR=127.0.0.1:3101 \
+  cargo run -p datalens-example-degov-client --bin degov-app-index-fixture
+```
+
+The fixture is not `datalens serve` and does not perform production indexing. It
+serves deterministic `VoteCast` pages, cursors, and pagination for client
+checkpoint and idempotency testing.
 
 For the local Datalens service setup, see `../../docs/runbook/local-rustfs.md`.
 For the runtime ownership boundary, see `../../docs/spec/production-runtime.md`.
@@ -31,7 +37,7 @@ Run the Degov consumer against the external application-owned index GraphQL
 endpoint:
 
 ```sh
-DATALENS_INDEX_GRAPHQL_URL=http://127.0.0.1:3100/graphql \
+DATALENS_INDEX_GRAPHQL_URL=http://127.0.0.1:3101/graphql \
 DEGOV_DATABASE_URL=sqlite:.tmp/degov-client.sqlite \
   cargo run -p datalens-example-degov-client
 ```
@@ -41,13 +47,23 @@ application service. The example binary's fallback URL is a local convention
 only; it is not provided by `datalens serve`. Use `DATALENS_TOKEN` when the
 external application service requires an authorization token.
 
+To validate duplicate handling after the first run, replay from the fixture's
+start cursor against the same SQLite database:
+
+```sh
+DATALENS_INDEX_GRAPHQL_URL=http://127.0.0.1:3101/graphql \
+DEGOV_DATABASE_URL=sqlite:.tmp/degov-client.sqlite \
+DEGOV_START_CURSOR=degov-cursor-0 \
+  cargo run -p datalens-example-degov-client
+```
+
 ## Configuration
 
 The application reads:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `DATALENS_INDEX_GRAPHQL_URL` | `http://127.0.0.1:3100/graphql` | External Degov application-owned index GraphQL endpoint |
+| `DATALENS_INDEX_GRAPHQL_URL` | `http://127.0.0.1:3100/graphql` | Degov application-owned index GraphQL endpoint |
 | `DATALENS_TOKEN` | unset | Optional bearer token |
 | `DEGOV_DATABASE_URL` | `sqlite:.tmp/degov-client.sqlite` | Application-owned SQLite database |
 | `DEGOV_PAGE_SIZE` | `25` | VoteCast page size |
