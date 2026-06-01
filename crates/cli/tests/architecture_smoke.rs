@@ -121,7 +121,7 @@ fn example_crate_roots_only_wire_modules_and_reexports() {
 
     for source in [ormp_lib, degov_lib] {
         assert!(source.contains("pub mod runner;"));
-        assert!(source.contains("pub use runner::{RunSummary, run_once};"));
+        assert!(source.contains("pub use runner::{RunSummary, run_once"));
         assert!(!source.contains("pub struct RunSummary"));
         assert!(!source.contains("pub fn run_once("));
         assert!(!source.contains("fn parse_checkpoint_block("));
@@ -198,8 +198,9 @@ fn local_compose_deployment_artifacts_are_declared() {
     assert!(compose_config.contains("rpc_urls = [\"${DATALENS_TRON_RPC_URL}\"]"));
     assert!(compose_config.contains("api_key = \"${DATALENS_TRONGRID_API_KEY}\""));
     assert!(
-        compose_config
-            .contains("chains = [\"ethereum\", \"solana-mainnet-beta\", \"tron-mainnet\"]")
+        compose_config.contains(
+            "chains = [\"ethereum\", \"arbitrum\", \"base\", \"darwinia\", \"solana-mainnet-beta\", \"tron-mainnet\"]"
+        )
     );
     assert!(compose_config.contains("datasets = [\"evm.blocks\", \"evm.logs\", \"solana.slots\", \"solana.transactions\", \"solana.instructions\", \"tron.blocks\", \"tron.events\"]"));
 
@@ -260,6 +261,45 @@ fn token_sdk_live_examples_match_compose_live_smoke_grants() {
     assert!(!go_example.contains("Textual: \"mainnet-beta\""));
     assert!(typescript_example.contains("networkId: { numeric: 101 }"));
     assert!(!typescript_example.contains("textual: \"mainnet-beta\""));
+}
+
+#[test]
+fn ormp_compose_application_covers_expected_evm_live_chains() {
+    let compose_config = include_str!("../../../config/datalens.compose.toml");
+    let config: toml::Value = toml::from_str(compose_config).expect("parse compose config");
+
+    let ormp = config["applications"]["applications"]
+        .as_array()
+        .expect("applications array")
+        .iter()
+        .find(|application| application["id"].as_str() == Some("ormp"))
+        .expect("ormp application");
+    let granted_chains = ormp["chains"].as_array().expect("ormp chains");
+    let granted_datasets = ormp["datasets"].as_array().expect("ormp datasets");
+    let granted_operations = ormp["operations"].as_array().expect("ormp operations");
+
+    assert_eq!(ormp["name"].as_str(), Some("ormp"));
+    assert_eq!(
+        granted_chains
+            .iter()
+            .map(|chain| chain.as_str().expect("chain name"))
+            .collect::<Vec<_>>(),
+        ["ethereum", "arbitrum", "base", "darwinia"]
+    );
+    assert_eq!(
+        granted_datasets
+            .iter()
+            .map(|dataset| dataset.as_str().expect("dataset name"))
+            .collect::<Vec<_>>(),
+        ["evm.blocks", "evm.logs"]
+    );
+    assert_eq!(
+        granted_operations
+            .iter()
+            .map(|operation| operation.as_str().expect("operation name"))
+            .collect::<Vec<_>>(),
+        ["query", "discovery"]
+    );
 }
 
 #[test]
