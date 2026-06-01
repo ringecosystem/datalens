@@ -24,6 +24,9 @@ outputs.
 - `e2e-native-query-flow.md`: local validation for the initial native EVM block and
   log query flow, deterministic cache behavior checks, multi-chain indexing gates, and
   the full durable cache lifecycle E2E with optional RustFS/S3-compatible coverage.
+- `examples-long-running-e2e.md`: canonical report template for long-running
+  `examples/` E2E workloads that compare first-run provider fill behavior with
+  second-run cache behavior.
 - `local-rustfs.md`: local RustFS object storage setup, bucket initialization, S3 test
   variables, stop, and cleanup commands.
 - `postgres-indexer-smoke.md`: opt-in PostgreSQL database setup and indexer smoke
