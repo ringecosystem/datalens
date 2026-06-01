@@ -57,6 +57,10 @@ pub struct EvmReceipt {
 struct RawLogRecord {
     block_number: u64,
     block_hash: String,
+    #[serde(default)]
+    parent_hash: Option<String>,
+    #[serde(default)]
+    block_timestamp: Option<u64>,
     transaction_hash: String,
     transaction_index: u64,
     log_index: u64,
@@ -71,6 +75,8 @@ struct RawLogRecord {
 pub struct LogRecord {
     pub block_number: u64,
     pub block_hash: String,
+    pub parent_hash: Option<String>,
+    pub block_timestamp: Option<u64>,
     pub transaction_hash: String,
     pub transaction_index: u64,
     pub log_index: u64,
@@ -95,6 +101,7 @@ impl TryFrom<RawLogRecord> for LogRecord {
             raw.data,
             raw.removed,
         )
+        .map(|record| record.with_block_metadata(raw.parent_hash, raw.block_timestamp))
     }
 }
 
@@ -115,6 +122,8 @@ impl LogRecord {
         Ok(Self {
             block_number,
             block_hash,
+            parent_hash: None,
+            block_timestamp: None,
             transaction_hash,
             transaction_index,
             log_index,
@@ -123,6 +132,16 @@ impl LogRecord {
             data,
             removed,
         })
+    }
+
+    pub fn with_block_metadata(
+        mut self,
+        parent_hash: Option<String>,
+        block_timestamp: Option<u64>,
+    ) -> Self {
+        self.parent_hash = parent_hash;
+        self.block_timestamp = block_timestamp;
+        self
     }
 }
 

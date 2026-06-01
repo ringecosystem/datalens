@@ -153,6 +153,8 @@ pub(crate) fn log(
     LogRecord {
         block_number,
         block_hash: format!("0xblock-{block_number}"),
+        parent_hash: None,
+        block_timestamp: None,
         transaction_hash: format!("0xtx-{block_number}-{log_index}"),
         transaction_index: 0,
         log_index,

@@ -106,6 +106,8 @@ fn evm_logs_batch(rows: &[LogRecord]) -> Result<RecordBatch, DatalensError> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("block_number", DataType::UInt64, false),
         Field::new("block_hash", DataType::Utf8, false),
+        Field::new("parent_hash", DataType::Utf8, true),
+        Field::new("block_timestamp", DataType::UInt64, true),
         Field::new("transaction_hash", DataType::Utf8, false),
         Field::new("transaction_index", DataType::UInt64, false),
         Field::new("log_index", DataType::UInt64, false),
@@ -133,6 +135,10 @@ fn evm_logs_batch(rows: &[LogRecord]) -> Result<RecordBatch, DatalensError> {
             )) as ArrayRef,
             Arc::new(StringArray::from_iter_values(
                 rows.iter().map(|row| row.block_hash.as_str()),
+            )),
+            optional_string_values(rows.iter().map(|row| row.parent_hash.as_deref())),
+            Arc::new(UInt64Array::from_iter(
+                rows.iter().map(|row| row.block_timestamp),
             )),
             Arc::new(StringArray::from_iter_values(
                 rows.iter().map(|row| row.transaction_hash.as_str()),
@@ -282,6 +288,8 @@ fn decode_evm_blocks(batch: &RecordBatch) -> Result<QueryRows, DatalensError> {
 fn decode_evm_logs(batch: &RecordBatch) -> Result<QueryRows, DatalensError> {
     let block_number = uint64_column(batch, "block_number")?;
     let block_hash = string_column(batch, "block_hash")?;
+    let parent_hash = optional_string_column(batch, "parent_hash")?;
+    let block_timestamp = optional_uint64_column(batch, "block_timestamp")?;
     let transaction_hash = string_column(batch, "transaction_hash")?;
     let transaction_index = uint64_column(batch, "transaction_index")?;
     let log_index = uint64_column(batch, "log_index")?;
@@ -294,17 +302,23 @@ fn decode_evm_logs(batch: &RecordBatch) -> Result<QueryRows, DatalensError> {
     for index in 0..batch.num_rows() {
         let topics = serde_json::from_str::<Vec<String>>(topics.value(index))
             .map_err(|error| parquet_read_error(format!("decode log topics: {error}")))?;
-        rows.push(LogRecord::try_new(
-            block_number.value(index),
-            block_hash.value(index).to_owned(),
-            transaction_hash.value(index).to_owned(),
-            transaction_index.value(index),
-            log_index.value(index),
-            address.value(index),
-            topics,
-            data.value(index).to_owned(),
-            removed.value(index),
-        )?);
+        rows.push(
+            LogRecord::try_new(
+                block_number.value(index),
+                block_hash.value(index).to_owned(),
+                transaction_hash.value(index).to_owned(),
+                transaction_index.value(index),
+                log_index.value(index),
+                address.value(index),
+                topics,
+                data.value(index).to_owned(),
+                removed.value(index),
+            )?
+            .with_block_metadata(
+                parent_hash.and_then(|column| optional_string(column, index)),
+                block_timestamp.and_then(|column| optional_u64(column, index)),
+            ),
+        );
     }
     Ok(QueryRows::EvmLogs(rows))
 }
@@ -395,11 +409,39 @@ fn uint64_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a UInt64Arr
         .ok_or_else(|| parquet_read_error(format!("missing UInt64 column {name}")))
 }
 
+fn optional_uint64_column<'a>(
+    batch: &'a RecordBatch,
+    name: &str,
+) -> Result<Option<&'a UInt64Array>, DatalensError> {
+    let Some(column) = batch.column_by_name(name) else {
+        return Ok(None);
+    };
+    column
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .map(Some)
+        .ok_or_else(|| parquet_read_error(format!("invalid UInt64 column {name}")))
+}
+
 fn string_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray, DatalensError> {
     batch
         .column_by_name(name)
         .and_then(|column| column.as_any().downcast_ref::<StringArray>())
         .ok_or_else(|| parquet_read_error(format!("missing Utf8 column {name}")))
+}
+
+fn optional_string_column<'a>(
+    batch: &'a RecordBatch,
+    name: &str,
+) -> Result<Option<&'a StringArray>, DatalensError> {
+    let Some(column) = batch.column_by_name(name) else {
+        return Ok(None);
+    };
+    column
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .map(Some)
+        .ok_or_else(|| parquet_read_error(format!("invalid Utf8 column {name}")))
 }
 
 fn bool_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a BooleanArray, DatalensError> {

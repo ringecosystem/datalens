@@ -44,6 +44,9 @@ fn test_slots_fetch_skips_missing_slots_and_keeps_ordered_adapter_json_rows() {
     assert_eq!(rows[0]["commitment"], "finalized");
     assert_eq!(rows[0]["blockhash"], "slot-10-hash");
     assert_eq!(rows[0]["previous_blockhash"], "slot-9-hash");
+    assert_eq!(rows[0]["block_hash"], "slot-10-hash");
+    assert_eq!(rows[0]["parent_hash"], "slot-9-hash");
+    assert_eq!(rows[0]["block_timestamp"], 1_700_000_010_u64);
     assert_eq!(rows[0]["parent_slot"], 9);
     assert_eq!(rows[0]["transaction_count"], 1);
 }
@@ -69,6 +72,9 @@ fn test_program_selector_fetches_transactions_and_instructions() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["signature"], "sig-slot-10");
     assert_eq!(rows[0]["selector_kind"], "solana_program");
+    assert_eq!(rows[0]["block_hash"], "slot-10-hash");
+    assert_eq!(rows[0]["parent_hash"], "slot-9-hash");
+    assert_eq!(rows[0]["block_timestamp"], 1_700_000_010_u64);
 
     let instructions = adapter
         .fetch(ChainFetchRequest::new(
@@ -249,6 +255,9 @@ fn test_signature_selector_uses_get_transaction_when_available() {
         panic!("expected adapter JSON rows");
     };
     assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["block_hash"], "slot-10-hash");
+    assert_eq!(rows[0]["parent_hash"], "slot-9-hash");
+    assert_eq!(rows[0]["block_timestamp"], 1_700_000_010_u64);
     assert_eq!(rows[0]["signature"], "sigslot10");
     assert_eq!(provider.transaction_calls(), vec!["sigslot10"]);
     assert_eq!(provider.blocks_with_limit_calls(), 0);

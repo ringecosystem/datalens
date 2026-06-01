@@ -207,6 +207,8 @@ fn record_batch(rows: &[NormalizedIndexedEvent], created_at: &str) -> io::Result
         Field::new("dataset", DataType::Utf8, false),
         Field::new("block_number", DataType::Int64, false),
         Field::new("block_hash", DataType::Utf8, true),
+        Field::new("parent_hash", DataType::Utf8, true),
+        Field::new("block_timestamp", DataType::Int64, true),
         Field::new("transaction_hash", DataType::Utf8, true),
         Field::new("transaction_index", DataType::Int64, true),
         Field::new("event_index", DataType::Int64, true),
@@ -233,6 +235,10 @@ fn record_batch(rows: &[NormalizedIndexedEvent], created_at: &str) -> io::Result
             rows.iter().map(|row| row.block_number),
         )),
         optional_string_values(rows.iter().map(|row| row.block_hash.as_deref())),
+        optional_string_values(rows.iter().map(|row| row.parent_hash.as_deref())),
+        Arc::new(Int64Array::from_iter(
+            rows.iter().map(|row| row.block_timestamp),
+        )),
         optional_string_values(rows.iter().map(|row| row.transaction_hash.as_deref())),
         Arc::new(Int64Array::from_iter(
             rows.iter().map(|row| row.transaction_index),
@@ -332,6 +338,11 @@ fn estimated_row_bytes(row: &NormalizedIndexedEvent) -> usize {
         + row.chain_identity.len()
         + row.dataset.len()
         + row.block_hash.as_ref().map(String::len).unwrap_or_default()
+        + row
+            .parent_hash
+            .as_ref()
+            .map(String::len)
+            .unwrap_or_default()
         + row
             .transaction_hash
             .as_ref()

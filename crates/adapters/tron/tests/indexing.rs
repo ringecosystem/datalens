@@ -212,6 +212,8 @@ fn test_tron_event_selector_filters_fallback_rows_by_contract_and_event_name() {
         "41abcdefabcdefabcdefabcdefabcdefabcdefabcd"
     );
     assert_eq!(rows[0]["event_name"], "Transfer");
+    assert_eq!(rows[0]["parent_hash"], "0000000000000009-tron-hash");
+    assert_eq!(rows[0]["block_timestamp"], 1_700_000_010_u64);
     assert_eq!(rows[0]["confirmed"], true);
     assert_eq!(rows[0]["source"]["provider"], "tron_block_scan");
 }
