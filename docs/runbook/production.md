@@ -75,11 +75,12 @@ the service binds `127.0.0.1:3000`.
 
 ```bash
 curl -fsS http://127.0.0.1:3000/health
+curl -fsS http://127.0.0.1:3000/healthz
 curl -fsS http://127.0.0.1:3000/metrics
 ```
 
-Expected output: `/health` returns `{"status":"ok"}` and `/metrics` returns Prometheus
-text when metrics are enabled.
+Expected output: `/health` and `/healthz` return `{"status":"ok"}` and `/metrics`
+returns Prometheus text when metrics are enabled.
 
 ## Backup
 
