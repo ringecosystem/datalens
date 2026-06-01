@@ -267,6 +267,7 @@ where
             return Ok(Some((vec![block], 2)));
         }
 
+        let mut block_metadata_by_slot = HashMap::new();
         let address = selector_value(selector, SOLANA_ADDRESS_KIND, "address/")
             .or_else(|| selector_value(selector, SOLANA_PROGRAM_KIND, "program/"));
         let Some(address) = address else {
@@ -320,8 +321,16 @@ where
             if let Some(transaction) = self.provider.get_transaction(&signature, FINALIZED)?
                 && range.contains(transaction.slot)
             {
-                provider_calls += 1;
-                blocks.push(self.block_for_transaction(transaction)?);
+                let was_cached = block_metadata_by_slot.contains_key(&transaction.slot);
+                blocks.push(
+                    self.block_for_transaction_with_cache(
+                        transaction,
+                        &mut block_metadata_by_slot,
+                    )?,
+                );
+                if !was_cached {
+                    provider_calls += 1;
+                }
             }
         }
         blocks.sort_by_key(|block| block.slot);
@@ -332,18 +341,34 @@ where
         &self,
         transaction: SolanaTransactionWithSlot,
     ) -> Result<SolanaBlock, DatalensError> {
-        let metadata = self
-            .provider
-            .get_block(transaction.slot, FINALIZED)?
-            .ok_or_else(|| {
-                DatalensError::new(
-                    DatalensErrorKind::ProviderFailure,
-                    format!(
-                        "provider returned no finalized Solana block metadata for slot {}",
-                        transaction.slot
-                    ),
-                )
-            })?;
+        let mut block_metadata_by_slot = HashMap::new();
+        self.block_for_transaction_with_cache(transaction, &mut block_metadata_by_slot)
+    }
+
+    fn block_for_transaction_with_cache(
+        &self,
+        transaction: SolanaTransactionWithSlot,
+        block_metadata_by_slot: &mut HashMap<u64, SolanaBlock>,
+    ) -> Result<SolanaBlock, DatalensError> {
+        let metadata = match block_metadata_by_slot.get(&transaction.slot) {
+            Some(metadata) => metadata.clone(),
+            None => {
+                let metadata = self
+                    .provider
+                    .get_block(transaction.slot, FINALIZED)?
+                    .ok_or_else(|| {
+                        DatalensError::new(
+                            DatalensErrorKind::ProviderFailure,
+                            format!(
+                                "provider returned no finalized Solana block metadata for slot {}",
+                                transaction.slot
+                            ),
+                        )
+                    })?;
+                block_metadata_by_slot.insert(transaction.slot, metadata.clone());
+                metadata
+            }
+        };
         if metadata.blockhash != transaction.blockhash {
             return Err(DatalensError::new(
                 DatalensErrorKind::ProviderFailure,

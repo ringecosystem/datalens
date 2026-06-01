@@ -300,6 +300,39 @@ fn test_address_selector_discovers_signatures_before_fetching_transactions() {
 }
 
 #[test]
+fn test_optimized_selector_reuses_finalized_block_metadata_for_same_slot() {
+    let provider = OptimizedSolanaRpc::with_same_slot_signatures();
+    let adapter = SolanaAdapter::with_provider(default_chain(), provider.clone());
+    let response = adapter
+        .fetch(ChainFetchRequest::new(
+            adapter.capabilities().chain().clone(),
+            DatasetKey::solana_transactions(),
+            LedgerRange::slots(10, 12).expect("valid range"),
+            solana_address_selector("Account111111111111111111111111111111111").expect("selector"),
+        ))
+        .expect("transactions");
+
+    let QueryRows::AdapterJson { rows, .. } = response.rows.rows() else {
+        panic!("expected adapter JSON rows");
+    };
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["signature"], "sigslot10-a");
+    assert_eq!(rows[0]["block_hash"], "slot-10-hash");
+    assert_eq!(rows[0]["parent_hash"], "slot-9-hash");
+    assert_eq!(rows[0]["block_timestamp"], 1_700_000_010_u64);
+    assert_eq!(rows[1]["signature"], "sigslot10-b");
+    assert_eq!(rows[1]["block_hash"], "slot-10-hash");
+    assert_eq!(rows[1]["parent_hash"], "slot-9-hash");
+    assert_eq!(rows[1]["block_timestamp"], 1_700_000_010_u64);
+    assert_eq!(
+        provider.transaction_calls(),
+        vec!["sigslot10-a", "sigslot10-b"]
+    );
+    assert_eq!(provider.block_calls(), vec![10]);
+    assert_eq!(response.provider_diagnostics.calls, 5);
+}
+
+#[test]
 fn test_optimized_selector_fetch_falls_back_to_slot_scan_on_provider_limit() {
     let provider = OptimizedSolanaRpc::with_signature_discovery_error(
         DatalensErrorKind::ProviderLimit,
@@ -555,6 +588,7 @@ struct OptimizedState {
     transaction_error: Option<DatalensErrorKind>,
     transaction_error_message: String,
     endless_newer_signature_pages: bool,
+    same_slot_signatures: bool,
 }
 
 impl OptimizedSolanaRpc {
@@ -585,6 +619,12 @@ impl OptimizedSolanaRpc {
             .lock()
             .expect("state")
             .endless_newer_signature_pages = true;
+        provider
+    }
+
+    fn with_same_slot_signatures() -> Self {
+        let provider = Self::default();
+        provider.state.lock().expect("state").same_slot_signatures = true;
         provider
     }
 
@@ -661,6 +701,18 @@ impl datalens_solana::SolanaRpc for OptimizedSolanaRpc {
         }
         if before.is_some() {
             return Ok(Vec::new());
+        }
+        if state.same_slot_signatures {
+            return Ok(vec![
+                SolanaSignatureInfo {
+                    signature: "sigslot10-a".to_owned(),
+                    slot: 10,
+                },
+                SolanaSignatureInfo {
+                    signature: "sigslot10-b".to_owned(),
+                    slot: 10,
+                },
+            ]);
         }
         Ok(vec![SolanaSignatureInfo {
             signature: "sigslot10".to_owned(),
