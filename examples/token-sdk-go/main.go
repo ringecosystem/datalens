@@ -132,9 +132,9 @@ func buildExampleQueries(config runtimeConfig) exampleQueries {
 			Chain: datalens.ChainIdentity{
 				Family:         datalens.ChainFamily{Kind: "other", Other: "solana"},
 				ConfiguredName: "solana-mainnet-beta",
-				NetworkID:      &datalens.NetworkID{Textual: "mainnet-beta"},
+				NetworkID:      &datalens.NetworkID{Numeric: intPtr(101)},
 			},
-			DatasetKey: datalens.DatasetKey{Family: "solana", Name: "account_updates"},
+			DatasetKey: datalens.DatasetKey{Family: "solana", Name: "transactions"},
 			Selector:   otherSelector("solana_address", "address", solanaUSDCMint, "solana-address"),
 			Range: datalens.QueryRange{
 				Kind:  "slot",

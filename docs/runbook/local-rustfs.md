@@ -137,6 +137,22 @@ cargo run -p datalens-cli -- index doctor --config config/datalens.tron-live-smo
 cargo run -p datalens-cli -- index run --config config/datalens.tron-live-smoke.index.toml
 ```
 
+Run the token SDK live examples against the compose `live-smoke` application:
+
+```sh
+export DATALENS_ENDPOINT=http://127.0.0.1:3000
+export DATALENS_APPLICATION=live-smoke
+export DATALENS_TOKEN=$DATALENS_LIVE_SMOKE_TOKEN
+
+cd examples/token-sdk-go
+go run .
+
+cd ../token-sdk-typescript
+npm install
+npm run build
+npm start
+```
+
 Run the three chain smokes together after setting the endpoints:
 
 ```sh

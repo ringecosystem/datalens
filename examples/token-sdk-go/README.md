@@ -30,14 +30,18 @@ on TRON. The TRON selector uses the normalized hex form
 Start Datalens separately:
 
 ```sh
-cargo run -p datalens-cli -- serve --config config/datalens.dev.toml
+export DATALENS_LIVE_SMOKE_TOKEN=replace-with-live-smoke-token
+cargo run -p datalens-cli -- serve --config config/datalens.compose.toml
 ```
 
 Run the example:
 
 ```sh
 cd examples/token-sdk-go
-DATALENS_ENDPOINT=http://127.0.0.1:3000 go run .
+export DATALENS_ENDPOINT=http://127.0.0.1:3000
+export DATALENS_APPLICATION=live-smoke
+export DATALENS_TOKEN=$DATALENS_LIVE_SMOKE_TOKEN
+go run .
 ```
 
 The first run over an uncached bounded range should show cache miss/fill
@@ -49,8 +53,8 @@ hit metadata for the Solana and TRON native queries.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `DATALENS_ENDPOINT` | `http://127.0.0.1:3000` | Datalens service endpoint |
-| `DATALENS_TOKEN` | unset | Optional bearer token |
-| `DATALENS_APPLICATION` | `token-sdk-go` | Application header value |
+| `DATALENS_TOKEN` | unset | Bearer token; use `$DATALENS_LIVE_SMOKE_TOKEN` with `config/datalens.compose.toml` |
+| `DATALENS_APPLICATION` | `token-sdk-go` | Application header value; use `live-smoke` with `config/datalens.compose.toml` |
 | `DATALENS_ETHEREUM_FROM_BLOCK` | `19000000` | Mock-covered Ethereum index query bounded start block |
 | `DATALENS_ETHEREUM_TO_BLOCK` | `19000010` | Mock-covered Ethereum index query bounded end block |
 | `DATALENS_ETHEREUM_FIRST` | `10` | Mock-covered Ethereum index query page size |
@@ -59,8 +63,10 @@ hit metadata for the Solana and TRON native queries.
 | `DATALENS_TRON_FROM_BLOCK` | `60000000` | TRON bounded start block |
 | `DATALENS_TRON_TO_BLOCK` | `60000002` | TRON bounded end block |
 
-Live smoke requires Datalens to be configured with RPC access for Solana and
-TRON. Do not commit real RPC URLs, API keys, or tokens.
+Live smoke uses `solana.transactions` on Solana chain id `101` and
+`tron.events` on TRON chain id `728126428`. It requires Datalens to be
+configured with RPC access for Solana and TRON. Do not commit real RPC URLs,
+API keys, or tokens.
 
 ## Tests
 

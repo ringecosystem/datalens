@@ -41,7 +41,7 @@ func TestRunExampleUsesNativeQueriesOnlyForLiveSmoke(t *testing.T) {
 		t.Fatalf("run example: %v", err)
 	}
 
-	wantCalls := []string{"solana.account_updates", "tron.events"}
+	wantCalls := []string{"solana.transactions", "tron.events"}
 	if !reflect.DeepEqual(client.calls, wantCalls) {
 		t.Fatalf("calls = %#v, want %#v", client.calls, wantCalls)
 	}
@@ -84,9 +84,9 @@ func TestBuildExampleQueriesUsesOfficialTokenTargetsAndBoundedRanges(t *testing.
 		Chain: datalens.ChainIdentity{
 			Family:         datalens.ChainFamily{Kind: "other", Other: "solana"},
 			ConfiguredName: "solana-mainnet-beta",
-			NetworkID:      &datalens.NetworkID{Textual: "mainnet-beta"},
+			NetworkID:      &datalens.NetworkID{Numeric: intPtr(101)},
 		},
-		DatasetKey: datalens.DatasetKey{Family: "solana", Name: "account_updates"},
+		DatasetKey: datalens.DatasetKey{Family: "solana", Name: "transactions"},
 		Selector: datalens.QuerySelector{
 			Kind: "other",
 			Other: &datalens.OtherSelector{
