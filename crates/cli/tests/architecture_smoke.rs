@@ -193,6 +193,50 @@ fn local_compose_deployment_artifacts_are_declared() {
 }
 
 #[test]
+fn token_sdk_live_examples_match_compose_live_smoke_grants() {
+    let compose_config = include_str!("../../../config/datalens.compose.toml");
+    let go_example = include_str!("../../../examples/token-sdk-go/main.go");
+    let typescript_example = include_str!("../../../examples/token-sdk-typescript/src/example.ts");
+    let config: toml::Value = toml::from_str(compose_config).expect("parse compose config");
+
+    let live_smoke = config["applications"]["applications"]
+        .as_array()
+        .expect("applications array")
+        .iter()
+        .find(|application| application["id"].as_str() == Some("live-smoke"))
+        .expect("live-smoke application");
+    let granted_chains = live_smoke["chains"].as_array().expect("live-smoke chains");
+    let granted_datasets = live_smoke["datasets"]
+        .as_array()
+        .expect("live-smoke datasets");
+    let solana_chain_id = config["chains"]["solana-mainnet-beta"]["chain_id"]
+        .as_integer()
+        .expect("solana chain id");
+
+    assert!(
+        granted_chains
+            .iter()
+            .any(|chain| chain.as_str() == Some("solana-mainnet-beta"))
+    );
+    assert!(
+        granted_datasets
+            .iter()
+            .any(|dataset| dataset.as_str() == Some("solana.transactions"))
+    );
+    assert_eq!(solana_chain_id, 101);
+
+    for source in [go_example, typescript_example] {
+        assert!(source.contains("solana-mainnet-beta"));
+        assert!(source.contains("transactions"));
+        assert!(!source.contains("account_updates"));
+    }
+    assert!(go_example.contains("NetworkID:      &datalens.NetworkID{Numeric: intPtr(101)}"));
+    assert!(!go_example.contains("Textual: \"mainnet-beta\""));
+    assert!(typescript_example.contains("networkId: { numeric: 101 }"));
+    assert!(!typescript_example.contains("textual: \"mainnet-beta\""));
+}
+
+#[test]
 fn authoritative_server_config_files_are_declared() {
     for path in [
         "../../config/datalens.dev.toml",

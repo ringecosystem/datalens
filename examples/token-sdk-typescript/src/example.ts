@@ -91,9 +91,9 @@ export function buildExampleQueries(config: RuntimeConfig): ExampleQueries {
       chain: {
         family: { kind: "other", other: "solana" },
         configuredName: "solana-mainnet-beta",
-        networkId: { textual: "mainnet-beta" },
+        networkId: { numeric: 101 },
       },
-      datasetKey: { family: "solana", name: "account_updates" },
+      datasetKey: { family: "solana", name: "transactions" },
       selector: otherSelector("solana_address", "address", solanaUSDCMint, "solana-address"),
       range: {
         kind: "slot",

@@ -44,7 +44,7 @@ test("runExample uses native queries only for live smoke", async () => {
     queries,
   );
 
-  assert.deepEqual(calls, ["solana.account_updates", "tron.events"]);
+  assert.deepEqual(calls, ["solana.transactions", "tron.events"]);
   assert.deepEqual(lines, [
     "solana-usdc cache={\"outcome\":\"miss\"}",
     "tron-usdt cache={\"outcome\":\"miss\"}",
@@ -73,7 +73,12 @@ test("buildExampleQueries uses official token targets and bounded ranges", () =>
     first: 3,
   });
 
-  assert.equal(queries.solana.datasetKey.name, "account_updates");
+  assert.deepEqual(queries.solana.chain, {
+    family: { kind: "other", other: "solana" },
+    configuredName: "solana-mainnet-beta",
+    networkId: { numeric: 101 },
+  });
+  assert.equal(queries.solana.datasetKey.name, "transactions");
   assert.deepEqual(queries.solana.selector, {
     kind: "other",
     other: {
@@ -138,7 +143,7 @@ test("formatters print normalized event and cache summaries", () => {
 
   const nativeResponse: NativeQueryResponse = {
     chain: { configuredName: "solana-mainnet-beta" },
-    datasetKey: "solana.account_updates",
+    datasetKey: "solana.transactions",
     range: { kind: "slot", start: 250000000, end: 250000003 },
     cache: { outcome: "hit", hit_ranges: [{ start: 250000000, end: 250000003 }] },
     rows: {
