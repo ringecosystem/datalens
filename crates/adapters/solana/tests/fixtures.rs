@@ -261,7 +261,8 @@ fn test_signature_selector_uses_get_transaction_when_available() {
     assert_eq!(rows[0]["signature"], "sigslot10");
     assert_eq!(provider.transaction_calls(), vec!["sigslot10"]);
     assert_eq!(provider.blocks_with_limit_calls(), 0);
-    assert_eq!(provider.block_calls(), Vec::<u64>::new());
+    assert_eq!(provider.block_calls(), vec![10]);
+    assert_eq!(response.provider_diagnostics.calls, 2);
 }
 
 #[test]
@@ -281,6 +282,10 @@ fn test_address_selector_discovers_signatures_before_fetching_transactions() {
         panic!("expected adapter JSON rows");
     };
     assert_eq!(rows.len(), 2);
+    for row in rows {
+        assert_eq!(row["parent_hash"], "slot-9-hash");
+        assert_eq!(row["block_timestamp"], 1_700_000_010_u64);
+    }
     assert_eq!(
         provider.signature_address_calls(),
         vec![
@@ -289,7 +294,9 @@ fn test_address_selector_discovers_signatures_before_fetching_transactions() {
         ]
     );
     assert_eq!(provider.transaction_calls(), vec!["sigslot10"]);
+    assert_eq!(provider.block_calls(), vec![10]);
     assert_eq!(provider.blocks_with_limit_calls(), 0);
+    assert_eq!(response.provider_diagnostics.calls, 4);
 }
 
 #[test]

@@ -17,8 +17,8 @@ use sha2::{Digest, Sha256};
 
 pub use crate::provider::{SolanaFixtureRpc, SolanaHttpRpc};
 use crate::rows::{
-    account_update_rows, block_from_transaction, block_rows, can_fallback_selector_fetch,
-    instruction_rows, selector_value, slot_rows, transaction_rows,
+    account_update_rows, block_rows, can_fallback_selector_fetch, instruction_rows, selector_value,
+    slot_rows, transaction_rows,
 };
 
 pub(crate) const SOLANA_ALL_KIND: &str = "solana_all";
@@ -263,7 +263,8 @@ where
             if !range.contains(transaction.slot) {
                 return Ok(Some((Vec::new(), 1)));
             }
-            return Ok(Some((vec![block_from_transaction(transaction)], 1)));
+            let block = self.block_for_transaction(transaction)?;
+            return Ok(Some((vec![block], 2)));
         }
 
         let address = selector_value(selector, SOLANA_ADDRESS_KIND, "address/")
@@ -319,11 +320,58 @@ where
             if let Some(transaction) = self.provider.get_transaction(&signature, FINALIZED)?
                 && range.contains(transaction.slot)
             {
-                blocks.push(block_from_transaction(transaction));
+                provider_calls += 1;
+                blocks.push(self.block_for_transaction(transaction)?);
             }
         }
         blocks.sort_by_key(|block| block.slot);
         Ok(Some((blocks, provider_calls)))
+    }
+
+    fn block_for_transaction(
+        &self,
+        transaction: SolanaTransactionWithSlot,
+    ) -> Result<SolanaBlock, DatalensError> {
+        let metadata = self
+            .provider
+            .get_block(transaction.slot, FINALIZED)?
+            .ok_or_else(|| {
+                DatalensError::new(
+                    DatalensErrorKind::ProviderFailure,
+                    format!(
+                        "provider returned no finalized Solana block metadata for slot {}",
+                        transaction.slot
+                    ),
+                )
+            })?;
+        if metadata.blockhash != transaction.blockhash {
+            return Err(DatalensError::new(
+                DatalensErrorKind::ProviderFailure,
+                format!(
+                    "Solana getTransaction blockhash {} did not match finalized block hash {} for slot {}",
+                    transaction.blockhash, metadata.blockhash, transaction.slot
+                ),
+            ));
+        }
+        if metadata.previous_blockhash.is_empty() {
+            return Err(DatalensError::new(
+                DatalensErrorKind::ProviderFailure,
+                format!(
+                    "finalized Solana block metadata missing previous blockhash for slot {}",
+                    transaction.slot
+                ),
+            ));
+        }
+        Ok(SolanaBlock {
+            slot: transaction.slot,
+            block_height: metadata.block_height,
+            blockhash: metadata.blockhash,
+            previous_blockhash: metadata.previous_blockhash,
+            parent_slot: metadata.parent_slot,
+            block_time: metadata.block_time,
+            transactions: vec![transaction.transaction],
+            raw: transaction.raw,
+        })
     }
 
     fn metadata(
