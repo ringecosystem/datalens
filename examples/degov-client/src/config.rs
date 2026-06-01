@@ -13,10 +13,8 @@ pub const DEFAULT_CHAIN_NAME: &str = "ethereum";
 pub const DEFAULT_CHAIN_ID: i32 = 1;
 pub const DEFAULT_DATASET_FAMILY: &str = "evm";
 pub const DEFAULT_DATASET_NAME: &str = "logs";
-pub const DEFAULT_CONTRACT_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 pub const DEFAULT_EVENT_TOPIC0: &str =
     "0xb8e138887d0aa13bab447e82de9d5c1777041ecd21ca36ba824ff1e6c07ddda4";
-pub const DEFAULT_START_BLOCK: i32 = 0;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AppConfig {
@@ -54,14 +52,41 @@ impl AppConfig {
                 "DEGOV_CHUNK_SIZE must be greater than zero".to_owned(),
             ));
         }
-        let start_block = env_i32("DEGOV_START_BLOCK", DEFAULT_START_BLOCK)?;
-        let end_block = optional_env_i32("DEGOV_END_BLOCK")?;
+        let start_block = required_live_selector_env("DEGOV_START_BLOCK")?
+            .parse()
+            .map_err(|error| {
+                AppError::Config(format!("DEGOV_START_BLOCK must be an integer: {error}"))
+            })?;
+        let end_block = Some(
+            required_live_selector_env("DEGOV_END_BLOCK")?
+                .parse()
+                .map_err(|error| {
+                    AppError::Config(format!("DEGOV_END_BLOCK must be an integer: {error}"))
+                })?,
+        );
         if let Some(end_block) = end_block
             && end_block < start_block
         {
             return Err(AppError::Config(
                 "DEGOV_END_BLOCK must be greater than or equal to DEGOV_START_BLOCK".to_owned(),
             ));
+        }
+
+        let contract_address = required_live_selector_env("DEGOV_CONTRACT_ADDRESS")?;
+        let event_topic0 = required_live_selector_env("DEGOV_EVENT_TOPIC0")?;
+        if !event_topic0.eq_ignore_ascii_case(DEFAULT_EVENT_TOPIC0) {
+            return Err(AppError::Config(format!(
+                "DEGOV_EVENT_TOPIC0 must match {}",
+                crate::datalens::VOTE_CAST_SIGNATURE
+            )));
+        }
+        let event_signature = env::var("DEGOV_EVENT_SIGNATURE")
+            .unwrap_or_else(|_| crate::datalens::VOTE_CAST_SIGNATURE.to_owned());
+        if event_signature != crate::datalens::VOTE_CAST_SIGNATURE {
+            return Err(AppError::Config(format!(
+                "DEGOV_EVENT_SIGNATURE must be {}",
+                crate::datalens::VOTE_CAST_SIGNATURE
+            )));
         }
 
         Ok(Self {
@@ -79,12 +104,9 @@ impl AppConfig {
                 .unwrap_or_else(|_| DEFAULT_DATASET_FAMILY.to_owned()),
             dataset_name: env::var("DEGOV_DATASET_NAME")
                 .unwrap_or_else(|_| DEFAULT_DATASET_NAME.to_owned()),
-            contract_address: env::var("DEGOV_CONTRACT_ADDRESS")
-                .unwrap_or_else(|_| DEFAULT_CONTRACT_ADDRESS.to_owned()),
-            event_topic0: env::var("DEGOV_EVENT_TOPIC0")
-                .unwrap_or_else(|_| DEFAULT_EVENT_TOPIC0.to_owned()),
-            event_signature: env::var("DEGOV_EVENT_SIGNATURE")
-                .unwrap_or_else(|_| crate::datalens::VOTE_CAST_SIGNATURE.to_owned()),
+            contract_address,
+            event_topic0,
+            event_signature,
             start_block,
             end_block,
             chunk_size,
@@ -108,6 +130,15 @@ impl AppConfig {
     }
 }
 
+fn required_live_selector_env(name: &str) -> AppResult<String> {
+    env::var(name).map_err(|_| {
+        AppError::Config(
+            "DEGOV_CONTRACT_ADDRESS, DEGOV_EVENT_TOPIC0, DEGOV_START_BLOCK, and DEGOV_END_BLOCK are required for live VoteCast indexing"
+                .to_owned(),
+        )
+    })
+}
+
 fn env_i32(name: &str, default: i32) -> AppResult<i32> {
     match env::var(name) {
         Ok(value) => value
@@ -115,17 +146,6 @@ fn env_i32(name: &str, default: i32) -> AppResult<i32> {
             .map_err(|error| AppError::Config(format!("{name} must be an integer: {error}"))),
         Err(_) => Ok(default),
     }
-}
-
-fn optional_env_i32(name: &str) -> AppResult<Option<i32>> {
-    env::var(name)
-        .ok()
-        .map(|value| {
-            value
-                .parse()
-                .map_err(|error| AppError::Config(format!("{name} must be an integer: {error}")))
-        })
-        .transpose()
 }
 
 fn env_bool(name: &str) -> bool {

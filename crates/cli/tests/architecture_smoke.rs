@@ -115,6 +115,20 @@ fn cli_command_implementations_are_split_by_boundary() {
 }
 
 #[test]
+fn example_crate_roots_only_wire_modules_and_reexports() {
+    let ormp_lib = include_str!("../../../examples/ormp-client/src/lib.rs");
+    let degov_lib = include_str!("../../../examples/degov-client/src/lib.rs");
+
+    for source in [ormp_lib, degov_lib] {
+        assert!(source.contains("pub mod runner;"));
+        assert!(source.contains("pub use runner::{RunSummary, run_once};"));
+        assert!(!source.contains("pub struct RunSummary"));
+        assert!(!source.contains("pub fn run_once("));
+        assert!(!source.contains("fn parse_checkpoint_block("));
+    }
+}
+
+#[test]
 fn production_boundary_artifacts_are_declared() {
     let dockerfile = include_str!("../../../Dockerfile");
     let dockerignore = include_str!("../../../.dockerignore");
