@@ -25,7 +25,6 @@ const (
 type rangeConfig struct {
 	Start int
 	End   int
-	First int
 }
 
 type runtimeConfig struct {
@@ -38,7 +37,7 @@ type runtimeConfig struct {
 }
 
 type exampleQueries struct {
-	Ethereum datalens.EventFilter
+	Ethereum datalens.QueryInput
 	Solana   datalens.QueryInput
 	Tron     datalens.QueryInput
 }
@@ -76,11 +75,17 @@ func main() {
 }
 
 func runExample(ctx context.Context, client tokenClient, queries exampleQueries) ([]string, error) {
+	ethereum, err := client.QueryNative(ctx, queries.Ethereum)
+	if err != nil {
+		return nil, err
+	}
+	lines := formatNativeRows("ethereum-usdc", ethereum)
+
 	solana, err := client.QueryNative(ctx, queries.Solana)
 	if err != nil {
 		return nil, err
 	}
-	lines := formatNativeRows("solana-usdc", solana)
+	lines = append(lines, formatNativeRows("solana-usdc", solana)...)
 
 	tron, err := client.QueryNative(ctx, queries.Tron)
 	if err != nil {
@@ -99,7 +104,6 @@ func buildRuntimeConfig(env map[string]string) (runtimeConfig, error) {
 		Ethereum: rangeConfig{
 			Start: intEnv(env, "DATALENS_ETHEREUM_FROM_BLOCK", 19000000),
 			End:   intEnv(env, "DATALENS_ETHEREUM_TO_BLOCK", 19000010),
-			First: intEnv(env, "DATALENS_ETHEREUM_FIRST", 10),
 		},
 		Solana: rangeConfig{
 			Start: intEnv(env, "DATALENS_SOLANA_FROM_SLOT", 250000000),
@@ -116,17 +120,26 @@ func buildRuntimeConfig(env map[string]string) (runtimeConfig, error) {
 func buildExampleQueries(config runtimeConfig) exampleQueries {
 	chainID := 1
 	return exampleQueries{
-		Ethereum: datalens.EventFilter{
-			Chain:     "ethereum",
-			ChainID:   &chainID,
-			Dataset:   "evm.logs",
-			Address:   ethereumUSDCAddress,
-			EventName: "Transfer",
-			Signature: erc20TransferSignature,
-			Topic0:    erc20TransferTopic0,
-			FromBlock: intPtr(config.Ethereum.Start),
-			ToBlock:   intPtr(config.Ethereum.End),
-			First:     config.Ethereum.First,
+		Ethereum: datalens.QueryInput{
+			Chain: datalens.ChainIdentity{
+				Family:         datalens.ChainFamily{Kind: "evm"},
+				ConfiguredName: "ethereum",
+				NetworkID:      &datalens.NetworkID{Numeric: &chainID},
+			},
+			DatasetKey: datalens.DatasetKey{Family: "evm", Name: "logs"},
+			Selector: datalens.QuerySelector{
+				Kind: "evm_logs",
+				EVMLogs: &datalens.EVMLogsSelector{
+					Addresses: []string{ethereumUSDCAddress},
+					Topics:    [][]string{{erc20TransferTopic0}},
+				},
+			},
+			Range: datalens.QueryRange{
+				Kind:  "block",
+				Start: config.Ethereum.Start,
+				End:   config.Ethereum.End,
+			},
+			Finality: "durable_only",
 		},
 		Solana: datalens.QueryInput{
 			Chain: datalens.ChainIdentity{
@@ -182,8 +195,9 @@ func formatDecodedTransfers(events []datalens.DecodedEvent) []string {
 }
 
 func formatNativeRows(label string, response datalens.QueryResponse) []string {
-	lines := []string{fmt.Sprintf("%s cache=%s", label, string(response.Cache))}
-	for _, row := range rowsFrom(response.Rows) {
+	rows := rowsFrom(response.Rows)
+	lines := []string{fmt.Sprintf("%s rows=%d cache=%s", label, len(rows), string(response.Cache))}
+	for _, row := range rows {
 		lines = append(lines, fmt.Sprintf("%s row=%s", label, string(row)))
 	}
 	return lines
@@ -217,11 +231,11 @@ func rowsFrom(raw json.RawMessage) []json.RawMessage {
 	if err := json.Unmarshal(raw, &array); err == nil {
 		return array
 	}
-	var object struct {
-		Rows []json.RawMessage `json:"rows"`
-	}
+	var object map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &object); err == nil {
-		return object.Rows
+		if rows, ok := object["rows"]; ok {
+			return rowsFrom(rows)
+		}
 	}
 	return nil
 }

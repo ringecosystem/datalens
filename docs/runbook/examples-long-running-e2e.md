@@ -46,6 +46,13 @@ Outputs:
   duration-based workloads, report `unbounded` plus the actual end block or slot reached.
 - Durable cache observations must describe finalized or safe coverage only. Reorg,
   latest, or hot-cache observations must not imply durable finality.
+- Separate service/cache correctness, provider data positivity, and business-row
+  insertion positivity. A cache hit over a zero-row range is valid cache evidence, but
+  it is not data-positive provider evidence or business insertion evidence.
+- Treat `ormp-client` and `degov-client` as external-business examples unless the run
+  supplies a contract/range known to return the target business event. Zero business rows
+  for those examples must be reported as structure-only or partial, not as data-positive
+  success.
 
 ## Report Template
 
@@ -77,6 +84,8 @@ Outputs:
 | Second-run status | <passed | failed | partial> |
 | Main cache comparison | <short statement> |
 | Blocking issues | <none or issue refs> |
+| Data-positive provider workloads | <count and names> |
+| Business-row-positive workloads | <count and names, or external fixture required> |
 
 ## Workload Inventory
 
@@ -175,6 +184,7 @@ rows when useful.
 - Provider behavior: <state whether provider calls dropped sharply on the second run>.
 - Storage behavior: <state whether storage growth was near zero for already covered ranges>.
 - Data behavior: <state whether business rows, duplicate skips, and invalid skips match expectations>.
+- Data-positive acceptance: <state which workloads proved non-empty provider rows and which proved non-empty business rows>.
 - Stability behavior: <state errors, retries, rate limits, timeouts, failed ranges, and finality caps>.
 
 ## Raw Evidence
@@ -216,6 +226,8 @@ rows when useful.
 - The comparison table includes total duration, provider calls, rows processed, cache hit
   ratio, new storage bytes, business rows inserted, duplicate rows skipped, and
   errors/retries.
+- Zero-row workloads are explicitly classified as cache-only, provider-data-positive, or
+  business-row-positive; do not infer one class from another.
 - For `ormp-client` and `degov-client`, record the application checkpoint as the
   next block number. If `*_RESET_CHECKPOINT=true` is used for a second-run replay,
   record duplicate business writes separately from normal resume runs that skip

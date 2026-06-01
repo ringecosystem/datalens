@@ -4,6 +4,11 @@ Purpose: Show an external ORMP application consuming raw native EVM logs from a
 shared Datalens service, decoding `MessageAccepted` locally, and owning its own
 business database and checkpoint.
 
+This is an external-business example. The default command documents the
+application structure and cache path, but the public range is not treated as a
+data-positive live E2E fixture unless the selected contract/range returns at
+least one `MessageAccepted` log during that run.
+
 ## Runtime model
 
 `datalens serve` runs independently as the shared cache service. It exposes the
@@ -100,6 +105,10 @@ The executable prints a concise one-page summary:
 ```text
 fetched=1 inserted=1 duplicates=0 invalid=0 checkpoint=20009691 has_next_page=false
 ```
+
+For live E2E reporting, `fetched=0 inserted=0` can still prove service/cache
+correctness for a bounded native query, but it must not be counted as
+business-row insertion positivity.
 
 ## Tests
 

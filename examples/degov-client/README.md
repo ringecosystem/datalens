@@ -4,6 +4,11 @@ Purpose: Show a governance application that consumes raw native EVM logs from
 Datalens, decodes `VoteCast` locally, and owns its database schema, checkpoint,
 and proposal projections.
 
+This is an external-business example. A reliable public `VoteCast` contract and
+range is not maintained in this repository, so default live E2E acceptance must
+exclude Degov from data-positive business-row requirements unless the caller
+provides a known non-empty governance contract/range.
+
 `datalens serve` runs independently as the shared cache service. It exposes the
 native Datalens REST and GraphQL surfaces, such as `/v1/query` and
 `/native/graphql`; `datalens serve` does not expose `/index/graphql`.
@@ -41,6 +46,10 @@ SDK client appends the native GraphQL path. Use `DATALENS_TOKEN` when the
 service requires an authorization token. A reliable public live VoteCast range
 is intentionally not baked into the example; provide a governance contract and
 block range that are valid for your indexed EVM log dataset.
+
+For live E2E reporting, `fetched=0 inserted=0` can still prove service/cache
+correctness for a bounded native query, but it must not be counted as
+business-row insertion positivity.
 
 To validate duplicate handling after the first run, run the same command again
 against the same SQLite database. The application resumes from its stored

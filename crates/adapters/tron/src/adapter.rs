@@ -542,12 +542,65 @@ pub fn normalize_tron_contract_address(address: &str) -> Result<String, Datalens
         && address.starts_with('T')
         && address.bytes().all(|b| b.is_ascii_alphanumeric())
     {
-        return Ok(address.to_owned());
+        return base58check_decode_address(address);
     }
     Err(DatalensError::new(
         DatalensErrorKind::InvalidInput,
         "Tron contract address must be 20-byte hex, 41-prefixed hex, or base58",
     ))
+}
+
+fn base58check_decode_address(address: &str) -> Result<String, DatalensError> {
+    let decoded = base58_decode(address).ok_or_else(|| {
+        DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "Tron base58 address contains an invalid digit",
+        )
+    })?;
+    if decoded.len() != 25 {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "Tron base58 address has an invalid length",
+        ));
+    }
+    let (payload, checksum) = decoded.split_at(21);
+    let first = Sha256::digest(payload);
+    let second = Sha256::digest(first);
+    if checksum != &second[..4] {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "Tron base58 address checksum is invalid",
+        ));
+    }
+    if payload.first() != Some(&0x41) {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "Tron base58 address must use mainnet 0x41 prefix",
+        ));
+    }
+    Ok(payload.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn base58_decode(value: &str) -> Option<Vec<u8>> {
+    const ALPHABET: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+    let mut bytes = vec![0_u8];
+    for character in value.bytes() {
+        let mut carry = ALPHABET.iter().position(|byte| *byte == character)? as u32;
+        for byte in &mut bytes {
+            let next = u32::from(*byte) * 58 + carry;
+            *byte = (next % 256) as u8;
+            carry = next / 256;
+        }
+        while carry > 0 {
+            bytes.push((carry % 256) as u8);
+            carry /= 256;
+        }
+    }
+    let leading_zeroes = value.bytes().take_while(|byte| *byte == b'1').count();
+    let mut decoded = vec![0_u8; leading_zeroes];
+    decoded.extend(bytes.iter().rev());
+    Some(decoded)
 }
 
 fn adapter_key(value: &str) -> AdapterKey {

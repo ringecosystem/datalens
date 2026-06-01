@@ -22,16 +22,16 @@ func (client *recordingTokenClient) QueryNative(_ context.Context, input datalen
 	client.calls = append(client.calls, input.DatasetKey.Family+"."+input.DatasetKey.Name)
 	return datalens.QueryResponse{
 		Cache: json.RawMessage(`{"outcome":"miss"}`),
-		Rows:  json.RawMessage(`[]`),
+		Rows:  json.RawMessage(`{"dataset_key":{"family":"` + input.DatasetKey.Family + `","name":"` + input.DatasetKey.Name + `"},"rows":{"dataset":"adapter_json","rows":{"dataset_key":{"family":"` + input.DatasetKey.Family + `","name":"` + input.DatasetKey.Name + `"},"rows":[{"sample":true}]}}}`),
 	}, nil
 }
 
-func TestRunExampleUsesNativeQueriesOnlyForLiveSmoke(t *testing.T) {
+func TestRunExampleUsesNativeQueriesForEveryConfiguredLiveSmokeWorkload(t *testing.T) {
 	client := &recordingTokenClient{}
 	queries := buildExampleQueries(runtimeConfig{
 		Endpoint:    "http://127.0.0.1:3000",
 		Application: "token-sdk-go",
-		Ethereum:    rangeConfig{Start: 19000000, End: 19000010, First: 3},
+		Ethereum:    rangeConfig{Start: 19000000, End: 19000010},
 		Solana:      rangeConfig{Start: 250000000, End: 250000003},
 		Tron:        rangeConfig{Start: 60000000, End: 60000002},
 	})
@@ -41,13 +41,17 @@ func TestRunExampleUsesNativeQueriesOnlyForLiveSmoke(t *testing.T) {
 		t.Fatalf("run example: %v", err)
 	}
 
-	wantCalls := []string{"solana.transactions", "tron.events"}
+	wantCalls := []string{"evm.logs", "solana.transactions", "tron.events"}
 	if !reflect.DeepEqual(client.calls, wantCalls) {
 		t.Fatalf("calls = %#v, want %#v", client.calls, wantCalls)
 	}
 	wantLines := []string{
-		`solana-usdc cache={"outcome":"miss"}`,
-		`tron-usdt cache={"outcome":"miss"}`,
+		`ethereum-usdc rows=1 cache={"outcome":"miss"}`,
+		`ethereum-usdc row={"sample":true}`,
+		`solana-usdc rows=1 cache={"outcome":"miss"}`,
+		`solana-usdc row={"sample":true}`,
+		`tron-usdt rows=1 cache={"outcome":"miss"}`,
+		`tron-usdt row={"sample":true}`,
 	}
 	if !reflect.DeepEqual(lines, wantLines) {
 		t.Fatalf("lines = %#v, want %#v", lines, wantLines)
@@ -58,23 +62,28 @@ func TestBuildExampleQueriesUsesOfficialTokenTargetsAndBoundedRanges(t *testing.
 	queries := buildExampleQueries(runtimeConfig{
 		Endpoint:    "http://127.0.0.1:3000",
 		Application: "token-sdk-go",
-		Ethereum:    rangeConfig{Start: 19000000, End: 19000010, First: 3},
+		Ethereum:    rangeConfig{Start: 19000000, End: 19000010},
 		Solana:      rangeConfig{Start: 250000000, End: 250000003},
 		Tron:        rangeConfig{Start: 60000000, End: 60000002},
 	})
 
 	chainID := 1
-	wantEthereum := datalens.EventFilter{
-		Chain:     "ethereum",
-		ChainID:   &chainID,
-		Dataset:   "evm.logs",
-		Address:   ethereumUSDCAddress,
-		EventName: "Transfer",
-		Signature: erc20TransferSignature,
-		Topic0:    erc20TransferTopic0,
-		FromBlock: intPtr(19000000),
-		ToBlock:   intPtr(19000010),
-		First:     3,
+	wantEthereum := datalens.QueryInput{
+		Chain: datalens.ChainIdentity{
+			Family:         datalens.ChainFamily{Kind: "evm"},
+			ConfiguredName: "ethereum",
+			NetworkID:      &datalens.NetworkID{Numeric: &chainID},
+		},
+		DatasetKey: datalens.DatasetKey{Family: "evm", Name: "logs"},
+		Selector: datalens.QuerySelector{
+			Kind: "evm_logs",
+			EVMLogs: &datalens.EVMLogsSelector{
+				Addresses: []string{ethereumUSDCAddress},
+				Topics:    [][]string{{erc20TransferTopic0}},
+			},
+		},
+		Range:    datalens.QueryRange{Kind: "block", Start: 19000000, End: 19000010},
+		Finality: "durable_only",
 	}
 	if !reflect.DeepEqual(queries.Ethereum, wantEthereum) {
 		t.Fatalf("ethereum query = %#v, want %#v", queries.Ethereum, wantEthereum)
@@ -132,7 +141,6 @@ func TestRuntimeConfigReadsEndpointTokenApplicationAndRanges(t *testing.T) {
 		"DATALENS_APPLICATION":         "demo-app",
 		"DATALENS_ETHEREUM_FROM_BLOCK": "19100000",
 		"DATALENS_ETHEREUM_TO_BLOCK":   "19100001",
-		"DATALENS_ETHEREUM_FIRST":      "2",
 		"DATALENS_SOLANA_FROM_SLOT":    "251000000",
 		"DATALENS_SOLANA_TO_SLOT":      "251000005",
 		"DATALENS_TRON_FROM_BLOCK":     "60100000",
@@ -146,7 +154,7 @@ func TestRuntimeConfigReadsEndpointTokenApplicationAndRanges(t *testing.T) {
 		Endpoint:    "http://datalens.example",
 		Token:       "secret-token",
 		Application: "demo-app",
-		Ethereum:    rangeConfig{Start: 19100000, End: 19100001, First: 2},
+		Ethereum:    rangeConfig{Start: 19100000, End: 19100001},
 		Solana:      rangeConfig{Start: 251000000, End: 251000005},
 		Tron:        rangeConfig{Start: 60100000, End: 60100004},
 	}
@@ -184,11 +192,11 @@ func TestFormattersPrintNormalizedEventAndCacheSummaries(t *testing.T) {
 
 	response := datalens.QueryResponse{
 		Cache: json.RawMessage(`{"outcome":"hit","hit_ranges":[{"start":250000000,"end":250000003}]}`),
-		Rows:  json.RawMessage(`{"rows":[{"slot":250000001,"signature":"5sig","account":"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v","post_amount":"42"}]}`),
+		Rows:  json.RawMessage(`{"dataset_key":{"family":"solana","name":"transactions"},"rows":{"dataset":"adapter_json","rows":{"dataset_key":{"family":"solana","name":"transactions"},"rows":[{"slot":250000001,"signature":"5sig","account":"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v","post_amount":"42"}]}}}`),
 	}
 	native := formatNativeRows("solana-usdc", response)
 	wantNative := []string{
-		`solana-usdc cache={"outcome":"hit","hit_ranges":[{"start":250000000,"end":250000003}]}`,
+		`solana-usdc rows=1 cache={"outcome":"hit","hit_ranges":[{"start":250000000,"end":250000003}]}`,
 		`solana-usdc row={"slot":250000001,"signature":"5sig","account":"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v","post_amount":"42"}`,
 	}
 	if !reflect.DeepEqual(native, wantNative) {

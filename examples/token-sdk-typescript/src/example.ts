@@ -1,9 +1,7 @@
 import { createHash } from "node:crypto";
 
 import type {
-  ConnectionPage,
   DecodedEvent,
-  EventQuery,
   JsonValue,
   NativeQueryInput,
   NativeQueryResponse,
@@ -23,7 +21,6 @@ export type RuntimeConfig = {
   ethereum: {
     fromBlock: number;
     toBlock: number;
-    first: number;
   };
   solana: {
     fromSlot: number;
@@ -36,15 +33,12 @@ export type RuntimeConfig = {
 };
 
 export type ExampleQueries = {
-  ethereum: EventQuery;
+  ethereum: NativeQueryInput;
   solana: NativeQueryInput;
   tron: NativeQueryInput;
 };
 
 export type ExampleClient = {
-  index: {
-    queryDecodedEvents(query: EventQuery): Promise<ConnectionPage<DecodedEvent>>;
-  };
   native: {
     query(query: NativeQueryInput): Promise<NativeQueryResponse>;
   };
@@ -60,7 +54,6 @@ export function buildRuntimeConfig(env: Environment = process.env): RuntimeConfi
     ethereum: {
       fromBlock: intEnv(env, "DATALENS_ETHEREUM_FROM_BLOCK", 19000000),
       toBlock: intEnv(env, "DATALENS_ETHEREUM_TO_BLOCK", 19000010),
-      first: intEnv(env, "DATALENS_ETHEREUM_FIRST", 10),
     },
     solana: {
       fromSlot: intEnv(env, "DATALENS_SOLANA_FROM_SLOT", 250000000),
@@ -76,16 +69,25 @@ export function buildRuntimeConfig(env: Environment = process.env): RuntimeConfi
 export function buildExampleQueries(config: RuntimeConfig): ExampleQueries {
   return {
     ethereum: {
-      chain: "ethereum",
-      chainId: 1,
-      dataset: "evm.logs",
-      address: ethereumUSDCAddress,
-      eventName: "Transfer",
-      signature: erc20TransferSignature,
-      topic0: erc20TransferTopic0,
-      fromBlock: config.ethereum.fromBlock,
-      toBlock: config.ethereum.toBlock,
-      first: config.ethereum.first,
+      chain: {
+        family: { kind: "evm" },
+        configuredName: "ethereum",
+        networkId: { numeric: 1 },
+      },
+      datasetKey: { family: "evm", name: "logs" },
+      selector: {
+        kind: "evm_logs",
+        evmLogs: {
+          addresses: [ethereumUSDCAddress],
+          topics: [[erc20TransferTopic0]],
+        },
+      },
+      range: {
+        kind: "block",
+        start: config.ethereum.fromBlock,
+        end: config.ethereum.toBlock,
+      },
+      finality: "durable_only",
     },
     solana: {
       chain: {
@@ -136,16 +138,20 @@ export function formatDecodedTransfers(events: DecodedEvent[]): string[] {
 }
 
 export function formatNativeRows(label: string, response: NativeQueryResponse): string[] {
-  const lines = [`${label} cache=${stableJson(response.cache)}`];
-  for (const row of rowsFrom(response.rows)) {
+  const rows = rowsFrom(response.rows);
+  const lines = [`${label} rows=${rows.length} cache=${stableJson(response.cache)}`];
+  for (const row of rows) {
     lines.push(`${label} row=${stableJson(row)}`);
   }
   return lines;
 }
 
 export async function runExample(client: ExampleClient, queries: ExampleQueries): Promise<string[]> {
+  const ethereum = await client.native.query(queries.ethereum);
+  const lines = formatNativeRows("ethereum-usdc", ethereum);
+
   const solana = await client.native.query(queries.solana);
-  const lines = formatNativeRows("solana-usdc", solana);
+  lines.push(...formatNativeRows("solana-usdc", solana));
 
   const tron = await client.native.query(queries.tron);
   lines.push(...formatNativeRows("tron-usdt", tron));
@@ -184,10 +190,14 @@ function rowsFrom(rows: JsonValue): JsonValue[] {
   if (Array.isArray(rows)) {
     return rows;
   }
-  if (rows != null && typeof rows === "object" && "rows" in rows && Array.isArray(rows.rows)) {
-    return rows.rows;
+  if (isJsonObject(rows) && "rows" in rows) {
+    return rowsFrom(rows.rows);
   }
   return [];
+}
+
+function isJsonObject(value: JsonValue): value is { [key: string]: JsonValue } {
+  return value != null && typeof value === "object" && !Array.isArray(value);
 }
 
 function stableJson(value: JsonValue): string {
