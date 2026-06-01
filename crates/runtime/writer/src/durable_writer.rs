@@ -250,9 +250,10 @@ where
         let mut staged_ranges = Vec::new();
 
         for segment in segments {
-            if segment.rows.row_count() == 0 {
-                // Empty coverage has no data object to compact, and delaying it
-                // would make the manifest under-report provider-confirmed gaps.
+            if segment.rows.row_count() == 0 || rows_must_be_durable_immediately(&segment.rows) {
+                // Empty coverage and adapter JSON rows must be visible through
+                // manifest coverage immediately; staged JSON rows would be
+                // lost across a fresh query executor before shutdown flush.
                 direct_segments.push(segment);
             } else {
                 staged_ranges.push(segment.range.clone());
@@ -615,6 +616,10 @@ fn estimated_object_bytes(rows: &DatasetRows) -> Result<u64, DatalensError> {
                 )
             }),
     }
+}
+
+fn rows_must_be_durable_immediately(rows: &DatasetRows) -> bool {
+    matches!(rows.rows(), QueryRows::AdapterJson { .. })
 }
 
 fn estimated_object_bytes_after_merge(

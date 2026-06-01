@@ -15,7 +15,7 @@ use datalens_solana::{
     SolanaRpc, SolanaTokenBalance, SolanaTransaction, solana_address_selector,
 };
 use datalens_storage::LocalStorage;
-use datalens_writer::DurableWriterConfig;
+use datalens_writer::{DurableWriterConfig, WriteStagingConfig};
 use serde_json::{Value, json};
 
 #[test]
@@ -189,6 +189,65 @@ fn test_durable_query_reads_indexed_solana_data_without_provider_fill() {
 }
 
 #[test]
+fn test_small_solana_json_rows_survive_query_executor_restart_with_staging_enabled() {
+    let storage_root = temp_storage_root("small-json-restart");
+    let first_provider = CountingSolanaRpc::default();
+    let first_adapter =
+        SolanaAdapter::with_provider(solana_chain(), first_provider).with_max_slot_range_len(3);
+    let first_executor = NativeQueryExecutor::new(
+        LocalStorage::new(&storage_root),
+        first_adapter.clone(),
+        NativeQueryExecutionConfig {
+            planner: NativePlannerConfig {
+                max_query_range_len: 10,
+                default_chunk_range_len: 10,
+            },
+            writer: staged_writer_config(),
+        },
+    );
+    let input = NativeQueryInput {
+        chain: first_adapter.capabilities().chain().clone(),
+        dataset_key: DatasetKey::solana_transactions(),
+        ledger_range: LedgerRange::slots(10, 12).expect("range"),
+        selector: DatasetSelector::all(),
+        field_selection: FieldSelection::All,
+        finality: datalens_core::QueryFinalityRequirement::DurableOnly,
+    };
+
+    let first = first_executor
+        .execute(input.clone())
+        .expect("first query fills small JSON rows");
+    assert_eq!(first.rows.row_count(), 2);
+
+    let second_provider = CountingSolanaRpc::default();
+    let second_adapter = SolanaAdapter::with_provider(solana_chain(), second_provider.clone())
+        .with_max_slot_range_len(3);
+    let second_executor = NativeQueryExecutor::new(
+        LocalStorage::new(&storage_root),
+        second_adapter,
+        NativeQueryExecutionConfig {
+            planner: NativePlannerConfig {
+                max_query_range_len: 10,
+                default_chunk_range_len: 10,
+            },
+            writer: staged_writer_config(),
+        },
+    );
+    let second = second_executor
+        .execute(input)
+        .expect("restarted query reads durable JSON rows");
+
+    assert_eq!(
+        second.cache.durable_hit_ranges,
+        vec![LedgerRange::slots(10, 12).expect("range")]
+    );
+    assert_eq!(second.cache.provider_fill_ranges, Vec::<LedgerRange>::new());
+    assert_eq!(second.rows.row_count(), 2);
+    assert_eq!(second_provider.blocks_with_limit_calls(), 0);
+    assert_eq!(second_provider.block_calls(), Vec::<u64>::new());
+}
+
+#[test]
 fn test_selector_specific_solana_indexing_reads_back_without_all_selector_collision() {
     let storage = LocalStorage::new(temp_storage_root("selector-specific-readback"));
     let provider = CountingSolanaRpc::default();
@@ -335,6 +394,19 @@ fn writer_config() -> DurableWriterConfig {
         min_object_rows: 1,
         record_empty_coverage: true,
         staging: Default::default(),
+    }
+}
+
+fn staged_writer_config() -> DurableWriterConfig {
+    DurableWriterConfig {
+        target_object_bytes: 1024 * 1024,
+        min_object_rows: 1000,
+        record_empty_coverage: true,
+        staging: WriteStagingConfig {
+            enabled: true,
+            min_rows: Some(1000),
+            ..Default::default()
+        },
     }
 }
 

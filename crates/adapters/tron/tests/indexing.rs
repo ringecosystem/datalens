@@ -18,7 +18,7 @@ use datalens_tron::{
     TronEventFilter, TronFinality, TronFixtureProviderRpc, TronProvider, tron_all_selector,
     tron_event_selector,
 };
-use datalens_writer::DurableWriterConfig;
+use datalens_writer::{DurableWriterConfig, WriteStagingConfig};
 
 #[test]
 fn test_tron_full_indexing_writes_all_durable_datasets() {
@@ -94,6 +94,61 @@ fn test_tron_empty_events_record_durable_coverage() {
             .expect("coverage"),
         vec![LedgerRange::blocks(11, 12).expect("range")]
     );
+}
+
+#[test]
+fn test_small_tron_json_rows_survive_query_executor_restart_with_staging_enabled() {
+    let storage_root = temp_storage_root("small-json-restart");
+    let first_adapter =
+        TronAdapter::with_provider(test_tron_chain(), CountingTronProvider::default());
+    let first_executor = NativeQueryExecutor::new(
+        LocalStorage::new(&storage_root),
+        first_adapter.clone(),
+        NativeQueryExecutionConfig {
+            planner: NativePlannerConfig {
+                max_query_range_len: 10,
+                default_chunk_range_len: 10,
+            },
+            writer: staged_writer_config(),
+        },
+    );
+    let input = NativeQueryInput {
+        chain: first_adapter.capabilities().chain().clone(),
+        dataset_key: DatasetKey::tron_events(),
+        ledger_range: LedgerRange::blocks(10, 12).expect("range"),
+        selector: tron_all_selector().expect("selector"),
+        field_selection: FieldSelection::All,
+        finality: QueryFinalityRequirement::DurableOnly,
+    };
+
+    let first = first_executor
+        .execute(input.clone())
+        .expect("first query fills small JSON rows");
+    assert_eq!(first.rows.row_count(), 1);
+
+    let second_provider = CountingTronProvider::default();
+    let second_executor = NativeQueryExecutor::new(
+        LocalStorage::new(&storage_root),
+        TronAdapter::with_provider(test_tron_chain(), second_provider.clone()),
+        NativeQueryExecutionConfig {
+            planner: NativePlannerConfig {
+                max_query_range_len: 10,
+                default_chunk_range_len: 10,
+            },
+            writer: staged_writer_config(),
+        },
+    );
+    let second = second_executor
+        .execute(input)
+        .expect("restarted query reads durable JSON rows");
+
+    assert_eq!(
+        second.cache.durable_hit_ranges,
+        vec![LedgerRange::blocks(10, 12).expect("range")]
+    );
+    assert_eq!(second.cache.provider_fill_ranges, Vec::<LedgerRange>::new());
+    assert_eq!(second.rows.row_count(), 1);
+    assert_eq!(second_provider.data_fetch_calls(), 0);
 }
 
 #[test]
@@ -785,6 +840,26 @@ fn writer_config() -> DurableWriterConfig {
     }
 }
 
+fn staged_writer_config() -> DurableWriterConfig {
+    DurableWriterConfig {
+        target_object_bytes: 1024 * 1024,
+        min_object_rows: 1000,
+        record_empty_coverage: true,
+        staging: WriteStagingConfig {
+            enabled: true,
+            min_rows: Some(1000),
+            ..Default::default()
+        },
+    }
+}
+
+fn test_tron_chain() -> datalens_core::ChainIdentity {
+    TronAdapter::with_fixture_defaults()
+        .capabilities()
+        .chain()
+        .clone()
+}
+
 fn temp_storage_root(name: &str) -> std::path::PathBuf {
     let root = std::env::temp_dir().join(format!(
         "datalens-tron-indexing-{name}-{}",
@@ -795,6 +870,57 @@ fn temp_storage_root(name: &str) -> std::path::PathBuf {
     ));
     std::fs::create_dir_all(&root).expect("create temp dir");
     root
+}
+
+#[derive(Clone, Default)]
+struct CountingTronProvider {
+    inner: TronFixtureProviderRpc,
+    data_fetch_calls: Arc<Mutex<usize>>,
+}
+
+impl CountingTronProvider {
+    fn data_fetch_calls(&self) -> usize {
+        *self.data_fetch_calls.lock().expect("data fetch calls")
+    }
+}
+
+impl TronProvider for CountingTronProvider {
+    fn latest_block(&self, finality: TronFinality) -> Result<TronBlock, DatalensError> {
+        self.inner.latest_block(finality)
+    }
+
+    fn get_block_by_number(
+        &self,
+        number: u64,
+        finality: TronFinality,
+    ) -> Result<Option<TronBlock>, DatalensError> {
+        *self.data_fetch_calls.lock().expect("data fetch calls") += 1;
+        self.inner.get_block_by_number(number, finality)
+    }
+
+    fn get_transaction_info_by_id(
+        &self,
+        tx_id: &str,
+    ) -> Result<Option<serde_json::Value>, DatalensError> {
+        *self.data_fetch_calls.lock().expect("data fetch calls") += 1;
+        self.inner.get_transaction_info_by_id(tx_id)
+    }
+
+    fn supports_contract_event_query(&self) -> bool {
+        self.inner.supports_contract_event_query()
+    }
+
+    fn get_contract_events(
+        &self,
+        request: TronContractEventRequest,
+    ) -> Result<TronContractEventPage, DatalensError> {
+        *self.data_fetch_calls.lock().expect("data fetch calls") += 1;
+        self.inner.get_contract_events(request)
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "counting-tron-fixture"
+    }
 }
 
 #[derive(Clone, Debug)]
