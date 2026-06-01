@@ -21,6 +21,9 @@ outputs.
 
 - `chain-adapter-conformance.md`: checklist for wiring a chain adapter into the shared
   conformance suite before durable or hot query path enablement.
+- `application-integration-handbook.md`: handbook for building and operating
+  SDK-based application indexers that call the shared Datalens service while owning their
+  own business database, handlers, and checkpoints.
 - `e2e-native-query-flow.md`: local validation for the initial native EVM block and
   log query flow, deterministic cache behavior checks, multi-chain indexing gates, and
   the full durable cache lifecycle E2E with optional RustFS/S3-compatible coverage.
