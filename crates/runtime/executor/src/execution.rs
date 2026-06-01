@@ -158,7 +158,7 @@ where
         // Coverage is read before asking the adapter for finality so full
         // durable hits avoid unnecessary provider calls; misses still require a
         // safe/finalized boundary before they can be filled and written.
-        let covered_ranges = match self.storage.covered_ranges(
+        let mut covered_ranges = match self.storage.covered_ranges(
             &input.chain,
             &input.dataset_key,
             &input.selector,
@@ -182,6 +182,12 @@ where
                 return Err(error);
             }
         };
+        covered_ranges.extend(self.writer.staged_covered_ranges(
+            &input.chain,
+            &input.dataset_key,
+            &input.selector,
+            input.ledger_range.clone(),
+        )?);
         let hit_ranges = covered_ranges
             .iter()
             .filter_map(|range| range.intersection(&input.ledger_range))
@@ -288,13 +294,35 @@ where
 
         let mut rows = empty_query_rows(&plan.dataset_key);
         for segment in &plan.read_segments {
-            let cached = match self.storage.read_rows(
+            let cached = match self.writer.read_staged_rows(
                 &plan.chain,
                 &plan.dataset_key,
                 &plan.selector,
                 segment.range.clone(),
             ) {
-                Ok(cached) => cached,
+                Ok(Some(cached)) => cached,
+                Ok(None) => match self.storage.read_rows(
+                    &plan.chain,
+                    &plan.dataset_key,
+                    &plan.selector,
+                    segment.range.clone(),
+                ) {
+                    Ok(cached) => cached,
+                    Err(error) => {
+                        self.record_error(&labels, &error);
+                        self.record_query(&labels, QueryOutcome::Error, start);
+                        self.record_usage_for_plan(
+                            &ledger_application,
+                            &plan,
+                            LedgerQueryOutcome::StorageError,
+                            ledger_cache_outcome(coverage_outcome),
+                            LedgerFillOutcome::NotAttempted,
+                            LedgerDurableWriteOutcome::NotAttempted,
+                            rows.row_count(),
+                        )?;
+                        return Err(error);
+                    }
+                },
                 Err(error) => {
                     self.record_error(&labels, &error);
                     self.record_query(&labels, QueryOutcome::Error, start);

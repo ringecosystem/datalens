@@ -5,7 +5,7 @@ use std::{
 
 use datalens_chain::{DatasetSelector, FinalityLevel};
 use datalens_core::{
-    ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey, DatasetRows, LedgerRange,
+    ChainIdentity, DatalensError, DatalensErrorKind, Dataset, DatasetKey, DatasetRows, LedgerRange,
     QueryRows,
 };
 use datalens_storage::{StorageDataObject, StorageRepository, StorageWriteRequest};
@@ -158,6 +158,53 @@ where
             return Ok(DurableWriteResult::default());
         }
         self.flush_with_reason(WriteFlushReason::Shutdown)
+    }
+
+    pub fn staged_covered_ranges(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+    ) -> Result<Vec<LedgerRange>, DatalensError> {
+        let staged = self
+            .staged
+            .lock()
+            .map_err(|_| DatalensError::internal("durable writer staging lock poisoned"))?;
+        let mut ranges = staged
+            .iter()
+            .filter(|write| write.matches_coverage(chain, dataset_key, selector, &range))
+            .filter_map(|write| write.segment.range.intersection(&range))
+            .collect::<Vec<_>>();
+        ranges.sort_by_key(|range| range.start());
+        Ok(ranges)
+    }
+
+    pub fn read_staged_rows(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+    ) -> Result<Option<DatasetRows>, DatalensError> {
+        let staged = self
+            .staged
+            .lock()
+            .map_err(|_| DatalensError::internal("durable writer staging lock poisoned"))?;
+        let mut rows = empty_query_rows(dataset_key.clone());
+        for write in staged
+            .iter()
+            .filter(|write| write.matches_coverage(chain, dataset_key, selector, &range))
+        {
+            let filtered = filter_rows(write.segment.rows.clone(), range.clone());
+            rows.try_append(filtered.into_rows())?;
+        }
+        rows.sort();
+        let rows = DatasetRows::new(dataset_key.clone(), rows)?;
+        if rows.row_count() == 0 {
+            return Ok(None);
+        }
+        Ok(Some(rows))
     }
 
     fn flush_with_reason(
@@ -369,6 +416,21 @@ struct StagedWrite {
     segment: DurableWriteSegment,
 }
 
+impl StagedWrite {
+    fn matches_coverage(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: &LedgerRange,
+    ) -> bool {
+        self.chain == *chain
+            && self.dataset_key == *dataset_key
+            && self.selector == *selector
+            && self.segment.range.kind() == range.kind()
+    }
+}
+
 impl DurableWriteResult {
     fn extend(&mut self, other: Self) {
         self.data_objects.extend(other.data_objects);
@@ -564,4 +626,50 @@ fn estimated_object_bytes_after_merge(
     rows.try_append(next.rows.clone().into_rows())?;
     rows.sort();
     estimated_object_bytes(&DatasetRows::new(dataset_key, rows)?)
+}
+
+fn empty_query_rows(dataset_key: DatasetKey) -> QueryRows {
+    match dataset_key.evm_dataset() {
+        Some(Dataset::Blocks) => QueryRows::EvmBlocks(Vec::new()),
+        Some(Dataset::Transactions) => QueryRows::EvmTransactions(Vec::new()),
+        Some(Dataset::Receipts) => QueryRows::EvmReceipts(Vec::new()),
+        Some(Dataset::Logs) => QueryRows::EvmLogs(Vec::new()),
+        None => QueryRows::AdapterJson {
+            dataset_key,
+            rows: Vec::new(),
+        },
+    }
+}
+
+fn filter_rows(rows: DatasetRows, range: LedgerRange) -> DatasetRows {
+    let dataset_key = rows.dataset_key().clone();
+    let Some(block_range) = range.block_range() else {
+        return rows;
+    };
+    let rows = match rows.into_rows() {
+        QueryRows::EvmBlocks(rows) => QueryRows::EvmBlocks(
+            rows.into_iter()
+                .filter(|row| block_range.contains(row.number))
+                .collect(),
+        ),
+        QueryRows::EvmTransactions(rows) => QueryRows::EvmTransactions(
+            rows.into_iter()
+                .filter(|row| block_range.contains(row.block_number))
+                .collect(),
+        ),
+        QueryRows::EvmReceipts(rows) => QueryRows::EvmReceipts(
+            rows.into_iter()
+                .filter(|row| block_range.contains(row.block_number))
+                .collect(),
+        ),
+        QueryRows::EvmLogs(rows) => QueryRows::EvmLogs(
+            rows.into_iter()
+                .filter(|row| block_range.contains(row.block_number))
+                .collect(),
+        ),
+        QueryRows::AdapterJson { dataset_key, rows } => {
+            QueryRows::AdapterJson { dataset_key, rows }
+        }
+    };
+    DatasetRows::new(dataset_key, rows).expect("filtered rows keep dataset key")
 }
