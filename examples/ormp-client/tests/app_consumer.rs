@@ -12,6 +12,12 @@ mod support;
 
 use support::MockGraphqlServer;
 
+const MESSAGE_ACCEPTED_TOPIC0: &str =
+    "0xcfb9b3466878aff0c7df17da215fd57d59eb245a5d03f5a7b57294d54581eb18";
+const MESSAGE_ACCEPTED_MSG_HASH: &str =
+    "0x60f5743a8b3bbe4e4bd99607b19985203a9310f4859e03912ed086f4d32bdff8";
+const MESSAGE_ACCEPTED_DATA: &str = "0x000000000000000000000000000000000000000000000000000000000000002000000000000000000000000013b2211a7ca45db2808f6db05557ce5347e3634e000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000002cd1867fb8016f93710b6386f7f9f1d540a60812000000000000000000000000000000000000000000000000000000000000002e0000000000000000000000002cd1867fb8016f93710b6386f7f9f1d540a60812000000000000000000000000000000000000000000000000000000000001d874000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000a4394d1bca0000000000000000000000009f33a4809aa708d7a399fedba514e0a0d15efa850000000000000000000000009f33a4809aa708d7a399fedba514e0a0d15efa8500000000000000000000000000000000000000000000000000000000000000600000000000000000000000000000000000000000000000000000000000000008844866883501484100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
+
 #[test]
 fn test_migrations_create_application_tables_and_indexes() {
     let db = AppDatabase::open("sqlite::memory:").expect("open database");
@@ -32,7 +38,7 @@ fn test_migrations_create_application_tables_and_indexes() {
 fn test_handle_message_accepted_page_writes_business_rows_and_checkpoint() {
     let db = migrated_db();
     let handler = MessageAcceptedHandler::new("ormp-message-consumer");
-    let page = message_page("cursor-2", Some("0xhash"));
+    let page = message_page("cursor-2", true);
 
     let summary = handle_message_accepted_page(&db, &handler, page).expect("handle page");
 
@@ -51,12 +57,11 @@ fn test_handle_message_accepted_page_writes_business_rows_and_checkpoint() {
 fn test_handle_message_accepted_page_is_idempotent_for_duplicate_events() {
     let db = migrated_db();
     let handler = MessageAcceptedHandler::new("ormp-message-consumer");
-    handle_message_accepted_page(&db, &handler, message_page("cursor-2", Some("0xhash")))
+    handle_message_accepted_page(&db, &handler, message_page("cursor-2", true))
         .expect("first page");
 
-    let summary =
-        handle_message_accepted_page(&db, &handler, message_page("cursor-2", Some("0xhash")))
-            .expect("duplicate page");
+    let summary = handle_message_accepted_page(&db, &handler, message_page("cursor-2", true))
+        .expect("duplicate page");
 
     assert_eq!(summary.inserted_rows, 0);
     assert_eq!(summary.skipped_duplicates, 1);
@@ -83,7 +88,7 @@ fn test_checkpoint_does_not_advance_when_business_write_fails() {
     })
     .expect("seed conflicting message");
 
-    let err = handle_message_accepted_page(&db, &handler, message_page("cursor-2", Some("0xhash")))
+    let err = handle_message_accepted_page(&db, &handler, message_page("cursor-2", true))
         .expect_err("unique cursor should fail");
 
     assert!(err.to_string().contains("event cursor already belongs"));
@@ -99,7 +104,7 @@ fn test_run_once_resumes_with_stored_checkpoint_cursor() {
     let db = migrated_db();
     db.insert_checkpoint("ormp-message-consumer", "11")
         .expect("seed checkpoint");
-    let server = MockGraphqlServer::new(vec![graphql_page("11:0xtx:3", Some("0xhash"), false)]);
+    let server = MockGraphqlServer::new(vec![graphql_page("11:0xtx:3", true, false)]);
     let client = DatalensOrmpClient::new(sdk_client(&server));
     let config = test_config(&server, 10, Some(12), 2);
 
@@ -155,7 +160,7 @@ fn test_config(
         dataset_family: "evm".to_owned(),
         dataset_name: "logs".to_owned(),
         contract_address: "0x13b2211a7ca45db2808f6db05557ce5347e3634e".to_owned(),
-        event_topic0: "0xtopic0".to_owned(),
+        event_topic0: MESSAGE_ACCEPTED_TOPIC0.to_owned(),
         event_signature: datalens_example_ormp_client::datalens::MESSAGE_ACCEPTED_SIGNATURE
             .to_owned(),
         start_block,
@@ -168,9 +173,9 @@ fn test_config(
 
 fn message_page(
     cursor: &str,
-    message_hash: Option<&str>,
+    valid_data: bool,
 ) -> datalens_example_ormp_client::datalens::MessageAcceptedPage {
-    let server = MockGraphqlServer::new(vec![graphql_page(cursor, message_hash, false)]);
+    let server = MockGraphqlServer::new(vec![graphql_page(cursor, valid_data, false)]);
     let client = DatalensOrmpClient::new(sdk_client(&server));
     let config = test_config(&server, 10, Some(10), 1);
     client
@@ -178,11 +183,7 @@ fn message_page(
         .expect("message page")
 }
 
-fn graphql_page(
-    cursor: &str,
-    message_hash: Option<&str>,
-    _has_next_page: bool,
-) -> serde_json::Value {
+fn graphql_page(cursor: &str, valid_data: bool, _has_next_page: bool) -> serde_json::Value {
     json!({
         "data": {
             "query": {
@@ -201,16 +202,9 @@ fn graphql_page(
                             "transaction_index": 0,
                             "log_index": 3,
                             "address": "0x13b2211a7ca45db2808f6db05557ce5347e3634e",
-                            "topics": ["0xtopic0"],
-                            "data": "0x",
-                            "removed": false,
-                            "decodedArgs": {
-                                "msgHash": message_hash,
-                                "sourceChainId": 1,
-                                "targetChainId": 137,
-                                "sender": "0xsender",
-                                "receiver": "0xreceiver"
-                            }
+                            "topics": [MESSAGE_ACCEPTED_TOPIC0, MESSAGE_ACCEPTED_MSG_HASH],
+                            "data": if valid_data { MESSAGE_ACCEPTED_DATA } else { "0x" },
+                            "removed": false
                         }]
                     }
                 }

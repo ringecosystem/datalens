@@ -15,7 +15,7 @@ pub const DEFAULT_DATASET_FAMILY: &str = "evm";
 pub const DEFAULT_DATASET_NAME: &str = "logs";
 pub const DEFAULT_CONTRACT_ADDRESS: &str = "0x13b2211a7ca45db2808f6db05557ce5347e3634e";
 pub const DEFAULT_EVENT_TOPIC0: &str =
-    "0x0aa912fb8d4a847fff42b3406d9581df47d263a5a2c1f91e586f3dc9d213808a";
+    "0xcfb9b3466878aff0c7df17da215fd57d59eb245a5d03f5a7b57294d54581eb18";
 pub const DEFAULT_START_BLOCK: i32 = 0;
 
 #[derive(Clone, Debug, Eq, PartialEq)]

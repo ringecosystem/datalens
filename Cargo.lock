@@ -2052,6 +2052,7 @@ dependencies = [
 name = "datalens-example-degov-client"
 version = "0.1.0"
 dependencies = [
+ "alloy-dyn-abi",
  "alloy-primitives",
  "datalens-sdk",
  "rusqlite",
@@ -2062,6 +2063,8 @@ dependencies = [
 name = "datalens-example-ormp-client"
 version = "0.1.0"
 dependencies = [
+ "alloy-dyn-abi",
+ "alloy-primitives",
  "datalens-sdk",
  "rusqlite",
  "serde",
