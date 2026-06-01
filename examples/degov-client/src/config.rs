@@ -62,10 +62,10 @@ impl DegovFixtureFile {
                 path.as_ref().display()
             ))
         })?;
-        Self::from_str(&contents)
+        Self::from_toml_str(&contents)
     }
 
-    pub fn from_str(contents: &str) -> AppResult<Self> {
+    pub fn from_toml_str(contents: &str) -> AppResult<Self> {
         let fixture: Self = toml::from_str(contents).map_err(|error| {
             AppError::Config(format!("failed to parse Degov fixture TOML: {error}"))
         })?;

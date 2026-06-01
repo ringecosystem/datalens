@@ -115,7 +115,7 @@ fn test_from_fixture_workload_overrides_selector_and_checkpoint_scope() {
     set_env("DEGOV_DATABASE_URL", "sqlite:.tmp/degov-fixtures.sqlite");
     set_env("DEGOV_CHUNK_SIZE", "250");
 
-    let fixture = DegovFixtureFile::from_str(
+    let fixture = DegovFixtureFile::from_toml_str(
         r#"
 [[workloads]]
 name = "seamless-dao"
