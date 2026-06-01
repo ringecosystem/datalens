@@ -1,6 +1,7 @@
 use datalens_core::{DatalensError, DatalensErrorKind, redact_url, redact_urls_in_text};
 use reqwest::blocking::Client;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::{
     TronBlock, TronContractEvent, TronContractEventPage, TronContractEventRequest, TronFinality,
@@ -151,16 +152,16 @@ impl TronProvider for TronHttpProvider {
                 "TronGrid API key is not configured",
             )
         })?;
-        let path = format!("v1/contracts/{}/events", request.contract_address);
+        if request.range.start() != request.range.end() {
+            return Err(DatalensError::new(
+                DatalensErrorKind::UnsupportedDataset,
+                "TronGrid contract events provider requires a single block_number query",
+            ));
+        }
+        let contract_address = trongrid_contract_address(&request.contract_address)?;
+        let path = format!("v1/contracts/{contract_address}/events");
         let mut query = vec![
-            (
-                "min_block_number".to_owned(),
-                request.range.start().to_string(),
-            ),
-            (
-                "max_block_number".to_owned(),
-                request.range.end().to_string(),
-            ),
+            ("block_number".to_owned(), request.range.start().to_string()),
             (
                 "only_confirmed".to_owned(),
                 request.only_confirmed.to_string(),
@@ -215,17 +216,8 @@ impl TronProvider for TronHttpProvider {
                 "TronGrid contract events rate limited",
             ));
         }
-        if status.is_server_error() {
-            return Err(DatalensError::new(
-                DatalensErrorKind::ProviderFailure,
-                format!("TronGrid contract events HTTP error {}", status.as_u16()),
-            ));
-        }
         if !status.is_success() {
-            return Err(DatalensError::new(
-                DatalensErrorKind::ProviderFailure,
-                format!("TronGrid contract events HTTP error {}", status.as_u16()),
-            ));
+            return Err(trongrid_contract_events_http_error(status.as_u16(), &body));
         }
         parse_contract_event_page(&body)
     }
@@ -407,6 +399,103 @@ fn encode_query_component(value: &str) -> String {
         }
     }
     output
+}
+
+fn trongrid_contract_address(address: &str) -> Result<String, DatalensError> {
+    let normalized = normalize_tron_contract_address(address)?;
+    if normalized.starts_with('T') {
+        return Ok(normalized);
+    }
+    let bytes = decode_hex(&normalized)?;
+    Ok(base58check_encode(&bytes))
+}
+
+fn decode_hex(value: &str) -> Result<Vec<u8>, DatalensError> {
+    if !value.len().is_multiple_of(2) {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "Tron hex address must contain an even number of digits",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    for chunk in value.as_bytes().chunks_exact(2) {
+        let hex = std::str::from_utf8(chunk).map_err(|_| {
+            DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                "Tron hex address must be valid UTF-8",
+            )
+        })?;
+        let byte = u8::from_str_radix(hex, 16).map_err(|_| {
+            DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                "Tron hex address contains an invalid digit",
+            )
+        })?;
+        bytes.push(byte);
+    }
+    Ok(bytes)
+}
+
+fn base58check_encode(payload: &[u8]) -> String {
+    let first = Sha256::digest(payload);
+    let second = Sha256::digest(first);
+    let mut bytes = Vec::with_capacity(payload.len() + 4);
+    bytes.extend_from_slice(payload);
+    bytes.extend_from_slice(&second[..4]);
+    base58_encode(&bytes)
+}
+
+fn base58_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+    let mut digits = vec![0_u8];
+    for byte in bytes {
+        let mut carry = u32::from(*byte);
+        for digit in &mut digits {
+            let value = u32::from(*digit) * 256 + carry;
+            *digit = (value % 58) as u8;
+            carry = value / 58;
+        }
+        while carry > 0 {
+            digits.push((carry % 58) as u8);
+            carry /= 58;
+        }
+    }
+
+    let leading_zeroes = bytes.iter().take_while(|byte| **byte == 0).count();
+    let mut output = String::with_capacity(leading_zeroes + digits.len());
+    for _ in 0..leading_zeroes {
+        output.push('1');
+    }
+    for digit in digits.iter().rev() {
+        output.push(ALPHABET[*digit as usize] as char);
+    }
+    output
+}
+
+fn trongrid_contract_events_http_error(status: u16, body: &Value) -> DatalensError {
+    let message = body
+        .get("error")
+        .or_else(|| body.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or("TronGrid contract events error");
+    let normalized = message.to_ascii_lowercase();
+    let kind = if normalized.contains("valid contract address") {
+        DatalensErrorKind::InvalidInput
+    } else if normalized.contains("page limit") || normalized.contains("limit 100") {
+        DatalensErrorKind::ProviderLimit
+    } else if status == 429 || normalized.contains("rate limit") {
+        DatalensErrorKind::RateLimited
+    } else {
+        DatalensErrorKind::ProviderFailure
+    };
+    DatalensError::new(
+        kind,
+        format!(
+            "TronGrid contract events HTTP error {status}: {}",
+            redact_urls_in_text(message)
+        ),
+    )
 }
 
 fn parse_contract_event_page(value: &Value) -> Result<TronContractEventPage, DatalensError> {

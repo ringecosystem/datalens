@@ -24,11 +24,11 @@ fn test_trongrid_contract_events_request_uses_path_query_auth_and_pagination() {
     let page = provider
         .get_contract_events(TronContractEventRequest {
             contract_address: normalize_tron_contract_address(
-                "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+                "41a614f803b6fd780986a42c78ec9c7f77e6ded13c",
             )
             .expect("address"),
             event_name: Some("Transfer".to_owned()),
-            range: LedgerRange::blocks(10, 12).expect("range"),
+            range: LedgerRange::blocks(83_200_000, 83_200_000).expect("range"),
             only_confirmed: true,
             limit: 50,
             fingerprint: Some("previous-page".to_owned()),
@@ -38,12 +38,11 @@ fn test_trongrid_contract_events_request_uses_path_query_auth_and_pagination() {
     assert_eq!(page.next_fingerprint.as_deref(), Some("next-page"));
     assert_eq!(page.provider_calls, 1);
     let request = seen.lock().expect("seen").join("\n");
-    assert!(
-        request.starts_with("GET /v1/contracts/41abcdefabcdefabcdefabcdefabcdefabcdefabcd/events?")
-    );
+    assert!(request.starts_with("GET /v1/contracts/TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t/events?"));
     assert!(request.contains("event_name=Transfer"));
-    assert!(request.contains("min_block_number=10"));
-    assert!(request.contains("max_block_number=12"));
+    assert!(request.contains("block_number=83200000"));
+    assert!(!request.contains("min_block_number="));
+    assert!(!request.contains("max_block_number="));
     assert!(request.contains("only_confirmed=true"));
     assert!(request.contains("limit=50"));
     assert!(request.contains("fingerprint=previous-page"));
@@ -52,6 +51,29 @@ fn test_trongrid_contract_events_request_uses_path_query_auth_and_pagination() {
             .to_ascii_lowercase()
             .contains("tron-pro-api-key: secret-key")
     );
+}
+
+#[test]
+fn test_trongrid_contract_events_rejects_direct_multi_block_range() {
+    let provider = TronHttpProvider::new("http://unused")
+        .with_trongrid("http://trongrid.invalid", Some("secret-key".to_owned()));
+
+    let error = provider
+        .get_contract_events(TronContractEventRequest {
+            contract_address: normalize_tron_contract_address(
+                "41a614f803b6fd780986a42c78ec9c7f77e6ded13c",
+            )
+            .expect("address"),
+            event_name: Some("Transfer".to_owned()),
+            range: LedgerRange::blocks(83_200_000, 83_200_002).expect("range"),
+            only_confirmed: true,
+            limit: 50,
+            fingerprint: None,
+        })
+        .expect_err("provider should not issue unbounded TronGrid scans");
+
+    assert_eq!(error.kind, DatalensErrorKind::UnsupportedDataset);
+    assert!(error.message.contains("single block_number"));
 }
 
 #[test]
@@ -174,7 +196,7 @@ fn test_trongrid_contract_events_malformed_response_is_invalid_request() {
             )
             .expect("address"),
             event_name: Some("Transfer".to_owned()),
-            range: LedgerRange::blocks(10, 12).expect("range"),
+            range: LedgerRange::blocks(10, 10).expect("range"),
             only_confirmed: true,
             limit: 50,
             fingerprint: None,
@@ -182,6 +204,60 @@ fn test_trongrid_contract_events_malformed_response_is_invalid_request() {
         .expect_err("malformed response should stay visible");
 
     assert_eq!(error.kind, DatalensErrorKind::InvalidRequest);
+}
+
+#[test]
+fn test_trongrid_contract_events_invalid_address_response_is_invalid_input() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let server = TestServer::spawn(
+        seen,
+        r#"{"success":false,"error":"A valid contract address is required.","statusCode":400}"#,
+        "HTTP/1.1 400 Bad Request",
+    );
+    let provider = TronHttpProvider::new("http://unused")
+        .with_trongrid(server.url(), Some("secret-key".to_owned()));
+
+    let error = provider
+        .get_contract_events(TronContractEventRequest {
+            contract_address: "T111111111111111111111111111111111".to_owned(),
+            event_name: Some("Transfer".to_owned()),
+            range: LedgerRange::blocks(123, 123).expect("range"),
+            only_confirmed: true,
+            limit: 20,
+            fingerprint: None,
+        })
+        .expect_err("invalid address response should be distinguished");
+
+    assert_eq!(error.kind, DatalensErrorKind::InvalidInput);
+    assert!(error.message.contains("valid contract address"));
+    assert!(!error.message.contains("secret-key"));
+}
+
+#[test]
+fn test_trongrid_contract_events_page_limit_response_is_provider_limit() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let server = TestServer::spawn(
+        seen,
+        r#"{"success":false,"error":"TronGrid contract event page limit 100 reached","statusCode":400}"#,
+        "HTTP/1.1 400 Bad Request",
+    );
+    let provider = TronHttpProvider::new("http://unused")
+        .with_trongrid(server.url(), Some("secret-key".to_owned()));
+
+    let error = provider
+        .get_contract_events(TronContractEventRequest {
+            contract_address: "T111111111111111111111111111111111".to_owned(),
+            event_name: Some("Transfer".to_owned()),
+            range: LedgerRange::blocks(123, 123).expect("range"),
+            only_confirmed: true,
+            limit: 20,
+            fingerprint: None,
+        })
+        .expect_err("page-limit response should be distinguished");
+
+    assert_eq!(error.kind, DatalensErrorKind::ProviderLimit);
+    assert!(error.message.contains("page limit"));
+    assert!(!error.message.contains("secret-key"));
 }
 
 struct TestServer {
