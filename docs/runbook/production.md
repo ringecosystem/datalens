@@ -34,6 +34,10 @@ docker run --rm datalens:local --help
 
 Expected output: the container starts as the non-root `datalens` user and prints CLI help.
 
+Published release images use `ghcr.io/ringecosystem/datalens` through
+`${{ github.repository }}` in the release workflow. Version tag releases publish
+`sha-<short-sha>`, `<git-tag>`, and `latest` tags.
+
 ## Configure Production
 
 Provide runtime values through environment or the deployment secret mechanism:
