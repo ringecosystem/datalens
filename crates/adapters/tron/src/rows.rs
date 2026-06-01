@@ -277,8 +277,10 @@ where
 }
 
 fn contract_event_row(event: TronContractEvent) -> Value {
+    let contract_address =
+        normalize_tron_contract_address(&event.contract_address).unwrap_or(event.contract_address);
     json!({
-        "contract_address": event.contract_address,
+        "contract_address": contract_address,
         "event_name": event.event_name,
         "event_signature": event.event_signature,
         "indexed_fields": event.indexed_fields,

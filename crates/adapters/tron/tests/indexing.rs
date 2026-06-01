@@ -240,6 +240,63 @@ fn test_tron_contract_event_provider_success_uses_trongrid_rows() {
 }
 
 #[test]
+fn test_tron_contract_event_provider_matches_base58_response_address() {
+    let provider = ContractEventFixtureProvider::with_contract_events(vec![TronContractEvent {
+        contract_address: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t".to_owned(),
+        event_name: Some("Transfer".to_owned()),
+        event_signature: Some(
+            "Transfer(address indexed from, address indexed to, uint256 value)".to_owned(),
+        ),
+        indexed_fields: Vec::new(),
+        non_indexed_fields: serde_json::json!({
+            "from": "0x9f3f3ab197bf6b8c05069520b28b48cc2852eba6",
+            "to": "0xfe0460cf2611ce2f29a7b8cded20e3dee3c7bae4",
+            "value": "256860200"
+        }),
+        transaction_id: Some("tron-grid-tx".to_owned()),
+        block_number: 83_200_000,
+        block_hash: None,
+        transaction_index: 0,
+        event_index: 0,
+        confirmed: true,
+        raw: serde_json::json!({
+            "contract_address": "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t",
+            "event_name": "Transfer"
+        }),
+    }]);
+    let adapter = TronAdapter::with_provider(
+        TronAdapter::with_fixture_defaults()
+            .capabilities()
+            .chain()
+            .clone(),
+        provider,
+    );
+    let selector = tron_event_selector(TronEventFilter {
+        contract_addresses: vec!["41a614f803b6fd780986a42c78ec9c7f77e6ded13c".to_owned()],
+        event_names: vec!["Transfer".to_owned()],
+    })
+    .expect("selector");
+
+    let response = adapter
+        .fetch(datalens_chain::ChainFetchRequest::new(
+            adapter.capabilities().chain().clone(),
+            DatasetKey::tron_events(),
+            LedgerRange::blocks(83_200_000, 83_200_000).expect("range"),
+            selector,
+        ))
+        .expect("fetch events");
+
+    let QueryRows::AdapterJson { rows, .. } = response.rows.rows() else {
+        panic!("expected adapter JSON rows");
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0]["contract_address"],
+        "41a614f803b6fd780986a42c78ec9c7f77e6ded13c"
+    );
+}
+
+#[test]
 fn test_tron_contract_event_provider_splits_multi_block_ranges() {
     let provider = ContractEventFixtureProvider::with_contract_event_pages(vec![
         TronContractEventPage {

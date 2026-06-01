@@ -113,7 +113,7 @@ fn test_trongrid_transport_error_redacts_rpc_url_credentials() {
 
     let error = provider
         .get_contract_events(TronContractEventRequest {
-            contract_address: "T111111111111111111111111111111111".to_owned(),
+            contract_address: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t".to_owned(),
             event_name: Some("MessageAccepted".to_owned()),
             range: LedgerRange::blocks(123, 123).expect("range"),
             only_confirmed: true,
@@ -138,7 +138,7 @@ fn test_trongrid_contract_events_response_is_normalized() {
         seen,
         r#"{
             "data":[{
-                "contract_address":"T111111111111111111111111111111111",
+                "contract_address":"TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t",
                 "event_name":"MessageAccepted",
                 "event":"MessageAccepted(address,uint256)",
                 "transaction_id":"tx-1",
@@ -159,7 +159,7 @@ fn test_trongrid_contract_events_response_is_normalized() {
 
     let page = provider
         .get_contract_events(TronContractEventRequest {
-            contract_address: "T111111111111111111111111111111111".to_owned(),
+            contract_address: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t".to_owned(),
             event_name: Some("MessageAccepted".to_owned()),
             range: LedgerRange::blocks(123, 123).expect("range"),
             only_confirmed: true,
@@ -169,6 +169,10 @@ fn test_trongrid_contract_events_response_is_normalized() {
         .expect("contract events");
 
     assert_eq!(page.events.len(), 1);
+    assert_eq!(
+        page.events[0].contract_address,
+        "41a614f803b6fd780986a42c78ec9c7f77e6ded13c"
+    );
     assert_eq!(
         page.events[0].event_name.as_deref(),
         Some("MessageAccepted")
@@ -219,7 +223,7 @@ fn test_trongrid_contract_events_invalid_address_response_is_invalid_input() {
 
     let error = provider
         .get_contract_events(TronContractEventRequest {
-            contract_address: "T111111111111111111111111111111111".to_owned(),
+            contract_address: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t".to_owned(),
             event_name: Some("Transfer".to_owned()),
             range: LedgerRange::blocks(123, 123).expect("range"),
             only_confirmed: true,
@@ -246,7 +250,7 @@ fn test_trongrid_contract_events_page_limit_response_is_provider_limit() {
 
     let error = provider
         .get_contract_events(TronContractEventRequest {
-            contract_address: "T111111111111111111111111111111111".to_owned(),
+            contract_address: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t".to_owned(),
             event_name: Some("Transfer".to_owned()),
             range: LedgerRange::blocks(123, 123).expect("range"),
             only_confirmed: true,
