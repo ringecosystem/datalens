@@ -5,6 +5,8 @@
 .env.*
 !.env.example
 .data/
+.datalens/
+indexes/
 
 # Logs
 *.log
