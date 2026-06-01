@@ -1,8 +1,8 @@
 # ORMP Client Example
 
-Purpose: Show an external ORMP application consuming decoded events from a
-shared Datalens service through the Rust SDK while owning its own business
-database and checkpoint.
+Purpose: Show an external ORMP application consuming raw native EVM logs from a
+shared Datalens service, decoding `MessageAccepted` locally, and owning its own
+business database and checkpoint.
 
 ## Runtime model
 
@@ -31,7 +31,7 @@ DATALENS_APPLICATION=ormp-client \
 ORMP_CHAIN_NAME=ethereum \
 ORMP_CHAIN_ID=1 \
 ORMP_CONTRACT_ADDRESS=0x13b2211a7ca45db2808f6db05557ce5347e3634e \
-ORMP_EVENT_TOPIC0=0x0aa912fb8d4a847fff42b3406d9581df47d263a5a2c1f91e586f3dc9d213808a \
+ORMP_EVENT_TOPIC0=0xcfb9b3466878aff0c7df17da215fd57d59eb245a5d03f5a7b57294d54581eb18 \
 ORMP_START_BLOCK=20009590 \
 ORMP_END_BLOCK=20009690 \
 ORMP_DATABASE_URL=sqlite:.tmp/ormp-client.sqlite \
@@ -62,7 +62,8 @@ The executable reads:
 - `ORMP_DATASET_FAMILY` and `ORMP_DATASET_NAME`: default to `evm` and `logs`.
 - `ORMP_CONTRACT_ADDRESS`: ORMP contract address to query.
 - `ORMP_EVENT_TOPIC0`: `MessageAccepted` topic selector.
-- `ORMP_EVENT_SIGNATURE`: business event signature stored with decoded rows.
+- `ORMP_EVENT_SIGNATURE`: business event signature stored with locally decoded
+  rows.
 - `ORMP_START_BLOCK` and optional `ORMP_END_BLOCK`: inclusive configured block
   range.
 - `ORMP_CHUNK_SIZE`: maximum blocks queried per run, defaulting to `100`.
@@ -81,16 +82,18 @@ Migrations live in `examples/ormp-client/migrations/`.
 `consumer_checkpoints` stores the application-owned next block for each consumer
 name. Datalens does not own this state.
 
-`ormp_messages` stores ORMP business data derived from `MessageAccepted` events:
+`ormp_messages` stores ORMP business data derived from locally decoded
+`MessageAccepted` logs:
 `message_hash`, source and target chain identifiers when present, sender and
 receiver when present, transaction hash, block number, event cursor, and a JSON
-snapshot of the decoded SDK event. `message_hash` is the primary key, and the
-synthesized event cursor is unique, so replaying the same range does not
-duplicate rows.
+snapshot of the SDK event, including both `decodedArgs` and the original native
+log row in `payload`. `message_hash` is the primary key, and the synthesized
+event cursor is unique, so replaying the same range does not duplicate rows.
 
 The handler writes ORMP rows and the checkpoint in one SQLite transaction. If a
-business write fails, the checkpoint is not advanced. Events missing
-`messageHash` or `msgHash` are skipped with a warning.
+business write fails, the checkpoint is not advanced. Logs that cannot be
+decoded are marked with `decodeStatus=failed` and skipped by the business
+handler.
 
 The executable prints a concise one-page summary:
 

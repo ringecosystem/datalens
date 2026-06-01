@@ -12,7 +12,7 @@ use datalens_sdk::{
         QuerySelectorInput, SelectorKindInput,
     },
 };
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::{AppError, AppResult, config::AppConfig};
 
@@ -64,7 +64,6 @@ pub fn fetch_vote_cast_page(
         .query(query_input(config, start_block, end_block))?;
     let events = rows_from(&response.rows)?
         .into_iter()
-        .filter(|row| topic_matches(row, &config.event_topic0))
         .map(|row| row_to_vote_cast_event(row, config))
         .collect::<AppResult<Vec<_>>>()?;
 
@@ -156,7 +155,7 @@ fn row_to_vote_cast_event(row: &Value, config: &AppConfig) -> AppResult<VoteCast
         transaction_hash.as_deref().unwrap_or("<missing-tx>"),
         log_index
     );
-    let decoded = decode_vote_cast(row, config);
+    let decoded = decode_vote_cast(row, &config.event_topic0);
 
     Ok(VoteCastEvent {
         cursor,
@@ -180,7 +179,7 @@ fn row_to_vote_cast_event(row: &Value, config: &AppConfig) -> AppResult<VoteCast
                 .and_then(Value::as_str)
                 .map(str::to_owned),
             decoded_args: decoded.args,
-            decode_status: Some(decoded.status),
+            decode_status: Some(decoded.status.to_owned()),
             decode_error: decoded.error,
             payload: row.clone(),
             created_at: None,
@@ -188,47 +187,41 @@ fn row_to_vote_cast_event(row: &Value, config: &AppConfig) -> AppResult<VoteCast
     })
 }
 
-fn string_field(row: &Value, name: &str) -> Option<String> {
-    row.get(name).and_then(Value::as_str).map(str::to_owned)
-}
-
-fn i32_field(row: &Value, name: &str) -> AppResult<i32> {
-    row.get(name)
-        .and_then(|value| {
-            value
-                .as_i64()
-                .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
-                .and_then(|value| i32::try_from(value).ok())
-        })
-        .ok_or_else(|| AppError::Handler(format!("native log row is missing {name}")))
-}
-
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct LocalDecode {
+    status: &'static str,
     args: Value,
-    status: String,
     error: Option<String>,
 }
 
-fn decode_vote_cast(row: &Value, config: &AppConfig) -> LocalDecode {
-    match decode_vote_cast_args(row, config) {
+fn decode_vote_cast(row: &Value, topic0: &str) -> LocalDecode {
+    if !topic_matches(row, topic0) {
+        return LocalDecode {
+            status: "unsupported",
+            args: Value::Null,
+            error: Some("log topic0 does not match VoteCast".to_owned()),
+        };
+    }
+
+    match decode_vote_cast_args(row, topic0) {
         Ok(args) => LocalDecode {
+            status: "decoded",
             args,
-            status: "decoded".to_owned(),
             error: None,
         },
         Err(error) => LocalDecode {
+            status: "failed",
             args: Value::Null,
-            status: "failed".to_owned(),
-            error: Some(format!("decode failed: {error}")),
+            error: Some(error),
         },
     }
 }
 
-fn decode_vote_cast_args(row: &Value, config: &AppConfig) -> Result<Value, String> {
-    let topics = topics(row)?;
+fn decode_vote_cast_args(row: &Value, topic0: &str) -> Result<Value, String> {
+    let topics = topics_from(row)?;
+    let data = data_from(row)?;
     let event = DynSolEvent::new(
-        Some(parse_topic(&config.event_topic0)?),
+        Some(parse_topic(topic0)?),
         vec![
             "address"
                 .parse::<DynSolType>()
@@ -249,74 +242,83 @@ fn decode_vote_cast_args(row: &Value, config: &AppConfig) -> Result<Value, Strin
                 .map_err(|error| error.to_string())?,
         ]),
     )
-    .ok_or_else(|| "invalid VoteCast ABI".to_owned())?;
+    .ok_or_else(|| "invalid VoteCast event ABI".to_owned())?;
     let decoded = event
-        .decode_log_parts(topics, &data(row)?)
+        .decode_log_parts(topics, &data)
         .map_err(|error| error.to_string())?;
-    let voter = decoded
-        .indexed
-        .first()
-        .map(sol_value_to_json)
-        .ok_or_else(|| "decoded log is missing voter".to_owned())?;
-    let proposal_id = decoded
-        .body
-        .first()
-        .map(sol_value_to_json)
-        .ok_or_else(|| "decoded log is missing proposalId".to_owned())?;
-    let support = decoded
-        .body
-        .get(1)
-        .map(sol_value_to_json)
-        .ok_or_else(|| "decoded log is missing support".to_owned())?;
-    let weight = decoded
-        .body
-        .get(2)
-        .map(sol_value_to_json)
-        .ok_or_else(|| "decoded log is missing weight".to_owned())?;
-    let reason = decoded
-        .body
-        .get(3)
-        .map(sol_value_to_json)
-        .ok_or_else(|| "decoded log is missing reason".to_owned())?;
-
-    Ok(json!({
-        "voter": voter,
-        "proposalId": proposal_id,
-        "support": support,
-        "weight": weight,
-        "reason": reason,
-    }))
+    let mut object = serde_json::Map::new();
+    object.insert(
+        "voter".to_owned(),
+        decoded
+            .indexed
+            .first()
+            .map(sol_value_to_json)
+            .ok_or_else(|| "decoded VoteCast log is missing voter".to_owned())?,
+    );
+    object.insert(
+        "proposalId".to_owned(),
+        decoded
+            .body
+            .first()
+            .map(sol_value_to_json)
+            .ok_or_else(|| "decoded VoteCast log is missing proposalId".to_owned())?,
+    );
+    object.insert(
+        "support".to_owned(),
+        decoded
+            .body
+            .get(1)
+            .map(sol_value_to_json)
+            .ok_or_else(|| "decoded VoteCast log is missing support".to_owned())?,
+    );
+    object.insert(
+        "weight".to_owned(),
+        decoded
+            .body
+            .get(2)
+            .map(sol_value_to_json)
+            .ok_or_else(|| "decoded VoteCast log is missing weight".to_owned())?,
+    );
+    object.insert(
+        "reason".to_owned(),
+        decoded
+            .body
+            .get(3)
+            .map(sol_value_to_json)
+            .ok_or_else(|| "decoded VoteCast log is missing reason".to_owned())?,
+    );
+    Ok(Value::Object(object))
 }
 
-fn topics(row: &Value) -> Result<Vec<B256>, String> {
+fn topics_from(row: &Value) -> Result<Vec<B256>, String> {
     row.get("topics")
         .and_then(Value::as_array)
-        .ok_or_else(|| "log row is missing topics".to_owned())?
+        .ok_or_else(|| "native log row is missing topics".to_owned())?
         .iter()
         .map(|topic| {
             topic
                 .as_str()
-                .ok_or_else(|| "log topic is not a string".to_owned())
+                .ok_or_else(|| "native log topic is not a string".to_owned())
                 .and_then(parse_topic)
         })
         .collect()
 }
 
-fn data(row: &Value) -> Result<Vec<u8>, String> {
-    let value = row
+fn data_from(row: &Value) -> Result<Vec<u8>, String> {
+    let data = row
         .get("data")
         .and_then(Value::as_str)
-        .ok_or_else(|| "log row is missing data".to_owned())?;
-    let hex = value
+        .ok_or_else(|| "native log row is missing data".to_owned())?;
+    let data = data
         .strip_prefix("0x")
-        .ok_or_else(|| "data must start with 0x".to_owned())?;
-    Vec::from_hex(hex).map_err(|error| format!("invalid data: {error}"))
+        .ok_or_else(|| "native log data must start with 0x".to_owned())?;
+    Vec::from_hex(data).map_err(|error| format!("invalid native log data: {error}"))
 }
 
 fn parse_topic(value: &str) -> Result<B256, String> {
     value
         .parse::<B256>()
-        .map_err(|error| format!("invalid topic: {error}"))
+        .map_err(|error| format!("invalid native log topic: {error}"))
 }
 
 fn sol_value_to_json(value: &DynSolValue) -> Value {
@@ -337,4 +339,19 @@ fn sol_value_to_json(value: &DynSolValue) -> Value {
             Value::Array(values.iter().map(sol_value_to_json).collect())
         }
     }
+}
+
+fn string_field(row: &Value, name: &str) -> Option<String> {
+    row.get(name).and_then(Value::as_str).map(str::to_owned)
+}
+
+fn i32_field(row: &Value, name: &str) -> AppResult<i32> {
+    row.get(name)
+        .and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
+                .and_then(|value| i32::try_from(value).ok())
+        })
+        .ok_or_else(|| AppError::Handler(format!("native log row is missing {name}")))
 }

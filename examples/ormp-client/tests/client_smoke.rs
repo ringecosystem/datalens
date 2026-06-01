@@ -1,4 +1,4 @@
-use datalens_example_ormp_client::config::AppConfig;
+use datalens_example_ormp_client::config::{AppConfig, DEFAULT_EVENT_TOPIC0};
 use datalens_example_ormp_client::fetch_message_accepted_page;
 use datalens_sdk::{ClientConfig, DatalensClient};
 use serde_json::json;
@@ -14,7 +14,8 @@ const MESSAGE_ACCEPTED_MSG_HASH: &str =
 const MESSAGE_ACCEPTED_DATA: &str = "0x000000000000000000000000000000000000000000000000000000000000002000000000000000000000000013b2211a7ca45db2808f6db05557ce5347e3634e000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000010000000000000000000000002cd1867fb8016f93710b6386f7f9f1d540a60812000000000000000000000000000000000000000000000000000000000000002e0000000000000000000000002cd1867fb8016f93710b6386f7f9f1d540a60812000000000000000000000000000000000000000000000000000000000001d874000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000a4394d1bca0000000000000000000000009f33a4809aa708d7a399fedba514e0a0d15efa850000000000000000000000009f33a4809aa708d7a399fedba514e0a0d15efa8500000000000000000000000000000000000000000000000000000000000000600000000000000000000000000000000000000000000000000000000000000008844866883501484100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
 
 #[test]
-fn test_fetch_message_accepted_page_queries_sdk_connection_with_cursor() {
+fn test_fetch_message_accepted_page_decodes_raw_native_log() {
+    assert_eq!(DEFAULT_EVENT_TOPIC0, MESSAGE_ACCEPTED_TOPIC0);
     let server = MockGraphqlServer::new(vec![json!({
         "data": {
             "query": {
@@ -54,9 +55,18 @@ fn test_fetch_message_accepted_page_queries_sdk_connection_with_cursor() {
         Some(MESSAGE_ACCEPTED_MSG_HASH)
     );
     assert_eq!(
+        page.events[0].event.decoded_args["sourceChainId"].as_str(),
+        Some("0")
+    );
+    assert_eq!(
+        page.events[0].event.decoded_args["targetChainId"].as_str(),
+        Some("1")
+    );
+    assert_eq!(
         page.events[0].event.decode_status.as_deref(),
         Some("decoded")
     );
+    assert_eq!(page.events[0].event.payload["data"], MESSAGE_ACCEPTED_DATA);
     assert_eq!(page.next_cursor.as_deref(), Some("12"));
     assert!(!page.has_next_page);
 

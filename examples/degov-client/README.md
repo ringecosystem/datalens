@@ -1,7 +1,8 @@
 # Degov Client Example
 
-Purpose: Show a governance application that owns its database schema,
-checkpoint, and proposal projections while consuming decoded Datalens events.
+Purpose: Show a governance application that consumes raw native EVM logs from
+Datalens, decodes `VoteCast` locally, and owns its database schema, checkpoint,
+and proposal projections.
 
 `datalens serve` runs independently as the shared cache service. It exposes the
 native Datalens REST and GraphQL surfaces, such as `/v1/query` and
@@ -60,7 +61,7 @@ The application reads:
 | `DEGOV_DATASET_FAMILY` / `DEGOV_DATASET_NAME` | `evm` / `logs` | Native dataset key |
 | `DEGOV_CONTRACT_ADDRESS` | required | Governance contract address |
 | `DEGOV_EVENT_TOPIC0` | required `0xb8e138887d0aa13bab447e82de9d5c1777041ecd21ca36ba824ff1e6c07ddda4` | `VoteCast(address,uint256,uint8,uint256,string)` topic selector |
-| `DEGOV_EVENT_SIGNATURE` | `VoteCast(address,uint256,uint8,uint256,string)` | Business event signature stored with decoded rows |
+| `DEGOV_EVENT_SIGNATURE` | `VoteCast(address,uint256,uint8,uint256,string)` | Business event signature stored with locally decoded rows |
 | `DEGOV_START_BLOCK` / `DEGOV_END_BLOCK` | required | Inclusive configured block range |
 | `DEGOV_CHUNK_SIZE` | `100` | Maximum blocks queried per run |
 | `DEGOV_RESET_CHECKPOINT` | unset | Set to `true` to replay from `DEGOV_START_BLOCK` |
@@ -77,12 +78,13 @@ tables:
 | Table | Responsibility |
 | --- | --- |
 | `consumer_checkpoints` | Stores the next block per consumer name. |
-| `degov_votes` | Stores normalized vote data plus the raw decoded event JSON. `event_cursor` is unique and the vote key is derived from transaction hash plus log index when available. |
+| `degov_votes` | Stores normalized vote data plus the SDK event JSON, including locally decoded args and the original native log row in `payload`. `event_cursor` is unique and the vote key is derived from transaction hash plus log index when available. |
 | `degov_proposals` | Stores proposal projection totals for for, against, and abstain votes. |
 
 Vote rows, proposal totals, and checkpoint updates are written in one SQLite
 transaction. Reprocessing the same page inserts no duplicate votes and does not
-double-count proposal totals.
+double-count proposal totals. Logs that cannot be decoded are marked with
+`decodeStatus=failed` and skipped by the business handler.
 
 ## Tests
 

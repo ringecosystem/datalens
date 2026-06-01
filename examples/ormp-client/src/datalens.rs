@@ -12,7 +12,7 @@ use datalens_sdk::{
         QuerySelectorInput, SelectorKindInput,
     },
 };
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::{AppError, AppResult, config::AppConfig};
 
@@ -65,7 +65,6 @@ pub fn fetch_message_accepted_page(
         .query(query_input(config, start_block, end_block))?;
     let events = rows_from(&response.rows)?
         .into_iter()
-        .filter(|row| topic_matches(row, &config.event_topic0))
         .map(|row| row_to_message_accepted_event(row, config))
         .collect::<AppResult<Vec<_>>>()?;
 
@@ -160,7 +159,7 @@ fn row_to_message_accepted_event(
         transaction_hash.as_deref().unwrap_or("<missing-tx>"),
         log_index
     );
-    let decoded = decode_message_accepted(row, config);
+    let decoded = decode_message_accepted(row, &config.event_topic0);
 
     Ok(MessageAcceptedEvent {
         cursor,
@@ -184,7 +183,7 @@ fn row_to_message_accepted_event(
                 .and_then(Value::as_str)
                 .map(str::to_owned),
             decoded_args: decoded.args,
-            decode_status: Some(decoded.status),
+            decode_status: Some(decoded.status.to_owned()),
             decode_error: decoded.error,
             payload: row.clone(),
             created_at: None,
@@ -192,47 +191,41 @@ fn row_to_message_accepted_event(
     })
 }
 
-fn string_field(row: &Value, name: &str) -> Option<String> {
-    row.get(name).and_then(Value::as_str).map(str::to_owned)
-}
-
-fn i32_field(row: &Value, name: &str) -> AppResult<i32> {
-    row.get(name)
-        .and_then(|value| {
-            value
-                .as_i64()
-                .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
-                .and_then(|value| i32::try_from(value).ok())
-        })
-        .ok_or_else(|| AppError::Handler(format!("native log row is missing {name}")))
-}
-
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct LocalDecode {
+    status: &'static str,
     args: Value,
-    status: String,
     error: Option<String>,
 }
 
-fn decode_message_accepted(row: &Value, config: &AppConfig) -> LocalDecode {
-    match decode_message_accepted_args(row, config) {
+fn decode_message_accepted(row: &Value, topic0: &str) -> LocalDecode {
+    if !topic_matches(row, topic0) {
+        return LocalDecode {
+            status: "unsupported",
+            args: Value::Null,
+            error: Some("log topic0 does not match MessageAccepted".to_owned()),
+        };
+    }
+
+    match decode_message_accepted_args(row, topic0) {
         Ok(args) => LocalDecode {
+            status: "decoded",
             args,
-            status: "decoded".to_owned(),
             error: None,
         },
         Err(error) => LocalDecode {
+            status: "failed",
             args: Value::Null,
-            status: "failed".to_owned(),
-            error: Some(format!("decode failed: {error}")),
+            error: Some(error),
         },
     }
 }
 
-fn decode_message_accepted_args(row: &Value, config: &AppConfig) -> Result<Value, String> {
-    let topics = topics(row)?;
+fn decode_message_accepted_args(row: &Value, topic0: &str) -> Result<Value, String> {
+    let topics = topics_from(row)?;
+    let data = data_from(row)?;
     let event = DynSolEvent::new(
-        Some(parse_topic(&config.event_topic0)?),
+        Some(parse_topic(topic0)?),
         vec![
             "bytes32"
                 .parse::<DynSolType>()
@@ -244,71 +237,70 @@ fn decode_message_accepted_args(row: &Value, config: &AppConfig) -> Result<Value
                 .map_err(|error| error.to_string())?,
         ]),
     )
-    .ok_or_else(|| "invalid MessageAccepted ABI".to_owned())?;
+    .ok_or_else(|| "invalid MessageAccepted event ABI".to_owned())?;
     let decoded = event
-        .decode_log_parts(topics, &data(row)?)
+        .decode_log_parts(topics, &data)
         .map_err(|error| error.to_string())?;
     let msg_hash = decoded
         .indexed
         .first()
         .map(sol_value_to_json)
-        .ok_or_else(|| "decoded log is missing msgHash".to_owned())?;
+        .ok_or_else(|| "decoded MessageAccepted log is missing msgHash".to_owned())?;
     let message = decoded
         .body
         .first()
-        .and_then(|value| match value {
-            DynSolValue::Tuple(values) => Some(values),
-            _ => None,
-        })
-        .ok_or_else(|| "decoded log is missing message tuple".to_owned())?;
+        .ok_or_else(|| "decoded MessageAccepted log is missing message tuple".to_owned())?;
+    let DynSolValue::Tuple(fields) = message else {
+        return Err("decoded MessageAccepted message is not a tuple".to_owned());
+    };
 
-    Ok(json!({
-        "msgHash": msg_hash,
-        "messageHash": msg_hash,
-        "message": sol_value_to_json(&decoded.body[0]),
-        "sender": tuple_value(message, 0),
-        "sourceChainId": tuple_value(message, 2),
-        "receiver": tuple_value(message, 3),
-        "targetChainId": tuple_value(message, 4),
-    }))
+    let mut object = serde_json::Map::new();
+    object.insert("msgHash".to_owned(), msg_hash.clone());
+    object.insert("messageHash".to_owned(), msg_hash);
+    if let Some(value) = fields.first() {
+        object.insert("sender".to_owned(), sol_value_to_json(value));
+    }
+    if let Some(value) = fields.get(1) {
+        object.insert("sourceChainId".to_owned(), sol_value_to_json(value));
+    }
+    if let Some(value) = fields.get(2) {
+        object.insert("targetChainId".to_owned(), sol_value_to_json(value));
+    }
+    if let Some(value) = fields.get(3) {
+        object.insert("receiver".to_owned(), sol_value_to_json(value));
+    }
+    Ok(Value::Object(object))
 }
 
-fn topics(row: &Value) -> Result<Vec<B256>, String> {
+fn topics_from(row: &Value) -> Result<Vec<B256>, String> {
     row.get("topics")
         .and_then(Value::as_array)
-        .ok_or_else(|| "log row is missing topics".to_owned())?
+        .ok_or_else(|| "native log row is missing topics".to_owned())?
         .iter()
         .map(|topic| {
             topic
                 .as_str()
-                .ok_or_else(|| "log topic is not a string".to_owned())
+                .ok_or_else(|| "native log topic is not a string".to_owned())
                 .and_then(parse_topic)
         })
         .collect()
 }
 
-fn data(row: &Value) -> Result<Vec<u8>, String> {
-    let value = row
+fn data_from(row: &Value) -> Result<Vec<u8>, String> {
+    let data = row
         .get("data")
         .and_then(Value::as_str)
-        .ok_or_else(|| "log row is missing data".to_owned())?;
-    let hex = value
+        .ok_or_else(|| "native log row is missing data".to_owned())?;
+    let data = data
         .strip_prefix("0x")
-        .ok_or_else(|| "data must start with 0x".to_owned())?;
-    Vec::from_hex(hex).map_err(|error| format!("invalid data: {error}"))
+        .ok_or_else(|| "native log data must start with 0x".to_owned())?;
+    Vec::from_hex(data).map_err(|error| format!("invalid native log data: {error}"))
 }
 
 fn parse_topic(value: &str) -> Result<B256, String> {
     value
         .parse::<B256>()
-        .map_err(|error| format!("invalid topic: {error}"))
-}
-
-fn tuple_value(values: &[DynSolValue], index: usize) -> Value {
-    values
-        .get(index)
-        .map(sol_value_to_json)
-        .unwrap_or(Value::Null)
+        .map_err(|error| format!("invalid native log topic: {error}"))
 }
 
 fn sol_value_to_json(value: &DynSolValue) -> Value {
@@ -329,4 +321,19 @@ fn sol_value_to_json(value: &DynSolValue) -> Value {
             Value::Array(values.iter().map(sol_value_to_json).collect())
         }
     }
+}
+
+fn string_field(row: &Value, name: &str) -> Option<String> {
+    row.get(name).and_then(Value::as_str).map(str::to_owned)
+}
+
+fn i32_field(row: &Value, name: &str) -> AppResult<i32> {
+    row.get(name)
+        .and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
+                .and_then(|value| i32::try_from(value).ok())
+        })
+        .ok_or_else(|| AppError::Handler(format!("native log row is missing {name}")))
 }
