@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::object_store::ObjectStore;
 
+const MAX_LEDGER_CHUNK_BYTES: u64 = 64 * 1024;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QueryOutcome {
@@ -177,7 +179,16 @@ where
     S: ObjectStore + 'static,
 {
     fn append(&self, entry: &UsageLedgerEntry) -> Result<(), DatalensError> {
-        let key = ledger_object_key(entry)?;
+        let mut line = Vec::new();
+        serde_json::to_writer(&mut line, entry).map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::Internal,
+                format!("encode usage ledger entry: {error}"),
+            )
+        })?;
+        line.push(b'\n');
+
+        let mut key = writable_ledger_object_key(&self.object_store, entry, line.len() as u64)?;
         let mut bytes = if self.object_store.exists(&key)? {
             self.object_store.get(&key)?
         } else {
@@ -186,13 +197,11 @@ where
         if !bytes.is_empty() && !bytes.ends_with(b"\n") {
             bytes.push(b'\n');
         }
-        serde_json::to_writer(&mut bytes, entry).map_err(|error| {
-            DatalensError::new(
-                DatalensErrorKind::Internal,
-                format!("encode usage ledger entry: {error}"),
-            )
-        })?;
-        bytes.push(b'\n');
+        if !bytes.is_empty() && bytes.len() as u64 + line.len() as u64 > MAX_LEDGER_CHUNK_BYTES {
+            key = next_ledger_object_key(&key)?;
+            bytes.clear();
+        }
+        bytes.extend_from_slice(&line);
         self.object_store.put(&key, &bytes).map_err(|error| {
             DatalensError::new(
                 DatalensErrorKind::StorageWriteFailure,
@@ -238,15 +247,73 @@ where
     }
 }
 
-fn ledger_object_key(entry: &UsageLedgerEntry) -> Result<String, DatalensError> {
+fn writable_ledger_object_key<S>(
+    object_store: &S,
+    entry: &UsageLedgerEntry,
+    entry_bytes: u64,
+) -> Result<String, DatalensError>
+where
+    S: ObjectStore,
+{
+    let prefix = ledger_chunk_prefix(entry)?;
+    let mut latest = None;
+    for object in object_store.list(&prefix)? {
+        if let Some(index) = ledger_chunk_index(&object.key) {
+            latest = Some(match latest {
+                Some((latest_index, latest_size)) if latest_index > index => {
+                    (latest_index, latest_size)
+                }
+                _ => (index, object.size),
+            });
+        }
+    }
+    let Some((index, size)) = latest else {
+        return Ok(ledger_chunk_key(&prefix, 0));
+    };
+    if size > 0 && size + entry_bytes > MAX_LEDGER_CHUNK_BYTES {
+        Ok(ledger_chunk_key(&prefix, index + 1))
+    } else {
+        Ok(ledger_chunk_key(&prefix, index))
+    }
+}
+
+fn next_ledger_object_key(key: &str) -> Result<String, DatalensError> {
+    let (prefix, index) = key.rsplit_once('/').ok_or_else(|| {
+        DatalensError::internal(format!("usage ledger chunk key missing prefix {key}"))
+    })?;
+    let index = index
+        .strip_suffix(".jsonl")
+        .ok_or_else(|| {
+            DatalensError::internal(format!("usage ledger chunk key missing extension {key}"))
+        })?
+        .parse::<u64>()
+        .map_err(|error| {
+            DatalensError::internal(format!("parse usage ledger chunk key: {error}"))
+        })?;
+    Ok(ledger_chunk_key(prefix, index + 1))
+}
+
+fn ledger_chunk_prefix(entry: &UsageLedgerEntry) -> Result<String, DatalensError> {
     let day = entry.timestamp_unix_seconds / 86_400;
     Ok(format!(
-        "usage/applications/{}/chains/{}/datasets/{}/range-kind/{}/days/{day}.jsonl",
+        "usage/applications/{}/chains/{}/datasets/{}/range-kind/{}/days/{day}/chunks",
         application_key(&entry.application_id),
         entry.chain.key_prefix(),
         dataset_key_segment(entry.dataset_key.as_str()),
         range_kind_key(entry.range.kind()),
     ))
+}
+
+fn ledger_chunk_key(prefix: &str, index: u64) -> String {
+    format!("{prefix}/{index:06}.jsonl")
+}
+
+fn ledger_chunk_index(key: &str) -> Option<u64> {
+    key.rsplit_once('/')?
+        .1
+        .strip_suffix(".jsonl")?
+        .parse::<u64>()
+        .ok()
 }
 
 fn application_key(application_id: &str) -> String {

@@ -1,4 +1,10 @@
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use datalens_chain::{DatasetSelector, FinalityLevel};
 use datalens_core::{
@@ -70,6 +76,54 @@ fn test_usage_ledger_partitions_by_application_chain_and_day() {
     assert!(objects[0].key.contains("/chains/evm/ethereum/1/"));
     assert!(objects[0].key.ends_with(".jsonl"));
     assert!(!objects[0].key.contains("api/with unsafe chars"));
+}
+
+#[test]
+fn test_usage_ledger_rotates_bounded_chunks_for_repeated_hits() {
+    let store = CountingObjectStore::new(temp_storage_root("repeated-hits"));
+    let ledger = UsageLedgerStore::new(store.clone());
+    let selector = DatasetSelector::all();
+    let entry = UsageLedgerEntry::query_event(
+        "analytics-api",
+        test_chain(),
+        DatasetKey::evm_blocks(),
+        &selector,
+        LedgerRange::blocks(1, 1).expect("valid range"),
+        FinalityLevel::Safe,
+        QueryOutcome::Hit,
+        CacheOutcome::Hit,
+        FillOutcome::NotAttempted,
+        1,
+    );
+
+    for request in 0..1_000 {
+        ledger
+            .append(&entry.clone().with_request_id(format!("request-{request}")))
+            .expect("append repeated hit");
+    }
+
+    let objects = store.list("usage").expect("list usage objects");
+    let durable_bytes: u64 = objects.iter().map(|object| object.size).sum();
+    assert!(objects.len() <= 16, "usage objects: {objects:#?}");
+    assert!(
+        objects.iter().all(|object| object.size <= 96 * 1024),
+        "usage objects: {objects:#?}"
+    );
+    assert!(
+        store.total_put_bytes() <= durable_bytes * 128,
+        "total put bytes {} durable bytes {durable_bytes}",
+        store.total_put_bytes()
+    );
+
+    let events = ledger
+        .read_application("analytics-api")
+        .expect("read application usage");
+    assert_eq!(events.len(), 1_000);
+    assert!(
+        events
+            .iter()
+            .all(|event| event.query_outcome == QueryOutcome::Hit)
+    );
 }
 
 #[test]
@@ -157,6 +211,49 @@ fn temp_storage_root(name: &str) -> PathBuf {
 fn test_chain() -> ChainIdentity {
     ChainIdentity::try_new(ChainFamily::Evm, "ethereum", Some(NetworkId::numeric(1)))
         .expect("valid chain identity")
+}
+
+#[derive(Clone, Debug)]
+struct CountingObjectStore {
+    inner: LocalObjectStore,
+    total_put_bytes: Arc<AtomicU64>,
+}
+
+impl CountingObjectStore {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            inner: LocalObjectStore::new(root),
+            total_put_bytes: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn total_put_bytes(&self) -> u64 {
+        self.total_put_bytes.load(Ordering::SeqCst)
+    }
+}
+
+impl ObjectStore for CountingObjectStore {
+    fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError> {
+        self.inner.get(key)
+    }
+
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
+        self.total_put_bytes
+            .fetch_add(bytes.len() as u64, Ordering::SeqCst);
+        self.inner.put(key, bytes)
+    }
+
+    fn exists(&self, key: &str) -> Result<bool, DatalensError> {
+        self.inner.exists(key)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
+        self.inner.list(prefix)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), DatalensError> {
+        self.inner.delete(key)
+    }
 }
 
 #[derive(Clone, Debug)]
