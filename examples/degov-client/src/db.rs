@@ -84,7 +84,10 @@ impl AppDatabase {
             .query_row("SELECT COUNT(*) FROM degov_votes", [], |row| row.get(0))?)
     }
 
-    pub fn proposal_totals(&self, proposal_id: &str) -> AppResult<Option<(i64, i64, i64)>> {
+    pub fn proposal_totals(
+        &self,
+        proposal_id: &str,
+    ) -> AppResult<Option<(String, String, String)>> {
         Ok(self
             .connection
             .borrow()

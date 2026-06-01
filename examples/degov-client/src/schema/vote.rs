@@ -4,7 +4,7 @@ pub struct GovernanceVote {
     pub proposal_id: String,
     pub voter: Option<String>,
     pub support: i64,
-    pub weight: i64,
+    pub weight: String,
     pub reason: Option<String>,
     pub transaction_hash: Option<String>,
     pub block_number: Option<i64>,

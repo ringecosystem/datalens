@@ -2056,7 +2056,9 @@ dependencies = [
  "alloy-primitives",
  "datalens-sdk",
  "rusqlite",
+ "serde",
  "serde_json",
+ "toml",
 ]
 
 [[package]]

@@ -137,11 +137,31 @@ fn apply_projection_delta(
     tx: &rusqlite::Transaction<'_>,
     delta: ProposalProjectionDelta,
 ) -> AppResult<()> {
-    let (for_delta, against_delta, abstain_delta) = match delta.support {
-        1 => (delta.weight, 0, 0),
-        0 => (0, delta.weight, 0),
-        2 => (0, 0, delta.weight),
-        _ => (0, 0, 0),
+    let current = tx
+        .query_row(
+            "SELECT for_votes, against_votes, abstain_votes, vote_count
+             FROM degov_proposals
+             WHERE proposal_id = ?1",
+            [&delta.proposal_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+
+    let (mut for_votes, mut against_votes, mut abstain_votes, vote_count) =
+        current.unwrap_or_else(|| ("0".to_owned(), "0".to_owned(), "0".to_owned(), 0));
+
+    match delta.support {
+        1 => for_votes = add_decimal_strings(&for_votes, &delta.weight),
+        0 => against_votes = add_decimal_strings(&against_votes, &delta.weight),
+        2 => abstain_votes = add_decimal_strings(&abstain_votes, &delta.weight),
+        _ => {}
     };
 
     tx.execute(
@@ -152,14 +172,20 @@ fn apply_projection_delta(
             abstain_votes,
             vote_count,
             updated_at
-        ) VALUES (?1, ?2, ?3, ?4, 1, CURRENT_TIMESTAMP)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, CURRENT_TIMESTAMP)
         ON CONFLICT(proposal_id) DO UPDATE SET
-            for_votes = for_votes + excluded.for_votes,
-            against_votes = against_votes + excluded.against_votes,
-            abstain_votes = abstain_votes + excluded.abstain_votes,
-            vote_count = vote_count + 1,
+            for_votes = excluded.for_votes,
+            against_votes = excluded.against_votes,
+            abstain_votes = excluded.abstain_votes,
+            vote_count = excluded.vote_count,
             updated_at = CURRENT_TIMESTAMP",
-        params![delta.proposal_id, for_delta, against_delta, abstain_delta,],
+        params![
+            delta.proposal_id,
+            for_votes,
+            against_votes,
+            abstain_votes,
+            vote_count + 1,
+        ],
     )?;
     Ok(())
 }
@@ -169,7 +195,7 @@ fn to_governance_vote(event: &VoteCastEvent) -> AppResult<Option<GovernanceVote>
     let Some(proposal_id) = string_field(args, &["proposalId", "proposal_id"]) else {
         return Ok(None);
     };
-    let Some(weight) = integer_field(args, &["weight"]) else {
+    let Some(weight) = decimal_string_field(args, &["weight"]) else {
         return Ok(None);
     };
 
@@ -221,7 +247,7 @@ impl GovernanceVote {
         ProposalProjectionDelta {
             proposal_id: self.proposal_id.clone(),
             support: self.support,
-            weight: self.weight,
+            weight: self.weight.clone(),
         }
     }
 }
@@ -249,4 +275,49 @@ fn integer_field(value: &Value, names: &[&str]) -> Option<i64> {
                 .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
                 .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
         })
+}
+
+fn decimal_string_field(value: &Value, names: &[&str]) -> Option<String> {
+    names
+        .iter()
+        .find_map(|name| value.get(*name))
+        .and_then(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .or_else(|| value.as_u64().map(|value| value.to_string()))
+                .or_else(|| value.as_i64().map(|value| value.to_string()))
+        })
+        .filter(|value| value.chars().all(|character| character.is_ascii_digit()))
+        .map(|value| trim_decimal_leading_zeroes(&value))
+}
+
+fn trim_decimal_leading_zeroes(value: &str) -> String {
+    let trimmed = value.trim_start_matches('0');
+    if trimmed.is_empty() {
+        "0".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+fn add_decimal_strings(left: &str, right: &str) -> String {
+    let mut carry = 0_u8;
+    let mut output = Vec::new();
+    let mut left = left.as_bytes().iter().rev();
+    let mut right = right.as_bytes().iter().rev();
+
+    loop {
+        let left_digit = left.next().map(|digit| digit - b'0');
+        let right_digit = right.next().map(|digit| digit - b'0');
+        if left_digit.is_none() && right_digit.is_none() && carry == 0 {
+            break;
+        }
+
+        let sum = left_digit.unwrap_or(0) + right_digit.unwrap_or(0) + carry;
+        output.push(char::from(b'0' + (sum % 10)));
+        carry = sum / 10;
+    }
+
+    output.iter().rev().collect()
 }

@@ -76,12 +76,27 @@ name = "live-smoke"
 enabled = true
 display_name = "Live Smoke"
 token = "${DATALENS_LIVE_SMOKE_TOKEN}"
-chains = ["ethereum", "solana-mainnet-beta", "tron-mainnet"]
+chains = ["ethereum", "arbitrum", "base", "darwinia", "solana-mainnet-beta", "tron-mainnet"]
 datasets = ["evm.blocks", "evm.logs", "solana.slots", "solana.transactions", "solana.instructions", "tron.blocks", "tron.events"]
 operations = ["query", "discovery"]
 
 [applications.applications.quota]
-max_query_range_blocks = 1000
+max_query_range_blocks = 10000
+max_requests_per_minute = 120
+max_concurrent_requests = 8
+
+[[applications.applications]]
+id = "degov-live"
+name = "degov-live"
+enabled = true
+display_name = "Degov Live Example"
+token = "${DATALENS_DEGOV_TOKEN}"
+chains = ["ethereum", "arbitrum", "base", "darwinia"]
+datasets = ["evm.blocks", "evm.logs"]
+operations = ["query", "discovery"]
+
+[applications.applications.quota]
+max_query_range_blocks = 10000
 max_requests_per_minute = 120
 max_concurrent_requests = 8
 
@@ -100,6 +115,69 @@ enabled = true
 max_batch_blocks = 1000
 
 [chains.ethereum.datasets.logs]
+enabled = true
+query_strategy = "provider_filter"
+max_get_logs_range_blocks = 10000
+max_block_scan_range_blocks = 100
+max_addresses_per_query = 32
+
+[chains.arbitrum]
+kind = "evm"
+chain_id = 42161
+rpc_urls = ["${DATALENS_ARBITRUM_RPC_URL}"]
+
+[chains.arbitrum.finality]
+mode = "lag"
+safe_lag_blocks = 64
+finalized_lag_blocks = 256
+
+[chains.arbitrum.datasets.blocks]
+enabled = true
+max_batch_blocks = 1000
+
+[chains.arbitrum.datasets.logs]
+enabled = true
+query_strategy = "provider_filter"
+max_get_logs_range_blocks = 10000
+max_block_scan_range_blocks = 100
+max_addresses_per_query = 32
+
+[chains.base]
+kind = "evm"
+chain_id = 8453
+rpc_urls = ["${DATALENS_BASE_RPC_URL}"]
+
+[chains.base.finality]
+mode = "lag"
+safe_lag_blocks = 64
+finalized_lag_blocks = 256
+
+[chains.base.datasets.blocks]
+enabled = true
+max_batch_blocks = 1000
+
+[chains.base.datasets.logs]
+enabled = true
+query_strategy = "provider_filter"
+max_get_logs_range_blocks = 10000
+max_block_scan_range_blocks = 100
+max_addresses_per_query = 32
+
+[chains.darwinia]
+kind = "evm"
+chain_id = 46
+rpc_urls = ["${DATALENS_DARWINIA_RPC_URL}"]
+
+[chains.darwinia.finality]
+mode = "lag"
+safe_lag_blocks = 64
+finalized_lag_blocks = 256
+
+[chains.darwinia.datasets.blocks]
+enabled = true
+max_batch_blocks = 1000
+
+[chains.darwinia.datasets.logs]
 enabled = true
 query_strategy = "provider_filter"
 max_get_logs_range_blocks = 10000

@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS degov_votes (
     proposal_id TEXT NOT NULL,
     voter TEXT,
     support INTEGER NOT NULL,
-    weight INTEGER NOT NULL,
+    weight TEXT NOT NULL,
     reason TEXT,
     transaction_hash TEXT,
     block_number INTEGER,
@@ -20,9 +20,9 @@ CREATE TABLE IF NOT EXISTS degov_votes (
 
 CREATE TABLE IF NOT EXISTS degov_proposals (
     proposal_id TEXT PRIMARY KEY NOT NULL,
-    for_votes INTEGER NOT NULL DEFAULT 0,
-    against_votes INTEGER NOT NULL DEFAULT 0,
-    abstain_votes INTEGER NOT NULL DEFAULT 0,
+    for_votes TEXT NOT NULL DEFAULT '0',
+    against_votes TEXT NOT NULL DEFAULT '0',
+    abstain_votes TEXT NOT NULL DEFAULT '0',
     vote_count INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
