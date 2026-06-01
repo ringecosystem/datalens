@@ -1,0 +1,8 @@
+[[workloads]]
+name = "base"
+chain_name = "base"
+chain_id = 8453
+contract_address = "0x13b2211a7ca45db2808f6db05557ce5347e3634e"
+start_block = 30519000
+end_block = 30520999
+chunk_size = 2000

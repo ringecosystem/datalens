@@ -63,6 +63,39 @@ pub fn run_once(
     })
 }
 
+pub fn run_until_complete(
+    config: &config::AppConfig,
+    db: &db::AppDatabase,
+    client: &datalens::DatalensOrmpClient,
+) -> AppResult<RunSummary> {
+    let mut page_config = config.clone();
+    let mut total = RunSummary {
+        fetched_rows: 0,
+        inserted_rows: 0,
+        skipped_duplicates: 0,
+        skipped_invalid: 0,
+        checkpoint_cursor: None,
+        has_next_page: false,
+    };
+
+    loop {
+        let page = run_once(&page_config, db, client)?;
+        total.fetched_rows += page.fetched_rows;
+        total.inserted_rows += page.inserted_rows;
+        total.skipped_duplicates += page.skipped_duplicates;
+        total.skipped_invalid += page.skipped_invalid;
+        total.checkpoint_cursor = page.checkpoint_cursor.clone();
+        total.has_next_page = page.has_next_page;
+
+        if !page.has_next_page {
+            break;
+        }
+        page_config.reset_checkpoint = false;
+    }
+
+    Ok(total)
+}
+
 fn parse_checkpoint_block(value: &str) -> AppResult<i32> {
     value.parse().map_err(|error| {
         AppError::Config(format!(
