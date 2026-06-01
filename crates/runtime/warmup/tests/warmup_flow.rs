@@ -567,6 +567,8 @@ fn log_record(block_number: u64, log_index: u64) -> LogRecord {
     LogRecord {
         block_number,
         block_hash: format!("0x{:064x}", block_number + 10_000),
+        parent_hash: None,
+        block_timestamp: None,
         transaction_hash: format!("0x{block_number:064x}"),
         transaction_index: 0,
         log_index,

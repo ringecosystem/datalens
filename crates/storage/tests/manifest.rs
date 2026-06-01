@@ -1,5 +1,9 @@
 use std::path::PathBuf;
 
+use arrow::{
+    array::{ArrayRef, BooleanArray, RecordBatch, StringArray, UInt64Array},
+    datatypes::{DataType, Field, Schema},
+};
 use datalens_chain::DatasetSelector;
 use datalens_chain::FinalityLevel;
 use datalens_core::{
@@ -9,6 +13,8 @@ use datalens_core::{
 };
 
 use datalens_storage::*;
+use parquet::arrow::ArrowWriter;
+use sha2::{Digest, Sha256};
 
 #[derive(Clone, Debug)]
 struct FailingPutObjectStore {
@@ -368,6 +374,47 @@ fn write_manifest_json(storage: &LocalStorage, chain: &ChainIdentity, manifest: 
     std::fs::write(storage.manifest_path(chain), bytes).expect("write manifest");
 }
 
+fn legacy_evm_logs_parquet_bytes() -> Vec<u8> {
+    let schema = std::sync::Arc::new(Schema::new(vec![
+        Field::new("block_number", DataType::UInt64, false),
+        Field::new("block_hash", DataType::Utf8, false),
+        Field::new("transaction_hash", DataType::Utf8, false),
+        Field::new("transaction_index", DataType::UInt64, false),
+        Field::new("log_index", DataType::UInt64, false),
+        Field::new("address", DataType::Utf8, false),
+        Field::new("topics", DataType::Utf8, false),
+        Field::new("data", DataType::Utf8, false),
+        Field::new("removed", DataType::Boolean, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            std::sync::Arc::new(UInt64Array::from_iter_values([10])) as ArrayRef,
+            std::sync::Arc::new(StringArray::from_iter_values(["0xblock10"])),
+            std::sync::Arc::new(StringArray::from_iter_values(["0xtx10"])),
+            std::sync::Arc::new(UInt64Array::from_iter_values([1])),
+            std::sync::Arc::new(UInt64Array::from_iter_values([0])),
+            std::sync::Arc::new(StringArray::from_iter_values([
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ])),
+            std::sync::Arc::new(StringArray::from_iter_values(["[]"])),
+            std::sync::Arc::new(StringArray::from_iter_values(["0x"])),
+            std::sync::Arc::new(BooleanArray::from_iter([false])),
+        ],
+    )
+    .expect("legacy batch");
+    let mut bytes = Vec::new();
+    let mut writer = ArrowWriter::try_new(&mut bytes, schema, None).expect("legacy writer");
+    writer.write(&batch).expect("legacy row write");
+    writer.close().expect("legacy writer close");
+    bytes
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 #[test]
 fn test_selector_coverage_key_includes_chain_dataset_and_stable_fingerprint() {
     let chain =
@@ -708,32 +755,41 @@ fn test_evm_logs_rows_write_parquet_and_read_back() {
     let rows = DatasetRows::new(
         DatasetKey::evm_logs(),
         QueryRows::EvmLogs(vec![
-            LogRecord::try_new(
-                10,
-                "0xblock10".to_owned(),
-                "0xtx10".to_owned(),
-                1,
-                0,
-                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                vec![
-                    "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
-                ],
-                "0x1234".to_owned(),
-                false,
-            )
-            .expect("log row"),
-            LogRecord::try_new(
-                12,
-                "0xblock12".to_owned(),
-                "0xtx12".to_owned(),
-                2,
-                1,
-                "0xcccccccccccccccccccccccccccccccccccccccc",
-                Vec::new(),
-                "0x".to_owned(),
-                true,
-            )
-            .expect("log row"),
+            LogRecord {
+                parent_hash: Some("0xparent09".to_owned()),
+                block_timestamp: Some(1_700_000_010),
+                ..LogRecord::try_new(
+                    10,
+                    "0xblock10".to_owned(),
+                    "0xtx10".to_owned(),
+                    1,
+                    0,
+                    "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    vec![
+                        "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                            .to_owned(),
+                    ],
+                    "0x1234".to_owned(),
+                    false,
+                )
+                .expect("log row")
+            },
+            LogRecord {
+                parent_hash: Some("0xparent11".to_owned()),
+                block_timestamp: Some(1_700_000_012),
+                ..LogRecord::try_new(
+                    12,
+                    "0xblock12".to_owned(),
+                    "0xtx12".to_owned(),
+                    2,
+                    1,
+                    "0xcccccccccccccccccccccccccccccccccccccccc",
+                    Vec::new(),
+                    "0x".to_owned(),
+                    true,
+                )
+                .expect("log row")
+            },
         ]),
     )
     .expect("dataset rows");
@@ -767,6 +823,75 @@ fn test_evm_logs_rows_write_parquet_and_read_back() {
         .read_rows(&chain, &DatasetKey::evm_logs(), &selector, range)
         .expect("read rows");
     assert_eq!(read, rows);
+}
+
+#[test]
+fn test_evm_logs_legacy_parquet_without_block_metadata_reads_null_metadata() {
+    let storage = LocalStorage::new(temp_storage_root("logs-legacy-parquet"));
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let range = LedgerRange::blocks(10, 10).expect("valid range");
+    let rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![
+            LogRecord::try_new(
+                10,
+                "0xblock10".to_owned(),
+                "0xtx10".to_owned(),
+                1,
+                0,
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                Vec::new(),
+                "0x".to_owned(),
+                false,
+            )
+            .expect("log row"),
+        ]),
+    )
+    .expect("dataset rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &selector,
+            range: range.clone(),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write rows");
+
+    let mut manifest = read_manifest_json(&storage, &chain);
+    let object_key = manifest["entries"][0]["object_key"]
+        .as_str()
+        .expect("object key")
+        .to_owned();
+    let legacy_bytes = legacy_evm_logs_parquet_bytes();
+    std::fs::write(storage.root().join(&object_key), &legacy_bytes).expect("legacy parquet write");
+    let entry = manifest["entries"][0]
+        .as_object_mut()
+        .expect("manifest entry object");
+    entry.insert(
+        "object_size_bytes".to_owned(),
+        serde_json::json!(legacy_bytes.len() as u64),
+    );
+    entry.insert(
+        "checksum".to_owned(),
+        serde_json::json!(hex_sha256(&legacy_bytes)),
+    );
+    write_manifest_json(&storage, &chain, manifest);
+
+    let read = storage
+        .read_rows(&chain, &DatasetKey::evm_logs(), &selector, range)
+        .expect("read legacy rows");
+    let QueryRows::EvmLogs(logs) = read.rows() else {
+        panic!("expected evm logs");
+    };
+
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].parent_hash, None);
+    assert_eq!(logs[0].block_timestamp, None);
 }
 
 #[test]

@@ -32,6 +32,8 @@ fn record(block_number: u64, log_index: u64, address: &str) -> IndexedRecord {
         payload: serde_json::json!({
             "block_number": block_number,
             "block_hash": format!("0xblock{block_number:064x}"),
+            "parent_hash": format!("0xparent{block_number:064x}"),
+            "block_timestamp": 1_700_000_000_u64 + block_number,
             "transaction_hash": format!("0xtx{block_number:064x}"),
             "transaction_index": 2,
             "log_index": log_index,
@@ -60,6 +62,8 @@ fn decoded_record_with_status(
     let mut payload = serde_json::json!({
         "block_number": block_number,
         "block_hash": format!("0xblock{block_number:064x}"),
+        "parent_hash": format!("0xparent{block_number:064x}"),
+        "block_timestamp": 1_700_000_000_u64 + block_number,
         "transaction_hash": format!("0xtx{block_number:064x}"),
         "transaction_index": 2,
         "log_index": log_index,
@@ -130,6 +134,8 @@ fn test_graphql_events_query_filters_sqlite_store_and_returns_stable_fields() {
                     dataset
                     blockNumber
                     blockHash
+                    parentHash
+                    blockTimestamp
                     transactionHash
                     transactionIndex
                     eventIndex
@@ -161,6 +167,11 @@ fn test_graphql_events_query_filters_sqlite_store_and_returns_stable_fields() {
     assert_eq!(events[0]["chainId"], 1);
     assert_eq!(events[0]["dataset"], "evm.logs");
     assert_eq!(events[0]["blockNumber"], 20);
+    assert_eq!(
+        events[0]["parentHash"],
+        "0xparent0000000000000000000000000000000000000000000000000000000000000014"
+    );
+    assert_eq!(events[0]["blockTimestamp"], 1_700_000_020_u64);
     assert_eq!(events[0]["eventIndex"], 1);
     assert_eq!(events[0]["address"], matching_address);
     assert_eq!(events[0]["selector"], matching_address);
@@ -335,6 +346,8 @@ fn test_graphql_decoded_events_query_returns_metadata_args_and_decode_status() {
                 dataset
                 blockNumber
                 blockHash
+                parentHash
+                blockTimestamp
                 transactionHash
                 transactionIndex
                 logIndex
@@ -365,6 +378,11 @@ fn test_graphql_decoded_events_query_returns_metadata_args_and_decode_status() {
     assert_eq!(events[0]["chainId"], 1);
     assert_eq!(events[0]["dataset"], "evm.logs");
     assert_eq!(events[0]["blockNumber"], 10);
+    assert_eq!(
+        events[0]["parentHash"],
+        "0xparent000000000000000000000000000000000000000000000000000000000000000a"
+    );
+    assert_eq!(events[0]["blockTimestamp"], 1_700_000_010_u64);
     assert_eq!(events[0]["logIndex"], 1);
     assert_eq!(
         events[0]["address"],

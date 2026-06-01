@@ -5,6 +5,8 @@ type DecodedEvent {
 	dataset: String
 	blockNumber: Int
 	blockHash: String
+	parentHash: String
+	blockTimestamp: Int
 	transactionHash: String
 	transactionIndex: Int
 	logIndex: Int
@@ -42,6 +44,8 @@ type IndexedEvent {
 	dataset: String
 	blockNumber: Int
 	blockHash: String
+	parentHash: String
+	blockTimestamp: Int
 	transactionHash: String
 	transactionIndex: Int
 	eventIndex: Int

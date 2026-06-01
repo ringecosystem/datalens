@@ -197,11 +197,14 @@ fn test_fetch_rejects_chain_mismatch_before_provider_call() {
 fn test_provider_filter_logs_use_eth_get_logs() {
     let topic = transfer_topic();
     let address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let (url, requests) = start_rpc_server(vec![json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "result": [provider_log(10, "0xaaa", topic)]
-    })]);
+    let (url, requests) = start_rpc_server(vec![
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": [provider_log(10, "0xaaa", topic)]
+        }),
+        block_response(10, "0xaaa", "0xparent", 1),
+    ]);
     let client = EvmRpcClient::with_chain(
         vec![url],
         ethereum_identity(),
@@ -232,11 +235,14 @@ fn test_provider_filter_logs_use_eth_get_logs() {
     };
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].address, address);
-    assert_eq!(response.provider_diagnostics.calls, 1);
+    assert_eq!(rows[0].parent_hash.as_deref(), Some("0xparent"));
+    assert_eq!(rows[0].block_timestamp, Some(1));
+    assert_eq!(response.provider_diagnostics.calls, 2);
     assert!(response.provider_diagnostics.warnings.is_empty());
     let requests = requests.lock().expect("requests");
-    assert_eq!(requests.len(), 1);
+    assert_eq!(requests.len(), 2);
     assert_eq!(requests[0]["method"], "eth_getLogs");
+    assert_eq!(requests[1]["method"], "eth_getBlockByNumber");
 }
 
 #[test]
@@ -297,6 +303,8 @@ fn test_block_range_logs_fetch_receipts_and_filter_locally_without_eth_get_logs(
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].transaction_hash, "0xtx0");
     assert_eq!(rows[0].log_index, 0);
+    assert_eq!(rows[0].parent_hash.as_deref(), Some("0xparent"));
+    assert_eq!(rows[0].block_timestamp, Some(1));
     assert_eq!(response.provider_diagnostics.calls, 3);
     assert!(
         response
@@ -561,6 +569,62 @@ fn test_canonical_block_fetches_provider_hash_at_height() {
     assert_eq!(requests[0]["params"][0], "0xa");
 }
 
+#[test]
+fn test_fetch_evm_logs_enriches_block_metadata_once_per_block() {
+    let block_hash = "0x000000000000000000000000000000000000000000000000000000000000000a";
+    let parent_hash = "0x0000000000000000000000000000000000000000000000000000000000000009";
+    let topic = transfer_topic();
+    let (url, requests) = start_rpc_server(vec![
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": [
+                provider_log_with_index(10, block_hash, "0xtx0", 0, topic),
+                provider_log_with_index(10, block_hash, "0xtx1", 1, topic)
+            ]
+        }),
+        block_response(10, block_hash, parent_hash, 1_700_000_000),
+    ]);
+    let client = EvmRpcClient::with_chain(
+        vec![url],
+        ethereum_identity(),
+        EvmFinalityPolicy::Lag {
+            safe_lag_blocks: Some(2),
+            finalized_lag_blocks: Some(4),
+        },
+        10,
+        10,
+        10,
+        10,
+    );
+
+    let logs = client
+        .fetch_evm_logs(
+            BlockRange::expect_new(10, 10),
+            &datalens_core::EvmLogFilter::try_from(&datalens_core::LogFilter {
+                addresses: Vec::new(),
+                topics: Vec::new(),
+            })
+            .expect("filter"),
+        )
+        .expect("logs");
+
+    assert_eq!(logs.len(), 2);
+    assert!(
+        logs.iter()
+            .all(|log| log.parent_hash.as_deref() == Some(parent_hash))
+    );
+    assert!(
+        logs.iter()
+            .all(|log| log.block_timestamp == Some(1_700_000_000))
+    );
+    let requests = requests.lock().expect("requests");
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0]["method"], "eth_getLogs");
+    assert_eq!(requests[1]["method"], "eth_getBlockByNumber");
+    assert_eq!(requests[1]["params"][0], "0xa");
+}
+
 fn ethereum_identity() -> ChainIdentity {
     ChainIdentity::try_new(ChainFamily::Evm, "ethereum", Some(NetworkId::numeric(1)))
         .expect("valid chain")
@@ -634,6 +698,19 @@ fn receipt(
     })
 }
 
+fn block_response(number: u64, hash: &str, parent_hash: &str, timestamp: u64) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "number": format!("0x{number:x}"),
+            "hash": hash,
+            "parentHash": parent_hash,
+            "timestamp": format!("0x{timestamp:x}")
+        }
+    })
+}
+
 fn provider_log(number: u64, block_hash: &str, topic: &str) -> Value {
     provider_log_with_address(
         number,
@@ -641,6 +718,24 @@ fn provider_log(number: u64, block_hash: &str, topic: &str) -> Value {
         "0xtx",
         0,
         0,
+        "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        topic,
+    )
+}
+
+fn provider_log_with_index(
+    number: u64,
+    block_hash: &str,
+    tx_hash: &str,
+    log_index: u64,
+    topic: &str,
+) -> Value {
+    provider_log_with_address(
+        number,
+        block_hash,
+        tx_hash,
+        0,
+        log_index,
         "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         topic,
     )

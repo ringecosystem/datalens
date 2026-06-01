@@ -33,6 +33,8 @@ fn record_with_event(
         payload: serde_json::json!({
             "block_number": block_number,
             "block_hash": format!("0xblock{block_number:064x}"),
+            "parent_hash": format!("0xparent{block_number:064x}"),
+            "block_timestamp": 1_700_000_000_u64 + block_number,
             "transaction_hash": format!("0xtx{block_number:064x}"),
             "transaction_index": 2,
             "log_index": log_index,
@@ -56,6 +58,8 @@ fn decoded_record(block_number: u64, log_index: u64, event_name: &str) -> Indexe
         payload: serde_json::json!({
             "block_number": block_number,
             "block_hash": format!("0xblock{block_number:064x}"),
+            "parent_hash": format!("0xparent{block_number:064x}"),
+            "block_timestamp": 1_700_000_000_u64 + block_number,
             "transaction_hash": format!("0xtx{block_number:064x}"),
             "transaction_index": 2,
             "log_index": log_index,
@@ -163,7 +167,46 @@ fn test_sqlite_output_queries_by_chain_dataset_address_and_block_range() {
 
     assert_eq!(rows.rows.len(), 1);
     assert_eq!(rows.rows[0]["block_number"], 20);
+    assert_eq!(
+        rows.rows[0]["parent_hash"],
+        "0xparent0000000000000000000000000000000000000000000000000000000000000014"
+    );
+    assert_eq!(rows.rows[0]["block_timestamp"], 1_700_000_020_u64);
     assert_eq!(rows.rows[0]["address"], matching_address);
+}
+
+#[test]
+fn test_sqlite_output_normalizes_block_time_to_block_timestamp() {
+    let store = SqliteOutputStore::connect("sqlite::memory:").expect("sqlite store connects");
+    store
+        .write_records(&[IndexedRecord {
+            index: "solana-index".to_owned(),
+            chain: "mainnet-beta".to_owned(),
+            chain_id: 0,
+            dataset: "solana.transactions".to_owned(),
+            payload: serde_json::json!({
+                "slot": 42,
+                "blockhash": "solana-block-hash",
+                "previous_blockhash": "solana-parent-hash",
+                "block_time": 1_700_000_042_u64,
+                "signature": "sig42"
+            }),
+        }])
+        .expect("write records");
+
+    let rows = store
+        .query(StoreQuery {
+            dataset: "solana.transactions".to_owned(),
+            filter: serde_json::json!({ "chain": "mainnet-beta" }),
+        })
+        .expect("query rows");
+
+    assert_eq!(rows.rows.len(), 1);
+    assert_eq!(rows.rows[0]["block_number"], 42);
+    assert_eq!(rows.rows[0]["block_hash"], "solana-block-hash");
+    assert_eq!(rows.rows[0]["parent_hash"], "solana-parent-hash");
+    assert_eq!(rows.rows[0]["block_timestamp"], 1_700_000_042_u64);
+    assert_eq!(rows.rows[0]["block_time"], 1_700_000_042_u64);
 }
 
 #[test]
@@ -298,6 +341,8 @@ fn test_sqlite_output_schema_matches_benchmark_query_paths() {
             .map(|row| row.get::<String, _>("name"))
             .collect::<Vec<_>>();
         assert!(columns.iter().any(|column| column == "topic0"));
+        assert!(columns.iter().any(|column| column == "parent_hash"));
+        assert!(columns.iter().any(|column| column == "block_timestamp"));
 
         let indexes = sqlx::query(
             "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'indexed_events'",

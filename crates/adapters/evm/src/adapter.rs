@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use datalens_chain::{
     AdapterCapabilities, CanonicalBlock, CanonicalBlockRequest, ChainAdapter, ChainFetchRequest,
     ChainFetchResponse, ChainHeight, DatasetCapability, DatasetSelector, FinalityKind,
@@ -252,7 +254,11 @@ impl EvmRpcClient {
                 )
             })?;
 
-        logs.into_iter().map(|log| parse_log_record(&log)).collect()
+        let logs = logs
+            .into_iter()
+            .map(|log| parse_log_record(&log))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.enrich_logs_with_block_metadata(logs)
     }
 
     fn fetch_evm_logs_from_receipts(
@@ -273,6 +279,8 @@ impl EvmRpcClient {
             provider_calls += 1;
             let block_number = hex_u64_field(&block, "number")?;
             let block_hash = string_field(&block, "hash")?;
+            let parent_hash = string_field(&block, "parentHash")?;
+            let block_timestamp = hex_u64_field(&block, "timestamp")?;
             let transactions = block
                 .get("transactions")
                 .and_then(Value::as_array)
@@ -303,7 +311,8 @@ impl EvmRpcClient {
                             )
                         })?;
                 for log in receipt_logs {
-                    let log = parse_log_record(log)?;
+                    let log = parse_log_record(log)?
+                        .with_block_metadata(Some(parent_hash.clone()), Some(block_timestamp));
                     if log_matches_filter(&log, filter) {
                         logs.push(log);
                     }
@@ -671,11 +680,12 @@ impl ChainAdapter for EvmRpcClient {
                 match self.logs_query_strategy {
                     QueryStrategy::ProviderFilter => {
                         let mut logs = self.fetch_evm_logs(range, &filter)?;
+                        let provider_calls = 1 + distinct_log_blocks(&logs);
                         logs.retain(|log| range.contains(log.block_number));
                         logs.sort_by_key(|log| {
                             (log.block_number, log.transaction_index, log.log_index)
                         });
-                        (QueryRows::EvmLogs(logs), 1)
+                        (QueryRows::EvmLogs(logs), provider_calls)
                     }
                     QueryStrategy::BlockRange => {
                         warnings.push("evm block_range log query strategy used".to_owned());
@@ -688,11 +698,12 @@ impl ChainAdapter for EvmRpcClient {
                 match self.logs_query_strategy {
                     QueryStrategy::ProviderFilter => {
                         let mut logs = self.fetch_evm_logs(range, filter)?;
+                        let provider_calls = 1 + distinct_log_blocks(&logs);
                         logs.retain(|log| range.contains(log.block_number));
                         logs.sort_by_key(|log| {
                             (log.block_number, log.transaction_index, log.log_index)
                         });
-                        (QueryRows::EvmLogs(logs), 1)
+                        (QueryRows::EvmLogs(logs), provider_calls)
                     }
                     QueryStrategy::BlockRange => {
                         warnings.push("evm block_range log query strategy used".to_owned());
@@ -772,6 +783,13 @@ fn log_matches_filter(log: &LogRecord, filter: &EvmLogFilter) -> bool {
     true
 }
 
+fn distinct_log_blocks(logs: &[LogRecord]) -> usize {
+    logs.iter()
+        .map(|log| log.block_number)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+}
+
 impl EvmRpcClient {
     fn fetch_full_blocks(&self, range: BlockRange) -> Result<Vec<Value>, DatalensError> {
         let mut blocks = Vec::new();
@@ -789,6 +807,47 @@ impl EvmRpcClient {
             blocks.push(block);
         }
         Ok(blocks)
+    }
+
+    fn enrich_logs_with_block_metadata(
+        &self,
+        logs: Vec<LogRecord>,
+    ) -> Result<Vec<LogRecord>, DatalensError> {
+        let mut block_headers = BTreeMap::new();
+        for log in &logs {
+            block_headers
+                .entry(log.block_number)
+                .or_insert_with(|| self.fetch_block_by_tag(&format!("0x{:x}", log.block_number)));
+        }
+
+        logs.into_iter()
+            .map(|log| {
+                let header = block_headers
+                    .get(&log.block_number)
+                    .expect("header request inserted")
+                    .as_ref()
+                    .map_err(|error| {
+                        DatalensError::new(
+                            error.kind.clone(),
+                            format!(
+                                "failed to fetch block header for log block {}: {}",
+                                log.block_number, error.message
+                            ),
+                        )
+                    })?;
+                if header.hash != log.block_hash {
+                    return Err(DatalensError::new(
+                        DatalensErrorKind::ProviderFailure,
+                        format!(
+                            "log block hash {} does not match fetched block hash {} for block {}",
+                            log.block_hash, header.hash, log.block_number
+                        ),
+                    ));
+                }
+                Ok(log
+                    .with_block_metadata(Some(header.parent_hash.clone()), Some(header.timestamp)))
+            })
+            .collect()
     }
 
     fn fetch_block_by_tag(&self, tag: &str) -> Result<BlockHeader, DatalensError> {

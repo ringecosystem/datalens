@@ -16,7 +16,7 @@ use crate::IndexerError;
 use super::{
     IndexedRecord, OutputWriteReceipt, OutputWriteResult, OutputWriteSink, QueryableStore,
     StoreQuery, StoreQueryResult,
-    event::{NormalizedIndexedEvent, max_position, row_payload_with_metadata},
+    event::{NormalizedIndexedEvent, RowPayloadMetadata, max_position, row_payload_with_metadata},
     filter::StoreQueryFilter,
 };
 
@@ -61,6 +61,8 @@ impl SqliteOutputStore {
                         dataset TEXT NOT NULL,
                         block_number INTEGER NOT NULL,
                         block_hash TEXT,
+                        parent_hash TEXT,
+                        block_timestamp INTEGER,
                         transaction_hash TEXT,
                         transaction_index INTEGER,
                         event_index INTEGER,
@@ -81,6 +83,8 @@ impl SqliteOutputStore {
                 .await?;
                 ensure_event_name_column_sqlite(&self.pool).await?;
                 ensure_topic0_column_sqlite(&self.pool).await?;
+                ensure_parent_hash_column_sqlite(&self.pool).await?;
+                ensure_block_timestamp_column_sqlite(&self.pool).await?;
                 backfill_topic0_sqlite(&self.pool).await?;
                 for statement in DROP_INDEX_STATEMENTS {
                     sqlx::query(*statement).execute(&self.pool).await?;
@@ -107,6 +111,28 @@ async fn ensure_event_name_column_sqlite(pool: &SqlitePool) -> Result<(), sqlx::
 
 async fn ensure_topic0_column_sqlite(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     match sqlx::query("ALTER TABLE indexed_events ADD COLUMN topic0 TEXT")
+        .execute(pool)
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(error) if error.to_string().contains("duplicate column name") => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+async fn ensure_parent_hash_column_sqlite(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    match sqlx::query("ALTER TABLE indexed_events ADD COLUMN parent_hash TEXT")
+        .execute(pool)
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(error) if error.to_string().contains("duplicate column name") => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+async fn ensure_block_timestamp_column_sqlite(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    match sqlx::query("ALTER TABLE indexed_events ADD COLUMN block_timestamp INTEGER")
         .execute(pool)
         .await
     {
@@ -224,6 +250,8 @@ async fn insert_record(
             dataset,
             block_number,
             block_hash,
+            parent_hash,
+            block_timestamp,
             transaction_hash,
             transaction_index,
             event_index,
@@ -237,7 +265,7 @@ async fn insert_record(
             removed,
             finality
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(&row.unique_key)
@@ -249,6 +277,8 @@ async fn insert_record(
     .bind(&row.dataset)
     .bind(row.block_number)
     .bind(&row.block_hash)
+    .bind(&row.parent_hash)
+    .bind(row.block_timestamp)
     .bind(&row.transaction_hash)
     .bind(row.transaction_index)
     .bind(row.event_index)
@@ -354,12 +384,16 @@ fn sqlite_row_to_json(row: SqliteRow) -> Result<Value, sqlx::Error> {
     let value = serde_json::from_str::<Value>(&raw_payload).unwrap_or(Value::Object(Map::new()));
     Ok(row_payload_with_metadata(
         value,
-        row.try_get("index_name")?,
-        row.try_get("chain_name")?,
-        row.try_get("chain_family")?,
-        row.try_get("chain_id")?,
-        row.try_get("dataset")?,
-        row.try_get("created_at")?,
+        RowPayloadMetadata {
+            index_name: row.try_get("index_name")?,
+            chain_name: row.try_get("chain_name")?,
+            chain_family: row.try_get("chain_family")?,
+            chain_id: row.try_get("chain_id")?,
+            dataset: row.try_get("dataset")?,
+            parent_hash: row.try_get("parent_hash")?,
+            block_timestamp: row.try_get("block_timestamp")?,
+            created_at: row.try_get("created_at")?,
+        },
     ))
 }
 

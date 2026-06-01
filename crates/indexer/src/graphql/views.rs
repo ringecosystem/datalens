@@ -232,6 +232,16 @@ fn dynamic_indexed_event_object() -> DynamicObject {
             TypeRef::named(TypeRef::STRING),
         ))
         .field(dynamic_row_field(
+            "parentHash",
+            "parent_hash",
+            TypeRef::named(TypeRef::STRING),
+        ))
+        .field(dynamic_row_field(
+            "blockTimestamp",
+            "block_timestamp",
+            TypeRef::named(TypeRef::INT),
+        ))
+        .field(dynamic_row_field(
             "transactionHash",
             "transaction_hash",
             TypeRef::named(TypeRef::STRING),

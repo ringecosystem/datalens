@@ -327,6 +327,30 @@ fn test_log_record_deserialization_canonicalizes_hex_values() {
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ]
     );
+    assert_eq!(record.parent_hash, None);
+    assert_eq!(record.block_timestamp, None);
+}
+
+#[test]
+fn test_log_record_deserialization_preserves_block_metadata() {
+    let json = r#"{
+        "block_number":10,
+        "block_hash":"0xblock",
+        "parent_hash":"0xparent",
+        "block_timestamp":1700000010,
+        "transaction_hash":"0xtx",
+        "transaction_index":0,
+        "log_index":1,
+        "address":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "topics":[],
+        "data":"0x",
+        "removed":false
+    }"#;
+
+    let record: LogRecord = serde_json::from_str(json).expect("valid log record");
+
+    assert_eq!(record.parent_hash.as_deref(), Some("0xparent"));
+    assert_eq!(record.block_timestamp, Some(1_700_000_010));
 }
 
 #[test]
@@ -656,6 +680,8 @@ fn log(block_number: u64, log_index: u64) -> LogRecord {
     LogRecord {
         block_number,
         block_hash: format!("0xblock-{block_number}"),
+        parent_hash: None,
+        block_timestamp: None,
         transaction_hash: format!("0xtx-{block_number}-{log_index}"),
         transaction_index: 0,
         log_index,
