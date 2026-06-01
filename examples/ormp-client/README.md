@@ -42,6 +42,11 @@ Set `DATALENS_ENDPOINT` to the base service URL, not `/native/graphql`; the
 Rust SDK client appends the native GraphQL path. Use `DATALENS_TOKEN` when the
 service requires a bearer token.
 
+To validate duplicate handling after the first run, run the same command again
+against the same SQLite database. The application resumes from its stored
+next-block checkpoint and reports idempotent writes without depending on an
+application index GraphQL service.
+
 ## Configuration
 
 The executable reads:
