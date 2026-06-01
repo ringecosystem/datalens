@@ -96,6 +96,8 @@ services:
       - serve
       - --config
       - ${DATALENS_SERVER_CONFIG:-/etc/datalens/datalens.toml}
+      - --bind
+      - ${DATALENS_SERVER_BIND:-0.0.0.0:3000}
     healthcheck:
       test:
         [

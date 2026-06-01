@@ -33,6 +33,27 @@ fn test_serve_accepts_config_path() {
     match cli.command {
         Command::Serve(command) => {
             assert_eq!(command.config, "custom.toml");
+            assert_eq!(command.bind, None);
+        }
+        command => panic!("expected serve command, got {command:?}"),
+    }
+}
+
+#[test]
+fn test_serve_accepts_bind_override() {
+    let cli = Cli::parse_from([
+        "datalens",
+        "serve",
+        "--config",
+        "config/datalens.compose.toml",
+        "--bind",
+        "127.0.0.1:3100",
+    ]);
+
+    match cli.command {
+        Command::Serve(command) => {
+            assert_eq!(command.config, "config/datalens.compose.toml");
+            assert_eq!(command.bind.as_deref(), Some("127.0.0.1:3100"));
         }
         command => panic!("expected serve command, got {command:?}"),
     }
@@ -45,6 +66,7 @@ fn test_serve_defaults_to_dev_server_config() {
     match cli.command {
         Command::Serve(command) => {
             assert_eq!(command.config, "config/datalens.dev.toml");
+            assert_eq!(command.bind, None);
         }
         command => panic!("expected serve command, got {command:?}"),
     }
@@ -81,6 +103,7 @@ fn test_serve_uses_unified_query_config() {
         toml::from_str(&minimal_config_text()).expect("minimal config should parse");
     let command = ServeCommand {
         config: "config/datalens.dev.toml".to_owned(),
+        bind: None,
     };
 
     let edge = serve_edge_config(&config, &command);

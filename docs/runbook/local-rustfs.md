@@ -60,9 +60,11 @@ Check service status:
 docker compose --profile datalens ps
 ```
 
-The Datalens service listens on `http://localhost:3000`. Native GraphQL is exposed at
-`/native/graphql` when enabled. Application index GraphQL endpoints are served by
-external application services, not by `datalens serve`.
+The Datalens service listens on `http://localhost:${DATALENS_SERVER_PORT:-3000}`.
+Use `DATALENS_SERVER_PORT=3100 DATALENS_SERVER_BIND=0.0.0.0:3000` when port 3000
+is already occupied on the host. Native GraphQL is exposed at `/native/graphql`
+when enabled. Application index GraphQL endpoints are served by external
+application services, not by `datalens serve`.
 
 ## Live Smoke
 
@@ -74,6 +76,7 @@ export DATALENS_SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
 export DATALENS_TRON_RPC_URL=https://api.trongrid.io
 export DATALENS_TRONGRID_API_KEY=
 export DATALENS_LIVE_SMOKE_TOKEN=replace-with-live-smoke-token
+export DATALENS_SERVER_PORT=3100
 ```
 
 Run the Solana durable cache smoke:
@@ -108,8 +111,8 @@ cargo run -p datalens-cli -- cache backfill \
   --chain tron-mainnet \
   --dataset events \
   --range-kind block \
-  --range-start 60000000 \
-  --range-end 60000001 \
+  --range-start 83200000 \
+  --range-end 83200001 \
   --application live-smoke \
   --address 0xa614f803b6fd780986a42c78ec9c7f77e6ded13c \
   --event-name Transfer \
@@ -120,8 +123,8 @@ cargo run -p datalens-cli -- cache verify \
   --chain tron-mainnet \
   --dataset events \
   --range-kind block \
-  --range-start 60000000 \
-  --range-end 60000001 \
+  --range-start 83200000 \
+  --range-end 83200001 \
   --application live-smoke \
   --address 0xa614f803b6fd780986a42c78ec9c7f77e6ded13c \
   --event-name Transfer \
@@ -140,7 +143,7 @@ cargo run -p datalens-cli -- index run --config config/datalens.tron-live-smoke.
 Run the token SDK live examples against the compose `live-smoke` application:
 
 ```sh
-export DATALENS_ENDPOINT=http://127.0.0.1:3000
+export DATALENS_ENDPOINT=http://127.0.0.1:${DATALENS_SERVER_PORT}
 export DATALENS_APPLICATION=live-smoke
 export DATALENS_TOKEN=$DATALENS_LIVE_SMOKE_TOKEN
 
@@ -163,6 +166,11 @@ done
 
 Use the JSON summaries to verify `status: "ok"` and the second pass reports existing
 durable coverage instead of writing a new range.
+
+The TRON public RPC smoke range above is intentionally near-finalized for public
+solidity RPC providers. Older archive/business TRON ranges require an
+archive-capable TRON provider or a TronGrid-backed path; do not use them as the
+default public RPC smoke range.
 
 ## Test Configuration
 
