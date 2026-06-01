@@ -171,6 +171,8 @@ fn local_compose_deployment_artifacts_are_declared() {
     assert!(dev_config.contains("root = \".tmp/datalens-dev\""));
     assert!(compose_config.contains("bucket = \"${DATALENS_S3_BUCKET}\""));
     assert!(compose_config.contains("endpoint_url = \"${DATALENS_S3_ENDPOINT_URL}\""));
+    assert!(compose_config.contains("registry_path = \".data/warmup\""));
+    assert!(!compose_config.contains("registry_path = \"indexes/warmup\""));
     assert!(compose_config.contains("token = \"${DATALENS_ORMP_TOKEN}\""));
     assert!(!compose_config.contains("[index.application"));
     assert!(!compose_config.contains(&format!("DATALENS_{}", "INDEX_DATABASE_URL")));
@@ -186,6 +188,8 @@ fn local_compose_deployment_artifacts_are_declared() {
     assert!(compose_config.contains("datasets = [\"evm.blocks\", \"evm.logs\", \"solana.slots\", \"solana.transactions\", \"solana.instructions\", \"tron.blocks\", \"tron.events\"]"));
 
     assert!(gitignore.contains(".data/"));
+    assert!(gitignore.contains(".datalens/"));
+    assert!(gitignore.contains("indexes/"));
     assert!(runbook.contains("docker compose up -d rustfs-init postgres"));
     assert!(runbook.contains("docker compose --profile datalens up -d --build"));
     assert!(runbook.contains("--chain solana-mainnet-beta"));

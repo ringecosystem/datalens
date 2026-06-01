@@ -45,7 +45,7 @@ bearer_token = "${DATALENS_METRICS_TOKEN}"
 
 [warmup]
 enabled = false
-registry_path = "indexes/warmup"
+registry_path = ".data/warmup"
 scheduler_interval_ms = 1000
 max_global_tasks = 1
 max_per_chain_tasks = 1
