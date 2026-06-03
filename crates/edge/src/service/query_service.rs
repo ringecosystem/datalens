@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use datalens_chain::{AdapterCapabilities, ChainAdapter, DatasetCapability, SelectorKind};
+use datalens_chain::{
+    AdapterCapabilities, ChainAdapter, ChainHeight, DatasetCapability, SelectorKind,
+};
 use datalens_core::{DatalensError, DatalensErrorKind, DatasetKey, DatasetRows, LedgerRange};
 use datalens_executor::{NativeQueryExecutionConfig, NativeQueryExecutor};
 use datalens_metrics::{ApplicationIdentity, MetricsRecorder};
@@ -184,6 +186,30 @@ where
         &self.chain_name
     }
 
+    pub fn chain_kind(&self) -> &str {
+        &self.chain.kind
+    }
+
+    pub fn chain_id(&self) -> u64 {
+        self.chain.chain_id
+    }
+
+    pub fn chain_identity(&self) -> datalens_core::ChainIdentity {
+        self.capabilities.chain().clone()
+    }
+
+    pub fn latest_height(&self) -> Result<ChainHeight, DatalensError> {
+        self.executor.latest_height()
+    }
+
+    pub fn cache_safe_height(&self) -> Result<ChainHeight, DatalensError> {
+        self.executor.cache_safe_height()
+    }
+
+    pub fn finalized_height(&self) -> Result<ChainHeight, DatalensError> {
+        self.executor.finalized_height()
+    }
+
     pub fn query_native(
         &self,
         native_input: NativeQueryInput,
@@ -326,6 +352,20 @@ fn selector_kind_name(selector: &SelectorKind) -> String {
 }
 
 pub(crate) trait RegisteredQueryService: Send + Sync {
+    fn chain_name(&self) -> &str;
+
+    fn chain_kind(&self) -> &str;
+
+    fn chain_id(&self) -> u64;
+
+    fn chain_identity(&self) -> datalens_core::ChainIdentity;
+
+    fn latest_height(&self) -> Result<ChainHeight, DatalensError>;
+
+    fn cache_safe_height(&self) -> Result<ChainHeight, DatalensError>;
+
+    fn finalized_height(&self) -> Result<ChainHeight, DatalensError>;
+
     fn query_native(
         &self,
         request: NativeQueryInput,
@@ -390,6 +430,34 @@ impl<S> RegisteredQueryService for QueryService<S>
 where
     S: ChainAdapter + 'static,
 {
+    fn chain_name(&self) -> &str {
+        QueryService::chain_name(self)
+    }
+
+    fn chain_kind(&self) -> &str {
+        QueryService::chain_kind(self)
+    }
+
+    fn chain_id(&self) -> u64 {
+        QueryService::chain_id(self)
+    }
+
+    fn chain_identity(&self) -> datalens_core::ChainIdentity {
+        QueryService::chain_identity(self)
+    }
+
+    fn latest_height(&self) -> Result<ChainHeight, DatalensError> {
+        QueryService::latest_height(self)
+    }
+
+    fn cache_safe_height(&self) -> Result<ChainHeight, DatalensError> {
+        QueryService::cache_safe_height(self)
+    }
+
+    fn finalized_height(&self) -> Result<ChainHeight, DatalensError> {
+        QueryService::finalized_height(self)
+    }
+
     fn query_native(
         &self,
         request: NativeQueryInput,

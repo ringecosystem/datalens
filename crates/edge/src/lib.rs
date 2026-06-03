@@ -11,6 +11,7 @@ pub mod service;
 pub use contract::{
     discovery::{ChainDiscovery, DatasetDiscovery, DiscoveryResponse},
     error::{ApiErrorBody, ApiErrorDetail, api_error_body, api_error_status},
+    head::{ChainHeadApiResponse, ChainHeadFinalityApi},
     query::{
         FieldSelectionApi, QueryApiRequest, QueryApiResponse, QueryCacheApi, QueryRangeApi,
         QuerySegmentApi, QuerySelectorApi,

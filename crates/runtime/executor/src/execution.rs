@@ -132,6 +132,18 @@ where
         self.execute_with_application(input, None)
     }
 
+    pub fn latest_height(&self) -> Result<datalens_chain::ChainHeight, DatalensError> {
+        self.source.latest_height()
+    }
+
+    pub fn cache_safe_height(&self) -> Result<datalens_chain::ChainHeight, DatalensError> {
+        self.source.cache_safe_height()
+    }
+
+    pub fn finalized_height(&self) -> Result<datalens_chain::ChainHeight, DatalensError> {
+        self.source.finalized_height()
+    }
+
     pub fn flush_staged_writes(&self) -> Result<DurableWriteResult, DatalensError> {
         self.writer.flush()
     }

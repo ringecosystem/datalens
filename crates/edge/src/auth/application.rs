@@ -209,6 +209,51 @@ impl ApplicationRegistry {
         result
     }
 
+    pub fn authenticate_chain_head_headers(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<Option<ApplicationContext>, DatalensError> {
+        if !self.required {
+            return Ok(None);
+        }
+        let result = (|| {
+            let application = self.authenticate_application_headers(headers)?;
+            authorize_application_operation(
+                application,
+                config::ApplicationOperationConfig::Discovery,
+            )?;
+            self.application_context(application)
+        })();
+        self.record_auth_result(headers, &result);
+        result
+    }
+
+    pub fn authorize_chain_head_application(
+        &self,
+        application_context: &Option<ApplicationContext>,
+        chain: &str,
+    ) -> Result<(), DatalensError> {
+        if !self.required {
+            return Ok(());
+        }
+        let Some(application_context) = application_context else {
+            return Err(DatalensError::new(
+                DatalensErrorKind::AuthenticationFailed,
+                "application identity is required",
+            ));
+        };
+        let application = self
+            .applications
+            .get(&application_context.id)
+            .ok_or_else(|| {
+                DatalensError::new(
+                    DatalensErrorKind::AuthenticationFailed,
+                    "application credentials are invalid",
+                )
+            })?;
+        authorize_application_chain(application, chain)
+    }
+
     pub fn authenticate_discovery_headers(
         &self,
         headers: &HeaderMap,
@@ -460,12 +505,7 @@ fn authorize_application_dataset(
     chain: &str,
     dataset: &str,
 ) -> Result<(), DatalensError> {
-    if !application.chains.iter().any(|allowed| allowed == chain) {
-        return Err(DatalensError::new(
-            DatalensErrorKind::Unauthorized,
-            "application is not allowed to access this chain",
-        ));
-    }
+    authorize_application_chain(application, chain)?;
     if !application
         .datasets
         .iter()
@@ -474,6 +514,19 @@ fn authorize_application_dataset(
         return Err(DatalensError::new(
             DatalensErrorKind::Unauthorized,
             "application is not allowed to access this dataset",
+        ));
+    }
+    Ok(())
+}
+
+fn authorize_application_chain(
+    application: &config::ApplicationConfig,
+    chain: &str,
+) -> Result<(), DatalensError> {
+    if !application.chains.iter().any(|allowed| allowed == chain) {
+        return Err(DatalensError::new(
+            DatalensErrorKind::Unauthorized,
+            "application is not allowed to access this chain",
         ));
     }
     Ok(())
