@@ -21,9 +21,8 @@ impl<'a> NativeClient<'a> {
     pub fn query(&self, input: QueryInput) -> Result<QueryResponse, Error> {
         match self.client.native_transport() {
             NativeTransport::Rest => {
-                let response: RestQueryResponse = self
-                    .client
-                    .post_json("/v1/query", &RestQueryInput::from(input))?;
+                let request = RestQueryInput::try_from(input)?;
+                let response: RestQueryResponse = self.client.post_json("/v1/query", &request)?;
                 Ok(response.into())
             }
             NativeTransport::Graphql => {
@@ -235,7 +234,7 @@ struct QueryData {
 
 #[derive(Serialize)]
 struct RestQueryInput {
-    chain: ChainIdentityInput,
+    chain: RestChainIdentityInput,
     dataset_key: String,
     selector: RestQuerySelectorInput,
     range: RestQueryRangeInput,
@@ -244,15 +243,86 @@ struct RestQueryInput {
     fields: RestFieldSelectionInput,
 }
 
-impl From<QueryInput> for RestQueryInput {
-    fn from(input: QueryInput) -> Self {
-        Self {
-            chain: input.chain,
+impl TryFrom<QueryInput> for RestQueryInput {
+    type Error = Error;
+
+    fn try_from(input: QueryInput) -> Result<Self, Self::Error> {
+        Ok(Self {
+            chain: RestChainIdentityInput::try_from(input.chain)?,
             dataset_key: format!("{}.{}", input.dataset_key.family, input.dataset_key.name),
             selector: RestQuerySelectorInput::from(input.selector),
             range: RestQueryRangeInput::from(input.range),
             finality: input.finality,
             fields: input.fields.into(),
+        })
+    }
+}
+
+#[derive(Serialize)]
+struct RestChainIdentityInput {
+    family: RestChainFamilyInput,
+    configured_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    network_id: Option<RestNetworkIdInput>,
+}
+
+impl TryFrom<ChainIdentityInput> for RestChainIdentityInput {
+    type Error = Error;
+
+    fn try_from(input: ChainIdentityInput) -> Result<Self, Self::Error> {
+        Ok(Self {
+            family: RestChainFamilyInput::try_from(input.family)?,
+            configured_name: input.configured_name,
+            network_id: input
+                .network_id
+                .map(RestNetworkIdInput::try_from)
+                .transpose()?,
+        })
+    }
+}
+
+#[derive(Serialize)]
+enum RestChainFamilyInput {
+    Evm,
+    Other(String),
+}
+
+impl TryFrom<ChainFamilyInput> for RestChainFamilyInput {
+    type Error = Error;
+
+    fn try_from(input: ChainFamilyInput) -> Result<Self, Self::Error> {
+        match input.kind {
+            ChainFamilyKindInput::Evm => Ok(Self::Evm),
+            ChainFamilyKindInput::Other => {
+                let other = input.other.ok_or_else(|| {
+                    Error::Encode("chain family other value is required".to_owned())
+                })?;
+                Ok(Self::Other(other))
+            }
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+enum RestNetworkIdInput {
+    Numeric(i32),
+    Textual(String),
+}
+
+impl TryFrom<NetworkIdInput> for RestNetworkIdInput {
+    type Error = Error;
+
+    fn try_from(input: NetworkIdInput) -> Result<Self, Self::Error> {
+        match (input.numeric, input.textual) {
+            (Some(value), None) => Ok(Self::Numeric(value)),
+            (None, Some(value)) => Ok(Self::Textual(value)),
+            (None, None) => Err(Error::Encode(
+                "network id numeric or textual value is required".to_owned(),
+            )),
+            (Some(_), Some(_)) => Err(Error::Encode(
+                "network id must provide either numeric or textual, not both".to_owned(),
+            )),
         }
     }
 }

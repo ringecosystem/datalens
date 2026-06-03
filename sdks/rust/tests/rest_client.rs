@@ -94,9 +94,20 @@ fn test_native_query_rest_request_json_uses_tagged_shapes_and_fields() {
     client.native().query(query_input()).expect("native query");
 
     let body = server.only_request().body;
-    assert_eq!(body["chain"]["configuredName"], "ethereum");
-    assert_eq!(body["chain"]["family"]["kind"], "evm");
-    assert_eq!(body["chain"]["networkId"]["numeric"], 1);
+    assert_eq!(
+        body["chain"],
+        json!({
+            "family": "Evm",
+            "configured_name": "ethereum",
+            "network_id": {
+                "kind": "numeric",
+                "value": 1
+            }
+        })
+    );
+    assert!(body["chain"]["family"]["kind"].is_null());
+    assert!(body["chain"]["configuredName"].is_null());
+    assert!(body["chain"]["networkId"]["numeric"].is_null());
     assert_eq!(body["dataset_key"], "evm.logs");
     assert_eq!(body["selector"]["kind"], "evm_logs");
     assert_eq!(body["selector"]["value"]["addresses"][0], "0xaddr");
