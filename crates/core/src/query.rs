@@ -365,8 +365,8 @@ impl QueryRows {
                 rows.dedup_by_key(|row| (row.block_number, row.transaction_index));
             }
             Self::EvmLogs(rows) => {
-                rows.sort_by_key(|row| (row.block_number, row.log_index));
-                rows.dedup_by_key(|row| (row.block_number, row.log_index));
+                rows.sort_by_key(|row| (row.block_number, row.transaction_index, row.log_index));
+                rows.dedup_by_key(|row| (row.block_number, row.transaction_index, row.log_index));
             }
             Self::AdapterJson { .. } => {}
         }

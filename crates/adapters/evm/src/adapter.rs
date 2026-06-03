@@ -258,7 +258,9 @@ impl EvmRpcClient {
             .into_iter()
             .map(|log| parse_log_record(&log))
             .collect::<Result<Vec<_>, _>>()?;
-        self.enrich_logs_with_block_metadata(logs)
+        let mut logs = self.enrich_logs_with_block_metadata(logs)?;
+        logs.sort_by_key(|log| (log.block_number, log.transaction_index, log.log_index));
+        Ok(logs)
     }
 
     fn fetch_evm_logs_from_receipts(

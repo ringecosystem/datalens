@@ -246,6 +246,90 @@ fn test_provider_filter_logs_use_eth_get_logs() {
 }
 
 #[test]
+fn test_provider_filter_logs_support_degov_style_address_and_topic0_unions() {
+    let governor = "0x1111111111111111111111111111111111111111";
+    let token = "0x2222222222222222222222222222222222222222";
+    let timelock = "0x3333333333333333333333333333333333333333";
+    let proposal_created = topic_with_prefix("aa");
+    let vote_cast = topic_with_prefix("bb");
+    let transfer = topic_with_prefix("cc");
+    let timelock_call_scheduled = topic_with_prefix("dd");
+    let block_hash = "0x000000000000000000000000000000000000000000000000000000000000000a";
+    let (url, requests) = start_rpc_server(vec![
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": [
+                provider_log_with_address(10, block_hash, "0xtx2", 2, 4, timelock, &timelock_call_scheduled),
+                provider_log_with_address(10, block_hash, "0xtx0", 0, 1, governor, &proposal_created),
+                provider_log_with_address(10, block_hash, "0xtx0", 0, 0, token, &transfer),
+                provider_log_with_address(10, block_hash, "0xtx1", 1, 3, governor, &vote_cast)
+            ]
+        }),
+        block_response(10, block_hash, "0xparent", 1),
+    ]);
+    let client = EvmRpcClient::with_chain(
+        vec![url],
+        ethereum_identity(),
+        EvmFinalityPolicy::Auto,
+        10,
+        10,
+        3,
+        3,
+    )
+    .with_logs_query_strategy(QueryStrategy::ProviderFilter);
+    let filter = datalens_core::EvmLogFilter::try_from(LogFilter {
+        addresses: vec![governor.to_owned(), token.to_owned(), timelock.to_owned()],
+        topics: vec![Some(vec![
+            proposal_created.clone(),
+            vote_cast.clone(),
+            transfer.clone(),
+            timelock_call_scheduled.clone(),
+        ])],
+    })
+    .expect("filter");
+
+    let logs = client
+        .fetch_evm_logs(BlockRange::expect_new(10, 10), &filter)
+        .expect("logs");
+
+    let requests = requests.lock().expect("requests");
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0]["method"], "eth_getLogs");
+    let eth_get_logs_filter = &requests[0]["params"][0];
+    assert_eq!(
+        eth_get_logs_filter["address"],
+        json!([governor, token, timelock])
+    );
+    assert_eq!(
+        eth_get_logs_filter["topics"],
+        json!([[
+            proposal_created,
+            vote_cast,
+            transfer,
+            timelock_call_scheduled
+        ]])
+    );
+    assert_eq!(
+        logs.iter()
+            .map(|log| (log.address.as_str(), log.topics[0].as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (token, transfer.as_str()),
+            (governor, proposal_created.as_str()),
+            (governor, vote_cast.as_str()),
+            (timelock, timelock_call_scheduled.as_str()),
+        ]
+    );
+    assert_eq!(
+        logs.iter()
+            .map(|log| (log.block_number, log.transaction_index, log.log_index))
+            .collect::<Vec<_>>(),
+        vec![(10, 0, 0), (10, 0, 1), (10, 1, 3), (10, 2, 4)]
+    );
+}
+
+#[test]
 fn test_block_range_logs_fetch_receipts_and_filter_locally_without_eth_get_logs() {
     let topic = transfer_topic();
     let matching_address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -324,6 +408,84 @@ fn test_block_range_logs_fetch_receipts_and_filter_locally_without_eth_get_logs(
             "eth_getBlockByNumber".to_owned(),
             "eth_getTransactionReceipt".to_owned(),
             "eth_getTransactionReceipt".to_owned()
+        ]
+    );
+}
+
+#[test]
+fn test_block_range_logs_match_address_and_topic0_unions_as_and_filters() {
+    let governor = "0x1111111111111111111111111111111111111111";
+    let token = "0x2222222222222222222222222222222222222222";
+    let timelock = "0x3333333333333333333333333333333333333333";
+    let other_address = "0x4444444444444444444444444444444444444444";
+    let proposal_created = topic_with_prefix("aa");
+    let transfer = topic_with_prefix("cc");
+    let timelock_call_scheduled = topic_with_prefix("dd");
+    let unrelated = topic_with_prefix("ee");
+    let (url, _requests) = start_rpc_server(vec![
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": full_block(10, "0xaaa", ["0xtx0", "0xtx1"])
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": receipt(10, "0xaaa", "0xtx0", 0, vec![
+                provider_log_with_address(10, "0xaaa", "0xtx0", 0, 4, other_address, &proposal_created),
+                provider_log_with_address(10, "0xaaa", "0xtx0", 0, 2, governor, &unrelated),
+                provider_log_with_address(10, "0xaaa", "0xtx0", 0, 1, governor, &proposal_created)
+            ])
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": receipt(10, "0xaaa", "0xtx1", 1, vec![
+                provider_log_with_address(10, "0xaaa", "0xtx1", 1, 3, token, &transfer),
+                provider_log_with_address(10, "0xaaa", "0xtx1", 1, 0, timelock, &timelock_call_scheduled)
+            ])
+        }),
+    ]);
+    let client = EvmRpcClient::with_chain(
+        vec![url],
+        ethereum_identity(),
+        EvmFinalityPolicy::Auto,
+        10,
+        10,
+        3,
+        3,
+    )
+    .with_logs_query_strategy(QueryStrategy::BlockRange);
+    let filter = datalens_core::EvmLogFilter::try_from(LogFilter {
+        addresses: vec![governor.to_owned(), token.to_owned(), timelock.to_owned()],
+        topics: vec![Some(vec![
+            proposal_created.clone(),
+            transfer.clone(),
+            timelock_call_scheduled.clone(),
+        ])],
+    })
+    .expect("filter");
+
+    let response = client
+        .fetch(ChainFetchRequest::new(
+            ethereum_identity(),
+            DatasetKey::evm_logs(),
+            LedgerRange::from_block_range(BlockRange::expect_new(10, 10)),
+            DatasetSelector::EvmLogs(filter),
+        ))
+        .expect("logs");
+
+    let QueryRows::EvmLogs(rows) = response.rows.rows() else {
+        panic!("expected EVM logs");
+    };
+    assert_eq!(
+        rows.iter()
+            .map(|log| (log.address.as_str(), log.topics[0].as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (governor, proposal_created.as_str()),
+            (timelock, timelock_call_scheduled.as_str()),
+            (token, transfer.as_str()),
         ]
     );
 }
@@ -652,6 +814,10 @@ fn transfer_topic() -> &'static str {
 
 fn unrelated_topic() -> &'static str {
     "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+}
+
+fn topic_with_prefix(prefix: &str) -> String {
+    format!("0x{prefix}{}", "0".repeat(62))
 }
 
 fn full_block<const N: usize>(number: u64, hash: &str, hashes: [&str; N]) -> Value {
