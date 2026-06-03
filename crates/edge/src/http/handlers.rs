@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use axum::{
     Json,
     extract::{Path as AxumPath, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use datalens_core::{DatalensError, DatalensErrorKind};
@@ -18,7 +18,7 @@ use crate::{
     config::ApplicationOperationConfig,
     contract::{
         discovery::DiscoveryResponse,
-        error::{api_error_body, api_error_status},
+        error::{api_error_body, api_error_status, api_retry_after_seconds},
         head::{ChainHeadApiResponse, ChainHeadFinalityApi},
         query::{QueryApiRequest, QueryApiResponse},
         warmup::{
@@ -424,13 +424,21 @@ pub(crate) struct ApiError(DatalensError);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let status = api_error_status(&self.0.kind);
+        let error = self.0;
+        let status = api_error_status(&error.kind);
+        let retry_after_seconds = api_retry_after_seconds(&error);
         log::warn!(
             "query response error status={} kind={:?}",
             status.as_u16(),
-            self.0.kind
+            error.kind
         );
-        (status, Json(api_error_body(self.0))).into_response()
+        let mut response = (status, Json(api_error_body(error))).into_response();
+        if let Some(seconds) = retry_after_seconds
+            && let Ok(value) = HeaderValue::from_str(&seconds.to_string())
+        {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        response
     }
 }
 

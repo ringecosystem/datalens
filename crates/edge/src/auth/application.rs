@@ -5,7 +5,10 @@ use std::{
 };
 
 use axum::http::{HeaderMap, header};
-use datalens_core::{DatalensError, DatalensErrorKind, DatasetKey, QueryFinalityRequirement};
+use datalens_core::{
+    DatalensError, DatalensErrorKind, DatasetKey, QueryFinalityRequirement, QuotaErrorKind,
+    QuotaErrorMetadata,
+};
 use datalens_metrics::ApplicationIdentity;
 
 use crate::{config, contract::query::QueryApiRequest};
@@ -355,17 +358,25 @@ impl ApplicationRegistry {
         if let Some(limit) = quota.max_requests_per_minute
             && state.requests_in_window >= limit
         {
-            return Err(DatalensError::new(
-                DatalensErrorKind::RateLimited,
+            return Err(quota_error(
+                QuotaErrorKind::RequestRateLimit,
                 "application request rate quota exceeded",
+                Some(limit),
+                None,
+                Some(state.requests_in_window),
+                Some(window_retry_after_seconds(state.window_started_at, now)),
             ));
         }
         if let Some(limit) = quota.max_concurrent_requests
             && state.in_flight >= limit
         {
-            return Err(DatalensError::new(
-                DatalensErrorKind::RateLimited,
+            return Err(quota_error(
+                QuotaErrorKind::ConcurrentLimit,
                 "application concurrent request quota exceeded",
+                Some(limit),
+                None,
+                Some(state.in_flight),
+                None,
             ));
         }
         if quota.max_requests_per_minute.is_some() {
@@ -559,15 +570,24 @@ fn enforce_quota(
         return Err(DatalensError::new(
             DatalensErrorKind::RateLimited,
             "application query range quota exceeded",
-        ));
+        )
+        .with_quota(range_quota_metadata(
+            QuotaErrorKind::RangeLimit,
+            limit,
+            range_len,
+        )));
     }
     if finality.allows_hot()
         && let Some(limit) = quota.max_hot_query_range_blocks
         && range_len > u128::from(limit)
     {
-        return Err(DatalensError::new(
-            DatalensErrorKind::RateLimited,
+        return Err(quota_error(
+            QuotaErrorKind::HotRangeLimit,
             "application hot query range quota exceeded",
+            Some(limit),
+            requested_u64(range_len),
+            None,
+            None,
         ));
     }
     Ok(())
@@ -584,9 +604,13 @@ fn enforce_native_query_quota(
     if let Some(limit) = quota.max_query_range_blocks {
         let requested = range.len();
         if requested > u128::from(limit) {
-            return Err(DatalensError::new(
-                DatalensErrorKind::RateLimited,
+            return Err(quota_error(
+                QuotaErrorKind::RangeLimit,
                 "application query range quota exceeded",
+                Some(limit),
+                requested_u64(requested),
+                None,
+                None,
             ));
         }
     }
@@ -595,13 +619,59 @@ fn enforce_native_query_quota(
     {
         let requested = range.len();
         if requested > u128::from(limit) {
-            return Err(DatalensError::new(
-                DatalensErrorKind::RateLimited,
+            return Err(quota_error(
+                QuotaErrorKind::HotRangeLimit,
                 "application hot query range quota exceeded",
+                Some(limit),
+                requested_u64(requested),
+                None,
+                None,
             ));
         }
     }
     Ok(())
+}
+
+fn quota_error(
+    kind: QuotaErrorKind,
+    message: impl Into<String>,
+    limit: Option<u64>,
+    requested: Option<u64>,
+    observed: Option<u64>,
+    retry_after_seconds: Option<u64>,
+) -> DatalensError {
+    DatalensError::new(DatalensErrorKind::RateLimited, message).with_quota(QuotaErrorMetadata {
+        kind,
+        scope: "application".to_owned(),
+        limit,
+        requested,
+        observed,
+        retry_after_seconds,
+    })
+}
+
+fn range_quota_metadata(kind: QuotaErrorKind, limit: u64, requested: u128) -> QuotaErrorMetadata {
+    QuotaErrorMetadata {
+        kind,
+        scope: "application".to_owned(),
+        limit: Some(limit),
+        requested: requested_u64(requested),
+        observed: None,
+        retry_after_seconds: None,
+    }
+}
+
+fn requested_u64(requested: u128) -> Option<u64> {
+    u64::try_from(requested).ok()
+}
+
+fn window_retry_after_seconds(window_started_at: Instant, now: Instant) -> u64 {
+    let elapsed = now.duration_since(window_started_at);
+    let remaining = Duration::from_secs(60).saturating_sub(elapsed);
+    remaining
+        .as_secs()
+        .saturating_add(u64::from(remaining.subsec_nanos() > 0))
+        .max(1)
 }
 
 pub fn normalize_application_id(value: &str) -> Result<String, DatalensError> {

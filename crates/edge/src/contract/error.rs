@@ -1,5 +1,5 @@
 use axum::http::StatusCode;
-use datalens_core::{DatalensError, DatalensErrorKind};
+use datalens_core::{DatalensError, DatalensErrorKind, QuotaErrorMetadata};
 use serde::Serialize;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -11,6 +11,8 @@ pub struct ApiErrorBody {
 pub struct ApiErrorDetail {
     pub kind: &'static str,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota: Option<Box<QuotaErrorMetadata>>,
 }
 
 pub fn api_error_status(kind: &DatalensErrorKind) -> StatusCode {
@@ -40,8 +42,16 @@ pub fn api_error_body(error: DatalensError) -> ApiErrorBody {
         error: ApiErrorDetail {
             kind: api_error_kind(&error.kind),
             message: error.message,
+            quota: error.quota,
         },
     }
+}
+
+pub fn api_retry_after_seconds(error: &DatalensError) -> Option<u64> {
+    error
+        .quota
+        .as_ref()
+        .and_then(|quota| quota.retry_after_seconds)
 }
 
 pub fn api_error_kind(kind: &DatalensErrorKind) -> &'static str {

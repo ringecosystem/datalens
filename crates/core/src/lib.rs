@@ -19,7 +19,7 @@ pub mod redaction;
 pub use chain::{ChainFamily, ChainIdentity, NetworkId};
 pub use coverage::CoverageLevel;
 pub use dataset::{Dataset, DatasetId, DatasetKey};
-pub use error::{DatalensError, DatalensErrorKind};
+pub use error::{DatalensError, DatalensErrorKind, QuotaErrorKind, QuotaErrorMetadata};
 pub use query::{
     BlockHeader, DatasetRows, EvmLogFilter, EvmReceipt, EvmTransaction, LogFilter, LogRecord,
     QueryRows, QueryStrategy, TopicFilter,

@@ -23,6 +23,25 @@ pub enum DatalensErrorKind {
     Internal,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaErrorKind {
+    RangeLimit,
+    HotRangeLimit,
+    RequestRateLimit,
+    ConcurrentLimit,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QuotaErrorMetadata {
+    pub kind: QuotaErrorKind,
+    pub scope: String,
+    pub limit: Option<u64>,
+    pub requested: Option<u64>,
+    pub observed: Option<u64>,
+    pub retry_after_seconds: Option<u64>,
+}
+
 impl DatalensErrorKind {
     pub fn is_retryable(&self) -> bool {
         matches!(
@@ -41,6 +60,8 @@ impl DatalensErrorKind {
 pub struct DatalensError {
     pub kind: DatalensErrorKind,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub quota: Option<Box<QuotaErrorMetadata>>,
 }
 
 impl DatalensError {
@@ -48,7 +69,13 @@ impl DatalensError {
         Self {
             kind,
             message: message.into(),
+            quota: None,
         }
+    }
+
+    pub fn with_quota(mut self, quota: QuotaErrorMetadata) -> Self {
+        self.quota = Some(Box::new(quota));
+        self
     }
 
     pub fn invalid_input(message: impl Into<String>) -> Self {
