@@ -7,7 +7,7 @@ use std::{
 };
 
 use datalens_sdk::{
-    ClientConfig, DatalensClient, Error,
+    ApiErrorKind, ClientConfig, DatalensClient, Error, QuotaErrorKind,
     index::{EventFilter, PageRequest},
     native::{
         ChainFamilyInput, ChainFamilyKindInput, ChainIdentityInput, DatasetKeyInput,
@@ -217,6 +217,71 @@ fn test_graphql_errors_are_returned_without_requiring_live_datalens() {
         .expect_err("graphql error");
 
     assert!(matches!(error, Error::Graphql(errors) if errors[0].message == "not authorized"));
+}
+
+#[test]
+fn test_graphql_error_extensions_are_typed_for_sdk_inspection() {
+    let server = MockGraphqlServer::new(vec![json!({
+        "errors": [{
+            "message": "application query range quota exceeded",
+            "extensions": {
+                "kind": "rate_limited",
+                "status": 429,
+                "quota": {
+                    "kind": "range_limit",
+                    "scope": "application",
+                    "limit": 1,
+                    "requested": 2,
+                    "observed": null,
+                    "retry_after_seconds": null
+                }
+            }
+        }]
+    })]);
+    let client = client(&server, None);
+
+    let error = client
+        .native()
+        .query(QueryInput {
+            chain: ChainIdentityInput {
+                family: ChainFamilyInput {
+                    kind: ChainFamilyKindInput::Evm,
+                    other: None,
+                },
+                configured_name: "ethereum".to_owned(),
+                network_id: Some(NetworkIdInput {
+                    numeric: Some(1),
+                    textual: None,
+                }),
+            },
+            dataset_key: DatasetKeyInput {
+                family: "evm".to_owned(),
+                name: "logs".to_owned(),
+            },
+            selector: QuerySelectorInput {
+                kind: SelectorKindInput::EvmLogs,
+                evm_logs: Some(EvmLogsSelectorInput {
+                    addresses: vec!["0xaddr".to_owned()],
+                    topics: Vec::new(),
+                }),
+                other: None,
+            },
+            range: QueryRangeInput {
+                kind: QueryRangeKindInput::Block,
+                start: 1,
+                end: 2,
+            },
+            finality: Some("durable_only".to_owned()),
+            fields: None,
+        })
+        .expect_err("graphql quota error");
+
+    let api_error = error.api_error().expect("typed graphql error");
+    assert_eq!(api_error.kind, ApiErrorKind::RateLimited);
+    assert_eq!(api_error.status, Some(429));
+    let quota = api_error.quota.expect("quota metadata");
+    assert_eq!(quota.kind, QuotaErrorKind::RangeLimit);
+    assert!(!error.is_retryable());
 }
 
 #[test]

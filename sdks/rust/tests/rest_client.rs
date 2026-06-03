@@ -7,7 +7,7 @@ use std::{
 };
 
 use datalens_sdk::{
-    ClientConfig, DatalensClient,
+    ApiErrorKind, ClientConfig, DatalensClient, QuotaErrorKind, RetryConfig,
     native::{
         ChainFamilyInput, ChainFamilyKindInput, ChainHeadFinalityInput, ChainIdentityInput,
         DatasetKeyInput, EvmLogsSelectorInput, FieldSelectionInput, NetworkIdInput, QueryInput,
@@ -200,6 +200,205 @@ fn test_native_chain_head_rejects_graphql_endpoint_clients() {
     );
 }
 
+#[test]
+fn test_native_query_retries_request_rate_limit_and_preserves_headers() {
+    let server = MockRestServer::with_responses(vec![
+        MockRestResponse::too_many_requests(request_rate_limit_body(Some(0))),
+        MockRestResponse::too_many_requests(request_rate_limit_body(Some(0))),
+        MockRestResponse::ok(query_response_body()),
+    ]);
+    let client = DatalensClient::new_with_retry_config(
+        ClientConfig {
+            endpoint: server.endpoint(),
+            bearer_token: Some("secret-token".to_owned()),
+            application: Some("query-app".to_owned()),
+            timeout: Some(Duration::from_secs(5)),
+            user_agent: Some("datalens-sdk-tests".to_owned()),
+        },
+        test_retry_config(3),
+    )
+    .expect("client config");
+
+    let response = client.native().query(query_input()).expect("native query");
+
+    assert_eq!(response.dataset_key, "evm.logs");
+    assert_eq!(response.rows["rows"][0]["blockNumber"], 1);
+    let requests = server.requests();
+    assert_eq!(requests.len(), 3, "{requests:?}");
+    for request in requests {
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/v1/query");
+        assert_eq!(
+            request.headers.authorization.as_deref(),
+            Some("Bearer secret-token")
+        );
+        assert_eq!(request.headers.application.as_deref(), Some("query-app"));
+        assert_eq!(
+            request.headers.user_agent.as_deref(),
+            Some("datalens-sdk-tests")
+        );
+    }
+}
+
+#[test]
+fn test_native_query_range_limit_is_typed_and_not_retried() {
+    let server = MockRestServer::with_responses(vec![MockRestResponse::too_many_requests(
+        range_limit_body(),
+    )]);
+    let client = DatalensClient::new_with_retry_config(
+        ClientConfig {
+            endpoint: server.endpoint(),
+            bearer_token: None,
+            application: None,
+            timeout: Some(Duration::from_secs(5)),
+            user_agent: None,
+        },
+        test_retry_config(3),
+    )
+    .expect("client config");
+
+    let error = client
+        .native()
+        .query(query_input())
+        .expect_err("range limit should fail");
+
+    let api_error = error.api_error().expect("typed api error");
+    assert_eq!(api_error.kind, ApiErrorKind::RateLimited);
+    let quota = api_error.quota.expect("quota metadata");
+    assert_eq!(quota.kind, QuotaErrorKind::RangeLimit);
+    assert_eq!(quota.retry_after_seconds, None);
+    assert!(!error.is_retryable());
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[test]
+fn test_native_query_stable_non_retryable_error_is_typed() {
+    let server = MockRestServer::with_responses(vec![MockRestResponse {
+        status: 422,
+        body: json!({
+            "error": {
+                "kind": "unsupported_dataset",
+                "message": "unsupported dataset evm.receipts"
+            }
+        }),
+    }]);
+    let client = DatalensClient::new_with_retry_config(
+        ClientConfig {
+            endpoint: server.endpoint(),
+            bearer_token: None,
+            application: None,
+            timeout: Some(Duration::from_secs(5)),
+            user_agent: None,
+        },
+        test_retry_config(3),
+    )
+    .expect("client config");
+
+    let error = client
+        .native()
+        .query(query_input())
+        .expect_err("unsupported dataset should fail");
+
+    let api_error = error.api_error().expect("typed api error");
+    assert_eq!(api_error.kind, ApiErrorKind::UnsupportedDataset);
+    assert_eq!(api_error.message, "unsupported dataset evm.receipts");
+    assert!(api_error.quota.is_none());
+    assert!(!error.is_retryable());
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[test]
+fn test_native_query_respects_retry_max_attempts() {
+    let server = MockRestServer::with_responses(vec![
+        MockRestResponse::too_many_requests(request_rate_limit_body(None)),
+        MockRestResponse::too_many_requests(request_rate_limit_body(None)),
+    ]);
+    let client = DatalensClient::new_with_retry_config(
+        ClientConfig {
+            endpoint: server.endpoint(),
+            bearer_token: None,
+            application: None,
+            timeout: Some(Duration::from_secs(5)),
+            user_agent: None,
+        },
+        test_retry_config(2),
+    )
+    .expect("client config");
+
+    let error = client
+        .native()
+        .query(query_input())
+        .expect_err("rate limit should exhaust retries");
+
+    assert!(error.is_retryable());
+    assert_eq!(error.retry_after_seconds(), None);
+    assert_eq!(server.requests().len(), 2);
+}
+
+#[test]
+fn test_native_chain_head_retries_request_rate_limit() {
+    let server = MockRestServer::with_responses(vec![
+        MockRestResponse::too_many_requests(request_rate_limit_body(Some(0))),
+        MockRestResponse::ok(json!({
+            "chain": {"configured_name": "ethereum"},
+            "height": 18_500_789,
+            "finality": "safe",
+            "range_kind": "block"
+        })),
+    ]);
+    let client = DatalensClient::new_with_retry_config(
+        ClientConfig {
+            endpoint: server.endpoint(),
+            bearer_token: None,
+            application: Some("head-app".to_owned()),
+            timeout: Some(Duration::from_secs(5)),
+            user_agent: None,
+        },
+        test_retry_config(2),
+    )
+    .expect("client config");
+
+    let response = client
+        .native()
+        .chain_head("ethereum", Some(ChainHeadFinalityInput::Safe))
+        .expect("chain head");
+
+    assert_eq!(response.height, 18_500_789);
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    assert_eq!(requests[0].path, "/v1/chains/ethereum/head?finality=safe");
+    assert_eq!(requests[1].headers.application.as_deref(), Some("head-app"));
+}
+
+#[test]
+fn test_retry_config_delay_prefers_service_retry_after() {
+    let retry = RetryConfig {
+        max_attempts: 4,
+        initial_delay: Duration::from_millis(2),
+        max_delay: Duration::from_millis(5),
+        max_elapsed: Some(Duration::from_millis(100)),
+        jitter: false,
+        jitter_factor: 0.0,
+    };
+
+    assert_eq!(
+        retry.delay_for_attempt(1, None),
+        Some(Duration::from_millis(2))
+    );
+    assert_eq!(
+        retry.delay_for_attempt(2, None),
+        Some(Duration::from_millis(4))
+    );
+    assert_eq!(
+        retry.delay_for_attempt(3, None),
+        Some(Duration::from_millis(5))
+    );
+    assert_eq!(
+        retry.delay_for_attempt(3, Some(Duration::from_secs(7))),
+        Some(Duration::from_secs(7))
+    );
+}
+
 fn query_input() -> QueryInput {
     QueryInput {
         chain: ChainIdentityInput {
@@ -237,6 +436,72 @@ fn query_input() -> QueryInput {
     }
 }
 
+fn query_response_body() -> Value {
+    json!({
+        "chain": {"configuredName": "ethereum"},
+        "dataset_key": "evm.logs",
+        "range": {"kind": "block", "start": 1, "end": 2},
+        "cache": {
+            "hit_ranges": [{"kind": "block", "start": 1, "end": 2}],
+            "missing_ranges": [],
+            "durable_hit_ranges": [{"kind": "block", "start": 1, "end": 2}],
+            "hot_hit_ranges": [],
+            "provider_fill_ranges": [],
+            "promotion_pending_ranges": [],
+            "segments": []
+        },
+        "rows": {
+            "dataset_key": "evm.logs",
+            "rows": [{"blockNumber": 1}]
+        }
+    })
+}
+
+fn request_rate_limit_body(retry_after_seconds: Option<u64>) -> Value {
+    json!({
+        "error": {
+            "kind": "rate_limited",
+            "message": "application request rate quota exceeded",
+            "quota": {
+                "kind": "request_rate_limit",
+                "scope": "application",
+                "limit": 1,
+                "requested": null,
+                "observed": 1,
+                "retry_after_seconds": retry_after_seconds
+            }
+        }
+    })
+}
+
+fn range_limit_body() -> Value {
+    json!({
+        "error": {
+            "kind": "rate_limited",
+            "message": "application query range quota exceeded",
+            "quota": {
+                "kind": "range_limit",
+                "scope": "application",
+                "limit": 1,
+                "requested": 2,
+                "observed": null,
+                "retry_after_seconds": null
+            }
+        }
+    })
+}
+
+fn test_retry_config(max_attempts: u32) -> RetryConfig {
+    RetryConfig {
+        max_attempts,
+        initial_delay: Duration::from_millis(1),
+        max_delay: Duration::from_millis(1),
+        max_elapsed: Some(Duration::from_millis(100)),
+        jitter: false,
+        jitter_factor: 0.0,
+    }
+}
+
 #[derive(Clone, Debug)]
 struct RecordedRequest {
     method: String,
@@ -252,6 +517,22 @@ struct RecordedHeaders {
     user_agent: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+struct MockRestResponse {
+    status: u16,
+    body: Value,
+}
+
+impl MockRestResponse {
+    fn ok(body: Value) -> Self {
+        Self { status: 200, body }
+    }
+
+    fn too_many_requests(body: Value) -> Self {
+        Self { status: 429, body }
+    }
+}
+
 struct MockRestServer {
     address: SocketAddr,
     requests: Arc<Mutex<Vec<RecordedRequest>>>,
@@ -260,6 +541,10 @@ struct MockRestServer {
 
 impl MockRestServer {
     fn new(responses: Vec<Value>) -> Self {
+        Self::with_responses(responses.into_iter().map(MockRestResponse::ok).collect())
+    }
+
+    fn with_responses(responses: Vec<MockRestResponse>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
         let address = listener.local_addr().expect("mock address");
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -286,6 +571,10 @@ impl MockRestServer {
         assert_eq!(requests.len(), 1, "{requests:?}");
         requests[0].clone()
     }
+
+    fn requests(&self) -> Vec<RecordedRequest> {
+        self.requests.lock().expect("requests").clone()
+    }
 }
 
 impl Drop for MockRestServer {
@@ -298,7 +587,7 @@ impl Drop for MockRestServer {
 
 fn handle_connection(
     mut stream: TcpStream,
-    response: Value,
+    response: MockRestResponse,
     requests: &Arc<Mutex<Vec<RecordedRequest>>>,
 ) {
     let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
@@ -341,10 +630,11 @@ fn handle_connection(
         body,
     });
 
-    let response_body = serde_json::to_vec(&response).expect("response json");
+    let response_body = serde_json::to_vec(&response.body).expect("response json");
+    let status = response.status;
     write!(
         stream,
-        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        "HTTP/1.1 {status} OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
         response_body.len()
     )
     .expect("response headers");
