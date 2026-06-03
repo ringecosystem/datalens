@@ -12,7 +12,7 @@ pub struct ApiErrorDetail {
     pub kind: &'static str,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub quota: Option<QuotaErrorMetadata>,
+    pub quota: Option<Box<QuotaErrorMetadata>>,
 }
 
 pub fn api_error_status(kind: &DatalensErrorKind) -> StatusCode {

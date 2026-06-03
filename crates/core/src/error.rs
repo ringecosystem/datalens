@@ -61,7 +61,7 @@ pub struct DatalensError {
     pub kind: DatalensErrorKind,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub quota: Option<QuotaErrorMetadata>,
+    pub quota: Option<Box<QuotaErrorMetadata>>,
 }
 
 impl DatalensError {
@@ -74,7 +74,7 @@ impl DatalensError {
     }
 
     pub fn with_quota(mut self, quota: QuotaErrorMetadata) -> Self {
-        self.quota = Some(quota);
+        self.quota = Some(Box::new(quota));
         self
     }
 
