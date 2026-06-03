@@ -17,7 +17,7 @@ pub const DEFAULT_DATASET_NAME: &str = "logs";
 pub const DEFAULT_CONTRACT_ADDRESS: &str = "0x13b2211a7ca45db2808f6db05557ce5347e3634e";
 pub const DEFAULT_EVENT_TOPIC0: &str =
     "0xcfb9b3466878aff0c7df17da215fd57d59eb245a5d03f5a7b57294d54581eb18";
-pub const DEFAULT_START_BLOCK: i32 = 0;
+pub const DEFAULT_START_BLOCK: u64 = 0;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AppConfig {
@@ -32,8 +32,8 @@ pub struct AppConfig {
     pub contract_address: String,
     pub event_topic0: String,
     pub event_signature: String,
-    pub start_block: i32,
-    pub end_block: Option<i32>,
+    pub start_block: u64,
+    pub end_block: Option<u64>,
     pub chunk_size: u32,
     pub reset_checkpoint: bool,
     pub consumer_name: String,
@@ -50,8 +50,8 @@ pub struct OrmpFixtureWorkload {
     pub chain_name: String,
     pub chain_id: i32,
     pub contract_address: String,
-    pub start_block: i32,
-    pub end_block: i32,
+    pub start_block: u64,
+    pub end_block: u64,
     pub chunk_size: Option<u32>,
     pub consumer_name: Option<String>,
 }
@@ -138,8 +138,8 @@ impl AppConfig {
                 "ORMP_CHUNK_SIZE must be greater than zero".to_owned(),
             ));
         }
-        let start_block = env_i32("ORMP_START_BLOCK", DEFAULT_START_BLOCK)?;
-        let end_block = optional_env_i32("ORMP_END_BLOCK")?;
+        let start_block = env_u64("ORMP_START_BLOCK", DEFAULT_START_BLOCK)?;
+        let end_block = optional_env_u64("ORMP_END_BLOCK")?;
         if let Some(end_block) = end_block
             && end_block < start_block
         {
@@ -250,13 +250,22 @@ fn env_i32(name: &str, default: i32) -> AppResult<i32> {
     }
 }
 
-fn optional_env_i32(name: &str) -> AppResult<Option<i32>> {
+fn env_u64(name: &str, default: u64) -> AppResult<u64> {
+    match env::var(name) {
+        Ok(value) => value.parse().map_err(|error| {
+            AppError::Config(format!("{name} must be a positive integer: {error}"))
+        }),
+        Err(_) => Ok(default),
+    }
+}
+
+fn optional_env_u64(name: &str) -> AppResult<Option<u64>> {
     env::var(name)
         .ok()
         .map(|value| {
-            value
-                .parse()
-                .map_err(|error| AppError::Config(format!("{name} must be an integer: {error}")))
+            value.parse().map_err(|error| {
+                AppError::Config(format!("{name} must be a positive integer: {error}"))
+            })
         })
         .transpose()
 }

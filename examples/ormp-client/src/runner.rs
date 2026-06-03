@@ -31,7 +31,7 @@ pub fn run_once(
         .unwrap_or(config.start_block);
     let target_end = config.end_block.unwrap_or_else(|| {
         start_block
-            .saturating_add(i32::try_from(config.chunk_size).unwrap_or(i32::MAX))
+            .saturating_add(u64::from(config.chunk_size))
             .saturating_sub(1)
     });
     if start_block > target_end {
@@ -45,7 +45,7 @@ pub fn run_once(
         });
     }
     let chunk_end = start_block
-        .saturating_add(i32::try_from(config.chunk_size).unwrap_or(i32::MAX))
+        .saturating_add(u64::from(config.chunk_size))
         .saturating_sub(1)
         .min(target_end);
     let page = client.fetch_message_accepted_page(config, start_block, chunk_end)?;
@@ -96,7 +96,7 @@ pub fn run_until_complete(
     Ok(total)
 }
 
-fn parse_checkpoint_block(value: &str) -> AppResult<i32> {
+fn parse_checkpoint_block(value: &str) -> AppResult<u64> {
     value.parse().map_err(|error| {
         AppError::Config(format!(
             "stored ORMP checkpoint must be the next block number: {error}"

@@ -30,8 +30,8 @@ pub struct AppConfig {
     pub contract_address: String,
     pub event_topic0: String,
     pub event_signature: String,
-    pub start_block: i32,
-    pub end_block: Option<i32>,
+    pub start_block: u64,
+    pub end_block: Option<u64>,
     pub chunk_size: u32,
     pub reset_checkpoint: bool,
     pub consumer_name: String,
@@ -48,8 +48,8 @@ pub struct DegovFixtureWorkload {
     pub chain_name: String,
     pub chain_id: i32,
     pub contract_address: String,
-    pub start_block: i32,
-    pub end_block: i32,
+    pub start_block: u64,
+    pub end_block: u64,
     pub chunk_size: Option<u32>,
     pub consumer_name: Option<String>,
 }
@@ -138,15 +138,19 @@ impl AppConfig {
             ));
         }
         let start_block = required_live_selector_env("DEGOV_START_BLOCK")?
-            .parse()
+            .parse::<u64>()
             .map_err(|error| {
-                AppError::Config(format!("DEGOV_START_BLOCK must be an integer: {error}"))
+                AppError::Config(format!(
+                    "DEGOV_START_BLOCK must be a positive integer: {error}"
+                ))
             })?;
         let end_block = Some(
             required_live_selector_env("DEGOV_END_BLOCK")?
-                .parse()
+                .parse::<u64>()
                 .map_err(|error| {
-                    AppError::Config(format!("DEGOV_END_BLOCK must be an integer: {error}"))
+                    AppError::Config(format!(
+                        "DEGOV_END_BLOCK must be a positive integer: {error}"
+                    ))
                 })?,
         );
         if let Some(end_block) = end_block

@@ -108,8 +108,8 @@ pub struct QueryInput {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct QueryRangeInput {
     pub kind: QueryRangeKindInput,
-    pub start: i32,
-    pub end: i32,
+    pub start: u64,
+    pub end: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -368,9 +368,9 @@ impl From<QuerySelectorInput> for RestQuerySelectorInput {
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum RestQueryRangeInput {
-    Block { start: i32, end: i32 },
-    Slot { start: i32, end: i32 },
-    Height { start: i32, end: i32 },
+    Block { start: u64, end: u64 },
+    Slot { start: u64, end: u64 },
+    Height { start: u64, end: u64 },
 }
 
 impl From<QueryRangeInput> for RestQueryRangeInput {

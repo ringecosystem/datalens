@@ -120,6 +120,28 @@ fn test_native_query_rest_request_json_uses_tagged_shapes_and_fields() {
 }
 
 #[test]
+fn test_native_query_rest_request_json_preserves_large_u64_range() {
+    let server = MockRestServer::new(vec![query_response_body()]);
+    let client = DatalensClient::new(ClientConfig {
+        endpoint: server.endpoint(),
+        bearer_token: None,
+        application: None,
+        timeout: None,
+        user_agent: None,
+    })
+    .expect("client config");
+    let mut input = query_input();
+    input.range.start = 2_147_483_648;
+    input.range.end = 2_147_483_649;
+
+    client.native().query(input).expect("native query");
+
+    let body = server.only_request().body;
+    assert_eq!(body["range"]["start"], json!(2_147_483_648_u64));
+    assert_eq!(body["range"]["end"], json!(2_147_483_649_u64));
+}
+
+#[test]
 fn test_native_chain_head_gets_rest_head_with_finality_and_auth_headers() {
     let server = MockRestServer::new(vec![json!({
         "chain": {"configured_name": "ethereum"},
@@ -408,6 +430,29 @@ fn test_retry_config_delay_prefers_service_retry_after() {
         retry.delay_for_attempt(3, Some(Duration::from_secs(7))),
         Some(Duration::from_secs(7))
     );
+}
+
+#[test]
+fn test_retry_config_jitter_delay_respects_max_delay() {
+    let retry = RetryConfig {
+        max_attempts: 4,
+        initial_delay: Duration::from_millis(10),
+        max_delay: Duration::from_millis(10),
+        max_elapsed: Some(Duration::from_millis(100)),
+        jitter: true,
+        jitter_factor: 1.0,
+    };
+
+    for _ in 0..10_000 {
+        let delay = retry
+            .delay_for_attempt(1, None)
+            .expect("retry delay should be configured");
+        assert!(
+            delay <= retry.max_delay,
+            "jittered delay {delay:?} exceeded max_delay {:?}",
+            retry.max_delay
+        );
+    }
 }
 
 fn query_input() -> QueryInput {

@@ -72,7 +72,7 @@ fn test_fetch_vote_cast_page_decodes_raw_native_log() {
     let request = server.only_request();
     assert_eq!(request.method, "POST");
     assert_eq!(request.path, "/v1/query");
-    assert_eq!(request.body["chain"]["configuredName"], "ethereum");
+    assert_eq!(request.body["chain"]["configured_name"], "ethereum");
     assert_eq!(request.body["dataset_key"], "evm.logs");
     assert_eq!(request.body["selector"]["kind"], "evm_logs");
     assert_eq!(request.body["range"]["start"], 100);

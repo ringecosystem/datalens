@@ -33,8 +33,8 @@ impl DatalensDegovClient {
     pub fn fetch_vote_cast_page(
         &self,
         config: &AppConfig,
-        start_block: i32,
-        end_block: i32,
+        start_block: u64,
+        end_block: u64,
     ) -> AppResult<VoteCastPage> {
         fetch_vote_cast_page(&self.client, config, start_block, end_block)
     }
@@ -56,8 +56,8 @@ pub struct VoteCastEvent {
 pub fn fetch_vote_cast_page(
     client: &DatalensClient,
     config: &AppConfig,
-    start_block: i32,
-    end_block: i32,
+    start_block: u64,
+    end_block: u64,
 ) -> AppResult<VoteCastPage> {
     let response = client
         .native()
@@ -74,7 +74,7 @@ pub fn fetch_vote_cast_page(
     })
 }
 
-pub fn query_input(config: &AppConfig, start_block: i32, end_block: i32) -> QueryInput {
+pub fn query_input(config: &AppConfig, start_block: u64, end_block: u64) -> QueryInput {
     QueryInput {
         chain: ChainIdentityInput {
             family: ChainFamilyInput {

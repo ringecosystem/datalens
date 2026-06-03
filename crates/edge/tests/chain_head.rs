@@ -193,6 +193,70 @@ async fn test_chain_head_authorizes_configured_chain_allowlist() {
 }
 
 #[tokio::test]
+async fn test_chain_head_chain_allowlist_rejection_does_not_consume_request_quota() {
+    let registry = QueryServiceRegistry::new()
+        .with_application_registry(application_registry(vec![ApplicationConfig {
+            id: "ethereum-reader".to_owned(),
+            name: "ethereum-reader".to_owned(),
+            enabled: true,
+            display_name: None,
+            token: "secret-token".to_owned(),
+            chains: vec!["ethereum".to_owned()],
+            datasets: vec!["evm.logs".to_owned()],
+            operations: vec![ApplicationOperationConfig::Discovery],
+            quota: Some(ApplicationQuotaConfig {
+                max_query_range_blocks: None,
+                max_hot_query_range_blocks: None,
+                max_requests_per_minute: Some(1),
+                max_concurrent_requests: None,
+            }),
+        }]))
+        .expect("application registry")
+        .with_service(service(
+            LocalStorage::new(temp_storage_root("chain-head-quota-ethereum")),
+            MockSource::default().with_latest_height(789),
+        ))
+        .expect("register ethereum service")
+        .with_service(service_named(
+            LocalStorage::new(temp_storage_root("chain-head-quota-polygon")),
+            MockSource::default()
+                .with_chain(polygon_identity())
+                .with_latest_height(456),
+            "polygon",
+            137,
+        ))
+        .expect("register polygon service");
+    let app = router(registry);
+
+    let disallowed = app
+        .clone()
+        .oneshot(
+            Request::get("/v1/chains/polygon/head")
+                .header("x-datalens-application", "ethereum-reader")
+                .header("authorization", "Bearer secret-token")
+                .body(Body::empty())
+                .expect("head request"),
+        )
+        .await
+        .expect("disallowed response");
+    let allowed = app
+        .oneshot(
+            Request::get("/v1/chains/ethereum/head")
+                .header("x-datalens-application", "ethereum-reader")
+                .header("authorization", "Bearer secret-token")
+                .body(Body::empty())
+                .expect("head request"),
+        )
+        .await
+        .expect("allowed response");
+
+    assert_eq!(disallowed.status(), StatusCode::FORBIDDEN);
+    assert_eq!(allowed.status(), StatusCode::OK);
+    let body = response_json(allowed).await;
+    assert_eq!(body["height"], 789);
+}
+
+#[tokio::test]
 async fn test_chain_head_rejects_unsupported_chain_and_finality() {
     let registry = QueryServiceRegistry::new()
         .with_service(service(

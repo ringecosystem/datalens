@@ -34,8 +34,8 @@ impl DatalensOrmpClient {
     pub fn fetch_message_accepted_page(
         &self,
         config: &AppConfig,
-        start_block: i32,
-        end_block: i32,
+        start_block: u64,
+        end_block: u64,
     ) -> AppResult<MessageAcceptedPage> {
         fetch_message_accepted_page(&self.client, config, start_block, end_block)
     }
@@ -57,8 +57,8 @@ pub struct MessageAcceptedEvent {
 pub fn fetch_message_accepted_page(
     client: &DatalensClient,
     config: &AppConfig,
-    start_block: i32,
-    end_block: i32,
+    start_block: u64,
+    end_block: u64,
 ) -> AppResult<MessageAcceptedPage> {
     let response = client
         .native()
@@ -75,7 +75,7 @@ pub fn fetch_message_accepted_page(
     })
 }
 
-pub fn query_input(config: &AppConfig, start_block: i32, end_block: i32) -> QueryInput {
+pub fn query_input(config: &AppConfig, start_block: u64, end_block: u64) -> QueryInput {
     QueryInput {
         chain: ChainIdentityInput {
             family: ChainFamilyInput {
