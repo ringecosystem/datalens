@@ -1,13 +1,14 @@
 use std::{
+    io::ErrorKind,
     io::{BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     sync::{Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use datalens_sdk::{
-    ClientConfig, DatalensClient, Error,
+    ApiErrorKind, ClientConfig, DatalensClient, Error, QuotaErrorKind, RetryConfig,
     index::{EventFilter, PageRequest},
     native::{
         ChainFamilyInput, ChainFamilyKindInput, ChainIdentityInput, DatasetKeyInput,
@@ -220,6 +221,142 @@ fn test_graphql_errors_are_returned_without_requiring_live_datalens() {
 }
 
 #[test]
+fn test_graphql_error_extensions_are_typed_for_sdk_inspection() {
+    let server = MockGraphqlServer::new(vec![json!({
+        "errors": [{
+            "message": "application query range quota exceeded",
+            "extensions": {
+                "kind": "rate_limited",
+                "status": 429,
+                "quota": {
+                    "kind": "range_limit",
+                    "scope": "application",
+                    "limit": 1,
+                    "requested": 2,
+                    "observed": null,
+                    "retry_after_seconds": null
+                }
+            }
+        }]
+    })]);
+    let client = client(&server, None);
+
+    let error = client
+        .native()
+        .query(QueryInput {
+            chain: ChainIdentityInput {
+                family: ChainFamilyInput {
+                    kind: ChainFamilyKindInput::Evm,
+                    other: None,
+                },
+                configured_name: "ethereum".to_owned(),
+                network_id: Some(NetworkIdInput {
+                    numeric: Some(1),
+                    textual: None,
+                }),
+            },
+            dataset_key: DatasetKeyInput {
+                family: "evm".to_owned(),
+                name: "logs".to_owned(),
+            },
+            selector: QuerySelectorInput {
+                kind: SelectorKindInput::EvmLogs,
+                evm_logs: Some(EvmLogsSelectorInput {
+                    addresses: vec!["0xaddr".to_owned()],
+                    topics: Vec::new(),
+                }),
+                other: None,
+            },
+            range: QueryRangeInput {
+                kind: QueryRangeKindInput::Block,
+                start: 1,
+                end: 2,
+            },
+            finality: Some("durable_only".to_owned()),
+            fields: None,
+        })
+        .expect_err("graphql quota error");
+
+    let api_error = error.api_error().expect("typed graphql error");
+    assert_eq!(api_error.kind, ApiErrorKind::RateLimited);
+    assert_eq!(api_error.status, Some(429));
+    let quota = api_error.quota.expect("quota metadata");
+    assert_eq!(quota.kind, QuotaErrorKind::RangeLimit);
+    assert!(!error.is_retryable());
+}
+
+#[test]
+fn test_graphql_request_rate_limit_is_retried_and_preserves_headers() {
+    let server = MockGraphqlServer::new(vec![
+        graphql_quota_error("request_rate_limit", Some(0)),
+        json!({
+            "data": {
+                "events": [{
+                    "indexName": "ormp",
+                    "chain": "ethereum",
+                    "chainId": 1,
+                    "dataset": "evm.logs",
+                    "blockNumber": 10,
+                    "blockHash": "0xblock",
+                    "transactionHash": "0xtx",
+                    "transactionIndex": 1,
+                    "eventIndex": 2,
+                    "address": "0xaddr",
+                    "selector": "Transfer",
+                    "topics": [],
+                    "topic0": null,
+                    "signature": null,
+                    "eventName": null,
+                    "decoded": null,
+                    "data": "0xdata",
+                    "payload": {},
+                    "createdAt": "2026-05-31T00:00:00Z"
+                }]
+            }
+        }),
+    ]);
+    let client = graphql_client_with_retry(&server, test_retry_config(2));
+
+    let events = client
+        .index()
+        .raw_events(EventFilter::new("evm.logs"), None, None)
+        .expect("raw events");
+
+    assert_eq!(events.len(), 1);
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    for request in requests {
+        assert_eq!(
+            request.headers.authorization.as_deref(),
+            Some("Bearer secret-token")
+        );
+        assert_eq!(request.headers.application.as_deref(), Some("query-app"));
+        assert_eq!(
+            request.headers.user_agent.as_deref(),
+            Some("datalens-sdk-tests")
+        );
+    }
+}
+
+#[test]
+fn test_graphql_range_limit_is_typed_and_not_retried() {
+    let server = MockGraphqlServer::new(vec![graphql_quota_error("range_limit", None)]);
+    let client = graphql_client_with_retry(&server, test_retry_config(3));
+
+    let error = client
+        .index()
+        .raw_events(EventFilter::new("evm.logs"), None, None)
+        .expect_err("range limit should fail");
+
+    let api_error = error.api_error().expect("typed graphql error");
+    assert_eq!(api_error.kind, ApiErrorKind::RateLimited);
+    let quota = api_error.quota.expect("quota metadata");
+    assert_eq!(quota.kind, QuotaErrorKind::RangeLimit);
+    assert!(!error.is_retryable());
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[test]
 fn test_http_unauthorized_is_auth_error() {
     let server = MockGraphqlServer::with_status(
         401,
@@ -246,6 +383,54 @@ fn client(server: &MockGraphqlServer, bearer_token: Option<&str>) -> DatalensCli
         user_agent: Some("datalens-sdk-tests".to_owned()),
     })
     .expect("client config")
+}
+
+fn graphql_client_with_retry(
+    server: &MockGraphqlServer,
+    retry_config: RetryConfig,
+) -> DatalensClient {
+    DatalensClient::with_graphql_endpoint_with_retry_config(
+        ClientConfig {
+            endpoint: server.endpoint(),
+            bearer_token: Some("secret-token".to_owned()),
+            application: Some("query-app".to_owned()),
+            timeout: Some(Duration::from_secs(5)),
+            user_agent: Some("datalens-sdk-tests".to_owned()),
+        },
+        retry_config,
+    )
+    .expect("client config")
+}
+
+fn graphql_quota_error(kind: &str, retry_after_seconds: Option<u64>) -> Value {
+    json!({
+        "errors": [{
+            "message": "application quota exceeded",
+            "extensions": {
+                "kind": "rate_limited",
+                "status": 429,
+                "quota": {
+                    "kind": kind,
+                    "scope": "application",
+                    "limit": 1,
+                    "requested": null,
+                    "observed": 1,
+                    "retry_after_seconds": retry_after_seconds
+                }
+            }
+        }]
+    })
+}
+
+fn test_retry_config(max_attempts: u32) -> RetryConfig {
+    RetryConfig {
+        max_attempts,
+        initial_delay: Duration::from_millis(1),
+        max_delay: Duration::from_millis(1),
+        max_elapsed: Some(Duration::from_millis(100)),
+        jitter: false,
+        jitter_factor: 0.0,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -275,12 +460,28 @@ impl MockGraphqlServer {
 
     fn with_status(status: u16, responses: Vec<Value>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking mock server");
         let address = listener.local_addr().expect("mock address");
         let requests = Arc::new(Mutex::new(Vec::new()));
         let server_requests = Arc::clone(&requests);
         let handle = thread::spawn(move || {
             for response in responses {
-                let (stream, _) = listener.accept().expect("accept request");
+                let started_at = Instant::now();
+                let stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error)
+                            if error.kind() == ErrorKind::WouldBlock
+                                && started_at.elapsed() < Duration::from_millis(250) =>
+                        {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) if error.kind() == ErrorKind::WouldBlock => return,
+                        Err(error) => panic!("accept request: {error}"),
+                    }
+                };
                 handle_connection(stream, status, response, &server_requests);
             }
         });
@@ -299,6 +500,10 @@ impl MockGraphqlServer {
         let requests = self.requests.lock().expect("requests");
         assert_eq!(requests.len(), 1, "{requests:?}");
         requests[0].clone()
+    }
+
+    fn requests(&self) -> Vec<RecordedRequest> {
+        self.requests.lock().expect("requests").clone()
     }
 }
 
