@@ -136,11 +136,21 @@ adapter cannot safely serve the requested hot/latest contract, the server return
 
 EVM logs selector value fields:
 
-- `addresses`: empty means any address.
+- `addresses`: empty means any address. Multiple addresses are sent as one native EVM
+  log selector and match logs from any listed address.
 - `topics`: ordered topic positions.
 - `null` topic position means wildcard.
 - Empty topic value set at a position means match no topic at that position.
 - Non-empty topic value set means match any listed topic at that position.
+
+When `addresses` and `topics` are both present, EVM log matching follows JSON-RPC
+`eth_getLogs` semantics: the address set is ORed, alternatives inside one topic slot are
+ORed, and different filter dimensions are ANDed. A DeGov governor/token/timelock read may
+therefore use one `evm_logs` selector with three addresses and a topic0 slot containing the
+union of governor, token, and timelock event topic0 values. Returned EVM log rows include
+the emitting `address` and `topics`, so clients can classify the source contract locally.
+EVM log rows are returned in deterministic chain order by `(block_number,
+transaction_index, log_index)` across all matched addresses.
 
 `POST /v1/query` response fields:
 

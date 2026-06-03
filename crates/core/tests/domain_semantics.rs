@@ -238,6 +238,29 @@ fn test_query_rows_sort_deduplicates_blocks_and_logs_stably() {
 }
 
 #[test]
+fn test_query_rows_sort_orders_logs_by_block_transaction_and_log_index() {
+    let mut logs = QueryRows::EvmLogs(vec![
+        log_with_transaction_index(10, 2, 4),
+        log_with_transaction_index(10, 0, 2),
+        log_with_transaction_index(9, 5, 1),
+        log_with_transaction_index(10, 0, 1),
+        log_with_transaction_index(10, 3, 1),
+    ]);
+
+    logs.sort();
+
+    let QueryRows::EvmLogs(rows) = logs else {
+        panic!("expected EVM logs");
+    };
+    assert_eq!(
+        rows.iter()
+            .map(|row| (row.block_number, row.transaction_index, row.log_index))
+            .collect::<Vec<_>>(),
+        vec![(9, 5, 1), (10, 0, 1), (10, 0, 2), (10, 2, 4), (10, 3, 1),]
+    );
+}
+
+#[test]
 fn test_evm_log_filter_normalization_is_canonical() {
     let left = LogFilter {
         addresses: vec![
@@ -677,13 +700,21 @@ fn block(number: u64, hash: &str) -> BlockHeader {
 }
 
 fn log(block_number: u64, log_index: u64) -> LogRecord {
+    log_with_transaction_index(block_number, 0, log_index)
+}
+
+fn log_with_transaction_index(
+    block_number: u64,
+    transaction_index: u64,
+    log_index: u64,
+) -> LogRecord {
     LogRecord {
         block_number,
         block_hash: format!("0xblock-{block_number}"),
         parent_hash: None,
         block_timestamp: None,
         transaction_hash: format!("0xtx-{block_number}-{log_index}"),
-        transaction_index: 0,
+        transaction_index,
         log_index,
         address: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
         topics: Vec::new(),
