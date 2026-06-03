@@ -197,8 +197,8 @@ fn sdk_client(server: &MockGraphqlServer) -> DatalensClient {
 
 fn test_config(
     server: &MockGraphqlServer,
-    start_block: i32,
-    end_block: Option<i32>,
+    start_block: u64,
+    end_block: Option<u64>,
     chunk_size: u32,
 ) -> AppConfig {
     AppConfig {

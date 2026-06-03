@@ -66,14 +66,14 @@ pub(crate) async fn chain_head(
     Query(query): Query<BTreeMap<String, String>>,
 ) -> Result<Json<ChainHeadApiResponse>, ApiError> {
     let registry = state.registry.clone();
-    let application_context = registry
+    let application_authentication = registry
         .authenticate_chain_head_headers(&headers)
         .map_err(ApiError)?;
     let finality =
         ChainHeadFinalityApi::parse(query.get("finality").map(String::as_str)).map_err(ApiError)?;
     let configured_chain = registry.configured_chain_name(&chain).map_err(ApiError)?;
     registry
-        .authorize_chain_head_application(&application_context, &configured_chain)
+        .authorize_chain_head_application(&headers, &application_authentication, &configured_chain)
         .map_err(ApiError)?;
     tokio::task::spawn_blocking(move || registry.chain_head(&chain, finality))
         .await

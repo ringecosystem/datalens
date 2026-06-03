@@ -20,6 +20,11 @@ pub struct AuthContext {
     pub subject: Option<String>,
 }
 
+#[derive(Debug)]
+pub struct ApplicationAuthentication {
+    id: String,
+}
+
 /// Authenticated application context carried from edge routes into metrics,
 /// usage ledger attribution, and warmup ownership checks. Authentication proves
 /// the token; authorization and quota checks are route-specific.
@@ -215,7 +220,7 @@ impl ApplicationRegistry {
     pub fn authenticate_chain_head_headers(
         &self,
         headers: &HeaderMap,
-    ) -> Result<Option<ApplicationContext>, DatalensError> {
+    ) -> Result<Option<ApplicationAuthentication>, DatalensError> {
         if !self.required {
             return Ok(None);
         }
@@ -225,36 +230,46 @@ impl ApplicationRegistry {
                 application,
                 config::ApplicationOperationConfig::Discovery,
             )?;
-            self.application_context(application)
+            Ok(Some(ApplicationAuthentication {
+                id: application.id.clone(),
+            }))
         })();
-        self.record_auth_result(headers, &result);
+        if let Err(error) = &result {
+            self.record_auth_error(headers, error);
+        }
         result
     }
 
     pub fn authorize_chain_head_application(
         &self,
-        application_context: &Option<ApplicationContext>,
+        headers: &HeaderMap,
+        application_authentication: &Option<ApplicationAuthentication>,
         chain: &str,
-    ) -> Result<(), DatalensError> {
+    ) -> Result<Option<ApplicationContext>, DatalensError> {
         if !self.required {
-            return Ok(());
+            return Ok(None);
         }
-        let Some(application_context) = application_context else {
-            return Err(DatalensError::new(
-                DatalensErrorKind::AuthenticationFailed,
-                "application identity is required",
-            ));
-        };
-        let application = self
-            .applications
-            .get(&application_context.id)
-            .ok_or_else(|| {
-                DatalensError::new(
+        let result = (|| {
+            let Some(application_authentication) = application_authentication else {
+                return Err(DatalensError::new(
                     DatalensErrorKind::AuthenticationFailed,
-                    "application credentials are invalid",
-                )
-            })?;
-        authorize_application_chain(application, chain)
+                    "application identity is required",
+                ));
+            };
+            let application = self
+                .applications
+                .get(&application_authentication.id)
+                .ok_or_else(|| {
+                    DatalensError::new(
+                        DatalensErrorKind::AuthenticationFailed,
+                        "application credentials are invalid",
+                    )
+                })?;
+            authorize_application_chain(application, chain)?;
+            self.application_context(application)
+        })();
+        self.record_auth_result(headers, &result);
+        result
     }
 
     pub fn authenticate_discovery_headers(
@@ -407,16 +422,14 @@ impl ApplicationRegistry {
             }
             Ok(None) => {}
             Err(error) => {
-                let reason = match error.kind {
-                    DatalensErrorKind::AuthenticationFailed => "rejected_authentication",
-                    DatalensErrorKind::Unauthorized => "rejected_authorization",
-                    DatalensErrorKind::RateLimited => "rejected_quota",
-                    _ => "rejected_other",
-                };
-                let state = states.entry(metrics_application_id(headers)).or_default();
-                *state.rejected.entry(reason.to_owned()).or_default() += 1;
+                record_auth_error(&mut states, headers, error);
             }
         }
+    }
+
+    fn record_auth_error(&self, headers: &HeaderMap, error: &DatalensError) {
+        let mut states = self.quota_state.lock().expect("application quota state");
+        record_auth_error(&mut states, headers, error);
     }
 
     pub(crate) fn metrics_text(&self) -> Option<String> {
@@ -502,6 +515,21 @@ fn metrics_application_id(headers: &HeaderMap) -> String {
         .and_then(|value| value.to_str().ok())
         .and_then(|value| normalize_application_id(value).ok())
         .unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn record_auth_error(
+    states: &mut BTreeMap<String, ApplicationQuotaState>,
+    headers: &HeaderMap,
+    error: &DatalensError,
+) {
+    let reason = match error.kind {
+        DatalensErrorKind::AuthenticationFailed => "rejected_authentication",
+        DatalensErrorKind::Unauthorized => "rejected_authorization",
+        DatalensErrorKind::RateLimited => "rejected_quota",
+        _ => "rejected_other",
+    };
+    let state = states.entry(metrics_application_id(headers)).or_default();
+    *state.rejected.entry(reason.to_owned()).or_default() += 1;
 }
 
 pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<&str> {

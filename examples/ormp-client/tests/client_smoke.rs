@@ -77,8 +77,8 @@ fn test_fetch_message_accepted_page_decodes_raw_native_log() {
     let request = server.only_request();
     assert_eq!(request.method, "POST");
     assert_eq!(request.path, "/v1/query");
-    assert_eq!(request.body["chain"]["configuredName"], "ethereum");
-    assert_eq!(request.body["chain"]["networkId"]["numeric"], 1);
+    assert_eq!(request.body["chain"]["configured_name"], "ethereum");
+    assert_eq!(request.body["chain"]["network_id"]["value"], 1);
     assert_eq!(request.body["dataset_key"], "evm.logs");
     assert_eq!(request.body["selector"]["kind"], "evm_logs");
     assert_eq!(

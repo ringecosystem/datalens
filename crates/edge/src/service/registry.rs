@@ -20,7 +20,7 @@ use datalens_warmup::{
 use datalens_writer::DurableWriteResult;
 
 use crate::{
-    auth::application::{ApplicationContext, ApplicationRegistry},
+    auth::application::{ApplicationAuthentication, ApplicationContext, ApplicationRegistry},
     config,
     contract::{
         discovery::DiscoveryResponse,
@@ -170,18 +170,22 @@ impl QueryServiceRegistry {
     pub(crate) fn authenticate_chain_head_headers(
         &self,
         headers: &HeaderMap,
-    ) -> Result<Option<ApplicationContext>, DatalensError> {
+    ) -> Result<Option<ApplicationAuthentication>, DatalensError> {
         self.application_registry
             .authenticate_chain_head_headers(headers)
     }
 
     pub(crate) fn authorize_chain_head_application(
         &self,
-        application_context: &Option<ApplicationContext>,
+        headers: &HeaderMap,
+        application_authentication: &Option<ApplicationAuthentication>,
         chain: &str,
-    ) -> Result<(), DatalensError> {
-        self.application_registry
-            .authorize_chain_head_application(application_context, chain)
+    ) -> Result<Option<ApplicationContext>, DatalensError> {
+        self.application_registry.authorize_chain_head_application(
+            headers,
+            application_authentication,
+            chain,
+        )
     }
 
     pub(crate) fn authenticate_discovery_headers(

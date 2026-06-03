@@ -337,7 +337,7 @@ impl RetryConfig {
         }
         let delay = retry_after.unwrap_or_else(|| self.exponential_delay(failed_attempt));
         if self.jitter && retry_after.is_none() {
-            Some(self.jitter_delay(delay, failed_attempt))
+            Some(self.jitter_delay(delay, failed_attempt).min(self.max_delay))
         } else {
             Some(delay)
         }
