@@ -183,6 +183,65 @@ impl DatalensClient {
         serde_json::from_str(&body)
             .map_err(|error| Error::Decode(format!("decode datalens REST response: {error}")))
     }
+
+    pub(crate) fn get_json<T>(
+        &self,
+        path_segments: &[&str],
+        query: &[(&str, &str)],
+    ) -> Result<T, Error>
+    where
+        T: DeserializeOwned,
+    {
+        let mut url = reqwest::Url::parse(&self.base_url).map_err(|error| {
+            Error::InvalidConfig(format!(
+                "datalens REST endpoint is not a valid URL: {error}"
+            ))
+        })?;
+        {
+            let mut segments = url.path_segments_mut().map_err(|_| {
+                Error::InvalidConfig(
+                    "datalens REST endpoint cannot be used as a base URL".to_owned(),
+                )
+            })?;
+            segments.pop_if_empty();
+            for segment in path_segments {
+                segments.push(segment);
+            }
+        }
+        if !query.is_empty() {
+            url.query_pairs_mut().extend_pairs(query.iter().copied());
+        }
+
+        let mut builder = self.http.get(url);
+        if let Some(token) = &self.bearer_token {
+            builder = builder.bearer_auth(token);
+        }
+        if let Some(application) = &self.application {
+            builder = builder.header("x-datalens-application", application);
+        }
+        if let Some(user_agent) = &self.user_agent {
+            builder = builder.header(reqwest::header::USER_AGENT, user_agent);
+        }
+
+        let response = builder
+            .send()
+            .map_err(|error| Error::Transport(format!("send datalens REST request: {error}")))?;
+        let status = response.status().as_u16();
+        let body = response
+            .text()
+            .map_err(|error| Error::Transport(format!("read datalens REST response: {error}")))?;
+
+        if !(200..300).contains(&status) {
+            return if status == 401 || status == 403 {
+                Err(Error::Unauthorized { status, body })
+            } else {
+                Err(Error::HttpStatus { status, body })
+            };
+        }
+
+        serde_json::from_str(&body)
+            .map_err(|error| Error::Decode(format!("decode datalens REST response: {error}")))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

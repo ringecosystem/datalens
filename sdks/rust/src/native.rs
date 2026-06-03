@@ -32,6 +32,28 @@ impl<'a> NativeClient<'a> {
             }
         }
     }
+
+    pub fn chain_head(
+        &self,
+        chain: impl AsRef<str>,
+        finality: Option<ChainHeadFinalityInput>,
+    ) -> Result<ChainHeadResponse, Error> {
+        match self.client.native_transport() {
+            NativeTransport::Rest => {
+                let chain = chain.as_ref();
+                let finality = finality.map(|finality| finality.as_str());
+                let query = finality
+                    .as_ref()
+                    .map(|finality| vec![("finality", *finality)])
+                    .unwrap_or_default();
+                self.client
+                    .get_json(&["v1", "chains", chain, "head"], &query)
+            }
+            NativeTransport::Graphql => Err(Error::InvalidConfig(
+                "native chain_head requires a REST datalens endpoint; clients created with with_graphql_endpoint cannot call the REST-only chain head API".to_owned(),
+            )),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -139,6 +161,24 @@ pub struct FieldSelectionInput {
     pub include: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChainHeadFinalityInput {
+    Latest,
+    Safe,
+    Finalized,
+}
+
+impl ChainHeadFinalityInput {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Latest => "latest",
+            Self::Safe => "safe",
+            Self::Finalized => "finalized",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 pub struct Discovery {
     pub chains: Vec<ChainDiscovery>,
@@ -167,6 +207,15 @@ pub struct QueryResponse {
     pub range: serde_json::Value,
     pub cache: serde_json::Value,
     pub rows: serde_json::Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct ChainHeadResponse {
+    pub chain: serde_json::Value,
+    pub height: u64,
+    pub finality: String,
+    pub range_kind: String,
+    pub timestamp: Option<u64>,
 }
 
 #[derive(Serialize)]

@@ -9,9 +9,9 @@ use std::{
 use datalens_sdk::{
     ClientConfig, DatalensClient,
     native::{
-        ChainFamilyInput, ChainFamilyKindInput, ChainIdentityInput, DatasetKeyInput,
-        EvmLogsSelectorInput, FieldSelectionInput, NetworkIdInput, QueryInput, QueryRangeInput,
-        QueryRangeKindInput, QuerySelectorInput, SelectorKindInput,
+        ChainFamilyInput, ChainFamilyKindInput, ChainHeadFinalityInput, ChainIdentityInput,
+        DatasetKeyInput, EvmLogsSelectorInput, FieldSelectionInput, NetworkIdInput, QueryInput,
+        QueryRangeInput, QueryRangeKindInput, QuerySelectorInput, SelectorKindInput,
     },
 };
 use serde_json::{Value, json};
@@ -106,6 +106,98 @@ fn test_native_query_rest_request_json_uses_tagged_shapes_and_fields() {
     assert_eq!(body["range"]["end"], 2);
     assert_eq!(body["finality"], "durable_only");
     assert_eq!(body["fields"]["include"], json!(["block_number", "topics"]));
+}
+
+#[test]
+fn test_native_chain_head_gets_rest_head_with_finality_and_auth_headers() {
+    let server = MockRestServer::new(vec![json!({
+        "chain": {"configured_name": "ethereum"},
+        "height": 18_500_123,
+        "finality": "finalized",
+        "range_kind": "block",
+        "timestamp": 1_700_000_000_u64
+    })]);
+    let client = DatalensClient::new(ClientConfig {
+        endpoint: server.endpoint(),
+        bearer_token: Some("secret-token".to_owned()),
+        application: Some("query-app".to_owned()),
+        timeout: Some(Duration::from_secs(5)),
+        user_agent: Some("datalens-sdk-tests".to_owned()),
+    })
+    .expect("client config");
+
+    let response = client
+        .native()
+        .chain_head("ethereum", Some(ChainHeadFinalityInput::Finalized))
+        .expect("chain head");
+
+    assert_eq!(response.chain["configured_name"], "ethereum");
+    assert_eq!(response.height, 18_500_123);
+    assert_eq!(response.finality, "finalized");
+    assert_eq!(response.range_kind, "block");
+    assert_eq!(response.timestamp, Some(1_700_000_000));
+
+    let request = server.only_request();
+    assert_eq!(request.method, "GET");
+    assert_eq!(request.path, "/v1/chains/ethereum/head?finality=finalized");
+    assert_eq!(
+        request.headers.authorization.as_deref(),
+        Some("Bearer secret-token")
+    );
+    assert_eq!(request.headers.application.as_deref(), Some("query-app"));
+    assert_eq!(
+        request.headers.user_agent.as_deref(),
+        Some("datalens-sdk-tests")
+    );
+    assert!(request.body.is_null());
+}
+
+#[test]
+fn test_native_chain_head_supports_numeric_chain_locator_without_finality_query() {
+    let server = MockRestServer::new(vec![json!({
+        "chain": {"configured_name": "ethereum"},
+        "height": 18_500_456,
+        "finality": "latest",
+        "range_kind": "block"
+    })]);
+    let client = DatalensClient::new(ClientConfig {
+        endpoint: server.endpoint(),
+        bearer_token: None,
+        application: None,
+        timeout: Some(Duration::from_secs(5)),
+        user_agent: None,
+    })
+    .expect("client config");
+
+    let response = client.native().chain_head("1", None).expect("chain head");
+
+    assert_eq!(response.height, 18_500_456);
+    assert_eq!(response.timestamp, None);
+    assert_eq!(server.only_request().path, "/v1/chains/1/head");
+}
+
+#[test]
+fn test_native_chain_head_rejects_graphql_endpoint_clients() {
+    let client = DatalensClient::with_graphql_endpoint(ClientConfig {
+        endpoint: "http://127.0.0.1:1/native/graphql".to_owned(),
+        bearer_token: None,
+        application: None,
+        timeout: Some(Duration::from_secs(5)),
+        user_agent: None,
+    })
+    .expect("client config");
+
+    let error = client
+        .native()
+        .chain_head("ethereum", Some(ChainHeadFinalityInput::Safe))
+        .expect_err("chain head should require REST");
+
+    assert!(
+        error
+            .to_string()
+            .contains("requires a REST datalens endpoint"),
+        "{error}"
+    );
 }
 
 fn query_input() -> QueryInput {
@@ -237,7 +329,11 @@ fn handle_connection(
     }
     let mut body = vec![0; content_length];
     reader.read_exact(&mut body).expect("request body");
-    let body: Value = serde_json::from_slice(&body).expect("rest body");
+    let body: Value = if body.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&body).expect("rest body")
+    };
     requests.lock().expect("requests").push(RecordedRequest {
         method,
         path,
