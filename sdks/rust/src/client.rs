@@ -134,16 +134,30 @@ impl DatalensClient {
         V: Serialize,
     {
         let request = GraphqlRequest { query, variables };
-        let mut builder = self.http.post(&self.graphql_endpoint).json(&request);
-        if let Some(token) = &self.bearer_token {
-            builder = builder.bearer_auth(token);
+        let started_at = Instant::now();
+        let mut attempt = 1;
+        loop {
+            let result = self.execute_once(&request);
+            match result {
+                Ok(data) => return Ok(data),
+                Err(error) => {
+                    let Some(delay) = self.retry_delay(&error, attempt, started_at) else {
+                        return Err(error);
+                    };
+                    std::thread::sleep(delay);
+                    attempt += 1;
+                }
+            }
         }
-        if let Some(application) = &self.application {
-            builder = builder.header("x-datalens-application", application);
-        }
-        if let Some(user_agent) = &self.user_agent {
-            builder = builder.header(reqwest::header::USER_AGENT, user_agent);
-        }
+    }
+
+    fn execute_once<T, V>(&self, request: &GraphqlRequest<V>) -> Result<T, Error>
+    where
+        T: DeserializeOwned,
+        V: Serialize,
+    {
+        let mut builder = self.http.post(&self.graphql_endpoint).json(request);
+        builder = self.apply_headers(builder);
 
         let response = builder
             .send()
