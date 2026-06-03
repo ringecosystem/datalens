@@ -185,6 +185,33 @@ async fn test_max_requests_per_minute_is_enforced_before_provider_fetch() {
 
     assert_eq!(first.status(), StatusCode::OK);
     assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    let retry_after = second
+        .headers()
+        .get(axum::http::header::RETRY_AFTER)
+        .expect("retry after header")
+        .to_str()
+        .expect("retry after value")
+        .to_owned();
+    let body: serde_json::Value = serde_json::from_slice(
+        &to_bytes(second.into_body(), usize::MAX)
+            .await
+            .expect("rate limit body"),
+    )
+    .expect("rate limit json");
+    assert_eq!(body["error"]["kind"], "rate_limited");
+    assert_eq!(
+        body["error"]["message"],
+        "application request rate quota exceeded"
+    );
+    assert_eq!(body["error"]["quota"]["kind"], "request_rate_limit");
+    assert_eq!(body["error"]["quota"]["scope"], "application");
+    assert_eq!(body["error"]["quota"]["limit"], 1);
+    assert_eq!(body["error"]["quota"]["observed"], 1);
+    let retry_after_seconds = body["error"]["quota"]["retry_after_seconds"]
+        .as_u64()
+        .expect("retry after seconds");
+    assert!((1..=60).contains(&retry_after_seconds));
+    assert_eq!(retry_after, retry_after_seconds.to_string());
     assert_eq!(
         source.calls(),
         vec![SourceCall::Blocks(BlockRange::expect_new(10, 10))]
@@ -242,6 +269,26 @@ async fn test_max_concurrent_requests_is_enforced_while_request_is_in_flight() {
 
     assert_eq!(first.status(), StatusCode::OK);
     assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        second
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .is_none()
+    );
+    let body: serde_json::Value = serde_json::from_slice(
+        &to_bytes(second.into_body(), usize::MAX)
+            .await
+            .expect("concurrent limit body"),
+    )
+    .expect("concurrent limit json");
+    assert_eq!(body["error"]["quota"]["kind"], "concurrent_limit");
+    assert_eq!(body["error"]["quota"]["scope"], "application");
+    assert_eq!(body["error"]["quota"]["limit"], 1);
+    assert_eq!(body["error"]["quota"]["observed"], 1);
+    assert_eq!(
+        body["error"]["quota"]["retry_after_seconds"],
+        serde_json::Value::Null
+    );
     assert_eq!(
         source.calls(),
         vec![SourceCall::Blocks(BlockRange::expect_new(10, 10))]
@@ -435,6 +482,47 @@ async fn test_application_allowlist_and_quota_rejections_happen_before_fetch_or_
     assert_eq!(unauthorized_dataset.status(), StatusCode::FORBIDDEN);
     assert_eq!(quota_limited.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(hot_quota_limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        quota_limited
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .is_none()
+    );
+    assert!(
+        hot_quota_limited
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .is_none()
+    );
+    let quota_body: serde_json::Value = serde_json::from_slice(
+        &to_bytes(quota_limited.into_body(), usize::MAX)
+            .await
+            .expect("quota body"),
+    )
+    .expect("quota json");
+    let hot_quota_body: serde_json::Value = serde_json::from_slice(
+        &to_bytes(hot_quota_limited.into_body(), usize::MAX)
+            .await
+            .expect("hot quota body"),
+    )
+    .expect("hot quota json");
+    assert_eq!(quota_body["error"]["kind"], "rate_limited");
+    assert_eq!(quota_body["error"]["quota"]["kind"], "range_limit");
+    assert_eq!(quota_body["error"]["quota"]["scope"], "application");
+    assert_eq!(quota_body["error"]["quota"]["limit"], 1);
+    assert_eq!(quota_body["error"]["quota"]["requested"], 2);
+    assert_eq!(
+        quota_body["error"]["quota"]["retry_after_seconds"],
+        serde_json::Value::Null
+    );
+    assert_eq!(hot_quota_body["error"]["quota"]["kind"], "hot_range_limit");
+    assert_eq!(hot_quota_body["error"]["quota"]["scope"], "application");
+    assert_eq!(hot_quota_body["error"]["quota"]["limit"], 1);
+    assert_eq!(hot_quota_body["error"]["quota"]["requested"], 2);
+    assert_eq!(
+        hot_quota_body["error"]["quota"]["retry_after_seconds"],
+        serde_json::Value::Null
+    );
     assert_eq!(source.calls(), Vec::<SourceCall>::new());
     assert!(!root.join("chains/evm/ethereum/1/manifest.json").exists());
 }

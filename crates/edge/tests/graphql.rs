@@ -281,6 +281,84 @@ async fn test_graphql_query_enforces_application_auth_like_rest_query() {
 }
 
 #[tokio::test]
+async fn test_graphql_query_quota_error_includes_stable_extensions() {
+    let registry = QueryServiceRegistry::new()
+        .with_application_registry(datalens_edge::config::ApplicationRegistryConfig {
+            required: true,
+            applications: vec![datalens_edge::config::ApplicationConfig {
+                id: "graphql-quota".to_owned(),
+                name: "graphql-quota".to_owned(),
+                enabled: true,
+                display_name: None,
+                token: "secret-token".to_owned(),
+                chains: vec!["ethereum".to_owned()],
+                datasets: vec!["evm.blocks".to_owned()],
+                operations: vec![datalens_edge::config::ApplicationOperationConfig::Query],
+                quota: Some(datalens_edge::config::ApplicationQuotaConfig {
+                    max_query_range_blocks: Some(1),
+                    max_hot_query_range_blocks: None,
+                    max_requests_per_minute: None,
+                    max_concurrent_requests: None,
+                }),
+            }],
+        })
+        .expect("application registry")
+        .with_service(service(
+            LocalStorage::new(temp_storage_root("gql-quota")),
+            MockSource::default().with_blocks(vec![block(10, "0x10")]),
+        ))
+        .expect("register service");
+    let app = graphql_router(registry);
+    let body = serde_json::to_vec(&serde_json::json!({
+        "query": r#"
+            query($input: QueryInput!) {
+              query(input: $input) {
+                datasetKey
+              }
+            }
+        "#,
+        "variables": {
+            "input": {
+                "chain": ethereum_chain_input(),
+                "datasetKey": dataset_key_input("evm", "blocks"),
+                "selector": { "kind": "all" },
+                "range": { "kind": "block", "start": 10, "end": 11 },
+                "finality": "durable_only"
+            }
+        }
+    }))
+    .expect("graphql request");
+
+    let response = app
+        .oneshot(
+            Request::post("/native/graphql")
+                .header("content-type", "application/json")
+                .header("x-datalens-application", "graphql-quota")
+                .header("authorization", "Bearer secret-token")
+                .body(Body::from(body))
+                .expect("quota request"),
+        )
+        .await
+        .expect("quota response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response.into_body()).await;
+    assert_eq!(body["errors"][0]["extensions"]["kind"], "rate_limited");
+    assert_eq!(body["errors"][0]["extensions"]["status"], 429);
+    assert_eq!(
+        body["errors"][0]["extensions"]["quota"],
+        serde_json::json!({
+            "kind": "range_limit",
+            "scope": "application",
+            "limit": 1,
+            "requested": 2,
+            "observed": null,
+            "retry_after_seconds": null
+        })
+    );
+}
+
+#[tokio::test]
 async fn test_graphql_native_solana_query_uses_native_contract() {
     let root = temp_storage_root("gql-solana");
     let solana = SolanaAdapter::with_fixture_defaults();

@@ -1,6 +1,6 @@
 use async_graphql::{
     Context, EmptySubscription, Error, ErrorExtensions, ID, Json, Object, Schema, SimpleObject,
-    http::GraphiQLSource,
+    Value as GraphqlValue, http::GraphiQLSource,
 };
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 use axum::{
@@ -484,9 +484,15 @@ fn headers(ctx: &Context<'_>) -> HeaderMap {
 pub(crate) fn graphql_error(error: DatalensError) -> Error {
     let kind = error.kind;
     let status = api_error_status(&kind).as_u16();
+    let quota = error.quota;
     Error::new(error.message).extend_with(move |_error, extension| {
         extension.set("kind", api_error_kind(&kind));
         extension.set("status", i32::from(status));
+        if let Some(quota) = &quota
+            && let Ok(value) = serde_json::to_value(quota).and_then(GraphqlValue::from_json)
+        {
+            extension.set("quota", value);
+        }
     })
 }
 
