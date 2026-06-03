@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use axum::{
     Json,
     extract::{Path as AxumPath, Query, State},
@@ -17,6 +19,7 @@ use crate::{
     contract::{
         discovery::DiscoveryResponse,
         error::{api_error_body, api_error_status},
+        head::{ChainHeadApiResponse, ChainHeadFinalityApi},
         query::{QueryApiRequest, QueryApiResponse},
         warmup::{
             WarmupRunOnceApiResponse, WarmupSubmitApiRequest, WarmupSubmitApiResponse,
@@ -54,6 +57,34 @@ pub(crate) async fn discovery(
         .authenticate_discovery_headers(&headers)
         .map_err(ApiError)?;
     state.registry.discovery().map(Json).map_err(ApiError)
+}
+
+pub(crate) async fn chain_head(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(chain): AxumPath<String>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Result<Json<ChainHeadApiResponse>, ApiError> {
+    let registry = state.registry.clone();
+    let application_context = registry
+        .authenticate_chain_head_headers(&headers)
+        .map_err(ApiError)?;
+    let finality =
+        ChainHeadFinalityApi::parse(query.get("finality").map(String::as_str)).map_err(ApiError)?;
+    let configured_chain = registry.configured_chain_name(&chain).map_err(ApiError)?;
+    registry
+        .authorize_chain_head_application(&application_context, &configured_chain)
+        .map_err(ApiError)?;
+    tokio::task::spawn_blocking(move || registry.chain_head(&chain, finality))
+        .await
+        .map_err(|error| {
+            ApiError(DatalensError::new(
+                DatalensErrorKind::Internal,
+                format!("chain head task failed: {error}"),
+            ))
+        })?
+        .map(Json)
+        .map_err(ApiError)
 }
 
 pub(crate) async fn query(

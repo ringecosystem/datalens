@@ -495,7 +495,9 @@ pub(crate) struct MockSource {
     blocks_max_range_len: Arc<Mutex<u64>>,
     logs_max_range_len: Arc<Mutex<u64>>,
     max_addresses_per_query: Arc<Mutex<usize>>,
+    latest_height: Arc<Mutex<ChainHeight>>,
     safe_height: Arc<Mutex<ChainHeight>>,
+    finalized_height: Arc<Mutex<ChainHeight>>,
     chain: Arc<Mutex<ChainIdentity>>,
     fetch_delay: Arc<Mutex<Option<Duration>>>,
 }
@@ -511,8 +513,12 @@ impl Default for MockSource {
             blocks_max_range_len: Arc::new(Mutex::new(2)),
             logs_max_range_len: Arc::new(Mutex::new(2)),
             max_addresses_per_query: Arc::new(Mutex::new(2)),
+            latest_height: Arc::new(Mutex::new(ChainHeight::block(100))),
             safe_height: Arc::new(Mutex::new(
                 ChainHeight::block(100).with_finality(FinalityKind::Safe),
+            )),
+            finalized_height: Arc::new(Mutex::new(
+                ChainHeight::block(100).with_finality(FinalityKind::Finalized),
             )),
             chain: Arc::new(Mutex::new(ethereum_identity())),
             fetch_delay: Arc::new(Mutex::new(None)),
@@ -549,6 +555,17 @@ impl MockSource {
     pub(crate) fn with_safe_height(self, value: u64, finality: FinalityKind) -> Self {
         *self.safe_height.lock().expect("safe height lock") =
             ChainHeight::block(value).with_finality(finality);
+        self
+    }
+
+    pub(crate) fn with_latest_height(self, value: u64) -> Self {
+        *self.latest_height.lock().expect("latest height lock") = ChainHeight::block(value);
+        self
+    }
+
+    pub(crate) fn with_finalized_height(self, value: u64) -> Self {
+        *self.finalized_height.lock().expect("finalized height lock") =
+            ChainHeight::block(value).with_finality(FinalityKind::Finalized);
         self
     }
 
@@ -625,11 +642,23 @@ impl ChainAdapter for MockSource {
     }
 
     fn latest_height(&self) -> Result<ChainHeight, DatalensError> {
-        Ok(ChainHeight::block(100))
+        Ok(self
+            .latest_height
+            .lock()
+            .expect("latest height lock")
+            .clone())
     }
 
     fn cache_safe_height(&self) -> Result<ChainHeight, DatalensError> {
         Ok(self.safe_height.lock().expect("safe height lock").clone())
+    }
+
+    fn finalized_height(&self) -> Result<ChainHeight, DatalensError> {
+        Ok(self
+            .finalized_height
+            .lock()
+            .expect("finalized height lock")
+            .clone())
     }
 
     fn fetch(&self, request: ChainFetchRequest) -> Result<ChainFetchResponse, DatalensError> {

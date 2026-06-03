@@ -22,7 +22,11 @@ use datalens_writer::DurableWriteResult;
 use crate::{
     auth::application::{ApplicationContext, ApplicationRegistry},
     config,
-    contract::{discovery::DiscoveryResponse, query::QueryApiRequest},
+    contract::{
+        discovery::DiscoveryResponse,
+        head::{ChainHeadApiResponse, ChainHeadFinalityApi},
+        query::QueryApiRequest,
+    },
     service::{
         lifecycle::WarmupSchedulerHandle,
         query_service::{
@@ -100,6 +104,28 @@ impl QueryServiceRegistry {
         Ok(DiscoveryResponse { chains })
     }
 
+    pub fn chain_head(
+        &self,
+        chain: &str,
+        finality: ChainHeadFinalityApi,
+    ) -> Result<ChainHeadApiResponse, DatalensError> {
+        let service = self.service_for_chain_locator(chain)?;
+        let identity = service.chain_identity();
+        let head = match finality {
+            ChainHeadFinalityApi::Latest => service.latest_height(),
+            ChainHeadFinalityApi::Safe => service.cache_safe_height(),
+            ChainHeadFinalityApi::Finalized => service.finalized_height(),
+        }?;
+        Ok(ChainHeadApiResponse::from_head(identity, head))
+    }
+
+    pub fn configured_chain_name(&self, chain: &str) -> Result<String, DatalensError> {
+        Ok(self
+            .service_for_chain_locator(chain)?
+            .chain_name()
+            .to_owned())
+    }
+
     pub(crate) fn authenticate_headers(
         &self,
         headers: &HeaderMap,
@@ -139,6 +165,23 @@ impl QueryServiceRegistry {
     ) -> Result<Option<ApplicationContext>, DatalensError> {
         self.application_registry
             .authenticate_task_headers(headers, operation)
+    }
+
+    pub(crate) fn authenticate_chain_head_headers(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<Option<ApplicationContext>, DatalensError> {
+        self.application_registry
+            .authenticate_chain_head_headers(headers)
+    }
+
+    pub(crate) fn authorize_chain_head_application(
+        &self,
+        application_context: &Option<ApplicationContext>,
+        chain: &str,
+    ) -> Result<(), DatalensError> {
+        self.application_registry
+            .authorize_chain_head_application(application_context, chain)
     }
 
     pub(crate) fn authenticate_discovery_headers(
@@ -245,6 +288,34 @@ impl QueryServiceRegistry {
                     format!("warmup is not configured for chain {chain_name}"),
                 )
             })
+    }
+
+    fn service_for_chain_locator(
+        &self,
+        chain: &str,
+    ) -> Result<&Arc<dyn RegisteredQueryService>, DatalensError> {
+        if let Some(service) = self.services.get(chain) {
+            return Ok(service);
+        }
+        if let Ok(chain_id) = chain.parse::<u64>() {
+            let mut matches = self
+                .services
+                .values()
+                .filter(|service| service.chain_kind() == "evm" && service.chain_id() == chain_id);
+            if let Some(service) = matches.next() {
+                if matches.next().is_some() {
+                    return Err(DatalensError::new(
+                        DatalensErrorKind::InvalidInput,
+                        format!("chain id {chain_id} matches more than one configured EVM chain"),
+                    ));
+                }
+                return Ok(service);
+            }
+        }
+        Err(DatalensError::new(
+            DatalensErrorKind::UnsupportedDataset,
+            format!("chain {chain} is not configured"),
+        ))
     }
 
     fn mutate_warmup_task(

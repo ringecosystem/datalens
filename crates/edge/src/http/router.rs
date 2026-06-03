@@ -8,8 +8,8 @@ use crate::{
     http::{
         AppState,
         handlers::{
-            chains, discovery, health, metrics, query, warmup_cancel, warmup_get, warmup_list,
-            warmup_pause, warmup_retry, warmup_run_once, warmup_submit,
+            chain_head, chains, discovery, health, metrics, query, warmup_cancel, warmup_get,
+            warmup_list, warmup_pause, warmup_retry, warmup_run_once, warmup_submit,
         },
     },
     service::registry::QueryServiceRegistry,
@@ -30,6 +30,7 @@ pub fn router_with_edge_config(registry: QueryServiceRegistry, edge: config::Edg
         .route("/healthz", get(health))
         .route("/metrics", get(metrics))
         .route("/v1/chains", get(chains))
+        .route("/v1/chains/{chain}/head", get(chain_head))
         .route("/v1/discovery", get(discovery))
         .route("/v1/query", post(query))
         .route("/v1/warmup/tasks", post(warmup_submit).get(warmup_list))
