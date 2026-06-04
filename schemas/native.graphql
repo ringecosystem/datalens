@@ -177,6 +177,7 @@ type WarmupTask {
 	applicationId: String!
 	chain: JSON!
 	datasetKey: String!
+	selector: WarmupTaskSelector!
 	rangeKind: JSON!
 	start: Int!
 	end: Int
@@ -192,6 +193,12 @@ input WarmupTaskFilterInput {
 	applicationId: String
 	chain: String
 	state: String
+}
+
+type WarmupTaskSelector {
+	kind: String!
+	fingerprint: String!
+	canonicalKey: String!
 }
 
 """
