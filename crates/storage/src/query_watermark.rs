@@ -1,3 +1,5 @@
+use std::sync::{Arc, Mutex};
+
 use datalens_chain::DatasetSelector;
 use datalens_core::{ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey, LedgerRangeKind};
 use serde::{Deserialize, Serialize};
@@ -48,6 +50,7 @@ pub trait QueryWatermarkRepository: Send + Sync {
 #[derive(Clone, Debug)]
 pub struct QueryWatermarkStore<S> {
     object_store: S,
+    update_lock: Arc<Mutex<()>>,
 }
 
 impl<S> QueryWatermarkStore<S>
@@ -55,7 +58,10 @@ where
     S: ObjectStore,
 {
     pub fn new(object_store: S) -> Self {
-        Self { object_store }
+        Self {
+            object_store,
+            update_lock: Arc::new(Mutex::new(())),
+        }
     }
 }
 
@@ -64,6 +70,9 @@ where
     S: ObjectStore + 'static,
 {
     fn update(&self, watermark: &QueryWatermark) -> Result<(), DatalensError> {
+        let _update_guard = self.update_lock.lock().map_err(|error| {
+            DatalensError::internal(format!("lock query watermark update: {error}"))
+        })?;
         let key = watermark_object_key(&watermark.key);
         if let Some(existing) = self.read(&watermark.key)?
             && existing.latest_block >= watermark.latest_block
