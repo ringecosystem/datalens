@@ -88,6 +88,71 @@ fn test_dataset_selector_fingerprint_is_stable_and_storage_safe() {
 }
 
 #[test]
+fn test_dataset_selector_evm_logs_delegates_coverage() {
+    let stored = DatasetSelector::try_evm_logs(LogFilter {
+        addresses: vec![
+            "0x1111111111111111111111111111111111111111".to_owned(),
+            "0x2222222222222222222222222222222222222222".to_owned(),
+        ],
+        topics: vec![Some(vec![
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+        ])],
+    })
+    .expect("valid selector");
+    let query = DatasetSelector::try_evm_logs(LogFilter {
+        addresses: vec!["0x1111111111111111111111111111111111111111".to_owned()],
+        topics: vec![Some(vec![
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        ])],
+    })
+    .expect("valid selector");
+    let broader_query = DatasetSelector::try_evm_logs(LogFilter {
+        addresses: vec![
+            "0x1111111111111111111111111111111111111111".to_owned(),
+            "0x3333333333333333333333333333333333333333".to_owned(),
+        ],
+        topics: vec![Some(vec![
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        ])],
+    })
+    .expect("valid selector");
+
+    assert!(stored.covers(&query));
+    assert!(!stored.covers(&broader_query));
+}
+
+#[test]
+fn test_dataset_selector_other_uses_exact_semantics_only() {
+    let kind = AdapterKey::try_new("custom").expect("valid key");
+    let stored = DatasetSelector::try_other(kind.clone(), "same-fingerprint", "same/canonical-key")
+        .expect("valid selector");
+    let same = DatasetSelector::try_other(kind.clone(), "same-fingerprint", "same/canonical-key")
+        .expect("valid selector");
+    let different_canonical =
+        DatasetSelector::try_other(kind.clone(), "same-fingerprint", "different/canonical-key")
+            .expect("valid selector");
+    let different_fingerprint =
+        DatasetSelector::try_other(kind.clone(), "different-fingerprint", "same/canonical-key")
+            .expect("valid selector");
+    let different_kind = DatasetSelector::try_other(
+        AdapterKey::try_new("other-custom").expect("valid key"),
+        "same-fingerprint",
+        "same/canonical-key",
+    )
+    .expect("valid selector");
+    let all = DatasetSelector::all();
+
+    assert!(stored.covers(&same));
+    assert!(!stored.covers(&different_canonical));
+    assert!(!stored.covers(&different_fingerprint));
+    assert!(!stored.covers(&different_kind));
+    assert!(all.covers(&DatasetSelector::all()));
+    assert!(!all.covers(&stored));
+    assert!(!stored.covers(&all));
+}
+
+#[test]
 fn test_fetch_request_response_and_capabilities_cover_query_cache_contract() {
     let chain = ChainIdentity::try_new(ChainFamily::Evm, "ethereum", Some(NetworkId::numeric(1)))
         .expect("valid chain");
