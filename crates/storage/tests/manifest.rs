@@ -2015,6 +2015,78 @@ fn test_cloned_storage_serializes_concurrent_manifest_updates() {
 }
 
 #[test]
+fn test_object_and_empty_coverage_under_same_selector_remain_visible() {
+    let storage = LocalStorage::new(temp_storage_root("mixed-object-empty-coverage"));
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let empty_rows = DatasetRows::new(DatasetKey::evm_blocks(), QueryRows::EvmBlocks(Vec::new()))
+        .expect("dataset rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &selector,
+            range: LedgerRange::blocks(1, 1).expect("valid range"),
+            rows: &single_block_rows(1),
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write object coverage");
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &selector,
+            range: LedgerRange::blocks(2, 2).expect("valid range"),
+            rows: &empty_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write empty coverage");
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &selector,
+            range: LedgerRange::blocks(3, 3).expect("valid range"),
+            rows: &single_block_rows(3),
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write adjacent object coverage");
+
+    let manifest = storage.manifest().expect("manifest");
+    assert_eq!(manifest.entries.len(), 3);
+    assert_eq!(
+        storage
+            .covered_ranges(
+                &chain,
+                &DatasetKey::evm_blocks(),
+                &selector,
+                LedgerRange::blocks(1, 3).expect("valid range"),
+            )
+            .expect("covered ranges"),
+        vec![LedgerRange::blocks(1, 3).expect("valid range")]
+    );
+    assert!(manifest.entries.iter().any(|entry| {
+        entry.range == LedgerRange::blocks(1, 1).expect("valid range")
+            && entry.object_key.is_some()
+            && entry.row_count == 1
+    }));
+    assert!(manifest.entries.iter().any(|entry| {
+        entry.range == LedgerRange::blocks(2, 2).expect("valid range")
+            && entry.object_key.is_none()
+            && entry.row_count == 0
+    }));
+    assert!(manifest.entries.iter().any(|entry| {
+        entry.range == LedgerRange::blocks(3, 3).expect("valid range")
+            && entry.object_key.is_some()
+            && entry.row_count == 1
+    }));
+}
+
+#[test]
 fn test_object_write_failure_does_not_update_manifest() {
     let root = temp_storage_root("object-write-failure");
     let storage = DurableStorage::from_object_store(FailingPutObjectStore::new(root.clone()));

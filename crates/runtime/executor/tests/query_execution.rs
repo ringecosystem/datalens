@@ -93,6 +93,34 @@ fn test_executor_miss_fetches_and_persists_through_writer() {
 }
 
 #[test]
+fn test_executor_repeated_query_hits_mixed_empty_and_data_coverage_without_fetch() {
+    let storage = LocalStorage::new(temp_storage_root("executor-hit-mixed-empty-data"));
+    seed_blocks(&storage, 1, 2, vec![block(1, "0x01"), block(2, "0x02")]);
+    seed_empty_blocks(&storage, 3, 4);
+    let source = MockSource::default()
+        .with_blocks(vec![
+            block(1, "0x01"),
+            block(2, "0x02"),
+            block(3, "0x03"),
+            block(4, "0x04"),
+        ])
+        .with_safe_height_error(DatalensErrorKind::ProviderFailure);
+    let executor = executor(storage, source.clone());
+
+    let result = executor
+        .execute(blocks_input(1, 4))
+        .expect("mixed empty/data cache hit succeeds");
+
+    assert_eq!(block_numbers(&result.rows), vec![1, 2]);
+    assert_eq!(
+        result.cache.hit_ranges,
+        vec![LedgerRange::blocks(1, 4).expect("valid range")]
+    );
+    assert_eq!(result.cache.missing_ranges, Vec::<LedgerRange>::new());
+    assert_eq!(source.calls(), Vec::<SourceCall>::new());
+}
+
+#[test]
 fn test_executor_flushes_staged_query_fill_before_returning() {
     let storage = LocalStorage::new(temp_storage_root("executor-staged-miss"));
     let source = MockSource::default().with_blocks(vec![block(10, "0x10")]);
@@ -947,6 +975,30 @@ fn seed_blocks(storage: &LocalStorage, start: u64, end: u64, blocks: Vec<BlockHe
         }],
     })
     .expect("seed cache");
+}
+
+fn seed_empty_blocks(storage: &LocalStorage, start: u64, end: u64) {
+    datalens_writer::DurableWriter::new(
+        storage.clone(),
+        DurableWriterConfig {
+            target_object_bytes: 1024,
+            min_object_rows: 1,
+            record_empty_coverage: true,
+            staging: Default::default(),
+        },
+    )
+    .write(DurableWriteRequest {
+        chain: ethereum_identity(),
+        dataset_key: DatasetKey::evm_blocks(),
+        selector: DatasetSelector::all(),
+        finality_level: FinalityKind::Safe,
+        segments: vec![DurableWriteSegment {
+            range: LedgerRange::blocks(start, end).expect("valid range"),
+            rows: DatasetRows::new(DatasetKey::evm_blocks(), QueryRows::EvmBlocks(Vec::new()))
+                .expect("dataset rows"),
+        }],
+    })
+    .expect("seed empty coverage");
 }
 
 fn blocks_input(start: u64, end: u64) -> NativeQueryInput {

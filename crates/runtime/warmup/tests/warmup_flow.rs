@@ -349,6 +349,44 @@ fn test_empty_fetch_records_empty_coverage_when_writer_allows_it() {
 }
 
 #[test]
+fn test_warmup_skips_provider_for_mixed_empty_and_data_coverage_and_checkpoints() {
+    let storage = LocalStorage::new(temp_root("mixed-hit-storage"));
+    let registry = LocalWarmupRegistry::new(object_store("mixed-hit-registry"));
+    let adapter = FixtureAdapter::new(3).with_max_range_len(3).with_logs(vec![
+        log_record(1, 0),
+        log_record(2, 0),
+        log_record(3, 0),
+    ]);
+    let runtime = runtime(adapter.clone(), storage.clone(), registry.clone());
+    let task_id = registry
+        .submit(submit_request(Some(3), WarmupTaskMode::FixedRange))
+        .unwrap()
+        .task_id;
+
+    seed_log_coverage(&storage, blocks(1, 1), vec![log_record(1, 0)]);
+    seed_coverage(&storage, blocks(2, 3));
+
+    let result = runtime.run_task_once(&task_id).expect("warmup run");
+
+    assert!(adapter.fetches().is_empty());
+    assert_eq!(result.status, WarmupRunStatus::Completed);
+    assert_eq!(result.rows_fetched, 0);
+    assert_eq!(result.provider_calls, 0);
+    assert_eq!(result.written_ranges, 0);
+    assert_eq!(
+        storage
+            .covered_ranges(&chain(), &DatasetKey::evm_logs(), &selector(), blocks(1, 3))
+            .unwrap(),
+        vec![blocks(1, 3)]
+    );
+    let cursor = registry.load_cursor(&task_id).unwrap().expect("cursor");
+    assert_eq!(cursor.next, 4);
+    let task = registry.get(&task_id).unwrap().expect("task");
+    assert_eq!(task.state, WarmupTaskState::Completed);
+    assert_eq!(task.stats.provider_calls, 0);
+}
+
+#[test]
 fn test_provider_failure_does_not_advance_cursor_and_marks_task_failed() {
     let storage = LocalStorage::new(temp_root("failure-storage"));
     let registry = LocalWarmupRegistry::new(object_store("failure-registry"));
@@ -628,6 +666,10 @@ fn log_record(block_number: u64, log_index: u64) -> LogRecord {
 }
 
 fn seed_coverage(storage: &LocalStorage, range: LedgerRange) {
+    seed_log_coverage(storage, range, Vec::new());
+}
+
+fn seed_log_coverage(storage: &LocalStorage, range: LedgerRange, logs: Vec<LogRecord>) {
     datalens_writer::DurableWriter::new(storage.clone(), writer_config())
         .write(datalens_writer::DurableWriteRequest {
             chain: chain(),
@@ -636,8 +678,7 @@ fn seed_coverage(storage: &LocalStorage, range: LedgerRange) {
             finality_level: FinalityLevel::Safe,
             segments: vec![datalens_writer::DurableWriteSegment {
                 range,
-                rows: DatasetRows::new(DatasetKey::evm_logs(), QueryRows::EvmLogs(Vec::new()))
-                    .unwrap(),
+                rows: DatasetRows::new(DatasetKey::evm_logs(), QueryRows::EvmLogs(logs)).unwrap(),
             }],
         })
         .unwrap();
