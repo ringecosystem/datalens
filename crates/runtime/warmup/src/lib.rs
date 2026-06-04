@@ -1,6 +1,7 @@
 //! Application-scoped durable cache warmup task pool.
 
 mod cursor;
+mod pending_commit;
 mod registry;
 mod runtime;
 mod task;
