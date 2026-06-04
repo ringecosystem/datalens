@@ -469,6 +469,50 @@ fn test_task_pool_runs_available_tasks_with_global_bound() {
 }
 
 #[test]
+fn test_task_pool_scopes_shared_registry_to_adapter_chain() {
+    let storage = LocalStorage::new(temp_root("pool-shared-chain-storage"));
+    let registry = LocalWarmupRegistry::new(object_store("pool-shared-chain-registry"));
+    let adapter = FixtureAdapter::new(3).with_max_range_len(3);
+    let pool = WarmupTaskPool::new(
+        runtime(adapter.clone(), storage, registry.clone()),
+        WarmupSchedulerConfig {
+            max_global_concurrent_tasks: 10,
+            max_concurrent_tasks_per_chain: 10,
+        },
+    );
+    let ethereum = registry
+        .submit(submit_request(Some(1), WarmupTaskMode::FixedRange))
+        .unwrap()
+        .task_id;
+    let mut polygon_request = submit_request(Some(1), WarmupTaskMode::FixedRange);
+    polygon_request.chain = polygon_chain();
+    let polygon = registry.submit(polygon_request).unwrap().task_id;
+
+    assert_eq!(pool.list(Default::default()).unwrap().len(), 1);
+    assert_eq!(
+        pool.list(datalens_warmup::WarmupTaskFilter {
+            chain_key: Some(polygon_chain().key_prefix()),
+            ..Default::default()
+        })
+        .unwrap(),
+        Vec::new()
+    );
+
+    let results = pool.run_available_once().expect("run matching task only");
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        registry.get(&ethereum).unwrap().unwrap().state,
+        WarmupTaskState::Completed
+    );
+    assert_eq!(
+        registry.get(&polygon).unwrap().unwrap().state,
+        WarmupTaskState::Queued
+    );
+    assert_eq!(adapter.fetches(), vec![blocks(1, 1)]);
+}
+
+#[test]
 fn test_fetch_loop_bound_leaves_fixed_task_partial_until_next_run() {
     let storage = LocalStorage::new(temp_root("bounded-storage"));
     let registry = LocalWarmupRegistry::new(object_store("bounded-registry"));
@@ -549,6 +593,10 @@ fn temp_root(name: &str) -> PathBuf {
 
 fn chain() -> ChainIdentity {
     ChainIdentity::try_new(ChainFamily::Evm, "ethereum", Some(NetworkId::numeric(1))).unwrap()
+}
+
+fn polygon_chain() -> ChainIdentity {
+    ChainIdentity::try_new(ChainFamily::Evm, "polygon", Some(NetworkId::numeric(137))).unwrap()
 }
 
 fn selector() -> DatasetSelector {
