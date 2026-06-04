@@ -7,7 +7,7 @@ use datalens_core::{DatalensError, DatalensErrorKind, DatasetKey, DatasetRows, L
 use datalens_executor::{NativeQueryExecutionConfig, NativeQueryExecutor};
 use datalens_metrics::{ApplicationIdentity, MetricsRecorder};
 use datalens_planner::{NativePlannerConfig, NativeQueryInput};
-use datalens_storage::{StorageRepository, UsageLedgerRepository};
+use datalens_storage::{QueryWatermarkRepository, StorageRepository, UsageLedgerRepository};
 use datalens_warmup::{
     WarmupRegistry, WarmupRunResult, WarmupSubmitOutcome, WarmupSubmitRequest, WarmupTask,
     WarmupTaskFilter, WarmupTaskId, WarmupTaskPool,
@@ -175,6 +175,15 @@ where
         application: ApplicationIdentity,
     ) -> Self {
         self.executor = self.executor.with_usage_ledger(repository, application);
+        self
+    }
+
+    pub fn with_query_watermarks(
+        mut self,
+        repository: impl QueryWatermarkRepository + 'static,
+        application: ApplicationIdentity,
+    ) -> Self {
+        self.executor = self.executor.with_query_watermarks(repository, application);
         self
     }
 

@@ -7,8 +7,9 @@ use datalens_evm::{EvmFinalityPolicy, EvmRpcClient};
 use datalens_metrics::ApplicationIdentity;
 use datalens_solana::{SolanaAdapter, SolanaHttpRpc};
 use datalens_storage::{
-    DurableStorage, LocalObjectStore, LocalStorage, ObjectMetadata, ObjectStore, S3ObjectStore,
-    UsageLedgerRepository, UsageLedgerStore,
+    DurableStorage, LocalObjectStore, LocalStorage, ObjectMetadata, ObjectStore,
+    QueryWatermarkRepository, QueryWatermarkStore, S3ObjectStore, UsageLedgerRepository,
+    UsageLedgerStore,
 };
 use datalens_tron::{TronAdapter, TronHttpProvider};
 use datalens_warmup::{
@@ -30,7 +31,16 @@ pub(crate) fn build_service(
     }
     let storage: Arc<dyn datalens_storage::StorageRepository> = Arc::from(build_storage(config)?);
     let usage_ledger: Arc<dyn UsageLedgerRepository> = Arc::from(build_usage_ledger(config)?);
-    build_evm_service_with_storage(storage, usage_ledger, config, chain_name, chain)
+    let query_watermarks: Arc<dyn QueryWatermarkRepository> =
+        Arc::from(build_query_watermarks(config)?);
+    build_evm_service_with_storage(
+        storage,
+        usage_ledger,
+        query_watermarks,
+        config,
+        chain_name,
+        chain,
+    )
 }
 
 pub(crate) fn build_service_registry(
@@ -38,6 +48,8 @@ pub(crate) fn build_service_registry(
 ) -> Result<QueryServiceRegistry, DatalensError> {
     let storage: Arc<dyn datalens_storage::StorageRepository> = Arc::from(build_storage(config)?);
     let usage_ledger: Arc<dyn UsageLedgerRepository> = Arc::from(build_usage_ledger(config)?);
+    let query_watermarks: Arc<dyn QueryWatermarkRepository> =
+        Arc::from(build_query_watermarks(config)?);
     let mut registry =
         QueryServiceRegistry::new().with_application_registry(config.applications.clone())?;
     for (chain_name, chain) in &config.chains {
@@ -46,6 +58,7 @@ pub(crate) fn build_service_registry(
                 let service = build_evm_service_with_storage(
                     storage.clone(),
                     usage_ledger.clone(),
+                    query_watermarks.clone(),
                     config,
                     chain_name.as_str(),
                     chain,
@@ -56,6 +69,7 @@ pub(crate) fn build_service_registry(
                 let service = build_solana_service_with_storage(
                     storage.clone(),
                     usage_ledger.clone(),
+                    query_watermarks.clone(),
                     config,
                     chain_name.as_str(),
                     chain,
@@ -66,6 +80,7 @@ pub(crate) fn build_service_registry(
                 let service = build_tron_service_with_storage(
                     storage.clone(),
                     usage_ledger.clone(),
+                    query_watermarks.clone(),
                     config,
                     chain_name.as_str(),
                     chain,
@@ -81,6 +96,7 @@ pub(crate) fn build_service_registry(
 fn build_evm_service_with_storage(
     storage: Arc<dyn datalens_storage::StorageRepository>,
     usage_ledger: Arc<dyn UsageLedgerRepository>,
+    query_watermarks: Arc<dyn QueryWatermarkRepository>,
     config: &DatalensConfig,
     chain_name: &str,
     chain: &ChainConfig,
@@ -110,7 +126,11 @@ fn build_evm_service_with_storage(
         config.metrics.clone(),
     )?
     .with_usage_ledger(
-        usage_ledger,
+        usage_ledger.clone(),
+        ApplicationIdentity::named(config.metrics.default_application.clone()),
+    )
+    .with_query_watermarks(
+        query_watermarks.clone(),
         ApplicationIdentity::named(config.metrics.default_application.clone()),
     );
     if config.warmup.enabled {
@@ -124,7 +144,9 @@ fn build_evm_service_with_storage(
         .with_runtime_config(WarmupRuntimeConfig {
             max_fetches_per_task_loop: config.warmup.max_fetches_per_loop,
         })
-        .with_usage_ledger(build_usage_ledger(config)?);
+        .with_follow_query_lookahead_blocks(config.warmup.follow_query_lookahead_blocks)
+        .with_usage_ledger(usage_ledger)
+        .with_query_watermarks(query_watermarks);
         if let Some(recorder) = service.metrics_recorder() {
             runtime = runtime.with_metrics(recorder);
         }
@@ -142,6 +164,7 @@ fn build_evm_service_with_storage(
 fn build_solana_service_with_storage(
     storage: Arc<dyn datalens_storage::StorageRepository>,
     usage_ledger: Arc<dyn UsageLedgerRepository>,
+    query_watermarks: Arc<dyn QueryWatermarkRepository>,
     config: &DatalensConfig,
     chain_name: &str,
     chain: &ChainConfig,
@@ -175,12 +198,17 @@ fn build_solana_service_with_storage(
     .with_usage_ledger(
         usage_ledger,
         ApplicationIdentity::named(config.metrics.default_application.clone()),
+    )
+    .with_query_watermarks(
+        query_watermarks,
+        ApplicationIdentity::named(config.metrics.default_application.clone()),
     ))
 }
 
 fn build_tron_service_with_storage(
     storage: Arc<dyn datalens_storage::StorageRepository>,
     usage_ledger: Arc<dyn UsageLedgerRepository>,
+    query_watermarks: Arc<dyn QueryWatermarkRepository>,
     config: &DatalensConfig,
     chain_name: &str,
     chain: &ChainConfig,
@@ -213,6 +241,10 @@ fn build_tron_service_with_storage(
     )?
     .with_usage_ledger(
         usage_ledger,
+        ApplicationIdentity::named(config.metrics.default_application.clone()),
+    )
+    .with_query_watermarks(
+        query_watermarks,
         ApplicationIdentity::named(config.metrics.default_application.clone()),
     ))
 }
@@ -323,6 +355,39 @@ pub(crate) fn build_usage_ledger(
             Ok(Box::new(UsageLedgerStore::new(S3ObjectStore::from_config(
                 s3,
             )?)))
+        }
+        _ => Err(DatalensError::new(
+            DatalensErrorKind::UnsupportedDataset,
+            "storage.backend must be local or s3",
+        )),
+    }
+}
+
+pub fn build_query_watermarks(
+    config: &DatalensConfig,
+) -> Result<Box<dyn QueryWatermarkRepository>, DatalensError> {
+    match config.storage.backend.as_str() {
+        "local" => {
+            let local = config.storage.local.as_ref().ok_or_else(|| {
+                DatalensError::new(
+                    DatalensErrorKind::InvalidInput,
+                    "storage.local.root must be set",
+                )
+            })?;
+            Ok(Box::new(QueryWatermarkStore::new(LocalObjectStore::new(
+                &local.root,
+            ))))
+        }
+        "s3" => {
+            let s3 = config.storage.s3.clone().ok_or_else(|| {
+                DatalensError::new(
+                    DatalensErrorKind::InvalidInput,
+                    "storage.s3 must be set when storage.backend is s3",
+                )
+            })?;
+            Ok(Box::new(QueryWatermarkStore::new(
+                S3ObjectStore::from_config(s3)?,
+            )))
         }
         _ => Err(DatalensError::new(
             DatalensErrorKind::UnsupportedDataset,

@@ -13,6 +13,7 @@ use datalens_core::{
 };
 use datalens_storage::{
     CacheOutcome, FillOutcome, LocalObjectStore, ObjectMetadata, ObjectStore, QueryOutcome,
+    QueryWatermark, QueryWatermarkKey, QueryWatermarkRepository, QueryWatermarkStore,
     UsageLedgerEntry, UsageLedgerRepository, UsageLedgerStore,
 };
 
@@ -194,6 +195,46 @@ fn test_usage_ledger_serializes_default_durable_only_request_contract() {
     let encoded = serde_json::to_string(&entry).expect("encode usage entry");
 
     assert!(encoded.contains(r#""requested_hot":false"#));
+}
+
+#[test]
+fn test_query_watermark_records_highest_selector_progress_without_rewinding() {
+    let store = QueryWatermarkStore::new(LocalObjectStore::new(temp_storage_root("watermark")));
+    let selector = DatasetSelector::all();
+    let key = QueryWatermarkKey::new(
+        "analytics-api",
+        test_chain(),
+        DatasetKey::evm_blocks(),
+        &selector,
+        datalens_core::LedgerRangeKind::Block,
+    );
+
+    store
+        .update(&QueryWatermark {
+            key: key.clone(),
+            latest_block: 25,
+            updated_at_unix_seconds: 100,
+        })
+        .expect("write watermark");
+    store
+        .update(&QueryWatermark {
+            key: key.clone(),
+            latest_block: 20,
+            updated_at_unix_seconds: 200,
+        })
+        .expect("stale update does not rewind");
+
+    let watermark = store
+        .read(&key)
+        .expect("read watermark")
+        .expect("watermark");
+    assert_eq!(watermark.latest_block, 25);
+    assert_eq!(watermark.updated_at_unix_seconds, 100);
+    assert_eq!(watermark.key.selector_fingerprint, selector.fingerprint());
+    assert_eq!(
+        watermark.key.selector_canonical_key,
+        selector.canonical_key()
+    );
 }
 
 fn temp_storage_root(name: &str) -> PathBuf {

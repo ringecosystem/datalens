@@ -202,6 +202,8 @@ pub struct WarmupConfig {
     pub max_per_chain_tasks: usize,
     #[serde(default = "default_warmup_max_fetches_per_loop")]
     pub max_fetches_per_loop: u64,
+    #[serde(default = "default_warmup_follow_query_lookahead_blocks")]
+    pub follow_query_lookahead_blocks: u64,
     #[serde(default = "default_warmup_flush_on_shutdown")]
     pub flush_on_shutdown: bool,
 }
@@ -215,6 +217,7 @@ impl Default for WarmupConfig {
             max_global_tasks: default_warmup_max_global_tasks(),
             max_per_chain_tasks: default_warmup_max_per_chain_tasks(),
             max_fetches_per_loop: default_warmup_max_fetches_per_loop(),
+            follow_query_lookahead_blocks: default_warmup_follow_query_lookahead_blocks(),
             flush_on_shutdown: default_warmup_flush_on_shutdown(),
         }
     }
@@ -352,6 +355,10 @@ fn default_warmup_max_per_chain_tasks() -> usize {
 
 fn default_warmup_max_fetches_per_loop() -> u64 {
     1
+}
+
+fn default_warmup_follow_query_lookahead_blocks() -> u64 {
+    100
 }
 
 fn default_warmup_flush_on_shutdown() -> bool {

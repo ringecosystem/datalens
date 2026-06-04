@@ -22,14 +22,15 @@ use datalens_edge::{
     config::{DatalensConfig, WriterConfig},
     router,
 };
-use datalens_metrics::MetricsRecorder;
+use datalens_metrics::{ApplicationIdentity, MetricsRecorder};
 use datalens_planner::{FieldSelection, NativeQueryInput};
 use datalens_storage::{
-    DurableStorage, LocalObjectStore, LocalStorage, ObjectMetadata, ObjectStore,
-    ReadThroughCacheConfig,
+    DurableStorage, LocalObjectStore, LocalStorage, ObjectMetadata, ObjectStore, QueryWatermarkKey,
+    QueryWatermarkRepository, QueryWatermarkStore, ReadThroughCacheConfig,
 };
 use datalens_warmup::{
-    LocalWarmupRegistry, WarmupRuntime, WarmupRuntimeConfig, WarmupSchedulerConfig, WarmupTaskPool,
+    LocalWarmupRegistry, WarmupChunkPolicy, WarmupRetryPolicy, WarmupRuntime, WarmupRuntimeConfig,
+    WarmupSchedulerConfig, WarmupSubmitRequest, WarmupTaskMode, WarmupTaskPool,
 };
 use tower::ServiceExt;
 
@@ -224,6 +225,106 @@ async fn test_production_readiness_validates_service_staging_warmup_metrics_and_
     assert!(metrics.contains(r#"datalens_warmup_fetch_total"#));
     assert!(metrics.contains(r#"datalens_warmup_write_total"#));
     assert!(metrics.contains(r#"application="production-app""#));
+}
+
+#[tokio::test]
+async fn test_service_wires_query_watermarks_into_follow_query_warmup() {
+    let root = temp_storage_root("production-follow-query-watermarks");
+    let config_path = write_config(&root);
+    let config = DatalensConfig::from_file(&config_path).expect("config boundary loads");
+    let chain = config
+        .chains
+        .get("ethereum")
+        .expect("configured ethereum chain")
+        .clone();
+    let storage: Arc<dyn datalens_storage::StorageRepository> = Arc::new(LocalStorage::new(&root));
+    let source = MockSource::default();
+    let watermarks = QueryWatermarkStore::new(LocalObjectStore::new(&root));
+    let service = QueryService::new_with_metrics_config(
+        storage.clone(),
+        source.clone(),
+        config.planner.clone(),
+        config.writer.clone(),
+        "ethereum",
+        chain,
+        config.metrics.clone(),
+    )
+    .expect("service boundary builds from config")
+    .with_query_watermarks(
+        watermarks.clone(),
+        ApplicationIdentity::named("prod-readiness"),
+    );
+    let registry = LocalWarmupRegistry::new(LocalObjectStore::new(root.join("warmup-registry")));
+    let runtime = WarmupRuntime::new(
+        source.clone(),
+        storage,
+        registry.clone(),
+        datalens_writer::DurableWriterConfig {
+            target_object_bytes: config.writer.target_object_bytes,
+            min_object_rows: config.writer.min_object_rows,
+            record_empty_coverage: config.writer.record_empty_coverage,
+            staging: datalens_writer::WriteStagingConfig::default(),
+        },
+    )
+    .with_durable_writer(service.durable_writer())
+    .with_query_watermarks(watermarks.clone())
+    .with_follow_query_lookahead_blocks(config.warmup.follow_query_lookahead_blocks)
+    .with_runtime_config(WarmupRuntimeConfig {
+        max_fetches_per_task_loop: 1,
+    });
+    let query = logs_request(20, 21);
+
+    service
+        .query_native(query.clone())
+        .expect("query records watermark");
+
+    let watermark_key = QueryWatermarkKey::new(
+        "prod-readiness",
+        ethereum_identity(),
+        DatasetKey::evm_logs(),
+        &query.selector,
+        datalens_core::LedgerRangeKind::Block,
+    );
+    assert_eq!(
+        watermarks
+            .read(&watermark_key)
+            .expect("read watermark")
+            .expect("watermark")
+            .latest_block,
+        21
+    );
+    source.clear_calls();
+
+    let task_id = registry
+        .submit(WarmupSubmitRequest {
+            application_id: "prod-readiness".to_owned(),
+            chain: ethereum_identity(),
+            dataset_key: DatasetKey::evm_logs(),
+            selector: query.selector,
+            range_kind: datalens_core::LedgerRangeKind::Block,
+            start: 1,
+            end: None,
+            mode: WarmupTaskMode::FollowQuery,
+            chunk_policy: WarmupChunkPolicy {
+                max_range_len: 4,
+                target_rows_hint: None,
+            },
+            retry_policy: WarmupRetryPolicy::default(),
+        })
+        .expect("submit follow-query task")
+        .task_id;
+
+    runtime.run_task_once(&task_id).expect("run follow-query");
+
+    assert_eq!(
+        source.calls(),
+        vec![SourceCall::Logs(BlockRange::expect_new(1, 4))]
+    );
+    let cursor = registry
+        .load_cursor(&task_id)
+        .expect("load cursor")
+        .expect("cursor");
+    assert_eq!(cursor.next, 5);
 }
 
 #[derive(Clone, Debug)]
@@ -605,6 +706,7 @@ fn write_config(root: &Path) -> PathBuf {
             max_global_tasks = 1
             max_per_chain_tasks = 1
             max_fetches_per_loop = 4
+            follow_query_lookahead_blocks = 2048
             flush_on_shutdown = true
 
             [index]
