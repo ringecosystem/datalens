@@ -35,10 +35,14 @@ impl WarmupTargetPlanner {
                     return PlannedWarmupTarget::Noop("query_watermark_missing");
                 };
 
-                let desired_start =
-                    query_watermark.saturating_add(input.start_offset_blocks.unwrap_or_else(
-                        || adaptive_start_offset_blocks(query_watermark, input.safe_head),
-                    ));
+                let desired_start = query_watermark.saturating_add(
+                    input
+                        .start_offset_blocks
+                        .map(|offset| offset.max(1))
+                        .unwrap_or_else(|| {
+                            adaptive_start_offset_blocks(query_watermark, input.safe_head)
+                        }),
+                );
                 let start = input.cursor_next.max(desired_start);
                 if start > input.safe_head {
                     return PlannedWarmupTarget::Noop("start_after_safe_head");
@@ -64,8 +68,8 @@ impl WarmupTargetPlanner {
 }
 
 fn adaptive_start_offset_blocks(query_watermark: u64, safe_head: u64) -> u64 {
-    [5_000, 4_000, 3_000, 1_000, 500, 100, 0]
+    [5_000, 4_000, 3_000, 1_000, 500, 100, 50, 10, 1]
         .into_iter()
         .find(|offset| query_watermark.saturating_add(*offset) <= safe_head)
-        .unwrap_or(0)
+        .unwrap_or(1)
 }

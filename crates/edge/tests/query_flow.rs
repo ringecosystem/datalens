@@ -464,6 +464,7 @@ async fn test_discovery_route_lists_chain_identities_and_native_dataset_capabili
                 kind: "tron".to_owned(),
                 chain_id: 1,
                 rpc_urls: vec!["http://example.invalid".to_owned()],
+                warmup: Default::default(),
                 trongrid: Default::default(),
                 finality: datalens_edge::config::FinalityConfig::Auto,
                 datasets: DatasetsConfig {

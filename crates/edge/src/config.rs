@@ -456,10 +456,18 @@ pub struct ChainConfig {
     pub chain_id: u64,
     pub rpc_urls: Vec<String>,
     #[serde(default)]
+    pub warmup: ChainWarmupConfig,
+    #[serde(default)]
     pub trongrid: TronGridConfig,
     #[serde(default)]
     pub finality: FinalityConfig,
     pub datasets: DatasetsConfig,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ChainWarmupConfig {
+    #[serde(default)]
+    pub follow_query_start_offset_blocks: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

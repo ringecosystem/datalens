@@ -527,9 +527,9 @@ fn test_query_watermark_does_not_directly_update_warmup_cursor() {
     let result = runtime.run_task_once(&task_id).expect("warmup run");
 
     assert_eq!(result.status, WarmupRunStatus::Partial);
-    assert_eq!(adapter.fetches(), vec![blocks(11, 11)]);
+    assert_eq!(adapter.fetches(), vec![blocks(11, 12)]);
     let cursor = registry.load_cursor(&task_id).unwrap().expect("cursor");
-    assert_eq!(cursor.next, 12);
+    assert_eq!(cursor.next, 13);
 }
 
 #[test]

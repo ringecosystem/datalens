@@ -225,6 +225,7 @@ pub(crate) fn chain_config(chain_id: u64) -> ChainConfig {
         kind: "evm".to_owned(),
         chain_id,
         rpc_urls: vec!["http://example.invalid".to_owned()],
+        warmup: Default::default(),
         trongrid: Default::default(),
         finality: datalens_edge::config::FinalityConfig::Auto,
         datasets: DatasetsConfig {
@@ -248,6 +249,7 @@ pub(crate) fn non_evm_chain_config(kind: &str) -> ChainConfig {
         kind: kind.to_owned(),
         chain_id: 0,
         rpc_urls: vec!["http://example.invalid".to_owned()],
+        warmup: Default::default(),
         trongrid: Default::default(),
         finality: datalens_edge::config::FinalityConfig::Auto,
         datasets: DatasetsConfig {

@@ -145,7 +145,12 @@ fn build_evm_service_with_storage(
             max_fetches_per_task_loop: config.warmup.max_fetches_per_loop,
         })
         .with_follow_query_lookahead_blocks(config.warmup.follow_query_lookahead_blocks)
-        .with_follow_query_start_offset_blocks(config.warmup.follow_query_start_offset_blocks)
+        .with_follow_query_start_offset_blocks(
+            chain
+                .warmup
+                .follow_query_start_offset_blocks
+                .or(config.warmup.follow_query_start_offset_blocks),
+        )
         .with_usage_ledger(usage_ledger)
         .with_query_watermarks(query_watermarks);
         if let Some(recorder) = service.metrics_recorder() {

@@ -248,6 +248,16 @@ fn validate_warmup_config(config: &DatalensConfig) -> Result<(), DatalensError> 
             "warmup.max_fetches_per_loop must be greater than zero",
         ));
     }
+    if config
+        .warmup
+        .follow_query_start_offset_blocks
+        .is_some_and(|offset| offset == 0)
+    {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "warmup.follow_query_start_offset_blocks must be greater than zero when set",
+        ));
+    }
     Ok(())
 }
 
@@ -342,6 +352,18 @@ fn validate_chain(name: &str, chain: &ChainConfig) -> Result<(), DatalensError> 
         return Err(DatalensError::new(
             DatalensErrorKind::InvalidInput,
             format!("chain {name} logs max_addresses_per_query must be greater than zero"),
+        ));
+    }
+    if chain
+        .warmup
+        .follow_query_start_offset_blocks
+        .is_some_and(|offset| offset == 0)
+    {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            format!(
+                "chain {name} warmup.follow_query_start_offset_blocks must be greater than zero when set"
+            ),
         ));
     }
     if matches!(chain.kind.as_str(), "solana" | "tron") {
