@@ -347,6 +347,39 @@ fn test_chain() -> ChainIdentity {
     ChainIdentity::expect_with_network_id(ChainFamily::Evm, "ethereum", NetworkId::numeric(1))
 }
 
+const ADDRESS_A: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const ADDRESS_B: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const ADDRESS_C: &str = "0xcccccccccccccccccccccccccccccccccccccccc";
+const TOPIC_1: &str = "0x1111111111111111111111111111111111111111111111111111111111111111";
+const TOPIC_2: &str = "0x2222222222222222222222222222222222222222222222222222222222222222";
+const TOPIC_3: &str = "0x3333333333333333333333333333333333333333333333333333333333333333";
+
+fn evm_log_selector(addresses: Vec<&str>, topics: Vec<Option<Vec<&str>>>) -> DatasetSelector {
+    DatasetSelector::try_evm_logs(LogFilter {
+        addresses: addresses.into_iter().map(str::to_owned).collect(),
+        topics: topics
+            .into_iter()
+            .map(|slot| slot.map(|values| values.into_iter().map(str::to_owned).collect()))
+            .collect(),
+    })
+    .expect("valid selector")
+}
+
+fn log_record(block_number: u64, log_index: u64, address: &str, topics: Vec<&str>) -> LogRecord {
+    LogRecord::try_new(
+        block_number,
+        format!("0xblock{block_number}"),
+        format!("0xtx{block_number}{log_index}"),
+        0,
+        log_index,
+        address,
+        topics.into_iter().map(str::to_owned).collect(),
+        "0x".to_owned(),
+        false,
+    )
+    .expect("valid log record")
+}
+
 fn single_block_rows(number: u64) -> DatasetRows {
     DatasetRows::new(
         DatasetKey::evm_blocks(),
@@ -1039,6 +1072,300 @@ fn test_evm_logs_rows_write_parquet_and_read_back() {
 
     let read = storage
         .read_rows(&chain, &DatasetKey::evm_logs(), &selector, range)
+        .expect("read rows");
+    assert_eq!(read, rows);
+}
+
+#[test]
+fn test_broad_evm_log_address_wildcard_topics_coverage_serves_narrow_query() {
+    let storage = LocalStorage::new(temp_storage_root("semantic-address-wildcard-topics"));
+    let chain = test_chain();
+    let stored_selector = evm_log_selector(vec![ADDRESS_A, ADDRESS_B, ADDRESS_C], vec![]);
+    let query_selector = evm_log_selector(vec![ADDRESS_A], vec![Some(vec![TOPIC_1])]);
+    let stored_rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![
+            log_record(10, 0, ADDRESS_A, vec![TOPIC_1]),
+            log_record(10, 1, ADDRESS_B, vec![TOPIC_2]),
+            log_record(11, 0, ADDRESS_C, vec![TOPIC_3]),
+        ]),
+    )
+    .expect("dataset rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &stored_selector,
+            range: LedgerRange::blocks(10, 11).expect("valid range"),
+            rows: &stored_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write broad rows");
+
+    let covered = storage
+        .covered_ranges(
+            &chain,
+            &DatasetKey::evm_logs(),
+            &query_selector,
+            LedgerRange::blocks(10, 11).expect("valid range"),
+        )
+        .expect("covered ranges");
+    assert_eq!(
+        covered,
+        vec![LedgerRange::blocks(10, 11).expect("valid range")]
+    );
+
+    let read = storage
+        .read_rows(
+            &chain,
+            &DatasetKey::evm_logs(),
+            &query_selector,
+            LedgerRange::blocks(10, 11).expect("valid range"),
+        )
+        .expect("read rows");
+    assert_eq!(
+        read,
+        DatasetRows::new(
+            DatasetKey::evm_logs(),
+            QueryRows::EvmLogs(vec![log_record(10, 0, ADDRESS_A, vec![TOPIC_1])])
+        )
+        .expect("dataset rows")
+    );
+}
+
+#[test]
+fn test_broad_evm_log_topic_values_coverage_serves_narrow_query() {
+    let storage = LocalStorage::new(temp_storage_root("semantic-topic-values"));
+    let chain = test_chain();
+    let stored_selector = evm_log_selector(
+        vec![ADDRESS_A, ADDRESS_B, ADDRESS_C],
+        vec![Some(vec![TOPIC_1, TOPIC_2])],
+    );
+    let query_selector = evm_log_selector(vec![ADDRESS_B], vec![Some(vec![TOPIC_2])]);
+    let stored_rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![
+            log_record(10, 0, ADDRESS_A, vec![TOPIC_1]),
+            log_record(10, 1, ADDRESS_B, vec![TOPIC_2]),
+            log_record(10, 2, ADDRESS_C, vec![TOPIC_3]),
+        ]),
+    )
+    .expect("dataset rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &stored_selector,
+            range: LedgerRange::blocks(10, 10).expect("valid range"),
+            rows: &stored_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write broad rows");
+
+    let read = storage
+        .read_rows(
+            &chain,
+            &DatasetKey::evm_logs(),
+            &query_selector,
+            LedgerRange::blocks(10, 10).expect("valid range"),
+        )
+        .expect("read rows");
+    assert_eq!(
+        read,
+        DatasetRows::new(
+            DatasetKey::evm_logs(),
+            QueryRows::EvmLogs(vec![log_record(10, 1, ADDRESS_B, vec![TOPIC_2])])
+        )
+        .expect("dataset rows")
+    );
+}
+
+#[test]
+fn test_broad_evm_log_empty_coverage_satisfies_narrow_query() {
+    let storage = LocalStorage::new(temp_storage_root("semantic-empty-coverage"));
+    let chain = test_chain();
+    let stored_selector = evm_log_selector(vec![ADDRESS_A, ADDRESS_B, ADDRESS_C], vec![]);
+    let query_selector = evm_log_selector(vec![ADDRESS_A], vec![Some(vec![TOPIC_1])]);
+    let rows = DatasetRows::new(DatasetKey::evm_logs(), QueryRows::EvmLogs(Vec::new()))
+        .expect("empty rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &stored_selector,
+            range: LedgerRange::blocks(20, 22).expect("valid range"),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write empty coverage");
+
+    let covered = storage
+        .covered_ranges(
+            &chain,
+            &DatasetKey::evm_logs(),
+            &query_selector,
+            LedgerRange::blocks(19, 23).expect("valid range"),
+        )
+        .expect("covered ranges");
+    assert_eq!(
+        covered,
+        vec![LedgerRange::blocks(20, 22).expect("valid range")]
+    );
+    let read = storage
+        .read_rows(
+            &chain,
+            &DatasetKey::evm_logs(),
+            &query_selector,
+            LedgerRange::blocks(20, 22).expect("valid range"),
+        )
+        .expect("read rows");
+    assert_eq!(read.row_count(), 0);
+}
+
+#[test]
+fn test_narrow_evm_log_address_coverage_does_not_cover_broader_query() {
+    let storage = LocalStorage::new(temp_storage_root("semantic-narrow-address"));
+    let chain = test_chain();
+    let stored_selector = evm_log_selector(vec![ADDRESS_A], vec![]);
+    let query_selector = evm_log_selector(vec![ADDRESS_A, ADDRESS_B], vec![]);
+    let rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![log_record(30, 0, ADDRESS_A, vec![TOPIC_1])]),
+    )
+    .expect("dataset rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &stored_selector,
+            range: LedgerRange::blocks(30, 30).expect("valid range"),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write rows");
+
+    let covered = storage
+        .covered_ranges(
+            &chain,
+            &DatasetKey::evm_logs(),
+            &query_selector,
+            LedgerRange::blocks(30, 30).expect("valid range"),
+        )
+        .expect("covered ranges");
+    assert!(covered.is_empty());
+}
+
+#[test]
+fn test_narrow_evm_log_topic_coverage_does_not_cover_wildcard_query() {
+    let storage = LocalStorage::new(temp_storage_root("semantic-narrow-topic"));
+    let chain = test_chain();
+    let stored_selector = evm_log_selector(vec![ADDRESS_A], vec![Some(vec![TOPIC_1])]);
+    let query_selector = evm_log_selector(vec![ADDRESS_A], vec![]);
+    let rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![log_record(40, 0, ADDRESS_A, vec![TOPIC_1])]),
+    )
+    .expect("dataset rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &stored_selector,
+            range: LedgerRange::blocks(40, 40).expect("valid range"),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write rows");
+
+    let covered = storage
+        .covered_ranges(
+            &chain,
+            &DatasetKey::evm_logs(),
+            &query_selector,
+            LedgerRange::blocks(40, 40).expect("valid range"),
+        )
+        .expect("covered ranges");
+    assert!(covered.is_empty());
+}
+
+#[test]
+fn test_invalid_evm_log_canonical_key_keeps_exact_fingerprint_reads() {
+    let storage = LocalStorage::new(temp_storage_root("semantic-invalid-canonical-exact"));
+    let chain = test_chain();
+    let selector = evm_log_selector(vec![ADDRESS_A], vec![Some(vec![TOPIC_1])]);
+    let rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![log_record(50, 0, ADDRESS_A, vec![TOPIC_1])]),
+    )
+    .expect("dataset rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &selector,
+            range: LedgerRange::blocks(50, 50).expect("valid range"),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write rows");
+    let mut manifest = read_manifest_json(&storage, &chain);
+    manifest["entries"][0]["selector_canonical_key"] =
+        serde_json::Value::String("evm-logs/not-addr=*".to_owned());
+    write_manifest_json(&storage, &chain, manifest);
+
+    let read = storage
+        .read_rows(
+            &chain,
+            &DatasetKey::evm_logs(),
+            &selector,
+            LedgerRange::blocks(50, 50).expect("valid range"),
+        )
+        .expect("read rows");
+    assert_eq!(read, rows);
+}
+
+#[test]
+fn test_exact_evm_log_selector_read_behavior_remains_unchanged() {
+    let storage = LocalStorage::new(temp_storage_root("semantic-exact-unchanged"));
+    let chain = test_chain();
+    let selector = evm_log_selector(vec![ADDRESS_A], vec![Some(vec![TOPIC_1])]);
+    let rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![log_record(60, 0, ADDRESS_A, vec![TOPIC_1])]),
+    )
+    .expect("dataset rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &selector,
+            range: LedgerRange::blocks(60, 60).expect("valid range"),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write rows");
+
+    let read = storage
+        .read_rows(
+            &chain,
+            &DatasetKey::evm_logs(),
+            &selector,
+            LedgerRange::blocks(60, 60).expect("valid range"),
+        )
         .expect("read rows");
     assert_eq!(read, rows);
 }

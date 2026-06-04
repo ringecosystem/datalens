@@ -8,6 +8,7 @@ mod object_store;
 mod parquet_codec;
 mod read_through_cache;
 mod repository;
+mod selector_coverage;
 mod usage_ledger;
 
 pub use repository::*;

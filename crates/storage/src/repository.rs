@@ -9,6 +9,7 @@ use std::{
 };
 
 use crate::read_through_cache;
+use crate::selector_coverage::{entry_covers_selector, filter_evm_log_rows_for_selector};
 
 #[derive(Debug)]
 /// Storage write request for one durable coverage segment. The caller must pass
@@ -210,7 +211,7 @@ where
                 entry.chain == *chain
                     && entry.dataset_key == *dataset_key
                     && entry.range.kind() == range.kind()
-                    && entry.selector_fingerprint == selector_fingerprint
+                    && entry_covers_selector(entry, dataset_key, selector, &selector_fingerprint)
             })
             .filter_map(|entry| intersect(entry.range, range.clone()))
             .collect::<Vec<_>>();
@@ -237,7 +238,7 @@ where
             if entry.chain != *chain
                 || entry.dataset_key != *dataset_key
                 || entry.range.kind() != range.kind()
-                || entry.selector_fingerprint != selector_fingerprint
+                || !entry_covers_selector(&entry, dataset_key, selector, &selector_fingerprint)
             {
                 continue;
             }
@@ -277,6 +278,7 @@ where
                     object_rows
                 };
             object_rows = filter_rows(object_rows, range.clone());
+            object_rows = filter_evm_log_rows_for_selector(object_rows, selector);
             rows.try_append(object_rows.into_rows())?;
         }
         rows.sort();
