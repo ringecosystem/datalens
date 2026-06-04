@@ -347,7 +347,7 @@ where
 
         let selector_fingerprint = selector.fingerprint();
         let selector_canonical_key = selector.canonical_key();
-        let mut manifest = self.manifest_for_chain(chain)?;
+        let manifest = self.manifest_for_chain(chain)?;
         let data_object = if rows.row_count() == 0 {
             None
         } else {
@@ -382,6 +382,35 @@ where
             ) {
                 // Object keys are deterministic for a logical coverage segment;
                 // an existing valid object is reused instead of rewriting bytes.
+                validate_existing_data_object(existing, &data_object)?;
+                if existing.object_size_bytes.is_some()
+                    && existing.checksum.is_some()
+                    && existing.checksum_algorithm.is_some()
+                    && let Some(written_at_unix_seconds) = existing.written_at_unix_seconds
+                    && self.object_store.exists(&data_object.object_key)?
+                {
+                    return Ok(StorageWriteOutcome {
+                        range,
+                        row_count: rows.row_count(),
+                        data_object: Some(StorageDataObject {
+                            written_at_unix_seconds,
+                            ..data_object
+                        }),
+                        recorded_empty_coverage: false,
+                    });
+                }
+            }
+            let latest_manifest = self.manifest_for_chain(chain)?;
+            if let Some(existing) = latest_manifest.find_logical(
+                chain,
+                &dataset_key,
+                &selector_fingerprint,
+                &range,
+                finality_level,
+            ) {
+                // A concurrent writer may have published this logical coverage
+                // after this write started. Reuse it before uploading bytes for
+                // the deterministic object key.
                 validate_existing_data_object(existing, &data_object)?;
                 if existing.object_size_bytes.is_some()
                     && existing.checksum.is_some()
@@ -444,7 +473,6 @@ where
             data_object,
             recorded_empty_coverage: rows.row_count() == 0,
         };
-        manifest.upsert(entry);
         log::info!(
             "storage wrote coverage chain_key={} dataset={} selector_fingerprint={} range_kind={} range={}-{} rows={} finality={} object_key_present={} coverage_kind={}",
             log_context.chain_key,
@@ -458,7 +486,7 @@ where
             log_context.object_key_present,
             log_context.coverage_kind
         );
-        self.write_manifest(chain, &manifest)?;
+        self.write_manifest_entry(chain, entry)?;
         Ok(outcome)
     }
 
@@ -527,6 +555,16 @@ where
                 format!("write manifest {key}: {}", error.message),
             )
         })
+    }
+
+    fn write_manifest_entry(
+        &self,
+        chain: &ChainIdentity,
+        entry: ManifestEntry,
+    ) -> Result<(), DatalensError> {
+        let mut manifest = self.manifest_for_chain(chain)?;
+        manifest.upsert(entry);
+        self.write_manifest(chain, &manifest)
     }
 }
 
