@@ -206,6 +206,10 @@ pub struct WarmupConfig {
     pub follow_query_lookahead_blocks: u64,
     #[serde(default)]
     pub follow_query_start_offset_blocks: Option<u64>,
+    #[serde(default)]
+    pub follow_query_start_offset_tiers_blocks: Option<Vec<u64>>,
+    #[serde(default = "default_warmup_follow_query_catchup_threshold_blocks")]
+    pub follow_query_catchup_threshold_blocks: u64,
     #[serde(default = "default_warmup_flush_on_shutdown")]
     pub flush_on_shutdown: bool,
 }
@@ -221,6 +225,9 @@ impl Default for WarmupConfig {
             max_fetches_per_loop: default_warmup_max_fetches_per_loop(),
             follow_query_lookahead_blocks: default_warmup_follow_query_lookahead_blocks(),
             follow_query_start_offset_blocks: None,
+            follow_query_start_offset_tiers_blocks: None,
+            follow_query_catchup_threshold_blocks:
+                default_warmup_follow_query_catchup_threshold_blocks(),
             flush_on_shutdown: default_warmup_flush_on_shutdown(),
         }
     }
@@ -364,6 +371,10 @@ fn default_warmup_follow_query_lookahead_blocks() -> u64 {
     100
 }
 
+fn default_warmup_follow_query_catchup_threshold_blocks() -> u64 {
+    200
+}
+
 fn default_warmup_flush_on_shutdown() -> bool {
     true
 }
@@ -468,6 +479,10 @@ pub struct ChainConfig {
 pub struct ChainWarmupConfig {
     #[serde(default)]
     pub follow_query_start_offset_blocks: Option<u64>,
+    #[serde(default)]
+    pub follow_query_start_offset_tiers_blocks: Option<Vec<u64>>,
+    #[serde(default)]
+    pub follow_query_catchup_threshold_blocks: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

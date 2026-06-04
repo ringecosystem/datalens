@@ -691,6 +691,8 @@ fn test_config_parses_warmup_follow_query_lookahead() {
         max_fetches_per_loop = 1
         follow_query_lookahead_blocks = 2048
         follow_query_start_offset_blocks = 512
+        follow_query_start_offset_tiers_blocks = [5000, 3000, 1000]
+        follow_query_catchup_threshold_blocks = 250
 
         [chains.ethereum]
         kind = "evm"
@@ -699,6 +701,8 @@ fn test_config_parses_warmup_follow_query_lookahead() {
 
         [chains.ethereum.warmup]
         follow_query_start_offset_blocks = 1000
+        follow_query_start_offset_tiers_blocks = [4000, 2000, 750]
+        follow_query_catchup_threshold_blocks = 300
 
         [chains.ethereum.datasets.blocks]
         enabled = true
@@ -715,6 +719,11 @@ fn test_config_parses_warmup_follow_query_lookahead() {
     assert_eq!(config.warmup.follow_query_lookahead_blocks, 2048);
     assert_eq!(config.warmup.follow_query_start_offset_blocks, Some(512));
     assert_eq!(
+        config.warmup.follow_query_start_offset_tiers_blocks,
+        Some(vec![5000, 3000, 1000])
+    );
+    assert_eq!(config.warmup.follow_query_catchup_threshold_blocks, 250);
+    assert_eq!(
         config
             .chains
             .get("ethereum")
@@ -723,7 +732,143 @@ fn test_config_parses_warmup_follow_query_lookahead() {
             .follow_query_start_offset_blocks,
         Some(1000)
     );
+    assert_eq!(
+        config
+            .chains
+            .get("ethereum")
+            .expect("ethereum chain")
+            .warmup
+            .follow_query_start_offset_tiers_blocks,
+        Some(vec![4000, 2000, 750])
+    );
+    assert_eq!(
+        config
+            .chains
+            .get("ethereum")
+            .expect("ethereum chain")
+            .warmup
+            .follow_query_catchup_threshold_blocks,
+        Some(300)
+    );
     validate_config(&config).expect("warmup follow-query config is valid");
+}
+
+#[test]
+fn test_validate_config_rejects_empty_follow_query_start_offset_tiers() {
+    let config = toml::from_str::<DatalensConfig>(
+        r#"
+        [server]
+        bind = "127.0.0.1:0"
+
+        [storage]
+        backend = "local"
+
+        [storage.local]
+        root = ".tmp/datalens-cli-test"
+
+        [planner]
+        max_query_range_blocks = 100
+        default_chunk_range_blocks = 10
+
+        [writer]
+        target_object_bytes = 1024
+        min_object_rows = 1
+        record_empty_coverage = true
+
+        [warmup]
+        enabled = true
+        registry_path = ".tmp/datalens-warmup"
+        scheduler_interval_ms = 1000
+        max_global_tasks = 1
+        max_per_chain_tasks = 1
+        max_fetches_per_loop = 1
+        follow_query_start_offset_tiers_blocks = []
+
+        [chains.ethereum]
+        kind = "evm"
+        chain_id = 1
+        rpc_urls = ["http://example.invalid"]
+
+        [chains.ethereum.datasets.blocks]
+        enabled = true
+        max_batch_blocks = 10
+
+        [chains.ethereum.datasets.logs]
+        enabled = true
+        max_get_logs_range_blocks = 10
+        max_addresses_per_query = 2
+        "#,
+    )
+    .expect("config parses");
+
+    let error = validate_config(&config).expect_err("empty tiers rejected");
+
+    assert_eq!(error.kind, DatalensErrorKind::InvalidInput);
+    assert!(
+        error
+            .message
+            .contains("warmup.follow_query_start_offset_tiers_blocks")
+    );
+}
+
+#[test]
+fn test_validate_config_rejects_zero_chain_follow_query_start_offset_tier() {
+    let config = toml::from_str::<DatalensConfig>(
+        r#"
+        [server]
+        bind = "127.0.0.1:0"
+
+        [storage]
+        backend = "local"
+
+        [storage.local]
+        root = ".tmp/datalens-cli-test"
+
+        [planner]
+        max_query_range_blocks = 100
+        default_chunk_range_blocks = 10
+
+        [writer]
+        target_object_bytes = 1024
+        min_object_rows = 1
+        record_empty_coverage = true
+
+        [warmup]
+        enabled = true
+        registry_path = ".tmp/datalens-warmup"
+        scheduler_interval_ms = 1000
+        max_global_tasks = 1
+        max_per_chain_tasks = 1
+        max_fetches_per_loop = 1
+
+        [chains.ethereum]
+        kind = "evm"
+        chain_id = 1
+        rpc_urls = ["http://example.invalid"]
+
+        [chains.ethereum.warmup]
+        follow_query_start_offset_tiers_blocks = [1000, 0]
+
+        [chains.ethereum.datasets.blocks]
+        enabled = true
+        max_batch_blocks = 10
+
+        [chains.ethereum.datasets.logs]
+        enabled = true
+        max_get_logs_range_blocks = 10
+        max_addresses_per_query = 2
+        "#,
+    )
+    .expect("config parses");
+
+    let error = validate_config(&config).expect_err("zero chain tier rejected");
+
+    assert_eq!(error.kind, DatalensErrorKind::InvalidInput);
+    assert!(
+        error
+            .message
+            .contains("chain ethereum warmup.follow_query_start_offset_tiers_blocks")
+    );
 }
 
 #[test]

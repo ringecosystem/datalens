@@ -88,6 +88,8 @@ pub struct WarmupRuntime<A, S, R> {
     runtime_config: WarmupRuntimeConfig,
     follow_query_lookahead_blocks: u64,
     follow_query_start_offset_blocks: Option<u64>,
+    follow_query_start_offset_tiers_blocks: Option<Vec<u64>>,
+    follow_query_catchup_threshold_blocks: u64,
     metrics: Option<MetricsRecorder>,
     usage_ledger: Option<Arc<dyn UsageLedgerRepository>>,
     query_watermarks: Option<Arc<dyn QueryWatermarkRepository>>,
@@ -195,6 +197,8 @@ where
             runtime_config: WarmupRuntimeConfig::default(),
             follow_query_lookahead_blocks: 100,
             follow_query_start_offset_blocks: None,
+            follow_query_start_offset_tiers_blocks: None,
+            follow_query_catchup_threshold_blocks: 200,
             metrics: None,
             usage_ledger: None,
             query_watermarks: None,
@@ -221,6 +225,22 @@ where
         start_offset_blocks: Option<u64>,
     ) -> Self {
         self.follow_query_start_offset_blocks = start_offset_blocks;
+        self
+    }
+
+    pub fn with_follow_query_start_offset_tiers_blocks(
+        mut self,
+        start_offset_tiers_blocks: Option<Vec<u64>>,
+    ) -> Self {
+        self.follow_query_start_offset_tiers_blocks = start_offset_tiers_blocks;
+        self
+    }
+
+    pub fn with_follow_query_catchup_threshold_blocks(
+        mut self,
+        catchup_threshold_blocks: u64,
+    ) -> Self {
+        self.follow_query_catchup_threshold_blocks = catchup_threshold_blocks;
         self
     }
 
@@ -289,6 +309,8 @@ where
             safe_head: safe_height.value,
             lookahead_blocks: self.follow_query_lookahead_blocks,
             start_offset_blocks: self.follow_query_start_offset_blocks,
+            start_offset_tiers_blocks: self.follow_query_start_offset_tiers_blocks.clone(),
+            catchup_threshold_blocks: self.follow_query_catchup_threshold_blocks,
         });
         log_target_plan(
             &task,
