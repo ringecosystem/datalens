@@ -18,7 +18,7 @@ use datalens_metrics::{ApplicationIdentity, MetricsRecorder};
 use datalens_planner::{FieldSelection, NativePlannerConfig, NativeQueryInput};
 use datalens_solana::{SolanaAdapter, solana_all_selector};
 use datalens_storage::{
-    LocalObjectStore, LocalStorage, QueryWatermarkKey, QueryWatermarkRepository,
+    LocalObjectStore, LocalStorage, QueryWatermark, QueryWatermarkKey, QueryWatermarkRepository,
     QueryWatermarkStore,
 };
 use datalens_tron::{TronAdapter, tron_all_selector};
@@ -527,9 +527,9 @@ fn test_query_watermark_does_not_directly_update_warmup_cursor() {
     let result = runtime.run_task_once(&task_id).expect("warmup run");
 
     assert_eq!(result.status, WarmupRunStatus::Partial);
-    assert_eq!(adapter.fetches(), vec![blocks(1, 2)]);
+    assert_eq!(adapter.fetches(), vec![blocks(11, 12)]);
     let cursor = registry.load_cursor(&task_id).unwrap().expect("cursor");
-    assert_eq!(cursor.next, 3);
+    assert_eq!(cursor.next, 13);
 }
 
 #[test]
@@ -539,7 +539,7 @@ fn test_repeated_query_progress_moves_follow_query_target_forward() {
     let watermarks = QueryWatermarkStore::new(LocalObjectStore::new(&root));
     let registry =
         LocalWarmupRegistry::new(object_store("follow-query-repeated-progress-registry"));
-    let adapter = FixtureAdapter::new(12)
+    let adapter = FixtureAdapter::new(5)
         .with_max_range_len(100)
         .with_logs(vec![log_record(2, 0), log_record(5, 0)]);
     let runtime = runtime(adapter.clone(), storage.clone(), registry.clone())
@@ -567,8 +567,8 @@ fn test_repeated_query_progress_moves_follow_query_target_forward() {
 
     execute_log_query(&executor, blocks(1, 3));
     let first = runtime.run_task_once(&task_id).expect("first warmup");
-    assert_eq!(first.status, WarmupRunStatus::Stopped);
-    assert_eq!(registry.load_cursor(&task_id).unwrap().unwrap().next, 4);
+    assert_eq!(first.status, WarmupRunStatus::Partial);
+    assert_eq!(registry.load_cursor(&task_id).unwrap().unwrap().next, 6);
 
     execute_log_query(&executor, blocks(4, 5));
     let second = runtime.run_task_once(&task_id).expect("second warmup");
@@ -590,6 +590,97 @@ fn test_repeated_query_progress_moves_follow_query_target_forward() {
             .latest_block,
         5
     );
+}
+
+#[test]
+fn test_follow_query_realigns_old_cursor_to_adaptive_lookahead_frontier() {
+    let root = temp_root("follow-query-realigns-old-cursor");
+    let storage = LocalStorage::new(&root);
+    let watermarks = QueryWatermarkStore::new(LocalObjectStore::new(&root));
+    let registry = LocalWarmupRegistry::new(object_store("follow-query-realigns-old-cursor"));
+    let adapter = FixtureAdapter::new(110_000)
+        .with_max_range_len(1)
+        .with_logs(vec![log_record(105_000, 0)]);
+    let runtime = runtime(adapter.clone(), storage.clone(), registry.clone())
+        .with_query_watermarks(watermarks.clone())
+        .with_follow_query_lookahead_blocks(3)
+        .with_runtime_config(WarmupRuntimeConfig {
+            max_fetches_per_task_loop: 1,
+        });
+    let task_id = registry
+        .submit(follow_query_request())
+        .expect("submit follow query")
+        .task_id;
+    save_query_watermark(&watermarks, 100_000);
+
+    let result = runtime.run_task_once(&task_id).expect("warmup run");
+
+    assert_eq!(result.status, WarmupRunStatus::Partial);
+    assert_eq!(adapter.fetches(), vec![blocks(105_000, 105_000)]);
+    assert!(
+        storage
+            .covered_ranges(
+                &chain(),
+                &DatasetKey::evm_logs(),
+                &selector(),
+                blocks(100, 104_999)
+            )
+            .unwrap()
+            .is_empty()
+    );
+    let cursor = registry.load_cursor(&task_id).unwrap().expect("cursor");
+    assert_eq!(cursor.next, 105_001);
+}
+
+#[test]
+fn test_follow_query_missing_watermark_noops_without_cursor_change() {
+    let storage = LocalStorage::new(temp_root("follow-query-missing-watermark-storage"));
+    let registry = LocalWarmupRegistry::new(object_store("follow-query-missing-watermark"));
+    let adapter = FixtureAdapter::new(110_000).with_max_range_len(1);
+    let runtime = runtime(adapter.clone(), storage, registry.clone());
+    let task_id = registry
+        .submit(follow_query_request())
+        .expect("submit follow query")
+        .task_id;
+    let cursor_before = registry.load_cursor(&task_id).unwrap();
+
+    let result = runtime.run_task_once(&task_id).expect("warmup run");
+
+    assert_eq!(result.status, WarmupRunStatus::Stopped);
+    assert!(adapter.fetches().is_empty());
+    assert_eq!(registry.load_cursor(&task_id).unwrap(), cursor_before);
+}
+
+#[test]
+fn test_follow_query_skips_existing_coverage_inside_lookahead_range() {
+    let root = temp_root("follow-query-skips-existing-lookahead-coverage");
+    let storage = LocalStorage::new(&root);
+    let watermarks = QueryWatermarkStore::new(LocalObjectStore::new(&root));
+    let registry = LocalWarmupRegistry::new(object_store(
+        "follow-query-skips-existing-lookahead-coverage",
+    ));
+    let adapter = FixtureAdapter::new(106_000)
+        .with_max_range_len(1)
+        .with_logs(vec![log_record(105_001, 0)]);
+    let runtime = runtime(adapter.clone(), storage.clone(), registry.clone())
+        .with_query_watermarks(watermarks.clone())
+        .with_follow_query_lookahead_blocks(3)
+        .with_runtime_config(WarmupRuntimeConfig {
+            max_fetches_per_task_loop: 1,
+        });
+    let task_id = registry
+        .submit(follow_query_request())
+        .expect("submit follow query")
+        .task_id;
+    save_query_watermark(&watermarks, 100_000);
+    seed_coverage(&storage, blocks(105_000, 105_000));
+
+    let result = runtime.run_task_once(&task_id).expect("warmup run");
+
+    assert_eq!(result.status, WarmupRunStatus::Partial);
+    assert_eq!(adapter.fetches(), vec![blocks(105_001, 105_001)]);
+    let cursor = registry.load_cursor(&task_id).unwrap().expect("cursor");
+    assert_eq!(cursor.next, 105_002);
 }
 
 #[test]
@@ -765,6 +856,25 @@ where
             Some(ApplicationIdentity::named("app-a")),
         )
         .expect("query succeeds");
+}
+
+fn save_query_watermark<S>(watermarks: &QueryWatermarkStore<S>, latest_block: u64)
+where
+    S: datalens_storage::ObjectStore + 'static,
+{
+    watermarks
+        .update(&QueryWatermark {
+            key: QueryWatermarkKey::new(
+                "app-a",
+                chain(),
+                DatasetKey::evm_logs(),
+                &selector(),
+                LedgerRangeKind::Block,
+            ),
+            latest_block,
+            updated_at_unix_seconds: 1,
+        })
+        .expect("save query watermark");
 }
 
 fn object_store(name: &str) -> LocalObjectStore {

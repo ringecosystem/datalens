@@ -690,6 +690,72 @@ fn test_config_parses_warmup_follow_query_lookahead() {
         max_per_chain_tasks = 1
         max_fetches_per_loop = 1
         follow_query_lookahead_blocks = 2048
+        follow_query_start_offset_blocks = 512
+
+        [chains.ethereum]
+        kind = "evm"
+        chain_id = 1
+        rpc_urls = ["http://example.invalid"]
+
+        [chains.ethereum.warmup]
+        follow_query_start_offset_blocks = 1000
+
+        [chains.ethereum.datasets.blocks]
+        enabled = true
+        max_batch_blocks = 10
+
+        [chains.ethereum.datasets.logs]
+        enabled = true
+        max_get_logs_range_blocks = 10
+        max_addresses_per_query = 2
+        "#,
+    )
+    .expect("config parses");
+
+    assert_eq!(config.warmup.follow_query_lookahead_blocks, 2048);
+    assert_eq!(config.warmup.follow_query_start_offset_blocks, Some(512));
+    assert_eq!(
+        config
+            .chains
+            .get("ethereum")
+            .expect("ethereum chain")
+            .warmup
+            .follow_query_start_offset_blocks,
+        Some(1000)
+    );
+    validate_config(&config).expect("warmup follow-query config is valid");
+}
+
+#[test]
+fn test_validate_config_rejects_zero_follow_query_start_offset() {
+    let config = toml::from_str::<DatalensConfig>(
+        r#"
+        [server]
+        bind = "127.0.0.1:0"
+
+        [storage]
+        backend = "local"
+
+        [storage.local]
+        root = ".tmp/datalens-cli-test"
+
+        [planner]
+        max_query_range_blocks = 100
+        default_chunk_range_blocks = 10
+
+        [writer]
+        target_object_bytes = 1024
+        min_object_rows = 1
+        record_empty_coverage = true
+
+        [warmup]
+        enabled = true
+        registry_path = ".tmp/datalens-warmup"
+        scheduler_interval_ms = 1000
+        max_global_tasks = 1
+        max_per_chain_tasks = 1
+        max_fetches_per_loop = 1
+        follow_query_start_offset_blocks = 0
 
         [chains.ethereum]
         kind = "evm"
@@ -708,12 +774,78 @@ fn test_config_parses_warmup_follow_query_lookahead() {
     )
     .expect("config parses");
 
-    assert_eq!(config.warmup.follow_query_lookahead_blocks, 2048);
-    validate_config(&config).expect("warmup follow-query config is valid");
+    let error = validate_config(&config).expect_err("zero start offset rejected");
+
+    assert_eq!(error.kind, DatalensErrorKind::InvalidInput);
+    assert!(
+        error
+            .message
+            .contains("warmup.follow_query_start_offset_blocks")
+    );
 }
 
 #[test]
-fn test_validate_config_rejects_zero_warmup_follow_query_lookahead() {
+fn test_validate_config_rejects_zero_chain_follow_query_start_offset() {
+    let config = toml::from_str::<DatalensConfig>(
+        r#"
+        [server]
+        bind = "127.0.0.1:0"
+
+        [storage]
+        backend = "local"
+
+        [storage.local]
+        root = ".tmp/datalens-cli-test"
+
+        [planner]
+        max_query_range_blocks = 100
+        default_chunk_range_blocks = 10
+
+        [writer]
+        target_object_bytes = 1024
+        min_object_rows = 1
+        record_empty_coverage = true
+
+        [warmup]
+        enabled = true
+        registry_path = ".tmp/datalens-warmup"
+        scheduler_interval_ms = 1000
+        max_global_tasks = 1
+        max_per_chain_tasks = 1
+        max_fetches_per_loop = 1
+
+        [chains.ethereum]
+        kind = "evm"
+        chain_id = 1
+        rpc_urls = ["http://example.invalid"]
+
+        [chains.ethereum.warmup]
+        follow_query_start_offset_blocks = 0
+
+        [chains.ethereum.datasets.blocks]
+        enabled = true
+        max_batch_blocks = 10
+
+        [chains.ethereum.datasets.logs]
+        enabled = true
+        max_get_logs_range_blocks = 10
+        max_addresses_per_query = 2
+        "#,
+    )
+    .expect("config parses");
+
+    let error = validate_config(&config).expect_err("zero chain start offset rejected");
+
+    assert_eq!(error.kind, DatalensErrorKind::InvalidInput);
+    assert!(
+        error
+            .message
+            .contains("chain ethereum warmup.follow_query_start_offset_blocks")
+    );
+}
+
+#[test]
+fn test_validate_config_allows_zero_warmup_follow_query_lookahead() {
     let config = toml::from_str::<DatalensConfig>(
         r#"
         [server]
@@ -760,14 +892,7 @@ fn test_validate_config_rejects_zero_warmup_follow_query_lookahead() {
     )
     .expect("config parses");
 
-    let error = validate_config(&config).expect_err("zero lookahead rejected");
-
-    assert_eq!(error.kind, DatalensErrorKind::InvalidInput);
-    assert!(
-        error
-            .message
-            .contains("warmup.follow_query_lookahead_blocks")
-    );
+    validate_config(&config).expect("zero lookahead means warm to safe head");
 }
 
 #[test]
@@ -1479,6 +1604,7 @@ fn test_doctor_chain_summary_rejects_unknown_auto_finality_without_profile() {
         kind: "evm".to_owned(),
         chain_id: 999999,
         rpc_urls: vec![url],
+        warmup: Default::default(),
         trongrid: Default::default(),
         finality: FinalityConfig::Auto,
         datasets: datalens_edge::config::DatasetsConfig {

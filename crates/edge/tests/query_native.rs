@@ -26,6 +26,7 @@ fn test_query_native_executes_non_evm_plan_without_evm_route_validation() {
             kind: "tron".to_owned(),
             chain_id: 1,
             rpc_urls: vec!["http://example.invalid".to_owned()],
+            warmup: Default::default(),
             trongrid: Default::default(),
             finality: datalens_edge::config::FinalityConfig::Auto,
             datasets: DatasetsConfig {
@@ -104,6 +105,7 @@ fn test_query_native_reuses_durable_non_evm_rows_before_shutdown_flush() {
                 kind: "tron".to_owned(),
                 chain_id: 1,
                 rpc_urls: vec!["http://example.invalid".to_owned()],
+                warmup: Default::default(),
                 trongrid: Default::default(),
                 finality: datalens_edge::config::FinalityConfig::Auto,
                 datasets: DatasetsConfig {
