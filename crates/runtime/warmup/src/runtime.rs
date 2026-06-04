@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     WarmupCheckpoint, WarmupCursor, WarmupRegistry, WarmupTask, WarmupTaskId, WarmupTaskMode,
-    WarmupTaskState, registry::unix_seconds_now,
+    WarmupTaskState, pending_commit::PendingWarmupCommit, registry::unix_seconds_now,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -258,13 +258,21 @@ where
 
         let writer = DurableWriter::new(self.storage.clone(), self.writer_config.clone());
         let mut result = WarmupRunResult::default();
+        let mut pending_commits = Vec::new();
         let mut next = cursor.next;
 
         while next <= target_end
             && result.fetched_ranges < self.runtime_config.max_fetches_per_task_loop.max(1)
         {
             if self.should_stop(task_id)? {
-                writer.flush_for_shutdown()?;
+                self.flush_pending_commits(
+                    &mut task,
+                    &mut cursor,
+                    &writer,
+                    &mut pending_commits,
+                    &mut result,
+                    safe_height.finality,
+                )?;
                 result.status = WarmupRunStatus::Stopped;
                 return Ok(result);
             }
@@ -338,29 +346,37 @@ where
                     WarmupWriteOutcome::Written
                 },
             );
-            // Commit the cursor only after the durable writer accepts the
-            // segment. If staging is enabled, the final shutdown flush below
-            // makes staged rows visible before the task leaves this run.
-            cursor.mark_committed(chunk.clone(), unix_seconds_now()?);
-            self.registry.save_cursor(&cursor)?;
-            self.append_usage(&task, &chunk, safe_height.finality, rows_fetched)?;
-            self.record_metrics(&task, &chunk, rows_fetched);
-
-            result.fetched_ranges += missing.len() as u64;
-            result.written_ranges += written_ranges;
-            result.empty_ranges += empty_ranges;
-            result.provider_calls += fetched.provider_calls;
-            result.rows_fetched += rows_fetched;
-            result.checkpoints.push(WarmupCheckpoint {
-                task_id: task.task_id.clone(),
-                range_kind: task.range_kind.clone(),
-                committed_range: chunk,
-                rows_written: rows_fetched,
+            let commit = PendingWarmupCommit {
+                range: chunk.clone(),
+                fetched_ranges: missing.len() as u64,
+                written_ranges,
+                empty_ranges,
                 provider_calls: fetched.provider_calls,
-            });
-            next = cursor.next;
+                rows_fetched,
+            };
+            if write_result.staged_ranges.is_empty() {
+                self.commit_visible_range(
+                    &task,
+                    &mut cursor,
+                    commit,
+                    &mut result,
+                    safe_height.finality,
+                )?;
+                next = cursor.next;
+            } else {
+                pending_commits.push(commit);
+                next = chunk.end().saturating_add(1);
+            }
         }
 
+        self.flush_pending_commits(
+            &mut task,
+            &mut cursor,
+            &writer,
+            &mut pending_commits,
+            &mut result,
+            safe_height.finality,
+        )?;
         task.stats.fetched_ranges += result.fetched_ranges;
         task.stats.written_ranges += result.written_ranges;
         task.stats.empty_ranges += result.empty_ranges;
@@ -368,13 +384,11 @@ where
         task.stats.rows_fetched += result.rows_fetched;
         task.touch(unix_seconds_now()?);
         if next <= target_end {
-            writer.flush_for_shutdown()?;
             task.state = WarmupTaskState::Queued;
             result.status = WarmupRunStatus::Partial;
             self.registry.save_task(&task)?;
             return Ok(result);
         }
-        writer.flush_for_shutdown()?;
         self.finish_or_stop(task, result)
     }
 
@@ -447,6 +461,65 @@ where
         task.touch(unix_seconds_now()?);
         self.registry.save_task(&task)?;
         Ok(result)
+    }
+
+    fn flush_pending_commits(
+        &self,
+        task: &mut WarmupTask,
+        cursor: &mut WarmupCursor,
+        writer: &DurableWriter<S>,
+        pending_commits: &mut Vec<PendingWarmupCommit>,
+        result: &mut WarmupRunResult,
+        finality: FinalityLevel,
+    ) -> Result<(), DatalensError> {
+        let flush_result = match writer.flush_for_shutdown() {
+            Ok(flush_result) => flush_result,
+            Err(error) => {
+                self.record_write_metric(task, WarmupWriteOutcome::Error);
+                if let Some(first_pending) = pending_commits.first() {
+                    self.mark_failed(task, cursor, first_pending.range.clone(), &error)?;
+                }
+                return Err(error);
+            }
+        };
+        if pending_commits.is_empty() {
+            return Ok(());
+        }
+        if let Some(last_commit) = pending_commits.last_mut() {
+            last_commit.include_flush_result(&flush_result);
+        }
+        for commit in std::mem::take(pending_commits) {
+            self.commit_visible_range(task, cursor, commit, result, finality)?;
+        }
+        Ok(())
+    }
+
+    fn commit_visible_range(
+        &self,
+        task: &WarmupTask,
+        cursor: &mut WarmupCursor,
+        commit: PendingWarmupCommit,
+        result: &mut WarmupRunResult,
+        finality: FinalityLevel,
+    ) -> Result<(), DatalensError> {
+        cursor.mark_committed(commit.range.clone(), unix_seconds_now()?);
+        self.registry.save_cursor(cursor)?;
+        self.append_usage(task, &commit.range, finality, commit.rows_fetched)?;
+        self.record_metrics(task, &commit.range, commit.rows_fetched);
+
+        result.fetched_ranges += commit.fetched_ranges;
+        result.written_ranges += commit.written_ranges;
+        result.empty_ranges += commit.empty_ranges;
+        result.provider_calls += commit.provider_calls;
+        result.rows_fetched += commit.rows_fetched;
+        result.checkpoints.push(WarmupCheckpoint {
+            task_id: task.task_id.clone(),
+            range_kind: task.range_kind.clone(),
+            committed_range: commit.range,
+            rows_written: commit.rows_fetched,
+            provider_calls: commit.provider_calls,
+        });
+        Ok(())
     }
 
     fn should_stop(&self, task_id: &WarmupTaskId) -> Result<bool, DatalensError> {

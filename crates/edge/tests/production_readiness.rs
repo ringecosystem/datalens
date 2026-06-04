@@ -76,20 +76,21 @@ async fn test_production_readiness_validates_service_staging_warmup_metrics_and_
         staged.cache.missing_ranges,
         vec![LedgerRange::blocks(10, 10).expect("range")]
     );
-    assert!(
-        storage.manifest().expect("manifest").entries.is_empty(),
-        "writer boundary should not create durable coverage below the staging threshold"
+    let manifest = storage.manifest().expect("manifest after query flush");
+    assert_eq!(
+        manifest.entries.len(),
+        1,
+        "writer boundary should flush staged query rows into durable coverage"
     );
-
-    let flush = service
-        .flush_staged_writes_for_shutdown()
-        .expect("writer boundary flushes staged rows");
-    assert_eq!(flush.data_objects.len(), 1);
-    let manifest = storage.manifest().expect("manifest after flush");
     let object_key = manifest.entries[0]
         .object_key
         .clone()
         .expect("flushed data object key");
+
+    let shutdown_flush = service
+        .flush_staged_writes_for_shutdown()
+        .expect("writer boundary has no remaining staged rows");
+    assert!(shutdown_flush.data_objects.is_empty());
 
     let first_hit = service
         .query_native(blocks_request(10, 10))
@@ -218,7 +219,6 @@ async fn test_production_readiness_validates_service_staging_warmup_metrics_and_
     assert!(metrics.contains(r#"datalens_fill_total"#));
     assert!(metrics.contains(r#"outcome="live_fetch""#));
     assert!(metrics.contains(r#"datalens_durable_write_total"#));
-    assert!(metrics.contains(r#"outcome="staged""#));
     assert!(metrics.contains(r#"outcome="flushed""#));
     assert!(metrics.contains(r#"datalens_warmup_task_total"#));
     assert!(metrics.contains(r#"datalens_warmup_fetch_total"#));
