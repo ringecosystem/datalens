@@ -777,6 +777,61 @@ fn test_write_rows_returns_data_object_metadata() {
 }
 
 #[test]
+fn test_write_rows_outcome_uses_current_range_when_manifest_tail_sorts_elsewhere() {
+    let storage = LocalStorage::new(temp_storage_root("write-outcome-sorted-tail"));
+    let chain = test_chain();
+    let unrelated_range = LedgerRange::blocks(3998752, 4000000).expect("valid range");
+    let unrelated_selector = evm_log_selector(vec![ADDRESS_A], vec![None]);
+    let unrelated_rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![log_record(3998752, 0, ADDRESS_A, Vec::new())]),
+    )
+    .expect("dataset rows");
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &unrelated_selector,
+            range: unrelated_range.clone(),
+            rows: &unrelated_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write unrelated rows");
+
+    let current_range = LedgerRange::blocks(5000000, 5000128).expect("valid range");
+    let current_selector = DatasetSelector::all();
+    let current_rows = DatasetRows::new(DatasetKey::evm_logs(), QueryRows::EvmLogs(Vec::new()))
+        .expect("dataset rows");
+    let outcome = storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &current_selector,
+            range: current_range.clone(),
+            rows: &current_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write current empty coverage");
+
+    let manifest = storage.manifest().expect("manifest");
+    let sorted_last = manifest.entries.last().expect("manifest entry");
+    assert_eq!(sorted_last.range, unrelated_range);
+    assert_eq!(outcome.range, current_range);
+    assert_eq!(outcome.row_count, 0);
+    assert!(outcome.recorded_empty_coverage);
+    assert_ne!(sorted_last.range, outcome.range);
+    assert!(manifest.entries.iter().any(|entry| {
+        entry.dataset_key == DatasetKey::evm_logs()
+            && entry.selector_fingerprint == current_selector.fingerprint()
+            && entry.range == outcome.range
+            && entry.row_count == 0
+            && entry.object_key.is_none()
+    }));
+}
+
+#[test]
 fn test_evm_blocks_rows_write_parquet_and_read_back() {
     let storage = LocalStorage::new(temp_storage_root("blocks-parquet-roundtrip"));
     let chain = test_chain();

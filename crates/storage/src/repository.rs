@@ -123,6 +123,42 @@ fn object_compression_for_encoding(
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct StorageWriteLogContext {
+    chain_key: String,
+    dataset: String,
+    selector_fingerprint: String,
+    range_kind: String,
+    start: u64,
+    end: u64,
+    row_count: usize,
+    finality: &'static str,
+    object_key_present: bool,
+    coverage_kind: &'static str,
+}
+
+impl StorageWriteLogContext {
+    fn from_entry(entry: &ManifestEntry) -> Self {
+        let object_key_present = entry.object_key.is_some();
+        Self {
+            chain_key: entry.chain.key_prefix(),
+            dataset: entry.dataset_key.as_str().to_owned(),
+            selector_fingerprint: entry.selector_fingerprint.clone(),
+            range_kind: range_kind_key(entry.range.kind()),
+            start: entry.range.start(),
+            end: entry.range.end(),
+            row_count: entry.row_count,
+            finality: entry.finality_level.as_str(),
+            object_key_present,
+            coverage_kind: if object_key_present {
+                "data_object"
+            } else {
+                "empty_coverage"
+            },
+        }
+    }
+}
+
 impl DurableStorage<LocalObjectStore> {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self::new_with_config(root, DurableStorageConfig::default())
@@ -401,6 +437,7 @@ where
                 .as_ref()
                 .map(|data_object| data_object.written_at_unix_seconds),
         };
+        let log_context = StorageWriteLogContext::from_entry(&entry);
         let outcome = StorageWriteOutcome {
             range: entry.range.clone(),
             row_count: rows.row_count(),
@@ -409,16 +446,17 @@ where
         };
         manifest.upsert(entry);
         log::info!(
-            "storage wrote coverage dataset={} range={}-{} rows={}",
-            dataset_key.as_str(),
-            manifest
-                .entries
-                .last()
-                .expect("manifest entry")
-                .range
-                .start(),
-            manifest.entries.last().expect("manifest entry").range.end(),
-            rows.row_count()
+            "storage wrote coverage chain_key={} dataset={} selector_fingerprint={} range_kind={} range={}-{} rows={} finality={} object_key_present={} coverage_kind={}",
+            log_context.chain_key,
+            log_context.dataset,
+            log_context.selector_fingerprint,
+            log_context.range_kind,
+            log_context.start,
+            log_context.end,
+            log_context.row_count,
+            log_context.finality,
+            log_context.object_key_present,
+            log_context.coverage_kind
         );
         self.write_manifest(chain, &manifest)?;
         Ok(outcome)
