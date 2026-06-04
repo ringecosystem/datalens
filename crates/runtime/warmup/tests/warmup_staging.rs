@@ -23,7 +23,10 @@ use datalens_warmup::{
     LocalWarmupRegistry, WarmupChunkPolicy, WarmupRetryPolicy, WarmupRunStatus, WarmupRuntime,
     WarmupSubmitRequest, WarmupTaskMode, WarmupTaskState,
 };
-use datalens_writer::{DurableWriterConfig, WriteStagingConfig};
+use datalens_writer::{
+    DurableWriteRequest, DurableWriteSegment, DurableWriter, DurableWriterConfig,
+    WriteStagingConfig,
+};
 
 #[test]
 fn test_staged_warmup_shutdown_flush_counts_written_ranges() {
@@ -76,6 +79,124 @@ fn test_staged_warmup_shutdown_flush_failure_does_not_advance_cursor() {
     assert_eq!(cursor.current_attempt, 1);
     let task = registry.get(&task_id).unwrap().expect("task");
     assert_eq!(task.state, WarmupTaskState::Failed);
+}
+
+#[test]
+fn test_warmup_skips_provider_for_shared_staged_coverage_without_advancing_cursor() {
+    let storage = LocalStorage::new(temp_root("shared-staged-storage"));
+    let registry = LocalWarmupRegistry::new(object_store("shared-staged-registry"));
+    let adapter = FixtureAdapter::new(1).with_logs(vec![log_record(1, 0)]);
+    let writer = DurableWriter::new(storage.clone(), staging_config());
+    writer
+        .write(DurableWriteRequest {
+            chain: chain(),
+            dataset_key: DatasetKey::evm_logs(),
+            selector: selector(),
+            finality_level: FinalityLevel::Safe,
+            segments: vec![DurableWriteSegment {
+                range: blocks(1, 1),
+                rows: log_rows(vec![log_record(1, 0)]),
+            }],
+        })
+        .expect("stage query write");
+    let runtime = WarmupRuntime::new(
+        adapter.clone(),
+        storage.clone(),
+        registry.clone(),
+        staging_config(),
+    )
+    .with_durable_writer(writer);
+    let task_id = registry.submit(submit_request(Some(1))).unwrap().task_id;
+
+    let result = runtime.run_task_once(&task_id).expect("warmup run");
+
+    assert!(adapter.fetches().is_empty());
+    assert_eq!(result.status, WarmupRunStatus::Partial);
+    assert!(
+        storage
+            .covered_ranges(&chain(), &DatasetKey::evm_logs(), &selector(), blocks(1, 1))
+            .unwrap()
+            .is_empty()
+    );
+    let cursor = registry.load_cursor(&task_id).unwrap().expect("cursor");
+    assert_eq!(cursor.next, 1);
+    assert_eq!(cursor.last_committed, None);
+    let task = registry.get(&task_id).unwrap().expect("task");
+    assert_eq!(task.state, WarmupTaskState::Queued);
+}
+
+#[test]
+fn test_warmup_fetches_ranges_not_durable_or_staged() {
+    let storage = LocalStorage::new(temp_root("shared-staged-gap-storage"));
+    let registry = LocalWarmupRegistry::new(object_store("shared-staged-gap-registry"));
+    let adapter = FixtureAdapter::new(2).with_logs(vec![log_record(1, 0), log_record(2, 0)]);
+    let writer = DurableWriter::new(storage.clone(), staging_config());
+    writer
+        .write(DurableWriteRequest {
+            chain: chain(),
+            dataset_key: DatasetKey::evm_logs(),
+            selector: selector(),
+            finality_level: FinalityLevel::Safe,
+            segments: vec![DurableWriteSegment {
+                range: blocks(1, 1),
+                rows: log_rows(vec![log_record(1, 0)]),
+            }],
+        })
+        .expect("stage query write");
+    let runtime = WarmupRuntime::new(
+        adapter.clone(),
+        storage.clone(),
+        registry.clone(),
+        staging_config(),
+    )
+    .with_durable_writer(writer);
+    let mut request = submit_request(Some(2));
+    request.chunk_policy.max_range_len = 1;
+    let task_id = registry.submit(request).unwrap().task_id;
+
+    let result = runtime.run_task_once(&task_id).expect("warmup run");
+
+    assert_eq!(adapter.fetches(), vec![blocks(2, 2)]);
+    assert_eq!(result.status, WarmupRunStatus::Partial);
+    let cursor = registry.load_cursor(&task_id).unwrap().expect("cursor");
+    assert_eq!(cursor.next, 1);
+    assert!(
+        storage
+            .covered_ranges(&chain(), &DatasetKey::evm_logs(), &selector(), blocks(1, 2))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn test_warmup_commits_shared_staged_coverage_after_durable_visibility() {
+    let storage = LocalStorage::new(temp_root("shared-staged-flushed-storage"));
+    let registry = LocalWarmupRegistry::new(object_store("shared-staged-flushed-registry"));
+    let adapter = FixtureAdapter::new(1).with_logs(vec![log_record(1, 0)]);
+    let writer = DurableWriter::new(storage.clone(), staging_config());
+    writer
+        .write(DurableWriteRequest {
+            chain: chain(),
+            dataset_key: DatasetKey::evm_logs(),
+            selector: selector(),
+            finality_level: FinalityLevel::Safe,
+            segments: vec![DurableWriteSegment {
+                range: blocks(1, 1),
+                rows: log_rows(vec![log_record(1, 0)]),
+            }],
+        })
+        .expect("stage query write");
+    writer.flush().expect("flush staged query write");
+    let runtime = WarmupRuntime::new(adapter.clone(), storage, registry.clone(), staging_config())
+        .with_durable_writer(writer);
+    let task_id = registry.submit(submit_request(Some(1))).unwrap().task_id;
+
+    let result = runtime.run_task_once(&task_id).expect("warmup run");
+
+    assert!(adapter.fetches().is_empty());
+    assert_eq!(result.status, WarmupRunStatus::Completed);
+    let cursor = registry.load_cursor(&task_id).unwrap().expect("cursor");
+    assert_eq!(cursor.next, 2);
 }
 
 fn staging_config() -> DurableWriterConfig {
@@ -156,6 +277,10 @@ fn log_record(block_number: u64, log_index: u64) -> LogRecord {
     }
 }
 
+fn log_rows(logs: Vec<LogRecord>) -> DatasetRows {
+    DatasetRows::new(DatasetKey::evm_logs(), QueryRows::EvmLogs(logs)).unwrap()
+}
+
 #[derive(Clone)]
 struct FixtureAdapter {
     inner: Arc<Mutex<FixtureState>>,
@@ -165,6 +290,7 @@ struct FixtureAdapter {
 struct FixtureState {
     safe_height: u64,
     logs: Vec<LogRecord>,
+    fetches: Vec<LedgerRange>,
 }
 
 impl FixtureAdapter {
@@ -180,6 +306,10 @@ impl FixtureAdapter {
     fn with_logs(self, logs: Vec<LogRecord>) -> Self {
         self.inner.lock().unwrap().logs = logs;
         self
+    }
+
+    fn fetches(&self) -> Vec<LedgerRange> {
+        self.inner.lock().unwrap().fetches.clone()
     }
 }
 
@@ -205,10 +335,9 @@ impl ChainAdapter for FixtureAdapter {
     }
 
     fn fetch(&self, request: ChainFetchRequest) -> Result<ChainFetchResponse, DatalensError> {
-        let logs = self
-            .inner
-            .lock()
-            .unwrap()
+        let mut state = self.inner.lock().unwrap();
+        state.fetches.push(request.range.clone());
+        let logs = state
             .logs
             .iter()
             .filter(|log| request.range.start() <= log.block_number)

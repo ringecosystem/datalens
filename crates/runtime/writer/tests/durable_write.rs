@@ -422,6 +422,18 @@ fn test_writer_exposes_staged_rows_for_matching_coverage_identity_only() {
             }],
         })
         .expect("stage write");
+    writer
+        .write(DurableWriteRequest {
+            chain: chain.clone(),
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: DatasetSelector::all(),
+            finality_level: FinalityLevel::Latest,
+            segments: vec![DurableWriteSegment {
+                range: LedgerRange::blocks(2, 2).expect("valid range"),
+                rows: block_rows(vec![block(2)]),
+            }],
+        })
+        .expect("stage latest write");
 
     assert_eq!(
         writer
@@ -429,7 +441,7 @@ fn test_writer_exposes_staged_rows_for_matching_coverage_identity_only() {
                 &chain,
                 &DatasetKey::evm_blocks(),
                 &DatasetSelector::all(),
-                range.clone()
+                LedgerRange::blocks(1, 2).expect("valid range")
             )
             .expect("staged coverage"),
         vec![range.clone()]
@@ -455,6 +467,17 @@ fn test_writer_exposes_staged_rows_for_matching_coverage_identity_only() {
         .expect("read staged rows")
         .expect("matching staged rows");
     assert_eq!(staged.row_count(), 1);
+    assert!(
+        writer
+            .read_staged_rows(
+                &chain,
+                &DatasetKey::evm_blocks(),
+                &DatasetSelector::all(),
+                LedgerRange::blocks(2, 2).expect("valid range"),
+            )
+            .expect("read latest staged rows")
+            .is_none()
+    );
     assert!(storage.manifest().expect("manifest").entries.is_empty());
 }
 

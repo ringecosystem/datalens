@@ -152,6 +152,10 @@ where
         self.writer.flush_for_shutdown()
     }
 
+    pub fn durable_writer(&self) -> DurableWriter<R> {
+        self.writer.clone()
+    }
+
     pub fn execute_with_application(
         &self,
         input: NativeQueryInput,
