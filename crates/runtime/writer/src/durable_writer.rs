@@ -177,7 +177,7 @@ where
             write.chain == *chain
                 && write.dataset_key == *dataset_key
                 && write.selector == *selector
-                && ranges.iter().any(|range| write.segment.range == *range)
+                && ranges.contains(&write.segment.range)
         })
     }
 
