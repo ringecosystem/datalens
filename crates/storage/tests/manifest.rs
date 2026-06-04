@@ -1,9 +1,10 @@
 use std::{
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Condvar, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 use arrow::{
@@ -71,6 +72,84 @@ impl ObjectStore for StaleManifestObjectStore {
             if count == 1 {
                 self.inner.put(key, &self.concurrent_manifest_bytes)?;
             }
+        }
+        self.inner.get(key)
+    }
+
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
+        self.inner.put(key, bytes)
+    }
+
+    fn exists(&self, key: &str) -> Result<bool, DatalensError> {
+        self.inner.exists(key)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
+        self.inner.list(prefix)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), DatalensError> {
+        self.inner.delete(key)
+    }
+}
+
+#[derive(Debug)]
+struct ConcurrentManifestState {
+    initial_manifest_reads: Mutex<usize>,
+    initial_manifest_reads_ready: Condvar,
+}
+
+#[derive(Clone, Debug)]
+struct ConcurrentManifestObjectStore {
+    inner: LocalObjectStore,
+    manifest_key: String,
+    manifest_get_count: Arc<AtomicUsize>,
+    state: Arc<ConcurrentManifestState>,
+}
+
+impl ConcurrentManifestObjectStore {
+    fn new(root: PathBuf, manifest_key: String) -> Self {
+        let inner = LocalObjectStore::new(root);
+        inner
+            .put(&manifest_key, br#"{"entries":[]}"#)
+            .expect("put initial manifest");
+        Self {
+            inner,
+            manifest_key,
+            manifest_get_count: Arc::new(AtomicUsize::new(0)),
+            state: Arc::new(ConcurrentManifestState {
+                initial_manifest_reads: Mutex::new(0),
+                initial_manifest_reads_ready: Condvar::new(),
+            }),
+        }
+    }
+}
+
+impl ObjectStore for ConcurrentManifestObjectStore {
+    fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError> {
+        if key == self.manifest_key {
+            let count = self.manifest_get_count.fetch_add(1, Ordering::SeqCst) + 1;
+            if count <= 2 {
+                let mut initial_manifest_reads = self
+                    .state
+                    .initial_manifest_reads
+                    .lock()
+                    .expect("lock reads");
+                *initial_manifest_reads += 1;
+                self.state.initial_manifest_reads_ready.notify_all();
+                while *initial_manifest_reads < 2 {
+                    initial_manifest_reads = self
+                        .state
+                        .initial_manifest_reads_ready
+                        .wait(initial_manifest_reads)
+                        .expect("wait reads");
+                }
+            }
+            let bytes = self.inner.get(key)?;
+            if count == 3 {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            return Ok(bytes);
         }
         self.inner.get(key)
     }
@@ -1869,6 +1948,67 @@ fn test_write_rows_merges_latest_manifest_before_persisting_stale_snapshot() {
     assert!(manifest.entries.iter().any(|entry| {
         entry.dataset_key == DatasetKey::evm_logs()
             && entry.range == concurrent_empty_range
+            && entry.object_key.is_none()
+            && entry.row_count == 0
+    }));
+}
+
+#[test]
+fn test_cloned_storage_serializes_concurrent_manifest_updates() {
+    let root = temp_storage_root("concurrent-manifest-writes");
+    let chain = test_chain();
+    let manifest_key = "chains/evm/ethereum/1/manifest.json".to_owned();
+    let storage =
+        DurableStorage::from_object_store(ConcurrentManifestObjectStore::new(root, manifest_key));
+
+    let first_storage = storage.clone();
+    let first_chain = chain.clone();
+    let first = std::thread::spawn(move || {
+        let rows = DatasetRows::new(DatasetKey::evm_logs(), QueryRows::EvmLogs(Vec::new()))
+            .expect("dataset rows");
+        first_storage
+            .write_rows(StorageWriteRequest {
+                chain: &first_chain,
+                dataset_key: DatasetKey::evm_logs(),
+                selector: &DatasetSelector::all(),
+                range: LedgerRange::blocks(10, 10).expect("valid range"),
+                rows: &rows,
+                finality_level: FinalityLevel::Safe,
+                record_empty_coverage: true,
+            })
+            .expect("write first coverage");
+    });
+
+    let second_storage = storage.clone();
+    let second_chain = chain.clone();
+    let second = std::thread::spawn(move || {
+        let rows = DatasetRows::new(DatasetKey::evm_logs(), QueryRows::EvmLogs(Vec::new()))
+            .expect("dataset rows");
+        second_storage
+            .write_rows(StorageWriteRequest {
+                chain: &second_chain,
+                dataset_key: DatasetKey::evm_logs(),
+                selector: &DatasetSelector::all(),
+                range: LedgerRange::blocks(11, 11).expect("valid range"),
+                rows: &rows,
+                finality_level: FinalityLevel::Safe,
+                record_empty_coverage: true,
+            })
+            .expect("write second coverage");
+    });
+
+    first.join().expect("first writer");
+    second.join().expect("second writer");
+
+    let manifest = storage.manifest().expect("manifest");
+    assert_eq!(manifest.entries.len(), 2);
+    assert!(manifest.entries.iter().any(|entry| {
+        entry.range == LedgerRange::blocks(10, 10).expect("valid range")
+            && entry.object_key.is_none()
+            && entry.row_count == 0
+    }));
+    assert!(manifest.entries.iter().any(|entry| {
+        entry.range == LedgerRange::blocks(11, 11).expect("valid range")
             && entry.object_key.is_none()
             && entry.row_count == 0
     }));

@@ -5,7 +5,7 @@ use datalens_core::{
 use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 use crate::read_through_cache;
@@ -82,6 +82,7 @@ pub use crate::usage_ledger::{
 pub struct DurableStorage<S> {
     object_store: S,
     read_through_cache: read_through_cache::ReadThroughCache,
+    manifest_update_lock: Arc<Mutex<()>>,
     config: DurableStorageConfig,
 }
 
@@ -170,6 +171,7 @@ impl DurableStorage<LocalObjectStore> {
             read_through_cache: read_through_cache::ReadThroughCache::new(
                 ReadThroughCacheConfig::default(),
             ),
+            manifest_update_lock: Arc::new(Mutex::new(())),
             config,
         }
     }
@@ -220,6 +222,7 @@ where
             read_through_cache: read_through_cache::ReadThroughCache::new(
                 read_through_cache_config,
             ),
+            manifest_update_lock: Arc::new(Mutex::new(())),
             config,
         }
     }
@@ -530,6 +533,15 @@ where
         chain: &ChainIdentity,
         manifest: &Manifest,
     ) -> Result<(), DatalensError> {
+        let _guard = self.lock_manifest_updates()?;
+        self.write_manifest_unlocked(chain, manifest)
+    }
+
+    fn write_manifest_unlocked(
+        &self,
+        chain: &ChainIdentity,
+        manifest: &Manifest,
+    ) -> Result<(), DatalensError> {
         // Never publish a manifest that references a missing object; once
         // written, the manifest is what readers and planners trust.
         for entry in &manifest.entries {
@@ -562,9 +574,16 @@ where
         chain: &ChainIdentity,
         entry: ManifestEntry,
     ) -> Result<(), DatalensError> {
+        let _guard = self.lock_manifest_updates()?;
         let mut manifest = self.manifest_for_chain(chain)?;
         manifest.upsert(entry);
-        self.write_manifest(chain, &manifest)
+        self.write_manifest_unlocked(chain, &manifest)
+    }
+
+    fn lock_manifest_updates(&self) -> Result<MutexGuard<'_, ()>, DatalensError> {
+        self.manifest_update_lock
+            .lock()
+            .map_err(|_| DatalensError::internal("manifest update lock poisoned"))
     }
 }
 
