@@ -247,11 +247,11 @@ where
                 ));
             };
             let object_rows =
-                if let Some(rows) = self.read_through_cache.get(object_key, &entry, encoding) {
+                if let Some(rows) = self.read_through_cache.get(object_key, entry, encoding) {
                     rows
                 } else {
                     let bytes = self.object_store.get(object_key)?;
-                    verify_manifest_object_metadata(&entry, object_key, &bytes)?;
+                    verify_manifest_object_metadata(entry, object_key, &bytes)?;
                     let object_rows = decode_object_rows(encoding, dataset_key.clone(), &bytes)
                         .map_err(|error| {
                             DatalensError::new(
@@ -260,7 +260,7 @@ where
                             )
                         })?;
                     self.read_through_cache
-                        .put(object_key, &entry, encoding, object_rows.clone());
+                        .put(object_key, entry, encoding, object_rows.clone());
                     object_rows
                 };
             for candidate_range in candidate.ranges {
