@@ -169,6 +169,51 @@ fn test_warmup_fetches_ranges_not_durable_or_staged() {
 }
 
 #[test]
+fn test_warmup_flushes_own_staged_commit_before_external_staged_gap() {
+    let storage = LocalStorage::new(temp_root("own-staged-before-shared-gap-storage"));
+    let registry = LocalWarmupRegistry::new(object_store("own-staged-before-shared-gap-registry"));
+    let adapter = FixtureAdapter::new(2).with_logs(vec![log_record(1, 0), log_record(2, 0)]);
+    let writer = DurableWriter::new(storage.clone(), staging_config());
+    writer
+        .write(DurableWriteRequest {
+            chain: chain(),
+            dataset_key: DatasetKey::evm_logs(),
+            selector: selector(),
+            finality_level: FinalityLevel::Safe,
+            segments: vec![DurableWriteSegment {
+                range: blocks(2, 2),
+                rows: log_rows(vec![log_record(2, 0)]),
+            }],
+        })
+        .expect("stage query write");
+    let runtime = WarmupRuntime::new(
+        adapter.clone(),
+        storage.clone(),
+        registry.clone(),
+        staging_config(),
+    )
+    .with_durable_writer(writer);
+    let mut request = submit_request(Some(2));
+    request.chunk_policy.max_range_len = 1;
+    let task_id = registry.submit(request).unwrap().task_id;
+
+    let result = runtime.run_task_once(&task_id).expect("warmup run");
+
+    assert_eq!(adapter.fetches(), vec![blocks(1, 1)]);
+    assert_eq!(result.status, WarmupRunStatus::Partial);
+    assert_eq!(
+        storage
+            .covered_ranges(&chain(), &DatasetKey::evm_logs(), &selector(), blocks(1, 2))
+            .unwrap(),
+        vec![blocks(1, 1)]
+    );
+    let cursor = registry.load_cursor(&task_id).unwrap().expect("cursor");
+    assert_eq!(cursor.next, 2);
+    let task = registry.get(&task_id).unwrap().expect("task");
+    assert_eq!(task.state, WarmupTaskState::Queued);
+}
+
+#[test]
 fn test_warmup_commits_shared_staged_coverage_after_durable_visibility() {
     let storage = LocalStorage::new(temp_root("shared-staged-flushed-storage"));
     let registry = LocalWarmupRegistry::new(object_store("shared-staged-flushed-registry"));

@@ -160,6 +160,27 @@ where
         self.flush_with_reason(WriteFlushReason::Shutdown)
     }
 
+    pub fn flush_ranges_for_shutdown(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        ranges: &[LedgerRange],
+    ) -> Result<DurableWriteResult, DatalensError> {
+        if !self.config.staging.enabled || !self.config.staging.flush_on_shutdown {
+            return Ok(DurableWriteResult::default());
+        }
+        if ranges.is_empty() {
+            return Ok(DurableWriteResult::default());
+        }
+        self.flush_matching_with_reason(WriteFlushReason::Shutdown, |write| {
+            write.chain == *chain
+                && write.dataset_key == *dataset_key
+                && write.selector == *selector
+                && ranges.contains(&write.segment.range)
+        })
+    }
+
     pub fn staged_covered_ranges(
         &self,
         chain: &ChainIdentity,
@@ -219,6 +240,46 @@ where
                 .lock()
                 .map_err(|_| DatalensError::internal("durable writer staging lock poisoned"))?;
             std::mem::take(&mut *staged)
+        };
+        if staged.is_empty() {
+            return Ok(DurableWriteResult::default());
+        }
+        match self.flush_staged(staged.clone(), reason) {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                let mut current = self
+                    .staged
+                    .lock()
+                    .map_err(|_| DatalensError::internal("durable writer staging lock poisoned"))?;
+                let mut retained = staged;
+                retained.append(&mut *current);
+                *current = retained;
+                Err(error)
+            }
+        }
+    }
+
+    fn flush_matching_with_reason(
+        &self,
+        reason: WriteFlushReason,
+        mut should_flush: impl FnMut(&StagedWrite) -> bool,
+    ) -> Result<DurableWriteResult, DatalensError> {
+        let staged = {
+            let mut staged = self
+                .staged
+                .lock()
+                .map_err(|_| DatalensError::internal("durable writer staging lock poisoned"))?;
+            let mut selected = Vec::new();
+            let mut retained = Vec::new();
+            for write in std::mem::take(&mut *staged) {
+                if should_flush(&write) {
+                    selected.push(write);
+                } else {
+                    retained.push(write);
+                }
+            }
+            *staged = retained;
+            selected
         };
         if staged.is_empty() {
             return Ok(DurableWriteResult::default());

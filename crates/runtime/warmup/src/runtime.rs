@@ -458,6 +458,18 @@ where
                 &mut result,
                 safe_height.finality,
             )?;
+        } else if pending_commits
+            .first()
+            .is_some_and(|commit| commit.range.start() == cursor.next)
+        {
+            self.flush_committable_pending_commits(
+                &mut task,
+                &mut cursor,
+                &writer,
+                &mut pending_commits,
+                &mut result,
+                safe_height.finality,
+            )?;
         }
         task.stats.fetched_ranges += result.fetched_ranges;
         task.stats.written_ranges += result.written_ranges;
@@ -568,7 +580,20 @@ where
         result: &mut WarmupRunResult,
         finality: FinalityLevel,
     ) -> Result<(), DatalensError> {
-        let flush_result = match writer.flush_for_shutdown() {
+        let pending_ranges = pending_commits
+            .iter()
+            .map(|commit| commit.range.clone())
+            .collect::<Vec<_>>();
+        let flush_result = match if pending_ranges.is_empty() {
+            writer.flush_for_shutdown()
+        } else {
+            writer.flush_ranges_for_shutdown(
+                &task.chain,
+                &task.dataset_key,
+                &task.selector,
+                &pending_ranges,
+            )
+        } {
             Ok(flush_result) => flush_result,
             Err(error) => {
                 self.record_write_metric(task, WarmupWriteOutcome::Error);
@@ -588,6 +613,39 @@ where
             self.commit_visible_range(task, cursor, commit, result, finality)?;
         }
         Ok(())
+    }
+
+    fn flush_committable_pending_commits(
+        &self,
+        task: &mut WarmupTask,
+        cursor: &mut WarmupCursor,
+        writer: &DurableWriter<S>,
+        pending_commits: &mut Vec<PendingWarmupCommit>,
+        result: &mut WarmupRunResult,
+        finality: FinalityLevel,
+    ) -> Result<(), DatalensError> {
+        let mut expected_next = cursor.next;
+        let committable_len = pending_commits
+            .iter()
+            .take_while(|commit| {
+                let committable = commit.range.start() == expected_next;
+                expected_next = commit.range.end().saturating_add(1);
+                committable
+            })
+            .count();
+        if committable_len == 0 {
+            return Ok(());
+        }
+
+        let mut committable = pending_commits.drain(..committable_len).collect::<Vec<_>>();
+        match self.flush_pending_commits(task, cursor, writer, &mut committable, result, finality) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                committable.append(pending_commits);
+                *pending_commits = committable;
+                Err(error)
+            }
+        }
     }
 
     fn commit_visible_range(
