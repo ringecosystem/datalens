@@ -12,7 +12,7 @@ use datalens_warmup::{
     WarmupRegistry, WarmupRunResult, WarmupSubmitOutcome, WarmupSubmitRequest, WarmupTask,
     WarmupTaskFilter, WarmupTaskId, WarmupTaskPool,
 };
-use datalens_writer::{DurableWriteResult, DurableWriterConfig};
+use datalens_writer::{DurableWriteResult, DurableWriter, DurableWriterConfig};
 
 use crate::{
     chain_family,
@@ -163,6 +163,10 @@ where
 
     pub fn metrics_recorder(&self) -> Option<MetricsRecorder> {
         self.metrics.clone()
+    }
+
+    pub fn durable_writer(&self) -> DurableWriter<Arc<dyn StorageRepository>> {
+        self.executor.durable_writer()
     }
 
     pub fn with_usage_ledger(

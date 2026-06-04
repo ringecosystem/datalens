@@ -173,6 +173,7 @@ where
             .map_err(|_| DatalensError::internal("durable writer staging lock poisoned"))?;
         let mut ranges = staged
             .iter()
+            .filter(|write| write.finality_level.is_durable_writable())
             .filter(|write| write.matches_coverage(chain, dataset_key, selector, &range))
             .filter_map(|write| write.segment.range.intersection(&range))
             .collect::<Vec<_>>();
@@ -194,6 +195,7 @@ where
         let mut rows = empty_query_rows(dataset_key.clone());
         for write in staged
             .iter()
+            .filter(|write| write.finality_level.is_durable_writable())
             .filter(|write| write.matches_coverage(chain, dataset_key, selector, &range))
         {
             let filtered = filter_rows(write.segment.rows.clone(), range.clone());

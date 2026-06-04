@@ -79,8 +79,8 @@ pub(crate) fn build_service_registry(
 }
 
 fn build_evm_service_with_storage(
-    storage: impl datalens_storage::StorageRepository + Clone + 'static,
-    usage_ledger: impl UsageLedgerRepository + Clone + 'static,
+    storage: Arc<dyn datalens_storage::StorageRepository>,
+    usage_ledger: Arc<dyn UsageLedgerRepository>,
     config: &DatalensConfig,
     chain_name: &str,
     chain: &ChainConfig,
@@ -120,6 +120,7 @@ fn build_evm_service_with_storage(
             build_warmup_registry(config)?,
             durable_writer_config(&config.writer),
         )
+        .with_durable_writer(service.durable_writer())
         .with_runtime_config(WarmupRuntimeConfig {
             max_fetches_per_task_loop: config.warmup.max_fetches_per_loop,
         })
@@ -139,8 +140,8 @@ fn build_evm_service_with_storage(
 }
 
 fn build_solana_service_with_storage(
-    storage: impl datalens_storage::StorageRepository + Clone + 'static,
-    usage_ledger: impl UsageLedgerRepository + Clone + 'static,
+    storage: Arc<dyn datalens_storage::StorageRepository>,
+    usage_ledger: Arc<dyn UsageLedgerRepository>,
     config: &DatalensConfig,
     chain_name: &str,
     chain: &ChainConfig,
@@ -178,8 +179,8 @@ fn build_solana_service_with_storage(
 }
 
 fn build_tron_service_with_storage(
-    storage: impl datalens_storage::StorageRepository + Clone + 'static,
-    usage_ledger: impl UsageLedgerRepository + Clone + 'static,
+    storage: Arc<dyn datalens_storage::StorageRepository>,
+    usage_ledger: Arc<dyn UsageLedgerRepository>,
     config: &DatalensConfig,
     chain_name: &str,
     chain: &ChainConfig,

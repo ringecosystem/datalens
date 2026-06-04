@@ -81,7 +81,7 @@ pub struct WarmupRuntime<A, S, R> {
     adapter: A,
     storage: S,
     registry: R,
-    writer_config: DurableWriterConfig,
+    writer: DurableWriter<S>,
     runtime_config: WarmupRuntimeConfig,
     metrics: Option<MetricsRecorder>,
     usage_ledger: Option<Arc<dyn UsageLedgerRepository>>,
@@ -180,15 +180,21 @@ where
     R: WarmupRegistry,
 {
     pub fn new(adapter: A, storage: S, registry: R, writer_config: DurableWriterConfig) -> Self {
+        let writer = DurableWriter::new(storage.clone(), writer_config);
         Self {
             adapter,
             storage,
             registry,
-            writer_config,
+            writer,
             runtime_config: WarmupRuntimeConfig::default(),
             metrics: None,
             usage_ledger: None,
         }
+    }
+
+    pub fn with_durable_writer(mut self, writer: DurableWriter<S>) -> Self {
+        self.writer = writer;
+        self
     }
 
     pub fn with_runtime_config(mut self, config: WarmupRuntimeConfig) -> Self {
@@ -256,10 +262,12 @@ where
         self.registry.save_task(&task)?;
         self.record_task_metric(&task, WarmupTaskOutcome::Running);
 
-        let writer = DurableWriter::new(self.storage.clone(), self.writer_config.clone());
+        let writer = self.writer.clone();
         let mut result = WarmupRunResult::default();
         let mut pending_commits = Vec::new();
         let mut next = cursor.next;
+        let mut uncommitted_staged_coverage_seen = false;
+        let mut external_staged_coverage_seen = false;
 
         while next <= target_end
             && result.fetched_ranges < self.runtime_config.max_fetches_per_task_loop.max(1)
@@ -283,27 +291,44 @@ where
                 target_end.min(next.saturating_add(max_chunk_len(&task, &self.adapter)? - 1)),
             )?;
             validate_durable_range(&chunk, &safe_height)?;
-            let covered = self.storage.covered_ranges(
+            let durable_covered = self.storage.covered_ranges(
                 &task.chain,
                 &task.dataset_key,
                 &task.selector,
                 chunk.clone(),
             )?;
+            let durable_missing = missing_ranges(chunk.clone(), &durable_covered);
+            let mut covered = durable_covered.clone();
+            covered.extend(writer.staged_covered_ranges(
+                &task.chain,
+                &task.dataset_key,
+                &task.selector,
+                chunk.clone(),
+            )?);
             let missing = missing_ranges(chunk.clone(), &covered);
             if missing.is_empty() {
-                // Cursor progress follows manifest coverage here: if the chunk
-                // is already covered, advancing the cursor records skipped work
-                // without creating new durable authority.
-                cursor.mark_committed(chunk.clone(), unix_seconds_now()?);
-                self.registry.save_cursor(&cursor)?;
-                next = cursor.next;
-                result.checkpoints.push(WarmupCheckpoint {
-                    task_id: task.task_id.clone(),
-                    range_kind: task.range_kind.clone(),
-                    committed_range: chunk,
-                    rows_written: 0,
-                    provider_calls: 0,
-                });
+                if durable_missing.is_empty()
+                    && !uncommitted_staged_coverage_seen
+                    && chunk.start() == cursor.next
+                {
+                    // Cursor progress follows manifest coverage here: if the
+                    // chunk is already covered, advancing the cursor records
+                    // skipped work without creating new durable authority.
+                    cursor.mark_committed(chunk.clone(), unix_seconds_now()?);
+                    self.registry.save_cursor(&cursor)?;
+                    next = cursor.next;
+                    result.checkpoints.push(WarmupCheckpoint {
+                        task_id: task.task_id.clone(),
+                        range_kind: task.range_kind.clone(),
+                        committed_range: chunk,
+                        rows_written: 0,
+                        provider_calls: 0,
+                    });
+                } else {
+                    uncommitted_staged_coverage_seen = true;
+                    external_staged_coverage_seen = true;
+                    next = chunk.end().saturating_add(1);
+                }
                 continue;
             }
 
@@ -355,35 +380,45 @@ where
                 rows_fetched,
             };
             if write_result.staged_ranges.is_empty() {
-                self.commit_visible_range(
-                    &task,
-                    &mut cursor,
-                    commit,
-                    &mut result,
-                    safe_height.finality,
-                )?;
-                next = cursor.next;
+                if !uncommitted_staged_coverage_seen
+                    && chunk.start() == cursor.next
+                    && self.is_durable_covered(&task, chunk.clone())?
+                {
+                    self.commit_visible_range(
+                        &task,
+                        &mut cursor,
+                        commit,
+                        &mut result,
+                        safe_height.finality,
+                    )?;
+                    next = cursor.next;
+                } else {
+                    uncommitted_staged_coverage_seen = true;
+                    next = chunk.end().saturating_add(1);
+                }
             } else {
                 pending_commits.push(commit);
                 next = chunk.end().saturating_add(1);
             }
         }
 
-        self.flush_pending_commits(
-            &mut task,
-            &mut cursor,
-            &writer,
-            &mut pending_commits,
-            &mut result,
-            safe_height.finality,
-        )?;
+        if !external_staged_coverage_seen {
+            self.flush_pending_commits(
+                &mut task,
+                &mut cursor,
+                &writer,
+                &mut pending_commits,
+                &mut result,
+                safe_height.finality,
+            )?;
+        }
         task.stats.fetched_ranges += result.fetched_ranges;
         task.stats.written_ranges += result.written_ranges;
         task.stats.empty_ranges += result.empty_ranges;
         task.stats.provider_calls += result.provider_calls;
         task.stats.rows_fetched += result.rows_fetched;
         task.touch(unix_seconds_now()?);
-        if next <= target_end {
+        if uncommitted_staged_coverage_seen || next <= target_end {
             task.state = WarmupTaskState::Queued;
             result.status = WarmupRunStatus::Partial;
             self.registry.save_task(&task)?;
@@ -461,6 +496,20 @@ where
         task.touch(unix_seconds_now()?);
         self.registry.save_task(&task)?;
         Ok(result)
+    }
+
+    fn is_durable_covered(
+        &self,
+        task: &WarmupTask,
+        range: LedgerRange,
+    ) -> Result<bool, DatalensError> {
+        let covered = self.storage.covered_ranges(
+            &task.chain,
+            &task.dataset_key,
+            &task.selector,
+            range.clone(),
+        )?;
+        Ok(missing_ranges(range, &covered).is_empty())
     }
 
     fn flush_pending_commits(
