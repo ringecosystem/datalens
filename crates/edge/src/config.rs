@@ -204,6 +204,8 @@ pub struct WarmupConfig {
     pub max_fetches_per_loop: u64,
     #[serde(default = "default_warmup_follow_query_lookahead_blocks")]
     pub follow_query_lookahead_blocks: u64,
+    #[serde(default)]
+    pub follow_query_start_offset_blocks: Option<u64>,
     #[serde(default = "default_warmup_flush_on_shutdown")]
     pub flush_on_shutdown: bool,
 }
@@ -218,6 +220,7 @@ impl Default for WarmupConfig {
             max_per_chain_tasks: default_warmup_max_per_chain_tasks(),
             max_fetches_per_loop: default_warmup_max_fetches_per_loop(),
             follow_query_lookahead_blocks: default_warmup_follow_query_lookahead_blocks(),
+            follow_query_start_offset_blocks: None,
             flush_on_shutdown: default_warmup_flush_on_shutdown(),
         }
     }

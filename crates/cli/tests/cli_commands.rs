@@ -690,6 +690,7 @@ fn test_config_parses_warmup_follow_query_lookahead() {
         max_per_chain_tasks = 1
         max_fetches_per_loop = 1
         follow_query_lookahead_blocks = 2048
+        follow_query_start_offset_blocks = 512
 
         [chains.ethereum]
         kind = "evm"
@@ -709,11 +710,12 @@ fn test_config_parses_warmup_follow_query_lookahead() {
     .expect("config parses");
 
     assert_eq!(config.warmup.follow_query_lookahead_blocks, 2048);
+    assert_eq!(config.warmup.follow_query_start_offset_blocks, Some(512));
     validate_config(&config).expect("warmup follow-query config is valid");
 }
 
 #[test]
-fn test_validate_config_rejects_zero_warmup_follow_query_lookahead() {
+fn test_validate_config_allows_zero_warmup_follow_query_lookahead() {
     let config = toml::from_str::<DatalensConfig>(
         r#"
         [server]
@@ -760,14 +762,7 @@ fn test_validate_config_rejects_zero_warmup_follow_query_lookahead() {
     )
     .expect("config parses");
 
-    let error = validate_config(&config).expect_err("zero lookahead rejected");
-
-    assert_eq!(error.kind, DatalensErrorKind::InvalidInput);
-    assert!(
-        error
-            .message
-            .contains("warmup.follow_query_lookahead_blocks")
-    );
+    validate_config(&config).expect("zero lookahead means warm to safe head");
 }
 
 #[test]

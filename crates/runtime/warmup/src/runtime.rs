@@ -87,6 +87,7 @@ pub struct WarmupRuntime<A, S, R> {
     writer: DurableWriter<S>,
     runtime_config: WarmupRuntimeConfig,
     follow_query_lookahead_blocks: u64,
+    follow_query_start_offset_blocks: Option<u64>,
     metrics: Option<MetricsRecorder>,
     usage_ledger: Option<Arc<dyn UsageLedgerRepository>>,
     query_watermarks: Option<Arc<dyn QueryWatermarkRepository>>,
@@ -193,6 +194,7 @@ where
             writer,
             runtime_config: WarmupRuntimeConfig::default(),
             follow_query_lookahead_blocks: 100,
+            follow_query_start_offset_blocks: None,
             metrics: None,
             usage_ledger: None,
             query_watermarks: None,
@@ -211,6 +213,14 @@ where
 
     pub fn with_follow_query_lookahead_blocks(mut self, lookahead_blocks: u64) -> Self {
         self.follow_query_lookahead_blocks = lookahead_blocks;
+        self
+    }
+
+    pub fn with_follow_query_start_offset_blocks(
+        mut self,
+        start_offset_blocks: Option<u64>,
+    ) -> Self {
+        self.follow_query_start_offset_blocks = start_offset_blocks;
         self
     }
 
@@ -278,6 +288,7 @@ where
             query_watermark,
             safe_head: safe_height.value,
             lookahead_blocks: self.follow_query_lookahead_blocks,
+            start_offset_blocks: self.follow_query_start_offset_blocks,
         });
         log_target_plan(
             &task,
@@ -287,8 +298,8 @@ where
             self.follow_query_lookahead_blocks,
             &target_plan,
         );
-        let target_end = match target_plan {
-            PlannedWarmupTarget::Range { end, .. } => end,
+        let (target_start, target_end) = match target_plan {
+            PlannedWarmupTarget::Range { start, end } => (start, end),
             PlannedWarmupTarget::Noop(_) => {
                 if task.mode == WarmupTaskMode::FixedRange {
                     self.record_task_metric(&task, WarmupTaskOutcome::Completed);
@@ -296,6 +307,11 @@ where
                 return self.finish_or_stop(task, WarmupRunResult::default());
             }
         };
+        if target_start > cursor.next {
+            cursor.next = target_start;
+            cursor.updated_at = unix_seconds_now()?;
+            self.registry.save_cursor(&cursor)?;
+        }
         if cursor.next > target_end {
             if task.mode == WarmupTaskMode::FixedRange {
                 self.record_task_metric(&task, WarmupTaskOutcome::Completed);

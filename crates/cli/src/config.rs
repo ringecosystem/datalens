@@ -248,12 +248,6 @@ fn validate_warmup_config(config: &DatalensConfig) -> Result<(), DatalensError> 
             "warmup.max_fetches_per_loop must be greater than zero",
         ));
     }
-    if config.warmup.follow_query_lookahead_blocks == 0 {
-        return Err(DatalensError::new(
-            DatalensErrorKind::InvalidInput,
-            "warmup.follow_query_lookahead_blocks must be greater than zero",
-        ));
-    }
     Ok(())
 }
 
