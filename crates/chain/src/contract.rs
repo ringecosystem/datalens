@@ -322,6 +322,30 @@ impl DatasetSelector {
             Self::Other { canonical_key, .. } => canonical_key.clone(),
         }
     }
+
+    pub fn covers(&self, query: &DatasetSelector) -> bool {
+        match (self, query) {
+            (Self::All, Self::All) => true,
+            (Self::EvmLogs(stored), Self::EvmLogs(query)) => stored.covers(query),
+            (
+                Self::Other {
+                    kind: stored_kind,
+                    fingerprint: stored_fingerprint,
+                    canonical_key: stored_canonical_key,
+                },
+                Self::Other {
+                    kind: query_kind,
+                    fingerprint: query_fingerprint,
+                    canonical_key: query_canonical_key,
+                },
+            ) => {
+                stored_kind == query_kind
+                    && stored_fingerprint == query_fingerprint
+                    && stored_canonical_key == query_canonical_key
+            }
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

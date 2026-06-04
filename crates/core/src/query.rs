@@ -211,6 +211,46 @@ impl EvmLogFilter {
     pub fn compact_key(&self) -> String {
         format!("addr-topic-{}", stable_digest_prefix(&self.canonical_key()))
     }
+
+    pub fn covers(&self, query: &EvmLogFilter) -> bool {
+        self.covers_addresses(query) && self.covers_topics(query)
+    }
+
+    pub fn matches_log(&self, log: &LogRecord) -> bool {
+        if !self.addresses.is_empty()
+            && !self.addresses.iter().any(|address| address == &log.address)
+        {
+            return false;
+        }
+
+        self.topics
+            .iter()
+            .enumerate()
+            .all(|(index, topic)| topic.matches_log_topic(log.topics.get(index)))
+    }
+
+    fn covers_addresses(&self, query: &EvmLogFilter) -> bool {
+        if self.addresses.is_empty() {
+            return true;
+        }
+        if query.addresses.is_empty() {
+            return false;
+        }
+        query
+            .addresses
+            .iter()
+            .all(|address| self.addresses.binary_search(address).is_ok())
+    }
+
+    fn covers_topics(&self, query: &EvmLogFilter) -> bool {
+        if self.topics.is_empty() {
+            return true;
+        }
+
+        let slot_count = self.topics.len().max(query.topics.len());
+        (0..slot_count)
+            .all(|index| TopicFilter::covers_slot(self.topics.get(index), query.topics.get(index)))
+    }
 }
 
 impl TryFrom<LogFilter> for EvmLogFilter {
@@ -270,6 +310,23 @@ impl TopicFilter {
             Self::Wildcard => "*".to_owned(),
             Self::AnyOf(values) if values.is_empty() => "[]".to_owned(),
             Self::AnyOf(values) => values.join(","),
+        }
+    }
+
+    fn covers_slot(stored: Option<&Self>, query: Option<&Self>) -> bool {
+        match (stored, query) {
+            (None, _) | (Some(Self::Wildcard), _) => true,
+            (Some(Self::AnyOf(_)), None | Some(Self::Wildcard)) => false,
+            (Some(Self::AnyOf(stored)), Some(Self::AnyOf(query))) => query
+                .iter()
+                .all(|topic| stored.binary_search(topic).is_ok()),
+        }
+    }
+
+    fn matches_log_topic(&self, topic: Option<&String>) -> bool {
+        match self {
+            Self::Wildcard => true,
+            Self::AnyOf(values) => topic.is_some_and(|topic| values.binary_search(topic).is_ok()),
         }
     }
 }

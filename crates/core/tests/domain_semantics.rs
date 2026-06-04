@@ -324,6 +324,73 @@ fn test_evm_log_filter_normalization_is_canonical() {
 }
 
 #[test]
+fn test_evm_log_filter_address_coverage_uses_wildcard_and_superset_semantics() {
+    let wildcard = evm_log_filter(vec![], vec![]);
+    let one = evm_log_filter(vec!["0x1111111111111111111111111111111111111111"], vec![]);
+    let two = evm_log_filter(
+        vec![
+            "0x1111111111111111111111111111111111111111",
+            "0x2222222222222222222222222222222222222222",
+        ],
+        vec![],
+    );
+
+    assert!(wildcard.covers(&one));
+    assert!(wildcard.covers(&two));
+    assert!(two.covers(&one));
+    assert!(!one.covers(&two));
+}
+
+#[test]
+fn test_evm_log_filter_topic_coverage_uses_wildcard_and_superset_semantics() {
+    let topic_a = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let topic_b = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    let wildcard = evm_log_filter(vec![], vec![]);
+    let concrete = evm_log_filter(vec![], vec![Some(vec![topic_a])]);
+    let superset = evm_log_filter(vec![], vec![Some(vec![topic_a, topic_b])]);
+    let subset = evm_log_filter(vec![], vec![Some(vec![topic_a])]);
+    let trailing_wildcard = evm_log_filter(vec![], vec![Some(vec![topic_a])]);
+    let two_slots = evm_log_filter(vec![], vec![Some(vec![topic_a]), Some(vec![topic_b])]);
+    let explicit_wildcard = evm_log_filter(vec![], vec![None]);
+
+    assert!(wildcard.covers(&concrete));
+    assert!(explicit_wildcard.covers(&concrete));
+    assert!(superset.covers(&subset));
+    assert!(!subset.covers(&superset));
+    assert!(trailing_wildcard.covers(&two_slots));
+    assert!(!concrete.covers(&explicit_wildcard));
+}
+
+#[test]
+fn test_evm_log_filter_matches_log_by_address_and_topic_slots() {
+    let topic_a = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let topic_b = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let topic_c = "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    let filter = evm_log_filter(
+        vec!["0x1111111111111111111111111111111111111111"],
+        vec![Some(vec![topic_a]), None, Some(vec![topic_c])],
+    );
+
+    assert!(filter.matches_log(&log_record(
+        "0x1111111111111111111111111111111111111111",
+        vec![topic_a, topic_b, topic_c],
+    )));
+    assert!(!filter.matches_log(&log_record(
+        "0x2222222222222222222222222222222222222222",
+        vec![topic_a, topic_b, topic_c],
+    )));
+    assert!(!filter.matches_log(&log_record(
+        "0x1111111111111111111111111111111111111111",
+        vec![topic_b, topic_b, topic_c],
+    )));
+    assert!(!filter.matches_log(&log_record(
+        "0x1111111111111111111111111111111111111111",
+        vec![topic_a, topic_b],
+    )));
+}
+
+#[test]
 fn test_log_record_deserialization_canonicalizes_hex_values() {
     let json = r#"{
         "block_number":10,
@@ -666,6 +733,32 @@ fn test_log_record_checked_constructor_canonicalizes_hex_values() {
         )
         .is_err()
     );
+}
+
+fn evm_log_filter(addresses: Vec<&str>, topics: Vec<Option<Vec<&str>>>) -> EvmLogFilter {
+    EvmLogFilter::try_from(LogFilter {
+        addresses: addresses.into_iter().map(str::to_owned).collect(),
+        topics: topics
+            .into_iter()
+            .map(|slot| slot.map(|values| values.into_iter().map(str::to_owned).collect()))
+            .collect(),
+    })
+    .expect("valid filter")
+}
+
+fn log_record(address: &str, topics: Vec<&str>) -> LogRecord {
+    LogRecord::try_new(
+        10,
+        "0xblock".to_owned(),
+        "0xtx".to_owned(),
+        0,
+        1,
+        address,
+        topics.into_iter().map(str::to_owned).collect(),
+        "0x".to_owned(),
+        false,
+    )
+    .expect("valid log record")
 }
 
 #[test]

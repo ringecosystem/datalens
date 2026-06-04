@@ -345,6 +345,7 @@ pub(crate) struct WarmupTask {
     application_id: String,
     chain: Json<ChainIdentity>,
     dataset_key: String,
+    selector: WarmupTaskSelector,
     range_kind: Json<LedgerRangeKind>,
     start: u64,
     end: Option<u64>,
@@ -356,6 +357,13 @@ pub(crate) struct WarmupTask {
     stats: Json<datalens_warmup::WarmupStats>,
 }
 
+#[derive(SimpleObject)]
+pub(crate) struct WarmupTaskSelector {
+    kind: String,
+    fingerprint: String,
+    canonical_key: String,
+}
+
 impl From<WarmupTaskView> for WarmupTask {
     fn from(task: WarmupTaskView) -> Self {
         Self {
@@ -363,6 +371,11 @@ impl From<WarmupTaskView> for WarmupTask {
             application_id: task.application_id,
             chain: Json(task.chain),
             dataset_key: task.dataset_key,
+            selector: WarmupTaskSelector {
+                kind: task.selector.kind,
+                fingerprint: task.selector.fingerprint,
+                canonical_key: task.selector.canonical_key,
+            },
             range_kind: Json(task.range_kind),
             start: task.start,
             end: task.end,
