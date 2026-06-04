@@ -12,8 +12,8 @@ use datalens_metrics::{
     WarmupWriteOutcome,
 };
 use datalens_storage::{
-    CacheOutcome, FillOutcome, QueryOutcome, StorageRepository, UsageLedgerEntry,
-    UsageLedgerRepository,
+    CacheOutcome, FillOutcome, QueryOutcome, QueryWatermarkKey, QueryWatermarkRepository,
+    StorageRepository, UsageLedgerEntry, UsageLedgerRepository,
 };
 use datalens_writer::{
     DurableWriteRequest, DurableWriteSegment, DurableWriter, DurableWriterConfig,
@@ -22,7 +22,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     WarmupCheckpoint, WarmupCursor, WarmupRegistry, WarmupTask, WarmupTaskId, WarmupTaskMode,
-    WarmupTaskState, pending_commit::PendingWarmupCommit, registry::unix_seconds_now,
+    WarmupTaskState,
+    pending_commit::PendingWarmupCommit,
+    registry::unix_seconds_now,
+    target_planner::{PlannedWarmupTarget, WarmupTargetPlanInput, WarmupTargetPlanner},
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -83,8 +86,10 @@ pub struct WarmupRuntime<A, S, R> {
     registry: R,
     writer: DurableWriter<S>,
     runtime_config: WarmupRuntimeConfig,
+    follow_query_lookahead_blocks: u64,
     metrics: Option<MetricsRecorder>,
     usage_ledger: Option<Arc<dyn UsageLedgerRepository>>,
+    query_watermarks: Option<Arc<dyn QueryWatermarkRepository>>,
 }
 
 #[derive(Clone)]
@@ -187,8 +192,10 @@ where
             registry,
             writer,
             runtime_config: WarmupRuntimeConfig::default(),
+            follow_query_lookahead_blocks: 100,
             metrics: None,
             usage_ledger: None,
+            query_watermarks: None,
         }
     }
 
@@ -202,6 +209,11 @@ where
         self
     }
 
+    pub fn with_follow_query_lookahead_blocks(mut self, lookahead_blocks: u64) -> Self {
+        self.follow_query_lookahead_blocks = lookahead_blocks;
+        self
+    }
+
     pub fn with_metrics(mut self, recorder: MetricsRecorder) -> Self {
         self.metrics = Some(recorder);
         self
@@ -209,6 +221,14 @@ where
 
     pub fn with_usage_ledger(mut self, repository: impl UsageLedgerRepository + 'static) -> Self {
         self.usage_ledger = Some(Arc::new(repository));
+        self
+    }
+
+    pub fn with_query_watermarks(
+        mut self,
+        repository: impl QueryWatermarkRepository + 'static,
+    ) -> Self {
+        self.query_watermarks = Some(Arc::new(repository));
         self
     }
 
@@ -250,7 +270,30 @@ where
                 unix_seconds_now().unwrap_or_default(),
             )
         });
-        let target_end = target_end(&task, safe_height.value)?;
+        let query_watermark = self.query_watermark(&task)?;
+        let target_plan = WarmupTargetPlanner::plan(WarmupTargetPlanInput {
+            mode: task.mode,
+            fixed_end: task.end,
+            cursor_next: cursor.next,
+            query_watermark,
+            safe_head: safe_height.value,
+            lookahead_blocks: self.follow_query_lookahead_blocks,
+        });
+        log_target_plan(
+            &task,
+            cursor.next,
+            query_watermark,
+            safe_height.value,
+            self.follow_query_lookahead_blocks,
+            &target_plan,
+        );
+        let target_end = match target_plan {
+            PlannedWarmupTarget::Range { end, .. } => end,
+            PlannedWarmupTarget::Noop(_) => {
+                self.record_task_metric(&task, WarmupTaskOutcome::Completed);
+                return self.finish_or_stop(task, WarmupRunResult::default());
+            }
+        };
         if cursor.next > target_end {
             self.record_task_metric(&task, WarmupTaskOutcome::Completed);
             return self.finish_or_stop(task, WarmupRunResult::default());
@@ -484,7 +527,7 @@ where
                 result.status = WarmupRunStatus::Completed;
                 self.record_task_metric(&task, WarmupTaskOutcome::Completed);
             }
-            WarmupTaskMode::FollowSafeHeight => {
+            WarmupTaskMode::FollowSafeHeight | WarmupTaskMode::FollowQuery => {
                 task.state = WarmupTaskState::Queued;
                 result.status = if result.fetched_ranges == 0 {
                     WarmupRunStatus::Stopped
@@ -634,6 +677,25 @@ where
             )
             .with_request_id(format!("warmup:{}", task.task_id.as_str())),
         )
+    }
+
+    fn query_watermark(&self, task: &WarmupTask) -> Result<Option<u64>, DatalensError> {
+        if task.mode != WarmupTaskMode::FollowQuery {
+            return Ok(None);
+        }
+        let Some(repository) = &self.query_watermarks else {
+            return Ok(None);
+        };
+        let key = QueryWatermarkKey::new(
+            task.application_id.clone(),
+            task.chain.clone(),
+            task.dataset_key.clone(),
+            &task.selector,
+            task.range_kind.clone(),
+        );
+        Ok(repository
+            .read(&key)?
+            .map(|watermark| watermark.latest_block))
     }
 
     fn record_metrics(&self, task: &WarmupTask, range: &LedgerRange, rows_written: usize) {
@@ -788,13 +850,6 @@ fn validate_selector_limits(
     Ok(())
 }
 
-fn target_end(task: &WarmupTask, safe_height: u64) -> Result<u64, DatalensError> {
-    match task.mode {
-        WarmupTaskMode::FixedRange => Ok(task.end.unwrap_or(task.start).min(safe_height)),
-        WarmupTaskMode::FollowSafeHeight => Ok(safe_height),
-    }
-}
-
 fn max_chunk_len<A>(task: &WarmupTask, adapter: &A) -> Result<u64, DatalensError>
 where
     A: ChainAdapter,
@@ -835,6 +890,36 @@ fn selector_label(selector: &DatasetSelector) -> String {
         SelectorKind::EvmLogs => "evm_logs".to_owned(),
         SelectorKind::Other(kind) => kind.as_str().to_owned(),
     }
+}
+
+fn log_target_plan(
+    task: &WarmupTask,
+    cursor_next: u64,
+    query_watermark: Option<u64>,
+    safe_head: u64,
+    lookahead_blocks: u64,
+    target_plan: &PlannedWarmupTarget,
+) {
+    let (planned_start, planned_end, no_op_reason) = match target_plan {
+        PlannedWarmupTarget::Range { start, end } => (Some(*start), Some(*end), None),
+        PlannedWarmupTarget::Noop(reason) => (None, None, Some(*reason)),
+    };
+    log::info!(
+        "warmup target plan task_id={} application={} chain={} dataset={} selector_fingerprint={} selector_canonical_key={} cursor_next={} query_watermark={:?} safe_head={} lookahead_blocks={} planned_start={:?} planned_end={:?} no_op_reason={:?}",
+        task.task_id.as_str(),
+        task.application_id,
+        task.chain.key_prefix(),
+        task.dataset_key.as_str(),
+        task.selector.fingerprint(),
+        task.selector.canonical_key(),
+        cursor_next,
+        query_watermark,
+        safe_head,
+        lookahead_blocks,
+        planned_start,
+        planned_end,
+        no_op_reason,
+    );
 }
 
 fn missing_task(task_id: &WarmupTaskId) -> DatalensError {

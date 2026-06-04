@@ -17,8 +17,9 @@ use datalens_metrics::{ApplicationIdentity, MetricsRecorder};
 use datalens_planner::{FieldSelection, NativePlannerConfig, NativeQueryInput};
 use datalens_storage::{
     CacheOutcome, FillOutcome, LocalObjectStore, LocalStorage, Manifest, ObjectMetadata,
-    ObjectStore, QueryOutcome, StorageRepository, StorageWriteOutcome, StorageWriteRequest,
-    UsageLedgerRepository, UsageLedgerStore,
+    ObjectStore, QueryOutcome, QueryWatermarkKey, QueryWatermarkRepository, QueryWatermarkStore,
+    StorageRepository, StorageWriteOutcome, StorageWriteRequest, UsageLedgerRepository,
+    UsageLedgerStore,
 };
 use datalens_writer::{
     DurableWriteRequest, DurableWriteSegment, DurableWriterConfig, WriteStagingConfig,
@@ -261,6 +262,43 @@ fn test_executor_writes_usage_ledger_for_miss_fill_and_empty_coverage() {
         datalens_storage::DurableWriteOutcome::Flushed
     );
     assert_eq!(events[0].row_count, 1);
+}
+
+#[test]
+fn test_executor_records_query_watermark_after_successful_durable_query() {
+    let root = temp_storage_root("executor-query-watermark");
+    let storage = LocalStorage::new(&root);
+    let watermarks = QueryWatermarkStore::new(LocalObjectStore::new(&root));
+    let source = MockSource::default().with_blocks(vec![block(30, "0x30")]);
+    let executor = executor(storage, source).with_query_watermarks(
+        watermarks.clone(),
+        ApplicationIdentity::named("analytics-api"),
+    );
+
+    executor
+        .execute(blocks_input(30, 32))
+        .expect("durable query succeeds");
+
+    let key = QueryWatermarkKey::new(
+        "analytics-api",
+        ethereum_identity(),
+        DatasetKey::evm_blocks(),
+        &DatasetSelector::all(),
+        datalens_core::LedgerRangeKind::Block,
+    );
+    let watermark = watermarks
+        .read(&key)
+        .expect("read watermark")
+        .expect("watermark");
+    assert_eq!(watermark.latest_block, 32);
+    assert_eq!(
+        watermark.key.selector_fingerprint,
+        DatasetSelector::all().fingerprint()
+    );
+    assert_eq!(
+        watermark.key.selector_canonical_key,
+        DatasetSelector::all().canonical_key()
+    );
 }
 
 #[test]

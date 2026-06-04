@@ -14,8 +14,9 @@ use datalens_planner::{
 };
 use datalens_storage::{
     CacheOutcome as LedgerCacheOutcome, DurableWriteOutcome as LedgerDurableWriteOutcome,
-    FillOutcome as LedgerFillOutcome, QueryOutcome as LedgerQueryOutcome, StorageRepository,
-    UsageLedgerEntry, UsageLedgerRepository,
+    FillOutcome as LedgerFillOutcome, QueryOutcome as LedgerQueryOutcome, QueryWatermark,
+    QueryWatermarkKey, QueryWatermarkRepository, StorageRepository, UsageLedgerEntry,
+    UsageLedgerRepository,
 };
 use datalens_writer::{
     DurableWriteRequest, DurableWriteResult, DurableWriteSegment, DurableWriter,
@@ -70,6 +71,7 @@ pub struct NativeQueryExecutor<R, S> {
     writer: DurableWriter<R>,
     metrics: Option<ExecutorMetrics>,
     usage_ledger: Option<ExecutorUsageLedger>,
+    query_watermarks: Option<ExecutorQueryWatermarks>,
 }
 
 #[derive(Clone)]
@@ -81,6 +83,12 @@ pub(crate) struct ExecutorMetrics {
 #[derive(Clone)]
 pub(crate) struct ExecutorUsageLedger {
     pub(crate) repository: Arc<dyn UsageLedgerRepository>,
+    pub(crate) application: ApplicationIdentity,
+}
+
+#[derive(Clone)]
+pub(crate) struct ExecutorQueryWatermarks {
+    pub(crate) repository: Arc<dyn QueryWatermarkRepository>,
     pub(crate) application: ApplicationIdentity,
 }
 
@@ -98,6 +106,7 @@ where
             writer,
             metrics: None,
             usage_ledger: None,
+            query_watermarks: None,
         }
     }
 
@@ -119,6 +128,18 @@ where
         application: ApplicationIdentity,
     ) -> Self {
         self.usage_ledger = Some(ExecutorUsageLedger {
+            repository: Arc::new(repository),
+            application,
+        });
+        self
+    }
+
+    pub fn with_query_watermarks(
+        mut self,
+        repository: impl QueryWatermarkRepository + 'static,
+        application: ApplicationIdentity,
+    ) -> Self {
+        self.query_watermarks = Some(ExecutorQueryWatermarks {
             repository: Arc::new(repository),
             application,
         });
@@ -564,6 +585,7 @@ where
             durable_write_outcome,
             result.rows.row_count(),
         )?;
+        self.record_query_watermark_for_plan(&application, &plan)?;
         Ok(result)
     }
 
@@ -739,6 +761,17 @@ where
         })
     }
 
+    fn watermark_application(
+        &self,
+        application: &Option<ApplicationIdentity>,
+    ) -> Option<ApplicationIdentity> {
+        self.query_watermarks.as_ref().map(|watermarks| {
+            application
+                .clone()
+                .unwrap_or_else(|| watermarks.application.clone())
+        })
+    }
+
     fn metrics_recorder<'a>(
         &'a self,
         labels: &'a Option<MetricsLabels>,
@@ -862,4 +895,52 @@ where
             row_count,
         )
     }
+
+    fn record_query_watermark_for_plan(
+        &self,
+        application: &Option<ApplicationIdentity>,
+        plan: &datalens_planner::NativeQueryPlan,
+    ) -> Result<(), DatalensError> {
+        let Some(watermarks) = &self.query_watermarks else {
+            return Ok(());
+        };
+        let Some(application) = self.watermark_application(application) else {
+            return Ok(());
+        };
+        let Some(latest_block) = durable_watermark_block(plan) else {
+            return Ok(());
+        };
+        watermarks.repository.update(&QueryWatermark {
+            key: QueryWatermarkKey::new(
+                application.as_str(),
+                plan.chain.clone(),
+                plan.dataset_key.clone(),
+                &plan.selector,
+                plan.ledger_range.kind(),
+            ),
+            latest_block,
+            updated_at_unix_seconds: unix_seconds_now()?,
+        })
+    }
+}
+
+fn durable_watermark_block(plan: &datalens_planner::NativeQueryPlan) -> Option<u64> {
+    match &plan.finality_policy {
+        FinalityPolicy::DurableCache { boundary } => {
+            Some(plan.ledger_range.end().min(boundary.value))
+        }
+        FinalityPolicy::MixedReadThrough {
+            durable_boundary, ..
+        } => Some(plan.ledger_range.end().min(durable_boundary.value)),
+        FinalityPolicy::HotReadThrough { .. } => None,
+    }
+}
+
+fn unix_seconds_now() -> Result<u64, DatalensError> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|error| {
+            DatalensError::internal(format!("system clock before unix epoch: {error}"))
+        })
 }

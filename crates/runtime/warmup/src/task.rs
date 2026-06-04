@@ -38,6 +38,7 @@ impl WarmupTaskId {
 pub enum WarmupTaskMode {
     FixedRange,
     FollowSafeHeight,
+    FollowQuery,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

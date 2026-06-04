@@ -17,7 +17,10 @@ use datalens_executor::{NativeQueryExecutionConfig, NativeQueryExecutor};
 use datalens_metrics::{ApplicationIdentity, MetricsRecorder};
 use datalens_planner::{FieldSelection, NativePlannerConfig, NativeQueryInput};
 use datalens_solana::{SolanaAdapter, solana_all_selector};
-use datalens_storage::{LocalObjectStore, LocalStorage};
+use datalens_storage::{
+    LocalObjectStore, LocalStorage, QueryWatermarkKey, QueryWatermarkRepository,
+    QueryWatermarkStore,
+};
 use datalens_tron::{TronAdapter, tron_all_selector};
 use datalens_warmup::{
     LocalWarmupRegistry, WarmupChunkPolicy, WarmupRetryPolicy, WarmupRunStatus, WarmupRuntime,
@@ -472,6 +475,124 @@ fn test_query_path_hits_warmup_generated_durable_coverage() {
 }
 
 #[test]
+fn test_query_watermark_does_not_directly_update_warmup_cursor() {
+    let root = temp_root("follow-query-no-fast-forward");
+    let storage = LocalStorage::new(&root);
+    let watermarks = QueryWatermarkStore::new(LocalObjectStore::new(&root));
+    let registry = LocalWarmupRegistry::new(object_store("follow-query-no-fast-forward-registry"));
+    let adapter = FixtureAdapter::new(12)
+        .with_max_range_len(2)
+        .with_logs(vec![log_record(9, 0)]);
+    let runtime = runtime(adapter.clone(), storage.clone(), registry.clone())
+        .with_query_watermarks(watermarks.clone())
+        .with_follow_query_lookahead_blocks(0)
+        .with_runtime_config(WarmupRuntimeConfig {
+            max_fetches_per_task_loop: 1,
+        });
+    let task_id = registry
+        .submit(follow_query_request())
+        .expect("submit follow query")
+        .task_id;
+    let cursor_before_query = registry.load_cursor(&task_id).unwrap();
+    let executor = NativeQueryExecutor::new(
+        storage,
+        adapter.clone(),
+        NativeQueryExecutionConfig {
+            planner: NativePlannerConfig {
+                max_query_range_len: 10,
+                default_chunk_range_len: 10,
+            },
+            writer: writer_config(),
+        },
+    )
+    .with_query_watermarks(watermarks.clone(), ApplicationIdentity::named("app-a"));
+
+    executor
+        .execute_with_application(
+            NativeQueryInput {
+                chain: chain(),
+                dataset_key: DatasetKey::evm_logs(),
+                ledger_range: blocks(8, 10),
+                selector: selector(),
+                field_selection: FieldSelection::All,
+                finality: QueryFinalityRequirement::DurableOnly,
+            },
+            Some(ApplicationIdentity::named("app-a")),
+        )
+        .expect("query fills high range");
+
+    assert_eq!(registry.load_cursor(&task_id).unwrap(), cursor_before_query);
+    adapter.clear_fetches();
+
+    let result = runtime.run_task_once(&task_id).expect("warmup run");
+
+    assert_eq!(result.status, WarmupRunStatus::Partial);
+    assert_eq!(adapter.fetches(), vec![blocks(1, 2)]);
+    let cursor = registry.load_cursor(&task_id).unwrap().expect("cursor");
+    assert_eq!(cursor.next, 3);
+}
+
+#[test]
+fn test_repeated_query_progress_moves_follow_query_target_forward() {
+    let root = temp_root("follow-query-repeated-progress");
+    let storage = LocalStorage::new(&root);
+    let watermarks = QueryWatermarkStore::new(LocalObjectStore::new(&root));
+    let registry =
+        LocalWarmupRegistry::new(object_store("follow-query-repeated-progress-registry"));
+    let adapter = FixtureAdapter::new(12)
+        .with_max_range_len(100)
+        .with_logs(vec![log_record(2, 0), log_record(5, 0)]);
+    let runtime = runtime(adapter.clone(), storage.clone(), registry.clone())
+        .with_query_watermarks(watermarks.clone())
+        .with_follow_query_lookahead_blocks(0)
+        .with_runtime_config(WarmupRuntimeConfig {
+            max_fetches_per_task_loop: 10,
+        });
+    let task_id = registry
+        .submit(follow_query_request())
+        .expect("submit follow query")
+        .task_id;
+    let executor = NativeQueryExecutor::new(
+        storage,
+        adapter.clone(),
+        NativeQueryExecutionConfig {
+            planner: NativePlannerConfig {
+                max_query_range_len: 10,
+                default_chunk_range_len: 10,
+            },
+            writer: writer_config(),
+        },
+    )
+    .with_query_watermarks(watermarks.clone(), ApplicationIdentity::named("app-a"));
+
+    execute_log_query(&executor, blocks(1, 3));
+    let first = runtime.run_task_once(&task_id).expect("first warmup");
+    assert_eq!(first.status, WarmupRunStatus::Stopped);
+    assert_eq!(registry.load_cursor(&task_id).unwrap().unwrap().next, 4);
+
+    execute_log_query(&executor, blocks(4, 5));
+    let second = runtime.run_task_once(&task_id).expect("second warmup");
+
+    assert_eq!(second.status, WarmupRunStatus::Stopped);
+    assert_eq!(registry.load_cursor(&task_id).unwrap().unwrap().next, 6);
+    let key = QueryWatermarkKey::new(
+        "app-a",
+        chain(),
+        DatasetKey::evm_logs(),
+        &selector(),
+        LedgerRangeKind::Block,
+    );
+    assert_eq!(
+        watermarks
+            .read(&key)
+            .expect("read watermark")
+            .expect("watermark")
+            .latest_block,
+        5
+    );
+}
+
+#[test]
 fn test_task_pool_runs_available_tasks_with_global_bound() {
     let storage = LocalStorage::new(temp_root("pool-storage"));
     let registry = LocalWarmupRegistry::new(object_store("pool-registry"));
@@ -617,6 +738,33 @@ fn submit_request(end: Option<u64>, mode: WarmupTaskMode) -> WarmupSubmitRequest
             max_backoff_ms: 0,
         },
     }
+}
+
+fn follow_query_request() -> WarmupSubmitRequest {
+    WarmupSubmitRequest {
+        end: None,
+        mode: WarmupTaskMode::FollowQuery,
+        ..submit_request(None, WarmupTaskMode::FollowQuery)
+    }
+}
+
+fn execute_log_query<R>(executor: &NativeQueryExecutor<R, FixtureAdapter>, range: LedgerRange)
+where
+    R: datalens_storage::StorageRepository + Clone,
+{
+    executor
+        .execute_with_application(
+            NativeQueryInput {
+                chain: chain(),
+                dataset_key: DatasetKey::evm_logs(),
+                ledger_range: range,
+                selector: selector(),
+                field_selection: FieldSelection::All,
+                finality: QueryFinalityRequirement::DurableOnly,
+            },
+            Some(ApplicationIdentity::named("app-a")),
+        )
+        .expect("query succeeds");
 }
 
 fn object_store(name: &str) -> LocalObjectStore {
