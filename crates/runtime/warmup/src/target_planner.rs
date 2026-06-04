@@ -9,6 +9,8 @@ pub struct WarmupTargetPlanInput {
     pub safe_head: u64,
     pub lookahead_blocks: u64,
     pub start_offset_blocks: Option<u64>,
+    pub start_offset_tiers_blocks: Option<Vec<u64>>,
+    pub catchup_threshold_blocks: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -35,15 +37,10 @@ impl WarmupTargetPlanner {
                     return PlannedWarmupTarget::Noop("query_watermark_missing");
                 };
 
-                let desired_start = query_watermark.saturating_add(
-                    input
-                        .start_offset_blocks
-                        .map(|offset| offset.max(1))
-                        .unwrap_or_else(|| {
-                            adaptive_start_offset_blocks(query_watermark, input.safe_head)
-                        }),
-                );
-                let start = input.cursor_next.max(desired_start);
+                if input.safe_head <= query_watermark {
+                    return PlannedWarmupTarget::Noop("start_after_safe_head");
+                }
+                let start = follow_query_start(&input, query_watermark);
                 if start > input.safe_head {
                     return PlannedWarmupTarget::Noop("start_after_safe_head");
                 }
@@ -67,9 +64,52 @@ impl WarmupTargetPlanner {
     }
 }
 
-fn adaptive_start_offset_blocks(query_watermark: u64, safe_head: u64) -> u64 {
-    [5_000, 4_000, 3_000, 1_000, 500, 100, 50, 10, 1]
+fn follow_query_start(input: &WarmupTargetPlanInput, query_watermark: u64) -> u64 {
+    let safe_delta = input.safe_head.saturating_sub(query_watermark);
+    let Some(cursor_distance) = input.cursor_next.checked_sub(query_watermark) else {
+        let offset = smallest_fitting_offset(input, 0, safe_delta).unwrap_or(1);
+        return query_watermark.saturating_add(offset);
+    };
+
+    if cursor_distance <= input.catchup_threshold_blocks
+        && let Some(offset) = smallest_fitting_offset(input, cursor_distance, safe_delta)
+    {
+        return query_watermark.saturating_add(offset);
+    }
+
+    input.cursor_next
+}
+
+fn smallest_fitting_offset(
+    input: &WarmupTargetPlanInput,
+    greater_than: u64,
+    safe_delta: u64,
+) -> Option<u64> {
+    let mut configured = configured_offset_tiers(input);
+    configured.sort_unstable();
+    configured.dedup();
+    configured
         .into_iter()
-        .find(|offset| query_watermark.saturating_add(*offset) <= safe_head)
-        .unwrap_or(1)
+        .find(|offset| *offset > greater_than && *offset <= safe_delta)
+        .or_else(|| adaptive_fallback_offset(greater_than, safe_delta))
+}
+
+fn configured_offset_tiers(input: &WarmupTargetPlanInput) -> Vec<u64> {
+    if let Some(offset) = input.start_offset_blocks {
+        return vec![offset.max(1)];
+    }
+    input
+        .start_offset_tiers_blocks
+        .clone()
+        .unwrap_or_else(|| vec![5_000, 3_000, 1_000])
+        .into_iter()
+        .filter(|offset| *offset > 0)
+        .collect()
+}
+
+fn adaptive_fallback_offset(greater_than: u64, safe_delta: u64) -> Option<u64> {
+    [500, 100, 50, 10, 1]
+        .into_iter()
+        .filter(|offset| *offset > greater_than && *offset <= safe_delta)
+        .max()
 }

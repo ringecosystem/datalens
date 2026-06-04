@@ -151,6 +151,19 @@ fn build_evm_service_with_storage(
                 .follow_query_start_offset_blocks
                 .or(config.warmup.follow_query_start_offset_blocks),
         )
+        .with_follow_query_start_offset_tiers_blocks(
+            chain
+                .warmup
+                .follow_query_start_offset_tiers_blocks
+                .clone()
+                .or(config.warmup.follow_query_start_offset_tiers_blocks.clone()),
+        )
+        .with_follow_query_catchup_threshold_blocks(
+            chain
+                .warmup
+                .follow_query_catchup_threshold_blocks
+                .unwrap_or(config.warmup.follow_query_catchup_threshold_blocks),
+        )
         .with_usage_ledger(usage_ledger)
         .with_query_watermarks(query_watermarks);
         if let Some(recorder) = service.metrics_recorder() {

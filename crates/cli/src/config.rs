@@ -258,6 +258,13 @@ fn validate_warmup_config(config: &DatalensConfig) -> Result<(), DatalensError> 
             "warmup.follow_query_start_offset_blocks must be greater than zero when set",
         ));
     }
+    validate_follow_query_start_offset_tiers(
+        "warmup.follow_query_start_offset_tiers_blocks",
+        config
+            .warmup
+            .follow_query_start_offset_tiers_blocks
+            .as_deref(),
+    )?;
     Ok(())
 }
 
@@ -366,10 +373,39 @@ fn validate_chain(name: &str, chain: &ChainConfig) -> Result<(), DatalensError> 
             ),
         ));
     }
+    validate_follow_query_start_offset_tiers(
+        &format!("chain {name} warmup.follow_query_start_offset_tiers_blocks"),
+        chain
+            .warmup
+            .follow_query_start_offset_tiers_blocks
+            .as_deref(),
+    )?;
     if matches!(chain.kind.as_str(), "solana" | "tron") {
         return Ok(());
     }
     validate_finality(name, &chain.finality)?;
+    Ok(())
+}
+
+fn validate_follow_query_start_offset_tiers(
+    name: &str,
+    tiers: Option<&[u64]>,
+) -> Result<(), DatalensError> {
+    let Some(tiers) = tiers else {
+        return Ok(());
+    };
+    if tiers.is_empty() {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            format!("{name} must not be empty when set"),
+        ));
+    }
+    if tiers.contains(&0) {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            format!("{name} values must be greater than zero"),
+        ));
+    }
     Ok(())
 }
 
