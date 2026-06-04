@@ -565,7 +565,7 @@ fn test_application_client_readmes_document_native_datalens_runtime() {
             .unwrap_or_else(|error| panic!("read {example} README: {error}"));
 
         assert!(
-            readme.contains("query `datalens serve` through `/native/graphql`"),
+            readme.contains("query `datalens serve` through REST `/v1/query`"),
             "{example} README should describe the native datalens serve runtime"
         );
         assert!(
