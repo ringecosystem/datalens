@@ -1,9 +1,11 @@
 use std::{
     path::PathBuf,
     sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc,
     },
+    thread,
 };
 
 use datalens_chain::{DatasetSelector, FinalityLevel};
@@ -237,6 +239,59 @@ fn test_query_watermark_records_highest_selector_progress_without_rewinding() {
     );
 }
 
+#[test]
+fn test_query_watermark_cloned_store_updates_do_not_race_rewind() {
+    let object_store =
+        PausingFirstPutObjectStore::new(LocalObjectStore::new(temp_storage_root("watermark-race")));
+    let first_put_started = object_store.first_put_started();
+    let release_first_put = object_store.release_first_put();
+    let store = QueryWatermarkStore::new(object_store);
+    let lower_store = store.clone();
+    let higher_store = store.clone();
+    let selector = DatasetSelector::all();
+    let key = QueryWatermarkKey::new(
+        "analytics-api",
+        test_chain(),
+        DatasetKey::evm_blocks(),
+        &selector,
+        datalens_core::LedgerRangeKind::Block,
+    );
+    let lower_key = key.clone();
+    let lower = thread::spawn(move || {
+        lower_store
+            .update(&QueryWatermark {
+                key: lower_key,
+                latest_block: 20,
+                updated_at_unix_seconds: 100,
+            })
+            .expect("lower update")
+    });
+    first_put_started
+        .recv()
+        .expect("lower update reached first put");
+
+    let higher_key = key.clone();
+    let higher = thread::spawn(move || {
+        higher_store
+            .update(&QueryWatermark {
+                key: higher_key,
+                latest_block: 25,
+                updated_at_unix_seconds: 200,
+            })
+            .expect("higher update")
+    });
+    release_first_put.send(()).expect("release lower update");
+    lower.join().expect("lower update joins");
+    higher.join().expect("higher update joins");
+
+    let watermark = store
+        .read(&key)
+        .expect("read watermark")
+        .expect("watermark");
+    assert_eq!(watermark.latest_block, 25);
+    assert_eq!(watermark.updated_at_unix_seconds, 200);
+}
+
 fn temp_storage_root(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!(
         "datalens-usage-ledger-{name}-{}",
@@ -258,6 +313,80 @@ fn test_chain() -> ChainIdentity {
 struct CountingObjectStore {
     inner: LocalObjectStore,
     total_put_bytes: Arc<AtomicU64>,
+}
+
+#[derive(Clone, Debug)]
+struct PausingFirstPutObjectStore {
+    inner: LocalObjectStore,
+    paused: Arc<AtomicBool>,
+    started: Arc<Mutex<Option<mpsc::Sender<()>>>>,
+    release: Arc<Mutex<mpsc::Receiver<()>>>,
+    release_sender: Arc<Mutex<Option<mpsc::Sender<()>>>>,
+}
+
+impl PausingFirstPutObjectStore {
+    fn new(inner: LocalObjectStore) -> Self {
+        let (started_tx, _started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        Self {
+            inner,
+            paused: Arc::new(AtomicBool::new(false)),
+            started: Arc::new(Mutex::new(Some(started_tx))),
+            release: Arc::new(Mutex::new(release_rx)),
+            release_sender: Arc::new(Mutex::new(Some(release_tx))),
+        }
+    }
+
+    fn first_put_started(&self) -> mpsc::Receiver<()> {
+        let (tx, rx) = mpsc::channel();
+        *self.started.lock().expect("started sender") = Some(tx);
+        rx
+    }
+
+    fn release_first_put(&self) -> mpsc::Sender<()> {
+        self.release_sender
+            .lock()
+            .expect("release sender")
+            .as_ref()
+            .expect("release sender")
+            .clone()
+    }
+}
+
+impl ObjectStore for PausingFirstPutObjectStore {
+    fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError> {
+        self.inner.get(key)
+    }
+
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
+        if self
+            .paused
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            if let Some(started) = self.started.lock().expect("started sender").take() {
+                started.send(()).expect("send first put started");
+            }
+            self.release
+                .lock()
+                .expect("release receiver")
+                .recv()
+                .expect("release first put");
+        }
+        self.inner.put(key, bytes)
+    }
+
+    fn exists(&self, key: &str) -> Result<bool, DatalensError> {
+        self.inner.exists(key)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
+        self.inner.list(prefix)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), DatalensError> {
+        self.inner.delete(key)
+    }
 }
 
 impl CountingObjectStore {
