@@ -277,6 +277,105 @@ async fn test_api_warmup_run_once_writes_durable_coverage_that_query_hits() {
 }
 
 #[tokio::test]
+async fn test_api_warmup_shared_registry_runs_only_matching_chain_task() {
+    let root = temp_storage_root("api-warmup-shared-registry");
+    let storage = LocalStorage::new(root.join("storage"));
+    let registry_store = LocalObjectStore::new(root.join("warmup-registry"));
+    let ethereum_source = MockSource::default();
+    let polygon_source = MockSource::default().with_chain(polygon_identity());
+    let ethereum_service = service(
+        LocalStorage::new(root.join("storage")),
+        ethereum_source.clone(),
+    )
+    .with_warmup_pool(shared_registry_warmup_pool(
+        storage.clone(),
+        LocalWarmupRegistry::new(registry_store.clone()),
+        ethereum_source.clone(),
+    ));
+    let polygon_service = service_named(
+        LocalStorage::new(root.join("storage")),
+        polygon_source.clone(),
+        "polygon",
+        chain_config(137),
+    )
+    .with_warmup_pool(shared_registry_warmup_pool(
+        storage,
+        LocalWarmupRegistry::new(registry_store),
+        polygon_source.clone(),
+    ));
+    let registry = QueryServiceRegistry::new()
+        .with_service(ethereum_service)
+        .expect("register ethereum")
+        .with_service(polygon_service)
+        .expect("register polygon");
+    let app = router(registry);
+
+    let submit = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/warmup/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "chain": ethereum_identity(),
+                        "dataset_key": "evm.logs",
+                        "selector": {
+                            "kind": "evm_logs",
+                            "value": evm_logs_selector_value(&logs_request(30, 31))
+                        },
+                        "range_kind": { "kind": "block" },
+                        "start": 30,
+                        "end": 31,
+                        "mode": "fixed_range"
+                    }))
+                    .expect("request json"),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("submit response");
+    assert_eq!(submit.status(), StatusCode::CREATED);
+
+    let list = app
+        .clone()
+        .oneshot(
+            Request::get("/v1/warmup/tasks")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("list response");
+    assert_eq!(list.status(), StatusCode::OK);
+    let list_body = body_json(list.into_body()).await;
+    assert_eq!(list_body["tasks"].as_array().expect("tasks").len(), 1);
+
+    let run_once = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/warmup/run-once")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("run once response");
+    assert_eq!(run_once.status(), StatusCode::OK);
+    assert_eq!(polygon_source.calls(), Vec::<SourceCall>::new());
+
+    ethereum_source.clear_calls();
+    let query = app
+        .oneshot(
+            Request::post("/v1/query")
+                .header("content-type", "application/json")
+                .body(Body::from(query_body(logs_request(30, 31))))
+                .expect("request"),
+        )
+        .await
+        .expect("query response");
+    assert_eq!(query.status(), StatusCode::OK);
+    assert_eq!(ethereum_source.calls(), Vec::<SourceCall>::new());
+}
+
+#[tokio::test]
 async fn test_api_warmup_native_submit_runs_solana_and_tron_tasks() {
     let root = temp_storage_root("api-warmup-native-multichain");
     let storage: Arc<dyn StorageRepository> = Arc::new(LocalStorage::new(&root));
@@ -508,4 +607,31 @@ async fn test_api_warmup_native_submit_rejects_unsupported_combinations_before_f
 
     assert_eq!(submit.status(), StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(solana_provider.data_fetch_count(), 0);
+}
+
+fn shared_registry_warmup_pool(
+    storage: LocalStorage,
+    registry: LocalWarmupRegistry<LocalObjectStore>,
+    adapter: MockSource,
+) -> WarmupTaskPool<MockSource, LocalStorage, LocalWarmupRegistry<LocalObjectStore>> {
+    WarmupTaskPool::new(
+        WarmupRuntime::new(
+            adapter,
+            storage,
+            registry,
+            datalens_writer::DurableWriterConfig {
+                target_object_bytes: 1024,
+                min_object_rows: 1,
+                record_empty_coverage: true,
+                staging: Default::default(),
+            },
+        )
+        .with_runtime_config(WarmupRuntimeConfig {
+            max_fetches_per_task_loop: 4,
+        }),
+        WarmupSchedulerConfig {
+            max_global_concurrent_tasks: 1,
+            max_concurrent_tasks_per_chain: 1,
+        },
+    )
 }

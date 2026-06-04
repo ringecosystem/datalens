@@ -117,7 +117,19 @@ where
         self.runtime.registry.get(task_id)
     }
 
-    pub fn list(&self, filter: crate::WarmupTaskFilter) -> Result<Vec<WarmupTask>, DatalensError> {
+    pub fn list(
+        &self,
+        mut filter: crate::WarmupTaskFilter,
+    ) -> Result<Vec<WarmupTask>, DatalensError> {
+        let chain_key = self.runtime.adapter.capabilities().chain().key_prefix();
+        if filter
+            .chain_key
+            .as_ref()
+            .is_some_and(|filter_chain_key| filter_chain_key != &chain_key)
+        {
+            return Ok(Vec::new());
+        }
+        filter.chain_key = Some(chain_key);
         self.runtime.registry.list(filter)
     }
 
@@ -138,10 +150,7 @@ where
         let max_global = self.config.max_global_concurrent_tasks.max(1);
         let max_per_chain = self.config.max_concurrent_tasks_per_chain.max(1);
         let mut chain_counts: HashMap<String, usize> = HashMap::new();
-        let tasks = self
-            .runtime
-            .registry
-            .list(crate::WarmupTaskFilter::default())?;
+        let tasks = self.list(crate::WarmupTaskFilter::default())?;
         for task in tasks {
             if results.len() >= max_global {
                 break;

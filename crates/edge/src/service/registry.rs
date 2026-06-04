@@ -227,15 +227,18 @@ impl QueryServiceRegistry {
         &self,
         filter: WarmupTaskFilter,
     ) -> Result<Vec<WarmupTask>, DatalensError> {
-        let mut tasks = Vec::new();
+        let mut tasks = BTreeMap::new();
         for service in self.services.values() {
             let Some(warmup) = service.warmup() else {
                 continue;
             };
-            tasks.extend(warmup.list(filter.clone())?);
+            for task in warmup.list(filter.clone())? {
+                tasks
+                    .entry(task.task_id.as_str().to_owned())
+                    .or_insert(task);
+            }
         }
-        tasks.sort_by(|left, right| left.task_id.as_str().cmp(right.task_id.as_str()));
-        Ok(tasks)
+        Ok(tasks.into_values().collect())
     }
 
     pub fn pause_warmup_task(&self, task_id: &WarmupTaskId) -> Result<WarmupTask, DatalensError> {
