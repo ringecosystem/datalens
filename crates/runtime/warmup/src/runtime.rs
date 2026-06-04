@@ -290,12 +290,16 @@ where
         let target_end = match target_plan {
             PlannedWarmupTarget::Range { end, .. } => end,
             PlannedWarmupTarget::Noop(_) => {
-                self.record_task_metric(&task, WarmupTaskOutcome::Completed);
+                if task.mode == WarmupTaskMode::FixedRange {
+                    self.record_task_metric(&task, WarmupTaskOutcome::Completed);
+                }
                 return self.finish_or_stop(task, WarmupRunResult::default());
             }
         };
         if cursor.next > target_end {
-            self.record_task_metric(&task, WarmupTaskOutcome::Completed);
+            if task.mode == WarmupTaskMode::FixedRange {
+                self.record_task_metric(&task, WarmupTaskOutcome::Completed);
+            }
             return self.finish_or_stop(task, WarmupRunResult::default());
         }
 

@@ -69,6 +69,7 @@ pub use crate::object_store::{
     LocalObjectStore, ObjectMetadata, ObjectStore, S3ObjectStore, S3ObjectStoreConfig,
     validate_object_key,
 };
+pub use crate::query_watermark::{QueryWatermark, QueryWatermarkKey, QueryWatermarkRepository};
 pub use crate::read_through_cache::ReadThroughCacheConfig;
 pub use crate::usage_ledger::{
     CacheOutcome, DurableWriteOutcome, FillOutcome, QueryOutcome, UsageLedgerEntry,
@@ -739,6 +740,26 @@ impl UsageLedgerRepository for Box<dyn UsageLedgerRepository> {
         application_id: &str,
     ) -> Result<Vec<UsageLedgerEntry>, DatalensError> {
         self.as_ref().read_application(application_id)
+    }
+}
+
+impl QueryWatermarkRepository for Arc<dyn QueryWatermarkRepository> {
+    fn update(&self, watermark: &QueryWatermark) -> Result<(), DatalensError> {
+        self.as_ref().update(watermark)
+    }
+
+    fn read(&self, key: &QueryWatermarkKey) -> Result<Option<QueryWatermark>, DatalensError> {
+        self.as_ref().read(key)
+    }
+}
+
+impl QueryWatermarkRepository for Box<dyn QueryWatermarkRepository> {
+    fn update(&self, watermark: &QueryWatermark) -> Result<(), DatalensError> {
+        self.as_ref().update(watermark)
+    }
+
+    fn read(&self, key: &QueryWatermarkKey) -> Result<Option<QueryWatermark>, DatalensError> {
+        self.as_ref().read(key)
     }
 }
 

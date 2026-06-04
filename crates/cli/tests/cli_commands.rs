@@ -16,8 +16,8 @@ use datalens_core::{
     NetworkId, QueryRows, QueryStrategy,
 };
 use datalens_storage::{
-    CacheOutcome, FillOutcome, ObjectStore, QueryOutcome, UsageLedgerEntry, UsageLedgerRepository,
-    UsageLedgerStore,
+    CacheOutcome, FillOutcome, ObjectStore, QueryOutcome, QueryWatermark, QueryWatermarkKey,
+    QueryWatermarkRepository, UsageLedgerEntry, UsageLedgerRepository, UsageLedgerStore,
 };
 use datalens_storage::{LocalStorage, StorageWriteRequest};
 
@@ -658,6 +658,188 @@ fn test_config_parses_writer_staging_thresholds() {
     assert!(config.writer.staging.flush_on_shutdown);
     assert_eq!(config.writer.staging.max_staged_bytes, Some(4096));
     validate_config(&config).expect("staging config is valid");
+}
+
+#[test]
+fn test_config_parses_warmup_follow_query_lookahead() {
+    let config = toml::from_str::<DatalensConfig>(
+        r#"
+        [server]
+        bind = "127.0.0.1:0"
+
+        [storage]
+        backend = "local"
+
+        [storage.local]
+        root = ".tmp/datalens-cli-test"
+
+        [planner]
+        max_query_range_blocks = 100
+        default_chunk_range_blocks = 10
+
+        [writer]
+        target_object_bytes = 1024
+        min_object_rows = 1
+        record_empty_coverage = true
+
+        [warmup]
+        enabled = true
+        registry_path = ".tmp/datalens-warmup"
+        scheduler_interval_ms = 1000
+        max_global_tasks = 1
+        max_per_chain_tasks = 1
+        max_fetches_per_loop = 1
+        follow_query_lookahead_blocks = 2048
+
+        [chains.ethereum]
+        kind = "evm"
+        chain_id = 1
+        rpc_urls = ["http://example.invalid"]
+
+        [chains.ethereum.datasets.blocks]
+        enabled = true
+        max_batch_blocks = 10
+
+        [chains.ethereum.datasets.logs]
+        enabled = true
+        max_get_logs_range_blocks = 10
+        max_addresses_per_query = 2
+        "#,
+    )
+    .expect("config parses");
+
+    assert_eq!(config.warmup.follow_query_lookahead_blocks, 2048);
+    validate_config(&config).expect("warmup follow-query config is valid");
+}
+
+#[test]
+fn test_validate_config_rejects_zero_warmup_follow_query_lookahead() {
+    let config = toml::from_str::<DatalensConfig>(
+        r#"
+        [server]
+        bind = "127.0.0.1:0"
+
+        [storage]
+        backend = "local"
+
+        [storage.local]
+        root = ".tmp/datalens-cli-test"
+
+        [planner]
+        max_query_range_blocks = 100
+        default_chunk_range_blocks = 10
+
+        [writer]
+        target_object_bytes = 1024
+        min_object_rows = 1
+        record_empty_coverage = true
+
+        [warmup]
+        enabled = true
+        registry_path = ".tmp/datalens-warmup"
+        scheduler_interval_ms = 1000
+        max_global_tasks = 1
+        max_per_chain_tasks = 1
+        max_fetches_per_loop = 1
+        follow_query_lookahead_blocks = 0
+
+        [chains.ethereum]
+        kind = "evm"
+        chain_id = 1
+        rpc_urls = ["http://example.invalid"]
+
+        [chains.ethereum.datasets.blocks]
+        enabled = true
+        max_batch_blocks = 10
+
+        [chains.ethereum.datasets.logs]
+        enabled = true
+        max_get_logs_range_blocks = 10
+        max_addresses_per_query = 2
+        "#,
+    )
+    .expect("config parses");
+
+    let error = validate_config(&config).expect_err("zero lookahead rejected");
+
+    assert_eq!(error.kind, DatalensErrorKind::InvalidInput);
+    assert!(
+        error
+            .message
+            .contains("warmup.follow_query_lookahead_blocks")
+    );
+}
+
+#[test]
+fn test_build_query_watermarks_uses_configured_local_storage_root() {
+    let root = temp_storage_root("query-watermark-builder");
+    let config = toml::from_str::<DatalensConfig>(&format!(
+        r#"
+        [server]
+        bind = "127.0.0.1:0"
+
+        [storage]
+        backend = "local"
+
+        [storage.local]
+        root = "{}"
+
+        [planner]
+        max_query_range_blocks = 100
+        default_chunk_range_blocks = 10
+
+        [writer]
+        target_object_bytes = 1024
+        min_object_rows = 1
+        record_empty_coverage = true
+
+        [chains.ethereum]
+        kind = "evm"
+        chain_id = 1
+        rpc_urls = ["http://example.invalid"]
+
+        [chains.ethereum.datasets.blocks]
+        enabled = true
+        max_batch_blocks = 10
+
+        [chains.ethereum.datasets.logs]
+        enabled = true
+        max_get_logs_range_blocks = 10
+        max_addresses_per_query = 2
+        "#,
+        root.display()
+    ))
+    .expect("config parses");
+    let watermarks = build_query_watermarks(&config).expect("build query watermark repository");
+    let key = QueryWatermarkKey::new(
+        "analytics-api",
+        ChainIdentity::try_new(ChainFamily::Evm, "ethereum", Some(NetworkId::numeric(1)))
+            .expect("chain"),
+        DatasetKey::evm_blocks(),
+        &DatasetSelector::all(),
+        datalens_core::LedgerRangeKind::Block,
+    );
+
+    watermarks
+        .update(&QueryWatermark {
+            key: key.clone(),
+            latest_block: 42,
+            updated_at_unix_seconds: 1,
+        })
+        .expect("write watermark");
+
+    assert_eq!(
+        watermarks
+            .read(&key)
+            .expect("read watermark")
+            .expect("watermark")
+            .latest_block,
+        42
+    );
+    assert!(
+        root.join("query-watermarks").exists(),
+        "watermark builder should use the configured storage root"
+    );
 }
 
 #[test]
