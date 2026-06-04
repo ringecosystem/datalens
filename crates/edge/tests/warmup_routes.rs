@@ -69,6 +69,35 @@ async fn test_api_warmup_routes_manage_application_scoped_tasks() {
     assert_eq!(list.status(), StatusCode::OK);
     let list_body = body_json(list.into_body()).await;
     assert_eq!(list_body["tasks"].as_array().expect("tasks").len(), 1);
+    let listed_task = &list_body["tasks"][0];
+    assert_eq!(listed_task["selector"]["kind"], "evm_logs");
+    assert!(
+        listed_task["selector"]["fingerprint"]
+            .as_str()
+            .expect("selector fingerprint")
+            .starts_with("evm-logs/")
+    );
+    assert!(
+        listed_task["selector"]["canonical_key"]
+            .as_str()
+            .expect("selector canonical key")
+            .starts_with("evm-logs/addr=")
+    );
+
+    let read = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/v1/warmup/tasks/{task_id}"))
+                .header("x-datalens-application", "app-a")
+                .header("authorization", "Bearer token-a")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("read response");
+    assert_eq!(read.status(), StatusCode::OK);
+    let read_body = body_json(read.into_body()).await;
+    assert_eq!(read_body["task"]["selector"], listed_task["selector"]);
 
     let forbidden = app
         .clone()
@@ -467,12 +496,24 @@ async fn test_api_warmup_native_submit_runs_solana_and_tron_tasks() {
     assert!(tasks.iter().any(|task| {
         task["dataset_key"].as_str() == Some("solana.slots")
             && task["range_kind"] == serde_json::json!({ "kind": "slot" })
+            && task["selector"]
+                == serde_json::json!({
+                    "kind": "solana_all",
+                    "fingerprint": "solana-all/all",
+                    "canonical_key": "all"
+                })
             && task["start"] == 10
             && task["end"] == 12
     }));
     assert!(tasks.iter().any(|task| {
         task["dataset_key"].as_str() == Some("tron.blocks")
             && task["range_kind"] == serde_json::json!({ "kind": "block" })
+            && task["selector"]
+                == serde_json::json!({
+                    "kind": "tron_all",
+                    "fingerprint": "tron-all/all",
+                    "canonical_key": "all"
+                })
             && task["start"] == 10
             && task["end"] == 12
     }));

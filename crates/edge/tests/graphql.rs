@@ -607,6 +607,102 @@ async fn test_graphql_query_records_metrics_with_application_header() {
     ));
 }
 
+#[tokio::test]
+async fn test_graphql_warmup_task_exposes_selector_metadata() {
+    let root = temp_storage_root("gql-warmup-selector");
+    let source = MockSource::default();
+    let service = service(LocalStorage::new(&root), source).with_warmup_pool(warmup_pool(&root));
+    let registry = QueryServiceRegistry::new()
+        .with_service(service)
+        .expect("register service");
+    let app = graphql_router(registry);
+
+    let submit = graphql_json(
+        app.clone(),
+        r#"
+        mutation($input: WarmupSubmitInput!) {
+          submitWarmupTask(input: $input) {
+            taskId
+          }
+        }
+        "#,
+        serde_json::json!({
+            "input": {
+                "chain": ethereum_chain_input(),
+                "datasetKey": dataset_key_input("evm", "logs"),
+                "selector": {
+                    "kind": "evm_logs",
+                    "evmLogs": {
+                        "addresses": ["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+                        "topics": []
+                    }
+                },
+                "rangeKind": { "kind": "block" },
+                "start": 20,
+                "end": 21,
+                "mode": "fixed_range"
+            }
+        }),
+    )
+    .await;
+    assert_eq!(submit["errors"], serde_json::Value::Null);
+    let task_id = submit["data"]["submitWarmupTask"]["taskId"]
+        .as_str()
+        .expect("task id")
+        .to_owned();
+
+    let listed = graphql_json(
+        app.clone(),
+        r#"
+        query {
+          warmupTasks {
+            selector {
+              kind
+              fingerprint
+              canonicalKey
+            }
+          }
+        }
+        "#,
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(listed["errors"], serde_json::Value::Null);
+    let selector = &listed["data"]["warmupTasks"][0]["selector"];
+    assert_eq!(selector["kind"], "evm_logs");
+    assert!(
+        selector["fingerprint"]
+            .as_str()
+            .expect("selector fingerprint")
+            .starts_with("evm-logs/")
+    );
+    assert!(
+        selector["canonicalKey"]
+            .as_str()
+            .expect("selector canonical key")
+            .starts_with("evm-logs/addr=")
+    );
+
+    let read = graphql_json(
+        app,
+        r#"
+        query($id: ID!) {
+          warmupTask(id: $id) {
+            selector {
+              kind
+              fingerprint
+              canonicalKey
+            }
+          }
+        }
+        "#,
+        serde_json::json!({ "id": task_id }),
+    )
+    .await;
+    assert_eq!(read["errors"], serde_json::Value::Null);
+    assert_eq!(read["data"]["warmupTask"]["selector"], *selector);
+}
+
 #[derive(Clone, Default)]
 struct MissingTronBlockProvider {
     calls: Arc<Mutex<Vec<u64>>>,

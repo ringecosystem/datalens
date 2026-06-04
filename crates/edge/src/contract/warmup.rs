@@ -1,4 +1,4 @@
-use datalens_chain::{AdapterKey, DatasetSelector};
+use datalens_chain::{AdapterKey, DatasetSelector, SelectorKind};
 use datalens_core::{ChainIdentity, DatalensError, DatasetKey, LedgerRangeKind, LogFilter};
 use datalens_warmup::{
     WarmupChunkPolicy, WarmupRetryPolicy, WarmupRunResult, WarmupTask, WarmupTaskId,
@@ -70,6 +70,7 @@ pub struct WarmupTaskView {
     pub application_id: String,
     pub chain: ChainIdentity,
     pub dataset_key: String,
+    pub selector: WarmupSelectorView,
     pub range_kind: LedgerRangeKind,
     pub start: u64,
     pub end: Option<u64>,
@@ -79,6 +80,13 @@ pub struct WarmupTaskView {
     pub updated_at: u64,
     pub last_error: Option<String>,
     pub stats: datalens_warmup::WarmupStats,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WarmupSelectorView {
+    pub kind: String,
+    pub fingerprint: String,
+    pub canonical_key: String,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize)]
@@ -121,6 +129,16 @@ impl WarmupSelectorApiRequest {
     }
 }
 
+impl From<&DatasetSelector> for WarmupSelectorView {
+    fn from(selector: &DatasetSelector) -> Self {
+        Self {
+            kind: selector_kind_name(&selector.kind()),
+            fingerprint: selector.fingerprint(),
+            canonical_key: selector.canonical_key(),
+        }
+    }
+}
+
 impl WarmupSubmitApiRequest {
     pub(crate) fn chain(&self) -> &ChainIdentity {
         &self.chain
@@ -137,6 +155,7 @@ pub(crate) fn warmup_task_view(task: WarmupTask) -> Result<WarmupTaskView, Datal
         application_id: task.application_id,
         chain: task.chain,
         dataset_key: task.dataset_key.as_str().to_owned(),
+        selector: WarmupSelectorView::from(&task.selector),
         range_kind: task.range_kind,
         start: task.start,
         end: task.end,
@@ -147,4 +166,12 @@ pub(crate) fn warmup_task_view(task: WarmupTask) -> Result<WarmupTaskView, Datal
         last_error: task.last_error,
         stats: task.stats,
     })
+}
+
+fn selector_kind_name(selector: &SelectorKind) -> String {
+    match selector {
+        SelectorKind::All => "all".to_owned(),
+        SelectorKind::EvmLogs => "evm_logs".to_owned(),
+        SelectorKind::Other(kind) => kind.as_str().to_owned(),
+    }
 }
