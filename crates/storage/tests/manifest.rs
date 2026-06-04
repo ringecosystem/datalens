@@ -1185,6 +1185,61 @@ fn test_broad_evm_log_topic_values_coverage_serves_narrow_query() {
 }
 
 #[test]
+fn test_exact_evm_log_coverage_prevents_overlapping_semantic_read() {
+    let storage = LocalStorage::new(temp_storage_root("semantic-overlap-exact-preferred"));
+    let chain = test_chain();
+    let query_selector = evm_log_selector(vec![ADDRESS_A], vec![Some(vec![TOPIC_1])]);
+    let broad_selector = evm_log_selector(vec![ADDRESS_A, ADDRESS_B, ADDRESS_C], vec![]);
+    let exact_rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![log_record(12, 0, ADDRESS_A, vec![TOPIC_1])]),
+    )
+    .expect("exact rows");
+    let broad_rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![
+            log_record(12, 1, ADDRESS_A, vec![TOPIC_1]),
+            log_record(12, 2, ADDRESS_B, vec![TOPIC_2]),
+        ]),
+    )
+    .expect("broad rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &query_selector,
+            range: LedgerRange::blocks(12, 12).expect("valid range"),
+            rows: &exact_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write exact rows");
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &broad_selector,
+            range: LedgerRange::blocks(12, 12).expect("valid range"),
+            rows: &broad_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write broad rows");
+
+    let read = storage
+        .read_rows(
+            &chain,
+            &DatasetKey::evm_logs(),
+            &query_selector,
+            LedgerRange::blocks(12, 12).expect("valid range"),
+        )
+        .expect("read rows");
+
+    assert_eq!(read, exact_rows);
+}
+
+#[test]
 fn test_broad_evm_log_empty_coverage_satisfies_narrow_query() {
     let storage = LocalStorage::new(temp_storage_root("semantic-empty-coverage"));
     let chain = test_chain();

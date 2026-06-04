@@ -9,7 +9,7 @@ use std::{
 };
 
 use crate::read_through_cache;
-use crate::selector_coverage::{entry_covers_selector, filter_evm_log_rows_for_selector};
+use crate::selector_coverage::{filter_evm_log_rows_for_selector, selector_coverage_candidates};
 
 #[derive(Debug)]
 /// Storage write request for one durable coverage segment. The caller must pass
@@ -202,19 +202,12 @@ where
         // Manifest entries are the sole coverage authority. Empty coverage and
         // data-object coverage both count here because both were provider
         // confirmed before entering the manifest.
-        let selector_fingerprint = selector.fingerprint();
-        let mut ranges = self
-            .manifest_for_chain(chain)?
-            .entries
-            .into_iter()
-            .filter(|entry| {
-                entry.chain == *chain
-                    && entry.dataset_key == *dataset_key
-                    && entry.range.kind() == range.kind()
-                    && entry_covers_selector(entry, dataset_key, selector, &selector_fingerprint)
-            })
-            .filter_map(|entry| intersect(entry.range, range.clone()))
-            .collect::<Vec<_>>();
+        let manifest = self.manifest_for_chain(chain)?;
+        let mut ranges =
+            selector_coverage_candidates(&manifest.entries, chain, dataset_key, selector, &range)
+                .into_iter()
+                .flat_map(|candidate| candidate.ranges)
+                .collect::<Vec<_>>();
         ranges.sort_by_key(|range| range.start());
         Ok(merge_ranges(ranges))
     }
@@ -232,19 +225,12 @@ where
             range.start(),
             range.end()
         );
-        let selector_fingerprint = selector.fingerprint();
+        let manifest = self.manifest_for_chain(chain)?;
         let mut rows = empty_rows(dataset_key.clone())?.into_rows();
-        for entry in self.manifest_for_chain(chain)?.entries {
-            if entry.chain != *chain
-                || entry.dataset_key != *dataset_key
-                || entry.range.kind() != range.kind()
-                || !entry_covers_selector(&entry, dataset_key, selector, &selector_fingerprint)
-            {
-                continue;
-            }
-            if intersect(entry.range.clone(), range.clone()).is_none() {
-                continue;
-            }
+        for candidate in
+            selector_coverage_candidates(&manifest.entries, chain, dataset_key, selector, &range)
+        {
+            let entry = candidate.entry;
             let Some(object_key) = entry.object_key.as_deref() else {
                 continue;
             };
@@ -260,7 +246,7 @@ where
                     format!("manifest entry object {object_key} missing object_encoding"),
                 ));
             };
-            let mut object_rows =
+            let object_rows =
                 if let Some(rows) = self.read_through_cache.get(object_key, &entry, encoding) {
                     rows
                 } else {
@@ -277,9 +263,11 @@ where
                         .put(object_key, &entry, encoding, object_rows.clone());
                     object_rows
                 };
-            object_rows = filter_rows(object_rows, range.clone());
-            object_rows = filter_evm_log_rows_for_selector(object_rows, selector);
-            rows.try_append(object_rows.into_rows())?;
+            for candidate_range in candidate.ranges {
+                let mut candidate_rows = filter_rows(object_rows.clone(), candidate_range);
+                candidate_rows = filter_evm_log_rows_for_selector(candidate_rows, selector);
+                rows.try_append(candidate_rows.into_rows())?;
+            }
         }
         rows.sort();
         DatasetRows::new(dataset_key.clone(), rows)

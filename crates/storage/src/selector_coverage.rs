@@ -1,17 +1,104 @@
 use datalens_chain::DatasetSelector;
-use datalens_core::{DatasetKey, DatasetRows, EvmLogFilter, LogFilter, QueryRows};
+use datalens_core::{
+    ChainIdentity, DatasetKey, DatasetRows, EvmLogFilter, LedgerRange, LogFilter, QueryRows,
+    missing_ranges,
+};
 
-use crate::ManifestEntry;
+use crate::{ManifestEntry, intersect, merge_ranges};
 
-pub(crate) fn entry_covers_selector(
-    entry: &ManifestEntry,
+pub(crate) struct SelectorCoverageCandidate<'a> {
+    pub(crate) entry: &'a ManifestEntry,
+    pub(crate) ranges: Vec<LedgerRange>,
+}
+
+pub(crate) fn selector_coverage_candidates<'a>(
+    entries: &'a [ManifestEntry],
+    chain: &ChainIdentity,
+    dataset_key: &DatasetKey,
+    selector: &DatasetSelector,
+    range: &LedgerRange,
+) -> Vec<SelectorCoverageCandidate<'a>> {
+    let selector_fingerprint = selector.fingerprint();
+    let mut candidates =
+        exact_selector_candidates(entries, chain, dataset_key, &selector_fingerprint, range);
+    let exact_ranges = merge_ranges(
+        candidates
+            .iter()
+            .flat_map(|candidate| candidate.ranges.clone())
+            .collect(),
+    );
+    candidates.extend(semantic_selector_candidates(
+        entries,
+        chain,
+        dataset_key,
+        selector,
+        &selector_fingerprint,
+        range,
+        &exact_ranges,
+    ));
+    candidates
+}
+
+fn exact_selector_candidates<'a>(
+    entries: &'a [ManifestEntry],
+    chain: &ChainIdentity,
+    dataset_key: &DatasetKey,
+    selector_fingerprint: &str,
+    range: &LedgerRange,
+) -> Vec<SelectorCoverageCandidate<'a>> {
+    entries
+        .iter()
+        .filter(|entry| entry_matches_context(entry, chain, dataset_key, range))
+        .filter(|entry| entry.selector_fingerprint == selector_fingerprint)
+        .filter_map(|entry| {
+            intersect(entry.range.clone(), range.clone()).map(|range| SelectorCoverageCandidate {
+                entry,
+                ranges: vec![range],
+            })
+        })
+        .collect()
+}
+
+fn semantic_selector_candidates<'a>(
+    entries: &'a [ManifestEntry],
+    chain: &ChainIdentity,
     dataset_key: &DatasetKey,
     selector: &DatasetSelector,
     selector_fingerprint: &str,
+    range: &LedgerRange,
+    exact_ranges: &[LedgerRange],
+) -> Vec<SelectorCoverageCandidate<'a>> {
+    entries
+        .iter()
+        .filter(|entry| entry_matches_context(entry, chain, dataset_key, range))
+        .filter(|entry| entry.selector_fingerprint != selector_fingerprint)
+        .filter(|entry| entry_semantically_covers_selector(entry, dataset_key, selector))
+        .filter_map(|entry| {
+            let intersection = intersect(entry.range.clone(), range.clone())?;
+            let ranges = missing_ranges(intersection.clone(), exact_ranges);
+            if ranges.is_empty() {
+                None
+            } else {
+                Some(SelectorCoverageCandidate { entry, ranges })
+            }
+        })
+        .collect()
+}
+
+fn entry_matches_context(
+    entry: &ManifestEntry,
+    chain: &ChainIdentity,
+    dataset_key: &DatasetKey,
+    range: &LedgerRange,
 ) -> bool {
-    if entry.selector_fingerprint == selector_fingerprint {
-        return true;
-    }
+    entry.chain == *chain && entry.dataset_key == *dataset_key && entry.range.kind() == range.kind()
+}
+
+fn entry_semantically_covers_selector(
+    entry: &ManifestEntry,
+    dataset_key: &DatasetKey,
+    selector: &DatasetSelector,
+) -> bool {
     if *dataset_key != DatasetKey::evm_logs() {
         return false;
     }
