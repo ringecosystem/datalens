@@ -1,4 +1,10 @@
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
 
 use datalens_chain::{ChainAdapter, ChainFetchRequest, FetchContext, FinalityLevel};
 use datalens_core::{
@@ -25,6 +31,17 @@ use datalens_writer::{
 
 use crate::helpers::*;
 pub use crate::hot_promotion::HotCachePromoter;
+
+static QUERY_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+pub fn generate_query_id() -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default();
+    let counter = QUERY_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("q{}{}", base36(millis), base36(counter))
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Native query executor configuration shared by REST and GraphQL query flows.
@@ -150,7 +167,7 @@ where
         &self,
         input: NativeQueryInput,
     ) -> Result<NativeQueryExecutionResult, DatalensError> {
-        self.execute_with_application(input, None)
+        self.execute_with_application_and_query_id(input, None, generate_query_id())
     }
 
     pub fn latest_height(&self) -> Result<datalens_chain::ChainHeight, DatalensError> {
@@ -182,6 +199,15 @@ where
         input: NativeQueryInput,
         application: Option<ApplicationIdentity>,
     ) -> Result<NativeQueryExecutionResult, DatalensError> {
+        self.execute_with_application_and_query_id(input, application, generate_query_id())
+    }
+
+    pub fn execute_with_application_and_query_id(
+        &self,
+        input: NativeQueryInput,
+        application: Option<ApplicationIdentity>,
+        query_id: String,
+    ) -> Result<NativeQueryExecutionResult, DatalensError> {
         let start = Instant::now();
         let labels = self.metrics_labels(&input, application.clone());
         let ledger_application = self.ledger_application(application.clone());
@@ -189,7 +215,7 @@ where
             recorder.set_latest_requested_block(labels, input.ledger_range.end());
         }
         if matches!(input.finality, QueryFinalityRequirement::LatestOnly) {
-            return self.execute_hot_read_through(input, application, start, labels);
+            return self.execute_hot_read_through(input, application, start, labels, query_id);
         }
 
         // Coverage is read before asking the adapter for finality so full
@@ -320,13 +346,34 @@ where
             }
         };
 
-        log::info!(
-            "query executor cache summary dataset={} hit_ranges={} missing_ranges={}",
-            plan.dataset_key.as_str(),
-            plan.coverage.hit_ranges.len(),
-            plan.coverage.missing_ranges.len()
-        );
         let coverage_outcome = plan_coverage_outcome(&plan);
+        let provider_fill_ranges = plan
+            .fetch_tasks
+            .iter()
+            .map(|task| task.range.clone())
+            .collect::<Vec<_>>();
+        log::info!(
+            "query executor cache summary {}",
+            cache_diagnostic_summary(
+                &query_id,
+                &plan.chain,
+                &plan.dataset_key,
+                &plan.ledger_range,
+                &plan.selector,
+                plan.coverage.status.clone(),
+                coverage_outcome,
+                &plan.coverage.hit_ranges,
+                &plan.coverage.missing_ranges,
+                &plan.coverage.durable_hit_ranges,
+                &plan.coverage.hot_hit_ranges,
+                &provider_fill_ranges,
+            )
+        );
+        log::debug!(
+            "query executor selector canonical query_id={} selector_canonical_key={}",
+            query_id,
+            plan.selector.canonical_key()
+        );
         self.record_cache_coverage(&labels, coverage_outcome);
 
         let mut rows = empty_query_rows(&plan.dataset_key);
@@ -410,7 +457,7 @@ where
                 plan.selector.clone(),
             )
             .with_context(FetchContext {
-                request_id: None,
+                request_id: Some(query_id.clone()),
                 cache_write: task.cache_write,
             });
             let fetched = match self.source.fetch(fetch_request.clone()) {
@@ -434,7 +481,8 @@ where
                 }
                 Err(error) => {
                     log::warn!(
-                        "provider fetch failed dataset={} range={}-{} kind={:?}",
+                        "provider fetch failed query_id={} dataset={} range={}-{} kind={:?}",
+                        query_id,
                         plan.dataset_key.as_str(),
                         task.range.start(),
                         task.range.end(),
@@ -561,11 +609,7 @@ where
 
         rows.sort();
         let mut cache = plan.coverage.clone();
-        cache.provider_fill_ranges = plan
-            .fetch_tasks
-            .iter()
-            .map(|task| task.range.clone())
-            .collect();
+        cache.provider_fill_ranges = provider_fill_ranges;
 
         let result = NativeQueryExecutionResult {
             chain: plan.chain.clone(),
@@ -595,6 +639,7 @@ where
         application: Option<ApplicationIdentity>,
         start: Instant,
         labels: Option<MetricsLabels>,
+        query_id: String,
     ) -> Result<NativeQueryExecutionResult, DatalensError> {
         let ledger_application = self.ledger_application(application);
         // Latest-only queries bypass durable coverage entirely so unsafe/latest
@@ -642,6 +687,33 @@ where
         };
 
         self.record_cache_coverage(&labels, CacheCoverageOutcome::HotMiss);
+        let provider_fill_ranges = plan
+            .fetch_tasks
+            .iter()
+            .map(|task| task.range.clone())
+            .collect::<Vec<_>>();
+        log::info!(
+            "query executor cache summary {}",
+            cache_diagnostic_summary(
+                &query_id,
+                &plan.chain,
+                &plan.dataset_key,
+                &plan.ledger_range,
+                &plan.selector,
+                plan.coverage.status.clone(),
+                CacheCoverageOutcome::HotMiss,
+                &plan.coverage.hit_ranges,
+                &plan.coverage.missing_ranges,
+                &plan.coverage.durable_hit_ranges,
+                &plan.coverage.hot_hit_ranges,
+                &provider_fill_ranges,
+            )
+        );
+        log::debug!(
+            "query executor selector canonical query_id={} selector_canonical_key={}",
+            query_id,
+            plan.selector.canonical_key()
+        );
         let fill_start = Instant::now();
         let mut rows = empty_query_rows(&plan.dataset_key);
         for task in &plan.fetch_tasks {
@@ -652,7 +724,7 @@ where
                 plan.selector.clone(),
             )
             .with_context(FetchContext {
-                request_id: None,
+                request_id: Some(query_id.clone()),
                 cache_write: false,
             });
             let fetched = match self.source.fetch(fetch_request.clone()) {
@@ -712,11 +784,7 @@ where
 
         rows.sort();
         let mut cache = plan.coverage.clone();
-        cache.provider_fill_ranges = plan
-            .fetch_tasks
-            .iter()
-            .map(|task| task.range.clone())
-            .collect();
+        cache.provider_fill_ranges = provider_fill_ranges;
 
         let result = NativeQueryExecutionResult {
             chain: plan.chain.clone(),
@@ -937,10 +1005,97 @@ fn durable_watermark_block(plan: &datalens_planner::NativeQueryPlan) -> Option<u
 }
 
 fn unix_seconds_now() -> Result<u64, DatalensError> {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .map_err(|error| {
             DatalensError::internal(format!("system clock before unix epoch: {error}"))
         })
+}
+
+fn base36(mut value: u64) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    if value == 0 {
+        return "0".to_owned();
+    }
+    let mut encoded = Vec::new();
+    while value > 0 {
+        encoded.push(DIGITS[(value % 36) as usize] as char);
+        value /= 36;
+    }
+    encoded.iter().rev().collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cache_diagnostic_summary(
+    query_id: &str,
+    chain: &ChainIdentity,
+    dataset_key: &DatasetKey,
+    ledger_range: &LedgerRange,
+    selector: &datalens_chain::DatasetSelector,
+    cache_status: datalens_planner::QueryPlanStatus,
+    cache_outcome: CacheCoverageOutcome,
+    hit_ranges: &[LedgerRange],
+    missing_ranges: &[LedgerRange],
+    durable_hit_ranges: &[LedgerRange],
+    hot_hit_ranges: &[LedgerRange],
+    provider_fill_ranges: &[LedgerRange],
+) -> String {
+    format!(
+        "query_id={} chain={} dataset={} range={}-{} selector_kind={:?} selector_fingerprint={} cache_status={:?} cache_outcome={:?} hit_ranges={} missing_ranges={} durable_hit_ranges={} hot_hit_ranges={} provider_fill_ranges={}",
+        query_id,
+        chain.configured_name(),
+        dataset_key.as_str(),
+        ledger_range.start(),
+        ledger_range.end(),
+        selector.kind(),
+        selector.fingerprint(),
+        cache_status,
+        cache_outcome,
+        format_ranges(hit_ranges),
+        format_ranges(missing_ranges),
+        format_ranges(durable_hit_ranges),
+        format_ranges(hot_hit_ranges),
+        format_ranges(provider_fill_ranges),
+    )
+}
+
+fn format_ranges(ranges: &[LedgerRange]) -> String {
+    let formatted = ranges
+        .iter()
+        .map(|range| format!("{}-{}", range.start(), range.end()))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{}[{}]", ranges.len(), formatted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cache_diagnostic_summary_includes_query_context_and_compact_ranges() {
+        let summary = cache_diagnostic_summary(
+            "q-abc",
+            &ChainIdentity::expect_new(datalens_core::ChainFamily::Evm, "ethereum"),
+            &DatasetKey::evm_blocks(),
+            &LedgerRange::blocks(10, 15).expect("range"),
+            &datalens_chain::DatasetSelector::all(),
+            datalens_planner::QueryPlanStatus::PartialHit,
+            CacheCoverageOutcome::PartialHit,
+            &[
+                LedgerRange::blocks(10, 11).expect("range"),
+                LedgerRange::blocks(14, 14).expect("range"),
+            ],
+            &[LedgerRange::blocks(12, 13).expect("range")],
+            &[LedgerRange::blocks(10, 11).expect("range")],
+            &[],
+            &[LedgerRange::blocks(12, 13).expect("range")],
+        );
+
+        assert_eq!(
+            summary,
+            "query_id=q-abc chain=ethereum dataset=evm.blocks range=10-15 selector_kind=All selector_fingerprint=all cache_status=PartialHit cache_outcome=PartialHit hit_ranges=2[10-11,14-14] missing_ranges=1[12-13] durable_hit_ranges=1[10-11] hot_hit_ranges=0[] provider_fill_ranges=1[12-13]"
+        );
+    }
 }

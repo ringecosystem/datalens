@@ -4,7 +4,7 @@ use datalens_chain::{
     AdapterCapabilities, ChainAdapter, ChainHeight, DatasetCapability, SelectorKind,
 };
 use datalens_core::{DatalensError, DatalensErrorKind, DatasetKey, DatasetRows, LedgerRange};
-use datalens_executor::{NativeQueryExecutionConfig, NativeQueryExecutor};
+use datalens_executor::{NativeQueryExecutionConfig, NativeQueryExecutor, generate_query_id};
 use datalens_metrics::{ApplicationIdentity, MetricsRecorder};
 use datalens_planner::{NativePlannerConfig, NativeQueryInput};
 use datalens_storage::{QueryWatermarkRepository, StorageRepository, UsageLedgerRepository};
@@ -239,16 +239,20 @@ where
             log::warn!("query validation failed kind={:?}", error.kind);
             return Err(error);
         }
+        let query_id = generate_query_id();
         log::info!(
-            "native query start chain={} dataset={} range={}-{}",
+            "native query start query_id={} chain={} dataset={} range={}-{}",
+            query_id,
             native_input.chain.configured_name(),
             native_input.dataset_key.as_str(),
             native_input.ledger_range.start(),
             native_input.ledger_range.end()
         );
-        let result = self
-            .executor
-            .execute_with_application(native_input, application)?;
+        let result = self.executor.execute_with_application_and_query_id(
+            native_input,
+            application,
+            query_id,
+        )?;
         Ok(NativeQueryResponse {
             chain: result.chain,
             dataset_key: result.dataset_key,

@@ -236,13 +236,32 @@ impl EvmRpcClient {
         range: BlockRange,
         filter: &EvmLogFilter,
     ) -> Result<Vec<LogRecord>, DatalensError> {
-        log::info!(
-            "fetching EVM logs range={}-{} addresses={} topic_slots={}",
-            range.from_block,
-            range.to_block,
-            filter.addresses().len(),
-            filter.topics().len()
-        );
+        self.fetch_evm_logs_with_request_id(range, filter, None)
+    }
+
+    fn fetch_evm_logs_with_request_id(
+        &self,
+        range: BlockRange,
+        filter: &EvmLogFilter,
+        request_id: Option<&str>,
+    ) -> Result<Vec<LogRecord>, DatalensError> {
+        match request_id {
+            Some(request_id) => log::info!(
+                "fetching EVM logs request_id={} range={}-{} addresses={} topic_slots={}",
+                request_id,
+                range.from_block,
+                range.to_block,
+                filter.addresses().len(),
+                filter.topics().len()
+            ),
+            None => log::info!(
+                "fetching EVM logs range={}-{} addresses={} topic_slots={}",
+                range.from_block,
+                range.to_block,
+                filter.addresses().len(),
+                filter.topics().len()
+            ),
+        }
         let result = self.call("eth_getLogs", json!([evm_log_filter(range, filter)]))?;
         let logs = result
             .and_then(|value| value.as_array().cloned())
@@ -263,18 +282,29 @@ impl EvmRpcClient {
         Ok(logs)
     }
 
-    fn fetch_evm_logs_from_receipts(
+    fn fetch_evm_logs_from_receipts_with_request_id(
         &self,
         range: BlockRange,
         filter: &EvmLogFilter,
+        request_id: Option<&str>,
     ) -> Result<(Vec<LogRecord>, usize), DatalensError> {
-        log::info!(
-            "fetching EVM logs with block scan range={}-{} addresses={} topic_slots={}",
-            range.from_block,
-            range.to_block,
-            filter.addresses().len(),
-            filter.topics().len()
-        );
+        match request_id {
+            Some(request_id) => log::info!(
+                "fetching EVM logs with block scan request_id={} range={}-{} addresses={} topic_slots={}",
+                request_id,
+                range.from_block,
+                range.to_block,
+                filter.addresses().len(),
+                filter.topics().len()
+            ),
+            None => log::info!(
+                "fetching EVM logs with block scan range={}-{} addresses={} topic_slots={}",
+                range.from_block,
+                range.to_block,
+                filter.addresses().len(),
+                filter.topics().len()
+            ),
+        }
         let mut logs = Vec::new();
         let mut provider_calls = 0;
         for block in self.fetch_full_blocks(range)? {
@@ -660,6 +690,7 @@ impl ChainAdapter for EvmRpcClient {
             }
         }
         let mut warnings = Vec::new();
+        let request_id = request.context.request_id.clone();
         let (rows, provider_calls) = match (&request.dataset_key, &request.selector) {
             (dataset, DatasetSelector::All) if *dataset == DatasetKey::evm_blocks() => (
                 QueryRows::EvmBlocks(self.fetch_blocks(range)?),
@@ -681,7 +712,11 @@ impl ChainAdapter for EvmRpcClient {
                 })?;
                 match self.logs_query_strategy {
                     QueryStrategy::ProviderFilter => {
-                        let mut logs = self.fetch_evm_logs(range, &filter)?;
+                        let mut logs = self.fetch_evm_logs_with_request_id(
+                            range,
+                            &filter,
+                            request_id.as_deref(),
+                        )?;
                         let provider_calls = 1 + distinct_log_blocks(&logs);
                         logs.retain(|log| range.contains(log.block_number));
                         logs.sort_by_key(|log| {
@@ -691,7 +726,11 @@ impl ChainAdapter for EvmRpcClient {
                     }
                     QueryStrategy::BlockRange => {
                         warnings.push("evm block_range log query strategy used".to_owned());
-                        let (logs, calls) = self.fetch_evm_logs_from_receipts(range, &filter)?;
+                        let (logs, calls) = self.fetch_evm_logs_from_receipts_with_request_id(
+                            range,
+                            &filter,
+                            request_id.as_deref(),
+                        )?;
                         (QueryRows::EvmLogs(logs), calls)
                     }
                 }
@@ -699,7 +738,11 @@ impl ChainAdapter for EvmRpcClient {
             (dataset, DatasetSelector::EvmLogs(filter)) if *dataset == DatasetKey::evm_logs() => {
                 match self.logs_query_strategy {
                     QueryStrategy::ProviderFilter => {
-                        let mut logs = self.fetch_evm_logs(range, filter)?;
+                        let mut logs = self.fetch_evm_logs_with_request_id(
+                            range,
+                            filter,
+                            request_id.as_deref(),
+                        )?;
                         let provider_calls = 1 + distinct_log_blocks(&logs);
                         logs.retain(|log| range.contains(log.block_number));
                         logs.sort_by_key(|log| {
@@ -709,7 +752,11 @@ impl ChainAdapter for EvmRpcClient {
                     }
                     QueryStrategy::BlockRange => {
                         warnings.push("evm block_range log query strategy used".to_owned());
-                        let (logs, calls) = self.fetch_evm_logs_from_receipts(range, filter)?;
+                        let (logs, calls) = self.fetch_evm_logs_from_receipts_with_request_id(
+                            range,
+                            filter,
+                            request_id.as_deref(),
+                        )?;
                         (QueryRows::EvmLogs(logs), calls)
                     }
                 }
@@ -745,7 +792,28 @@ impl ChainAdapter for EvmRpcClient {
                 ));
             }
         };
-        let request_id = request.context.request_id.clone();
+        if let Some(request_id) = &request_id {
+            log::info!(
+                "evm adapter fetch request_id={} chain={} dataset={} range={}-{} provider_calls={} rows={}",
+                request_id,
+                request.chain.configured_name(),
+                request.dataset_key.as_str(),
+                request.range.start(),
+                request.range.end(),
+                provider_calls,
+                rows.row_count()
+            );
+        } else {
+            log::info!(
+                "evm adapter fetch chain={} dataset={} range={}-{} provider_calls={} rows={}",
+                request.chain.configured_name(),
+                request.dataset_key.as_str(),
+                request.range.start(),
+                request.range.end(),
+                provider_calls,
+                rows.row_count()
+            );
+        }
         Ok(ChainFetchResponse::try_new(
             request.chain,
             request.dataset_key,

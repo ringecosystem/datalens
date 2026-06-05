@@ -318,13 +318,13 @@ async fn test_service_wires_query_watermarks_into_follow_query_warmup() {
 
     assert_eq!(
         source.calls(),
-        vec![SourceCall::Logs(BlockRange::expect_new(1, 4))]
+        vec![SourceCall::Logs(BlockRange::expect_new(71, 74))]
     );
     let cursor = registry
         .load_cursor(&task_id)
         .expect("load cursor")
         .expect("cursor");
-    assert_eq!(cursor.next, 5);
+    assert_eq!(cursor.next, 75);
 }
 
 #[derive(Clone, Debug)]

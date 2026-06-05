@@ -94,6 +94,34 @@ fn test_executor_miss_fetches_and_persists_through_writer() {
 }
 
 #[test]
+fn test_executor_passes_query_id_to_provider_fetch_context() {
+    let storage = LocalStorage::new(temp_storage_root("executor-query-id"));
+    let source = MockSource::default().with_blocks(vec![block(10, "0x10"), block(11, "0x11")]);
+    let executor = executor(storage, source.clone());
+
+    executor
+        .execute_with_application_and_query_id(blocks_input(10, 11), None, "q-test".to_owned())
+        .expect("miss succeeds");
+
+    assert_eq!(source.request_ids(), vec![Some("q-test".to_owned())]);
+}
+
+#[test]
+fn test_executor_passes_query_id_to_hot_provider_fetch_context() {
+    let storage = LocalStorage::new(temp_storage_root("executor-hot-query-id"));
+    let source = MockSource::default().with_blocks(vec![block(10, "0x10")]);
+    let executor = executor(storage, source.clone());
+    let mut input = blocks_input(10, 10);
+    input.finality = QueryFinalityRequirement::LatestOnly;
+
+    executor
+        .execute_with_application_and_query_id(input, None, "q-hot".to_owned())
+        .expect("hot query succeeds");
+
+    assert_eq!(source.request_ids(), vec![Some("q-hot".to_owned())]);
+}
+
+#[test]
 fn test_executor_repeated_query_hits_mixed_empty_and_data_coverage_without_fetch() {
     let storage = LocalStorage::new(temp_storage_root("executor-hit-mixed-empty-data"));
     seed_blocks(&storage, 1, 2, vec![block(1, "0x01"), block(2, "0x02")]);
@@ -1092,6 +1120,7 @@ enum SourceCall {
 struct MockSource {
     blocks: Arc<Mutex<Vec<BlockHeader>>>,
     calls: Arc<Mutex<Vec<SourceCall>>>,
+    request_ids: Arc<Mutex<Vec<Option<String>>>>,
     latest_height: Arc<Mutex<u64>>,
     safe_height: Arc<Mutex<u64>>,
     response_mutation: Arc<Mutex<Option<ResponseMutation>>>,
@@ -1104,6 +1133,7 @@ impl Default for MockSource {
         Self {
             blocks: Arc::new(Mutex::new(Vec::new())),
             calls: Arc::new(Mutex::new(Vec::new())),
+            request_ids: Arc::new(Mutex::new(Vec::new())),
             latest_height: Arc::new(Mutex::new(100)),
             safe_height: Arc::new(Mutex::new(100)),
             response_mutation: Arc::new(Mutex::new(None)),
@@ -1152,6 +1182,10 @@ impl MockSource {
 
     fn calls(&self) -> Vec<SourceCall> {
         self.calls.lock().expect("calls lock").clone()
+    }
+
+    fn request_ids(&self) -> Vec<Option<String>> {
+        self.request_ids.lock().expect("request ids lock").clone()
     }
 }
 
@@ -1205,6 +1239,10 @@ impl ChainAdapter for MockSource {
             .lock()
             .expect("calls lock")
             .push(SourceCall::Blocks(range));
+        self.request_ids
+            .lock()
+            .expect("request ids lock")
+            .push(request.context.request_id.clone());
         if let Some(kind) = self.error.lock().expect("error lock").clone() {
             return Err(DatalensError::new(kind, "injected provider failure"));
         }
