@@ -3,7 +3,9 @@ use std::sync::Arc;
 use datalens_core::{DatalensError, DatalensErrorKind};
 use datalens_edge::config::{ChainConfig, DatalensConfig, FinalityConfig};
 use datalens_edge::{QueryService, QueryServiceRegistry};
-use datalens_evm::{EvmFinalityPolicy, EvmRpcClient};
+use datalens_evm::{
+    EvmBlockHeaderFetchMode, EvmBlockHeaderMetadataConfig, EvmFinalityPolicy, EvmRpcClient,
+};
 use datalens_metrics::ApplicationIdentity;
 use datalens_solana::{SolanaAdapter, SolanaHttpRpc};
 use datalens_storage::{
@@ -115,7 +117,8 @@ fn build_evm_service_with_storage(
         chain.datasets.logs.max_block_scan_range_blocks,
         chain.datasets.logs.max_addresses_per_query,
     )
-    .with_logs_query_strategy(chain.datasets.logs.query_strategy);
+    .with_logs_query_strategy(chain.datasets.logs.query_strategy)
+    .with_block_header_metadata_config(evm_block_header_metadata_config(chain)?);
     let mut service = datalens_edge::QueryService::new_with_metrics_config(
         storage.clone(),
         source.clone(),
@@ -531,6 +534,26 @@ pub(crate) fn evm_finality_policy(finality: &FinalityConfig) -> EvmFinalityPolic
             finalized_tag: finalized_tag.clone(),
         },
     }
+}
+
+pub(crate) fn evm_block_header_metadata_config(
+    chain: &ChainConfig,
+) -> Result<EvmBlockHeaderMetadataConfig, DatalensError> {
+    let fetch_mode = match chain.datasets.logs.header_fetch_mode.as_str() {
+        "concurrent" => EvmBlockHeaderFetchMode::Concurrent,
+        "batch" => EvmBlockHeaderFetchMode::Batch,
+        _ => {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                "logs header_fetch_mode must be concurrent or batch",
+            ));
+        }
+    };
+    Ok(EvmBlockHeaderMetadataConfig::default()
+        .with_cache_max_entries(chain.datasets.logs.header_cache_max_entries)
+        .with_fetch_concurrency(chain.datasets.logs.header_fetch_concurrency)
+        .with_fetch_mode(fetch_mode)
+        .with_batch_size(chain.datasets.logs.header_fetch_batch_size))
 }
 
 pub(crate) fn finality_summary(chain: &ChainConfig) -> serde_json::Value {

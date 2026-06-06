@@ -1,4 +1,9 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, VecDeque},
+    sync::{Arc, Mutex},
+    thread,
+    time::Instant,
+};
 
 use datalens_chain::{
     AdapterCapabilities, CanonicalBlock, CanonicalBlockRequest, ChainAdapter, ChainFetchRequest,
@@ -97,6 +102,112 @@ pub enum EvmFinalityPolicy {
     },
 }
 
+const DEFAULT_BLOCK_HEADER_CACHE_MAX_ENTRIES: usize = 50_000;
+const DEFAULT_BLOCK_HEADER_FETCH_CONCURRENCY: usize = 8;
+const DEFAULT_BLOCK_HEADER_BATCH_SIZE: usize = 20;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum EvmBlockHeaderFetchMode {
+    #[default]
+    Concurrent,
+    Batch,
+}
+
+impl EvmBlockHeaderFetchMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Concurrent => "concurrent",
+            Self::Batch => "batch",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvmBlockHeaderMetadataConfig {
+    pub cache_max_entries: usize,
+    pub fetch_concurrency: usize,
+    pub fetch_mode: EvmBlockHeaderFetchMode,
+    pub batch_size: usize,
+}
+
+impl Default for EvmBlockHeaderMetadataConfig {
+    fn default() -> Self {
+        Self {
+            cache_max_entries: DEFAULT_BLOCK_HEADER_CACHE_MAX_ENTRIES,
+            fetch_concurrency: DEFAULT_BLOCK_HEADER_FETCH_CONCURRENCY,
+            fetch_mode: EvmBlockHeaderFetchMode::Concurrent,
+            batch_size: DEFAULT_BLOCK_HEADER_BATCH_SIZE,
+        }
+    }
+}
+
+impl EvmBlockHeaderMetadataConfig {
+    pub fn with_cache_max_entries(mut self, cache_max_entries: usize) -> Self {
+        self.cache_max_entries = cache_max_entries.max(1);
+        self
+    }
+
+    pub fn with_fetch_concurrency(mut self, fetch_concurrency: usize) -> Self {
+        self.fetch_concurrency = fetch_concurrency.max(1);
+        self
+    }
+
+    pub fn with_fetch_mode(mut self, fetch_mode: EvmBlockHeaderFetchMode) -> Self {
+        self.fetch_mode = fetch_mode;
+        self
+    }
+
+    pub fn with_batch_size(mut self, batch_size: usize) -> Self {
+        self.batch_size = batch_size.max(1);
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct BlockHeaderCacheKey {
+    chain_key: String,
+    number: u64,
+    hash: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct BlockHeaderCache {
+    headers: BTreeMap<BlockHeaderCacheKey, BlockHeader>,
+    insertion_order: VecDeque<BlockHeaderCacheKey>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct LogBlockHeaderDiagnostics {
+    cache_hits: usize,
+    cache_misses: usize,
+    provider_calls: usize,
+    fetch_duration_ms: u128,
+    fetch_mode: EvmBlockHeaderFetchMode,
+    fetch_concurrency: usize,
+    batch_size: usize,
+}
+
+impl LogBlockHeaderDiagnostics {
+    fn warning(&self) -> String {
+        format!(
+            "evm log header metadata header_cache_hits={} header_cache_misses={} header_provider_calls={} header_fetch_duration_ms={} header_fetch_mode={} header_fetch_concurrency={} header_batch_size={}",
+            self.cache_hits,
+            self.cache_misses,
+            self.provider_calls,
+            self.fetch_duration_ms,
+            self.fetch_mode.as_str(),
+            self.fetch_concurrency,
+            self.batch_size
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LogBlockHeaderRequest {
+    number: u64,
+    hash: String,
+}
+
 #[derive(Clone)]
 pub struct EvmRpcClient {
     rpc_urls: Vec<String>,
@@ -108,6 +219,8 @@ pub struct EvmRpcClient {
     max_block_scan_range_blocks: u64,
     max_addresses_per_query: usize,
     logs_query_strategy: QueryStrategy,
+    block_header_metadata: EvmBlockHeaderMetadataConfig,
+    block_header_cache: Arc<Mutex<BlockHeaderCache>>,
 }
 
 impl EvmRpcClient {
@@ -122,6 +235,8 @@ impl EvmRpcClient {
             max_block_scan_range_blocks: u64::MAX,
             max_addresses_per_query: usize::MAX,
             logs_query_strategy: QueryStrategy::ProviderFilter,
+            block_header_metadata: EvmBlockHeaderMetadataConfig::default(),
+            block_header_cache: Arc::new(Mutex::new(BlockHeaderCache::default())),
         }
     }
 
@@ -144,12 +259,27 @@ impl EvmRpcClient {
             max_block_scan_range_blocks,
             max_addresses_per_query,
             logs_query_strategy: QueryStrategy::ProviderFilter,
+            block_header_metadata: EvmBlockHeaderMetadataConfig::default(),
+            block_header_cache: Arc::new(Mutex::new(BlockHeaderCache::default())),
         }
     }
 
     pub fn with_logs_query_strategy(mut self, query_strategy: QueryStrategy) -> Self {
         self.logs_query_strategy = query_strategy;
         self
+    }
+
+    pub fn with_block_header_metadata_config(
+        mut self,
+        config: EvmBlockHeaderMetadataConfig,
+    ) -> Self {
+        self.block_header_metadata = config;
+        self.block_header_cache = Arc::new(Mutex::new(BlockHeaderCache::default()));
+        self
+    }
+
+    pub fn block_header_metadata_config(&self) -> &EvmBlockHeaderMetadataConfig {
+        &self.block_header_metadata
     }
 
     pub fn fetch_blocks(&self, range: BlockRange) -> Result<Vec<BlockHeader>, DatalensError> {
@@ -237,6 +367,7 @@ impl EvmRpcClient {
         filter: &EvmLogFilter,
     ) -> Result<Vec<LogRecord>, DatalensError> {
         self.fetch_evm_logs_with_request_id(range, filter, None)
+            .map(|(logs, _diagnostics)| logs)
     }
 
     fn fetch_evm_logs_with_request_id(
@@ -244,7 +375,7 @@ impl EvmRpcClient {
         range: BlockRange,
         filter: &EvmLogFilter,
         request_id: Option<&str>,
-    ) -> Result<Vec<LogRecord>, DatalensError> {
+    ) -> Result<(Vec<LogRecord>, LogBlockHeaderDiagnostics), DatalensError> {
         match request_id {
             Some(request_id) => log::info!(
                 "fetching EVM logs request_id={} range={}-{} addresses={} topic_slots={}",
@@ -277,9 +408,10 @@ impl EvmRpcClient {
             .into_iter()
             .map(|log| parse_log_record(&log))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut logs = self.enrich_logs_with_block_metadata(logs)?;
+        let (mut logs, diagnostics) = self.enrich_logs_with_block_metadata(logs)?;
+        log::info!("{}", diagnostics.warning());
         logs.sort_by_key(|log| (log.block_number, log.transaction_index, log.log_index));
-        Ok(logs)
+        Ok((logs, diagnostics))
     }
 
     fn fetch_evm_logs_from_receipts_with_request_id(
@@ -431,6 +563,55 @@ impl EvmRpcClient {
             return Err(error);
         }
         Ok(body.get("result").cloned())
+    }
+
+    fn batch_call(&self, method: &str, requests: Vec<Value>) -> Result<Vec<Value>, DatalensError> {
+        let url = self.rpc_urls.first().ok_or_else(|| {
+            DatalensError::new(DatalensErrorKind::InvalidInput, "chain has no rpc_urls")
+        })?;
+        log::debug!(
+            "sending EVM provider batch request method={method} requests={}",
+            requests.len()
+        );
+        let response = self
+            .client
+            .post(url)
+            .json(&requests)
+            .send()
+            .map_err(|error| {
+                let error = classify_transport_error(error, url);
+                log::warn!(
+                    "provider batch transport failed method={method} kind={:?}",
+                    error.kind
+                );
+                error
+            })?;
+        let status = response.status();
+        let body: Value = response.json().map_err(|error| {
+            log::warn!("failed to decode provider batch response method={method}: {error}");
+            DatalensError::new(
+                DatalensErrorKind::ProviderFailure,
+                format!(
+                    "decode JSON-RPC batch response: {}",
+                    redact_urls_in_text(&error.to_string())
+                ),
+            )
+        })?;
+        if !status.is_success() {
+            let error = classify_provider_error(status.as_u16() as i64, &body.to_string());
+            log::warn!(
+                "provider returned HTTP batch error method={method} status={} kind={:?}",
+                status.as_u16(),
+                error.kind
+            );
+            return Err(error);
+        }
+        body.as_array().cloned().ok_or_else(|| {
+            DatalensError::new(
+                DatalensErrorKind::ProviderFailure,
+                "invalid JSON-RPC batch response",
+            )
+        })
     }
 }
 
@@ -712,12 +893,13 @@ impl ChainAdapter for EvmRpcClient {
                 })?;
                 match self.logs_query_strategy {
                     QueryStrategy::ProviderFilter => {
-                        let mut logs = self.fetch_evm_logs_with_request_id(
+                        let (mut logs, diagnostics) = self.fetch_evm_logs_with_request_id(
                             range,
                             &filter,
                             request_id.as_deref(),
                         )?;
-                        let provider_calls = 1 + distinct_log_blocks(&logs);
+                        let provider_calls = 1 + diagnostics.provider_calls;
+                        warnings.push(diagnostics.warning());
                         logs.retain(|log| range.contains(log.block_number));
                         logs.sort_by_key(|log| {
                             (log.block_number, log.transaction_index, log.log_index)
@@ -738,12 +920,13 @@ impl ChainAdapter for EvmRpcClient {
             (dataset, DatasetSelector::EvmLogs(filter)) if *dataset == DatasetKey::evm_logs() => {
                 match self.logs_query_strategy {
                     QueryStrategy::ProviderFilter => {
-                        let mut logs = self.fetch_evm_logs_with_request_id(
+                        let (mut logs, diagnostics) = self.fetch_evm_logs_with_request_id(
                             range,
                             filter,
                             request_id.as_deref(),
                         )?;
-                        let provider_calls = 1 + distinct_log_blocks(&logs);
+                        let provider_calls = 1 + diagnostics.provider_calls;
+                        warnings.push(diagnostics.warning());
                         logs.retain(|log| range.contains(log.block_number));
                         logs.sort_by_key(|log| {
                             (log.block_number, log.transaction_index, log.log_index)
@@ -853,13 +1036,6 @@ fn log_matches_filter(log: &LogRecord, filter: &EvmLogFilter) -> bool {
     true
 }
 
-fn distinct_log_blocks(logs: &[LogRecord]) -> usize {
-    logs.iter()
-        .map(|log| log.block_number)
-        .collect::<std::collections::BTreeSet<_>>()
-        .len()
-}
-
 impl EvmRpcClient {
     fn fetch_full_blocks(&self, range: BlockRange) -> Result<Vec<Value>, DatalensError> {
         let mut blocks = Vec::new();
@@ -882,42 +1058,307 @@ impl EvmRpcClient {
     fn enrich_logs_with_block_metadata(
         &self,
         logs: Vec<LogRecord>,
-    ) -> Result<Vec<LogRecord>, DatalensError> {
-        let mut block_headers = BTreeMap::new();
-        for log in &logs {
-            block_headers
-                .entry(log.block_number)
-                .or_insert_with(|| self.fetch_block_by_tag(&format!("0x{:x}", log.block_number)));
+    ) -> Result<(Vec<LogRecord>, LogBlockHeaderDiagnostics), DatalensError> {
+        let started_at = Instant::now();
+        let mut diagnostics = LogBlockHeaderDiagnostics {
+            fetch_mode: self.block_header_metadata.fetch_mode,
+            fetch_concurrency: self.block_header_metadata.fetch_concurrency,
+            batch_size: self.block_header_metadata.batch_size,
+            ..LogBlockHeaderDiagnostics::default()
+        };
+        if logs.is_empty() {
+            return Ok((logs, diagnostics));
         }
 
-        logs.into_iter()
-            .map(|log| {
-                let header = block_headers
-                    .get(&log.block_number)
-                    .expect("header request inserted")
-                    .as_ref()
-                    .map_err(|error| {
-                        DatalensError::new(
-                            error.kind.clone(),
-                            format!(
-                                "failed to fetch block header for log block {}: {}",
-                                log.block_number, error.message
-                            ),
-                        )
-                    })?;
-                if header.hash != log.block_hash {
-                    return Err(DatalensError::new(
-                        DatalensErrorKind::ProviderFailure,
-                        format!(
-                            "log block hash {} does not match fetched block hash {} for block {}",
-                            log.block_hash, header.hash, log.block_number
-                        ),
-                    ));
+        let mut headers = BTreeMap::new();
+        let mut missing = BTreeMap::new();
+        {
+            let cache = self.block_header_cache.lock().expect("block header cache");
+            for log in &logs {
+                let key = self.block_header_cache_key(log.block_number, &log.block_hash);
+                if headers.contains_key(&key) || missing.contains_key(&key) {
+                    continue;
                 }
+                if let Some(header) = cache.headers.get(&key) {
+                    diagnostics.cache_hits += 1;
+                    headers.insert(key, header.clone());
+                } else {
+                    diagnostics.cache_misses += 1;
+                    missing.insert(
+                        key,
+                        LogBlockHeaderRequest {
+                            number: log.block_number,
+                            hash: log.block_hash.clone(),
+                        },
+                    );
+                }
+            }
+        }
+
+        let missing = missing.into_values().collect::<Vec<_>>();
+        if !missing.is_empty() {
+            let (fetched, provider_calls) = match self.block_header_metadata.fetch_mode {
+                EvmBlockHeaderFetchMode::Concurrent => {
+                    self.fetch_log_block_headers_concurrently(missing)?
+                }
+                EvmBlockHeaderFetchMode::Batch => {
+                    self.fetch_log_block_headers_in_batches(missing)?
+                }
+            };
+            diagnostics.provider_calls = provider_calls;
+            self.insert_block_headers_into_cache(&fetched);
+            headers.extend(fetched);
+        }
+        diagnostics.fetch_duration_ms = started_at.elapsed().as_millis();
+
+        let logs = logs
+            .into_iter()
+            .map(|log| {
+                let key = self.block_header_cache_key(log.block_number, &log.block_hash);
+                let header = headers.get(&key).expect("header inserted for log block");
+                self.validate_log_block_header(&log, header)?;
                 Ok(log
                     .with_block_metadata(Some(header.parent_hash.clone()), Some(header.timestamp)))
             })
-            .collect()
+            .collect::<Result<Vec<_>, DatalensError>>()?;
+        Ok((logs, diagnostics))
+    }
+
+    fn block_header_cache_key(&self, number: u64, hash: &str) -> BlockHeaderCacheKey {
+        BlockHeaderCacheKey {
+            chain_key: self.chain.key_prefix(),
+            number,
+            hash: hash.to_owned(),
+        }
+    }
+
+    fn insert_block_headers_into_cache(
+        &self,
+        headers: &BTreeMap<BlockHeaderCacheKey, BlockHeader>,
+    ) {
+        if headers.is_empty() {
+            return;
+        }
+        let mut cache = self.block_header_cache.lock().expect("block header cache");
+        for (key, header) in headers {
+            if cache.headers.contains_key(key) {
+                cache.headers.insert(key.clone(), header.clone());
+                continue;
+            }
+            cache.insertion_order.push_back(key.clone());
+            cache.headers.insert(key.clone(), header.clone());
+        }
+        while cache.headers.len() > self.block_header_metadata.cache_max_entries {
+            let Some(key) = cache.insertion_order.pop_front() else {
+                break;
+            };
+            cache.headers.remove(&key);
+        }
+    }
+
+    fn fetch_log_block_headers_concurrently(
+        &self,
+        missing: Vec<LogBlockHeaderRequest>,
+    ) -> Result<(BTreeMap<BlockHeaderCacheKey, BlockHeader>, usize), DatalensError> {
+        let provider_calls = missing.len();
+        let concurrency = self
+            .block_header_metadata
+            .fetch_concurrency
+            .min(missing.len())
+            .max(1);
+        let work = Arc::new(Mutex::new(VecDeque::from(missing)));
+        let mut handles = Vec::with_capacity(concurrency);
+        for _ in 0..concurrency {
+            let client = self.clone();
+            let work = Arc::clone(&work);
+            handles.push(thread::spawn(move || {
+                let mut headers = BTreeMap::new();
+                loop {
+                    let request = work.lock().expect("header work").pop_front();
+                    let Some(request) = request else {
+                        break;
+                    };
+                    let header = client.fetch_log_block_header(&request)?;
+                    headers.insert(
+                        client.block_header_cache_key(request.number, &request.hash),
+                        header,
+                    );
+                }
+                Ok::<_, DatalensError>(headers)
+            }));
+        }
+
+        let mut headers = BTreeMap::new();
+        for handle in handles {
+            let fetched = handle.join().map_err(|_| {
+                DatalensError::new(
+                    DatalensErrorKind::Internal,
+                    "EVM block header worker panicked",
+                )
+            })??;
+            headers.extend(fetched);
+        }
+        Ok((headers, provider_calls))
+    }
+
+    fn fetch_log_block_headers_in_batches(
+        &self,
+        missing: Vec<LogBlockHeaderRequest>,
+    ) -> Result<(BTreeMap<BlockHeaderCacheKey, BlockHeader>, usize), DatalensError> {
+        let mut headers = BTreeMap::new();
+        let mut provider_calls = 0;
+        for chunk in missing.chunks(self.block_header_metadata.batch_size) {
+            provider_calls += 1;
+            let fetched = self.fetch_log_block_header_batch(chunk)?;
+            headers.extend(fetched);
+        }
+        Ok((headers, provider_calls))
+    }
+
+    fn fetch_log_block_header(
+        &self,
+        request: &LogBlockHeaderRequest,
+    ) -> Result<BlockHeader, DatalensError> {
+        let header = self
+            .fetch_block_by_tag(&format!("0x{:x}", request.number))
+            .map_err(|error| {
+                DatalensError::new(
+                    error.kind,
+                    format!(
+                        "failed to fetch block header for log block {}: {}",
+                        request.number, error.message
+                    ),
+                )
+            })?;
+        self.validate_log_block_header_request(request, &header)?;
+        Ok(header)
+    }
+
+    fn fetch_log_block_header_batch(
+        &self,
+        requests: &[LogBlockHeaderRequest],
+    ) -> Result<BTreeMap<BlockHeaderCacheKey, BlockHeader>, DatalensError> {
+        let rpc_requests = requests
+            .iter()
+            .enumerate()
+            .map(|(index, request)| {
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": index + 1,
+                    "method": "eth_getBlockByNumber",
+                    "params": [format!("0x{:x}", request.number), false],
+                })
+            })
+            .collect::<Vec<_>>();
+        let responses = self.batch_call("eth_getBlockByNumber", rpc_requests)?;
+        let request_by_id = requests
+            .iter()
+            .enumerate()
+            .map(|(index, request)| ((index + 1) as u64, request))
+            .collect::<BTreeMap<_, _>>();
+        let mut response_by_id = BTreeMap::new();
+        for response in responses {
+            let id = response.get("id").and_then(Value::as_u64).ok_or_else(|| {
+                DatalensError::new(
+                    DatalensErrorKind::ProviderFailure,
+                    "batch response missing numeric id",
+                )
+            })?;
+            response_by_id.insert(id, response);
+        }
+
+        let mut headers = BTreeMap::new();
+        for (id, request) in request_by_id {
+            let response = response_by_id.get(&id).ok_or_else(|| {
+                DatalensError::new(
+                    DatalensErrorKind::ProviderFailure,
+                    format!("missing batch response for log block {}", request.number),
+                )
+            })?;
+            if let Some(error) = response.get("error") {
+                let code = error
+                    .get("code")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default();
+                let message = error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("provider error");
+                let error = classify_provider_error(code, message);
+                return Err(DatalensError::new(
+                    error.kind,
+                    format!(
+                        "failed to fetch block header for log block {}: {}",
+                        request.number, error.message
+                    ),
+                ));
+            }
+            let Some(block) = response.get("result") else {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::ProviderFailure,
+                    format!(
+                        "batch response missing result for log block {}",
+                        request.number
+                    ),
+                ));
+            };
+            if block.is_null() {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::UnsupportedDataset,
+                    format!(
+                        "provider returned no block for log block {}",
+                        request.number
+                    ),
+                ));
+            }
+            let header = Self::parse_block_header(block)?;
+            self.validate_log_block_header_request(request, &header)?;
+            headers.insert(
+                self.block_header_cache_key(request.number, &request.hash),
+                header,
+            );
+        }
+        Ok(headers)
+    }
+
+    fn validate_log_block_header_request(
+        &self,
+        request: &LogBlockHeaderRequest,
+        header: &BlockHeader,
+    ) -> Result<(), DatalensError> {
+        if header.number != request.number {
+            return Err(DatalensError::new(
+                DatalensErrorKind::ProviderFailure,
+                format!(
+                    "fetched block number {} does not match log block {}",
+                    header.number, request.number
+                ),
+            ));
+        }
+        if header.hash != request.hash {
+            return Err(DatalensError::new(
+                DatalensErrorKind::ProviderFailure,
+                format!(
+                    "log block hash {} does not match fetched block hash {} for block {}",
+                    request.hash, header.hash, request.number
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_log_block_header(
+        &self,
+        log: &LogRecord,
+        header: &BlockHeader,
+    ) -> Result<(), DatalensError> {
+        self.validate_log_block_header_request(
+            &LogBlockHeaderRequest {
+                number: log.block_number,
+                hash: log.block_hash.clone(),
+            },
+            header,
+        )
     }
 
     fn fetch_block_by_tag(&self, tag: &str) -> Result<BlockHeader, DatalensError> {
@@ -928,11 +1369,15 @@ impl EvmRpcClient {
                 format!("provider returned no block for tag {tag}"),
             ));
         };
+        Self::parse_block_header(&block)
+    }
+
+    fn parse_block_header(block: &Value) -> Result<BlockHeader, DatalensError> {
         Ok(BlockHeader {
-            number: hex_u64_field(&block, "number")?,
-            hash: string_field(&block, "hash")?,
-            parent_hash: string_field(&block, "parentHash")?,
-            timestamp: hex_u64_field(&block, "timestamp")?,
+            number: hex_u64_field(block, "number")?,
+            hash: string_field(block, "hash")?,
+            parent_hash: string_field(block, "parentHash")?,
+            timestamp: hex_u64_field(block, "timestamp")?,
         })
     }
 

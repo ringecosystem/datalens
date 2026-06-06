@@ -10,4 +10,6 @@ pub use runtime::build_query_watermarks;
 
 pub(crate) use commands::{chain_identity, configured_chain, parse_bind};
 pub(crate) use config::load_config;
-pub(crate) use runtime::{build_storage, build_usage_ledger, evm_finality_policy};
+pub(crate) use runtime::{
+    build_storage, build_usage_ledger, evm_block_header_metadata_config, evm_finality_policy,
+};
