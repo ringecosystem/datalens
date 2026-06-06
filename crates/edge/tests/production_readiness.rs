@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -285,14 +286,7 @@ async fn test_service_wires_query_watermarks_into_follow_query_warmup() {
         &query.selector,
         datalens_core::LedgerRangeKind::Block,
     );
-    assert_eq!(
-        watermarks
-            .read(&watermark_key)
-            .expect("read watermark")
-            .expect("watermark")
-            .latest_block,
-        21
-    );
+    assert_eq!(wait_for_query_watermark(&watermarks, &watermark_key), 21);
     source.clear_calls();
 
     let task_id = registry
@@ -753,4 +747,20 @@ fn temp_storage_root(name: &str) -> PathBuf {
     ));
     std::fs::create_dir_all(&root).expect("create temp root");
     root
+}
+
+fn wait_for_query_watermark<R>(watermarks: &R, key: &QueryWatermarkKey) -> u64
+where
+    R: QueryWatermarkRepository,
+{
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(watermark) = watermarks.read(key).expect("read watermark") {
+            return watermark.latest_block;
+        }
+        if Instant::now() >= deadline {
+            panic!("watermark was not recorded");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
