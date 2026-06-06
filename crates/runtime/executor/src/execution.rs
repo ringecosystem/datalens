@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -6,10 +7,12 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use datalens_chain::{ChainAdapter, ChainFetchRequest, FetchContext, FinalityLevel};
+use datalens_chain::{
+    ChainAdapter, ChainFetchRequest, ChainFetchResponse, FetchContext, FinalityLevel,
+};
 use datalens_core::{
-    ChainIdentity, DatalensError, DatasetKey, DatasetRows, LedgerRange, QueryFinalityRequirement,
-    missing_ranges,
+    ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey, DatasetRows, LedgerRange,
+    QueryFinalityRequirement, missing_ranges,
 };
 use datalens_metrics::{
     ApplicationIdentity, CacheCoverageOutcome, DurableWriteOutcome as MetricsDurableWriteOutcome,
@@ -108,6 +111,8 @@ pub(crate) struct ExecutorQueryWatermarks {
     pub(crate) repository: Arc<dyn QueryWatermarkRepository>,
     pub(crate) application: ApplicationIdentity,
 }
+
+type ProviderFetchResponse = (ChainFetchRequest, ChainFetchResponse);
 
 impl<R, S> NativeQueryExecutor<R, S>
 where
@@ -460,8 +465,35 @@ where
                 request_id: Some(query_id.clone()),
                 cache_write: task.cache_write,
             });
-            let fetched = match self.source.fetch(fetch_request.clone()) {
-                Ok(response) => {
+            let fetched_responses =
+                match self.fetch_with_provider_limit_splits(fetch_request.clone(), &query_id) {
+                    Ok(responses) => responses,
+                    Err(error) => {
+                        log::warn!(
+                            "provider fetch failed query_id={} dataset={} range={}-{} kind={:?}",
+                            query_id,
+                            plan.dataset_key.as_str(),
+                            task.range.start(),
+                            task.range.end(),
+                            error.kind
+                        );
+                        self.record_error(&labels, &error);
+                        self.record_fill(&labels, FillOutcome::Error, fill_start);
+                        self.record_query(&labels, QueryOutcome::Error, start);
+                        self.record_usage_for_plan(
+                            &ledger_application,
+                            &plan,
+                            ledger_query_error(&error),
+                            ledger_cache_outcome(coverage_outcome),
+                            ledger_fill_error(&error),
+                            LedgerDurableWriteOutcome::NotAttempted,
+                            rows.row_count(),
+                        )?;
+                        return Err(error);
+                    }
+                };
+            for (fetch_request, response) in fetched_responses {
+                let fetched = {
                     if let Err(error) = response.validate_for_request(&fetch_request) {
                         self.record_fill(&labels, FillOutcome::Error, fill_start);
                         self.record_query(&labels, QueryOutcome::Error, start);
@@ -478,58 +510,35 @@ where
                     }
                     fill_row_count += response.rows.row_count();
                     response.rows
-                }
-                Err(error) => {
-                    log::warn!(
-                        "provider fetch failed query_id={} dataset={} range={}-{} kind={:?}",
-                        query_id,
-                        plan.dataset_key.as_str(),
-                        task.range.start(),
-                        task.range.end(),
-                        error.kind
+                };
+                if task.cache_write {
+                    // Only planner-marked durable misses are staged for durable
+                    // cache. Hot/latest provider data is appended to the response
+                    // but intentionally excluded from fetched_segments.
+                    fill_end_block = Some(
+                        fill_end_block
+                            .unwrap_or(fetch_request.range.end())
+                            .max(fetch_request.range.end()),
                     );
-                    self.record_error(&labels, &error);
+                    fetched_segments.push(DurableWriteSegment {
+                        range: fetch_request.range.clone(),
+                        rows: fetched.clone(),
+                    });
+                }
+                if let Err(error) = rows.try_append(fetched.into_rows()) {
                     self.record_fill(&labels, FillOutcome::Error, fill_start);
                     self.record_query(&labels, QueryOutcome::Error, start);
                     self.record_usage_for_plan(
                         &ledger_application,
                         &plan,
-                        ledger_query_error(&error),
+                        LedgerQueryOutcome::Error,
                         ledger_cache_outcome(coverage_outcome),
-                        ledger_fill_error(&error),
+                        LedgerFillOutcome::Error,
                         LedgerDurableWriteOutcome::NotAttempted,
                         rows.row_count(),
                     )?;
                     return Err(error);
                 }
-            };
-            if task.cache_write {
-                // Only planner-marked durable misses are staged for durable
-                // cache. Hot/latest provider data is appended to the response
-                // but intentionally excluded from fetched_segments.
-                fill_end_block = Some(
-                    fill_end_block
-                        .unwrap_or(task.range.end())
-                        .max(task.range.end()),
-                );
-                fetched_segments.push(DurableWriteSegment {
-                    range: task.range.clone(),
-                    rows: fetched.clone(),
-                });
-            }
-            if let Err(error) = rows.try_append(fetched.into_rows()) {
-                self.record_fill(&labels, FillOutcome::Error, fill_start);
-                self.record_query(&labels, QueryOutcome::Error, start);
-                self.record_usage_for_plan(
-                    &ledger_application,
-                    &plan,
-                    LedgerQueryOutcome::Error,
-                    ledger_cache_outcome(coverage_outcome),
-                    LedgerFillOutcome::Error,
-                    LedgerDurableWriteOutcome::NotAttempted,
-                    rows.row_count(),
-                )?;
-                return Err(error);
             }
         }
 
@@ -727,8 +736,27 @@ where
                 request_id: Some(query_id.clone()),
                 cache_write: false,
             });
-            let fetched = match self.source.fetch(fetch_request.clone()) {
-                Ok(response) => {
+            let fetched_responses =
+                match self.fetch_with_provider_limit_splits(fetch_request.clone(), &query_id) {
+                    Ok(responses) => responses,
+                    Err(error) => {
+                        self.record_error(&labels, &error);
+                        self.record_fill(&labels, FillOutcome::Error, fill_start);
+                        self.record_query(&labels, QueryOutcome::Error, start);
+                        self.record_usage_for_plan(
+                            &ledger_application,
+                            &plan,
+                            ledger_query_error(&error),
+                            LedgerCacheOutcome::HotMiss,
+                            ledger_fill_error(&error),
+                            LedgerDurableWriteOutcome::NotAttempted,
+                            rows.row_count(),
+                        )?;
+                        return Err(error);
+                    }
+                };
+            for (fetch_request, response) in fetched_responses {
+                let fetched = {
                     if let Err(error) = response.validate_for_request(&fetch_request) {
                         self.record_fill(&labels, FillOutcome::Error, fill_start);
                         self.record_query(&labels, QueryOutcome::Error, start);
@@ -744,36 +772,21 @@ where
                         return Err(error);
                     }
                     response.rows
-                }
-                Err(error) => {
-                    self.record_error(&labels, &error);
+                };
+                if let Err(error) = rows.try_append(fetched.into_rows()) {
                     self.record_fill(&labels, FillOutcome::Error, fill_start);
                     self.record_query(&labels, QueryOutcome::Error, start);
                     self.record_usage_for_plan(
                         &ledger_application,
                         &plan,
-                        ledger_query_error(&error),
+                        LedgerQueryOutcome::Error,
                         LedgerCacheOutcome::HotMiss,
-                        ledger_fill_error(&error),
+                        LedgerFillOutcome::Error,
                         LedgerDurableWriteOutcome::NotAttempted,
                         rows.row_count(),
                     )?;
                     return Err(error);
                 }
-            };
-            if let Err(error) = rows.try_append(fetched.into_rows()) {
-                self.record_fill(&labels, FillOutcome::Error, fill_start);
-                self.record_query(&labels, QueryOutcome::Error, start);
-                self.record_usage_for_plan(
-                    &ledger_application,
-                    &plan,
-                    LedgerQueryOutcome::Error,
-                    LedgerCacheOutcome::HotMiss,
-                    LedgerFillOutcome::Error,
-                    LedgerDurableWriteOutcome::NotAttempted,
-                    rows.row_count(),
-                )?;
-                return Err(error);
             }
         }
 
@@ -804,6 +817,43 @@ where
             result.rows.row_count(),
         )?;
         Ok(result)
+    }
+
+    fn fetch_with_provider_limit_splits(
+        &self,
+        fetch_request: ChainFetchRequest,
+        query_id: &str,
+    ) -> Result<Vec<ProviderFetchResponse>, DatalensError> {
+        let mut responses = Vec::new();
+        let mut queue = VecDeque::from([fetch_request]);
+        while let Some(fetch_request) = queue.pop_front() {
+            match self.source.fetch(fetch_request.clone()) {
+                Ok(response) => responses.push((fetch_request, response)),
+                Err(error)
+                    if error.kind == DatalensErrorKind::ProviderLimit
+                        && fetch_request.range.len() > 1 =>
+                {
+                    log::warn!(
+                        "provider limit split query_id={} dataset={} range={}-{}",
+                        query_id,
+                        fetch_request.dataset_key.as_str(),
+                        fetch_request.range.start(),
+                        fetch_request.range.end()
+                    );
+                    for range in split_provider_limit_range(&fetch_request.range)?
+                        .into_iter()
+                        .rev()
+                    {
+                        queue.push_front(ChainFetchRequest {
+                            range,
+                            ..fetch_request.clone()
+                        });
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(responses)
     }
 
     fn ledger_application(
@@ -990,6 +1040,15 @@ where
             updated_at_unix_seconds: unix_seconds_now()?,
         })
     }
+}
+
+fn split_provider_limit_range(range: &LedgerRange) -> Result<Vec<LedgerRange>, DatalensError> {
+    let first_len = u64::try_from(range.len() / 2).unwrap_or(u64::MAX).max(1);
+    let first_end = range.start().saturating_add(first_len - 1);
+    Ok(vec![
+        LedgerRange::try_new(range.kind(), range.start(), first_end)?,
+        LedgerRange::try_new(range.kind(), first_end + 1, range.end())?,
+    ])
 }
 
 fn durable_watermark_block(plan: &datalens_planner::NativeQueryPlan) -> Option<u64> {

@@ -94,6 +94,59 @@ fn test_executor_miss_fetches_and_persists_through_writer() {
 }
 
 #[test]
+fn test_executor_splits_provider_limit_ranges_without_changing_logical_query_range() {
+    let storage = LocalStorage::new(temp_storage_root("executor-provider-limit-split"));
+    let source = MockSource::default()
+        .with_blocks(vec![
+            block(10, "0x10"),
+            block(11, "0x11"),
+            block(12, "0x12"),
+            block(13, "0x13"),
+        ])
+        .with_capability_max_range_len(4)
+        .with_provider_limit_for_ranges_longer_than(2);
+    let executor = NativeQueryExecutor::new(
+        storage,
+        source.clone(),
+        NativeQueryExecutionConfig {
+            planner: NativePlannerConfig {
+                max_query_range_len: 4,
+                default_chunk_range_len: 4,
+            },
+            writer: DurableWriterConfig {
+                target_object_bytes: 1024,
+                min_object_rows: 1,
+                record_empty_coverage: true,
+                staging: Default::default(),
+            },
+        },
+    );
+
+    let result = executor
+        .execute(blocks_input(10, 13))
+        .expect("provider limit split succeeds");
+
+    assert_eq!(result.ledger_range, LedgerRange::blocks(10, 13).unwrap());
+    assert_eq!(
+        result.cache.missing_ranges,
+        vec![LedgerRange::blocks(10, 13).unwrap()]
+    );
+    assert_eq!(
+        result.cache.provider_fill_ranges,
+        vec![LedgerRange::blocks(10, 13).unwrap()]
+    );
+    assert_eq!(
+        source.calls(),
+        vec![
+            SourceCall::Blocks(BlockRange::expect_new(10, 13)),
+            SourceCall::Blocks(BlockRange::expect_new(10, 11)),
+            SourceCall::Blocks(BlockRange::expect_new(12, 13)),
+        ]
+    );
+    assert_eq!(block_numbers(&result.rows), vec![10, 11, 12, 13]);
+}
+
+#[test]
 fn test_executor_passes_query_id_to_provider_fetch_context() {
     let storage = LocalStorage::new(temp_storage_root("executor-query-id"));
     let source = MockSource::default().with_blocks(vec![block(10, "0x10"), block(11, "0x11")]);
@@ -1126,6 +1179,8 @@ struct MockSource {
     response_mutation: Arc<Mutex<Option<ResponseMutation>>>,
     safe_height_error: Arc<Mutex<Option<DatalensErrorKind>>>,
     error: Arc<Mutex<Option<DatalensErrorKind>>>,
+    provider_limit_len: Arc<Mutex<Option<u128>>>,
+    capability_max_range_len: Arc<Mutex<u64>>,
 }
 
 impl Default for MockSource {
@@ -1139,6 +1194,8 @@ impl Default for MockSource {
             response_mutation: Arc::new(Mutex::new(None)),
             safe_height_error: Arc::new(Mutex::new(None)),
             error: Arc::new(Mutex::new(None)),
+            provider_limit_len: Arc::new(Mutex::new(None)),
+            capability_max_range_len: Arc::new(Mutex::new(2)),
         }
     }
 }
@@ -1180,6 +1237,22 @@ impl MockSource {
         self
     }
 
+    fn with_capability_max_range_len(self, len: u64) -> Self {
+        *self
+            .capability_max_range_len
+            .lock()
+            .expect("capability max range len lock") = len;
+        self
+    }
+
+    fn with_provider_limit_for_ranges_longer_than(self, len: u128) -> Self {
+        *self
+            .provider_limit_len
+            .lock()
+            .expect("provider limit len lock") = Some(len);
+        self
+    }
+
     fn calls(&self) -> Vec<SourceCall> {
         self.calls.lock().expect("calls lock").clone()
     }
@@ -1204,7 +1277,12 @@ impl ChainAdapter for MockSource {
             DatasetCapability::new(Dataset::Blocks)
                 .with_selector(SelectorKind::All)
                 .with_range(HeightRangeKind::Block)
-                .with_max_range_len(2)
+                .with_max_range_len(
+                    *self
+                        .capability_max_range_len
+                        .lock()
+                        .expect("capability max range len lock"),
+                )
                 .with_empty_coverage(true)
                 .with_safe_height(true)
                 .with_finalized_height(true)
@@ -1245,6 +1323,17 @@ impl ChainAdapter for MockSource {
             .push(request.context.request_id.clone());
         if let Some(kind) = self.error.lock().expect("error lock").clone() {
             return Err(DatalensError::new(kind, "injected provider failure"));
+        }
+        if self
+            .provider_limit_len
+            .lock()
+            .expect("provider limit len lock")
+            .is_some_and(|limit| request.range.len() > limit)
+        {
+            return Err(DatalensError::new(
+                DatalensErrorKind::ProviderLimit,
+                "injected provider limit",
+            ));
         }
         let rows = self
             .blocks
