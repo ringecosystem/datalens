@@ -1,6 +1,10 @@
 use std::{
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use datalens_chain::{
@@ -16,10 +20,9 @@ use datalens_executor::{NativeQueryExecutionConfig, NativeQueryExecutor};
 use datalens_metrics::{ApplicationIdentity, MetricsRecorder};
 use datalens_planner::{FieldSelection, NativePlannerConfig, NativeQueryInput};
 use datalens_storage::{
-    CacheOutcome, FillOutcome, LocalObjectStore, LocalStorage, Manifest, ObjectMetadata,
-    ObjectStore, QueryOutcome, QueryWatermarkKey, QueryWatermarkRepository, QueryWatermarkStore,
-    StorageRepository, StorageWriteOutcome, StorageWriteRequest, UsageLedgerRepository,
-    UsageLedgerStore,
+    CacheOutcome, FillOutcome, LocalObjectStore, LocalStorage, Manifest, QueryOutcome,
+    QueryWatermarkKey, QueryWatermarkRepository, QueryWatermarkStore, StorageRepository,
+    StorageWriteOutcome, StorageWriteRequest, UsageLedgerRepository, UsageLedgerStore,
 };
 use datalens_writer::{
     DurableWriteRequest, DurableWriteSegment, DurableWriterConfig, WriteStagingConfig,
@@ -278,9 +281,7 @@ fn test_executor_usage_ledger_records_query_staging_flush_as_durable_write() {
         .execute(blocks_input(10, 10))
         .expect("query miss succeeds");
 
-    let events = ledger
-        .read_application("analytics-api")
-        .expect("read application usage");
+    let events = wait_for_ledger_events(&ledger, "analytics-api", 1);
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].fill_outcome, FillOutcome::LiveFetch);
     assert_eq!(
@@ -304,9 +305,7 @@ fn test_executor_writes_usage_ledger_for_cache_hit() {
         .execute(blocks_input(1, 2))
         .expect("cache hit succeeds");
 
-    let events = ledger
-        .read_application("analytics-api")
-        .expect("read application usage");
+    let events = wait_for_ledger_events(&ledger, "analytics-api", 1);
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].application_id, "analytics-api");
     assert_eq!(events[0].chain, ethereum_identity());
@@ -331,9 +330,7 @@ fn test_executor_writes_usage_ledger_for_miss_fill_and_empty_coverage() {
         .execute(blocks_input(10, 11))
         .expect("miss fill succeeds");
 
-    let events = ledger
-        .read_application("analytics-api")
-        .expect("read application usage");
+    let events = wait_for_ledger_events(&ledger, "analytics-api", 1);
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].query_outcome, QueryOutcome::Filled);
     assert_eq!(events[0].cache_outcome, CacheOutcome::Miss);
@@ -367,10 +364,7 @@ fn test_executor_records_query_watermark_after_successful_durable_query() {
         &DatasetSelector::all(),
         datalens_core::LedgerRangeKind::Block,
     );
-    let watermark = watermarks
-        .read(&key)
-        .expect("read watermark")
-        .expect("watermark");
+    let watermark = wait_for_query_watermark(&watermarks, &key);
     assert_eq!(watermark.latest_block, 32);
     assert_eq!(
         watermark.key.selector_fingerprint,
@@ -421,9 +415,7 @@ fn test_executor_latest_only_fetches_latest_without_durable_read_or_write() {
     assert_eq!(counting_storage.read_ranges(), Vec::<LedgerRange>::new());
     assert!(root.join("chains/evm/ethereum/1/manifest.json").exists());
 
-    let events = ledger
-        .read_application("analytics-api")
-        .expect("read application usage");
+    let events = wait_for_ledger_events(&ledger, "analytics-api", 1);
     assert_eq!(events.len(), 1);
     assert!(events[0].requested_hot);
     assert_eq!(events[0].query_outcome, QueryOutcome::HotMiss);
@@ -491,6 +483,10 @@ fn test_executor_safe_to_latest_reads_durable_cache_and_fetches_hot_tail() {
             SourceCall::Blocks(BlockRange::expect_new(4, 4)),
         ]
     );
+    let events = wait_for_ledger_events(&ledger, "analytics-api", 1);
+    assert_eq!(events[0].query_outcome, QueryOutcome::Mixed);
+    assert_eq!(events[0].cache_outcome, CacheOutcome::Mixed);
+    assert_eq!(events[0].fill_outcome, FillOutcome::LiveFetch);
 
     let second = executor
         .execute(blocks_input(3, 3))
@@ -507,13 +503,6 @@ fn test_executor_safe_to_latest_reads_durable_cache_and_fetches_hot_tail() {
             .expect("covered ranges"),
         Vec::<LedgerRange>::new()
     );
-
-    let events = ledger
-        .read_application("analytics-api")
-        .expect("read application usage");
-    assert_eq!(events[0].query_outcome, QueryOutcome::Mixed);
-    assert_eq!(events[0].cache_outcome, CacheOutcome::Mixed);
-    assert_eq!(events[0].fill_outcome, FillOutcome::LiveFetch);
 }
 
 #[test]
@@ -532,18 +521,14 @@ fn test_executor_records_separate_usage_for_shared_durable_cache() {
         .execute(blocks_input(20, 20))
         .expect("second application hits shared cache");
 
+    let app_a_events = wait_for_ledger_events(&ledger, "app-a", 1);
+    let app_b_events = wait_for_ledger_events(&ledger, "app-b", 1);
+    assert_eq!(app_a_events[0].fill_outcome, FillOutcome::LiveFetch);
     assert_eq!(
-        ledger.read_application("app-a").expect("read app-a usage")[0].fill_outcome,
-        FillOutcome::LiveFetch
-    );
-    assert_eq!(
-        ledger.read_application("app-a").expect("read app-a usage")[0].durable_write_outcome,
+        app_a_events[0].durable_write_outcome,
         datalens_storage::DurableWriteOutcome::Flushed
     );
-    assert_eq!(
-        ledger.read_application("app-b").expect("read app-b usage")[0].cache_outcome,
-        CacheOutcome::Hit
-    );
+    assert_eq!(app_b_events[0].cache_outcome, CacheOutcome::Hit);
     assert_eq!(storage.manifest().expect("manifest").entries.len(), 1);
 }
 
@@ -572,20 +557,61 @@ fn test_executor_returns_provider_rows_when_durable_write_fails_without_coverage
 }
 
 #[test]
-fn test_executor_ledger_write_failure_blocks_successful_query() {
+fn test_executor_ledger_write_failure_does_not_block_successful_query() {
     let storage = LocalStorage::new(temp_storage_root("executor-ledger-failure"));
     seed_blocks(&storage, 1, 1, vec![block(1, "0x01")]);
     let source = MockSource::default();
-    let executor = executor(storage, source).with_usage_ledger(
-        UsageLedgerStore::new(FailingPutObjectStore),
-        ApplicationIdentity::named("api"),
-    );
+    let ledger = FailingUsageLedgerRepository::default();
+    let attempts = ledger.attempts();
+    let executor =
+        executor(storage, source).with_usage_ledger(ledger, ApplicationIdentity::named("api"));
 
-    let error = executor
+    let result = executor
         .execute(blocks_input(1, 1))
-        .expect_err("ledger failure blocks query");
+        .expect("ledger failure does not block query");
 
-    assert_eq!(error.kind, DatalensErrorKind::StorageWriteFailure);
+    assert_eq!(block_numbers(&result.rows), vec![1]);
+    wait_for_attempt(&attempts);
+}
+
+#[test]
+fn test_executor_query_watermark_write_failure_does_not_block_successful_query() {
+    let storage = LocalStorage::new(temp_storage_root("executor-watermark-failure"));
+    let source = MockSource::default().with_blocks(vec![block(30, "0x30")]);
+    let watermarks = FailingQueryWatermarkRepository::default();
+    let attempts = watermarks.attempts();
+    let executor = executor(storage, source)
+        .with_query_watermarks(watermarks, ApplicationIdentity::named("api"));
+
+    let result = executor
+        .execute(blocks_input(30, 32))
+        .expect("watermark failure does not block query");
+
+    assert_eq!(block_numbers(&result.rows), vec![30]);
+    wait_for_attempt(&attempts);
+}
+
+#[test]
+fn test_executor_slow_usage_ledger_write_does_not_delay_successful_query() {
+    let storage = LocalStorage::new(temp_storage_root("executor-slow-ledger"));
+    seed_blocks(&storage, 1, 1, vec![block(1, "0x01")]);
+    let source = MockSource::default();
+    let ledger = SlowUsageLedgerRepository::new(Duration::from_millis(500));
+    let attempts = ledger.attempts();
+    let executor =
+        executor(storage, source).with_usage_ledger(ledger, ApplicationIdentity::named("api"));
+
+    let start = Instant::now();
+    let result = executor
+        .execute(blocks_input(1, 1))
+        .expect("slow ledger write does not block query");
+
+    assert_eq!(block_numbers(&result.rows), vec![1]);
+    assert!(
+        start.elapsed() < Duration::from_millis(250),
+        "query response waited for slow metadata write"
+    );
+    wait_for_attempt(&attempts);
 }
 
 #[test]
@@ -999,31 +1025,152 @@ impl FailingStorage {
     }
 }
 
-#[derive(Clone, Debug)]
-struct FailingPutObjectStore;
+#[derive(Clone, Default)]
+struct FailingUsageLedgerRepository {
+    attempts: Arc<AtomicUsize>,
+}
 
-impl ObjectStore for FailingPutObjectStore {
-    fn get(&self, _key: &str) -> Result<Vec<u8>, DatalensError> {
-        Ok(Vec::new())
+impl FailingUsageLedgerRepository {
+    fn attempts(&self) -> Arc<AtomicUsize> {
+        self.attempts.clone()
     }
+}
 
-    fn put(&self, _key: &str, _bytes: &[u8]) -> Result<(), DatalensError> {
+impl UsageLedgerRepository for FailingUsageLedgerRepository {
+    fn append(&self, _entry: &datalens_storage::UsageLedgerEntry) -> Result<(), DatalensError> {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
         Err(DatalensError::new(
             DatalensErrorKind::StorageWriteFailure,
             "injected ledger write failure",
         ))
     }
 
-    fn exists(&self, _key: &str) -> Result<bool, DatalensError> {
-        Ok(false)
-    }
-
-    fn list(&self, _prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
+    fn read_application(
+        &self,
+        _application_id: &str,
+    ) -> Result<Vec<datalens_storage::UsageLedgerEntry>, DatalensError> {
         Ok(Vec::new())
     }
+}
 
-    fn delete(&self, _key: &str) -> Result<(), DatalensError> {
+#[derive(Clone, Default)]
+struct FailingQueryWatermarkRepository {
+    attempts: Arc<AtomicUsize>,
+}
+
+impl FailingQueryWatermarkRepository {
+    fn attempts(&self) -> Arc<AtomicUsize> {
+        self.attempts.clone()
+    }
+}
+
+impl QueryWatermarkRepository for FailingQueryWatermarkRepository {
+    fn update(&self, _watermark: &datalens_storage::QueryWatermark) -> Result<(), DatalensError> {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+        Err(DatalensError::new(
+            DatalensErrorKind::StorageWriteFailure,
+            "injected query watermark write failure",
+        ))
+    }
+
+    fn read(
+        &self,
+        _key: &QueryWatermarkKey,
+    ) -> Result<Option<datalens_storage::QueryWatermark>, DatalensError> {
+        Ok(None)
+    }
+}
+
+#[derive(Clone)]
+struct SlowUsageLedgerRepository {
+    attempts: Arc<AtomicUsize>,
+    delay: Duration,
+}
+
+impl SlowUsageLedgerRepository {
+    fn new(delay: Duration) -> Self {
+        Self {
+            attempts: Arc::new(AtomicUsize::new(0)),
+            delay,
+        }
+    }
+
+    fn attempts(&self) -> Arc<AtomicUsize> {
+        self.attempts.clone()
+    }
+}
+
+impl UsageLedgerRepository for SlowUsageLedgerRepository {
+    fn append(&self, _entry: &datalens_storage::UsageLedgerEntry) -> Result<(), DatalensError> {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(self.delay);
         Ok(())
+    }
+
+    fn read_application(
+        &self,
+        _application_id: &str,
+    ) -> Result<Vec<datalens_storage::UsageLedgerEntry>, DatalensError> {
+        Ok(Vec::new())
+    }
+}
+
+fn wait_for_attempt(attempts: &AtomicUsize) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if attempts.load(Ordering::SeqCst) > 0 {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        attempts.load(Ordering::SeqCst) > 0,
+        "metadata repository was not attempted"
+    );
+}
+
+fn wait_for_ledger_events<R>(
+    ledger: &R,
+    application_id: &str,
+    expected: usize,
+) -> Vec<datalens_storage::UsageLedgerEntry>
+where
+    R: UsageLedgerRepository,
+{
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let events = ledger
+            .read_application(application_id)
+            .expect("read application usage");
+        if events.len() >= expected || Instant::now() >= deadline {
+            assert!(
+                events.len() >= expected,
+                "expected at least {expected} ledger events, got {}",
+                events.len()
+            );
+            return events;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_query_watermark<R>(
+    watermarks: &R,
+    key: &QueryWatermarkKey,
+) -> datalens_storage::QueryWatermark
+where
+    R: QueryWatermarkRepository,
+{
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let watermark = watermarks.read(key).expect("read watermark");
+        if let Some(watermark) = watermark {
+            return watermark;
+        }
+        if Instant::now() >= deadline {
+            panic!("watermark was not recorded");
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use datalens_chain::{
     AdapterCapabilities, ChainAdapter, ChainHeight, DatasetCapability, SelectorKind,
@@ -235,11 +235,30 @@ where
         native_input: NativeQueryInput,
         application: Option<ApplicationIdentity>,
     ) -> Result<NativeQueryResponse, DatalensError> {
+        let query_id = generate_query_id();
+        self.query_native_with_application_and_query_id(native_input, application, query_id)
+    }
+
+    pub fn query_native_with_application_and_query_id(
+        &self,
+        native_input: NativeQueryInput,
+        application: Option<ApplicationIdentity>,
+        query_id: String,
+    ) -> Result<NativeQueryResponse, DatalensError> {
         if let Err(error) = self.validate_native_query_route(&native_input) {
-            log::warn!("query validation failed kind={:?}", error.kind);
+            log::warn!(
+                "native query validation failed query_id={} chain={} dataset={} range={}-{} kind={:?} message={}",
+                query_id,
+                native_input.chain.configured_name(),
+                native_input.dataset_key.as_str(),
+                native_input.ledger_range.start(),
+                native_input.ledger_range.end(),
+                error.kind,
+                error.message
+            );
             return Err(error);
         }
-        let query_id = generate_query_id();
+        let start = Instant::now();
         log::info!(
             "native query start query_id={} chain={} dataset={} range={}-{}",
             query_id,
@@ -251,8 +270,31 @@ where
         let result = self.executor.execute_with_application_and_query_id(
             native_input,
             application,
+            query_id.clone(),
+        );
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                log::warn!(
+                    "native query failed query_id={} kind={:?} message={} duration_ms={}",
+                    query_id,
+                    error.kind,
+                    error.message,
+                    start.elapsed().as_millis()
+                );
+                return Err(error);
+            }
+        };
+        log::info!(
+            "native query completed query_id={} chain={} dataset={} range={}-{} rows={} duration_ms={}",
             query_id,
-        )?;
+            result.chain.configured_name(),
+            result.dataset_key.as_str(),
+            result.ledger_range.start(),
+            result.ledger_range.end(),
+            result.rows.row_count(),
+            start.elapsed().as_millis()
+        );
         Ok(NativeQueryResponse {
             chain: result.chain,
             dataset_key: result.dataset_key,
@@ -387,6 +429,7 @@ pub(crate) trait RegisteredQueryService: Send + Sync {
         &self,
         request: NativeQueryInput,
         application: Option<ApplicationIdentity>,
+        query_id: String,
     ) -> Result<NativeQueryResponse, DatalensError>;
 
     fn metrics_text(&self) -> Option<Result<String, DatalensError>>;
@@ -479,8 +522,14 @@ where
         &self,
         request: NativeQueryInput,
         application: Option<ApplicationIdentity>,
+        query_id: String,
     ) -> Result<NativeQueryResponse, DatalensError> {
-        QueryService::query_native_with_application(self, request, application)
+        QueryService::query_native_with_application_and_query_id(
+            self,
+            request,
+            application,
+            query_id,
+        )
     }
 
     fn metrics_text(&self) -> Option<Result<String, DatalensError>> {

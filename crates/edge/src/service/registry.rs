@@ -11,6 +11,7 @@ use std::{
 use axum::http::HeaderMap;
 use datalens_chain::ChainAdapter;
 use datalens_core::{DatalensError, DatalensErrorKind, QueryFinalityRequirement};
+use datalens_executor::generate_query_id;
 use datalens_metrics::ApplicationIdentity;
 use datalens_planner::NativeQueryInput;
 use datalens_warmup::{
@@ -85,6 +86,15 @@ impl QueryServiceRegistry {
         request: NativeQueryInput,
         application: Option<ApplicationIdentity>,
     ) -> Result<NativeQueryResponse, DatalensError> {
+        self.query_native_with_application_and_query_id(request, application, generate_query_id())
+    }
+
+    pub fn query_native_with_application_and_query_id(
+        &self,
+        request: NativeQueryInput,
+        application: Option<ApplicationIdentity>,
+        query_id: String,
+    ) -> Result<NativeQueryResponse, DatalensError> {
         let chain_name = request.chain.configured_name();
         let service = self.services.get(chain_name).ok_or_else(|| {
             DatalensError::new(
@@ -92,7 +102,7 @@ impl QueryServiceRegistry {
                 format!("chain {chain_name} is not configured"),
             )
         })?;
-        service.query_native(request, application)
+        service.query_native(request, application, query_id)
     }
 
     pub fn discovery(&self) -> Result<DiscoveryResponse, DatalensError> {
