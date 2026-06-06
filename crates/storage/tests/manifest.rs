@@ -3,6 +3,7 @@ use std::{
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicUsize, Ordering},
+        mpsc,
     },
     time::Duration,
 };
@@ -155,6 +156,176 @@ impl ObjectStore for ConcurrentManifestObjectStore {
     }
 
     fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
+        self.inner.put(key, bytes)
+    }
+
+    fn exists(&self, key: &str) -> Result<bool, DatalensError> {
+        self.inner.exists(key)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
+        self.inner.list(prefix)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), DatalensError> {
+        self.inner.delete(key)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CountingDataObjectExistsStore {
+    inner: LocalObjectStore,
+    data_object_exists_count: Arc<AtomicUsize>,
+}
+
+impl CountingDataObjectExistsStore {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            inner: LocalObjectStore::new(root),
+            data_object_exists_count: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn put_inner(&self, key: &str, bytes: &[u8]) {
+        self.inner.put(key, bytes).expect("put inner object");
+    }
+
+    fn data_object_exists_count(&self) -> usize {
+        self.data_object_exists_count.load(Ordering::SeqCst)
+    }
+}
+
+impl ObjectStore for CountingDataObjectExistsStore {
+    fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError> {
+        self.inner.get(key)
+    }
+
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
+        self.inner.put(key, bytes)
+    }
+
+    fn exists(&self, key: &str) -> Result<bool, DatalensError> {
+        if key.contains("/datasets/") {
+            self.data_object_exists_count.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.exists(key)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
+        self.inner.list(prefix)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), DatalensError> {
+        self.inner.delete(key)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct MissingDataObjectExistsStore {
+    inner: LocalObjectStore,
+}
+
+impl MissingDataObjectExistsStore {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            inner: LocalObjectStore::new(root),
+        }
+    }
+}
+
+impl ObjectStore for MissingDataObjectExistsStore {
+    fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError> {
+        self.inner.get(key)
+    }
+
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
+        self.inner.put(key, bytes)
+    }
+
+    fn exists(&self, key: &str) -> Result<bool, DatalensError> {
+        if key.contains("/datasets/") {
+            return Ok(false);
+        }
+        self.inner.exists(key)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
+        self.inner.list(prefix)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), DatalensError> {
+        self.inner.delete(key)
+    }
+}
+
+#[derive(Debug)]
+struct PausedManifestPutState {
+    put_started: Mutex<bool>,
+    release_put: Mutex<bool>,
+    put_started_ready: Condvar,
+    release_put_ready: Condvar,
+}
+
+#[derive(Clone, Debug)]
+struct PausedManifestPutStore {
+    inner: LocalObjectStore,
+    paused_manifest_key: String,
+    state: Arc<PausedManifestPutState>,
+}
+
+impl PausedManifestPutStore {
+    fn new(root: PathBuf, paused_manifest_key: String) -> Self {
+        Self {
+            inner: LocalObjectStore::new(root),
+            paused_manifest_key,
+            state: Arc::new(PausedManifestPutState {
+                put_started: Mutex::new(false),
+                release_put: Mutex::new(false),
+                put_started_ready: Condvar::new(),
+                release_put_ready: Condvar::new(),
+            }),
+        }
+    }
+
+    fn wait_for_paused_put(&self) {
+        let mut put_started = self.state.put_started.lock().expect("lock put started");
+        while !*put_started {
+            put_started = self
+                .state
+                .put_started_ready
+                .wait(put_started)
+                .expect("wait put started");
+        }
+    }
+
+    fn release_paused_put(&self) {
+        let mut release_put = self.state.release_put.lock().expect("lock release put");
+        *release_put = true;
+        self.state.release_put_ready.notify_all();
+    }
+}
+
+impl ObjectStore for PausedManifestPutStore {
+    fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError> {
+        self.inner.get(key)
+    }
+
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
+        if key == self.paused_manifest_key {
+            {
+                let mut put_started = self.state.put_started.lock().expect("lock put started");
+                *put_started = true;
+                self.state.put_started_ready.notify_all();
+            }
+            let mut release_put = self.state.release_put.lock().expect("lock release put");
+            while !*release_put {
+                release_put = self
+                    .state
+                    .release_put_ready
+                    .wait(release_put)
+                    .expect("wait release put");
+            }
+        }
         self.inner.put(key, bytes)
     }
 
@@ -483,6 +654,10 @@ fn temp_storage_root(name: &str) -> PathBuf {
 
 fn test_chain() -> ChainIdentity {
     ChainIdentity::expect_with_network_id(ChainFamily::Evm, "ethereum", NetworkId::numeric(1))
+}
+
+fn lisk_chain() -> ChainIdentity {
+    ChainIdentity::expect_with_network_id(ChainFamily::Evm, "lisk", NetworkId::numeric(1135))
 }
 
 const ADDRESS_A: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -2012,6 +2187,164 @@ fn test_cloned_storage_serializes_concurrent_manifest_updates() {
             && entry.object_key.is_none()
             && entry.row_count == 0
     }));
+}
+
+#[test]
+fn test_single_entry_empty_coverage_publish_does_not_revalidate_existing_data_objects() {
+    let root = temp_storage_root("single-entry-no-historical-exists");
+    let store = CountingDataObjectExistsStore::new(root);
+    let chain = test_chain();
+    let historical_entry_count = 32;
+    let mut manifest = Manifest::default();
+
+    for index in 0..historical_entry_count {
+        let object_key = format!(
+            "chains/{}/datasets/evm.blocks/parquet-v1/block/all/{index:020}-{index:020}.parquet",
+            chain.key_prefix()
+        );
+        store.put_inner(&object_key, b"x");
+        manifest.entries.push(ManifestEntry {
+            chain: chain.clone(),
+            dataset_key: DatasetKey::evm_blocks(),
+            range: LedgerRange::blocks(index as u64, index as u64).expect("valid range"),
+            selector_fingerprint: "all".to_owned(),
+            selector_canonical_key: "all".to_owned(),
+            finality_level: ManifestFinalityLevel::Safe,
+            object_key: Some(object_key),
+            object_encoding: Some(ObjectEncoding::ParquetV1),
+            object_compression: Some(ParquetCompression::None),
+            row_count: 1,
+            object_size_bytes: Some(1),
+            checksum: Some("0".repeat(64)),
+            checksum_algorithm: Some("sha256".to_owned()),
+            written_at_unix_seconds: Some(1),
+        });
+    }
+    store.put_inner(
+        &format!("chains/{}/manifest.json", chain.key_prefix()),
+        &serde_json::to_vec_pretty(&manifest).expect("manifest bytes"),
+    );
+
+    let storage = DurableStorage::from_object_store(store.clone());
+    let rows = DatasetRows::new(DatasetKey::evm_logs(), QueryRows::EvmLogs(Vec::new()))
+        .expect("dataset rows");
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &DatasetSelector::all(),
+            range: LedgerRange::blocks(10_000, 10_000).expect("valid range"),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write empty coverage");
+
+    assert_eq!(store.data_object_exists_count(), 0);
+    assert_eq!(
+        storage.manifest().expect("manifest").entries.len(),
+        historical_entry_count + 1
+    );
+}
+
+#[test]
+fn test_single_entry_data_object_publish_validates_new_object_exists() {
+    let storage = DurableStorage::from_object_store(MissingDataObjectExistsStore::new(
+        temp_storage_root("single-entry-new-object-exists"),
+    ));
+    let chain = test_chain();
+    let selector = evm_log_selector(vec![ADDRESS_A], vec![Some(vec![TOPIC_1])]);
+    let rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![log_record(10_000, 0, ADDRESS_A, vec![TOPIC_1])]),
+    )
+    .expect("dataset rows");
+
+    let error = storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &selector,
+            range: LedgerRange::blocks(10_000, 10_000).expect("valid range"),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect_err("missing new object validation should fail");
+
+    assert_eq!(error.kind, DatalensErrorKind::ManifestUpdateFailure);
+    assert!(
+        storage.manifest().expect("manifest").entries.is_empty(),
+        "failed data-object manifest publish must not leave durable coverage"
+    );
+}
+
+#[test]
+fn test_manifest_updates_for_different_chains_do_not_share_lock() {
+    let root = temp_storage_root("per-chain-manifest-locks");
+    let ethereum = test_chain();
+    let lisk = lisk_chain();
+    let store = PausedManifestPutStore::new(
+        root,
+        format!("chains/{}/manifest.json", ethereum.key_prefix()),
+    );
+    let storage = DurableStorage::from_object_store(store.clone());
+
+    let ethereum_storage = storage.clone();
+    let ethereum_writer = std::thread::spawn(move || {
+        let rows = DatasetRows::new(DatasetKey::evm_logs(), QueryRows::EvmLogs(Vec::new()))
+            .expect("dataset rows");
+        ethereum_storage.write_rows(StorageWriteRequest {
+            chain: &ethereum,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &DatasetSelector::all(),
+            range: LedgerRange::blocks(1, 1).expect("valid range"),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+    });
+    store.wait_for_paused_put();
+
+    let (sender, receiver) = mpsc::channel();
+    let lisk_storage = storage.clone();
+    let lisk_writer = std::thread::spawn(move || {
+        let rows = DatasetRows::new(DatasetKey::evm_logs(), QueryRows::EvmLogs(Vec::new()))
+            .expect("dataset rows");
+        let result = lisk_storage.write_rows(StorageWriteRequest {
+            chain: &lisk,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &DatasetSelector::all(),
+            range: LedgerRange::blocks(2, 2).expect("valid range"),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        });
+        sender.send(result).expect("send lisk result");
+    });
+
+    let quick_lisk_result = receiver.recv_timeout(Duration::from_millis(100));
+    let lisk_completed_quickly =
+        !matches!(&quick_lisk_result, Err(mpsc::RecvTimeoutError::Timeout));
+    store.release_paused_put();
+    ethereum_writer
+        .join()
+        .expect("ethereum writer")
+        .expect("ethereum write");
+    let lisk_result = match quick_lisk_result {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("lisk result after releasing ethereum put"),
+        Err(mpsc::RecvTimeoutError::Disconnected) => panic!("lisk writer disconnected"),
+    };
+    lisk_writer.join().expect("lisk writer");
+    lisk_result.expect("lisk write");
+
+    assert!(
+        lisk_completed_quickly,
+        "lisk manifest write waited behind ethereum manifest put"
+    );
 }
 
 #[test]

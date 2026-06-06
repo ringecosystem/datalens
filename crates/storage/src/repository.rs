@@ -4,8 +4,10 @@ use datalens_core::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
+    time::Instant,
 };
 
 use crate::read_through_cache;
@@ -83,7 +85,7 @@ pub use crate::usage_ledger::{
 pub struct DurableStorage<S> {
     object_store: S,
     read_through_cache: read_through_cache::ReadThroughCache,
-    manifest_update_lock: Arc<Mutex<()>>,
+    manifest_update_locks: Arc<Mutex<BTreeMap<String, Arc<Mutex<()>>>>>,
     config: DurableStorageConfig,
 }
 
@@ -172,7 +174,7 @@ impl DurableStorage<LocalObjectStore> {
             read_through_cache: read_through_cache::ReadThroughCache::new(
                 ReadThroughCacheConfig::default(),
             ),
-            manifest_update_lock: Arc::new(Mutex::new(())),
+            manifest_update_locks: Arc::new(Mutex::new(BTreeMap::new())),
             config,
         }
     }
@@ -223,7 +225,7 @@ where
             read_through_cache: read_through_cache::ReadThroughCache::new(
                 read_through_cache_config,
             ),
-            manifest_update_lock: Arc::new(Mutex::new(())),
+            manifest_update_locks: Arc::new(Mutex::new(BTreeMap::new())),
             config,
         }
     }
@@ -534,14 +536,17 @@ where
         chain: &ChainIdentity,
         manifest: &Manifest,
     ) -> Result<(), DatalensError> {
-        let _guard = self.lock_manifest_updates()?;
-        self.write_manifest_unlocked(chain, manifest)
+        let started = Instant::now();
+        let lock = self.manifest_update_lock(chain)?;
+        let _guard = self.lock_manifest_updates(&lock)?;
+        self.write_manifest_unlocked(chain, manifest, started)
     }
 
     fn write_manifest_unlocked(
         &self,
         chain: &ChainIdentity,
         manifest: &Manifest,
+        started: Instant,
     ) -> Result<(), DatalensError> {
         // Never publish a manifest that references a missing object; once
         // written, the manifest is what readers and planners trust.
@@ -555,6 +560,16 @@ where
                 ));
             }
         }
+        self.publish_manifest_unlocked(chain, manifest, "full", started)
+    }
+
+    fn publish_manifest_unlocked(
+        &self,
+        chain: &ChainIdentity,
+        manifest: &Manifest,
+        publish_kind: &'static str,
+        started: Instant,
+    ) -> Result<(), DatalensError> {
         let key = manifest_key(chain);
         let bytes = serde_json::to_vec_pretty(manifest).map_err(|error| {
             DatalensError::new(
@@ -567,7 +582,25 @@ where
                 DatalensErrorKind::ManifestUpdateFailure,
                 format!("write manifest {key}: {}", error.message),
             )
-        })
+        })?;
+        let entries_count = manifest.entries.len();
+        let data_object_count = manifest
+            .entries
+            .iter()
+            .filter(|entry| entry.object_key.is_some())
+            .count();
+        let empty_coverage_count = entries_count - data_object_count;
+        log::info!(
+            "storage published manifest publish_kind={} chain_key={} entries_count={} data_object_count={} empty_coverage_count={} manifest_bytes={} duration_ms={}",
+            publish_kind,
+            chain.key_prefix(),
+            entries_count,
+            data_object_count,
+            empty_coverage_count,
+            bytes.len(),
+            started.elapsed().as_millis()
+        );
+        Ok(())
     }
 
     fn write_manifest_entry(
@@ -575,15 +608,39 @@ where
         chain: &ChainIdentity,
         entry: ManifestEntry,
     ) -> Result<(), DatalensError> {
-        let _guard = self.lock_manifest_updates()?;
+        let started = Instant::now();
+        let lock = self.manifest_update_lock(chain)?;
+        let _guard = self.lock_manifest_updates(&lock)?;
+        if let Some(object_key) = entry.object_key.as_deref()
+            && !self.object_store.exists(object_key)?
+        {
+            return Err(DatalensError::new(
+                DatalensErrorKind::ManifestUpdateFailure,
+                format!("manifest entry object not found {object_key}"),
+            ));
+        }
         let mut manifest = self.manifest_for_chain(chain)?;
         manifest.upsert(entry);
-        self.write_manifest_unlocked(chain, &manifest)
+        self.publish_manifest_unlocked(chain, &manifest, "single_entry", started)
     }
 
-    fn lock_manifest_updates(&self) -> Result<MutexGuard<'_, ()>, DatalensError> {
-        self.manifest_update_lock
+    fn manifest_update_lock(&self, chain: &ChainIdentity) -> Result<Arc<Mutex<()>>, DatalensError> {
+        let chain_key = chain.key_prefix();
+        let mut locks = self
+            .manifest_update_locks
             .lock()
+            .map_err(|_| DatalensError::internal("manifest update lock poisoned"))?;
+        Ok(locks
+            .entry(chain_key)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone())
+    }
+
+    fn lock_manifest_updates<'a>(
+        &self,
+        lock: &'a Mutex<()>,
+    ) -> Result<MutexGuard<'a, ()>, DatalensError> {
+        lock.lock()
             .map_err(|_| DatalensError::internal("manifest update lock poisoned"))
     }
 }
