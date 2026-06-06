@@ -1,9 +1,11 @@
 use std::{
     collections::VecDeque,
     sync::{
-        Arc,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
+        mpsc,
     },
+    thread,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -238,6 +240,7 @@ where
                 self.record_cache_coverage(&labels, CacheCoverageOutcome::Error);
                 self.record_query(&labels, QueryOutcome::Error, start);
                 self.record_usage(
+                    &query_id,
                     &ledger_application,
                     &input,
                     FinalityLevel::Safe,
@@ -246,7 +249,7 @@ where
                     LedgerFillOutcome::NotAttempted,
                     LedgerDurableWriteOutcome::NotAttempted,
                     0,
-                )?;
+                );
                 return Err(error);
             }
         };
@@ -270,6 +273,7 @@ where
                     self.record_cache_coverage(&labels, CacheCoverageOutcome::Error);
                     self.record_query(&labels, QueryOutcome::Error, start);
                     self.record_usage(
+                        &query_id,
                         &ledger_application,
                         &input,
                         FinalityLevel::Safe,
@@ -278,7 +282,7 @@ where
                         LedgerFillOutcome::NotAttempted,
                         LedgerDurableWriteOutcome::NotAttempted,
                         0,
-                    )?;
+                    );
                     return Err(error);
                 }
             }
@@ -291,6 +295,7 @@ where
                     self.record_error(&labels, &error);
                     self.record_query(&labels, QueryOutcome::Error, start);
                     self.record_usage(
+                        &query_id,
                         &ledger_application,
                         &input,
                         FinalityLevel::Safe,
@@ -299,7 +304,7 @@ where
                         LedgerFillOutcome::NotAttempted,
                         LedgerDurableWriteOutcome::NotAttempted,
                         0,
-                    )?;
+                    );
                     return Err(error);
                 }
             }
@@ -312,6 +317,7 @@ where
                     self.record_cache_coverage(&labels, CacheCoverageOutcome::Error);
                     self.record_query(&labels, QueryOutcome::Error, start);
                     self.record_usage(
+                        &query_id,
                         &ledger_application,
                         &input,
                         FinalityLevel::Latest,
@@ -320,7 +326,7 @@ where
                         LedgerFillOutcome::NotAttempted,
                         LedgerDurableWriteOutcome::NotAttempted,
                         0,
-                    )?;
+                    );
                     return Err(error);
                 }
             }
@@ -338,6 +344,7 @@ where
             Err(error) => {
                 self.record_query(&labels, QueryOutcome::Error, start);
                 self.record_usage(
+                    &query_id,
                     &ledger_application,
                     &input,
                     durable_boundary.finality,
@@ -346,7 +353,7 @@ where
                     LedgerFillOutcome::NotAttempted,
                     LedgerDurableWriteOutcome::NotAttempted,
                     0,
-                )?;
+                );
                 return Err(error);
             }
         };
@@ -401,6 +408,7 @@ where
                         self.record_error(&labels, &error);
                         self.record_query(&labels, QueryOutcome::Error, start);
                         self.record_usage_for_plan(
+                            &query_id,
                             &ledger_application,
                             &plan,
                             LedgerQueryOutcome::StorageError,
@@ -408,7 +416,7 @@ where
                             LedgerFillOutcome::NotAttempted,
                             LedgerDurableWriteOutcome::NotAttempted,
                             rows.row_count(),
-                        )?;
+                        );
                         return Err(error);
                     }
                 },
@@ -416,6 +424,7 @@ where
                     self.record_error(&labels, &error);
                     self.record_query(&labels, QueryOutcome::Error, start);
                     self.record_usage_for_plan(
+                        &query_id,
                         &ledger_application,
                         &plan,
                         LedgerQueryOutcome::StorageError,
@@ -423,13 +432,14 @@ where
                         LedgerFillOutcome::NotAttempted,
                         LedgerDurableWriteOutcome::NotAttempted,
                         rows.row_count(),
-                    )?;
+                    );
                     return Err(error);
                 }
             };
             if let Err(error) = rows.try_append(cached.into_rows()) {
                 self.record_query(&labels, QueryOutcome::Error, start);
                 self.record_usage_for_plan(
+                    &query_id,
                     &ledger_application,
                     &plan,
                     LedgerQueryOutcome::Error,
@@ -437,7 +447,7 @@ where
                     LedgerFillOutcome::NotAttempted,
                     LedgerDurableWriteOutcome::NotAttempted,
                     rows.row_count(),
-                )?;
+                );
                 return Err(error);
             }
         }
@@ -481,6 +491,7 @@ where
                         self.record_fill(&labels, FillOutcome::Error, fill_start);
                         self.record_query(&labels, QueryOutcome::Error, start);
                         self.record_usage_for_plan(
+                            &query_id,
                             &ledger_application,
                             &plan,
                             ledger_query_error(&error),
@@ -488,7 +499,7 @@ where
                             ledger_fill_error(&error),
                             LedgerDurableWriteOutcome::NotAttempted,
                             rows.row_count(),
-                        )?;
+                        );
                         return Err(error);
                     }
                 };
@@ -498,6 +509,7 @@ where
                         self.record_fill(&labels, FillOutcome::Error, fill_start);
                         self.record_query(&labels, QueryOutcome::Error, start);
                         self.record_usage_for_plan(
+                            &query_id,
                             &ledger_application,
                             &plan,
                             LedgerQueryOutcome::Error,
@@ -505,7 +517,7 @@ where
                             LedgerFillOutcome::Error,
                             LedgerDurableWriteOutcome::NotAttempted,
                             rows.row_count(),
-                        )?;
+                        );
                         return Err(error);
                     }
                     fill_row_count += response.rows.row_count();
@@ -529,6 +541,7 @@ where
                     self.record_fill(&labels, FillOutcome::Error, fill_start);
                     self.record_query(&labels, QueryOutcome::Error, start);
                     self.record_usage_for_plan(
+                        &query_id,
                         &ledger_application,
                         &plan,
                         LedgerQueryOutcome::Error,
@@ -536,7 +549,7 @@ where
                         LedgerFillOutcome::Error,
                         LedgerDurableWriteOutcome::NotAttempted,
                         rows.row_count(),
-                    )?;
+                    );
                     return Err(error);
                 }
             }
@@ -630,6 +643,7 @@ where
         let query_outcome = query_outcome(coverage_outcome, cache_fill_attempted, &result);
         self.record_query(&labels, query_outcome, start);
         self.record_usage_for_plan(
+            &query_id,
             &ledger_application,
             &plan,
             ledger_query_outcome(query_outcome),
@@ -637,8 +651,8 @@ where
             ledger_fill_outcome(provider_fetch_attempted, fill_row_count),
             durable_write_outcome,
             result.rows.row_count(),
-        )?;
-        self.record_query_watermark_for_plan(&application, &plan)?;
+        );
+        self.record_query_watermark_for_plan(&query_id, &application, &plan);
         Ok(result)
     }
 
@@ -660,6 +674,7 @@ where
                 self.record_cache_coverage(&labels, CacheCoverageOutcome::Error);
                 self.record_query(&labels, QueryOutcome::Error, start);
                 self.record_usage(
+                    &query_id,
                     &ledger_application,
                     &input,
                     FinalityLevel::Latest,
@@ -668,7 +683,7 @@ where
                     LedgerFillOutcome::NotAttempted,
                     LedgerDurableWriteOutcome::NotAttempted,
                     0,
-                )?;
+                );
                 return Err(error);
             }
         };
@@ -682,6 +697,7 @@ where
             Err(error) => {
                 self.record_query(&labels, QueryOutcome::Error, start);
                 self.record_usage(
+                    &query_id,
                     &ledger_application,
                     &input,
                     FinalityLevel::Latest,
@@ -690,7 +706,7 @@ where
                     LedgerFillOutcome::NotAttempted,
                     LedgerDurableWriteOutcome::NotAttempted,
                     0,
-                )?;
+                );
                 return Err(error);
             }
         };
@@ -744,6 +760,7 @@ where
                         self.record_fill(&labels, FillOutcome::Error, fill_start);
                         self.record_query(&labels, QueryOutcome::Error, start);
                         self.record_usage_for_plan(
+                            &query_id,
                             &ledger_application,
                             &plan,
                             ledger_query_error(&error),
@@ -751,7 +768,7 @@ where
                             ledger_fill_error(&error),
                             LedgerDurableWriteOutcome::NotAttempted,
                             rows.row_count(),
-                        )?;
+                        );
                         return Err(error);
                     }
                 };
@@ -761,6 +778,7 @@ where
                         self.record_fill(&labels, FillOutcome::Error, fill_start);
                         self.record_query(&labels, QueryOutcome::Error, start);
                         self.record_usage_for_plan(
+                            &query_id,
                             &ledger_application,
                             &plan,
                             LedgerQueryOutcome::Error,
@@ -768,7 +786,7 @@ where
                             LedgerFillOutcome::Error,
                             LedgerDurableWriteOutcome::NotAttempted,
                             rows.row_count(),
-                        )?;
+                        );
                         return Err(error);
                     }
                     response.rows
@@ -777,6 +795,7 @@ where
                     self.record_fill(&labels, FillOutcome::Error, fill_start);
                     self.record_query(&labels, QueryOutcome::Error, start);
                     self.record_usage_for_plan(
+                        &query_id,
                         &ledger_application,
                         &plan,
                         LedgerQueryOutcome::Error,
@@ -784,7 +803,7 @@ where
                         LedgerFillOutcome::Error,
                         LedgerDurableWriteOutcome::NotAttempted,
                         rows.row_count(),
-                    )?;
+                    );
                     return Err(error);
                 }
             }
@@ -808,6 +827,7 @@ where
         };
         self.record_query(&labels, QueryOutcome::HotMiss, start);
         self.record_usage_for_plan(
+            &query_id,
             &ledger_application,
             &plan,
             LedgerQueryOutcome::HotMiss,
@@ -815,7 +835,7 @@ where
             LedgerFillOutcome::LiveFetch,
             LedgerDurableWriteOutcome::NotAttempted,
             result.rows.row_count(),
-        )?;
+        );
         Ok(result)
     }
 
@@ -945,6 +965,7 @@ where
     #[allow(clippy::too_many_arguments)]
     fn record_usage(
         &self,
+        query_id: &str,
         application: &Option<ApplicationIdentity>,
         input: &NativeQueryInput,
         finality_level: FinalityLevel,
@@ -953,36 +974,37 @@ where
         fill_outcome: LedgerFillOutcome,
         durable_write_outcome: LedgerDurableWriteOutcome,
         row_count: usize,
-    ) -> Result<(), DatalensError> {
+    ) {
         let Some(ledger) = &self.usage_ledger else {
-            return Ok(());
+            return;
         };
         let application = application
             .as_ref()
             .unwrap_or(&ledger.application)
             .as_str()
             .to_owned();
-        ledger.repository.append(
-            &UsageLedgerEntry::query_event(
-                application,
-                input.chain.clone(),
-                input.dataset_key.clone(),
-                &input.selector,
-                input.ledger_range.clone(),
-                finality_level,
-                query_outcome,
-                cache_outcome,
-                fill_outcome,
-                row_count,
-            )
-            .with_requested_hot(input.finality.allows_hot())
-            .with_durable_write_outcome(durable_write_outcome),
+        let entry = UsageLedgerEntry::query_event(
+            application,
+            input.chain.clone(),
+            input.dataset_key.clone(),
+            &input.selector,
+            input.ledger_range.clone(),
+            finality_level,
+            query_outcome,
+            cache_outcome,
+            fill_outcome,
+            row_count,
         )
+        .with_requested_hot(input.finality.allows_hot())
+        .with_durable_write_outcome(durable_write_outcome)
+        .with_request_id(query_id.to_owned());
+        enqueue_usage_ledger_append(ledger.repository.clone(), entry);
     }
 
     #[allow(clippy::too_many_arguments)]
     fn record_usage_for_plan(
         &self,
+        query_id: &str,
         application: &Option<ApplicationIdentity>,
         plan: &datalens_planner::NativeQueryPlan,
         query_outcome: LedgerQueryOutcome,
@@ -990,8 +1012,9 @@ where
         fill_outcome: LedgerFillOutcome,
         durable_write_outcome: LedgerDurableWriteOutcome,
         row_count: usize,
-    ) -> Result<(), DatalensError> {
+    ) {
         self.record_usage(
+            query_id,
             application,
             &NativeQueryInput {
                 chain: plan.chain.clone(),
@@ -1016,19 +1039,36 @@ where
 
     fn record_query_watermark_for_plan(
         &self,
+        query_id: &str,
         application: &Option<ApplicationIdentity>,
         plan: &datalens_planner::NativeQueryPlan,
-    ) -> Result<(), DatalensError> {
+    ) {
         let Some(watermarks) = &self.query_watermarks else {
-            return Ok(());
+            return;
         };
         let Some(application) = self.watermark_application(application) else {
-            return Ok(());
+            return;
         };
         let Some(latest_block) = durable_watermark_block(plan) else {
-            return Ok(());
+            return;
         };
-        watermarks.repository.update(&QueryWatermark {
+        let updated_at_unix_seconds = match unix_seconds_now() {
+            Ok(updated_at_unix_seconds) => updated_at_unix_seconds,
+            Err(error) => {
+                log::warn!(
+                    "query metadata build failed metadata_kind=query_watermark query_id={} chain={} dataset={} range={}-{} kind={:?} message={}",
+                    query_id,
+                    plan.chain.configured_name(),
+                    plan.dataset_key.as_str(),
+                    plan.ledger_range.start(),
+                    plan.ledger_range.end(),
+                    error.kind,
+                    error.message
+                );
+                return;
+            }
+        };
+        let watermark = QueryWatermark {
             key: QueryWatermarkKey::new(
                 application.as_str(),
                 plan.chain.clone(),
@@ -1037,9 +1077,328 @@ where
                 plan.ledger_range.kind(),
             ),
             latest_block,
-            updated_at_unix_seconds: unix_seconds_now()?,
-        })
+            updated_at_unix_seconds,
+        };
+        enqueue_query_watermark_update(
+            watermarks.repository.clone(),
+            query_id.to_owned(),
+            watermark,
+            plan.ledger_range.start(),
+            plan.ledger_range.end(),
+        );
     }
+}
+
+const QUERY_METADATA_QUEUE_CAPACITY: usize = 1024;
+const QUERY_METADATA_WORKER_THREADS: usize = 2;
+
+static QUERY_METADATA_WORKER_POOL: OnceLock<MetadataWorkerPool> = OnceLock::new();
+
+#[derive(Debug, Eq, PartialEq)]
+enum MetadataEnqueueOutcome {
+    Enqueued,
+    Full,
+    Closed,
+}
+
+struct MetadataWorkerPool {
+    sender: mpsc::SyncSender<MetadataJob>,
+    _receiver: Arc<Mutex<mpsc::Receiver<MetadataJob>>>,
+}
+
+impl MetadataWorkerPool {
+    fn new(capacity: usize, worker_count: usize) -> Self {
+        let (sender, receiver) = mpsc::sync_channel(capacity);
+        let receiver = Arc::new(Mutex::new(receiver));
+        for worker_index in 0..worker_count {
+            let receiver = receiver.clone();
+            let name = format!("datalens-query-metadata-{worker_index}");
+            if let Err(error) = thread::Builder::new().name(name).spawn(move || {
+                loop {
+                    let job = {
+                        let receiver = match receiver.lock() {
+                            Ok(receiver) => receiver,
+                            Err(error) => {
+                                log::warn!("query metadata worker lock failed message={error}");
+                                return;
+                            }
+                        };
+                        receiver.recv()
+                    };
+                    match job {
+                        Ok(job) => process_metadata_job(job),
+                        Err(_) => return,
+                    }
+                }
+            }) {
+                log::warn!(
+                    "query metadata worker spawn failed worker_index={} message={}",
+                    worker_index,
+                    error
+                );
+            }
+        }
+        Self {
+            sender,
+            _receiver: receiver,
+        }
+    }
+
+    #[cfg(test)]
+    fn new_for_test(capacity: usize, worker_count: usize) -> Self {
+        Self::new(capacity, worker_count)
+    }
+
+    fn enqueue(&self, job: MetadataJob) -> MetadataEnqueueOutcome {
+        match self.sender.try_send(job) {
+            Ok(()) => MetadataEnqueueOutcome::Enqueued,
+            Err(mpsc::TrySendError::Full(_)) => MetadataEnqueueOutcome::Full,
+            Err(mpsc::TrySendError::Disconnected(_)) => MetadataEnqueueOutcome::Closed,
+        }
+    }
+}
+
+enum MetadataJob {
+    UsageLedgerAppend {
+        repository: Arc<dyn UsageLedgerRepository>,
+        entry: UsageLedgerEntry,
+        context: UsageLedgerMetadataContext,
+    },
+    QueryWatermarkUpdate {
+        repository: Arc<dyn QueryWatermarkRepository>,
+        watermark: QueryWatermark,
+        context: QueryWatermarkMetadataContext,
+    },
+    #[cfg(test)]
+    NoopForTest,
+}
+
+#[derive(Clone)]
+struct QueryMetadataContext {
+    query_id: String,
+    application_id: String,
+    chain: String,
+    dataset: String,
+    range_start: u64,
+    range_end: u64,
+}
+
+#[derive(Clone)]
+struct UsageLedgerMetadataContext {
+    base: QueryMetadataContext,
+    query_outcome: LedgerQueryOutcome,
+}
+
+#[derive(Clone)]
+struct QueryWatermarkMetadataContext {
+    base: QueryMetadataContext,
+    latest_block: u64,
+}
+
+fn metadata_worker_pool() -> &'static MetadataWorkerPool {
+    QUERY_METADATA_WORKER_POOL.get_or_init(|| {
+        MetadataWorkerPool::new(QUERY_METADATA_QUEUE_CAPACITY, QUERY_METADATA_WORKER_THREADS)
+    })
+}
+
+fn enqueue_usage_ledger_append(
+    repository: Arc<dyn UsageLedgerRepository>,
+    entry: UsageLedgerEntry,
+) {
+    let enqueue_start = Instant::now();
+    let context = UsageLedgerMetadataContext {
+        base: QueryMetadataContext {
+            query_id: entry
+                .request_id
+                .clone()
+                .unwrap_or_else(|| "unknown".to_owned()),
+            application_id: entry.application_id.clone(),
+            chain: entry.chain.configured_name().to_owned(),
+            dataset: entry.dataset_key.as_str().to_owned(),
+            range_start: entry.range.start(),
+            range_end: entry.range.end(),
+        },
+        query_outcome: entry.query_outcome,
+    };
+    let outcome = metadata_worker_pool().enqueue(MetadataJob::UsageLedgerAppend {
+        repository,
+        entry,
+        context: context.clone(),
+    });
+    match outcome {
+        MetadataEnqueueOutcome::Enqueued => log::debug!(
+            "query metadata enqueue completed metadata_kind=usage_ledger query_id={} application={} chain={} dataset={} range={}-{} duration_ms={}",
+            context.base.query_id,
+            context.base.application_id,
+            context.base.chain,
+            context.base.dataset,
+            context.base.range_start,
+            context.base.range_end,
+            elapsed_ms(enqueue_start)
+        ),
+        MetadataEnqueueOutcome::Full => log::warn!(
+            "query metadata enqueue dropped metadata_kind=usage_ledger query_id={} application={} chain={} dataset={} range={}-{} duration_ms={} reason=queue_full",
+            context.base.query_id,
+            context.base.application_id,
+            context.base.chain,
+            context.base.dataset,
+            context.base.range_start,
+            context.base.range_end,
+            elapsed_ms(enqueue_start),
+        ),
+        MetadataEnqueueOutcome::Closed => log::warn!(
+            "query metadata enqueue failed metadata_kind=usage_ledger query_id={} application={} chain={} dataset={} range={}-{} duration_ms={} reason=queue_closed",
+            context.base.query_id,
+            context.base.application_id,
+            context.base.chain,
+            context.base.dataset,
+            context.base.range_start,
+            context.base.range_end,
+            elapsed_ms(enqueue_start),
+        ),
+    }
+}
+
+fn enqueue_query_watermark_update(
+    repository: Arc<dyn QueryWatermarkRepository>,
+    query_id: String,
+    watermark: QueryWatermark,
+    range_start: u64,
+    range_end: u64,
+) {
+    let enqueue_start = Instant::now();
+    let application_id = watermark.key.application_id.clone();
+    let chain = watermark.key.chain.configured_name().to_owned();
+    let dataset = watermark.key.dataset_key.as_str().to_owned();
+    let latest_block = watermark.latest_block;
+    let context = QueryWatermarkMetadataContext {
+        base: QueryMetadataContext {
+            query_id,
+            application_id,
+            chain,
+            dataset,
+            range_start,
+            range_end,
+        },
+        latest_block,
+    };
+    let outcome = metadata_worker_pool().enqueue(MetadataJob::QueryWatermarkUpdate {
+        repository,
+        watermark,
+        context: context.clone(),
+    });
+    match outcome {
+        MetadataEnqueueOutcome::Enqueued => log::debug!(
+            "query metadata enqueue completed metadata_kind=query_watermark query_id={} application={} chain={} dataset={} range={}-{} latest_block={} duration_ms={}",
+            context.base.query_id,
+            context.base.application_id,
+            context.base.chain,
+            context.base.dataset,
+            context.base.range_start,
+            context.base.range_end,
+            context.latest_block,
+            elapsed_ms(enqueue_start)
+        ),
+        MetadataEnqueueOutcome::Full => log::warn!(
+            "query metadata enqueue dropped metadata_kind=query_watermark query_id={} application={} chain={} dataset={} range={}-{} latest_block={} duration_ms={} reason=queue_full",
+            context.base.query_id,
+            context.base.application_id,
+            context.base.chain,
+            context.base.dataset,
+            context.base.range_start,
+            context.base.range_end,
+            context.latest_block,
+            elapsed_ms(enqueue_start),
+        ),
+        MetadataEnqueueOutcome::Closed => log::warn!(
+            "query metadata enqueue failed metadata_kind=query_watermark query_id={} application={} chain={} dataset={} range={}-{} latest_block={} duration_ms={} reason=queue_closed",
+            context.base.query_id,
+            context.base.application_id,
+            context.base.chain,
+            context.base.dataset,
+            context.base.range_start,
+            context.base.range_end,
+            context.latest_block,
+            elapsed_ms(enqueue_start),
+        ),
+    }
+}
+
+fn process_metadata_job(job: MetadataJob) {
+    match job {
+        MetadataJob::UsageLedgerAppend {
+            repository,
+            entry,
+            context,
+        } => {
+            let start = Instant::now();
+            match repository.append(&entry) {
+                Ok(()) => log::info!(
+                    "query metadata background write completed metadata_kind=usage_ledger query_id={} application={} chain={} dataset={} range={}-{} query_outcome={:?} duration_ms={}",
+                    context.base.query_id,
+                    context.base.application_id,
+                    context.base.chain,
+                    context.base.dataset,
+                    context.base.range_start,
+                    context.base.range_end,
+                    context.query_outcome,
+                    elapsed_ms(start)
+                ),
+                Err(error) => log::warn!(
+                    "query metadata background write failed metadata_kind=usage_ledger query_id={} application={} chain={} dataset={} range={}-{} query_outcome={:?} duration_ms={} kind={:?} message={}",
+                    context.base.query_id,
+                    context.base.application_id,
+                    context.base.chain,
+                    context.base.dataset,
+                    context.base.range_start,
+                    context.base.range_end,
+                    context.query_outcome,
+                    elapsed_ms(start),
+                    error.kind,
+                    error.message
+                ),
+            }
+        }
+        MetadataJob::QueryWatermarkUpdate {
+            repository,
+            watermark,
+            context,
+        } => {
+            let start = Instant::now();
+            match repository.update(&watermark) {
+                Ok(()) => log::info!(
+                    "query metadata background write completed metadata_kind=query_watermark query_id={} application={} chain={} dataset={} range={}-{} latest_block={} duration_ms={}",
+                    context.base.query_id,
+                    context.base.application_id,
+                    context.base.chain,
+                    context.base.dataset,
+                    context.base.range_start,
+                    context.base.range_end,
+                    context.latest_block,
+                    elapsed_ms(start)
+                ),
+                Err(error) => log::warn!(
+                    "query metadata background write failed metadata_kind=query_watermark query_id={} application={} chain={} dataset={} range={}-{} latest_block={} duration_ms={} kind={:?} message={}",
+                    context.base.query_id,
+                    context.base.application_id,
+                    context.base.chain,
+                    context.base.dataset,
+                    context.base.range_start,
+                    context.base.range_end,
+                    context.latest_block,
+                    elapsed_ms(start),
+                    error.kind,
+                    error.message
+                ),
+            }
+        }
+        #[cfg(test)]
+        MetadataJob::NoopForTest => {}
+    }
+}
+
+fn elapsed_ms(start: Instant) -> u128 {
+    start.elapsed().as_millis()
 }
 
 fn split_provider_limit_range(range: &LedgerRange) -> Result<Vec<LedgerRange>, DatalensError> {
@@ -1155,6 +1514,25 @@ mod tests {
         assert_eq!(
             summary,
             "query_id=q-abc chain=ethereum dataset=evm.blocks range=10-15 selector_kind=All selector_fingerprint=all cache_status=PartialHit cache_outcome=PartialHit hit_ranges=2[10-11,14-14] missing_ranges=1[12-13] durable_hit_ranges=1[10-11] hot_hit_ranges=0[] provider_fill_ranges=1[12-13]"
+        );
+    }
+
+    #[test]
+    fn test_metadata_worker_pool_reports_full_without_blocking() {
+        let pool = MetadataWorkerPool::new_for_test(1, 0);
+
+        assert_eq!(
+            pool.enqueue(MetadataJob::NoopForTest),
+            MetadataEnqueueOutcome::Enqueued
+        );
+        let start = Instant::now();
+        assert_eq!(
+            pool.enqueue(MetadataJob::NoopForTest),
+            MetadataEnqueueOutcome::Full
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(50),
+            "full metadata queue enqueue should not block"
         );
     }
 }

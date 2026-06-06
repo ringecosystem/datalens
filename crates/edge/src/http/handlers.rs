@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::Instant};
 
 use axum::{
     Json,
@@ -7,6 +7,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use datalens_core::{DatalensError, DatalensErrorKind};
+use datalens_executor::generate_query_id;
 use datalens_metrics::ApplicationIdentity;
 use datalens_warmup::{
     WarmupChunkPolicy, WarmupRetryPolicy, WarmupSubmitRequest, WarmupTask, WarmupTaskFilter,
@@ -20,7 +21,7 @@ use crate::{
         discovery::DiscoveryResponse,
         error::{api_error_body, api_error_status, api_retry_after_seconds},
         head::{ChainHeadApiResponse, ChainHeadFinalityApi},
-        query::{QueryApiRequest, QueryApiResponse},
+        query::{QueryApiRequest, QueryApiResponse, QueryRangeApi},
         warmup::{
             WarmupRunOnceApiResponse, WarmupSubmitApiRequest, WarmupSubmitApiResponse,
             WarmupTaskApiResponse, WarmupTaskListApiResponse, WarmupTaskListQuery,
@@ -92,40 +93,209 @@ pub(crate) async fn query(
     headers: HeaderMap,
     Json(request): Json<QueryApiRequest>,
 ) -> Result<Json<QueryApiResponse>, ApiError> {
+    let query_id = generate_query_id();
+    let handler_start = Instant::now();
     let registry = state.registry.clone();
-    let dataset = request.dataset_for_auth().map_err(ApiError)?;
+    let chain = request.chain.configured_name().to_owned();
+    let requested_dataset = request.dataset_key.clone();
+    let (range_start, range_end) = query_range_bounds(&request.range);
+    log::info!(
+        "query api request start query_id={} chain={} dataset={} range={}-{}",
+        query_id,
+        chain,
+        requested_dataset,
+        range_start,
+        range_end
+    );
+    let dataset = match request.dataset_for_auth() {
+        Ok(dataset) => dataset,
+        Err(error) => {
+            log::warn!(
+                "query api request failed query_id={} chain={} dataset={} range={}-{} stage=dataset_validation duration_ms={} kind={:?} message={}",
+                query_id,
+                chain,
+                requested_dataset,
+                range_start,
+                range_end,
+                handler_start.elapsed().as_millis(),
+                error.kind,
+                error.message
+            );
+            return Err(ApiError(error));
+        }
+    };
     // Authentication identifies the caller; authorization and quota checks bind
     // that identity to the requested chain, dataset, range, and finality.
-    let application_context = registry
-        .authenticate_headers(
-            &headers,
-            request.chain.configured_name(),
-            &dataset,
-            request.range_len(),
-            request.finality,
-        )
-        .map_err(ApiError)?;
+    let application_context = match registry.authenticate_headers(
+        &headers,
+        request.chain.configured_name(),
+        &dataset,
+        request.range_len(),
+        request.finality,
+    ) {
+        Ok(application_context) => application_context,
+        Err(error) => {
+            log::warn!(
+                "query api request failed query_id={} chain={} dataset={} range={}-{} stage=authentication duration_ms={} kind={:?} message={}",
+                query_id,
+                chain,
+                dataset,
+                range_start,
+                range_end,
+                handler_start.elapsed().as_millis(),
+                error.kind,
+                error.message
+            );
+            return Err(ApiError(error));
+        }
+    };
     let application = application_context
         .as_ref()
         .map(|application| application.metrics_identity())
         .or_else(|| application_from_headers(&headers));
-    let native_input = request.into_native_input().map_err(ApiError)?;
+    let native_input = match request.into_native_input() {
+        Ok(native_input) => native_input,
+        Err(error) => {
+            log::warn!(
+                "query api request failed query_id={} chain={} dataset={} range={}-{} stage=native_input duration_ms={} kind={:?} message={}",
+                query_id,
+                chain,
+                dataset,
+                range_start,
+                range_end,
+                handler_start.elapsed().as_millis(),
+                error.kind,
+                error.message
+            );
+            return Err(ApiError(error));
+        }
+    };
     // The blocking native executor is shared with GraphQL; both API surfaces
     // pass the same application identity into metrics and the usage ledger.
-    tokio::task::spawn_blocking(move || {
-        registry
-            .query_native_with_application(native_input, application)
-            .and_then(QueryApiResponse::try_from_native_response)
+    let task_query_id = query_id.clone();
+    let task_chain = chain.clone();
+    let task_dataset = dataset.clone();
+    let task_result = tokio::task::spawn_blocking(move || {
+        let executor_start = Instant::now();
+        let native_response = match registry.query_native_with_application_and_query_id(
+            native_input,
+            application,
+            task_query_id.clone(),
+        ) {
+            Ok(response) => {
+                log::info!(
+                    "query api executor completed query_id={} chain={} dataset={} range={}-{} duration_ms={}",
+                    task_query_id,
+                    task_chain,
+                    task_dataset,
+                    range_start,
+                    range_end,
+                    executor_start.elapsed().as_millis()
+                );
+                response
+            }
+            Err(error) => {
+                log::warn!(
+                    "query api executor failed query_id={} chain={} dataset={} range={}-{} duration_ms={} kind={:?} message={}",
+                    task_query_id,
+                    task_chain,
+                    task_dataset,
+                    range_start,
+                    range_end,
+                    executor_start.elapsed().as_millis(),
+                    error.kind,
+                    error.message
+                );
+                return Err(error);
+            }
+        };
+        let conversion_start = Instant::now();
+        match QueryApiResponse::try_from_native_response(native_response) {
+            Ok(response) => {
+                log::info!(
+                    "query api response conversion completed query_id={} chain={} dataset={} range={}-{} rows={} duration_ms={}",
+                    task_query_id,
+                    task_chain,
+                    task_dataset,
+                    range_start,
+                    range_end,
+                    response.rows.row_count(),
+                    conversion_start.elapsed().as_millis()
+                );
+                Ok(response)
+            }
+            Err(error) => {
+                log::warn!(
+                    "query api response conversion failed query_id={} chain={} dataset={} range={}-{} duration_ms={} kind={:?} message={}",
+                    task_query_id,
+                    task_chain,
+                    task_dataset,
+                    range_start,
+                    range_end,
+                    conversion_start.elapsed().as_millis(),
+                    error.kind,
+                    error.message
+                );
+                Err(error)
+            }
+        }
     })
     .await
     .map_err(|error| {
-        ApiError(DatalensError::new(
+        let error = DatalensError::new(
             DatalensErrorKind::Internal,
             format!("query task failed: {error}"),
-        ))
-    })?
-    .map(Json)
-    .map_err(ApiError)
+        );
+        log::warn!(
+            "query api request failed query_id={} chain={} dataset={} range={}-{} stage=join duration_ms={} kind={:?} message={}",
+            query_id,
+            chain,
+            dataset,
+            range_start,
+            range_end,
+            handler_start.elapsed().as_millis(),
+            error.kind,
+            error.message
+        );
+        ApiError(error)
+    })?;
+    match task_result {
+        Ok(response) => {
+            log::info!(
+                "query api request completed query_id={} chain={} dataset={} range={}-{} rows={} total_duration_ms={}",
+                query_id,
+                chain,
+                dataset,
+                range_start,
+                range_end,
+                response.rows.row_count(),
+                handler_start.elapsed().as_millis()
+            );
+            Ok(Json(response))
+        }
+        Err(error) => {
+            log::warn!(
+                "query api request failed query_id={} chain={} dataset={} range={}-{} stage=executor duration_ms={} kind={:?} message={}",
+                query_id,
+                chain,
+                dataset,
+                range_start,
+                range_end,
+                handler_start.elapsed().as_millis(),
+                error.kind,
+                error.message
+            );
+            Err(ApiError(error))
+        }
+    }
+}
+
+fn query_range_bounds(range: &QueryRangeApi) -> (u64, u64) {
+    match *range {
+        QueryRangeApi::Block { start, end }
+        | QueryRangeApi::Slot { start, end }
+        | QueryRangeApi::Height { start, end } => (start, end),
+    }
 }
 
 pub(crate) async fn warmup_submit(

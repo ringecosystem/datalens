@@ -2,6 +2,7 @@ use std::{
     fs,
     path::PathBuf,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use datalens_chain::{
@@ -520,6 +521,7 @@ fn test_query_watermark_does_not_directly_update_warmup_cursor() {
             Some(ApplicationIdentity::named("app-a")),
         )
         .expect("query fills high range");
+    wait_for_query_watermark(&watermarks, 10);
 
     assert_eq!(registry.load_cursor(&task_id).unwrap(), cursor_before_query);
     adapter.clear_fetches();
@@ -566,30 +568,18 @@ fn test_repeated_query_progress_moves_follow_query_target_forward() {
     .with_query_watermarks(watermarks.clone(), ApplicationIdentity::named("app-a"));
 
     execute_log_query(&executor, blocks(1, 3));
+    wait_for_query_watermark(&watermarks, 3);
     let first = runtime.run_task_once(&task_id).expect("first warmup");
     assert_eq!(first.status, WarmupRunStatus::Partial);
     assert_eq!(registry.load_cursor(&task_id).unwrap().unwrap().next, 6);
 
     execute_log_query(&executor, blocks(4, 5));
+    wait_for_query_watermark(&watermarks, 5);
     let second = runtime.run_task_once(&task_id).expect("second warmup");
 
     assert_eq!(second.status, WarmupRunStatus::Stopped);
     assert_eq!(registry.load_cursor(&task_id).unwrap().unwrap().next, 6);
-    let key = QueryWatermarkKey::new(
-        "app-a",
-        chain(),
-        DatasetKey::evm_logs(),
-        &selector(),
-        LedgerRangeKind::Block,
-    );
-    assert_eq!(
-        watermarks
-            .read(&key)
-            .expect("read watermark")
-            .expect("watermark")
-            .latest_block,
-        5
-    );
+    assert_eq!(wait_for_query_watermark(&watermarks, 5), 5);
 }
 
 #[test]
@@ -956,6 +946,31 @@ where
             updated_at_unix_seconds: 1,
         })
         .expect("save query watermark");
+}
+
+fn wait_for_query_watermark<S>(watermarks: &QueryWatermarkStore<S>, expected: u64) -> u64
+where
+    S: datalens_storage::ObjectStore + 'static,
+{
+    let key = QueryWatermarkKey::new(
+        "app-a",
+        chain(),
+        DatasetKey::evm_logs(),
+        &selector(),
+        LedgerRangeKind::Block,
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(watermark) = watermarks.read(&key).expect("read watermark")
+            && watermark.latest_block >= expected
+        {
+            return watermark.latest_block;
+        }
+        if Instant::now() >= deadline {
+            panic!("watermark did not reach {expected}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn object_store(name: &str) -> LocalObjectStore {
