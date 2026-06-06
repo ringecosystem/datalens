@@ -1,8 +1,12 @@
 use std::{
     io::{Read, Write},
     net::{SocketAddr, TcpListener},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread,
+    time::Duration,
 };
 
 use datalens_chain::{
@@ -238,7 +242,13 @@ fn test_provider_filter_logs_use_eth_get_logs() {
     assert_eq!(rows[0].parent_hash.as_deref(), Some("0xparent"));
     assert_eq!(rows[0].block_timestamp, Some(1));
     assert_eq!(response.provider_diagnostics.calls, 2);
-    assert!(response.provider_diagnostics.warnings.is_empty());
+    assert!(
+        response
+            .provider_diagnostics
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("header_provider_calls=1"))
+    );
     let requests = requests.lock().expect("requests");
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0]["method"], "eth_getLogs");
@@ -787,9 +797,311 @@ fn test_fetch_evm_logs_enriches_block_metadata_once_per_block() {
     assert_eq!(requests[1]["params"][0], "0xa");
 }
 
+#[test]
+fn test_provider_filter_log_headers_reuse_cache_for_same_block_hash() {
+    let block_hash = "0x000000000000000000000000000000000000000000000000000000000000000a";
+    let topic = transfer_topic();
+    let (url, requests) = start_rpc_server(vec![
+        logs_response(vec![provider_log(10, block_hash, topic)]),
+        block_response(10, block_hash, "0xparent", 1),
+        logs_response(vec![provider_log(10, block_hash, topic)]),
+    ]);
+    let client = evm_test_client(url);
+    let request = logs_fetch_request(10, 10);
+
+    let first = client.fetch(request.clone()).expect("first logs");
+    let second = client.fetch(request).expect("second logs");
+
+    assert_eq!(first.provider_diagnostics.calls, 2);
+    assert!(
+        first
+            .provider_diagnostics
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("header_cache_misses=1"))
+    );
+    assert_eq!(second.provider_diagnostics.calls, 1);
+    assert!(
+        second
+            .provider_diagnostics
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("header_cache_hits=1"))
+    );
+    let requests = requests.lock().expect("requests");
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[1]["method"], "eth_getBlockByNumber");
+}
+
+#[test]
+fn test_provider_filter_log_headers_miss_cache_for_same_number_different_hash() {
+    let first_hash = "0x000000000000000000000000000000000000000000000000000000000000000a";
+    let second_hash = "0x00000000000000000000000000000000000000000000000000000000000000aa";
+    let topic = transfer_topic();
+    let (url, requests) = start_rpc_server(vec![
+        logs_response(vec![provider_log(10, first_hash, topic)]),
+        block_response(10, first_hash, "0xparent1", 1),
+        logs_response(vec![provider_log(10, second_hash, topic)]),
+        block_response(10, second_hash, "0xparent2", 2),
+    ]);
+    let client = evm_test_client(url);
+    let request = logs_fetch_request(10, 10);
+
+    client.fetch(request.clone()).expect("first logs");
+    let second = client.fetch(request).expect("second logs");
+
+    assert_eq!(second.provider_diagnostics.calls, 2);
+    assert!(
+        second
+            .provider_diagnostics
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("header_cache_misses=1"))
+    );
+    let block_header_calls = requests
+        .lock()
+        .expect("requests")
+        .iter()
+        .filter(|request| request["method"] == "eth_getBlockByNumber")
+        .count();
+    assert_eq!(block_header_calls, 2);
+}
+
+#[test]
+fn test_provider_filter_log_headers_preserve_hash_mismatch_failure() {
+    let log_hash = "0x000000000000000000000000000000000000000000000000000000000000000a";
+    let header_hash = "0x00000000000000000000000000000000000000000000000000000000000000aa";
+    let (url, _requests) = start_rpc_server(vec![
+        logs_response(vec![provider_log(10, log_hash, transfer_topic())]),
+        block_response(10, header_hash, "0xparent", 1),
+    ]);
+    let client = evm_test_client(url);
+
+    let error = client
+        .fetch(logs_fetch_request(10, 10))
+        .expect_err("hash mismatch");
+
+    assert_eq!(error.kind, DatalensErrorKind::ProviderFailure);
+    assert!(error.message.contains("does not match fetched block hash"));
+    assert!(error.message.contains("block 10"));
+}
+
+#[test]
+fn test_provider_filter_log_headers_fetch_missing_blocks_with_bounded_concurrency() {
+    let (url, requests, max_active) = start_concurrent_header_server(4, Duration::from_millis(75));
+    let client = evm_test_client(url).with_block_header_metadata_config(
+        EvmBlockHeaderMetadataConfig::default().with_fetch_concurrency(2),
+    );
+
+    let response = client
+        .fetch(logs_fetch_request(10, 13))
+        .expect("concurrent header logs");
+
+    let QueryRows::EvmLogs(rows) = response.rows.rows() else {
+        panic!("expected EVM logs");
+    };
+    assert_eq!(
+        rows.iter().map(|log| log.block_number).collect::<Vec<_>>(),
+        vec![10, 11, 12, 13]
+    );
+    assert_eq!(response.provider_diagnostics.calls, 5);
+    assert!(max_active.load(Ordering::SeqCst) <= 2);
+    assert!(
+        response
+            .provider_diagnostics
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("header_fetch_mode=concurrent"))
+    );
+    assert_eq!(requests.lock().expect("requests").len(), 5);
+}
+
+#[test]
+fn test_provider_filter_log_header_error_includes_block_context() {
+    let hash10 = "0x000000000000000000000000000000000000000000000000000000000000000a";
+    let hash11 = "0x000000000000000000000000000000000000000000000000000000000000000b";
+    let (url, _requests) = start_rpc_server(vec![
+        logs_response(vec![
+            provider_log(10, hash10, transfer_topic()),
+            provider_log(11, hash11, transfer_topic()),
+        ]),
+        block_response(10, hash10, "0xparent10", 10),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {
+                "code": -32000,
+                "message": "request timed out"
+            }
+        }),
+    ]);
+    let client = evm_test_client(url).with_block_header_metadata_config(
+        EvmBlockHeaderMetadataConfig::default().with_fetch_concurrency(1),
+    );
+
+    let error = client
+        .fetch(logs_fetch_request(10, 11))
+        .expect_err("header error");
+
+    assert_eq!(error.kind, DatalensErrorKind::ProviderTimeout);
+    assert!(error.message.contains("log block 11"));
+}
+
+#[test]
+fn test_provider_filter_log_headers_batch_mode_maps_out_of_order_responses() {
+    let hash10 = block_hash(10);
+    let hash11 = block_hash(11);
+    let (url, requests) = start_rpc_server(vec![
+        logs_response(vec![
+            provider_log(10, &hash10, transfer_topic()),
+            provider_log(11, &hash11, transfer_topic()),
+        ]),
+        json!([
+            block_batch_response(2, 11, &hash11, "0xparent11", 11),
+            block_batch_response(1, 10, &hash10, "0xparent10", 10)
+        ]),
+    ]);
+    let client = evm_test_client(url).with_block_header_metadata_config(
+        EvmBlockHeaderMetadataConfig::default().with_fetch_mode(EvmBlockHeaderFetchMode::Batch),
+    );
+
+    let response = client
+        .fetch(logs_fetch_request(10, 11))
+        .expect("batch headers");
+
+    let QueryRows::EvmLogs(rows) = response.rows.rows() else {
+        panic!("expected EVM logs");
+    };
+    assert_eq!(rows[0].parent_hash.as_deref(), Some("0xparent10"));
+    assert_eq!(rows[1].parent_hash.as_deref(), Some("0xparent11"));
+    assert_eq!(response.provider_diagnostics.calls, 2);
+    assert!(
+        response
+            .provider_diagnostics
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("header_fetch_mode=batch"))
+    );
+    let requests = requests.lock().expect("requests");
+    assert!(requests[1].is_array());
+}
+
+#[test]
+fn test_provider_filter_log_headers_batch_mode_reports_partial_error_context() {
+    let hash10 = block_hash(10);
+    let hash11 = block_hash(11);
+    let (url, _requests) = start_rpc_server(vec![
+        logs_response(vec![
+            provider_log(10, &hash10, transfer_topic()),
+            provider_log(11, &hash11, transfer_topic()),
+        ]),
+        json!([
+            block_batch_response(1, 10, &hash10, "0xparent10", 10),
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "error": {
+                    "code": -32000,
+                    "message": "request timed out"
+                }
+            }
+        ]),
+    ]);
+    let client = evm_test_client(url).with_block_header_metadata_config(
+        EvmBlockHeaderMetadataConfig::default().with_fetch_mode(EvmBlockHeaderFetchMode::Batch),
+    );
+
+    let error = client
+        .fetch(logs_fetch_request(10, 11))
+        .expect_err("partial batch error");
+
+    assert_eq!(error.kind, DatalensErrorKind::ProviderTimeout);
+    assert!(error.message.contains("log block 11"));
+}
+
+#[test]
+fn test_provider_filter_log_headers_batch_mode_splits_by_batch_size() {
+    let hashes = (10..=13).map(block_hash).collect::<Vec<_>>();
+    let (url, requests) = start_rpc_server(vec![
+        logs_response(
+            (10..=13)
+                .zip(hashes.iter())
+                .map(|(number, hash)| provider_log(number, hash, transfer_topic()))
+                .collect(),
+        ),
+        json!([
+            block_batch_response(1, 10, &hashes[0], "0xparent10", 10),
+            block_batch_response(2, 11, &hashes[1], "0xparent11", 11)
+        ]),
+        json!([
+            block_batch_response(1, 12, &hashes[2], "0xparent12", 12),
+            block_batch_response(2, 13, &hashes[3], "0xparent13", 13)
+        ]),
+    ]);
+    let client = evm_test_client(url).with_block_header_metadata_config(
+        EvmBlockHeaderMetadataConfig::default()
+            .with_fetch_mode(EvmBlockHeaderFetchMode::Batch)
+            .with_batch_size(2),
+    );
+
+    let response = client
+        .fetch(logs_fetch_request(10, 13))
+        .expect("split batch headers");
+
+    assert_eq!(response.provider_diagnostics.calls, 3);
+    let batch_lengths = requests
+        .lock()
+        .expect("requests")
+        .iter()
+        .skip(1)
+        .map(|request| request.as_array().expect("batch request").len())
+        .collect::<Vec<_>>();
+    assert_eq!(batch_lengths, vec![2, 2]);
+}
+
+#[test]
+fn test_provider_filter_log_headers_use_concurrent_mode_by_default() {
+    let client = EvmRpcClient::new(Vec::new());
+
+    assert_eq!(
+        client.block_header_metadata_config().fetch_mode,
+        EvmBlockHeaderFetchMode::Concurrent
+    );
+}
+
 fn ethereum_identity() -> ChainIdentity {
     ChainIdentity::try_new(ChainFamily::Evm, "ethereum", Some(NetworkId::numeric(1)))
         .expect("valid chain")
+}
+
+fn evm_test_client(url: String) -> EvmRpcClient {
+    EvmRpcClient::with_chain(
+        vec![url],
+        ethereum_identity(),
+        EvmFinalityPolicy::Lag {
+            safe_lag_blocks: Some(2),
+            finalized_lag_blocks: Some(4),
+        },
+        10,
+        10,
+        10,
+        10,
+    )
+}
+
+fn logs_fetch_request(from_block: u64, to_block: u64) -> ChainFetchRequest {
+    ChainFetchRequest::new(
+        ethereum_identity(),
+        DatasetKey::evm_logs(),
+        LedgerRange::from_block_range(BlockRange::expect_new(from_block, to_block)),
+        DatasetSelector::EvmLogs(
+            datalens_core::EvmLogFilter::try_from(&datalens_core::LogFilter {
+                addresses: Vec::new(),
+                topics: Vec::new(),
+            })
+            .expect("filter"),
+        ),
+    )
 }
 
 fn unused_local_address() -> SocketAddr {
@@ -877,6 +1189,37 @@ fn block_response(number: u64, hash: &str, parent_hash: &str, timestamp: u64) ->
     })
 }
 
+fn logs_response(logs: Vec<Value>) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": logs
+    })
+}
+
+fn block_batch_response(
+    id: u64,
+    number: u64,
+    hash: &str,
+    parent_hash: &str,
+    timestamp: u64,
+) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "number": format!("0x{number:x}"),
+            "hash": hash,
+            "parentHash": parent_hash,
+            "timestamp": format!("0x{timestamp:x}")
+        }
+    })
+}
+
+fn block_hash(number: u64) -> String {
+    format!("0x{number:064x}")
+}
+
 fn provider_log(number: u64, block_hash: &str, topic: &str) -> Value {
     provider_log_with_address(
         number,
@@ -958,4 +1301,75 @@ fn start_rpc_server(responses: Vec<Value>) -> (String, Arc<Mutex<Vec<Value>>>) {
     });
 
     (format!("http://{address}"), requests)
+}
+
+fn start_concurrent_header_server(
+    block_count: u64,
+    delay: Duration,
+) -> (String, Arc<Mutex<Vec<Value>>>, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+    let address = listener.local_addr().expect("test server address");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    let active = Arc::new(AtomicUsize::new(0));
+    let request_log = Arc::clone(&requests);
+    let max_active_log = Arc::clone(&max_active);
+    let active_log = Arc::clone(&active);
+
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = stream.expect("test server connection");
+            let request_log = Arc::clone(&request_log);
+            let max_active = Arc::clone(&max_active_log);
+            let active = Arc::clone(&active_log);
+            thread::spawn(move || {
+                let mut buffer = [0; 8192];
+                let bytes = stream.read(&mut buffer).expect("read request");
+                let request = String::from_utf8_lossy(&buffer[..bytes]);
+                let body = request.split("\r\n\r\n").nth(1).expect("request body");
+                let request_json: Value = serde_json::from_str(body).expect("request JSON");
+                request_log
+                    .lock()
+                    .expect("request log")
+                    .push(request_json.clone());
+                let response = if request_json["method"] == "eth_getLogs" {
+                    logs_response(
+                        (10..10 + block_count)
+                            .map(|number| {
+                                provider_log(number, &block_hash(number), transfer_topic())
+                            })
+                            .collect(),
+                    )
+                } else {
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_active.fetch_max(current, Ordering::SeqCst);
+                    thread::sleep(delay);
+                    let number = request_json["params"][0]
+                        .as_str()
+                        .and_then(|value| {
+                            u64::from_str_radix(value.trim_start_matches("0x"), 16).ok()
+                        })
+                        .expect("block number");
+                    let response = block_response(
+                        number,
+                        &block_hash(number),
+                        &format!("0xparent{number}"),
+                        number,
+                    );
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    response
+                };
+                let response = response.to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                    response.len(),
+                    response
+                )
+                .expect("write response");
+            });
+        }
+    });
+
+    (format!("http://{address}"), requests, max_active)
 }

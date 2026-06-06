@@ -26,7 +26,8 @@ use datalens_writer::DurableWriterConfig;
 
 use crate::{
     ChainConfig, DatalensConfig, build_storage, build_usage_ledger, chain_identity,
-    configured_chain, evm_finality_policy, load_config, validate_config,
+    configured_chain, evm_block_header_metadata_config, evm_finality_policy, load_config,
+    validate_config,
 };
 
 use super::index_report::{plan_summary, run_summary};
@@ -176,7 +177,8 @@ pub fn cache_summary(command: CacheWorkflowCommand) -> Result<serde_json::Value,
                 chain.datasets.logs.max_block_scan_range_blocks,
                 chain.datasets.logs.max_addresses_per_query,
             )
-            .with_logs_query_strategy(chain.datasets.logs.query_strategy);
+            .with_logs_query_strategy(chain.datasets.logs.query_strategy)
+            .with_block_header_metadata_config(evm_block_header_metadata_config(&chain)?);
             cache_summary_with_context(command, config, &chain_name, &chain, adapter)
         }
         "solana" => {

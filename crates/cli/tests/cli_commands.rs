@@ -1593,6 +1593,10 @@ fn test_validate_config_accepts_per_chain_log_query_strategy_differences() {
         max_get_logs_range_blocks = 10000
         max_block_scan_range_blocks = 1
         max_addresses_per_query = 2
+        header_fetch_mode = "batch"
+        header_fetch_concurrency = 3
+        header_fetch_batch_size = 5
+        header_cache_max_entries = 100
         "#,
     )
     .expect("config parses");
@@ -1605,6 +1609,56 @@ fn test_validate_config_accepts_per_chain_log_query_strategy_differences() {
     assert_eq!(
         config.chains["private"].datasets.logs.query_strategy,
         QueryStrategy::BlockRange
+    );
+    assert_eq!(
+        config.chains["ethereum"].datasets.logs.header_fetch_mode,
+        "concurrent"
+    );
+    assert_eq!(
+        config.chains["ethereum"]
+            .datasets
+            .logs
+            .header_fetch_concurrency,
+        8
+    );
+    assert_eq!(
+        config.chains["ethereum"]
+            .datasets
+            .logs
+            .header_fetch_batch_size,
+        20
+    );
+    assert_eq!(
+        config.chains["ethereum"]
+            .datasets
+            .logs
+            .header_cache_max_entries,
+        50_000
+    );
+    assert_eq!(
+        config.chains["private"].datasets.logs.header_fetch_mode,
+        "batch"
+    );
+    assert_eq!(
+        config.chains["private"]
+            .datasets
+            .logs
+            .header_fetch_concurrency,
+        3
+    );
+    assert_eq!(
+        config.chains["private"]
+            .datasets
+            .logs
+            .header_fetch_batch_size,
+        5
+    );
+    assert_eq!(
+        config.chains["private"]
+            .datasets
+            .logs
+            .header_cache_max_entries,
+        100
     );
 }
 
@@ -1652,6 +1706,62 @@ fn test_validate_config_rejects_zero_block_scan_range_limit() {
     let error = validate_config(&config).expect_err("zero block scan limit");
 
     assert!(error.message.contains("max_block_scan_range_blocks"));
+}
+
+#[test]
+fn test_validate_config_rejects_invalid_log_header_metadata_config() {
+    for (field, value) in [
+        ("header_fetch_mode", "\"serial\""),
+        ("header_fetch_concurrency", "0"),
+        ("header_fetch_batch_size", "0"),
+        ("header_cache_max_entries", "0"),
+    ] {
+        let config: DatalensConfig = toml::from_str(&format!(
+            r#"
+            [server]
+            bind = "127.0.0.1:8080"
+
+            [storage]
+            backend = "local"
+
+            [storage.local]
+            root = ".datalens/storage"
+
+            [planner]
+            max_query_range_blocks = 100
+            default_chunk_range_blocks = 10
+
+            [writer]
+            target_object_bytes = 1024
+            min_object_rows = 1
+            record_empty_coverage = true
+
+            [chains.private]
+            kind = "evm"
+            chain_id = 999
+            rpc_urls = ["http://example.invalid/private"]
+
+            [chains.private.datasets.blocks]
+            enabled = true
+            max_batch_blocks = 10
+
+            [chains.private.datasets.logs]
+            enabled = true
+            max_get_logs_range_blocks = 10000
+            max_addresses_per_query = 2
+            {field} = {value}
+            "#
+        ))
+        .expect("config parses");
+
+        let error = validate_config(&config).expect_err("header metadata config rejected");
+
+        assert!(
+            error.message.contains(field),
+            "expected {field} in error message, got {}",
+            error.message
+        );
+    }
 }
 
 #[test]
@@ -1763,6 +1873,10 @@ fn test_doctor_chain_summary_rejects_unknown_auto_finality_without_profile() {
                 max_get_logs_range_blocks: 10,
                 max_block_scan_range_blocks: 10,
                 max_addresses_per_query: 2,
+                header_fetch_mode: "concurrent".to_owned(),
+                header_fetch_concurrency: 8,
+                header_fetch_batch_size: 20,
+                header_cache_max_entries: 50_000,
             },
         },
     };

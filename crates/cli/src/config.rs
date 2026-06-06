@@ -8,7 +8,9 @@ use datalens_evm::EvmRpcClient;
 use datalens_solana::{SolanaAdapter, SolanaHttpRpc};
 use datalens_tron::TronAdapter;
 
-use crate::runtime::{evm_finality_policy, finality_summary, tron_provider};
+use crate::runtime::{
+    evm_block_header_metadata_config, evm_finality_policy, finality_summary, tron_provider,
+};
 use crate::{chain_identity, parse_bind, redact_url};
 
 pub(crate) fn load_config(path: &str) -> Result<DatalensConfig, DatalensError> {
@@ -361,6 +363,33 @@ fn validate_chain(name: &str, chain: &ChainConfig) -> Result<(), DatalensError> 
             format!("chain {name} logs max_addresses_per_query must be greater than zero"),
         ));
     }
+    if !matches!(
+        chain.datasets.logs.header_fetch_mode.as_str(),
+        "concurrent" | "batch"
+    ) {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            format!("chain {name} logs header_fetch_mode must be concurrent or batch"),
+        ));
+    }
+    if chain.datasets.logs.header_fetch_concurrency == 0 {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            format!("chain {name} logs header_fetch_concurrency must be greater than zero"),
+        ));
+    }
+    if chain.datasets.logs.header_fetch_batch_size == 0 {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            format!("chain {name} logs header_fetch_batch_size must be greater than zero"),
+        ));
+    }
+    if chain.datasets.logs.header_cache_max_entries == 0 {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            format!("chain {name} logs header_cache_max_entries must be greater than zero"),
+        ));
+    }
     if chain
         .warmup
         .follow_query_start_offset_blocks
@@ -519,7 +548,8 @@ pub fn doctor_chain_summary(
         chain.datasets.logs.max_block_scan_range_blocks,
         chain.datasets.logs.max_addresses_per_query,
     )
-    .with_logs_query_strategy(chain.datasets.logs.query_strategy);
+    .with_logs_query_strategy(chain.datasets.logs.query_strategy)
+    .with_block_header_metadata_config(evm_block_header_metadata_config(chain)?);
     let safe_height = source.cache_safe_height().map_err(|error| {
         DatalensError::new(
             error.kind,
@@ -550,6 +580,10 @@ pub fn doctor_chain_summary(
                 "max_get_logs_range_blocks": chain.datasets.logs.max_get_logs_range_blocks,
                 "max_block_scan_range_blocks": chain.datasets.logs.max_block_scan_range_blocks,
                 "max_addresses_per_query": chain.datasets.logs.max_addresses_per_query,
+                "header_fetch_mode": chain.datasets.logs.header_fetch_mode,
+                "header_fetch_concurrency": chain.datasets.logs.header_fetch_concurrency,
+                "header_fetch_batch_size": chain.datasets.logs.header_fetch_batch_size,
+                "header_cache_max_entries": chain.datasets.logs.header_cache_max_entries,
             }
         }
     }))

@@ -533,10 +533,34 @@ pub struct LogsDatasetConfig {
     #[serde(default = "default_max_block_scan_range_blocks")]
     pub max_block_scan_range_blocks: u64,
     pub max_addresses_per_query: usize,
+    #[serde(default = "default_evm_log_header_fetch_mode")]
+    pub header_fetch_mode: String,
+    #[serde(default = "default_evm_log_header_fetch_concurrency")]
+    pub header_fetch_concurrency: usize,
+    #[serde(default = "default_evm_log_header_fetch_batch_size")]
+    pub header_fetch_batch_size: usize,
+    #[serde(default = "default_evm_log_header_cache_max_entries")]
+    pub header_cache_max_entries: usize,
 }
 
 fn default_max_block_scan_range_blocks() -> u64 {
     100
+}
+
+fn default_evm_log_header_fetch_mode() -> String {
+    "concurrent".to_owned()
+}
+
+fn default_evm_log_header_fetch_concurrency() -> usize {
+    8
+}
+
+fn default_evm_log_header_fetch_batch_size() -> usize {
+    20
+}
+
+fn default_evm_log_header_cache_max_entries() -> usize {
+    50_000
 }
 
 fn expand_env_vars(text: &str) -> Result<String, DatalensError> {
