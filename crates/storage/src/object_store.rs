@@ -1,6 +1,7 @@
 use std::{
-    fs,
+    fs::{self, OpenOptions},
     future::Future,
+    io::Write,
     path::{Path, PathBuf},
     sync::mpsc,
 };
@@ -32,9 +33,9 @@ pub fn validate_object_key(key: &str) -> Result<(), DatalensError> {
     if key.trim().is_empty()
         || key.contains('\\')
         || Path::new(key).is_absolute()
-        || key
-            .split('/')
-            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+        || key.split('/').any(|segment| {
+            segment.is_empty() || segment == "." || segment == ".." || segment == ".datalens-tmp"
+        })
     {
         return Err(DatalensError::new(
             DatalensErrorKind::InvalidInput,
@@ -91,19 +92,17 @@ impl ObjectStore for LocalObjectStore {
                 format!("create object directory {}: {error}", parent.display()),
             )
         })?;
-        let temp_path = path.with_extension(format!(
-            "tmp-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_nanos())
-                .unwrap_or_default()
-        ));
-        fs::write(&temp_path, bytes).map_err(|error| {
+        let temp_parent = local_temp_parent(&self.root);
+        fs::create_dir_all(&temp_parent).map_err(|error| {
             DatalensError::new(
                 DatalensErrorKind::StorageWriteFailure,
-                format!("write object temp {}: {error}", temp_path.display()),
+                format!(
+                    "create temp object directory {}: {error}",
+                    temp_parent.display()
+                ),
             )
         })?;
+        let temp_path = create_local_temp_file(&temp_parent, bytes)?;
         fs::rename(&temp_path, &path).map_err(|error| {
             let _ = fs::remove_file(&temp_path);
             DatalensError::new(
@@ -189,6 +188,48 @@ fn collect_local_objects(
         }
     }
     Ok(())
+}
+
+fn local_temp_parent(root: &Path) -> PathBuf {
+    root.join(".datalens-tmp")
+}
+
+fn create_local_temp_file(parent: &Path, bytes: &[u8]) -> Result<PathBuf, DatalensError> {
+    for attempt in 0..1024u16 {
+        let path = parent.join(format!(
+            "object-{}-{}-{attempt}.tmp",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default()
+        ));
+        let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::StorageWriteFailure,
+                    format!("create object temp {}: {error}", path.display()),
+                ));
+            }
+        };
+        if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+            let _ = fs::remove_file(&path);
+            return Err(DatalensError::new(
+                DatalensErrorKind::StorageWriteFailure,
+                format!("write object temp {}: {error}", path.display()),
+            ));
+        }
+        return Ok(path);
+    }
+    Err(DatalensError::new(
+        DatalensErrorKind::StorageWriteFailure,
+        format!(
+            "create object temp under {}: exhausted unique name attempts",
+            parent.display()
+        ),
+    ))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

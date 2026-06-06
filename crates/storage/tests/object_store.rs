@@ -7,7 +7,16 @@ use datalens_storage::{
 
 #[test]
 fn test_object_store_key_validation_rejects_unsafe_relative_paths() {
-    for key in ["", "/absolute", "a//b", "a/./b", "a/../b", "a\\b"] {
+    for key in [
+        "",
+        "/absolute",
+        "a//b",
+        "a/./b",
+        "a/../b",
+        "a\\b",
+        ".datalens-tmp/object.tmp",
+        "chains/.datalens-tmp/object.tmp",
+    ] {
         let error = validate_object_key(key).expect_err("unsafe key rejected");
         assert_eq!(error.kind, DatalensErrorKind::InvalidInput);
     }
@@ -52,6 +61,33 @@ fn test_local_object_store_put_get_exists_list_delete() {
         !store
             .exists("chains/ethereum/manifest.json")
             .expect("exists")
+    );
+}
+
+#[test]
+fn test_local_object_store_lists_valid_tmp_extension_objects() {
+    let root = temp_storage_root("local-list-tmp-extension");
+    let store = LocalObjectStore::new(&root);
+    store
+        .put("usage/applications/app/chunks/000000", b"stable")
+        .expect("put object");
+    store
+        .put("usage/applications/app/chunks/000001.tmp-123", b"valid")
+        .expect("put valid tmp-extension object");
+
+    let objects = store
+        .list("usage/applications/app/chunks")
+        .expect("list objects");
+
+    assert_eq!(
+        objects
+            .iter()
+            .map(|object| object.key.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "usage/applications/app/chunks/000000",
+            "usage/applications/app/chunks/000001.tmp-123",
+        ]
     );
 }
 
