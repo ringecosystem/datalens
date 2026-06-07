@@ -109,6 +109,17 @@ fn test_config_storage_parquet_compression_defaults_to_disabled() {
 }
 
 #[test]
+fn test_config_evm_log_header_fetch_mode_defaults_to_batch() {
+    let config: DatalensConfig =
+        toml::from_str(&config_text("[query.native]")).expect("config should parse");
+
+    assert_eq!(
+        config.chains["ethereum"].datasets.logs.header_fetch_mode,
+        "batch"
+    );
+}
+
+#[test]
 fn test_config_storage_parquet_compression_accepts_zstd_and_snappy() {
     for codec in ["zstd", "snappy"] {
         let input = config_text("[query.native]").replace(

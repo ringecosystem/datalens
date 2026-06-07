@@ -108,8 +108,8 @@ const DEFAULT_BLOCK_HEADER_BATCH_SIZE: usize = 20;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum EvmBlockHeaderFetchMode {
-    #[default]
     Concurrent,
+    #[default]
     Batch,
 }
 
@@ -135,7 +135,7 @@ impl Default for EvmBlockHeaderMetadataConfig {
         Self {
             cache_max_entries: DEFAULT_BLOCK_HEADER_CACHE_MAX_ENTRIES,
             fetch_concurrency: DEFAULT_BLOCK_HEADER_FETCH_CONCURRENCY,
-            fetch_mode: EvmBlockHeaderFetchMode::Concurrent,
+            fetch_mode: EvmBlockHeaderFetchMode::Batch,
             batch_size: DEFAULT_BLOCK_HEADER_BATCH_SIZE,
         }
     }
@@ -183,13 +183,15 @@ struct LogBlockHeaderDiagnostics {
     provider_calls: usize,
     fetch_duration_ms: u128,
     fetch_mode: EvmBlockHeaderFetchMode,
+    fallback_mode: Option<EvmBlockHeaderFetchMode>,
+    fallback_reason: Option<String>,
     fetch_concurrency: usize,
     batch_size: usize,
 }
 
 impl LogBlockHeaderDiagnostics {
     fn warning(&self) -> String {
-        format!(
+        let mut warning = format!(
             "evm log header metadata header_cache_hits={} header_cache_misses={} header_provider_calls={} header_fetch_duration_ms={} header_fetch_mode={} header_fetch_concurrency={} header_batch_size={}",
             self.cache_hits,
             self.cache_misses,
@@ -198,7 +200,14 @@ impl LogBlockHeaderDiagnostics {
             self.fetch_mode.as_str(),
             self.fetch_concurrency,
             self.batch_size
-        )
+        );
+        if let Some(fallback_mode) = self.fallback_mode {
+            warning.push_str(&format!(" header_fallback_mode={}", fallback_mode.as_str()));
+        }
+        if let Some(fallback_reason) = &self.fallback_reason {
+            warning.push_str(&format!(" header_fallback_reason={fallback_reason}"));
+        }
+        warning
     }
 }
 
@@ -206,6 +215,20 @@ impl LogBlockHeaderDiagnostics {
 struct LogBlockHeaderRequest {
     number: u64,
     hash: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct LogBlockHeaderBatchFetch {
+    headers: BTreeMap<BlockHeaderCacheKey, BlockHeader>,
+    missing: Vec<LogBlockHeaderRequest>,
+    fallback_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct LogBlockHeaderFetch {
+    headers: BTreeMap<BlockHeaderCacheKey, BlockHeader>,
+    provider_calls: usize,
+    fallback_reason: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1097,17 +1120,27 @@ impl EvmRpcClient {
 
         let missing = missing.into_values().collect::<Vec<_>>();
         if !missing.is_empty() {
-            let (fetched, provider_calls) = match self.block_header_metadata.fetch_mode {
+            let fetched = match self.block_header_metadata.fetch_mode {
                 EvmBlockHeaderFetchMode::Concurrent => {
-                    self.fetch_log_block_headers_concurrently(missing)?
+                    let (headers, provider_calls) =
+                        self.fetch_log_block_headers_concurrently(missing)?;
+                    LogBlockHeaderFetch {
+                        headers,
+                        provider_calls,
+                        fallback_reason: None,
+                    }
                 }
                 EvmBlockHeaderFetchMode::Batch => {
-                    self.fetch_log_block_headers_in_batches(missing)?
+                    self.fetch_log_block_headers_in_batches_with_fallback(missing)?
                 }
             };
-            diagnostics.provider_calls = provider_calls;
-            self.insert_block_headers_into_cache(&fetched);
-            headers.extend(fetched);
+            diagnostics.provider_calls = fetched.provider_calls;
+            if let Some(fallback_reason) = fetched.fallback_reason {
+                diagnostics.fallback_mode = Some(EvmBlockHeaderFetchMode::Concurrent);
+                diagnostics.fallback_reason = Some(fallback_reason);
+            }
+            self.insert_block_headers_into_cache(&fetched.headers);
+            headers.extend(fetched.headers);
         }
         diagnostics.fetch_duration_ms = started_at.elapsed().as_millis();
 
@@ -1201,18 +1234,51 @@ impl EvmRpcClient {
         Ok((headers, provider_calls))
     }
 
-    fn fetch_log_block_headers_in_batches(
+    fn fetch_log_block_headers_in_batches_with_fallback(
         &self,
         missing: Vec<LogBlockHeaderRequest>,
-    ) -> Result<(BTreeMap<BlockHeaderCacheKey, BlockHeader>, usize), DatalensError> {
+    ) -> Result<LogBlockHeaderFetch, DatalensError> {
         let mut headers = BTreeMap::new();
         let mut provider_calls = 0;
+        let mut fallback_missing = Vec::new();
+        let mut fallback_reason = None;
+
         for chunk in missing.chunks(self.block_header_metadata.batch_size) {
+            if fallback_reason.is_some() {
+                fallback_missing.extend(chunk.iter().cloned());
+                continue;
+            }
             provider_calls += 1;
             let fetched = self.fetch_log_block_header_batch(chunk)?;
-            headers.extend(fetched);
+            headers.extend(fetched.headers);
+            if !fetched.missing.is_empty() {
+                fallback_missing.extend(fetched.missing);
+                fallback_reason = fetched.fallback_reason;
+            }
         }
-        Ok((headers, provider_calls))
+
+        if !fallback_missing.is_empty() {
+            let reason = fallback_reason.unwrap_or_else(|| "incomplete_batch".to_owned());
+            log::warn!(
+                "falling back to concurrent EVM log header fetch missing_headers={} reason={reason}",
+                fallback_missing.len()
+            );
+            let (fallback_headers, fallback_calls) =
+                self.fetch_log_block_headers_concurrently(fallback_missing)?;
+            provider_calls += fallback_calls;
+            headers.extend(fallback_headers);
+            return Ok(LogBlockHeaderFetch {
+                headers,
+                provider_calls,
+                fallback_reason: Some(reason),
+            });
+        }
+
+        Ok(LogBlockHeaderFetch {
+            headers,
+            provider_calls,
+            fallback_reason: None,
+        })
     }
 
     fn fetch_log_block_header(
@@ -1237,7 +1303,7 @@ impl EvmRpcClient {
     fn fetch_log_block_header_batch(
         &self,
         requests: &[LogBlockHeaderRequest],
-    ) -> Result<BTreeMap<BlockHeaderCacheKey, BlockHeader>, DatalensError> {
+    ) -> Result<LogBlockHeaderBatchFetch, DatalensError> {
         let rpc_requests = requests
             .iter()
             .enumerate()
@@ -1250,7 +1316,16 @@ impl EvmRpcClient {
                 })
             })
             .collect::<Vec<_>>();
-        let responses = self.batch_call("eth_getBlockByNumber", rpc_requests)?;
+        let responses = match self.batch_call("eth_getBlockByNumber", rpc_requests) {
+            Ok(responses) => responses,
+            Err(error) => {
+                return Ok(LogBlockHeaderBatchFetch {
+                    headers: BTreeMap::new(),
+                    missing: requests.to_vec(),
+                    fallback_reason: Some(format!("{:?}", error.kind)),
+                });
+            }
+        };
         let request_by_id = requests
             .iter()
             .enumerate()
@@ -1258,23 +1333,25 @@ impl EvmRpcClient {
             .collect::<BTreeMap<_, _>>();
         let mut response_by_id = BTreeMap::new();
         for response in responses {
-            let id = response.get("id").and_then(Value::as_u64).ok_or_else(|| {
-                DatalensError::new(
-                    DatalensErrorKind::ProviderFailure,
-                    "batch response missing numeric id",
-                )
-            })?;
+            let Some(id) = response.get("id").and_then(Value::as_u64) else {
+                return Ok(LogBlockHeaderBatchFetch {
+                    headers: BTreeMap::new(),
+                    missing: requests.to_vec(),
+                    fallback_reason: Some("missing_numeric_id".to_owned()),
+                });
+            };
             response_by_id.insert(id, response);
         }
 
         let mut headers = BTreeMap::new();
+        let mut missing = Vec::new();
+        let mut fallback_reason = None;
         for (id, request) in request_by_id {
-            let response = response_by_id.get(&id).ok_or_else(|| {
-                DatalensError::new(
-                    DatalensErrorKind::ProviderFailure,
-                    format!("missing batch response for log block {}", request.number),
-                )
-            })?;
+            let Some(response) = response_by_id.get(&id) else {
+                missing.push(request.clone());
+                fallback_reason.get_or_insert_with(|| "missing_response".to_owned());
+                continue;
+            };
             if let Some(error) = response.get("error") {
                 let code = error
                     .get("code")
@@ -1285,40 +1362,39 @@ impl EvmRpcClient {
                     .and_then(Value::as_str)
                     .unwrap_or("provider error");
                 let error = classify_provider_error(code, message);
-                return Err(DatalensError::new(
-                    error.kind,
-                    format!(
-                        "failed to fetch block header for log block {}: {}",
-                        request.number, error.message
-                    ),
-                ));
+                missing.push(request.clone());
+                fallback_reason.get_or_insert_with(|| format!("{:?}", error.kind));
+                continue;
             }
             let Some(block) = response.get("result") else {
-                return Err(DatalensError::new(
-                    DatalensErrorKind::ProviderFailure,
-                    format!(
-                        "batch response missing result for log block {}",
-                        request.number
-                    ),
-                ));
+                missing.push(request.clone());
+                fallback_reason.get_or_insert_with(|| "missing_result".to_owned());
+                continue;
             };
             if block.is_null() {
-                return Err(DatalensError::new(
-                    DatalensErrorKind::UnsupportedDataset,
-                    format!(
-                        "provider returned no block for log block {}",
-                        request.number
-                    ),
-                ));
+                missing.push(request.clone());
+                fallback_reason.get_or_insert_with(|| "null_result".to_owned());
+                continue;
             }
-            let header = Self::parse_block_header(block)?;
+            let header = match Self::parse_block_header(block) {
+                Ok(header) => header,
+                Err(error) => {
+                    missing.push(request.clone());
+                    fallback_reason.get_or_insert_with(|| format!("{:?}", error.kind));
+                    continue;
+                }
+            };
             self.validate_log_block_header_request(request, &header)?;
             headers.insert(
                 self.block_header_cache_key(request.number, &request.hash),
                 header,
             );
         }
-        Ok(headers)
+        Ok(LogBlockHeaderBatchFetch {
+            headers,
+            missing,
+            fallback_reason,
+        })
     }
 
     fn validate_log_block_header_request(

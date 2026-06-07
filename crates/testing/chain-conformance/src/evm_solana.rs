@@ -592,34 +592,38 @@ fn write_response(stream: &mut impl Write, response: Value) {
 }
 
 fn evm_response(request: &Value) -> Value {
+    if let Some(batch) = request.as_array() {
+        return Value::Array(batch.iter().map(evm_response).collect());
+    }
+
+    let id = request.get("id").cloned().unwrap_or_else(|| json!(1));
     let method = request["method"].as_str().expect("method");
     match method {
-        "eth_blockNumber" => rpc_result(json!("0x8")),
+        "eth_blockNumber" => rpc_result(id, json!("0x8")),
         "eth_getBlockByNumber" => {
             let tag = request["params"][0].as_str().expect("block tag");
             if tag == "latest" {
-                return rpc_result(evm_block(8));
+                return rpc_result(id, evm_block(8));
             }
             let number =
                 u64::from_str_radix(tag.trim_start_matches("0x"), 16).expect("hex block number");
-            rpc_result(evm_block(number))
+            rpc_result(id, evm_block(number))
         }
         "eth_getLogs" => {
             let from = hex_param_number(request, "fromBlock");
             let to = hex_param_number(request, "toBlock");
             if from == 4 && to == 4 {
-                rpc_result(json!([]))
+                rpc_result(id, json!([]))
             } else {
-                rpc_result(json!([
-                    evm_log(3, 0, 1),
-                    evm_log(2, 0, 0),
-                    evm_log(9, 0, 2)
-                ]))
+                rpc_result(
+                    id,
+                    json!([evm_log(3, 0, 1), evm_log(2, 0, 0), evm_log(9, 0, 2)]),
+                )
             }
         }
         _ => json!({
             "jsonrpc": "2.0",
-            "id": 1,
+            "id": id,
             "error": {
                 "code": -32601,
                 "message": "unsupported method"
@@ -628,10 +632,10 @@ fn evm_response(request: &Value) -> Value {
     }
 }
 
-fn rpc_result(result: Value) -> Value {
+fn rpc_result(id: Value, result: Value) -> Value {
     json!({
         "jsonrpc": "2.0",
-        "id": 1,
+        "id": id,
         "result": result
     })
 }
