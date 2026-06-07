@@ -10,8 +10,8 @@ use datalens_core::{
     QueryRows,
 };
 use datalens_storage::{
-    DurableStorage, LocalObjectStore, ObjectMetadata, ObjectStore, ReadThroughCacheConfig,
-    StorageWriteRequest,
+    DurableStorage, LocalObjectStore, Manifest, ObjectMetadata, ObjectStore,
+    ReadThroughCacheConfig, StorageWriteRequest,
 };
 
 #[derive(Clone, Debug)]
@@ -160,7 +160,15 @@ fn test_read_through_cache_checksum_change_invalidates_entry() {
             b"changed",
         )
         .expect("write manifest version");
-    clear_coverage_index(&store, &chain);
+    write_coverage_index(
+        &store,
+        &chain,
+        &DatasetKey::evm_blocks(),
+        "block",
+        &selector,
+        &range,
+        &manifest,
+    );
 
     storage
         .read_rows(&chain, &DatasetKey::evm_blocks(), &selector, range)
@@ -341,16 +349,33 @@ where
         .expect("object key")
 }
 
-fn clear_coverage_index<S>(store: &S, chain: &ChainIdentity)
-where
+fn write_coverage_index<S>(
+    store: &S,
+    chain: &ChainIdentity,
+    dataset_key: &DatasetKey,
+    range_kind: &str,
+    selector: &DatasetSelector,
+    range: &LedgerRange,
+    manifest: &Manifest,
+) where
     S: ObjectStore,
 {
-    for object in store
-        .list(&format!("chains/{}/coverage-index", chain.key_prefix()))
-        .expect("coverage index list")
-    {
-        store
-            .delete(&object.key)
-            .expect("delete coverage index object");
-    }
+    let bucket_size = 100_000;
+    let bucket_start = (range.start() / bucket_size) * bucket_size;
+    let bucket_end = bucket_start + bucket_size - 1;
+    let key = format!(
+        "chains/{}/coverage-index/{}/{}/{}/safe/{:020}-{:020}.json",
+        chain.key_prefix(),
+        dataset_key.as_str(),
+        range_kind,
+        selector.fingerprint(),
+        bucket_start,
+        bucket_end
+    );
+    store
+        .put(
+            &key,
+            &serde_json::to_vec_pretty(manifest).expect("coverage index bytes"),
+        )
+        .expect("write coverage index");
 }
