@@ -142,6 +142,145 @@ fn test_native_query_rest_request_json_preserves_large_u64_range() {
 }
 
 #[test]
+fn test_native_query_without_finality_defaults_to_durable_boundary() {
+    let server = MockRestServer::new(vec![
+        json!({
+            "chain": {"configured_name": "ethereum"},
+            "height": 2,
+            "finality": "finalized",
+            "range_kind": "block"
+        }),
+        query_response_body(),
+    ]);
+    let client = DatalensClient::new(ClientConfig {
+        endpoint: server.endpoint(),
+        bearer_token: None,
+        application: None,
+        timeout: Some(Duration::from_secs(5)),
+        user_agent: None,
+    })
+    .expect("client config");
+    let mut input = query_input();
+    input.finality = None;
+
+    let response = client.native().query(input).expect("native query");
+
+    assert_eq!(response.dataset_key, "evm.logs");
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    assert_eq!(
+        requests[0].path,
+        "/v1/chains/ethereum/head?finality=finalized"
+    );
+    assert_eq!(requests[1].method, "POST");
+    assert_eq!(requests[1].path, "/v1/query");
+    assert_eq!(requests[1].body["finality"], "durable_only");
+}
+
+#[test]
+fn test_native_query_without_finality_accepts_safe_head_fallback() {
+    let server = MockRestServer::new(vec![
+        json!({
+            "chain": {"configured_name": "ethereum"},
+            "height": 2,
+            "finality": "safe",
+            "range_kind": "block"
+        }),
+        query_response_body(),
+    ]);
+    let client = DatalensClient::new(ClientConfig {
+        endpoint: server.endpoint(),
+        bearer_token: None,
+        application: None,
+        timeout: Some(Duration::from_secs(5)),
+        user_agent: None,
+    })
+    .expect("client config");
+    let mut input = query_input();
+    input.finality = None;
+
+    client.native().query(input).expect("native query");
+
+    assert_eq!(server.requests().len(), 2);
+}
+
+#[test]
+fn test_native_query_without_finality_rejects_range_above_durable_boundary() {
+    let server = MockRestServer::new(vec![json!({
+        "chain": {"configured_name": "ethereum"},
+        "height": 1,
+        "finality": "finalized",
+        "range_kind": "block"
+    })]);
+    let client = DatalensClient::new(ClientConfig {
+        endpoint: server.endpoint(),
+        bearer_token: None,
+        application: None,
+        timeout: Some(Duration::from_secs(5)),
+        user_agent: None,
+    })
+    .expect("client config");
+    let mut input = query_input();
+    input.finality = None;
+
+    let error = client
+        .native()
+        .query(input)
+        .expect_err("range should exceed durable boundary");
+
+    assert!(matches!(error, datalens_sdk::Error::Safety(_)));
+    assert!(
+        error.to_string().contains("exceeds finalized head"),
+        "{error}"
+    );
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[test]
+fn test_native_query_rejects_latest_segment_for_durable_query() {
+    let server = MockRestServer::new(vec![json!({
+        "chain": {"configuredName": "ethereum"},
+        "dataset_key": "evm.logs",
+        "range": {"kind": "block", "start": 1, "end": 2},
+        "cache": {
+            "hit_ranges": [],
+            "missing_ranges": [{"kind": "block", "start": 1, "end": 2}],
+            "durable_hit_ranges": [],
+            "hot_hit_ranges": [],
+            "provider_fill_ranges": [{"kind": "block", "start": 1, "end": 2}],
+            "promotion_pending_ranges": [],
+            "segments": [{
+                "range": {"kind": "block", "start": 1, "end": 2},
+                "source": "provider",
+                "finality": "latest"
+            }]
+        },
+        "rows": {"rows": []}
+    })]);
+    let client = DatalensClient::new(ClientConfig {
+        endpoint: server.endpoint(),
+        bearer_token: None,
+        application: None,
+        timeout: Some(Duration::from_secs(5)),
+        user_agent: None,
+    })
+    .expect("client config");
+
+    let error = client
+        .native()
+        .query(query_input())
+        .expect_err("durable query should reject latest segment");
+
+    assert!(matches!(error, datalens_sdk::Error::Safety(_)));
+    assert!(
+        error
+            .to_string()
+            .contains("durable query returned non-durable segment"),
+        "{error}"
+    );
+}
+
+#[test]
 fn test_native_chain_head_gets_rest_head_with_finality_and_auth_headers() {
     let server = MockRestServer::new(vec![json!({
         "chain": {"configured_name": "ethereum"},
@@ -183,6 +322,59 @@ fn test_native_chain_head_gets_rest_head_with_finality_and_auth_headers() {
         Some("datalens-sdk-tests")
     );
     assert!(request.body.is_null());
+}
+
+#[test]
+fn test_native_chain_head_helpers_use_typed_finality() {
+    let server = MockRestServer::new(vec![
+        json!({
+            "chain": {"configured_name": "ethereum"},
+            "height": 18_500_001,
+            "finality": "latest",
+            "range_kind": "block"
+        }),
+        json!({
+            "chain": {"configured_name": "ethereum"},
+            "height": 18_499_900,
+            "finality": "safe",
+            "range_kind": "block"
+        }),
+        json!({
+            "chain": {"configured_name": "ethereum"},
+            "height": 18_499_800,
+            "finality": "finalized",
+            "range_kind": "block"
+        }),
+    ]);
+    let client = DatalensClient::new(ClientConfig {
+        endpoint: server.endpoint(),
+        bearer_token: None,
+        application: None,
+        timeout: Some(Duration::from_secs(5)),
+        user_agent: None,
+    })
+    .expect("client config");
+
+    assert_eq!(
+        client.native().latest_head("ethereum").unwrap().finality,
+        "latest"
+    );
+    assert_eq!(
+        client.native().safe_head("ethereum").unwrap().finality,
+        "safe"
+    );
+    assert_eq!(
+        client.native().finalized_head("ethereum").unwrap().finality,
+        "finalized"
+    );
+
+    let requests = server.requests();
+    assert_eq!(requests[0].path, "/v1/chains/ethereum/head?finality=latest");
+    assert_eq!(requests[1].path, "/v1/chains/ethereum/head?finality=safe");
+    assert_eq!(
+        requests[2].path,
+        "/v1/chains/ethereum/head?finality=finalized"
+    );
 }
 
 #[test]

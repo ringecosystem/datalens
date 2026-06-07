@@ -203,6 +203,82 @@ fn test_native_query_sends_graphql_input_and_decodes_sdk_owned_response() {
 }
 
 #[test]
+fn test_native_query_graphql_defaults_missing_finality_to_durable_only() {
+    let server = MockGraphqlServer::new(vec![json!({
+        "data": {
+            "query": {
+                "chain": {"configuredName": "ethereum"},
+                "datasetKey": "evm.logs",
+                "range": {"kind": "block", "start": 1, "end": 2},
+                "cache": {
+                    "hitRanges": [{"kind": "block", "start": 1, "end": 2}],
+                    "missingRanges": [],
+                    "hotHitRanges": [],
+                    "providerFillRanges": [],
+                    "segments": [{
+                        "range": {"kind": "block", "start": 1, "end": 2},
+                        "source": "durable",
+                        "finality": "safe"
+                    }]
+                },
+                "rows": [{"blockNumber": 1}]
+            }
+        }
+    })]);
+    let client = client(&server, None);
+    let mut input = native_query_input();
+    input.finality = None;
+
+    let response = client.native().query(input).expect("native query");
+
+    assert_eq!(response.dataset_key, "evm.logs");
+    let request = server.only_request();
+    assert_eq!(
+        request.variables["input"]["finality"],
+        json!("durable_only")
+    );
+}
+
+#[test]
+fn test_native_query_graphql_rejects_latest_segment_for_durable_query() {
+    let server = MockGraphqlServer::new(vec![json!({
+        "data": {
+            "query": {
+                "chain": {"configuredName": "ethereum"},
+                "datasetKey": "evm.logs",
+                "range": {"kind": "block", "start": 1, "end": 2},
+                "cache": {
+                    "hitRanges": [],
+                    "missingRanges": [{"kind": "block", "start": 1, "end": 2}],
+                    "hotHitRanges": [],
+                    "providerFillRanges": [{"kind": "block", "start": 1, "end": 2}],
+                    "segments": [{
+                        "range": {"kind": "block", "start": 1, "end": 2},
+                        "source": "provider",
+                        "finality": "latest"
+                    }]
+                },
+                "rows": []
+            }
+        }
+    })]);
+    let client = client(&server, None);
+
+    let error = client
+        .native()
+        .query(native_query_input())
+        .expect_err("durable query should reject latest segment");
+
+    assert!(matches!(error, Error::Safety(_)));
+    assert!(
+        error
+            .to_string()
+            .contains("durable query returned non-durable segment"),
+        "{error}"
+    );
+}
+
+#[test]
 fn test_graphql_errors_are_returned_without_requiring_live_datalens() {
     let server = MockGraphqlServer::new(vec![json!({
         "errors": [{
@@ -218,6 +294,41 @@ fn test_graphql_errors_are_returned_without_requiring_live_datalens() {
         .expect_err("graphql error");
 
     assert!(matches!(error, Error::Graphql(errors) if errors[0].message == "not authorized"));
+}
+
+fn native_query_input() -> QueryInput {
+    QueryInput {
+        chain: ChainIdentityInput {
+            family: ChainFamilyInput {
+                kind: ChainFamilyKindInput::Evm,
+                other: None,
+            },
+            configured_name: "ethereum".to_owned(),
+            network_id: Some(NetworkIdInput {
+                numeric: Some(1),
+                textual: None,
+            }),
+        },
+        dataset_key: DatasetKeyInput {
+            family: "evm".to_owned(),
+            name: "logs".to_owned(),
+        },
+        selector: QuerySelectorInput {
+            kind: SelectorKindInput::EvmLogs,
+            evm_logs: Some(EvmLogsSelectorInput {
+                addresses: vec!["0xaddr".to_owned()],
+                topics: Vec::new(),
+            }),
+            other: None,
+        },
+        range: QueryRangeInput {
+            kind: QueryRangeKindInput::Block,
+            start: 1,
+            end: 2,
+        },
+        finality: Some("durable_only".to_owned()),
+        fields: None,
+    }
 }
 
 #[test]

@@ -201,6 +201,7 @@ pub enum Error {
     InvalidConfig(String),
     Encode(String),
     Decode(String),
+    Safety(String),
     Transport(String),
     Unauthorized { status: u16, body: String },
     HttpStatus { status: u16, body: String },
@@ -234,6 +235,7 @@ impl fmt::Display for Error {
             Self::InvalidConfig(message)
             | Self::Encode(message)
             | Self::Decode(message)
+            | Self::Safety(message)
             | Self::Transport(message) => formatter.write_str(message),
             Self::Unauthorized { status, body } => {
                 write!(formatter, "datalens auth error {status}: {body}")
