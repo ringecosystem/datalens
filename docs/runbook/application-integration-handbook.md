@@ -91,12 +91,55 @@ they may return live provider or hot-cache segments that are not durable coverag
 not advance a long-lived business checkpoint past data that the application cannot
 tolerate replaying or reconciling after reorg-sensitive reads.
 
+### Safe-Default Indexing Workflow
+
+Use this path for final business tables and durable application checkpoints.
+
+1. Resolve a finalized head with `DatalensClient::native().finalized_head(chain)`, or a
+   safe head with `safe_head(chain)` when finalized head availability is not required for
+   the workload.
+2. Cap each query range at that safe or finalized head. The Rust SDK also applies this
+   guard for REST `query` calls when `QueryInput.finality` is omitted.
+3. Call `DatalensClient::native().query(input)`. Omit `finality`, or set
+   `finality = Some("durable_only")` when explicit configuration is clearer.
+4. Treat returned rows as eligible for final business tables only when the response
+   segment metadata is safe or finalized. `datalens_sdk::safety::extract_cache_segments`
+   exposes segment `source`, `finality`, `range`, and available anchor metadata.
+5. Write final rows and the final business cursor in the same application transaction.
+6. Advance the final cursor only with safe or finalized anchors. In Rust, model this with
+   `FinalizedCursor`; it rejects latest, provisional, unknown, mismatched, or regressing
+   anchors.
+
 Chunk ranges should be capped by the smaller of:
 
 - The application quota in the shared Datalens service config.
 - The chain dataset provider limits.
 - The application handler's transaction and retry budget.
 - The finality boundary for the requested durable range.
+
+### Optional Provisional Indexing Workflow
+
+Use this path only for features that can tolerate rechecks and rollback, such as
+preview-only UI, fast-but-reconcilable counters, or application-specific staging tables.
+
+1. Opt in explicitly with `DatalensClient::native().query_provisional(input)`.
+   `QueryInput.finality` must be `latest_only` or `safe_to_latest`; ordinary `query`
+   rejects those finality modes.
+2. Store latest or provisional rows separately from final business tables. Keep a
+   separate provisional cursor, for example with `ProvisionalCursor`, so the final
+   business cursor remains safe.
+3. Persist available segment metadata with the provisional rows: range, source,
+   finality, and anchor fields such as height, block hash, parent hash, timestamp, and
+   anchor finality.
+4. On later safe or finalized coverage, compare the provisional range and anchor against
+   the durable head. `plan_promotion` returns one of `Promote`, `KeepProvisional`,
+   `Recheck`, or `Rollback`.
+5. Promote only when the plan returns `Promote`. Without canonical proof that the
+   provisional data matches a safe or finalized anchor, recheck the range instead of
+   promoting it.
+6. Keep rollback as an application-owned operation. Datalens supplies rows and safety
+   metadata; the application decides how to remove, mark, or replace provisional
+   business state.
 
 ## Business Database Pattern
 
@@ -113,6 +156,11 @@ Use this loop for each workload:
    application checkpoint.
 6. Advance the checkpoint only after business writes succeed.
 7. On restart or replay, tolerate duplicate native rows and duplicate business keys.
+
+For the safe-default path, step 5 writes only safe or finalized data to final business
+tables, and step 6 advances only the final cursor derived from safe or finalized
+coverage. Provisional rows, cursors, and rollback markers belong in separate
+application-owned staging tables or equivalent state.
 
 Handlers must be idempotent. Use stable unique keys such as transaction hash plus log
 index, event cursor, message hash, proposal id plus voter, or another product-owned key.
@@ -133,6 +181,9 @@ checkpoint only when that skip decision is committed with the rest of the page o
 - It owns SQLite migrations, `ormp_messages`, and `consumer_checkpoints`.
 - It writes rows and checkpoint updates in one application transaction.
 - It uses unique business keys so replay does not duplicate messages.
+- It uses the durable query path for final business writes; the explicit
+  `durable_only` request can also be omitted because SDK `query` defaults to that
+  contract.
 
 `examples/degov-client/` demonstrates a governance indexer:
 
@@ -141,6 +192,8 @@ checkpoint only when that skip decision is committed with the rest of the page o
 - It owns vote tables, proposal projections, migrations, and checkpoints.
 - It includes fixture workloads for data-positive live E2E checks across configured
   chains.
+- It keeps the example on the safe-default indexing path and does not treat latest data
+  as final business state.
 
 Treat these examples as application indexers, not Datalens core runtime code. They are
 references for the external-service pattern: Datalens supplies cached native rows, while

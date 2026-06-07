@@ -98,6 +98,11 @@ EVM logs selector value 字段：
 - `rows`：`DatasetRows`，按数据集顺序排序，并在响应前去重。
 - 空结果用所选数据集下的空 `rows` 数组表示。
 
+Safe-default client 只能把 `finalized` 或 `safe` 数据写入最终业务表，并且只能基于 finalized 或
+safe coverage 推进最终业务 cursor。Latest、unsafe、hot 或其他 provisional segment 只能进入
+application 自己的 provisional state，除非 application 已证明它们匹配 canonical safe 或 finalized
+coverage。
+
 响应 metadata 必须区分 durable cache、hot cache 和 live provider segment，并标记
 `finalized`、`safe`、`unsafe` 或 `latest` finality。调用方必须基于稳定的 `error.kind` 分支，而
 不是解析 `error.message`。
@@ -132,6 +137,26 @@ workspace crate 实现使用，不是外部 SDK package。
 - `QueryResponse` 为 chain、range、cache 和 rows 保留 GraphQL JSON scalar，不暴露内部
   server/runtime model。
 - `solana.slots`、`tron.blocks` 等非 EVM dataset 通过同一个原生方法查询。
+- 缺失 `QueryInput.finality` 时默认使用 `durable_only`。
+- `query` 会拒绝 `latest_only` 和 `safe_to_latest`；需要 hot/latest 数据的调用方必须显式使用
+  `query_provisional`。
+- REST `query` 在缺失 explicit finality 时会先解析 finalized head；如果 finalized head 不可用，
+  再回退到 safe head，然后才发送 durable query。
+- `query_provisional` 要求 explicit `latest_only` 或 `safe_to_latest` finality，并且不能用于推进
+  最终业务 cursor。
+
+Rust SDK safety helpers 是公开的集成工具：
+
+- `DataFinality` 把 `finalized` 和 `safe` 归类为 durable，把 `latest` 或 provisional 值归类为
+  provisional。
+- `BlockAnchor`、`FinalizedCursor` 和 `ProvisionalCursor` 帮助 application 分离 durable 与
+  provisional checkpoint state。`FinalizedCursor` 必须拒绝 non-durable finality、unknown
+  finality、range-kind mismatch 和 height regression。
+- `extract_cache_segments` 读取 response segment 的 range、source、finality，以及可用的 anchor
+  metadata，方便 application 持久化后续 reconciliation 所需证据。
+- `plan_promotion` 返回 `Promote`、`KeepProvisional`、`Recheck` 或 `Rollback`。如果没有由
+  durable safe/finalized anchor coverage 表示的 canonical proof，latest 或 provisional range 必须
+  recheck，不能 promote。
 
 SDK 也通过 `DatalensClient::index()` 暴露 checked-in `schemas/index.graphql` SDL 的 wrapper：
 
