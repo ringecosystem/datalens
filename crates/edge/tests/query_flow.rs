@@ -96,7 +96,10 @@ fn test_query_empty_logs_records_empty_coverage_without_data_object() {
         ]
     );
     assert_eq!(log_indexes(&second), Vec::<u64>::new());
-    assert!(root.join("chains/evm/ethereum/1/manifest.json").exists());
+    assert!(
+        root.join("chains/evm/ethereum/1/manifest-segments")
+            .exists()
+    );
     assert!(!root.join("chains/evm/ethereum/1/datasets").exists());
 }
 
@@ -262,6 +265,11 @@ fn test_query_rejects_range_above_safe_height_without_fetch_or_cache_write() {
     assert!(error.message.contains("safe/finalized height"));
     assert_eq!(source.calls(), Vec::<SourceCall>::new());
     assert!(!root.join("chains/evm/ethereum/1/manifest.json").exists());
+    assert!(
+        !root
+            .join("chains/evm/ethereum/1/manifest-segments")
+            .exists()
+    );
     assert!(!root.join("chains/evm/ethereum/1/datasets").exists());
 }
 
@@ -282,7 +290,10 @@ fn test_query_allows_range_at_safe_height_and_writes_cache() {
         source.calls(),
         vec![SourceCall::Blocks(BlockRange::expect_new(98, 99))]
     );
-    assert!(root.join("chains/evm/ethereum/1/manifest.json").exists());
+    assert!(
+        root.join("chains/evm/ethereum/1/manifest-segments")
+            .exists()
+    );
     assert!(root.join("chains/evm/ethereum/1/datasets").exists());
 }
 
@@ -303,6 +314,11 @@ fn test_query_rejects_empty_unsafe_range_without_empty_coverage() {
     assert_eq!(error.kind, DatalensErrorKind::InvalidInput);
     assert_eq!(source.calls(), Vec::<SourceCall>::new());
     assert!(!root.join("chains/evm/ethereum/1/manifest.json").exists());
+    assert!(
+        !root
+            .join("chains/evm/ethereum/1/manifest-segments")
+            .exists()
+    );
     assert!(!root.join("chains/evm/ethereum/1/datasets").exists());
 }
 
@@ -705,8 +721,14 @@ fn test_registry_shared_storage_keeps_manifest_isolated_by_chain_identity() {
         .query_native(blocks_request_for(polygon_identity(), 1, 1))
         .expect("polygon query succeeds");
 
-    assert!(root.join("chains/evm/ethereum/1/manifest.json").exists());
-    assert!(root.join("chains/evm/polygon/137/manifest.json").exists());
+    assert!(
+        root.join("chains/evm/ethereum/1/manifest-segments")
+            .exists()
+    );
+    assert!(
+        root.join("chains/evm/polygon/137/manifest-segments")
+            .exists()
+    );
     assert!(root.join("chains/evm/ethereum/1/datasets").exists());
     assert!(root.join("chains/evm/polygon/137/datasets").exists());
 }
@@ -770,9 +792,12 @@ fn test_registry_routes_evm_and_solana_native_queries_side_by_side() {
             .collect::<Vec<_>>(),
         vec![10, 12]
     );
-    assert!(root.join("chains/evm/ethereum/1/manifest.json").exists());
     assert!(
-        root.join("chains/solana/solana-mainnet-beta/mainnet-beta/manifest.json")
+        root.join("chains/evm/ethereum/1/manifest-segments")
+            .exists()
+    );
+    assert!(
+        root.join("chains/solana/solana-mainnet-beta/mainnet-beta/manifest-segments")
             .exists()
     );
 }

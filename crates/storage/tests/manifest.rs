@@ -94,84 +94,6 @@ impl ObjectStore for StaleManifestObjectStore {
     }
 }
 
-#[derive(Debug)]
-struct ConcurrentManifestState {
-    initial_manifest_reads: Mutex<usize>,
-    initial_manifest_reads_ready: Condvar,
-}
-
-#[derive(Clone, Debug)]
-struct ConcurrentManifestObjectStore {
-    inner: LocalObjectStore,
-    manifest_key: String,
-    manifest_get_count: Arc<AtomicUsize>,
-    state: Arc<ConcurrentManifestState>,
-}
-
-impl ConcurrentManifestObjectStore {
-    fn new(root: PathBuf, manifest_key: String) -> Self {
-        let inner = LocalObjectStore::new(root);
-        inner
-            .put(&manifest_key, br#"{"entries":[]}"#)
-            .expect("put initial manifest");
-        Self {
-            inner,
-            manifest_key,
-            manifest_get_count: Arc::new(AtomicUsize::new(0)),
-            state: Arc::new(ConcurrentManifestState {
-                initial_manifest_reads: Mutex::new(0),
-                initial_manifest_reads_ready: Condvar::new(),
-            }),
-        }
-    }
-}
-
-impl ObjectStore for ConcurrentManifestObjectStore {
-    fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError> {
-        if key == self.manifest_key {
-            let count = self.manifest_get_count.fetch_add(1, Ordering::SeqCst) + 1;
-            if count <= 2 {
-                let mut initial_manifest_reads = self
-                    .state
-                    .initial_manifest_reads
-                    .lock()
-                    .expect("lock reads");
-                *initial_manifest_reads += 1;
-                self.state.initial_manifest_reads_ready.notify_all();
-                while *initial_manifest_reads < 2 {
-                    initial_manifest_reads = self
-                        .state
-                        .initial_manifest_reads_ready
-                        .wait(initial_manifest_reads)
-                        .expect("wait reads");
-                }
-            }
-            let bytes = self.inner.get(key)?;
-            if count == 3 {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            return Ok(bytes);
-        }
-        self.inner.get(key)
-    }
-
-    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
-        self.inner.put(key, bytes)
-    }
-
-    fn exists(&self, key: &str) -> Result<bool, DatalensError> {
-        self.inner.exists(key)
-    }
-
-    fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
-        self.inner.list(prefix)
-    }
-
-    fn delete(&self, key: &str) -> Result<(), DatalensError> {
-        self.inner.delete(key)
-    }
-}
-
 #[derive(Clone, Debug)]
 struct CountingDataObjectExistsStore {
     inner: LocalObjectStore,
@@ -258,6 +180,57 @@ impl ObjectStore for MissingDataObjectExistsStore {
     }
 }
 
+#[derive(Clone, Debug)]
+struct ManifestGetCountingStore {
+    inner: LocalObjectStore,
+    manifest_key: String,
+    manifest_get_count: Arc<AtomicUsize>,
+}
+
+impl ManifestGetCountingStore {
+    fn new(root: PathBuf, chain: &ChainIdentity) -> Self {
+        let inner = LocalObjectStore::new(root);
+        let manifest_key = format!("chains/{}/manifest.json", chain.key_prefix());
+        inner
+            .put(&manifest_key, br#"{"entries":[]}"#)
+            .expect("put initial manifest");
+        Self {
+            inner,
+            manifest_key,
+            manifest_get_count: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn manifest_get_count(&self) -> usize {
+        self.manifest_get_count.load(Ordering::SeqCst)
+    }
+}
+
+impl ObjectStore for ManifestGetCountingStore {
+    fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError> {
+        if key == self.manifest_key {
+            self.manifest_get_count.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.get(key)
+    }
+
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
+        self.inner.put(key, bytes)
+    }
+
+    fn exists(&self, key: &str) -> Result<bool, DatalensError> {
+        self.inner.exists(key)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
+        self.inner.list(prefix)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), DatalensError> {
+        self.inner.delete(key)
+    }
+}
+
 #[derive(Debug)]
 struct PausedManifestPutState {
     put_started: Mutex<bool>,
@@ -269,15 +242,15 @@ struct PausedManifestPutState {
 #[derive(Clone, Debug)]
 struct PausedManifestPutStore {
     inner: LocalObjectStore,
-    paused_manifest_key: String,
+    paused_put_prefix: String,
     state: Arc<PausedManifestPutState>,
 }
 
 impl PausedManifestPutStore {
-    fn new(root: PathBuf, paused_manifest_key: String) -> Self {
+    fn new(root: PathBuf, paused_put_prefix: String) -> Self {
         Self {
             inner: LocalObjectStore::new(root),
-            paused_manifest_key,
+            paused_put_prefix,
             state: Arc::new(PausedManifestPutState {
                 put_started: Mutex::new(false),
                 release_put: Mutex::new(false),
@@ -311,7 +284,7 @@ impl ObjectStore for PausedManifestPutStore {
     }
 
     fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
-        if key == self.paused_manifest_key {
+        if key.starts_with(&self.paused_put_prefix) {
             {
                 let mut put_started = self.state.put_started.lock().expect("lock put started");
                 *put_started = true;
@@ -707,21 +680,52 @@ fn single_block_rows(number: u64) -> DatasetRows {
 }
 
 fn first_manifest_object_key(storage: &LocalStorage, chain: &ChainIdentity) -> String {
-    let manifest = read_manifest_json(storage, chain);
-    manifest["entries"][0]["object_key"]
-        .as_str()
-        .expect("object key")
-        .to_owned()
+    first_manifest_object_key_from_merged(storage, chain)
 }
 
 fn read_manifest_json(storage: &LocalStorage, chain: &ChainIdentity) -> serde_json::Value {
-    let bytes = std::fs::read(storage.manifest_path(chain)).expect("manifest bytes");
+    let bytes = std::fs::read(manifest_json_path_for_test(storage, chain)).expect("manifest bytes");
     serde_json::from_slice(&bytes).expect("manifest json")
 }
 
 fn write_manifest_json(storage: &LocalStorage, chain: &ChainIdentity, manifest: serde_json::Value) {
     let bytes = serde_json::to_vec_pretty(&manifest).expect("manifest bytes");
-    std::fs::write(storage.manifest_path(chain), bytes).expect("write manifest");
+    std::fs::write(manifest_json_path_for_test(storage, chain), bytes).expect("write manifest");
+}
+
+fn manifest_json_path_for_test(storage: &LocalStorage, chain: &ChainIdentity) -> PathBuf {
+    let manifest_path = storage.manifest_path(chain);
+    if manifest_path.exists() {
+        return manifest_path;
+    }
+    let segment_key = manifest_segment_keys(storage, chain)
+        .into_iter()
+        .next()
+        .expect("manifest segment");
+    storage.root().join(segment_key)
+}
+
+fn manifest_segment_keys(storage: &LocalStorage, chain: &ChainIdentity) -> Vec<String> {
+    storage
+        .object_store()
+        .list(&format!("chains/{}/manifest-segments", chain.key_prefix()))
+        .expect("manifest segment list")
+        .into_iter()
+        .map(|object| object.key)
+        .collect()
+}
+
+fn first_manifest_object_key_from_merged(storage: &LocalStorage, chain: &ChainIdentity) -> String {
+    let manifest = storage.manifest().expect("manifest");
+    manifest
+        .entries
+        .iter()
+        .find(|entry| entry.chain == *chain)
+        .expect("manifest entry")
+        .object_key
+        .as_deref()
+        .expect("object key")
+        .to_owned()
 }
 
 fn legacy_evm_logs_parquet_bytes() -> Vec<u8> {
@@ -1181,10 +1185,7 @@ fn test_evm_blocks_rows_write_parquet_and_read_back() {
         })
         .expect("write rows");
 
-    let manifest_bytes =
-        std::fs::read(storage.manifest_path(&chain)).expect("manifest bytes after write");
-    let manifest_json: serde_json::Value =
-        serde_json::from_slice(&manifest_bytes).expect("manifest json");
+    let manifest_json = read_manifest_json(&storage, &chain);
     let entry = &manifest_json["entries"][0];
     let object_key = entry["object_key"].as_str().expect("object key");
     assert_eq!(entry["object_encoding"], "parquet-v1");
@@ -1319,8 +1320,9 @@ fn test_read_rows_rejects_unknown_checksum_algorithm() {
     manifest["entries"][0]["checksum_algorithm"] = serde_json::Value::String("md5".to_owned());
     write_manifest_json(&storage, &chain, manifest);
     let object_key = first_manifest_object_key(&storage, &chain);
+    let reader = LocalStorage::new(storage.root().to_path_buf());
 
-    let error = storage
+    let error = reader
         .read_rows(&chain, &DatasetKey::evm_blocks(), &selector, range)
         .expect_err("unknown checksum algorithm");
 
@@ -1357,8 +1359,9 @@ fn test_read_rows_rejects_manifest_without_required_object_metadata() {
     entry.remove("checksum_algorithm");
     entry.remove("written_at_unix_seconds");
     write_manifest_json(&storage, &chain, manifest);
+    let reader = LocalStorage::new(storage.root().to_path_buf());
 
-    let error = storage
+    let error = reader
         .read_rows(&chain, &DatasetKey::evm_blocks(), &selector, range)
         .expect_err("manifest without required object metadata");
 
@@ -1425,10 +1428,7 @@ fn test_evm_logs_rows_write_parquet_and_read_back() {
         })
         .expect("write rows");
 
-    let manifest_bytes =
-        std::fs::read(storage.manifest_path(&chain)).expect("manifest bytes after write");
-    let manifest_json: serde_json::Value =
-        serde_json::from_slice(&manifest_bytes).expect("manifest json");
+    let manifest_json = read_manifest_json(&storage, &chain);
     let entry = &manifest_json["entries"][0];
     let object_key = entry["object_key"].as_str().expect("object key");
     assert_eq!(entry["object_encoding"], "parquet-v1");
@@ -1747,8 +1747,9 @@ fn test_invalid_evm_log_canonical_key_keeps_exact_fingerprint_reads() {
     manifest["entries"][0]["selector_canonical_key"] =
         serde_json::Value::String("evm-logs/not-addr=*".to_owned());
     write_manifest_json(&storage, &chain, manifest);
+    let reader = LocalStorage::new(storage.root().to_path_buf());
 
-    let read = storage
+    let read = reader
         .read_rows(
             &chain,
             &DatasetKey::evm_logs(),
@@ -1849,8 +1850,9 @@ fn test_evm_logs_legacy_parquet_without_block_metadata_reads_null_metadata() {
         serde_json::json!(hex_sha256(&legacy_bytes)),
     );
     write_manifest_json(&storage, &chain, manifest);
+    let reader = LocalStorage::new(storage.root().to_path_buf());
 
-    let read = storage
+    let read = reader
         .read_rows(&chain, &DatasetKey::evm_logs(), &selector, range)
         .expect("read legacy rows");
     let QueryRows::EvmLogs(logs) = read.rows() else {
@@ -2025,11 +2027,182 @@ fn test_manifest_is_chain_namespaced() {
         })
         .expect("write rows");
 
-    assert!(
+    assert_eq!(manifest_segment_keys(&storage, &chain).len(), 1);
+}
+
+#[test]
+fn test_empty_coverage_write_publishes_segment_without_rewriting_full_manifest() {
+    let root = temp_storage_root("empty-segment-no-full-rewrite");
+    let chain = test_chain();
+    let store = ManifestGetCountingStore::new(root.clone(), &chain);
+    let storage = DurableStorage::from_object_store(store.clone());
+    let manifest_path = root.join(format!("chains/{}/manifest.json", chain.key_prefix()));
+    let original_manifest_bytes = std::fs::read(&manifest_path).expect("manifest bytes");
+    let rows = DatasetRows::new(DatasetKey::evm_logs(), QueryRows::EvmLogs(Vec::new()))
+        .expect("dataset rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &DatasetSelector::all(),
+            range: LedgerRange::blocks(10, 10).expect("valid range"),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write empty coverage");
+
+    assert_eq!(store.manifest_get_count(), 0);
+    assert_eq!(
+        std::fs::read(&manifest_path).expect("manifest bytes"),
+        original_manifest_bytes
+    );
+    let segments = LocalStorage::new(root)
+        .object_store()
+        .list(&format!("chains/{}/manifest-segments", chain.key_prefix()))
+        .expect("manifest segments");
+    assert_eq!(segments.len(), 1);
+    assert!(segments[0].size < 2048);
+}
+
+#[test]
+fn test_legacy_full_manifest_and_segments_merge() {
+    let storage = LocalStorage::new(temp_storage_root("legacy-full-plus-segments"));
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let legacy_range = LedgerRange::blocks(1, 1).expect("valid range");
+    let segment_range = LedgerRange::blocks(2, 2).expect("valid range");
+    let legacy_rows = DatasetRows::new(DatasetKey::evm_logs(), QueryRows::EvmLogs(Vec::new()))
+        .expect("dataset rows");
+    let segment_rows = DatasetRows::new(DatasetKey::evm_logs(), QueryRows::EvmLogs(Vec::new()))
+        .expect("dataset rows");
+    let legacy_manifest = Manifest {
+        entries: vec![ManifestEntry {
+            chain: chain.clone(),
+            dataset_key: DatasetKey::evm_logs(),
+            range: legacy_range.clone(),
+            selector_fingerprint: "all".to_owned(),
+            selector_canonical_key: "all".to_owned(),
+            finality_level: ManifestFinalityLevel::Safe,
+            object_key: None,
+            object_encoding: None,
+            object_compression: None,
+            row_count: 0,
+            object_size_bytes: None,
+            checksum: None,
+            checksum_algorithm: None,
+            written_at_unix_seconds: None,
+        }],
+    };
+    std::fs::create_dir_all(
         storage
             .root()
-            .join("chains/evm/ethereum/1/manifest.json")
-            .exists()
+            .join(format!("chains/{}", chain.key_prefix())),
+    )
+    .expect("create manifest parent");
+    std::fs::write(
+        storage.manifest_path(&chain),
+        serde_json::to_vec_pretty(&legacy_manifest).expect("manifest bytes"),
+    )
+    .expect("write legacy manifest");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &selector,
+            range: segment_range.clone(),
+            rows: &segment_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write segment coverage");
+
+    let manifest = storage.manifest().expect("manifest");
+    assert_eq!(manifest.entries.len(), 2);
+    assert!(
+        manifest
+            .entries
+            .iter()
+            .any(|entry| entry.range == legacy_range)
+    );
+    assert!(
+        manifest
+            .entries
+            .iter()
+            .any(|entry| entry.range == segment_range)
+    );
+    assert_eq!(
+        storage
+            .covered_ranges(
+                &chain,
+                &DatasetKey::evm_logs(),
+                &selector,
+                LedgerRange::blocks(1, 2).expect("valid range"),
+            )
+            .expect("covered ranges"),
+        vec![LedgerRange::blocks(1, 2).expect("valid range")]
+    );
+    assert_eq!(legacy_rows.row_count(), 0);
+}
+
+#[test]
+fn test_segmented_entries_are_visible_to_covered_ranges_and_read_rows() {
+    let storage = LocalStorage::new(temp_storage_root("segmented-read-coverage"));
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let data_range = LedgerRange::blocks(1, 1).expect("valid range");
+    let empty_range = LedgerRange::blocks(2, 2).expect("valid range");
+    let rows = single_block_rows(1);
+    let empty_rows = DatasetRows::new(DatasetKey::evm_blocks(), QueryRows::EvmBlocks(Vec::new()))
+        .expect("dataset rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &selector,
+            range: data_range.clone(),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write data rows");
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &selector,
+            range: empty_range.clone(),
+            rows: &empty_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write empty rows");
+
+    assert_eq!(manifest_segment_keys(&storage, &chain).len(), 2);
+    assert_eq!(
+        storage
+            .covered_ranges(
+                &chain,
+                &DatasetKey::evm_blocks(),
+                &selector,
+                LedgerRange::blocks(1, 2).expect("valid range"),
+            )
+            .expect("covered ranges"),
+        vec![LedgerRange::blocks(1, 2).expect("valid range")]
+    );
+    assert_eq!(
+        storage
+            .read_rows(
+                &chain,
+                &DatasetKey::evm_blocks(),
+                &selector,
+                LedgerRange::blocks(1, 2).expect("valid range"),
+            )
+            .expect("read rows"),
+        rows
     );
 }
 
@@ -2039,16 +2212,7 @@ fn test_write_rows_is_idempotent_for_same_logical_shard() {
     let chain = test_chain();
     let selector = DatasetSelector::all();
     let range = LedgerRange::blocks(1, 2).expect("valid range");
-    let rows = DatasetRows::new(
-        DatasetKey::evm_blocks(),
-        QueryRows::EvmBlocks(vec![BlockHeader {
-            number: 1,
-            hash: "0xblock".to_owned(),
-            parent_hash: "0xparent".to_owned(),
-            timestamp: 1,
-        }]),
-    )
-    .expect("dataset rows");
+    let rows = single_block_rows(1);
 
     for _ in 0..2 {
         storage
@@ -2066,6 +2230,97 @@ fn test_write_rows_is_idempotent_for_same_logical_shard() {
 
     let manifest = storage.manifest().expect("manifest");
     assert_eq!(manifest.entries.len(), 1);
+    assert_eq!(manifest_segment_keys(&storage, &chain).len(), 1);
+}
+
+#[test]
+fn test_full_manifest_shadows_stale_compacted_segments() {
+    let root = temp_storage_root("full-manifest-shadows-stale-segments");
+    let storage = LocalStorage::new(&root);
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &selector,
+            range: LedgerRange::blocks(1, 1).expect("valid range"),
+            rows: &single_block_rows(1),
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write stale small segment");
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &selector,
+            range: LedgerRange::blocks(1, 2).expect("valid range"),
+            rows: &DatasetRows::new(
+                DatasetKey::evm_blocks(),
+                QueryRows::EvmBlocks(vec![
+                    BlockHeader {
+                        number: 1,
+                        hash: "0xblock1".to_owned(),
+                        parent_hash: "0xparent".to_owned(),
+                        timestamp: 1,
+                    },
+                    BlockHeader {
+                        number: 2,
+                        hash: "0xblock2".to_owned(),
+                        parent_hash: "0xblock1".to_owned(),
+                        timestamp: 2,
+                    },
+                ]),
+            )
+            .expect("dataset rows"),
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write compacted segment object");
+
+    let compacted_entry = storage
+        .manifest()
+        .expect("manifest")
+        .entries
+        .into_iter()
+        .find(|entry| entry.range == LedgerRange::blocks(1, 2).expect("valid range"))
+        .expect("compacted entry");
+    let full_manifest = Manifest {
+        entries: vec![compacted_entry],
+    };
+    std::fs::create_dir_all(
+        storage
+            .root()
+            .join(format!("chains/{}", chain.key_prefix())),
+    )
+    .expect("create manifest parent");
+    std::fs::write(
+        storage.manifest_path(&chain),
+        serde_json::to_vec_pretty(&full_manifest).expect("manifest bytes"),
+    )
+    .expect("write full manifest");
+    assert_eq!(manifest_segment_keys(&storage, &chain).len(), 2);
+
+    let restarted = LocalStorage::new(root);
+    let manifest = restarted.manifest().expect("manifest");
+    assert_eq!(manifest.entries.len(), 1);
+    assert_eq!(
+        manifest.entries[0].range,
+        LedgerRange::blocks(1, 2).expect("valid range")
+    );
+    assert_eq!(
+        restarted
+            .covered_ranges(
+                &chain,
+                &DatasetKey::evm_blocks(),
+                &selector,
+                LedgerRange::blocks(1, 2).expect("valid range"),
+            )
+            .expect("covered ranges"),
+        vec![LedgerRange::blocks(1, 2).expect("valid range")]
+    );
 }
 
 #[test]
@@ -2130,11 +2385,9 @@ fn test_write_rows_merges_latest_manifest_before_persisting_stale_snapshot() {
 
 #[test]
 fn test_cloned_storage_serializes_concurrent_manifest_updates() {
-    let root = temp_storage_root("concurrent-manifest-writes");
+    let root = temp_storage_root("concurrent-segment-writes");
     let chain = test_chain();
-    let manifest_key = "chains/evm/ethereum/1/manifest.json".to_owned();
-    let storage =
-        DurableStorage::from_object_store(ConcurrentManifestObjectStore::new(root, manifest_key));
+    let storage = LocalStorage::new(root);
 
     let first_storage = storage.clone();
     let first_chain = chain.clone();
@@ -2177,6 +2430,7 @@ fn test_cloned_storage_serializes_concurrent_manifest_updates() {
 
     let manifest = storage.manifest().expect("manifest");
     assert_eq!(manifest.entries.len(), 2);
+    assert_eq!(manifest_segment_keys(&storage, &chain).len(), 2);
     assert!(manifest.entries.iter().any(|entry| {
         entry.range == LedgerRange::blocks(10, 10).expect("valid range")
             && entry.object_key.is_none()
@@ -2249,9 +2503,9 @@ fn test_single_entry_empty_coverage_publish_does_not_revalidate_existing_data_ob
 
 #[test]
 fn test_single_entry_data_object_publish_validates_new_object_exists() {
-    let storage = DurableStorage::from_object_store(MissingDataObjectExistsStore::new(
-        temp_storage_root("single-entry-new-object-exists"),
-    ));
+    let root = temp_storage_root("single-entry-new-object-exists");
+    let storage =
+        DurableStorage::from_object_store(MissingDataObjectExistsStore::new(root.clone()));
     let chain = test_chain();
     let selector = evm_log_selector(vec![ADDRESS_A], vec![Some(vec![TOPIC_1])]);
     let rows = DatasetRows::new(
@@ -2277,6 +2531,11 @@ fn test_single_entry_data_object_publish_validates_new_object_exists() {
         storage.manifest().expect("manifest").entries.is_empty(),
         "failed data-object manifest publish must not leave durable coverage"
     );
+    let segment_prefix = root.join(format!("chains/{}/manifest-segments", chain.key_prefix()));
+    assert!(
+        !segment_prefix.exists(),
+        "failed data-object manifest publish must not leave a segment"
+    );
 }
 
 #[test]
@@ -2286,7 +2545,7 @@ fn test_manifest_updates_for_different_chains_do_not_share_lock() {
     let lisk = lisk_chain();
     let store = PausedManifestPutStore::new(
         root,
-        format!("chains/{}/manifest.json", ethereum.key_prefix()),
+        format!("chains/{}/manifest-segments/", ethereum.key_prefix()),
     );
     let storage = DurableStorage::from_object_store(store.clone());
 

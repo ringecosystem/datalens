@@ -200,7 +200,6 @@ fn test_compaction_merges_adjacent_small_objects_and_retains_old_objects() {
     let chain = test_chain();
     let first_object = write_block_object(&storage, &chain, 50, FinalityLevel::Safe);
     let second_object = write_block_object(&storage, &chain, 51, FinalityLevel::Safe);
-    let before = storage.object_store().list("chains").expect("before list");
 
     let report = storage
         .compact_small_objects(MaintenanceCompactionConfig {
@@ -243,12 +242,16 @@ fn test_compaction_merges_adjacent_small_objects_and_retains_old_objects() {
             .expect("second exists")
     );
     assert!(
+        storage.manifest_path(&chain).exists(),
+        "compaction should write an authoritative full manifest"
+    );
+    assert!(
         storage
             .object_store()
-            .list("chains")
-            .expect("after list")
-            .len()
-            > before.len()
+            .list(&format!("chains/{}/manifest-segments", chain.key_prefix()))
+            .expect("manifest segments")
+            .is_empty(),
+        "compaction should replace per-entry segments with the full manifest"
     );
 
     let rows = storage
@@ -364,12 +367,34 @@ fn temp_storage_root(name: &str) -> PathBuf {
 }
 
 fn read_manifest_json(storage: &LocalStorage, chain: &ChainIdentity) -> serde_json::Value {
-    let bytes = std::fs::read(storage.manifest_path(chain)).expect("manifest bytes");
-    serde_json::from_slice(&bytes).expect("manifest json")
+    let manifest = storage.manifest().expect("manifest");
+    let entries = manifest
+        .entries
+        .into_iter()
+        .filter(|entry| entry.chain == *chain)
+        .collect::<Vec<_>>();
+    serde_json::to_value(datalens_storage::Manifest { entries }).expect("manifest json")
 }
 
 fn write_manifest_json(storage: &LocalStorage, chain: &ChainIdentity, manifest: serde_json::Value) {
+    for object in storage
+        .object_store()
+        .list(&format!("chains/{}/manifest-segments", chain.key_prefix()))
+        .expect("manifest segments")
+    {
+        storage
+            .object_store()
+            .delete(&object.key)
+            .expect("delete manifest segment");
+    }
     let bytes = serde_json::to_vec_pretty(&manifest).expect("manifest bytes");
+    std::fs::create_dir_all(
+        storage
+            .manifest_path(chain)
+            .parent()
+            .expect("manifest parent"),
+    )
+    .expect("create manifest parent");
     std::fs::write(storage.manifest_path(chain), bytes).expect("write manifest");
 }
 

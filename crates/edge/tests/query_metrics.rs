@@ -17,6 +17,11 @@ fn test_provider_limit_error_is_classified() {
 
     assert_eq!(error.kind, DatalensErrorKind::ProviderLimit);
     assert!(!root.join("chains/evm/ethereum/1/manifest.json").exists());
+    assert!(
+        !root
+            .join("chains/evm/ethereum/1/manifest-segments")
+            .exists()
+    );
 }
 
 #[tokio::test]

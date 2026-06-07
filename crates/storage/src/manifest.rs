@@ -37,6 +37,28 @@ impl Manifest {
         });
     }
 
+    pub(crate) fn merge(&mut self, manifest: Manifest) {
+        for entry in manifest.entries {
+            self.upsert(entry);
+        }
+    }
+
+    pub(crate) fn merge_filtering_shadowed_segments(
+        &mut self,
+        manifest: Manifest,
+        base_entries: &[ManifestEntry],
+    ) {
+        for entry in manifest.entries {
+            if base_entries
+                .iter()
+                .any(|base_entry| base_entry.shadows_segment(&entry))
+            {
+                continue;
+            }
+            self.upsert(entry);
+        }
+    }
+
     pub(crate) fn find_logical(
         &self,
         chain: &ChainIdentity,
@@ -117,6 +139,18 @@ impl<'de> Deserialize<'de> for ManifestEntry {
 }
 
 impl ManifestEntry {
+    fn shadows_segment(&self, segment: &ManifestEntry) -> bool {
+        self.chain == segment.chain
+            && self.dataset_key == segment.dataset_key
+            && self.selector_fingerprint == segment.selector_fingerprint
+            && self.finality_level == segment.finality_level
+            && self.object_key.is_some()
+            && segment.object_key.is_some()
+            && self.range.kind() == segment.range.kind()
+            && self.range.start() <= segment.range.start()
+            && self.range.end() >= segment.range.end()
+    }
+
     fn try_from_raw(raw: RawManifestEntry) -> Result<Self, DatalensError> {
         validate_object_key(&raw.selector_fingerprint)?;
         validate_object_key(&raw.selector_canonical_key)?;

@@ -239,8 +239,14 @@ fn test_local_lifecycle_covers_multichain_storage_isolation_and_unknown_chain() 
         })
         .expect("polygon query");
 
-    assert!(root.join("chains/evm/ethereum/1/manifest.json").exists());
-    assert!(root.join("chains/evm/polygon/137/manifest.json").exists());
+    assert!(
+        root.join("chains/evm/ethereum/1/manifest-segments")
+            .exists()
+    );
+    assert!(
+        root.join("chains/evm/polygon/137/manifest-segments")
+            .exists()
+    );
     assert_eq!(
         ethereum_source.calls(),
         vec![SourceCall::Blocks(BlockRange::expect_new(40, 40))]
@@ -283,7 +289,10 @@ fn test_empty_logs_lifecycle_records_empty_coverage_without_data_object_and_hits
         source.calls(),
         vec![SourceCall::Logs(BlockRange::expect_new(50, 51))]
     );
-    assert!(root.join("chains/evm/ethereum/1/manifest.json").exists());
+    assert!(
+        root.join("chains/evm/ethereum/1/manifest-segments")
+            .exists()
+    );
     assert!(!root.join("chains/evm/ethereum/1/datasets").exists());
 }
 
@@ -322,6 +331,11 @@ fn test_local_lifecycle_returns_provider_rows_when_durable_write_fails_without_c
         vec![SourceCall::Blocks(BlockRange::expect_new(65, 65))]
     );
     assert!(!root.join("chains/evm/ethereum/1/manifest.json").exists());
+    assert!(
+        !root
+            .join("chains/evm/ethereum/1/manifest-segments")
+            .exists()
+    );
     assert!(!root.join("chains/evm/ethereum/1/datasets").exists());
 }
 

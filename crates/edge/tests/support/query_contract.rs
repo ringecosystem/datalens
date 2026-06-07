@@ -37,6 +37,11 @@ pub(crate) fn assert_contract_violation_not_cached(name: &str, mutation: Respons
 
     assert_eq!(error.kind, DatalensErrorKind::Internal);
     assert!(!root.join("chains/evm/ethereum/1/manifest.json").exists());
+    assert!(
+        !root
+            .join("chains/evm/ethereum/1/manifest-segments")
+            .exists()
+    );
     assert!(!root.join("chains/evm/ethereum/1/datasets").exists());
 }
 

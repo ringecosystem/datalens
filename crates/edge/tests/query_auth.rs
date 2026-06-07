@@ -404,6 +404,11 @@ async fn test_missing_invalid_and_disabled_application_are_rejected_before_fetch
     assert_eq!(disabled.status(), StatusCode::FORBIDDEN);
     assert_eq!(source.calls(), Vec::<SourceCall>::new());
     assert!(!root.join("chains/evm/ethereum/1/manifest.json").exists());
+    assert!(
+        !root
+            .join("chains/evm/ethereum/1/manifest-segments")
+            .exists()
+    );
 
     let invalid_body = to_bytes(invalid.into_body(), usize::MAX)
         .await
@@ -525,6 +530,11 @@ async fn test_application_allowlist_and_quota_rejections_happen_before_fetch_or_
     );
     assert_eq!(source.calls(), Vec::<SourceCall>::new());
     assert!(!root.join("chains/evm/ethereum/1/manifest.json").exists());
+    assert!(
+        !root
+            .join("chains/evm/ethereum/1/manifest-segments")
+            .exists()
+    );
 }
 
 #[tokio::test]
@@ -579,6 +589,9 @@ async fn test_application_identity_does_not_partition_durable_cache_key() {
         source.calls(),
         vec![SourceCall::Blocks(BlockRange::expect_new(10, 10))]
     );
-    assert!(root.join("chains/evm/ethereum/1/manifest.json").exists());
+    assert!(
+        root.join("chains/evm/ethereum/1/manifest-segments")
+            .exists()
+    );
     assert!(!root.join("applications").exists());
 }
