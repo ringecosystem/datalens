@@ -52,7 +52,7 @@ fn test_promotion_planning_below_provisional_range_keeps_provisional() {
 }
 
 #[test]
-fn test_promotion_planning_covering_durable_head_promotes() {
+fn test_promotion_planning_covering_durable_head_rechecks_latest_anchor() {
     let durable_head = anchor("block", 20, DataFinality::Safe);
     let provisional_range = DataRange::new("block", 10, 20);
     let provisional_anchor = anchor("block", 20, DataFinality::Latest);
@@ -63,8 +63,50 @@ fn test_promotion_planning_covering_durable_head_promotes() {
         Some(&provisional_anchor),
     );
 
+    assert!(matches!(plan.decision, PromotionDecision::Recheck { .. }));
+}
+
+#[test]
+fn test_promotion_planning_covering_durable_head_rechecks_provisional_anchor() {
+    let durable_head = anchor("block", 20, DataFinality::Finalized);
+    let provisional_range = DataRange::new("block", 10, 20);
+    let provisional_anchor = anchor("block", 20, DataFinality::Provisional);
+
+    let plan = plan_promotion(
+        Some(&durable_head),
+        Some(&provisional_range),
+        Some(&provisional_anchor),
+    );
+
+    assert!(matches!(plan.decision, PromotionDecision::Recheck { .. }));
+}
+
+#[test]
+fn test_promotion_planning_covering_durable_head_promotes_durable_anchor() {
+    let durable_head = anchor("block", 20, DataFinality::Safe);
+    let provisional_range = DataRange::new("block", 10, 20);
+    let safe_anchor = anchor("block", 20, DataFinality::Safe);
+    let finalized_anchor = anchor("block", 20, DataFinality::Finalized);
+
+    let safe_plan = plan_promotion(
+        Some(&durable_head),
+        Some(&provisional_range),
+        Some(&safe_anchor),
+    );
+    let finalized_plan = plan_promotion(
+        Some(&durable_head),
+        Some(&provisional_range),
+        Some(&finalized_anchor),
+    );
+
     assert_eq!(
-        plan.decision,
+        safe_plan.decision,
+        PromotionDecision::Promote {
+            range: provisional_range.clone()
+        }
+    );
+    assert_eq!(
+        finalized_plan.decision,
         PromotionDecision::Promote {
             range: provisional_range
         }
@@ -134,6 +176,27 @@ fn test_query_response_cache_segment_extraction_preserves_metadata() {
             finality: DataFinality::Latest,
         })
     );
+}
+
+#[test]
+fn test_query_response_cache_segment_extraction_treats_durable_only_as_unknown_finality() {
+    let response = QueryResponse {
+        chain: json!({"configuredName": "ethereum"}),
+        dataset_key: "evm.logs".to_owned(),
+        range: json!({"kind": "block", "start": 10, "end": 12}),
+        cache: json!({
+            "segments": [{
+                "range": {"kind": "block", "start": 10, "end": 12},
+                "source": "cache",
+                "finality": "durable_only"
+            }]
+        }),
+        rows: json!({"rows": []}),
+    };
+
+    let segments = extract_cache_segments(&response);
+
+    assert_eq!(segments[0].finality, DataFinality::Unknown);
 }
 
 #[test]

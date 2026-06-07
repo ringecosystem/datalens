@@ -27,7 +27,7 @@ impl DataFinality {
 impl From<&str> for DataFinality {
     fn from(value: &str) -> Self {
         match value {
-            "finalized" | "final" | "durable" | "durable_only" => Self::Finalized,
+            "finalized" | "final" | "durable" => Self::Finalized,
             "safe" => Self::Safe,
             "latest" | "latest_only" => Self::Latest,
             "provisional" | "safe_to_latest" | "hot" => Self::Provisional,
@@ -234,6 +234,12 @@ fn promotion_decision(
         };
     }
     if durable_head.height >= provisional_range.end {
+        if !provisional_anchor.finality.is_durable() {
+            return PromotionDecision::Recheck {
+                reason: "provisional anchor requires canonical match proof before promotion"
+                    .to_owned(),
+            };
+        }
         return PromotionDecision::Promote {
             range: provisional_range.clone(),
         };
