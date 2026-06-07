@@ -277,66 +277,34 @@ where
         )? {
             let covered =
                 merged_selector_ranges(&index_entries, chain, dataset_key, selector, &range);
-            if missing_ranges(range.clone(), &covered).is_empty() {
-                log::debug!(
-                    "storage coverage lookup source=coverage_index chain_key={} dataset={} selector_fingerprint={} range_kind={} range={}-{} index_entries_count={} covered_range_count={} duration_ms={}",
-                    chain.key_prefix(),
-                    dataset_key.as_str(),
-                    selector.fingerprint(),
-                    range_kind_key(range.kind()),
-                    range.start(),
-                    range.end(),
-                    index_entries.len(),
-                    covered.len(),
-                    started.elapsed().as_millis()
-                );
-                return Ok(covered);
-            }
-
-            let manifest = self.manifest_for_chain(chain)?;
-            let mut combined_entries = index_entries;
-            combined_entries.extend(manifest.entries);
-            let covered =
-                merged_selector_ranges(&combined_entries, chain, dataset_key, selector, &range);
-            log::debug!(
-                "storage coverage lookup source=coverage_index_with_legacy_manifest chain_key={} dataset={} selector_fingerprint={} range_kind={} range={}-{} coverage_entries_count={} covered_range_count={} duration_ms={}",
+            let missing = missing_ranges(range.clone(), &covered);
+            log::info!(
+                "storage coverage lookup source=coverage_index chain_key={} dataset={} selector_fingerprint={} range_kind={} range={}-{} index_entries_count={} covered_range_count={} missing_range_count={} duration_ms={}",
                 chain.key_prefix(),
                 dataset_key.as_str(),
                 selector.fingerprint(),
                 range_kind_key(range.kind()),
                 range.start(),
                 range.end(),
-                combined_entries.len(),
+                index_entries.len(),
                 covered.len(),
+                missing.len(),
                 started.elapsed().as_millis()
             );
             return Ok(covered);
         }
 
-        let manifest = self.manifest_for_chain(chain)?;
-        let candidates =
-            selector_coverage_candidates(&manifest.entries, chain, dataset_key, selector, &range);
-        let candidate_count = candidates.len();
-        let mut ranges = candidates
-            .into_iter()
-            .flat_map(|candidate| candidate.ranges)
-            .collect::<Vec<_>>();
-        ranges.sort_by_key(|range| range.start());
-        let covered = merge_ranges(ranges);
-        log::debug!(
-            "storage coverage lookup source=legacy_manifest chain_key={} dataset={} selector_fingerprint={} range_kind={} range={}-{} manifest_entries_count={} matched_entries_count={} covered_range_count={} duration_ms={}",
+        log::info!(
+            "storage coverage lookup source=coverage_index_absent chain_key={} dataset={} selector_fingerprint={} range_kind={} range={}-{} index_entries_count=0 covered_range_count=0 missing_range_count=1 duration_ms={}",
             chain.key_prefix(),
             dataset_key.as_str(),
             selector.fingerprint(),
             range_kind_key(range.kind()),
             range.start(),
             range.end(),
-            manifest.entries.len(),
-            candidate_count,
-            covered.len(),
             started.elapsed().as_millis()
         );
-        Ok(covered)
+        Ok(Vec::new())
     }
 
     pub fn read_rows(
@@ -361,20 +329,13 @@ where
                 selector,
                 &range,
             )? {
-            let covered =
-                merged_selector_ranges(&index_entries, chain, dataset_key, selector, &range);
-            if missing_ranges(range.clone(), &covered).is_empty() {
-                ("coverage_index", index_entries)
-            } else {
-                let manifest = self.manifest_for_chain(chain)?;
-                let mut combined_entries = index_entries;
-                combined_entries.extend(manifest.entries);
-                ("coverage_index_with_legacy_manifest", combined_entries)
-            }
+            ("coverage_index", index_entries)
         } else {
-            ("legacy_manifest", self.manifest_for_chain(chain)?.entries)
+            ("coverage_index_absent", Vec::new())
         };
         let entries_count = entries.len();
+        let covered = merged_selector_ranges(&entries, chain, dataset_key, selector, &range);
+        let missing_range_count = missing_ranges(range.clone(), &covered).len();
         let candidates =
             selector_coverage_candidates(&entries, chain, dataset_key, selector, &range);
         let candidate_count = candidates.len();
@@ -383,8 +344,8 @@ where
             .filter(|candidate| candidate.entry.object_key.is_some())
             .count();
         let empty_coverage_count = candidate_count - data_object_count;
-        log::debug!(
-            "storage read coverage lookup source={} chain_key={} dataset={} selector_fingerprint={} range_kind={} range={}-{} coverage_entries_count={} matched_entries_count={} data_object_count={} empty_coverage_count={} duration_ms={}",
+        log::info!(
+            "storage read coverage lookup source={} chain_key={} dataset={} selector_fingerprint={} range_kind={} range={}-{} coverage_entries_count={} covered_range_count={} missing_range_count={} matched_entries_count={} data_object_count={} empty_coverage_count={} duration_ms={}",
             coverage_source,
             chain.key_prefix(),
             dataset_key.as_str(),
@@ -393,6 +354,8 @@ where
             range.start(),
             range.end(),
             entries_count,
+            covered.len(),
+            missing_range_count,
             candidate_count,
             data_object_count,
             empty_coverage_count,

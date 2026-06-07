@@ -40,6 +40,7 @@ where
 {
     let selector_fingerprint = selector.fingerprint();
     let mut entries = Vec::new();
+    let mut any_bucket_has_index = false;
     for (bucket_start, bucket_end) in bucket_ranges(range, DEFAULT_COVERAGE_INDEX_BUCKET_SIZE) {
         let mut bucket_has_index = false;
         for finality_level in [
@@ -58,7 +59,6 @@ where
             if !object_store.exists(&key)? {
                 continue;
             }
-            bucket_has_index = true;
             let bytes = object_store.get(&key)?;
             let mut index: CoverageIndex = serde_json::from_slice(&bytes).map_err(|error| {
                 DatalensError::new(
@@ -66,11 +66,15 @@ where
                     format!("decode coverage index {key}: {error}"),
                 )
             })?;
+            bucket_has_index = true;
             entries.append(&mut index.entries);
         }
-        if !bucket_has_index {
-            return Ok(None);
+        if bucket_has_index {
+            any_bucket_has_index = true;
         }
+    }
+    if !any_bucket_has_index {
+        return Ok(None);
     }
 
     let mut index = CoverageIndex { entries };
