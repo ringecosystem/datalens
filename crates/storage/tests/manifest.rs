@@ -231,6 +231,70 @@ impl ObjectStore for ManifestGetCountingStore {
     }
 }
 
+#[derive(Clone, Debug)]
+struct ManifestAccessCountingStore {
+    inner: LocalObjectStore,
+    manifest_access_count: Arc<AtomicUsize>,
+}
+
+impl ManifestAccessCountingStore {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            inner: LocalObjectStore::new(root),
+            manifest_access_count: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn manifest_access_count(&self) -> usize {
+        self.manifest_access_count.load(Ordering::SeqCst)
+    }
+
+    fn reset_manifest_access_count(&self) {
+        self.manifest_access_count.store(0, Ordering::SeqCst);
+    }
+
+    fn put_inner(&self, key: &str, bytes: &[u8]) {
+        self.inner.put(key, bytes).expect("put inner object");
+    }
+
+    fn is_manifest_access(key: &str) -> bool {
+        key.ends_with("/manifest.json")
+            || key.ends_with("/manifest.version")
+            || key.contains("/manifest-segments")
+    }
+}
+
+impl ObjectStore for ManifestAccessCountingStore {
+    fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError> {
+        if Self::is_manifest_access(key) {
+            self.manifest_access_count.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.get(key)
+    }
+
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
+        self.inner.put(key, bytes)
+    }
+
+    fn exists(&self, key: &str) -> Result<bool, DatalensError> {
+        if Self::is_manifest_access(key) {
+            self.manifest_access_count.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.exists(key)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
+        if Self::is_manifest_access(prefix) {
+            self.manifest_access_count.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.list(prefix)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), DatalensError> {
+        self.inner.delete(key)
+    }
+}
+
 #[derive(Debug)]
 struct PausedManifestPutState {
     put_started: Mutex<bool>,
@@ -691,6 +755,7 @@ fn read_manifest_json(storage: &LocalStorage, chain: &ChainIdentity) -> serde_js
 fn write_manifest_json(storage: &LocalStorage, chain: &ChainIdentity, manifest: serde_json::Value) {
     let bytes = serde_json::to_vec_pretty(&manifest).expect("manifest bytes");
     std::fs::write(manifest_json_path_for_test(storage, chain), bytes).expect("write manifest");
+    clear_coverage_index(storage, chain);
 }
 
 fn manifest_json_path_for_test(storage: &LocalStorage, chain: &ChainIdentity) -> PathBuf {
@@ -713,6 +778,66 @@ fn manifest_segment_keys(storage: &LocalStorage, chain: &ChainIdentity) -> Vec<S
         .into_iter()
         .map(|object| object.key)
         .collect()
+}
+
+fn coverage_index_keys<S: ObjectStore>(
+    storage: &DurableStorage<S>,
+    chain: &ChainIdentity,
+    dataset_key: &DatasetKey,
+    range_kind: &str,
+    selector: &DatasetSelector,
+    finality_level: ManifestFinalityLevel,
+) -> Vec<String> {
+    storage
+        .object_store()
+        .list(&format!(
+            "chains/{}/coverage-index/{}/{}/{}/{}",
+            chain.key_prefix(),
+            dataset_key.as_str(),
+            range_kind,
+            selector.fingerprint(),
+            finality_level.as_str(),
+        ))
+        .expect("coverage index list")
+        .into_iter()
+        .map(|object| object.key)
+        .collect()
+}
+
+fn clear_coverage_index(storage: &LocalStorage, chain: &ChainIdentity) {
+    for object in storage
+        .object_store()
+        .list(&format!("chains/{}/coverage-index", chain.key_prefix()))
+        .expect("coverage index list")
+    {
+        storage
+            .object_store()
+            .delete(&object.key)
+            .expect("delete coverage index object");
+    }
+}
+
+fn first_coverage_index_json(
+    storage: &LocalStorage,
+    chain: &ChainIdentity,
+    dataset_key: &DatasetKey,
+    range_kind: &str,
+    selector: &DatasetSelector,
+    finality_level: ManifestFinalityLevel,
+) -> serde_json::Value {
+    let key = coverage_index_keys(
+        storage,
+        chain,
+        dataset_key,
+        range_kind,
+        selector,
+        finality_level,
+    )
+    .into_iter()
+    .next()
+    .expect("coverage index key");
+    let bytes = std::fs::read(storage.root().join(key)).expect("coverage index bytes");
+    serde_json::from_slice(&bytes).expect("coverage index json")
 }
 
 fn first_manifest_object_key_from_merged(storage: &LocalStorage, chain: &ChainIdentity) -> String {
@@ -1608,6 +1733,83 @@ fn test_exact_evm_log_coverage_prevents_overlapping_semantic_read() {
 }
 
 #[test]
+fn test_partial_exact_coverage_keeps_semantic_fallback_for_missing_ranges() {
+    let storage = LocalStorage::new(temp_storage_root("semantic-partial-exact-fallback"));
+    let chain = test_chain();
+    let query_selector = evm_log_selector(vec![ADDRESS_A], vec![Some(vec![TOPIC_1])]);
+    let broad_selector = evm_log_selector(vec![ADDRESS_A, ADDRESS_B, ADDRESS_C], vec![]);
+    let exact_rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![log_record(12, 0, ADDRESS_A, vec![TOPIC_1])]),
+    )
+    .expect("exact rows");
+    let broad_rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![
+            log_record(13, 0, ADDRESS_A, vec![TOPIC_1]),
+            log_record(13, 1, ADDRESS_B, vec![TOPIC_2]),
+        ]),
+    )
+    .expect("broad rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &query_selector,
+            range: LedgerRange::blocks(12, 12).expect("valid range"),
+            rows: &exact_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write exact rows");
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &broad_selector,
+            range: LedgerRange::blocks(13, 13).expect("valid range"),
+            rows: &broad_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write broad rows");
+
+    assert_eq!(
+        storage
+            .covered_ranges(
+                &chain,
+                &DatasetKey::evm_logs(),
+                &query_selector,
+                LedgerRange::blocks(12, 13).expect("valid range"),
+            )
+            .expect("covered ranges"),
+        vec![LedgerRange::blocks(12, 13).expect("valid range")]
+    );
+
+    let read = storage
+        .read_rows(
+            &chain,
+            &DatasetKey::evm_logs(),
+            &query_selector,
+            LedgerRange::blocks(12, 13).expect("valid range"),
+        )
+        .expect("read rows");
+
+    assert_eq!(
+        read,
+        DatasetRows::new(
+            DatasetKey::evm_logs(),
+            QueryRows::EvmLogs(vec![
+                log_record(12, 0, ADDRESS_A, vec![TOPIC_1]),
+                log_record(13, 0, ADDRESS_A, vec![TOPIC_1]),
+            ])
+        )
+        .expect("dataset rows")
+    );
+}
+
+#[test]
 fn test_broad_evm_log_empty_coverage_satisfies_narrow_query() {
     let storage = LocalStorage::new(temp_storage_root("semantic-empty-coverage"));
     let chain = test_chain();
@@ -2133,6 +2335,7 @@ fn test_legacy_full_manifest_and_segments_merge() {
             .iter()
             .any(|entry| entry.range == segment_range)
     );
+    clear_coverage_index(&storage, &chain);
     assert_eq!(
         storage
             .covered_ranges(
@@ -2204,6 +2407,248 @@ fn test_segmented_entries_are_visible_to_covered_ranges_and_read_rows() {
             .expect("read rows"),
         rows
     );
+}
+
+#[test]
+fn test_empty_coverage_write_creates_bucket_index_and_serves_covered_ranges() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-index-empty"));
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let rows = DatasetRows::new(DatasetKey::evm_blocks(), QueryRows::EvmBlocks(Vec::new()))
+        .expect("dataset rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &selector,
+            range: LedgerRange::blocks(10, 12).expect("valid range"),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write empty coverage");
+
+    let index_keys = coverage_index_keys(
+        &storage,
+        &chain,
+        &DatasetKey::evm_blocks(),
+        "block",
+        &selector,
+        ManifestFinalityLevel::Safe,
+    );
+    assert_eq!(index_keys.len(), 1);
+    assert!(index_keys[0].contains("/coverage-index/evm.blocks/block/all/safe/"));
+
+    assert_eq!(
+        storage
+            .covered_ranges(
+                &chain,
+                &DatasetKey::evm_blocks(),
+                &selector,
+                LedgerRange::blocks(10, 12).expect("valid range"),
+            )
+            .expect("covered ranges"),
+        vec![LedgerRange::blocks(10, 12).expect("valid range")]
+    );
+}
+
+#[test]
+fn test_adjacent_empty_coverage_coalesces_in_bucket_index() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-index-empty-coalesce"));
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let rows = DatasetRows::new(DatasetKey::evm_blocks(), QueryRows::EvmBlocks(Vec::new()))
+        .expect("dataset rows");
+
+    for range in [
+        LedgerRange::blocks(10, 11).expect("valid range"),
+        LedgerRange::blocks(12, 14).expect("valid range"),
+    ] {
+        storage
+            .write_rows(StorageWriteRequest {
+                chain: &chain,
+                dataset_key: DatasetKey::evm_blocks(),
+                selector: &selector,
+                range,
+                rows: &rows,
+                finality_level: FinalityLevel::Safe,
+                record_empty_coverage: true,
+            })
+            .expect("write empty coverage");
+    }
+
+    let index = first_coverage_index_json(
+        &storage,
+        &chain,
+        &DatasetKey::evm_blocks(),
+        "block",
+        &selector,
+        ManifestFinalityLevel::Safe,
+    );
+    let entries = index["entries"].as_array().expect("index entries");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["range"]["start"], 10);
+    assert_eq!(entries[0]["range"]["end"], 14);
+    assert!(entries[0]["object_key"].is_null());
+
+    assert_eq!(
+        storage
+            .covered_ranges(
+                &chain,
+                &DatasetKey::evm_blocks(),
+                &selector,
+                LedgerRange::blocks(10, 14).expect("valid range"),
+            )
+            .expect("covered ranges"),
+        vec![LedgerRange::blocks(10, 14).expect("valid range")]
+    );
+}
+
+#[test]
+fn test_data_object_coverage_can_be_read_through_coverage_index() {
+    let store = ManifestAccessCountingStore::new(temp_storage_root("coverage-index-data-read"));
+    let storage = DurableStorage::from_object_store(store.clone());
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let rows = single_block_rows(10);
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &selector,
+            range: LedgerRange::blocks(10, 10).expect("valid range"),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write data rows");
+
+    store.reset_manifest_access_count();
+    let read = storage
+        .read_rows(
+            &chain,
+            &DatasetKey::evm_blocks(),
+            &selector,
+            LedgerRange::blocks(10, 10).expect("valid range"),
+        )
+        .expect("read rows");
+
+    assert_eq!(read, rows);
+    assert_eq!(store.manifest_access_count(), 0);
+}
+
+#[test]
+fn test_old_manifest_data_still_works_when_coverage_index_is_absent() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-index-legacy-fallback"));
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let range = LedgerRange::blocks(20, 20).expect("valid range");
+    let rows = DatasetRows::new(DatasetKey::evm_blocks(), QueryRows::EvmBlocks(Vec::new()))
+        .expect("dataset rows");
+    let legacy_manifest = Manifest {
+        entries: vec![ManifestEntry {
+            chain: chain.clone(),
+            dataset_key: DatasetKey::evm_blocks(),
+            range: range.clone(),
+            selector_fingerprint: "all".to_owned(),
+            selector_canonical_key: "all".to_owned(),
+            finality_level: ManifestFinalityLevel::Safe,
+            object_key: None,
+            object_encoding: None,
+            object_compression: None,
+            row_count: 0,
+            object_size_bytes: None,
+            checksum: None,
+            checksum_algorithm: None,
+            written_at_unix_seconds: None,
+        }],
+    };
+    std::fs::create_dir_all(
+        storage
+            .root()
+            .join(format!("chains/{}", chain.key_prefix())),
+    )
+    .expect("create manifest parent");
+    std::fs::write(
+        storage.manifest_path(&chain),
+        serde_json::to_vec_pretty(&legacy_manifest).expect("manifest bytes"),
+    )
+    .expect("write legacy manifest");
+
+    assert!(
+        coverage_index_keys(
+            &storage,
+            &chain,
+            &DatasetKey::evm_blocks(),
+            "block",
+            &selector,
+            ManifestFinalityLevel::Safe,
+        )
+        .is_empty()
+    );
+    assert_eq!(
+        storage
+            .covered_ranges(&chain, &DatasetKey::evm_blocks(), &selector, range.clone(),)
+            .expect("covered ranges"),
+        vec![range]
+    );
+    assert_eq!(
+        storage
+            .read_rows(
+                &chain,
+                &DatasetKey::evm_blocks(),
+                &selector,
+                LedgerRange::blocks(20, 20).expect("valid range"),
+            )
+            .expect("read rows")
+            .row_count(),
+        rows.row_count()
+    );
+}
+
+#[test]
+fn test_exact_indexed_query_does_not_load_unrelated_manifest_segments() {
+    let store = ManifestAccessCountingStore::new(temp_storage_root("coverage-index-no-manifest"));
+    let storage = DurableStorage::from_object_store(store.clone());
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let unrelated_selector = evm_log_selector(vec![ADDRESS_A], vec![]);
+    let rows = DatasetRows::new(DatasetKey::evm_blocks(), QueryRows::EvmBlocks(Vec::new()))
+        .expect("dataset rows");
+    let unrelated_manifest_key = format!(
+        "chains/{}/manifest-segments/evm.logs/block/{}/safe/00000000000000000001-00000000000000000001.json",
+        chain.key_prefix(),
+        unrelated_selector.fingerprint()
+    );
+    store.put_inner(&unrelated_manifest_key, br#"{"entries":[]}"#);
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &selector,
+            range: LedgerRange::blocks(30, 31).expect("valid range"),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write empty coverage");
+
+    store.reset_manifest_access_count();
+    assert_eq!(
+        storage
+            .covered_ranges(
+                &chain,
+                &DatasetKey::evm_blocks(),
+                &selector,
+                LedgerRange::blocks(30, 31).expect("valid range"),
+            )
+            .expect("covered ranges"),
+        vec![LedgerRange::blocks(30, 31).expect("valid range")]
+    );
+    assert_eq!(store.manifest_access_count(), 0);
 }
 
 #[test]
@@ -2676,6 +3121,56 @@ fn test_object_and_empty_coverage_under_same_selector_remain_visible() {
             && entry.object_key.is_some()
             && entry.row_count == 1
     }));
+}
+
+#[test]
+fn test_cold_narrow_coverage_lookup_does_not_scan_all_empty_manifest_segments() {
+    let root = temp_storage_root("narrow-empty-coverage-lookup");
+    let writer = LocalStorage::new(&root);
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let empty_rows = DatasetRows::new(DatasetKey::evm_logs(), QueryRows::EvmLogs(Vec::new()))
+        .expect("dataset rows");
+    let segment_count = 128;
+
+    for block in 1..=segment_count {
+        writer
+            .write_rows(StorageWriteRequest {
+                chain: &chain,
+                dataset_key: DatasetKey::evm_logs(),
+                selector: &selector,
+                range: LedgerRange::blocks(block, block).expect("valid range"),
+                rows: &empty_rows,
+                finality_level: FinalityLevel::Safe,
+                record_empty_coverage: true,
+            })
+            .expect("write empty coverage");
+    }
+    assert_eq!(
+        manifest_segment_keys(&writer, &chain).len(),
+        segment_count as usize
+    );
+
+    let store = ManifestAccessCountingStore::new(root);
+    let storage = DurableStorage::from_object_store(store.clone());
+    let covered = storage
+        .covered_ranges(
+            &chain,
+            &DatasetKey::evm_logs(),
+            &selector,
+            LedgerRange::blocks(segment_count, segment_count).expect("valid range"),
+        )
+        .expect("covered ranges");
+
+    assert_eq!(
+        covered,
+        vec![LedgerRange::blocks(segment_count, segment_count).expect("valid range")]
+    );
+    assert!(
+        store.manifest_access_count() <= 4,
+        "narrow coverage lookup used {} manifest accesses",
+        store.manifest_access_count()
+    );
 }
 
 #[test]

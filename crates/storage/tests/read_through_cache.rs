@@ -160,6 +160,7 @@ fn test_read_through_cache_checksum_change_invalidates_entry() {
             b"changed",
         )
         .expect("write manifest version");
+    clear_coverage_index(&store, &chain);
 
     storage
         .read_rows(&chain, &DatasetKey::evm_blocks(), &selector, range)
@@ -338,4 +339,18 @@ where
         .into_iter()
         .find_map(|entry| entry.object_key)
         .expect("object key")
+}
+
+fn clear_coverage_index<S>(store: &S, chain: &ChainIdentity)
+where
+    S: ObjectStore,
+{
+    for object in store
+        .list(&format!("chains/{}/coverage-index", chain.key_prefix()))
+        .expect("coverage index list")
+    {
+        store
+            .delete(&object.key)
+            .expect("delete coverage index object");
+    }
 }

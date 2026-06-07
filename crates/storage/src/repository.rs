@@ -1,6 +1,7 @@
 use datalens_chain::{DatasetSelector, FinalityLevel};
 use datalens_core::{
     ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey, DatasetRows, LedgerRange,
+    missing_ranges,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -10,8 +11,8 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use crate::read_through_cache;
 use crate::selector_coverage::{filter_evm_log_rows_for_selector, selector_coverage_candidates};
+use crate::{coverage_index, read_through_cache};
 
 #[derive(Debug)]
 /// Storage write request for one durable coverage segment. The caller must pass
@@ -135,6 +136,21 @@ fn object_compression_for_encoding(
     }
 }
 
+fn merged_selector_ranges(
+    entries: &[ManifestEntry],
+    chain: &ChainIdentity,
+    dataset_key: &DatasetKey,
+    selector: &DatasetSelector,
+    range: &LedgerRange,
+) -> Vec<LedgerRange> {
+    let mut ranges = selector_coverage_candidates(entries, chain, dataset_key, selector, range)
+        .into_iter()
+        .flat_map(|candidate| candidate.ranges)
+        .collect::<Vec<_>>();
+    ranges.sort_by_key(|range| range.start());
+    merge_ranges(ranges)
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct StorageWriteLogContext {
     chain_key: String,
@@ -251,17 +267,76 @@ where
         selector: &DatasetSelector,
         range: LedgerRange,
     ) -> Result<Vec<LedgerRange>, DatalensError> {
-        // Manifest entries are the sole coverage authority. Empty coverage and
-        // data-object coverage both count here because both were provider
-        // confirmed before entering the manifest.
+        let started = Instant::now();
+        if let Some(index_entries) = coverage_index::read_entries_for_query(
+            &self.object_store,
+            chain,
+            dataset_key,
+            selector,
+            &range,
+        )? {
+            let covered =
+                merged_selector_ranges(&index_entries, chain, dataset_key, selector, &range);
+            if missing_ranges(range.clone(), &covered).is_empty() {
+                log::debug!(
+                    "storage coverage lookup source=coverage_index chain_key={} dataset={} selector_fingerprint={} range_kind={} range={}-{} index_entries_count={} covered_range_count={} duration_ms={}",
+                    chain.key_prefix(),
+                    dataset_key.as_str(),
+                    selector.fingerprint(),
+                    range_kind_key(range.kind()),
+                    range.start(),
+                    range.end(),
+                    index_entries.len(),
+                    covered.len(),
+                    started.elapsed().as_millis()
+                );
+                return Ok(covered);
+            }
+
+            let manifest = self.manifest_for_chain(chain)?;
+            let mut combined_entries = index_entries;
+            combined_entries.extend(manifest.entries);
+            let covered =
+                merged_selector_ranges(&combined_entries, chain, dataset_key, selector, &range);
+            log::debug!(
+                "storage coverage lookup source=coverage_index_with_legacy_manifest chain_key={} dataset={} selector_fingerprint={} range_kind={} range={}-{} coverage_entries_count={} covered_range_count={} duration_ms={}",
+                chain.key_prefix(),
+                dataset_key.as_str(),
+                selector.fingerprint(),
+                range_kind_key(range.kind()),
+                range.start(),
+                range.end(),
+                combined_entries.len(),
+                covered.len(),
+                started.elapsed().as_millis()
+            );
+            return Ok(covered);
+        }
+
         let manifest = self.manifest_for_chain(chain)?;
-        let mut ranges =
-            selector_coverage_candidates(&manifest.entries, chain, dataset_key, selector, &range)
-                .into_iter()
-                .flat_map(|candidate| candidate.ranges)
-                .collect::<Vec<_>>();
+        let candidates =
+            selector_coverage_candidates(&manifest.entries, chain, dataset_key, selector, &range);
+        let candidate_count = candidates.len();
+        let mut ranges = candidates
+            .into_iter()
+            .flat_map(|candidate| candidate.ranges)
+            .collect::<Vec<_>>();
         ranges.sort_by_key(|range| range.start());
-        Ok(merge_ranges(ranges))
+        let covered = merge_ranges(ranges);
+        log::debug!(
+            "storage coverage lookup source=legacy_manifest chain_key={} dataset={} selector_fingerprint={} range_kind={} range={}-{} manifest_entries_count={} matched_entries_count={} covered_range_count={} duration_ms={}",
+            chain.key_prefix(),
+            dataset_key.as_str(),
+            selector.fingerprint(),
+            range_kind_key(range.kind()),
+            range.start(),
+            range.end(),
+            manifest.entries.len(),
+            candidate_count,
+            covered.len(),
+            started.elapsed().as_millis()
+        );
+        Ok(covered)
     }
 
     pub fn read_rows(
@@ -277,11 +352,54 @@ where
             range.start(),
             range.end()
         );
-        let manifest = self.manifest_for_chain(chain)?;
+        let coverage_started = Instant::now();
+        let (coverage_source, entries) = if let Some(index_entries) =
+            coverage_index::read_entries_for_query(
+                &self.object_store,
+                chain,
+                dataset_key,
+                selector,
+                &range,
+            )? {
+            let covered =
+                merged_selector_ranges(&index_entries, chain, dataset_key, selector, &range);
+            if missing_ranges(range.clone(), &covered).is_empty() {
+                ("coverage_index", index_entries)
+            } else {
+                let manifest = self.manifest_for_chain(chain)?;
+                let mut combined_entries = index_entries;
+                combined_entries.extend(manifest.entries);
+                ("coverage_index_with_legacy_manifest", combined_entries)
+            }
+        } else {
+            ("legacy_manifest", self.manifest_for_chain(chain)?.entries)
+        };
+        let entries_count = entries.len();
+        let candidates =
+            selector_coverage_candidates(&entries, chain, dataset_key, selector, &range);
+        let candidate_count = candidates.len();
+        let data_object_count = candidates
+            .iter()
+            .filter(|candidate| candidate.entry.object_key.is_some())
+            .count();
+        let empty_coverage_count = candidate_count - data_object_count;
+        log::debug!(
+            "storage read coverage lookup source={} chain_key={} dataset={} selector_fingerprint={} range_kind={} range={}-{} coverage_entries_count={} matched_entries_count={} data_object_count={} empty_coverage_count={} duration_ms={}",
+            coverage_source,
+            chain.key_prefix(),
+            dataset_key.as_str(),
+            selector.fingerprint(),
+            range_kind_key(range.kind()),
+            range.start(),
+            range.end(),
+            entries_count,
+            candidate_count,
+            data_object_count,
+            empty_coverage_count,
+            coverage_started.elapsed().as_millis()
+        );
         let mut rows = empty_rows(dataset_key.clone())?.into_rows();
-        for candidate in
-            selector_coverage_candidates(&manifest.entries, chain, dataset_key, selector, &range)
-        {
+        for candidate in candidates {
             let entry = candidate.entry;
             let Some(object_key) = entry.object_key.as_deref() else {
                 continue;
@@ -510,7 +628,14 @@ where
         &self,
         chain: &ChainIdentity,
     ) -> Result<Manifest, DatalensError> {
+        let started = Instant::now();
         if let Some(manifest) = self.cached_manifest(chain)? {
+            log::debug!(
+                "storage manifest load source=manifest_cache chain_key={} entries_count={} duration_ms={}",
+                chain.key_prefix(),
+                manifest.entries.len(),
+                started.elapsed().as_millis()
+            );
             return Ok(manifest);
         }
         let mut manifest = Manifest::default();
@@ -528,7 +653,9 @@ where
             manifest.merge(base_manifest);
         }
         let mut segment_manifest = Manifest::default();
+        let mut segment_objects_count = 0usize;
         for object in self.object_store.list(&manifest_segment_prefix(chain))? {
+            segment_objects_count += 1;
             let bytes = self.object_store.get(&object.key)?;
             let mut object_manifest: Manifest =
                 serde_json::from_slice(&bytes).map_err(|error| {
@@ -541,8 +668,19 @@ where
                 .entries
                 .append(&mut object_manifest.entries);
         }
+        let segment_entries_count = segment_manifest.entries.len();
         manifest.merge_filtering_shadowed_segments(segment_manifest, &base_entries);
+        let entries_count = manifest.entries.len();
         self.cache_manifest(chain, manifest.clone())?;
+        log::debug!(
+            "storage manifest load source=legacy_manifest chain_key={} base_entries_count={} segment_objects_count={} segment_entries_count={} entries_count={} duration_ms={}",
+            chain.key_prefix(),
+            base_entries.len(),
+            segment_objects_count,
+            segment_entries_count,
+            entries_count,
+            started.elapsed().as_millis()
+        );
         Ok(manifest)
     }
 
@@ -613,9 +751,11 @@ where
                 ));
             }
         }
+        coverage_index::delete_chain(&self.object_store, chain)?;
         self.publish_manifest_unlocked(chain, manifest, "full", started)?;
-        self.delete_manifest_segments_unlocked(chain)?;
         self.bump_manifest_version(chain)?;
+        self.delete_manifest_segments_unlocked(chain)?;
+        coverage_index::write_entries(&self.object_store, &manifest.entries)?;
         self.cache_manifest(chain, manifest.clone())?;
         Ok(())
     }
@@ -717,10 +857,7 @@ where
             )
         })?;
         self.bump_manifest_version(chain)?;
-        if let Some(mut manifest) = self.cached_manifest_without_refresh(&chain.key_prefix())? {
-            manifest.upsert(entry.clone());
-            self.cache_manifest(chain, manifest)?;
-        }
+        coverage_index::write_entry(&self.object_store, &entry)?;
         log::info!(
             "storage published manifest segment chain_key={} range={}-{} selector_fingerprint={} segment_key={} segment_bytes={} duration_ms={}",
             chain.key_prefix(),
@@ -747,17 +884,6 @@ where
             .map(|entry| entry.manifest.clone()))
     }
 
-    fn cached_manifest_without_refresh(
-        &self,
-        chain_key: &str,
-    ) -> Result<Option<Manifest>, DatalensError> {
-        let cache = self
-            .manifest_cache
-            .lock()
-            .map_err(|_| DatalensError::internal("manifest cache lock poisoned"))?;
-        Ok(cache.get(chain_key).map(|entry| entry.manifest.clone()))
-    }
-
     fn cache_manifest(
         &self,
         chain: &ChainIdentity,
@@ -770,6 +896,17 @@ where
             .lock()
             .map_err(|_| DatalensError::internal("manifest cache lock poisoned"))?;
         cache.insert(chain_key, ManifestCacheEntry { manifest, version });
+        let cache_chain_count = cache.len();
+        let cache_entries_count: usize = cache
+            .values()
+            .map(|entry| entry.manifest.entries.len())
+            .sum();
+        log::debug!(
+            "storage manifest cache updated chain_key={} cache_chain_count={} cache_entries_count={}",
+            chain.key_prefix(),
+            cache_chain_count,
+            cache_entries_count
+        );
         Ok(())
     }
 

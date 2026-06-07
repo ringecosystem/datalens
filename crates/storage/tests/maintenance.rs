@@ -253,6 +253,14 @@ fn test_compaction_merges_adjacent_small_objects_and_retains_old_objects() {
             .is_empty(),
         "compaction should replace per-entry segments with the full manifest"
     );
+    storage
+        .object_store()
+        .delete(&first_object)
+        .expect("delete old first object");
+    storage
+        .object_store()
+        .delete(&second_object)
+        .expect("delete old second object");
 
     let rows = storage
         .read_rows(
