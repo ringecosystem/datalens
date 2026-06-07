@@ -329,6 +329,11 @@ fn test_query_service_supports_latest_only_read_through_without_durable_cache_wr
         vec![SourceCall::Blocks(BlockRange::expect_new(100, 100))]
     );
     assert!(!root.join("chains/evm/ethereum/1/manifest.json").exists());
+    assert!(
+        !root
+            .join("chains/evm/ethereum/1/manifest-segments")
+            .exists()
+    );
     assert!(!root.join("chains/evm/ethereum/1/datasets").exists());
 }
 

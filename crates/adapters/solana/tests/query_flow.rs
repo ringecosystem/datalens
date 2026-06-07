@@ -56,10 +56,7 @@ fn test_solana_slots_complete_fetch_query_cache_flow() {
             .collect::<Vec<_>>(),
         vec![10, 12]
     );
-    assert!(
-        root.join("chains/solana/solana-mainnet-beta/mainnet-beta/manifest.json")
-            .exists()
-    );
+    assert_eq!(storage.manifest().expect("manifest").entries.len(), 1);
     assert!(
         root.join("chains/solana/solana-mainnet-beta/mainnet-beta/datasets")
             .exists()

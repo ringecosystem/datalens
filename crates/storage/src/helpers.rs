@@ -50,6 +50,27 @@ pub(crate) fn manifest_key(chain: &ChainIdentity) -> String {
     format!("chains/{}/manifest.json", chain.key_prefix())
 }
 
+pub(crate) fn manifest_version_key(chain: &ChainIdentity) -> String {
+    format!("chains/{}/manifest.version", chain.key_prefix())
+}
+
+pub(crate) fn manifest_segment_prefix(chain: &ChainIdentity) -> String {
+    format!("chains/{}/manifest-segments", chain.key_prefix())
+}
+
+pub(crate) fn manifest_segment_key(chain: &ChainIdentity, entry: &ManifestEntry) -> String {
+    format!(
+        "{}/{}/{}/{}/{}/{:020}-{:020}.json",
+        manifest_segment_prefix(chain),
+        entry.dataset_key.as_str(),
+        range_kind_key(entry.range.kind()),
+        entry.selector_fingerprint,
+        entry.finality_level.as_str(),
+        entry.range.start(),
+        entry.range.end(),
+    )
+}
+
 pub(crate) fn checksum_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest

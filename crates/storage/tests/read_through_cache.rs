@@ -140,13 +140,26 @@ fn test_read_through_cache_checksum_change_invalidates_entry() {
     assert_eq!(store.read_count(&object_key), 1);
 
     let mut manifest = storage.manifest().expect("manifest");
-    manifest.entries[0].checksum = Some("0".repeat(64));
+    manifest.entries[0].checksum = Some("changed-checksum".to_owned());
+    let segment_key = store
+        .list(&format!("chains/{}/manifest-segments", chain.key_prefix()))
+        .expect("manifest segments")
+        .into_iter()
+        .next()
+        .expect("manifest segment")
+        .key;
     store
         .put(
-            &format!("chains/{}/manifest.json", chain.key_prefix()),
+            &segment_key,
             &serde_json::to_vec_pretty(&manifest).expect("manifest bytes"),
         )
-        .expect("write manifest");
+        .expect("write manifest segment");
+    store
+        .put(
+            &format!("chains/{}/manifest.version", chain.key_prefix()),
+            b"changed",
+        )
+        .expect("write manifest version");
 
     storage
         .read_rows(&chain, &DatasetKey::evm_blocks(), &selector, range)

@@ -7,7 +7,7 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
-    time::Instant,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::read_through_cache;
@@ -50,8 +50,9 @@ pub struct StorageDataObject {
 pub use crate::helpers::coverage_key;
 pub(crate) use crate::helpers::{
     checksum_hex, decode_object_rows, empty_rows, encode_object_rows, filter_rows, intersect,
-    manifest_key, merge_ranges, object_encoding_for_dataset, object_key, range_kind_key,
-    unix_seconds_now, validate_existing_data_object, verify_manifest_object_metadata,
+    manifest_key, manifest_segment_key, manifest_segment_prefix, manifest_version_key,
+    merge_ranges, object_encoding_for_dataset, object_key, range_kind_key, unix_seconds_now,
+    validate_existing_data_object, verify_manifest_object_metadata,
 };
 pub use crate::hot_cache::{
     HOT_CACHE_SCHEMA_VERSION, HotBlockMetadata, HotCache, HotCacheCandidateStatus,
@@ -86,7 +87,14 @@ pub struct DurableStorage<S> {
     object_store: S,
     read_through_cache: read_through_cache::ReadThroughCache,
     manifest_update_locks: Arc<Mutex<BTreeMap<String, Arc<Mutex<()>>>>>,
+    manifest_cache: Arc<Mutex<BTreeMap<String, ManifestCacheEntry>>>,
     config: DurableStorageConfig,
+}
+
+#[derive(Clone, Debug)]
+struct ManifestCacheEntry {
+    manifest: Manifest,
+    version: Option<Vec<u8>>,
 }
 
 pub type LocalStorage = DurableStorage<LocalObjectStore>;
@@ -175,6 +183,7 @@ impl DurableStorage<LocalObjectStore> {
                 ReadThroughCacheConfig::default(),
             ),
             manifest_update_locks: Arc::new(Mutex::new(BTreeMap::new())),
+            manifest_cache: Arc::new(Mutex::new(BTreeMap::new())),
             config,
         }
     }
@@ -226,6 +235,7 @@ where
                 read_through_cache_config,
             ),
             manifest_update_locks: Arc::new(Mutex::new(BTreeMap::new())),
+            manifest_cache: Arc::new(Mutex::new(BTreeMap::new())),
             config,
         }
     }
@@ -353,7 +363,6 @@ where
 
         let selector_fingerprint = selector.fingerprint();
         let selector_canonical_key = selector.canonical_key();
-        let manifest = self.manifest_for_chain(chain)?;
         let data_object = if rows.row_count() == 0 {
             None
         } else {
@@ -379,6 +388,7 @@ where
                 checksum_algorithm: "sha256".to_owned(),
                 written_at_unix_seconds: unix_seconds_now()?,
             };
+            let manifest = self.manifest_for_chain(chain)?;
             if let Some(existing) = manifest.find_logical(
                 chain,
                 &dataset_key,
@@ -500,33 +510,66 @@ where
         &self,
         chain: &ChainIdentity,
     ) -> Result<Manifest, DatalensError> {
-        let key = manifest_key(chain);
-        if !self.object_store.exists(&key)? {
-            return Ok(Manifest::default());
+        if let Some(manifest) = self.cached_manifest(chain)? {
+            return Ok(manifest);
         }
-        let bytes = self.object_store.get(&key)?;
-        serde_json::from_slice(&bytes).map_err(|error| {
-            DatalensError::new(
-                DatalensErrorKind::StorageReadFailure,
-                format!("decode manifest {key}: {error}"),
-            )
-        })
+        let mut manifest = Manifest::default();
+        let mut base_entries = Vec::new();
+        let key = manifest_key(chain);
+        if self.object_store.exists(&key)? {
+            let bytes = self.object_store.get(&key)?;
+            let base_manifest: Manifest = serde_json::from_slice(&bytes).map_err(|error| {
+                DatalensError::new(
+                    DatalensErrorKind::StorageReadFailure,
+                    format!("decode manifest {key}: {error}"),
+                )
+            })?;
+            base_entries = base_manifest.entries.clone();
+            manifest.merge(base_manifest);
+        }
+        for object in self.object_store.list(&manifest_segment_prefix(chain))? {
+            let bytes = self.object_store.get(&object.key)?;
+            let segment_manifest: Manifest = serde_json::from_slice(&bytes).map_err(|error| {
+                DatalensError::new(
+                    DatalensErrorKind::StorageReadFailure,
+                    format!("decode manifest segment {}: {error}", object.key),
+                )
+            })?;
+            manifest.merge_filtering_shadowed_segments(segment_manifest, &base_entries);
+        }
+        self.cache_manifest(chain, manifest.clone())?;
+        Ok(manifest)
     }
 
     pub fn manifest(&self) -> Result<Manifest, DatalensError> {
         let mut manifest = Manifest::default();
-        for object in self.object_store.list("chains")? {
-            if object.key.ends_with("/manifest.json") {
-                let bytes = self.object_store.get(&object.key)?;
-                let mut chain_manifest: Manifest =
-                    serde_json::from_slice(&bytes).map_err(|error| {
-                        DatalensError::new(
-                            DatalensErrorKind::StorageReadFailure,
-                            format!("decode manifest {}: {error}", object.key),
-                        )
-                    })?;
-                manifest.entries.append(&mut chain_manifest.entries);
-            }
+        let objects = self.object_store.list("chains")?;
+        let mut base_entries = Vec::new();
+        for object in objects
+            .iter()
+            .filter(|object| object.key.ends_with("/manifest.json"))
+        {
+            let bytes = self.object_store.get(&object.key)?;
+            let chain_manifest: Manifest = serde_json::from_slice(&bytes).map_err(|error| {
+                DatalensError::new(
+                    DatalensErrorKind::StorageReadFailure,
+                    format!("decode manifest {}: {error}", object.key),
+                )
+            })?;
+            base_entries.extend(chain_manifest.entries.clone());
+            manifest.merge(chain_manifest);
+        }
+        for object in objects.iter().filter(|object| {
+            object.key.contains("/manifest-segments/") && object.key.ends_with(".json")
+        }) {
+            let bytes = self.object_store.get(&object.key)?;
+            let segment_manifest: Manifest = serde_json::from_slice(&bytes).map_err(|error| {
+                DatalensError::new(
+                    DatalensErrorKind::StorageReadFailure,
+                    format!("decode manifest segment {}: {error}", object.key),
+                )
+            })?;
+            manifest.merge_filtering_shadowed_segments(segment_manifest, &base_entries);
         }
         Ok(manifest)
     }
@@ -560,7 +603,11 @@ where
                 ));
             }
         }
-        self.publish_manifest_unlocked(chain, manifest, "full", started)
+        self.publish_manifest_unlocked(chain, manifest, "full", started)?;
+        self.delete_manifest_segments_unlocked(chain)?;
+        self.bump_manifest_version(chain)?;
+        self.cache_manifest(chain, manifest.clone())?;
+        Ok(())
     }
 
     fn publish_manifest_unlocked(
@@ -591,7 +638,7 @@ where
             .count();
         let empty_coverage_count = entries_count - data_object_count;
         log::info!(
-            "storage published manifest publish_kind={} chain_key={} entries_count={} data_object_count={} empty_coverage_count={} manifest_bytes={} duration_ms={}",
+            "storage published full manifest publish_kind={} chain_key={} entries_count={} data_object_count={} empty_coverage_count={} manifest_bytes={} duration_ms={}",
             publish_kind,
             chain.key_prefix(),
             entries_count,
@@ -600,6 +647,21 @@ where
             bytes.len(),
             started.elapsed().as_millis()
         );
+        Ok(())
+    }
+
+    fn delete_manifest_segments_unlocked(
+        &self,
+        chain: &ChainIdentity,
+    ) -> Result<(), DatalensError> {
+        for object in self.object_store.list(&manifest_segment_prefix(chain))? {
+            self.object_store.delete(&object.key).map_err(|error| {
+                DatalensError::new(
+                    DatalensErrorKind::ManifestUpdateFailure,
+                    format!("delete manifest segment {}: {}", object.key, error.message),
+                )
+            })?;
+        }
         Ok(())
     }
 
@@ -619,9 +681,116 @@ where
                 format!("manifest entry object not found {object_key}"),
             ));
         }
-        let mut manifest = self.manifest_for_chain(chain)?;
-        manifest.upsert(entry);
-        self.publish_manifest_unlocked(chain, &manifest, "single_entry", started)
+        self.publish_manifest_segment_unlocked(chain, entry, started)
+    }
+
+    fn publish_manifest_segment_unlocked(
+        &self,
+        chain: &ChainIdentity,
+        entry: ManifestEntry,
+        started: Instant,
+    ) -> Result<(), DatalensError> {
+        let key = manifest_segment_key(chain, &entry);
+        let segment = Manifest {
+            entries: vec![entry.clone()],
+        };
+        let bytes = serde_json::to_vec_pretty(&segment).map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::Internal,
+                format!("encode manifest segment: {error}"),
+            )
+        })?;
+        self.object_store.put(&key, &bytes).map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::ManifestUpdateFailure,
+                format!("write manifest segment {key}: {}", error.message),
+            )
+        })?;
+        self.bump_manifest_version(chain)?;
+        if let Some(mut manifest) = self.cached_manifest_without_refresh(&chain.key_prefix())? {
+            manifest.upsert(entry.clone());
+            self.cache_manifest(chain, manifest)?;
+        }
+        log::info!(
+            "storage published manifest segment chain_key={} range={}-{} selector_fingerprint={} segment_key={} segment_bytes={} duration_ms={}",
+            chain.key_prefix(),
+            entry.range.start(),
+            entry.range.end(),
+            entry.selector_fingerprint,
+            key,
+            bytes.len(),
+            started.elapsed().as_millis()
+        );
+        Ok(())
+    }
+
+    fn cached_manifest(&self, chain: &ChainIdentity) -> Result<Option<Manifest>, DatalensError> {
+        let chain_key = chain.key_prefix();
+        let current_version = self.manifest_version(chain)?;
+        let cache = self
+            .manifest_cache
+            .lock()
+            .map_err(|_| DatalensError::internal("manifest cache lock poisoned"))?;
+        Ok(cache
+            .get(&chain_key)
+            .filter(|entry| entry.version == current_version)
+            .map(|entry| entry.manifest.clone()))
+    }
+
+    fn cached_manifest_without_refresh(
+        &self,
+        chain_key: &str,
+    ) -> Result<Option<Manifest>, DatalensError> {
+        let cache = self
+            .manifest_cache
+            .lock()
+            .map_err(|_| DatalensError::internal("manifest cache lock poisoned"))?;
+        Ok(cache.get(chain_key).map(|entry| entry.manifest.clone()))
+    }
+
+    fn cache_manifest(
+        &self,
+        chain: &ChainIdentity,
+        manifest: Manifest,
+    ) -> Result<(), DatalensError> {
+        let version = self.manifest_version(chain)?;
+        let chain_key = chain.key_prefix();
+        let mut cache = self
+            .manifest_cache
+            .lock()
+            .map_err(|_| DatalensError::internal("manifest cache lock poisoned"))?;
+        cache.insert(chain_key, ManifestCacheEntry { manifest, version });
+        Ok(())
+    }
+
+    fn bump_manifest_version(&self, chain: &ChainIdentity) -> Result<(), DatalensError> {
+        let key = manifest_version_key(chain);
+        let value = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| {
+                DatalensError::new(
+                    DatalensErrorKind::Internal,
+                    format!("system clock before unix epoch: {error}"),
+                )
+            })?
+            .as_nanos()
+            .to_string();
+        self.object_store
+            .put(&key, value.as_bytes())
+            .map_err(|error| {
+                DatalensError::new(
+                    DatalensErrorKind::ManifestUpdateFailure,
+                    format!("write manifest version {key}: {}", error.message),
+                )
+            })
+    }
+
+    fn manifest_version(&self, chain: &ChainIdentity) -> Result<Option<Vec<u8>>, DatalensError> {
+        let key = manifest_version_key(chain);
+        if !self.object_store.exists(&key)? {
+            return Ok(None);
+        }
+        self.object_store.get(&key).map(Some)
     }
 
     fn manifest_update_lock(&self, chain: &ChainIdentity) -> Result<Arc<Mutex<()>>, DatalensError> {

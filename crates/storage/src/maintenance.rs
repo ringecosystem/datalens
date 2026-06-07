@@ -146,18 +146,19 @@ where
 {
     pub fn maintenance_report(&self) -> Result<MaintenanceReport, DatalensError> {
         let manifest_objects = self.object_store().list("chains")?;
-        let manifest_keys = manifest_objects
+        let mut manifest_keys = manifest_objects
             .iter()
-            .filter(|object| object.key.ends_with("/manifest.json"))
+            .filter(|object| is_manifest_object(&object.key))
             .map(|object| object.key.clone())
             .collect::<Vec<_>>();
+        manifest_keys.sort_by_key(|key| (key.contains("/manifest-segments/"), key.clone()));
 
         let mut issues = Vec::new();
-        let mut entries = Vec::new();
+        let mut manifest = Manifest::default();
         for manifest_key in manifest_keys {
             let bytes = self.object_store().get(&manifest_key)?;
             match serde_json::from_slice::<Manifest>(&bytes) {
-                Ok(mut manifest) => entries.append(&mut manifest.entries),
+                Ok(object_manifest) => manifest.merge(object_manifest),
                 Err(error) => issues.push(MaintenanceIssue {
                     issue_kind: MaintenanceIssueKind::ManifestDecodeFailure,
                     chain: None,
@@ -169,6 +170,7 @@ where
                 }),
             }
         }
+        let entries = manifest.entries;
 
         issues.extend(self.check_entries(&entries)?);
         issues.extend(contradictory_coverage_issues(&entries));
@@ -222,20 +224,7 @@ where
         &self,
         config: MaintenanceCompactionConfig,
     ) -> Result<MaintenanceCompactionReport, DatalensError> {
-        let mut manifest = Manifest::default();
-        for object in self.object_store().list("chains")? {
-            if object.key.ends_with("/manifest.json") {
-                let bytes = self.object_store().get(&object.key)?;
-                let mut chain_manifest: Manifest =
-                    serde_json::from_slice(&bytes).map_err(|error| {
-                        DatalensError::new(
-                            DatalensErrorKind::StorageReadFailure,
-                            format!("decode manifest {}: {error}", object.key),
-                        )
-                    })?;
-                manifest.entries.append(&mut chain_manifest.entries);
-            }
-        }
+        let manifest = self.manifest()?;
 
         let candidates = compaction_candidates(&manifest.entries, config);
         let mut compacted_objects = 0usize;
@@ -647,7 +636,13 @@ fn current_object_keys(entries: &[ManifestEntry]) -> Vec<String> {
 
 fn is_data_object(object_key: &str) -> bool {
     object_key != manifest_key_from_object_key(object_key)
+        && !object_key.contains("/manifest-segments/")
         && (object_key.ends_with(".json") || object_key.ends_with(".parquet"))
+}
+
+fn is_manifest_object(object_key: &str) -> bool {
+    object_key.ends_with("/manifest.json")
+        || (object_key.contains("/manifest-segments/") && object_key.ends_with(".json"))
 }
 
 fn manifest_key_from_object_key(object_key: &str) -> String {

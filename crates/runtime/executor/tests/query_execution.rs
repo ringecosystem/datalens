@@ -413,7 +413,10 @@ fn test_executor_latest_only_fetches_latest_without_durable_read_or_write() {
         vec![SourceCall::Blocks(BlockRange::expect_new(99, 100))]
     );
     assert_eq!(counting_storage.read_ranges(), Vec::<LedgerRange>::new());
-    assert!(root.join("chains/evm/ethereum/1/manifest.json").exists());
+    assert!(
+        root.join("chains/evm/ethereum/1/manifest-segments")
+            .exists()
+    );
 
     let events = wait_for_ledger_events(&ledger, "analytics-api", 1);
     assert_eq!(events.len(), 1);
