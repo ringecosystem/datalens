@@ -19,12 +19,41 @@ impl<'a> NativeClient<'a> {
     }
 
     pub fn query(&self, input: QueryInput) -> Result<QueryResponse, Error> {
+        if let Some(finality) = input.finality.as_deref()
+            && is_provisional_query_finality(finality)
+        {
+            return Err(Error::Safety(format!(
+                "native query finality {finality} requires query_provisional explicit opt-in"
+            )));
+        }
+        self.query_inner(input, true)
+    }
+
+    pub fn query_provisional(&self, input: QueryInput) -> Result<QueryResponse, Error> {
+        let Some(finality) = input.finality.as_deref() else {
+            return Err(Error::Safety(
+                "native provisional query requires explicit finality".to_owned(),
+            ));
+        };
+        if !is_provisional_query_finality(finality) {
+            return Err(Error::Safety(format!(
+                "native provisional query finality {finality} is not provisional"
+            )));
+        }
+        self.query_inner(input, false)
+    }
+
+    fn query_inner(
+        &self,
+        input: QueryInput,
+        enforce_safe_query_finality: bool,
+    ) -> Result<QueryResponse, Error> {
         let mut input = input;
         let enforce_durable_response = input
             .finality
             .as_deref()
             .is_none_or(|finality| finality == DEFAULT_QUERY_FINALITY);
-        if input.finality.is_none() {
+        if enforce_safe_query_finality && input.finality.is_none() {
             if matches!(self.client.native_transport(), NativeTransport::Rest) {
                 self.ensure_range_within_default_durable_head(&input)?;
             }
@@ -344,6 +373,10 @@ fn has_nonempty_array(value: &serde_json::Value, key: &str) -> bool {
 
 fn is_durable_finality(finality: &str) -> bool {
     matches!(finality, "safe" | "finalized")
+}
+
+fn is_provisional_query_finality(finality: &str) -> bool {
+    matches!(finality, "latest_only" | "safe_to_latest")
 }
 
 fn should_fallback_to_safe_head(error: &Error) -> bool {

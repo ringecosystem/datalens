@@ -240,6 +240,83 @@ fn test_native_query_graphql_defaults_missing_finality_to_durable_only() {
 }
 
 #[test]
+fn test_native_query_graphql_rejects_latest_only_finality_without_explicit_opt_in() {
+    let server = MockGraphqlServer::new(Vec::new());
+    let client = client(&server, None);
+    let mut input = native_query_input();
+    input.finality = Some("latest_only".to_owned());
+
+    let error = client
+        .native()
+        .query(input)
+        .expect_err("latest query should require explicit opt-in");
+
+    assert!(matches!(error, Error::Safety(_)));
+    assert!(
+        error.to_string().contains("requires query_provisional"),
+        "{error}"
+    );
+    assert_eq!(server.requests().len(), 0);
+}
+
+#[test]
+fn test_native_query_graphql_rejects_safe_to_latest_finality_without_explicit_opt_in() {
+    let server = MockGraphqlServer::new(Vec::new());
+    let client = client(&server, None);
+    let mut input = native_query_input();
+    input.finality = Some("safe_to_latest".to_owned());
+
+    let error = client
+        .native()
+        .query(input)
+        .expect_err("safe-to-latest query should require explicit opt-in");
+
+    assert!(matches!(error, Error::Safety(_)));
+    assert!(
+        error.to_string().contains("requires query_provisional"),
+        "{error}"
+    );
+    assert_eq!(server.requests().len(), 0);
+}
+
+#[test]
+fn test_native_query_graphql_provisional_sends_latest_only_finality() {
+    let server = MockGraphqlServer::new(vec![native_graphql_query_response_with_segment("latest")]);
+    let client = client(&server, None);
+    let mut input = native_query_input();
+    input.finality = Some("latest_only".to_owned());
+
+    let response = client
+        .native()
+        .query_provisional(input)
+        .expect("provisional query");
+
+    assert_eq!(response.cache["segments"][0]["finality"], json!("latest"));
+    assert_eq!(
+        server.only_request().variables["input"]["finality"],
+        json!("latest_only")
+    );
+}
+
+#[test]
+fn test_native_query_graphql_provisional_sends_safe_to_latest_finality() {
+    let server = MockGraphqlServer::new(vec![native_graphql_query_response_with_segment("latest")]);
+    let client = client(&server, None);
+    let mut input = native_query_input();
+    input.finality = Some("safe_to_latest".to_owned());
+
+    client
+        .native()
+        .query_provisional(input)
+        .expect("provisional query");
+
+    assert_eq!(
+        server.only_request().variables["input"]["finality"],
+        json!("safe_to_latest")
+    );
+}
+
+#[test]
 fn test_native_query_graphql_rejects_latest_segment_for_durable_query() {
     let server = MockGraphqlServer::new(vec![json!({
         "data": {
@@ -276,6 +353,30 @@ fn test_native_query_graphql_rejects_latest_segment_for_durable_query() {
             .contains("durable query returned non-durable segment"),
         "{error}"
     );
+}
+
+fn native_graphql_query_response_with_segment(finality: &str) -> Value {
+    json!({
+        "data": {
+            "query": {
+                "chain": {"configuredName": "ethereum"},
+                "datasetKey": "evm.logs",
+                "range": {"kind": "block", "start": 1, "end": 2},
+                "cache": {
+                    "hitRanges": [],
+                    "missingRanges": [{"kind": "block", "start": 1, "end": 2}],
+                    "hotHitRanges": [{"kind": "block", "start": 1, "end": 2}],
+                    "providerFillRanges": [{"kind": "block", "start": 1, "end": 2}],
+                    "segments": [{
+                        "range": {"kind": "block", "start": 1, "end": 2},
+                        "source": "provider",
+                        "finality": finality
+                    }]
+                },
+                "rows": []
+            }
+        }
+    })
 }
 
 #[test]
