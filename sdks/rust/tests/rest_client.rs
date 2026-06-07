@@ -237,26 +237,51 @@ fn test_native_query_without_finality_rejects_range_above_durable_boundary() {
 }
 
 #[test]
-fn test_native_query_rejects_latest_segment_for_durable_query() {
-    let server = MockRestServer::new(vec![json!({
-        "chain": {"configuredName": "ethereum"},
-        "dataset_key": "evm.logs",
-        "range": {"kind": "block", "start": 1, "end": 2},
-        "cache": {
-            "hit_ranges": [],
-            "missing_ranges": [{"kind": "block", "start": 1, "end": 2}],
-            "durable_hit_ranges": [],
-            "hot_hit_ranges": [],
-            "provider_fill_ranges": [{"kind": "block", "start": 1, "end": 2}],
-            "promotion_pending_ranges": [],
-            "segments": [{
-                "range": {"kind": "block", "start": 1, "end": 2},
-                "source": "provider",
-                "finality": "latest"
-            }]
+fn test_native_query_without_finality_falls_back_to_safe_head_when_finalized_unavailable() {
+    let server = MockRestServer::with_responses(vec![
+        MockRestResponse {
+            status: 422,
+            body: json!({
+                "error": {
+                    "kind": "unavailable_head",
+                    "message": "finalized head is unavailable"
+                }
+            }),
         },
-        "rows": {"rows": []}
-    })]);
+        MockRestResponse::ok(json!({
+            "chain": {"configured_name": "ethereum"},
+            "height": 2,
+            "finality": "safe",
+            "range_kind": "block"
+        })),
+        MockRestResponse::ok(query_response_body()),
+    ]);
+    let client = DatalensClient::new(ClientConfig {
+        endpoint: server.endpoint(),
+        bearer_token: None,
+        application: None,
+        timeout: Some(Duration::from_secs(5)),
+        user_agent: None,
+    })
+    .expect("client config");
+    let mut input = query_input();
+    input.finality = None;
+
+    client.native().query(input).expect("native query");
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 3, "{requests:?}");
+    assert_eq!(
+        requests[0].path,
+        "/v1/chains/ethereum/head?finality=finalized"
+    );
+    assert_eq!(requests[1].path, "/v1/chains/ethereum/head?finality=safe");
+    assert_eq!(requests[2].path, "/v1/query");
+}
+
+#[test]
+fn test_native_query_rejects_latest_segment_for_durable_query() {
+    let server = MockRestServer::new(vec![query_response_body_with_provider_segment("latest")]);
     let client = DatalensClient::new(ClientConfig {
         endpoint: server.endpoint(),
         bearer_token: None,
@@ -278,6 +303,45 @@ fn test_native_query_rejects_latest_segment_for_durable_query() {
             .contains("durable query returned non-durable segment"),
         "{error}"
     );
+}
+
+#[test]
+fn test_native_query_accepts_provider_finalized_segment_for_durable_query() {
+    let server = MockRestServer::new(vec![query_response_body_with_provider_segment("finalized")]);
+    let client = DatalensClient::new(ClientConfig {
+        endpoint: server.endpoint(),
+        bearer_token: None,
+        application: None,
+        timeout: Some(Duration::from_secs(5)),
+        user_agent: None,
+    })
+    .expect("client config");
+
+    let response = client.native().query(query_input()).expect("native query");
+
+    assert_eq!(response.cache["segments"][0]["source"], json!("provider"));
+    assert_eq!(
+        response.cache["segments"][0]["finality"],
+        json!("finalized")
+    );
+}
+
+#[test]
+fn test_native_query_accepts_provider_safe_segment_for_durable_query() {
+    let server = MockRestServer::new(vec![query_response_body_with_provider_segment("safe")]);
+    let client = DatalensClient::new(ClientConfig {
+        endpoint: server.endpoint(),
+        bearer_token: None,
+        application: None,
+        timeout: Some(Duration::from_secs(5)),
+        user_agent: None,
+    })
+    .expect("client config");
+
+    let response = client.native().query(query_input()).expect("native query");
+
+    assert_eq!(response.cache["segments"][0]["source"], json!("provider"));
+    assert_eq!(response.cache["segments"][0]["finality"], json!("safe"));
 }
 
 #[test]
@@ -702,6 +766,28 @@ fn query_response_body() -> Value {
             "dataset_key": "evm.logs",
             "rows": [{"blockNumber": 1}]
         }
+    })
+}
+
+fn query_response_body_with_provider_segment(finality: &str) -> Value {
+    json!({
+        "chain": {"configuredName": "ethereum"},
+        "dataset_key": "evm.logs",
+        "range": {"kind": "block", "start": 1, "end": 2},
+        "cache": {
+            "hit_ranges": [],
+            "missing_ranges": [{"kind": "block", "start": 1, "end": 2}],
+            "durable_hit_ranges": [],
+            "hot_hit_ranges": [],
+            "provider_fill_ranges": [{"kind": "block", "start": 1, "end": 2}],
+            "promotion_pending_ranges": [],
+            "segments": [{
+                "range": {"kind": "block", "start": 1, "end": 2},
+                "source": "provider",
+                "finality": finality
+            }]
+        },
+        "rows": {"rows": []}
     })
 }
 

@@ -86,10 +86,16 @@ impl<'a> NativeClient<'a> {
     }
 
     fn ensure_range_within_default_durable_head(&self, input: &QueryInput) -> Result<(), Error> {
-        let head = self.finalized_head(&input.chain.configured_name)?;
+        let head = match self.finalized_head(&input.chain.configured_name) {
+            Ok(head) => head,
+            Err(error) if should_fallback_to_safe_head(&error) => {
+                self.safe_head(&input.chain.configured_name)?
+            }
+            Err(error) => return Err(error),
+        };
         if !is_durable_finality(&head.finality) {
             return Err(Error::Safety(format!(
-                "datalens finalized head returned non-durable finality {}",
+                "datalens durable head returned non-durable finality {}",
                 head.finality
             )));
         }
@@ -102,8 +108,8 @@ impl<'a> NativeClient<'a> {
         }
         if input.range.end > head.height {
             return Err(Error::Safety(format!(
-                "query range end {} exceeds finalized head {} for chain {}",
-                input.range.end, head.height, input.chain.configured_name
+                "query range end {} exceeds {} head {} for chain {}",
+                input.range.end, head.finality, head.height, input.chain.configured_name
             )));
         }
         Ok(())
@@ -313,7 +319,7 @@ fn ensure_durable_response(response: &QueryResponse) -> Result<(), Error> {
             .get("finality")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("<missing>");
-        if source != "durable" || !is_durable_finality(finality) {
+        if !is_durable_finality(finality) {
             return Err(Error::Safety(format!(
                 "durable query returned non-durable segment with source {source} and finality {finality}"
             )));
@@ -321,11 +327,9 @@ fn ensure_durable_response(response: &QueryResponse) -> Result<(), Error> {
     }
     if has_nonempty_array(&response.cache, "hot_hit_ranges")
         || has_nonempty_array(&response.cache, "hotHitRanges")
-        || has_nonempty_array(&response.cache, "provider_fill_ranges")
-        || has_nonempty_array(&response.cache, "providerFillRanges")
     {
         return Err(Error::Safety(
-            "durable query returned non-durable cache ranges".to_owned(),
+            "durable query returned hot cache ranges".to_owned(),
         ));
     }
     Ok(())
@@ -340,6 +344,23 @@ fn has_nonempty_array(value: &serde_json::Value, key: &str) -> bool {
 
 fn is_durable_finality(finality: &str) -> bool {
     matches!(finality, "safe" | "finalized")
+}
+
+fn should_fallback_to_safe_head(error: &Error) -> bool {
+    let Some(api_error) = error.api_error() else {
+        return false;
+    };
+    match api_error.kind {
+        crate::ApiErrorKind::UnavailableHead => true,
+        crate::ApiErrorKind::InvalidInput => {
+            let message = api_error.message.to_ascii_lowercase();
+            message.contains("finalized")
+                && (message.contains("unavailable")
+                    || message.contains("unsupported")
+                    || message.contains("not supported"))
+        }
+        _ => false,
+    }
 }
 
 #[derive(Serialize)]
