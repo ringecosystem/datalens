@@ -19,14 +19,33 @@ impl<'a> NativeClient<'a> {
     }
 
     pub fn query(&self, input: QueryInput) -> Result<QueryResponse, Error> {
+        let mut input = input;
+        let enforce_durable_response = input
+            .finality
+            .as_deref()
+            .is_none_or(|finality| finality == DEFAULT_QUERY_FINALITY);
+        if input.finality.is_none() {
+            if matches!(self.client.native_transport(), NativeTransport::Rest) {
+                self.ensure_range_within_default_durable_head(&input)?;
+            }
+            input.finality = Some(DEFAULT_QUERY_FINALITY.to_owned());
+        }
+
         match self.client.native_transport() {
             NativeTransport::Rest => {
                 let request = RestQueryInput::try_from(input)?;
                 let response: RestQueryResponse = self.client.post_json("/v1/query", &request)?;
-                Ok(response.into())
+                let response = response.into();
+                if enforce_durable_response {
+                    ensure_durable_response(&response)?;
+                }
+                Ok(response)
             }
             NativeTransport::Graphql => {
                 let data: QueryData = self.client.execute(QUERY_QUERY, QueryVariables { input })?;
+                if enforce_durable_response {
+                    ensure_durable_response(&data.query)?;
+                }
                 Ok(data.query)
             }
         }
@@ -52,6 +71,48 @@ impl<'a> NativeClient<'a> {
                 "native chain_head requires a REST datalens endpoint; clients created with with_graphql_endpoint cannot call the REST-only chain head API".to_owned(),
             )),
         }
+    }
+
+    pub fn latest_head(&self, chain: impl AsRef<str>) -> Result<ChainHeadResponse, Error> {
+        self.chain_head(chain, Some(ChainHeadFinalityInput::Latest))
+    }
+
+    pub fn safe_head(&self, chain: impl AsRef<str>) -> Result<ChainHeadResponse, Error> {
+        self.chain_head(chain, Some(ChainHeadFinalityInput::Safe))
+    }
+
+    pub fn finalized_head(&self, chain: impl AsRef<str>) -> Result<ChainHeadResponse, Error> {
+        self.chain_head(chain, Some(ChainHeadFinalityInput::Finalized))
+    }
+
+    fn ensure_range_within_default_durable_head(&self, input: &QueryInput) -> Result<(), Error> {
+        let head = match self.finalized_head(&input.chain.configured_name) {
+            Ok(head) => head,
+            Err(error) if should_fallback_to_safe_head(&error) => {
+                self.safe_head(&input.chain.configured_name)?
+            }
+            Err(error) => return Err(error),
+        };
+        if !is_durable_finality(&head.finality) {
+            return Err(Error::Safety(format!(
+                "datalens durable head returned non-durable finality {}",
+                head.finality
+            )));
+        }
+        let range_kind = input.range.kind.as_str();
+        if head.range_kind != range_kind {
+            return Err(Error::Safety(format!(
+                "datalens finalized head range kind {} does not match query range kind {range_kind}",
+                head.range_kind
+            )));
+        }
+        if input.range.end > head.height {
+            return Err(Error::Safety(format!(
+                "query range end {} exceeds {} head {} for chain {}",
+                input.range.end, head.finality, head.height, input.chain.configured_name
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -118,6 +179,16 @@ pub enum QueryRangeKindInput {
     Block,
     Slot,
     Height,
+}
+
+impl QueryRangeKindInput {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Block => "block",
+            Self::Slot => "slot",
+            Self::Height => "height",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -230,6 +301,66 @@ struct DiscoveryData {
 #[derive(Deserialize)]
 struct QueryData {
     query: QueryResponse,
+}
+
+const DEFAULT_QUERY_FINALITY: &str = "durable_only";
+
+fn ensure_durable_response(response: &QueryResponse) -> Result<(), Error> {
+    let segments = response
+        .cache
+        .get("segments")
+        .and_then(serde_json::Value::as_array);
+    for segment in segments.into_iter().flatten() {
+        let source = segment
+            .get("source")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<missing>");
+        let finality = segment
+            .get("finality")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<missing>");
+        if !is_durable_finality(finality) {
+            return Err(Error::Safety(format!(
+                "durable query returned non-durable segment with source {source} and finality {finality}"
+            )));
+        }
+    }
+    if has_nonempty_array(&response.cache, "hot_hit_ranges")
+        || has_nonempty_array(&response.cache, "hotHitRanges")
+    {
+        return Err(Error::Safety(
+            "durable query returned hot cache ranges".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn has_nonempty_array(value: &serde_json::Value, key: &str) -> bool {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|items| !items.is_empty())
+}
+
+fn is_durable_finality(finality: &str) -> bool {
+    matches!(finality, "safe" | "finalized")
+}
+
+fn should_fallback_to_safe_head(error: &Error) -> bool {
+    let Some(api_error) = error.api_error() else {
+        return false;
+    };
+    match api_error.kind {
+        crate::ApiErrorKind::UnavailableHead => true,
+        crate::ApiErrorKind::InvalidInput => {
+            let message = api_error.message.to_ascii_lowercase();
+            message.contains("finalized")
+                && (message.contains("unavailable")
+                    || message.contains("unsupported")
+                    || message.contains("not supported"))
+        }
+        _ => false,
+    }
 }
 
 #[derive(Serialize)]
