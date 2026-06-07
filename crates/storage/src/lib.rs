@@ -1,5 +1,6 @@
 //! Storage boundary for durable datalens objects and coverage metadata.
 
+mod coverage_index;
 mod helpers;
 mod hot_cache;
 mod maintenance;
