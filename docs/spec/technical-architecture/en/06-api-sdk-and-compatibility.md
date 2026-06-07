@@ -82,6 +82,28 @@ first-class native Rust SDK API:
   rows instead of exposing internal server/runtime models.
 - Non-EVM datasets such as `solana.slots` and `tron.blocks` are queried through the
   same native method.
+- Missing `QueryInput.finality` defaults to `durable_only`.
+- `query` rejects `latest_only` and `safe_to_latest`; callers that want hot/latest data
+  must opt in with `query_provisional`.
+- REST `query` calls without explicit finality resolve the finalized head, falling back
+  to the safe head when the finalized head is unavailable, before sending the durable
+  query.
+- `query_provisional` requires explicit `latest_only` or `safe_to_latest` finality and
+  must not be used to advance final business cursors.
+
+The Rust SDK safety helpers are public integration utilities:
+
+- `DataFinality` classifies `finalized` and `safe` as durable, and `latest` or
+  provisional values as provisional.
+- `BlockAnchor`, `FinalizedCursor`, and `ProvisionalCursor` let applications keep
+  durable and provisional checkpoint state separate. `FinalizedCursor` must reject
+  non-durable finality, unknown finality, range-kind mismatch, and height regression.
+- `extract_cache_segments` reads response segment range, source, finality, and available
+  anchor metadata so applications can persist the evidence used for later
+  reconciliation.
+- `plan_promotion` returns `Promote`, `KeepProvisional`, `Recheck`, or `Rollback`.
+  Without a canonical proof represented by durable safe/finalized anchor coverage, a
+  latest or provisional range must be rechecked, not promoted.
 
 The SDK also exposes `DatalensClient::index()` wrappers over the checked-in
 `schemas/index.graphql` SDL:
@@ -170,6 +192,12 @@ transaction_index, log_index)` across all matched addresses.
 - `cache.segments[].finality`: `finalized`, `safe`, `unsafe`, or `latest`.
 - `rows`: `QueryRows`, sorted by dataset order and de-duplicated before response.
 - Empty results are represented by an empty `rows` array for the selected dataset.
+
+Safe-default clients must write only `finalized` or `safe` data into final business
+tables and must advance final business cursors only from finalized or safe coverage.
+Latest, unsafe, hot, or otherwise provisional response segments may be stored only in
+application-owned provisional state unless and until the application proves they match
+canonical safe or finalized coverage.
 
 Client cache outcome helpers:
 

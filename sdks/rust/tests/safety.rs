@@ -179,6 +179,37 @@ fn test_query_response_cache_segment_extraction_preserves_metadata() {
 }
 
 #[test]
+fn test_query_response_cache_segment_extraction_preserves_anchor_finality() {
+    let response = QueryResponse {
+        chain: json!({"configuredName": "ethereum"}),
+        dataset_key: "evm.logs".to_owned(),
+        range: json!({"kind": "block", "start": 10, "end": 12}),
+        cache: json!({
+            "segments": [{
+                "range": {"kind": "block", "start": 10, "end": 12},
+                "source": "hot",
+                "finality": "latest",
+                "anchor": {
+                    "range_kind": "block",
+                    "height": 12,
+                    "block_hash": "0xabc",
+                    "finality": "safe"
+                }
+            }]
+        }),
+        rows: json!({"rows": []}),
+    };
+
+    let segments = extract_cache_segments(&response);
+
+    assert_eq!(segments[0].finality, DataFinality::Latest);
+    assert_eq!(
+        segments[0].anchor.as_ref().map(|anchor| anchor.finality),
+        Some(DataFinality::Safe)
+    );
+}
+
+#[test]
 fn test_query_response_cache_segment_extraction_treats_durable_only_as_unknown_finality() {
     let response = QueryResponse {
         chain: json!({"configuredName": "ethereum"}),
