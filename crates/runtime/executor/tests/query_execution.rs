@@ -206,7 +206,7 @@ fn test_executor_repeated_query_hits_mixed_empty_and_data_coverage_without_fetch
 }
 
 #[test]
-fn test_executor_flushes_staged_query_fill_before_returning() {
+fn test_executor_returns_staged_query_fill_without_forcing_manifest_flush() {
     let storage = LocalStorage::new(temp_storage_root("executor-staged-miss"));
     let source = MockSource::default().with_blocks(vec![block(10, "0x10")]);
     let executor = NativeQueryExecutor::new(
@@ -233,11 +233,11 @@ fn test_executor_flushes_staged_query_fill_before_returning() {
         .execute(blocks_input(10, 10))
         .expect("query miss returns provider rows");
     assert_eq!(block_numbers(&first.rows), vec![10]);
-    assert_eq!(storage.manifest().expect("manifest").entries.len(), 1);
+    assert_eq!(storage.manifest().expect("manifest").entries.len(), 0);
 
     let second = executor
         .execute(blocks_input(10, 10))
-        .expect("same-process query reads durable rows");
+        .expect("same-process query reads staged rows");
 
     assert_eq!(block_numbers(&second.rows), vec![10]);
     assert_eq!(
@@ -251,7 +251,7 @@ fn test_executor_flushes_staged_query_fill_before_returning() {
 }
 
 #[test]
-fn test_executor_usage_ledger_records_query_staging_flush_as_durable_write() {
+fn test_executor_usage_ledger_records_query_staging_without_forced_flush() {
     let root = temp_storage_root("executor-ledger-staged");
     let storage = LocalStorage::new(&root);
     let ledger = UsageLedgerStore::new(LocalObjectStore::new(&root));
@@ -286,7 +286,7 @@ fn test_executor_usage_ledger_records_query_staging_flush_as_durable_write() {
     assert_eq!(events[0].fill_outcome, FillOutcome::LiveFetch);
     assert_eq!(
         events[0].durable_write_outcome,
-        datalens_storage::DurableWriteOutcome::Flushed
+        datalens_storage::DurableWriteOutcome::Staged
     );
     assert_eq!(events[0].row_count, 1);
 }
