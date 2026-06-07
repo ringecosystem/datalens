@@ -548,7 +548,7 @@ fn default_max_block_scan_range_blocks() -> u64 {
 }
 
 fn default_evm_log_header_fetch_mode() -> String {
-    "concurrent".to_owned()
+    "batch".to_owned()
 }
 
 fn default_evm_log_header_fetch_concurrency() -> usize {

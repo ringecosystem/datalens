@@ -1612,7 +1612,7 @@ fn test_validate_config_accepts_per_chain_log_query_strategy_differences() {
     );
     assert_eq!(
         config.chains["ethereum"].datasets.logs.header_fetch_mode,
-        "concurrent"
+        "batch"
     );
     assert_eq!(
         config.chains["ethereum"]
@@ -1873,7 +1873,7 @@ fn test_doctor_chain_summary_rejects_unknown_auto_finality_without_profile() {
                 max_get_logs_range_blocks: 10,
                 max_block_scan_range_blocks: 10,
                 max_addresses_per_query: 2,
-                header_fetch_mode: "concurrent".to_owned(),
+                header_fetch_mode: "batch".to_owned(),
                 header_fetch_concurrency: 8,
                 header_fetch_batch_size: 20,
                 header_cache_max_entries: 50_000,

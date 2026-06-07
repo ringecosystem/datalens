@@ -77,7 +77,7 @@ pub(crate) fn chain_config(max_addresses_per_query: usize) -> ChainConfig {
                 max_get_logs_range_blocks: 2,
                 max_block_scan_range_blocks: 2,
                 max_addresses_per_query,
-                header_fetch_mode: "concurrent".to_owned(),
+                header_fetch_mode: "batch".to_owned(),
                 header_fetch_concurrency: 8,
                 header_fetch_batch_size: 20,
                 header_cache_max_entries: 50_000,
