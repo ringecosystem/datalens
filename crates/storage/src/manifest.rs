@@ -1,6 +1,7 @@
 use datalens_chain::FinalityLevel;
 use datalens_core::{ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey, LedgerRange};
 use serde::{Deserialize, Deserializer, Serialize, de::Error};
+use std::collections::BTreeMap;
 
 use crate::{ObjectEncoding, ParquetCompression, range_kind_key, validate_object_key};
 
@@ -15,32 +16,13 @@ pub struct Manifest {
 
 impl Manifest {
     pub(crate) fn upsert(&mut self, entry: ManifestEntry) {
-        if let Some(existing) = self.entries.iter_mut().find(|existing| {
-            existing.chain == entry.chain
-                && existing.dataset_key == entry.dataset_key
-                && existing.selector_fingerprint == entry.selector_fingerprint
-                && existing.range == entry.range
-                && existing.finality_level == entry.finality_level
-        }) {
-            *existing = entry;
-        } else {
-            self.entries.push(entry);
-        }
-        self.entries.sort_by_key(|entry| {
-            (
-                entry.dataset_key.as_str().to_owned(),
-                range_kind_key(entry.range.kind()),
-                entry.selector_fingerprint.clone(),
-                entry.range.start(),
-                entry.range.end(),
-            )
-        });
+        self.entries.push(entry);
+        self.normalize();
     }
 
     pub(crate) fn merge(&mut self, manifest: Manifest) {
-        for entry in manifest.entries {
-            self.upsert(entry);
-        }
+        self.entries.extend(manifest.entries);
+        self.normalize();
     }
 
     pub(crate) fn merge_filtering_shadowed_segments(
@@ -48,15 +30,25 @@ impl Manifest {
         manifest: Manifest,
         base_entries: &[ManifestEntry],
     ) {
-        for entry in manifest.entries {
-            if base_entries
-                .iter()
-                .any(|base_entry| base_entry.shadows_segment(&entry))
-            {
-                continue;
-            }
-            self.upsert(entry);
+        self.entries
+            .extend(manifest.entries.into_iter().filter(|entry| {
+                if base_entries
+                    .iter()
+                    .any(|base_entry| base_entry.shadows_segment(entry))
+                {
+                    return false;
+                }
+                true
+            }));
+        self.normalize();
+    }
+
+    pub(crate) fn normalize(&mut self) {
+        let mut entries = BTreeMap::new();
+        for entry in self.entries.drain(..) {
+            entries.insert(entry.logical_key(), entry);
         }
+        self.entries = entries.into_values().collect();
     }
 
     pub(crate) fn find_logical(
@@ -139,6 +131,18 @@ impl<'de> Deserialize<'de> for ManifestEntry {
 }
 
 impl ManifestEntry {
+    fn logical_key(&self) -> ManifestEntryLogicalKey {
+        ManifestEntryLogicalKey {
+            chain_key: self.chain.key_prefix(),
+            dataset_key: self.dataset_key.as_str().to_owned(),
+            selector_fingerprint: self.selector_fingerprint.clone(),
+            range_kind: range_kind_key(self.range.kind()),
+            range_start: self.range.start(),
+            range_end: self.range.end(),
+            finality: self.finality_level.as_str().to_owned(),
+        }
+    }
+
     fn shadows_segment(&self, segment: &ManifestEntry) -> bool {
         self.chain == segment.chain
             && self.dataset_key == segment.dataset_key
@@ -224,6 +228,17 @@ impl ManifestEntry {
             }
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ManifestEntryLogicalKey {
+    chain_key: String,
+    dataset_key: String,
+    selector_fingerprint: String,
+    range_kind: String,
+    range_start: u64,
+    range_end: u64,
+    finality: String,
 }
 
 fn required_data_object_metadata<T>(value: Option<T>, field: &str) -> Result<T, DatalensError> {
