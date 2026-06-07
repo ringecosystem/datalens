@@ -280,6 +280,106 @@ fn test_native_query_without_finality_falls_back_to_safe_head_when_finalized_una
 }
 
 #[test]
+fn test_native_query_rejects_latest_only_finality_without_explicit_opt_in() {
+    let server = MockRestServer::new(Vec::new());
+    let client = DatalensClient::new(ClientConfig {
+        endpoint: server.endpoint(),
+        bearer_token: None,
+        application: None,
+        timeout: Some(Duration::from_secs(5)),
+        user_agent: None,
+    })
+    .expect("client config");
+    let mut input = query_input();
+    input.finality = Some("latest_only".to_owned());
+
+    let error = client
+        .native()
+        .query(input)
+        .expect_err("latest query should require explicit opt-in");
+
+    assert!(matches!(error, datalens_sdk::Error::Safety(_)));
+    assert!(
+        error.to_string().contains("requires query_provisional"),
+        "{error}"
+    );
+    assert_eq!(server.requests().len(), 0);
+}
+
+#[test]
+fn test_native_query_rejects_safe_to_latest_finality_without_explicit_opt_in() {
+    let server = MockRestServer::new(Vec::new());
+    let client = DatalensClient::new(ClientConfig {
+        endpoint: server.endpoint(),
+        bearer_token: None,
+        application: None,
+        timeout: Some(Duration::from_secs(5)),
+        user_agent: None,
+    })
+    .expect("client config");
+    let mut input = query_input();
+    input.finality = Some("safe_to_latest".to_owned());
+
+    let error = client
+        .native()
+        .query(input)
+        .expect_err("safe-to-latest query should require explicit opt-in");
+
+    assert!(matches!(error, datalens_sdk::Error::Safety(_)));
+    assert!(
+        error.to_string().contains("requires query_provisional"),
+        "{error}"
+    );
+    assert_eq!(server.requests().len(), 0);
+}
+
+#[test]
+fn test_native_query_provisional_sends_latest_only_finality() {
+    let server = MockRestServer::new(vec![query_response_body_with_provider_segment("latest")]);
+    let client = DatalensClient::new(ClientConfig {
+        endpoint: server.endpoint(),
+        bearer_token: None,
+        application: None,
+        timeout: Some(Duration::from_secs(5)),
+        user_agent: None,
+    })
+    .expect("client config");
+    let mut input = query_input();
+    input.finality = Some("latest_only".to_owned());
+
+    let response = client
+        .native()
+        .query_provisional(input)
+        .expect("provisional query");
+
+    assert_eq!(response.cache["segments"][0]["finality"], json!("latest"));
+    let request = server.only_request();
+    assert_eq!(request.body["finality"], "latest_only");
+}
+
+#[test]
+fn test_native_query_provisional_sends_safe_to_latest_finality() {
+    let server = MockRestServer::new(vec![query_response_body_with_provider_segment("latest")]);
+    let client = DatalensClient::new(ClientConfig {
+        endpoint: server.endpoint(),
+        bearer_token: None,
+        application: None,
+        timeout: Some(Duration::from_secs(5)),
+        user_agent: None,
+    })
+    .expect("client config");
+    let mut input = query_input();
+    input.finality = Some("safe_to_latest".to_owned());
+
+    client
+        .native()
+        .query_provisional(input)
+        .expect("provisional query");
+
+    assert_eq!(server.only_request().body["finality"], "safe_to_latest");
+}
+
+#[test]
 fn test_native_query_rejects_latest_segment_for_durable_query() {
     let server = MockRestServer::new(vec![query_response_body_with_provider_segment("latest")]);
     let client = DatalensClient::new(ClientConfig {
