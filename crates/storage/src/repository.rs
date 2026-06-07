@@ -527,16 +527,21 @@ where
             base_entries = base_manifest.entries.clone();
             manifest.merge(base_manifest);
         }
+        let mut segment_manifest = Manifest::default();
         for object in self.object_store.list(&manifest_segment_prefix(chain))? {
             let bytes = self.object_store.get(&object.key)?;
-            let segment_manifest: Manifest = serde_json::from_slice(&bytes).map_err(|error| {
-                DatalensError::new(
-                    DatalensErrorKind::StorageReadFailure,
-                    format!("decode manifest segment {}: {error}", object.key),
-                )
-            })?;
-            manifest.merge_filtering_shadowed_segments(segment_manifest, &base_entries);
+            let mut object_manifest: Manifest =
+                serde_json::from_slice(&bytes).map_err(|error| {
+                    DatalensError::new(
+                        DatalensErrorKind::StorageReadFailure,
+                        format!("decode manifest segment {}: {error}", object.key),
+                    )
+                })?;
+            segment_manifest
+                .entries
+                .append(&mut object_manifest.entries);
         }
+        manifest.merge_filtering_shadowed_segments(segment_manifest, &base_entries);
         self.cache_manifest(chain, manifest.clone())?;
         Ok(manifest)
     }
@@ -559,18 +564,23 @@ where
             base_entries.extend(chain_manifest.entries.clone());
             manifest.merge(chain_manifest);
         }
+        let mut segment_manifest = Manifest::default();
         for object in objects.iter().filter(|object| {
             object.key.contains("/manifest-segments/") && object.key.ends_with(".json")
         }) {
             let bytes = self.object_store.get(&object.key)?;
-            let segment_manifest: Manifest = serde_json::from_slice(&bytes).map_err(|error| {
-                DatalensError::new(
-                    DatalensErrorKind::StorageReadFailure,
-                    format!("decode manifest segment {}: {error}", object.key),
-                )
-            })?;
-            manifest.merge_filtering_shadowed_segments(segment_manifest, &base_entries);
+            let mut object_manifest: Manifest =
+                serde_json::from_slice(&bytes).map_err(|error| {
+                    DatalensError::new(
+                        DatalensErrorKind::StorageReadFailure,
+                        format!("decode manifest segment {}: {error}", object.key),
+                    )
+                })?;
+            segment_manifest
+                .entries
+                .append(&mut object_manifest.entries);
         }
+        manifest.merge_filtering_shadowed_segments(segment_manifest, &base_entries);
         Ok(manifest)
     }
 
