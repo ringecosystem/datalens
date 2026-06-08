@@ -1,8 +1,8 @@
 use datalens_core::{ChainFamily, ChainIdentity, DatalensErrorKind, DatasetKey};
 use datalens_metrics::{
-    ApplicationIdentity, CacheCoverageOutcome, DurableIntentOutcome, DurableWriteOutcome,
-    ErrorLabels, FillOutcome, HotReorgOutcome, MetricsLabels, MetricsRecorder, QueryOutcome,
-    WarmupFetchOutcome, WarmupTaskOutcome, WarmupWriteOutcome,
+    ApplicationIdentity, CacheCoverageOutcome, DurableIntentClaimOutcome, DurableIntentOutcome,
+    DurableWriteOutcome, ErrorLabels, FillOutcome, HotReorgOutcome, MetricsLabels, MetricsRecorder,
+    QueryOutcome, WarmupFetchOutcome, WarmupTaskOutcome, WarmupWriteOutcome,
 };
 
 #[test]
@@ -22,7 +22,14 @@ fn test_record_metrics_renders_prometheus_text_with_expected_labels() {
         DurableIntentOutcome::Completed,
         2.0,
     );
-    recorder.set_durable_intent_backlog(3, 15);
+    recorder.set_durable_intent_backlog_for_scope(&chain(), "query", 3, 15);
+    recorder.observe_durable_intent_claim_duration(
+        &chain(),
+        "query",
+        DurableIntentClaimOutcome::Claimed,
+        0.125,
+    );
+    recorder.record_durable_intent_claim(&chain(), "query", DurableIntentClaimOutcome::Claimed);
     recorder.observe_fill_duration(&labels, 1.5);
     recorder.set_latest_requested_block(&labels, 42);
     recorder.set_latest_filled_block(&labels, 40);
@@ -55,8 +62,16 @@ fn test_record_metrics_renders_prometheus_text_with_expected_labels() {
         r#"datalens_durable_intent_total{application="indexer",chain="ethereum",chain_kind="evm",dataset="evm.logs",outcome="submitted",source="query"} 1"#
     ));
     assert!(output.contains("datalens_durable_intent_duration_seconds"));
-    assert!(output.contains("datalens_durable_intent_pending_count 3"));
-    assert!(output.contains("datalens_durable_intent_oldest_pending_age_seconds 15"));
+    assert!(output.contains(
+        r#"datalens_durable_intent_pending_total{chain="ethereum",chain_kind="evm",source="query"} 3"#
+    ));
+    assert!(output.contains(
+        r#"datalens_durable_intent_oldest_pending_age_seconds{chain="ethereum",chain_kind="evm",source="query"} 15"#
+    ));
+    assert!(output.contains(
+        r#"datalens_durable_intent_claim_total{chain="ethereum",chain_kind="evm",outcome="claimed",source="query"} 1"#
+    ));
+    assert!(output.contains("datalens_durable_intent_claim_duration_seconds"));
     assert!(output.contains("datalens_fill_duration_seconds"));
     assert!(output.contains(
         r#"datalens_provider_error_total{chain="ethereum",chain_kind="evm",dataset="evm.logs",error_kind="provider_timeout"} 1"#
@@ -227,9 +242,13 @@ fn test_metrics_labels_preserve_native_dataset_keys() {
 fn labels(application: Option<&str>) -> MetricsLabels {
     MetricsLabels::from_dataset_key(
         ApplicationIdentity::from_optional(application),
-        ChainIdentity::expect_new(ChainFamily::Evm, "ethereum"),
+        chain(),
         DatasetKey::evm_logs(),
     )
+}
+
+fn chain() -> ChainIdentity {
+    ChainIdentity::expect_new(ChainFamily::Evm, "ethereum")
 }
 
 fn labels_with(chain: ChainIdentity, dataset_key: DatasetKey) -> MetricsLabels {

@@ -1,7 +1,5 @@
 use datalens_core::{ChainIdentity, DatalensErrorKind, DatasetKey};
-use prometheus::{
-    CounterVec, Gauge, GaugeVec, HistogramOpts, HistogramVec, Opts, Registry, TextEncoder,
-};
+use prometheus::{CounterVec, GaugeVec, HistogramOpts, HistogramVec, Opts, Registry, TextEncoder};
 
 const APPLICATION: &str = "unknown";
 
@@ -236,6 +234,27 @@ impl DurableIntentOutcome {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DurableIntentClaimOutcome {
+    Claimed,
+    Empty,
+    ListError,
+    MarkRunningError,
+    SkippedIneligible,
+}
+
+impl DurableIntentClaimOutcome {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Claimed => "claimed",
+            Self::Empty => "empty",
+            Self::ListError => "list_error",
+            Self::MarkRunningError => "mark_running_error",
+            Self::SkippedIneligible => "skipped_ineligible",
+        }
+    }
+}
+
 impl DurableWriteOutcome {
     fn as_str(&self) -> &'static str {
         match self {
@@ -362,8 +381,10 @@ pub struct MetricsRecorder {
     durable_write_total: CounterVec,
     durable_intent_total: CounterVec,
     durable_intent_duration_seconds: HistogramVec,
-    durable_intent_pending_count: Gauge,
-    durable_intent_oldest_pending_age_seconds: Gauge,
+    durable_intent_pending_total: GaugeVec,
+    durable_intent_oldest_pending_age_seconds: GaugeVec,
+    durable_intent_claim_total: CounterVec,
+    durable_intent_claim_duration_seconds: HistogramVec,
     hot_reorg_total: CounterVec,
     hot_promotion_total: CounterVec,
     fill_duration_seconds: HistogramVec,
@@ -470,14 +491,34 @@ impl MetricsRecorder {
                 "outcome",
             ],
         )?;
-        let durable_intent_pending_count = Gauge::with_opts(Opts::new(
-            "datalens_durable_intent_pending_count",
-            "Datalens durable promotion intents currently eligible for processing.",
-        ))?;
-        let durable_intent_oldest_pending_age_seconds = Gauge::with_opts(Opts::new(
-            "datalens_durable_intent_oldest_pending_age_seconds",
-            "Age in seconds of the oldest currently eligible durable promotion intent.",
-        ))?;
+        let durable_intent_pending_total = GaugeVec::new(
+            Opts::new(
+                "datalens_durable_intent_pending_total",
+                "Datalens durable promotion intents currently eligible in the pending index.",
+            ),
+            &["chain", "chain_kind", "source"],
+        )?;
+        let durable_intent_oldest_pending_age_seconds = GaugeVec::new(
+            Opts::new(
+                "datalens_durable_intent_oldest_pending_age_seconds",
+                "Age in seconds of the oldest currently eligible durable promotion intent in the pending index.",
+            ),
+            &["chain", "chain_kind", "source"],
+        )?;
+        let durable_intent_claim_total = CounterVec::new(
+            Opts::new(
+                "datalens_durable_intent_claim_total",
+                "Datalens durable promotion intent claim attempts by outcome.",
+            ),
+            &["chain", "chain_kind", "source", "outcome"],
+        )?;
+        let durable_intent_claim_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "datalens_durable_intent_claim_duration_seconds",
+                "Datalens durable promotion intent pending-index list and claim duration in seconds.",
+            ),
+            &["chain", "chain_kind", "source", "outcome"],
+        )?;
         let hot_reorg_total = CounterVec::new(
             Opts::new(
                 "datalens_hot_reorg_total",
@@ -626,8 +667,10 @@ impl MetricsRecorder {
         registry.register(Box::new(durable_write_total.clone()))?;
         registry.register(Box::new(durable_intent_total.clone()))?;
         registry.register(Box::new(durable_intent_duration_seconds.clone()))?;
-        registry.register(Box::new(durable_intent_pending_count.clone()))?;
+        registry.register(Box::new(durable_intent_pending_total.clone()))?;
         registry.register(Box::new(durable_intent_oldest_pending_age_seconds.clone()))?;
+        registry.register(Box::new(durable_intent_claim_total.clone()))?;
+        registry.register(Box::new(durable_intent_claim_duration_seconds.clone()))?;
         registry.register(Box::new(hot_reorg_total.clone()))?;
         registry.register(Box::new(hot_promotion_total.clone()))?;
         registry.register(Box::new(fill_duration_seconds.clone()))?;
@@ -655,8 +698,10 @@ impl MetricsRecorder {
             durable_write_total,
             durable_intent_total,
             durable_intent_duration_seconds,
-            durable_intent_pending_count,
+            durable_intent_pending_total,
             durable_intent_oldest_pending_age_seconds,
+            durable_intent_claim_total,
+            durable_intent_claim_duration_seconds,
             hot_reorg_total,
             hot_promotion_total,
             fill_duration_seconds,
@@ -738,14 +783,50 @@ impl MetricsRecorder {
             .observe(seconds);
     }
 
-    pub fn set_durable_intent_backlog(
+    pub fn set_durable_intent_backlog_for_scope(
         &self,
-        pending_count: usize,
+        chain: &ChainIdentity,
+        source: &str,
+        pending_total: usize,
         oldest_pending_age_seconds: u64,
     ) {
-        self.durable_intent_pending_count.set(pending_count as f64);
+        self.durable_intent_pending_total
+            .with_label_values(&durable_intent_scope_label_values(chain, source))
+            .set(pending_total as f64);
         self.durable_intent_oldest_pending_age_seconds
+            .with_label_values(&durable_intent_scope_label_values(chain, source))
             .set(oldest_pending_age_seconds as f64);
+    }
+
+    pub fn record_durable_intent_claim(
+        &self,
+        chain: &ChainIdentity,
+        source: &str,
+        outcome: DurableIntentClaimOutcome,
+    ) {
+        self.durable_intent_claim_total
+            .with_label_values(&durable_intent_claim_label_values(
+                chain,
+                source,
+                outcome.as_str(),
+            ))
+            .inc();
+    }
+
+    pub fn observe_durable_intent_claim_duration(
+        &self,
+        chain: &ChainIdentity,
+        source: &str,
+        outcome: DurableIntentClaimOutcome,
+        seconds: f64,
+    ) {
+        self.durable_intent_claim_duration_seconds
+            .with_label_values(&durable_intent_claim_label_values(
+                chain,
+                source,
+                outcome.as_str(),
+            ))
+            .observe(seconds);
     }
 
     pub fn record_hot_reorg(&self, labels: &MetricsLabels, outcome: HotReorgOutcome, count: u64) {
@@ -917,6 +998,26 @@ fn durable_intent_label_values<'a>(
         &labels.chain,
         &labels.chain_kind,
         &labels.dataset,
+        source,
+        outcome,
+    ]
+}
+
+fn durable_intent_scope_label_values<'a>(
+    chain: &'a ChainIdentity,
+    source: &'a str,
+) -> [&'a str; 3] {
+    [chain.configured_name(), chain.family_ref().key(), source]
+}
+
+fn durable_intent_claim_label_values<'a>(
+    chain: &'a ChainIdentity,
+    source: &'a str,
+    outcome: &'a str,
+) -> [&'a str; 4] {
+    [
+        chain.configured_name(),
+        chain.family_ref().key(),
         source,
         outcome,
     ]
