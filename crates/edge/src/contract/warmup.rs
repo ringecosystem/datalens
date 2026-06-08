@@ -50,6 +50,13 @@ pub struct WarmupSubmitApiResponse {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WarmupEnsureApiResponse {
+    pub task_id: WarmupTaskId,
+    pub created: bool,
+    pub state: WarmupTaskState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct WarmupTaskApiResponse {
     pub task: WarmupTaskView,
 }
@@ -80,6 +87,17 @@ pub struct WarmupTaskView {
     pub updated_at: u64,
     pub last_error: Option<String>,
     pub stats: datalens_warmup::WarmupStats,
+    pub query_watermark: Option<u64>,
+    pub cursor_next: Option<u64>,
+    pub cursor_query_distance: Option<u64>,
+    pub safe_head: Option<u64>,
+    pub lookahead_blocks: Option<u64>,
+    pub planned_start: Option<u64>,
+    pub planned_end: Option<u64>,
+    pub planned_query_distance: Option<u64>,
+    pub no_op_reason: Option<String>,
+    pub published_coverage_end: Option<u64>,
+    pub published_query_distance: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -150,6 +168,7 @@ impl WarmupSubmitApiRequest {
 }
 
 pub(crate) fn warmup_task_view(task: WarmupTask) -> Result<WarmupTaskView, DatalensError> {
+    let follow_query_status = task.follow_query_status.clone();
     Ok(WarmupTaskView {
         task_id: task.task_id,
         application_id: task.application_id,
@@ -165,6 +184,37 @@ pub(crate) fn warmup_task_view(task: WarmupTask) -> Result<WarmupTaskView, Datal
         updated_at: task.updated_at,
         last_error: task.last_error,
         stats: task.stats,
+        query_watermark: follow_query_status
+            .as_ref()
+            .and_then(|status| status.query_watermark),
+        cursor_next: follow_query_status
+            .as_ref()
+            .map(|status| status.cursor_next),
+        cursor_query_distance: follow_query_status
+            .as_ref()
+            .and_then(|status| status.cursor_query_distance),
+        safe_head: follow_query_status.as_ref().map(|status| status.safe_head),
+        lookahead_blocks: follow_query_status
+            .as_ref()
+            .map(|status| status.lookahead_blocks),
+        planned_start: follow_query_status
+            .as_ref()
+            .and_then(|status| status.planned_start),
+        planned_end: follow_query_status
+            .as_ref()
+            .and_then(|status| status.planned_end),
+        planned_query_distance: follow_query_status
+            .as_ref()
+            .and_then(|status| status.planned_query_distance),
+        no_op_reason: follow_query_status
+            .as_ref()
+            .and_then(|status| status.no_op_reason.clone()),
+        published_coverage_end: follow_query_status
+            .as_ref()
+            .and_then(|status| status.published_coverage_end),
+        published_query_distance: follow_query_status
+            .as_ref()
+            .and_then(|status| status.published_query_distance),
     })
 }
 

@@ -9,8 +9,8 @@ use datalens_metrics::{ApplicationIdentity, MetricsRecorder};
 use datalens_planner::{NativePlannerConfig, NativeQueryInput};
 use datalens_storage::{QueryWatermarkRepository, StorageRepository, UsageLedgerRepository};
 use datalens_warmup::{
-    WarmupRegistry, WarmupRunResult, WarmupSubmitOutcome, WarmupSubmitRequest, WarmupTask,
-    WarmupTaskFilter, WarmupTaskId, WarmupTaskPool,
+    WarmupEnsureOutcome, WarmupRegistry, WarmupRunResult, WarmupSubmitOutcome, WarmupSubmitRequest,
+    WarmupTask, WarmupTaskFilter, WarmupTaskId, WarmupTaskPool,
 };
 use datalens_writer::{DurableWriteResult, DurableWriter, DurableWriterConfig};
 
@@ -449,6 +449,7 @@ pub(crate) trait RegisteredQueryService: Send + Sync {
 
 pub trait RegisteredWarmupService: Send + Sync {
     fn submit(&self, request: WarmupSubmitRequest) -> Result<WarmupSubmitOutcome, DatalensError>;
+    fn ensure(&self, request: WarmupSubmitRequest) -> Result<WarmupEnsureOutcome, DatalensError>;
     fn get(&self, task_id: &WarmupTaskId) -> Result<Option<WarmupTask>, DatalensError>;
     fn list(&self, filter: WarmupTaskFilter) -> Result<Vec<WarmupTask>, DatalensError>;
     fn pause(&self, task_id: &WarmupTaskId) -> Result<(), DatalensError>;
@@ -465,6 +466,10 @@ where
 {
     fn submit(&self, request: WarmupSubmitRequest) -> Result<WarmupSubmitOutcome, DatalensError> {
         WarmupTaskPool::submit(self, request)
+    }
+
+    fn ensure(&self, request: WarmupSubmitRequest) -> Result<WarmupEnsureOutcome, DatalensError> {
+        WarmupTaskPool::ensure(self, request)
     }
 
     fn get(&self, task_id: &WarmupTaskId) -> Result<Option<WarmupTask>, DatalensError> {

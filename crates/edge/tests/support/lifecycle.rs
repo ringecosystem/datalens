@@ -498,6 +498,13 @@ pub(crate) fn native_warmup_request(body: serde_json::Value) -> Request<Body> {
         .expect("request")
 }
 
+pub(crate) fn native_warmup_ensure_request(body: serde_json::Value) -> Request<Body> {
+    Request::post("/v1/warmup/tasks/ensure")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).expect("request json")))
+        .expect("request")
+}
+
 pub(crate) fn block(number: u64) -> BlockHeader {
     BlockHeader {
         number,

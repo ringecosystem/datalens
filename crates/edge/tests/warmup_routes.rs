@@ -1,5 +1,9 @@
 mod support;
 
+use datalens_core::{DatasetKey, LedgerRangeKind};
+use datalens_storage::{
+    QueryWatermark, QueryWatermarkKey, QueryWatermarkRepository, QueryWatermarkStore,
+};
 use support::lifecycle::*;
 
 #[tokio::test]
@@ -138,6 +142,184 @@ async fn test_api_warmup_routes_manage_application_scoped_tasks() {
     assert_eq!(cancel.status(), StatusCode::OK);
     let cancel_body = body_json(cancel.into_body()).await;
     assert_eq!(cancel_body["task"]["state"], "cancelled");
+}
+
+#[tokio::test]
+async fn test_api_warmup_ensure_reuses_follow_query_task_without_start_in_identity() {
+    let root = temp_storage_root("api-warmup-ensure-follow-query");
+    let source = MockSource::default();
+    let service = service(LocalStorage::new(&root), source).with_warmup_pool(warmup_pool(&root));
+    let registry = QueryServiceRegistry::new()
+        .with_service(service)
+        .expect("registry");
+    let app = router(registry);
+
+    let first = app
+        .clone()
+        .oneshot(native_warmup_ensure_request(serde_json::json!({
+            "chain": ethereum_identity(),
+            "dataset_key": "evm.logs",
+            "selector": {
+                "kind": "evm_logs",
+                "value": evm_logs_selector_value(&logs_request(20, 21))
+            },
+            "range_kind": { "kind": "block" },
+            "start": 20,
+            "end": null,
+            "mode": "follow_query"
+        })))
+        .await
+        .expect("first ensure response");
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let first_body = body_json(first.into_body()).await;
+    let task_id = first_body["task_id"].as_str().expect("task id").to_owned();
+    assert_eq!(first_body["created"], true);
+    assert_eq!(first_body["state"], "queued");
+
+    let second = app
+        .clone()
+        .oneshot(native_warmup_ensure_request(serde_json::json!({
+            "chain": ethereum_identity(),
+            "dataset_key": "evm.logs",
+            "selector": {
+                "kind": "evm_logs",
+                "value": evm_logs_selector_value(&logs_request(20, 21))
+            },
+            "range_kind": { "kind": "block" },
+            "start": 500,
+            "end": 550,
+            "mode": "follow_query"
+        })))
+        .await
+        .expect("second ensure response");
+    assert_eq!(second.status(), StatusCode::OK);
+    let second_body = body_json(second.into_body()).await;
+    assert_eq!(second_body["task_id"], task_id);
+    assert_eq!(second_body["created"], false);
+    assert_eq!(second_body["state"], "queued");
+
+    let list = app
+        .oneshot(
+            Request::get("/v1/warmup/tasks")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("list response");
+    assert_eq!(list.status(), StatusCode::OK);
+    let list_body = body_json(list.into_body()).await;
+    assert_eq!(list_body["tasks"].as_array().expect("tasks").len(), 1);
+    assert_eq!(list_body["tasks"][0]["start"], 20);
+    assert_eq!(list_body["tasks"][0]["end"], serde_json::Value::Null);
+}
+
+#[tokio::test]
+async fn test_api_warmup_list_exposes_follow_query_status() {
+    let root = temp_storage_root("api-warmup-follow-query-status");
+    let watermarks = QueryWatermarkStore::new(LocalObjectStore::new(root.join("watermarks")));
+    let source = MockSource::default();
+    let service =
+        service(LocalStorage::new(&root), source.clone()).with_warmup_pool(WarmupTaskPool::new(
+            WarmupRuntime::new(
+                source,
+                LocalStorage::new(&root),
+                LocalWarmupRegistry::new(LocalObjectStore::new(root.join("warmup-registry"))),
+                datalens_writer::DurableWriterConfig {
+                    target_object_bytes: 1024,
+                    min_object_rows: 1,
+                    record_empty_coverage: true,
+                    staging: Default::default(),
+                },
+            )
+            .with_query_watermarks(watermarks.clone())
+            .with_follow_query_start_offset_blocks(Some(1))
+            .with_follow_query_lookahead_blocks(3)
+            .with_runtime_config(WarmupRuntimeConfig {
+                max_fetches_per_task_loop: 1,
+            }),
+            WarmupSchedulerConfig {
+                max_global_concurrent_tasks: 1,
+                max_concurrent_tasks_per_chain: 1,
+            },
+        ));
+    let registry = QueryServiceRegistry::new()
+        .with_service(service)
+        .expect("registry");
+    let app = router(registry);
+
+    watermarks
+        .update(&QueryWatermark {
+            key: QueryWatermarkKey::new(
+                "app-a",
+                ethereum_identity(),
+                DatasetKey::evm_logs(),
+                &logs_request(10, 10).selector,
+                LedgerRangeKind::Block,
+            ),
+            latest_block: 10,
+            updated_at_unix_seconds: 1,
+        })
+        .expect("save watermark");
+
+    let submit = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/warmup/tasks/ensure")
+                .header("content-type", "application/json")
+                .header("x-datalens-application", "app-a")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "chain": ethereum_identity(),
+                        "dataset_key": "evm.logs",
+                        "selector": {
+                            "kind": "evm_logs",
+                            "value": evm_logs_selector_value(&logs_request(10, 10))
+                        },
+                        "range_kind": { "kind": "block" },
+                        "start": 1,
+                        "mode": "follow_query"
+                    }))
+                    .expect("request json"),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("submit response");
+    assert_eq!(submit.status(), StatusCode::CREATED);
+
+    let run_once = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/warmup/run-once")
+                .header("x-datalens-application", "app-a")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("run-once response");
+    assert_eq!(run_once.status(), StatusCode::OK);
+
+    let list = app
+        .oneshot(
+            Request::get("/v1/warmup/tasks")
+                .header("x-datalens-application", "app-a")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("list response");
+
+    assert_eq!(list.status(), StatusCode::OK);
+    let list_body = body_json(list.into_body()).await;
+    let task = &list_body["tasks"].as_array().expect("tasks")[0];
+    assert_eq!(task["query_watermark"], 10);
+    assert_eq!(task["cursor_next"], 1);
+    assert_eq!(task["safe_head"], 100);
+    assert_eq!(task["lookahead_blocks"], 3);
+    assert_eq!(task["planned_start"], 11);
+    assert_eq!(task["planned_end"], 13);
+    assert_eq!(task["planned_query_distance"], 1);
+    assert_eq!(task["no_op_reason"], serde_json::Value::Null);
 }
 
 #[tokio::test]

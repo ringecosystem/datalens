@@ -15,8 +15,8 @@ use datalens_executor::generate_query_id;
 use datalens_metrics::ApplicationIdentity;
 use datalens_planner::NativeQueryInput;
 use datalens_warmup::{
-    WarmupRunResult, WarmupSubmitOutcome, WarmupSubmitRequest, WarmupTask, WarmupTaskFilter,
-    WarmupTaskId,
+    WarmupEnsureOutcome, WarmupRunResult, WarmupSubmitOutcome, WarmupSubmitRequest, WarmupTask,
+    WarmupTaskFilter, WarmupTaskId,
 };
 use datalens_writer::DurableWriteResult;
 
@@ -216,6 +216,14 @@ impl QueryServiceRegistry {
     ) -> Result<WarmupSubmitOutcome, DatalensError> {
         let service = self.warmup_service_for_chain(request.chain.configured_name())?;
         service.submit(request)
+    }
+
+    pub fn ensure_warmup_task(
+        &self,
+        request: WarmupSubmitRequest,
+    ) -> Result<WarmupEnsureOutcome, DatalensError> {
+        let service = self.warmup_service_for_chain(request.chain.configured_name())?;
+        service.ensure(request)
     }
 
     pub fn get_warmup_task(

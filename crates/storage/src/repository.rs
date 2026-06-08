@@ -444,8 +444,8 @@ where
 
         let selector_fingerprint = selector.fingerprint();
         let selector_canonical_key = selector.canonical_key();
-        let data_object = if rows.row_count() == 0 {
-            None
+        let (data_object, data_object_bytes) = if rows.row_count() == 0 {
+            (None, None)
         } else {
             let encoding = object_encoding_for_dataset(&dataset_key);
             let object_key = object_key(
@@ -469,66 +469,7 @@ where
                 checksum_algorithm: "sha256".to_owned(),
                 written_at_unix_seconds: unix_seconds_now()?,
             };
-            let manifest = self.manifest_for_chain(chain)?;
-            if let Some(existing) = manifest.find_logical(
-                chain,
-                &dataset_key,
-                &selector_fingerprint,
-                &range,
-                finality_level,
-            ) {
-                // Object keys are deterministic for a logical coverage segment;
-                // an existing valid object is reused instead of rewriting bytes.
-                validate_existing_data_object(existing, &data_object)?;
-                if existing.object_size_bytes.is_some()
-                    && existing.checksum.is_some()
-                    && existing.checksum_algorithm.is_some()
-                    && let Some(written_at_unix_seconds) = existing.written_at_unix_seconds
-                    && self.object_store.exists(&data_object.object_key)?
-                {
-                    return Ok(StorageWriteOutcome {
-                        range,
-                        row_count: rows.row_count(),
-                        data_object: Some(StorageDataObject {
-                            written_at_unix_seconds,
-                            ..data_object
-                        }),
-                        recorded_empty_coverage: false,
-                    });
-                }
-            }
-            let latest_manifest = self.manifest_for_chain(chain)?;
-            if let Some(existing) = latest_manifest.find_logical(
-                chain,
-                &dataset_key,
-                &selector_fingerprint,
-                &range,
-                finality_level,
-            ) {
-                // A concurrent writer may have published this logical coverage
-                // after this write started. Reuse it before uploading bytes for
-                // the deterministic object key.
-                validate_existing_data_object(existing, &data_object)?;
-                if existing.object_size_bytes.is_some()
-                    && existing.checksum.is_some()
-                    && existing.checksum_algorithm.is_some()
-                    && let Some(written_at_unix_seconds) = existing.written_at_unix_seconds
-                    && self.object_store.exists(&data_object.object_key)?
-                {
-                    return Ok(StorageWriteOutcome {
-                        range,
-                        row_count: rows.row_count(),
-                        data_object: Some(StorageDataObject {
-                            written_at_unix_seconds,
-                            ..data_object
-                        }),
-                        recorded_empty_coverage: false,
-                    });
-                }
-            }
-            let object_key = data_object.object_key.clone();
-            self.object_store.put(&object_key, &bytes)?;
-            Some(data_object)
+            (Some(data_object), Some(bytes))
         };
 
         let entry = ManifestEntry {
@@ -564,12 +505,9 @@ where
                 .map(|data_object| data_object.written_at_unix_seconds),
         };
         let log_context = StorageWriteLogContext::from_entry(&entry);
-        let outcome = StorageWriteOutcome {
-            range: entry.range.clone(),
-            row_count: rows.row_count(),
-            data_object,
-            recorded_empty_coverage: rows.row_count() == 0,
-        };
+        let outcome_range = entry.range.clone();
+        let row_count = rows.row_count();
+        let recorded_empty_coverage = rows.row_count() == 0;
         log::info!(
             "storage wrote coverage chain_key={} dataset={} selector_fingerprint={} range_kind={} range={}-{} rows={} finality={} object_key_present={} coverage_kind={}",
             log_context.chain_key,
@@ -583,8 +521,21 @@ where
             log_context.object_key_present,
             log_context.coverage_kind
         );
-        self.write_manifest_entry(chain, entry)?;
-        Ok(outcome)
+        let data_object = match (data_object, data_object_bytes) {
+            (Some(data_object), Some(bytes)) => {
+                Some(self.write_data_object_manifest_entry(chain, entry, data_object, bytes)?)
+            }
+            _ => {
+                self.write_manifest_entry(chain, entry)?;
+                None
+            }
+        };
+        Ok(StorageWriteOutcome {
+            range: outcome_range,
+            row_count,
+            data_object,
+            recorded_empty_coverage,
+        })
     }
 
     pub(crate) fn manifest_for_chain(
@@ -795,6 +746,89 @@ where
             ));
         }
         self.publish_manifest_segment_unlocked(chain, entry, started)
+    }
+
+    fn write_data_object_manifest_entry(
+        &self,
+        chain: &ChainIdentity,
+        entry: ManifestEntry,
+        mut data_object: StorageDataObject,
+        bytes: Vec<u8>,
+    ) -> Result<StorageDataObject, DatalensError> {
+        let started = Instant::now();
+        let lock = self.manifest_update_lock(chain)?;
+        let _guard = self.lock_manifest_updates(&lock)?;
+
+        if let Some(existing) = self.exact_manifest_segment_entry(chain, &entry)? {
+            validate_existing_data_object(&existing, &data_object)?;
+            if existing.object_size_bytes.is_some()
+                && existing.checksum.is_some()
+                && existing.checksum_algorithm.is_some()
+                && let Some(written_at_unix_seconds) = existing.written_at_unix_seconds
+                && self.object_store.exists(&data_object.object_key)?
+            {
+                data_object.written_at_unix_seconds = written_at_unix_seconds;
+                return Ok(data_object);
+            }
+        }
+
+        if !self.existing_data_object_matches(&data_object)? {
+            self.object_store.put(&data_object.object_key, &bytes)?;
+        }
+        if !self.object_store.exists(&data_object.object_key)? {
+            return Err(DatalensError::new(
+                DatalensErrorKind::ManifestUpdateFailure,
+                format!("manifest entry object not found {}", data_object.object_key),
+            ));
+        }
+        self.publish_manifest_segment_unlocked(chain, entry, started)?;
+        Ok(data_object)
+    }
+
+    fn exact_manifest_segment_entry(
+        &self,
+        chain: &ChainIdentity,
+        entry: &ManifestEntry,
+    ) -> Result<Option<ManifestEntry>, DatalensError> {
+        let key = manifest_segment_key(chain, entry);
+        if !self.object_store.exists(&key)? {
+            return Ok(None);
+        }
+        let bytes = self.object_store.get(&key)?;
+        let segment: Manifest = serde_json::from_slice(&bytes).map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::StorageReadFailure,
+                format!("decode manifest segment {key}: {error}"),
+            )
+        })?;
+        Ok(segment
+            .find_logical(
+                chain,
+                &entry.dataset_key,
+                &entry.selector_fingerprint,
+                &entry.range,
+                entry.finality_level,
+            )
+            .cloned())
+    }
+
+    fn existing_data_object_matches(
+        &self,
+        data_object: &StorageDataObject,
+    ) -> Result<bool, DatalensError> {
+        if !self.object_store.exists(&data_object.object_key)? {
+            return Ok(false);
+        }
+        let existing_bytes = self.object_store.get(&data_object.object_key)?;
+        if existing_bytes.len() as u64 != data_object.object_size_bytes
+            || checksum_hex(&existing_bytes) != data_object.checksum
+        {
+            return Err(DatalensError::new(
+                DatalensErrorKind::StorageWriteFailure,
+                "existing data object bytes differ for logical shard",
+            ));
+        }
+        Ok(true)
     }
 
     fn publish_manifest_segment_unlocked(

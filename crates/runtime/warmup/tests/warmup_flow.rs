@@ -49,6 +49,109 @@ fn test_submit_duplicate_task_returns_existing_task_id() {
 }
 
 #[test]
+fn test_ensure_follow_query_with_different_start_returns_existing_task_id() {
+    let registry = LocalWarmupRegistry::new(object_store("ensure-follow-query-dedupe"));
+    let first_request = follow_query_request();
+    let mut second_request = follow_query_request();
+    second_request.start = 500;
+    second_request.end = Some(550);
+
+    let first = registry.ensure(first_request).expect("first ensure");
+    let second = registry.ensure(second_request).expect("second ensure");
+
+    assert!(first.created);
+    assert!(!second.created);
+    assert_eq!(first.task_id, second.task_id);
+    assert_eq!(first.state, WarmupTaskState::Queued);
+    assert_eq!(second.state, WarmupTaskState::Queued);
+    let tasks = registry
+        .list(datalens_warmup::WarmupTaskFilter::default())
+        .unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].start, 1);
+    assert_eq!(tasks[0].end, None);
+}
+
+#[test]
+fn test_submit_follow_query_with_different_start_uses_ensure_identity() {
+    let registry = LocalWarmupRegistry::new(object_store("submit-follow-query-ensure-identity"));
+    let first_request = follow_query_request();
+    let mut second_request = follow_query_request();
+    second_request.start = 500;
+    second_request.end = Some(550);
+
+    let first = registry.submit(first_request).expect("first submit");
+    let second = registry.submit(second_request).expect("second submit");
+
+    assert!(first.created);
+    assert!(!second.created);
+    assert_eq!(first.task_id, second.task_id);
+    let tasks = registry
+        .list(datalens_warmup::WarmupTaskFilter::default())
+        .unwrap();
+    assert_eq!(tasks.len(), 1);
+}
+
+#[test]
+fn test_ensure_follow_query_different_selector_or_chain_creates_different_tasks() {
+    let registry = LocalWarmupRegistry::new(object_store("ensure-follow-query-scope"));
+    let base = registry
+        .ensure(follow_query_request())
+        .expect("base ensure")
+        .task_id;
+    let mut selector_request = follow_query_request();
+    selector_request.selector = DatasetSelector::try_evm_logs(LogFilter {
+        addresses: vec!["0x0000000000000000000000000000000000000002".to_owned()],
+        topics: Vec::new(),
+    })
+    .unwrap();
+    let selector = registry
+        .ensure(selector_request)
+        .expect("selector ensure")
+        .task_id;
+    let mut chain_request = follow_query_request();
+    chain_request.chain = polygon_chain();
+    let chain = registry
+        .ensure(chain_request)
+        .expect("chain ensure")
+        .task_id;
+
+    assert_ne!(base, selector);
+    assert_ne!(base, chain);
+    assert_ne!(selector, chain);
+    let tasks = registry
+        .list(datalens_warmup::WarmupTaskFilter::default())
+        .unwrap();
+    assert_eq!(tasks.len(), 3);
+}
+
+#[test]
+fn test_ensure_follow_query_returns_existing_non_running_task_state() {
+    let registry = LocalWarmupRegistry::new(object_store("ensure-follow-query-states"));
+
+    let paused = registry
+        .ensure(follow_query_request())
+        .expect("paused ensure")
+        .task_id;
+    registry.pause(&paused).expect("pause task");
+    assert_existing_ensure_state(&registry, WarmupTaskState::Paused);
+
+    let mut failed_task = registry.get(&paused).unwrap().unwrap();
+    failed_task.state = WarmupTaskState::Failed;
+    failed_task.last_error = Some("provider unavailable".to_owned());
+    registry.save_task(&failed_task).expect("save failed task");
+    assert_existing_ensure_state(&registry, WarmupTaskState::Failed);
+
+    registry.cancel(&paused).expect("cancel task");
+    assert_existing_ensure_state(&registry, WarmupTaskState::Cancelled);
+
+    let tasks = registry
+        .list(datalens_warmup::WarmupTaskFilter::default())
+        .unwrap();
+    assert_eq!(tasks.len(), 1);
+}
+
+#[test]
 fn test_warmup_fetches_evm_logs_in_chunks_and_writes_durable_cache() {
     let storage = LocalStorage::new(temp_root("chunked-storage"));
     let registry = LocalWarmupRegistry::new(object_store("chunked-registry"));
@@ -831,6 +934,87 @@ fn test_task_pool_runs_available_tasks_with_global_bound() {
 }
 
 #[test]
+fn test_task_pool_prioritizes_active_follow_query_watermark() {
+    let storage = LocalStorage::new(temp_root("pool-follow-query-priority-storage"));
+    let registry = LocalWarmupRegistry::new(object_store("pool-follow-query-priority-registry"));
+    let watermarks =
+        QueryWatermarkStore::new(object_store("pool-follow-query-priority-watermarks"));
+    let adapter = FixtureAdapter::new(2_000).with_max_range_len(1);
+    let pool = WarmupTaskPool::new(
+        runtime(adapter.clone(), storage, registry.clone())
+            .with_query_watermarks(watermarks.clone())
+            .with_follow_query_start_offset_blocks(Some(1))
+            .with_follow_query_lookahead_blocks(1)
+            .with_runtime_config(WarmupRuntimeConfig {
+                max_fetches_per_task_loop: 1,
+            }),
+        WarmupSchedulerConfig {
+            max_global_concurrent_tasks: 1,
+            max_concurrent_tasks_per_chain: 1,
+        },
+    );
+    let active = registry
+        .submit(follow_query_request())
+        .expect("active follow query")
+        .task_id;
+    save_query_watermark(&watermarks, 1_000);
+    let stale = ensure_lower_task_id_without_watermark(&registry, &active);
+
+    let results = pool.run_available_once().expect("run prioritized task");
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(adapter.fetches(), vec![blocks(1_001, 1_001)]);
+    assert_eq!(registry.load_cursor(&active).unwrap().unwrap().next, 1_002);
+    assert_eq!(registry.load_cursor(&stale).unwrap().unwrap().next, 1);
+}
+
+#[test]
+fn test_task_pool_rotates_between_low_lead_follow_query_tasks() {
+    let storage = LocalStorage::new(temp_root("pool-follow-query-fairness-storage"));
+    let registry = LocalWarmupRegistry::new(object_store("pool-follow-query-fairness-registry"));
+    let watermarks =
+        QueryWatermarkStore::new(object_store("pool-follow-query-fairness-watermarks"));
+    let adapter = FixtureAdapter::new(2_000).with_max_range_len(1);
+    let pool = WarmupTaskPool::new(
+        runtime(adapter, storage, registry.clone())
+            .with_query_watermarks(watermarks.clone())
+            .with_follow_query_start_offset_blocks(Some(1))
+            .with_follow_query_lookahead_blocks(1)
+            .with_runtime_config(WarmupRuntimeConfig {
+                max_fetches_per_task_loop: 1,
+            }),
+        WarmupSchedulerConfig {
+            max_global_concurrent_tasks: 1,
+            max_concurrent_tasks_per_chain: 1,
+        },
+    );
+    let first = registry
+        .submit(follow_query_request())
+        .expect("first follow query")
+        .task_id;
+    let mut second_request = follow_query_request();
+    second_request.selector = second_selector();
+    let second = registry
+        .submit(second_request)
+        .expect("second follow query")
+        .task_id;
+    save_query_watermark(&watermarks, 1_000);
+    save_query_watermark_for(&watermarks, "app-a", &second_selector(), 1_000);
+
+    pool.run_available_once().expect("first tick");
+    pool.run_available_once().expect("second tick");
+
+    assert!(
+        registry.load_cursor(&first).unwrap().unwrap().next > 1,
+        "first follow_query task should get a run opportunity"
+    );
+    assert!(
+        registry.load_cursor(&second).unwrap().unwrap().next > 1,
+        "second follow_query task should get a run opportunity"
+    );
+}
+
+#[test]
 fn test_task_pool_scopes_shared_registry_to_adapter_chain() {
     let storage = LocalStorage::new(temp_root("pool-shared-chain-storage"));
     let registry = LocalWarmupRegistry::new(object_store("pool-shared-chain-registry"));
@@ -951,6 +1135,37 @@ fn follow_query_request() -> WarmupSubmitRequest {
     }
 }
 
+fn ensure_lower_task_id_without_watermark(
+    registry: &LocalWarmupRegistry<LocalObjectStore>,
+    active: &datalens_warmup::WarmupTaskId,
+) -> datalens_warmup::WarmupTaskId {
+    for index in 0..512 {
+        let mut request = follow_query_request();
+        request.application_id = format!("inactive-{index}");
+        let stale = registry
+            .ensure(request)
+            .expect("inactive follow query")
+            .task_id;
+        if stale.as_str() < active.as_str() {
+            return stale;
+        }
+    }
+    panic!("could not create a lower sorted inactive follow_query task");
+}
+
+fn assert_existing_ensure_state(
+    registry: &LocalWarmupRegistry<LocalObjectStore>,
+    state: WarmupTaskState,
+) {
+    let mut request = follow_query_request();
+    request.start = 100;
+
+    let outcome = registry.ensure(request).expect("ensure existing task");
+
+    assert!(!outcome.created);
+    assert_eq!(outcome.state, state);
+}
+
 fn execute_log_query<R>(executor: &NativeQueryExecutor<R, FixtureAdapter>, range: LedgerRange)
 where
     R: datalens_storage::StorageRepository + Clone + 'static,
@@ -974,13 +1189,24 @@ fn save_query_watermark<S>(watermarks: &QueryWatermarkStore<S>, latest_block: u6
 where
     S: datalens_storage::ObjectStore + 'static,
 {
+    save_query_watermark_for(watermarks, "app-a", &selector(), latest_block);
+}
+
+fn save_query_watermark_for<S>(
+    watermarks: &QueryWatermarkStore<S>,
+    application_id: &str,
+    selector: &DatasetSelector,
+    latest_block: u64,
+) where
+    S: datalens_storage::ObjectStore + 'static,
+{
     watermarks
         .update(&QueryWatermark {
             key: QueryWatermarkKey::new(
-                "app-a",
+                application_id,
                 chain(),
                 DatasetKey::evm_logs(),
-                &selector(),
+                selector,
                 LedgerRangeKind::Block,
             ),
             latest_block,
@@ -1035,6 +1261,14 @@ fn polygon_chain() -> ChainIdentity {
 fn selector() -> DatasetSelector {
     DatasetSelector::try_evm_logs(LogFilter {
         addresses: vec!["0x0000000000000000000000000000000000000001".to_owned()],
+        topics: Vec::new(),
+    })
+    .unwrap()
+}
+
+fn second_selector() -> DatasetSelector {
+    DatasetSelector::try_evm_logs(LogFilter {
+        addresses: vec!["0x0000000000000000000000000000000000000002".to_owned()],
         topics: Vec::new(),
     })
     .unwrap()

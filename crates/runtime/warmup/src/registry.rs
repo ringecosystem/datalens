@@ -4,12 +4,14 @@ use datalens_storage::ObjectStore;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    WarmupCursor, WarmupSubmitRequest, WarmupTask, WarmupTaskId, WarmupTaskMode, WarmupTaskState,
-    task::task_dedupe_key,
+    WarmupCursor, WarmupFollowQueryStatus, WarmupSubmitRequest, WarmupTask, WarmupTaskId,
+    WarmupTaskMode, WarmupTaskState,
+    task::{task_dedupe_key, task_ensure_key, task_ensure_key_for_task},
 };
 
 pub trait WarmupRegistry: Clone + Send + Sync + 'static {
     fn submit(&self, request: WarmupSubmitRequest) -> Result<WarmupSubmitOutcome, DatalensError>;
+    fn ensure(&self, request: WarmupSubmitRequest) -> Result<WarmupEnsureOutcome, DatalensError>;
     fn get(&self, task_id: &WarmupTaskId) -> Result<Option<WarmupTask>, DatalensError>;
     fn save_task(&self, task: &WarmupTask) -> Result<(), DatalensError>;
     fn list(&self, filter: WarmupTaskFilter) -> Result<Vec<WarmupTask>, DatalensError>;
@@ -48,6 +50,13 @@ pub struct WarmupSubmitOutcome {
     pub created: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WarmupEnsureOutcome {
+    pub task_id: WarmupTaskId,
+    pub created: bool,
+    pub state: WarmupTaskState,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct WarmupTaskFilter {
     pub application_id: Option<String>,
@@ -77,6 +86,13 @@ where
         request: WarmupSubmitRequest,
     ) -> Result<WarmupSubmitOutcome, DatalensError> {
         <Self as WarmupRegistry>::submit(self, request)
+    }
+
+    pub fn ensure(
+        &self,
+        request: WarmupSubmitRequest,
+    ) -> Result<WarmupEnsureOutcome, DatalensError> {
+        <Self as WarmupRegistry>::ensure(self, request)
     }
 
     pub fn get(&self, task_id: &WarmupTaskId) -> Result<Option<WarmupTask>, DatalensError> {
@@ -120,6 +136,14 @@ where
     S: ObjectStore + 'static,
 {
     fn submit(&self, request: WarmupSubmitRequest) -> Result<WarmupSubmitOutcome, DatalensError> {
+        if request.mode == WarmupTaskMode::FollowQuery {
+            let outcome = self.ensure(request)?;
+            return Ok(WarmupSubmitOutcome {
+                task_id: outcome.task_id,
+                created: outcome.created,
+            });
+        }
+
         let dedupe_key = task_dedupe_key(&request);
         if let Some(existing) = self
             .list(WarmupTaskFilter::default())?
@@ -143,6 +167,43 @@ where
         Ok(WarmupSubmitOutcome {
             task_id,
             created: true,
+        })
+    }
+
+    fn ensure(&self, request: WarmupSubmitRequest) -> Result<WarmupEnsureOutcome, DatalensError> {
+        if request.mode != WarmupTaskMode::FollowQuery {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                "warmup ensure requires follow_query mode",
+            ));
+        }
+        let ensure_key = task_ensure_key(&request);
+        if let Some(existing) = self
+            .list(WarmupTaskFilter::default())?
+            .into_iter()
+            .filter(|task| task.mode == WarmupTaskMode::FollowQuery)
+            .find(|task| task_ensure_key_for_task(task) == ensure_key)
+        {
+            return Ok(WarmupEnsureOutcome {
+                task_id: existing.task_id,
+                created: false,
+                state: existing.state,
+            });
+        }
+
+        let task = WarmupTask::from_ensure(request, unix_seconds_now()?)?;
+        let task_id = task.task_id.clone();
+        let state = task.state;
+        self.save_task(&task)?;
+        self.save_cursor(&WarmupCursor::new(
+            task.task_id.clone(),
+            task.start,
+            task.created_at,
+        ))?;
+        Ok(WarmupEnsureOutcome {
+            task_id,
+            created: true,
+            state,
         })
     }
 
@@ -223,6 +284,8 @@ struct StoredWarmupTask {
     updated_at: u64,
     last_error: Option<String>,
     stats: crate::WarmupStats,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    follow_query_status: Option<WarmupFollowQueryStatus>,
     dedupe_key: String,
 }
 
@@ -273,6 +336,7 @@ impl StoredWarmupTask {
             updated_at: task.updated_at,
             last_error: task.last_error.clone(),
             stats: task.stats.clone(),
+            follow_query_status: task.follow_query_status.clone(),
             dedupe_key: task.dedupe_key.clone(),
         })
     }
@@ -304,6 +368,7 @@ impl StoredWarmupTask {
             updated_at: self.updated_at,
             last_error: self.last_error,
             stats: self.stats,
+            follow_query_status: self.follow_query_status,
             dedupe_key: self.dedupe_key,
         })
     }
