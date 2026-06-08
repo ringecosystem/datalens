@@ -25,7 +25,8 @@ use datalens_storage::{
     CacheOutcome, CreateDurablePromotionIntent, DurablePromotionIntent,
     DurablePromotionIntentCreateOutcome, DurablePromotionIntentRepository,
     DurablePromotionIntentSource, DurablePromotionIntentStatus, DurablePromotionIntentStore,
-    FillOutcome, LocalObjectStore, LocalStorage, Manifest, QueryOutcome, QueryWatermarkKey,
+    FillOutcome, LocalObjectStore, LocalStorage, Manifest, QueryActivityKey,
+    QueryActivityRepository, QueryActivityStore, QueryOutcome, QueryWatermarkKey,
     QueryWatermarkRepository, QueryWatermarkStore, StorageRepository, StorageWriteOutcome,
     StorageWriteRequest, UsageLedgerRepository, UsageLedgerStore,
 };
@@ -767,6 +768,37 @@ fn test_executor_records_query_watermark_after_successful_durable_query() {
 }
 
 #[test]
+fn test_executor_records_query_activity_after_successful_durable_query() {
+    let root = temp_storage_root("executor-query-activity");
+    let storage = LocalStorage::new(&root);
+    let activities = QueryActivityStore::new(LocalObjectStore::new(&root));
+    let source = MockSource::default().with_blocks(vec![block(30, "0x30")]);
+    let executor = executor(storage, source).with_query_activity(
+        activities.clone(),
+        ApplicationIdentity::named("analytics-api"),
+    );
+
+    executor
+        .execute(blocks_input(30, 32))
+        .expect("durable query succeeds");
+
+    let key = QueryActivityKey::new(
+        "analytics-api",
+        ethereum_identity(),
+        DatasetKey::evm_blocks(),
+        &DatasetSelector::all(),
+        datalens_core::LedgerRangeKind::Block,
+    );
+    let activity = wait_for_query_activity(&activities, &key);
+    assert_eq!(activity.latest_range, LedgerRange::blocks(30, 32).unwrap());
+    assert!(activity.request_id.is_some());
+    assert_eq!(
+        activity.key.selector_canonical_key,
+        DatasetSelector::all().canonical_key()
+    );
+}
+
+#[test]
 fn test_executor_latest_only_fetches_latest_without_durable_read_or_write() {
     let root = temp_storage_root("executor-hot-read-through");
     let storage = LocalStorage::new(&root);
@@ -987,6 +1019,23 @@ fn test_executor_query_watermark_write_failure_does_not_block_successful_query()
     let result = executor
         .execute(blocks_input(30, 32))
         .expect("watermark failure does not block query");
+
+    assert_eq!(block_numbers(&result.rows), vec![30]);
+    wait_for_attempt(&attempts);
+}
+
+#[test]
+fn test_executor_query_activity_write_failure_does_not_block_successful_query() {
+    let storage = LocalStorage::new(temp_storage_root("executor-activity-failure"));
+    let source = MockSource::default().with_blocks(vec![block(30, "0x30")]);
+    let activities = FailingQueryActivityRepository::default();
+    let attempts = activities.attempts();
+    let executor = executor(storage, source)
+        .with_query_activity(activities, ApplicationIdentity::named("api"));
+
+    let result = executor
+        .execute(blocks_input(30, 32))
+        .expect("activity failure does not block query");
 
     assert_eq!(block_numbers(&result.rows), vec![30]);
     wait_for_attempt(&attempts);
@@ -1861,6 +1910,34 @@ impl QueryWatermarkRepository for FailingQueryWatermarkRepository {
     }
 }
 
+#[derive(Clone, Default)]
+struct FailingQueryActivityRepository {
+    attempts: Arc<AtomicUsize>,
+}
+
+impl FailingQueryActivityRepository {
+    fn attempts(&self) -> Arc<AtomicUsize> {
+        self.attempts.clone()
+    }
+}
+
+impl QueryActivityRepository for FailingQueryActivityRepository {
+    fn update(&self, _activity: &datalens_storage::QueryActivity) -> Result<(), DatalensError> {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+        Err(DatalensError::new(
+            DatalensErrorKind::StorageWriteFailure,
+            "injected query activity write failure",
+        ))
+    }
+
+    fn read(
+        &self,
+        _key: &QueryActivityKey,
+    ) -> Result<Option<datalens_storage::QueryActivity>, DatalensError> {
+        Ok(None)
+    }
+}
+
 #[derive(Clone)]
 struct SlowUsageLedgerRepository {
     attempts: Arc<AtomicUsize>,
@@ -1907,6 +1984,25 @@ fn wait_for_attempt(attempts: &AtomicUsize) {
         attempts.load(Ordering::SeqCst) > 0,
         "metadata repository was not attempted"
     );
+}
+
+fn wait_for_query_activity<S>(
+    activities: &QueryActivityStore<S>,
+    key: &QueryActivityKey,
+) -> datalens_storage::QueryActivity
+where
+    S: datalens_storage::ObjectStore + 'static,
+{
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(activity) = activities.read(key).expect("read activity") {
+            return activity;
+        }
+        if Instant::now() >= deadline {
+            panic!("query activity was not recorded");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn wait_for_ledger_events<R>(

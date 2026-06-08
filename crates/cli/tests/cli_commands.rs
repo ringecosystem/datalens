@@ -725,6 +725,7 @@ fn test_config_parses_warmup_follow_query_lookahead() {
         follow_query_start_offset_blocks = 512
         follow_query_start_offset_tiers_blocks = [5000, 3000, 1000]
         follow_query_catchup_threshold_blocks = 250
+        query_activity_ttl_seconds = 600
 
         [chains.ethereum]
         kind = "evm"
@@ -755,6 +756,7 @@ fn test_config_parses_warmup_follow_query_lookahead() {
         Some(vec![5000, 3000, 1000])
     );
     assert_eq!(config.warmup.follow_query_catchup_threshold_blocks, 250);
+    assert_eq!(config.warmup.query_activity_ttl_seconds, 600);
     assert_eq!(
         config
             .chains

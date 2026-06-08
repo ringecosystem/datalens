@@ -29,8 +29,9 @@ use datalens_storage::{
     DurableIntentSubmissionRequest, DurableIntentSubmissionService,
     DurablePromotionIntentRepository, DurablePromotionIntentSource,
     DurableWriteOutcome as LedgerDurableWriteOutcome, FillOutcome as LedgerFillOutcome,
-    QueryOutcome as LedgerQueryOutcome, QueryWatermark, QueryWatermarkKey,
-    QueryWatermarkRepository, StorageRepository, UsageLedgerEntry, UsageLedgerRepository,
+    QueryActivity, QueryActivityKey, QueryActivityRepository, QueryOutcome as LedgerQueryOutcome,
+    QueryWatermark, QueryWatermarkKey, QueryWatermarkRepository, StorageRepository,
+    UsageLedgerEntry, UsageLedgerRepository,
 };
 use datalens_writer::{
     DurableWriteResult, DurableWriteSegment, DurableWriter, DurableWriterConfig,
@@ -105,6 +106,7 @@ pub struct NativeQueryExecutor<R, S> {
     metrics: Option<ExecutorMetrics>,
     usage_ledger: Option<ExecutorUsageLedger>,
     query_watermarks: Option<ExecutorQueryWatermarks>,
+    query_activity: Option<ExecutorQueryActivity>,
     durable_intents: Option<Arc<dyn DurablePromotionIntentRepository>>,
     durable_intent_worker: Option<DurablePromotionIntentWorker<R, S>>,
 }
@@ -124,6 +126,12 @@ pub(crate) struct ExecutorUsageLedger {
 #[derive(Clone)]
 pub(crate) struct ExecutorQueryWatermarks {
     pub(crate) repository: Arc<dyn QueryWatermarkRepository>,
+    pub(crate) application: ApplicationIdentity,
+}
+
+#[derive(Clone)]
+pub(crate) struct ExecutorQueryActivity {
+    pub(crate) repository: Arc<dyn QueryActivityRepository>,
     pub(crate) application: ApplicationIdentity,
 }
 
@@ -155,6 +163,7 @@ where
             metrics: None,
             usage_ledger: None,
             query_watermarks: None,
+            query_activity: None,
             durable_intents: None,
             durable_intent_worker: None,
         }
@@ -190,6 +199,18 @@ where
         application: ApplicationIdentity,
     ) -> Self {
         self.query_watermarks = Some(ExecutorQueryWatermarks {
+            repository: Arc::new(repository),
+            application,
+        });
+        self
+    }
+
+    pub fn with_query_activity(
+        mut self,
+        repository: impl QueryActivityRepository + 'static,
+        application: ApplicationIdentity,
+    ) -> Self {
+        self.query_activity = Some(ExecutorQueryActivity {
             repository: Arc::new(repository),
             application,
         });
@@ -760,6 +781,7 @@ where
             result.rows.row_count(),
         );
         self.record_query_watermark_for_plan(&query_id, &application, &plan);
+        self.record_query_activity_for_plan(&query_id, &application, &plan);
         Ok(result)
     }
 
@@ -1041,6 +1063,17 @@ where
             application
                 .clone()
                 .unwrap_or_else(|| watermarks.application.clone())
+        })
+    }
+
+    fn activity_application(
+        &self,
+        application: &Option<ApplicationIdentity>,
+    ) -> Option<ApplicationIdentity> {
+        self.query_activity.as_ref().map(|activity| {
+            application
+                .clone()
+                .unwrap_or_else(|| activity.application.clone())
         })
     }
 
@@ -1366,6 +1399,58 @@ where
             plan.ledger_range.end(),
         );
     }
+
+    fn record_query_activity_for_plan(
+        &self,
+        query_id: &str,
+        application: &Option<ApplicationIdentity>,
+        plan: &datalens_planner::NativeQueryPlan,
+    ) {
+        let Some(activities) = &self.query_activity else {
+            return;
+        };
+        let Some(application) = self.activity_application(application) else {
+            return;
+        };
+        let Some(latest_range) = durable_activity_range(plan) else {
+            return;
+        };
+        let updated_at_unix_seconds = match unix_seconds_now() {
+            Ok(updated_at_unix_seconds) => updated_at_unix_seconds,
+            Err(error) => {
+                log::warn!(
+                    "query metadata build failed metadata_kind=query_activity query_id={} chain={} dataset={} range={}-{} kind={:?} message={}",
+                    query_id,
+                    plan.chain.configured_name(),
+                    plan.dataset_key.as_str(),
+                    plan.ledger_range.start(),
+                    plan.ledger_range.end(),
+                    error.kind,
+                    error.message
+                );
+                return;
+            }
+        };
+        let activity = QueryActivity {
+            key: QueryActivityKey::new(
+                application.as_str(),
+                plan.chain.clone(),
+                plan.dataset_key.clone(),
+                &plan.selector,
+                plan.ledger_range.kind(),
+            ),
+            latest_range,
+            updated_at_unix_seconds,
+            request_id: Some(query_id.to_owned()),
+        };
+        enqueue_query_activity_update(
+            activities.repository.clone(),
+            query_id.to_owned(),
+            activity,
+            plan.ledger_range.start(),
+            plan.ledger_range.end(),
+        );
+    }
 }
 
 const QUERY_METADATA_QUEUE_CAPACITY: usize = 1024;
@@ -1448,6 +1533,11 @@ enum MetadataJob {
         watermark: QueryWatermark,
         context: QueryWatermarkMetadataContext,
     },
+    QueryActivityUpdate {
+        repository: Arc<dyn QueryActivityRepository>,
+        activity: QueryActivity,
+        context: QueryActivityMetadataContext,
+    },
     #[cfg(test)]
     NoopForTest,
 }
@@ -1472,6 +1562,13 @@ struct UsageLedgerMetadataContext {
 struct QueryWatermarkMetadataContext {
     base: QueryMetadataContext,
     latest_block: u64,
+}
+
+#[derive(Clone)]
+struct QueryActivityMetadataContext {
+    base: QueryMetadataContext,
+    latest_start: u64,
+    latest_end: u64,
 }
 
 fn metadata_worker_pool() -> &'static MetadataWorkerPool {
@@ -1603,6 +1700,76 @@ fn enqueue_query_watermark_update(
     }
 }
 
+fn enqueue_query_activity_update(
+    repository: Arc<dyn QueryActivityRepository>,
+    query_id: String,
+    activity: QueryActivity,
+    range_start: u64,
+    range_end: u64,
+) {
+    let enqueue_start = Instant::now();
+    let application_id = activity.key.application_id.clone();
+    let chain = activity.key.chain.configured_name().to_owned();
+    let dataset = activity.key.dataset_key.as_str().to_owned();
+    let latest_start = activity.latest_range.start();
+    let latest_end = activity.latest_range.end();
+    let context = QueryActivityMetadataContext {
+        base: QueryMetadataContext {
+            query_id,
+            application_id,
+            chain,
+            dataset,
+            range_start,
+            range_end,
+        },
+        latest_start,
+        latest_end,
+    };
+    let outcome = metadata_worker_pool().enqueue(MetadataJob::QueryActivityUpdate {
+        repository,
+        activity,
+        context: context.clone(),
+    });
+    match outcome {
+        MetadataEnqueueOutcome::Enqueued => log::debug!(
+            "query metadata enqueue completed metadata_kind=query_activity query_id={} application={} chain={} dataset={} range={}-{} latest_range={}-{} duration_ms={}",
+            context.base.query_id,
+            context.base.application_id,
+            context.base.chain,
+            context.base.dataset,
+            context.base.range_start,
+            context.base.range_end,
+            context.latest_start,
+            context.latest_end,
+            elapsed_ms(enqueue_start)
+        ),
+        MetadataEnqueueOutcome::Full => log::warn!(
+            "query metadata enqueue dropped metadata_kind=query_activity query_id={} application={} chain={} dataset={} range={}-{} latest_range={}-{} duration_ms={} reason=queue_full",
+            context.base.query_id,
+            context.base.application_id,
+            context.base.chain,
+            context.base.dataset,
+            context.base.range_start,
+            context.base.range_end,
+            context.latest_start,
+            context.latest_end,
+            elapsed_ms(enqueue_start),
+        ),
+        MetadataEnqueueOutcome::Closed => log::warn!(
+            "query metadata enqueue failed metadata_kind=query_activity query_id={} application={} chain={} dataset={} range={}-{} latest_range={}-{} duration_ms={} reason=queue_closed",
+            context.base.query_id,
+            context.base.application_id,
+            context.base.chain,
+            context.base.dataset,
+            context.base.range_start,
+            context.base.range_end,
+            context.latest_start,
+            context.latest_end,
+            elapsed_ms(enqueue_start),
+        ),
+    }
+}
+
 fn process_metadata_job(job: MetadataJob) {
     match job {
         MetadataJob::UsageLedgerAppend {
@@ -1671,6 +1838,41 @@ fn process_metadata_job(job: MetadataJob) {
                 ),
             }
         }
+        MetadataJob::QueryActivityUpdate {
+            repository,
+            activity,
+            context,
+        } => {
+            let start = Instant::now();
+            match repository.update(&activity) {
+                Ok(()) => log::info!(
+                    "query metadata background write completed metadata_kind=query_activity query_id={} application={} chain={} dataset={} range={}-{} latest_range={}-{} duration_ms={}",
+                    context.base.query_id,
+                    context.base.application_id,
+                    context.base.chain,
+                    context.base.dataset,
+                    context.base.range_start,
+                    context.base.range_end,
+                    context.latest_start,
+                    context.latest_end,
+                    elapsed_ms(start)
+                ),
+                Err(error) => log::warn!(
+                    "query metadata background write failed metadata_kind=query_activity query_id={} application={} chain={} dataset={} range={}-{} latest_range={}-{} duration_ms={} kind={:?} message={}",
+                    context.base.query_id,
+                    context.base.application_id,
+                    context.base.chain,
+                    context.base.dataset,
+                    context.base.range_start,
+                    context.base.range_end,
+                    context.latest_start,
+                    context.latest_end,
+                    elapsed_ms(start),
+                    error.kind,
+                    error.message
+                ),
+            }
+        }
         #[cfg(test)]
         MetadataJob::NoopForTest => {}
     }
@@ -1690,6 +1892,16 @@ fn durable_watermark_block(plan: &datalens_planner::NativeQueryPlan) -> Option<u
         } => Some(plan.ledger_range.end().min(durable_boundary.value)),
         FinalityPolicy::HotReadThrough { .. } => None,
     }
+}
+
+fn durable_activity_range(plan: &datalens_planner::NativeQueryPlan) -> Option<LedgerRange> {
+    let latest_block = durable_watermark_block(plan)?;
+    LedgerRange::try_new(
+        plan.ledger_range.kind(),
+        plan.ledger_range.start(),
+        latest_block,
+    )
+    .ok()
 }
 
 fn unix_seconds_now() -> Result<u64, DatalensError> {

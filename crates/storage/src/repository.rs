@@ -73,6 +73,7 @@ pub use crate::object_store::{
     LocalObjectStore, ObjectMetadata, ObjectStore, S3ObjectStore, S3ObjectStoreConfig,
     validate_object_key,
 };
+pub use crate::query_activity::{QueryActivity, QueryActivityKey, QueryActivityRepository};
 pub use crate::query_watermark::{QueryWatermark, QueryWatermarkKey, QueryWatermarkRepository};
 pub use crate::read_through_cache::ReadThroughCacheConfig;
 pub use crate::usage_ledger::{
@@ -1129,6 +1130,26 @@ impl QueryWatermarkRepository for Box<dyn QueryWatermarkRepository> {
     }
 
     fn read(&self, key: &QueryWatermarkKey) -> Result<Option<QueryWatermark>, DatalensError> {
+        self.as_ref().read(key)
+    }
+}
+
+impl QueryActivityRepository for Arc<dyn QueryActivityRepository> {
+    fn update(&self, activity: &QueryActivity) -> Result<(), DatalensError> {
+        self.as_ref().update(activity)
+    }
+
+    fn read(&self, key: &QueryActivityKey) -> Result<Option<QueryActivity>, DatalensError> {
+        self.as_ref().read(key)
+    }
+}
+
+impl QueryActivityRepository for Box<dyn QueryActivityRepository> {
+    fn update(&self, activity: &QueryActivity) -> Result<(), DatalensError> {
+        self.as_ref().update(activity)
+    }
+
+    fn read(&self, key: &QueryActivityKey) -> Result<Option<QueryActivity>, DatalensError> {
         self.as_ref().read(key)
     }
 }

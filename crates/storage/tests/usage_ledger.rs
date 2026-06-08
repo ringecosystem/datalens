@@ -14,9 +14,10 @@ use datalens_core::{
     NetworkId,
 };
 use datalens_storage::{
-    CacheOutcome, FillOutcome, LocalObjectStore, ObjectMetadata, ObjectStore, QueryOutcome,
-    QueryWatermark, QueryWatermarkKey, QueryWatermarkRepository, QueryWatermarkStore,
-    UsageLedgerEntry, UsageLedgerRepository, UsageLedgerStore,
+    CacheOutcome, FillOutcome, LocalObjectStore, ObjectMetadata, ObjectStore, QueryActivity,
+    QueryActivityKey, QueryActivityRepository, QueryActivityStore, QueryOutcome, QueryWatermark,
+    QueryWatermarkKey, QueryWatermarkRepository, QueryWatermarkStore, UsageLedgerEntry,
+    UsageLedgerRepository, UsageLedgerStore,
 };
 
 #[test]
@@ -237,6 +238,190 @@ fn test_query_watermark_records_highest_selector_progress_without_rewinding() {
         watermark.key.selector_canonical_key,
         selector.canonical_key()
     );
+}
+
+#[test]
+fn test_query_activity_can_rewind_without_rewinding_query_watermark() {
+    let root = temp_storage_root("query-activity-rewinds");
+    let watermarks = QueryWatermarkStore::new(LocalObjectStore::new(&root));
+    let activities = QueryActivityStore::new(LocalObjectStore::new(&root));
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let watermark_key = QueryWatermarkKey::new(
+        "analytics-api",
+        chain.clone(),
+        DatasetKey::evm_blocks(),
+        &selector,
+        LedgerRange::blocks(1, 1).unwrap().kind(),
+    );
+    let activity_key = QueryActivityKey::new(
+        "analytics-api",
+        chain.clone(),
+        DatasetKey::evm_blocks(),
+        &selector,
+        LedgerRange::blocks(1, 1).unwrap().kind(),
+    );
+
+    watermarks
+        .update(&QueryWatermark {
+            key: watermark_key.clone(),
+            latest_block: 100,
+            updated_at_unix_seconds: 10,
+        })
+        .expect("write high watermark");
+    activities
+        .update(&QueryActivity {
+            key: activity_key.clone(),
+            latest_range: LedgerRange::blocks(90, 100).unwrap(),
+            updated_at_unix_seconds: 10,
+            request_id: Some("query-high".to_owned()),
+        })
+        .expect("write high activity");
+
+    watermarks
+        .update(&QueryWatermark {
+            key: watermark_key.clone(),
+            latest_block: 20,
+            updated_at_unix_seconds: 20,
+        })
+        .expect("lower watermark update is ignored");
+    activities
+        .update(&QueryActivity {
+            key: activity_key.clone(),
+            latest_range: LedgerRange::blocks(10, 20).unwrap(),
+            updated_at_unix_seconds: 20,
+            request_id: Some("query-low".to_owned()),
+        })
+        .expect("activity rewinds");
+
+    let watermark = watermarks
+        .read(&watermark_key)
+        .expect("read watermark")
+        .expect("watermark");
+    let activity = activities
+        .read(&activity_key)
+        .expect("read activity")
+        .expect("activity");
+    assert_eq!(watermark.latest_block, 100);
+    assert_eq!(watermark.updated_at_unix_seconds, 10);
+    assert_eq!(activity.latest_range, LedgerRange::blocks(10, 20).unwrap());
+    assert_eq!(activity.updated_at_unix_seconds, 20);
+    assert_eq!(activity.request_id.as_deref(), Some("query-low"));
+    assert_eq!(
+        activity.key.selector_canonical_key,
+        selector.canonical_key()
+    );
+}
+
+#[test]
+fn test_query_activity_skips_older_out_of_order_update() {
+    let store = QueryActivityStore::new(LocalObjectStore::new(temp_storage_root(
+        "query-activity-out-of-order",
+    )));
+    let selector = DatasetSelector::all();
+    let key = QueryActivityKey::new(
+        "analytics-api",
+        test_chain(),
+        DatasetKey::evm_blocks(),
+        &selector,
+        datalens_core::LedgerRangeKind::Block,
+    );
+
+    store
+        .update(&QueryActivity {
+            key: key.clone(),
+            latest_range: LedgerRange::blocks(90, 100).unwrap(),
+            updated_at_unix_seconds: 200,
+            request_id: Some("q-newer".to_owned()),
+        })
+        .expect("write newer activity");
+    store
+        .update(&QueryActivity {
+            key: key.clone(),
+            latest_range: LedgerRange::blocks(10, 20).unwrap(),
+            updated_at_unix_seconds: 100,
+            request_id: Some("q-older".to_owned()),
+        })
+        .expect("older out-of-order update is ignored");
+
+    let activity = store.read(&key).expect("read activity").expect("activity");
+    assert_eq!(activity.latest_range, LedgerRange::blocks(90, 100).unwrap());
+    assert_eq!(activity.updated_at_unix_seconds, 200);
+    assert_eq!(activity.request_id.as_deref(), Some("q-newer"));
+}
+
+#[test]
+fn test_query_activity_allows_newer_lower_block_update() {
+    let store = QueryActivityStore::new(LocalObjectStore::new(temp_storage_root(
+        "query-activity-newer-lower-block",
+    )));
+    let selector = DatasetSelector::all();
+    let key = QueryActivityKey::new(
+        "analytics-api",
+        test_chain(),
+        DatasetKey::evm_blocks(),
+        &selector,
+        datalens_core::LedgerRangeKind::Block,
+    );
+
+    store
+        .update(&QueryActivity {
+            key: key.clone(),
+            latest_range: LedgerRange::blocks(90, 100).unwrap(),
+            updated_at_unix_seconds: 100,
+            request_id: Some("q-high".to_owned()),
+        })
+        .expect("write older high activity");
+    store
+        .update(&QueryActivity {
+            key: key.clone(),
+            latest_range: LedgerRange::blocks(10, 20).unwrap(),
+            updated_at_unix_seconds: 200,
+            request_id: Some("q-low".to_owned()),
+        })
+        .expect("newer lower activity rewinds range");
+
+    let activity = store.read(&key).expect("read activity").expect("activity");
+    assert_eq!(activity.latest_range, LedgerRange::blocks(10, 20).unwrap());
+    assert_eq!(activity.updated_at_unix_seconds, 200);
+    assert_eq!(activity.request_id.as_deref(), Some("q-low"));
+}
+
+#[test]
+fn test_query_activity_uses_request_id_tie_breaker_for_equal_timestamps() {
+    let store = QueryActivityStore::new(LocalObjectStore::new(temp_storage_root(
+        "query-activity-request-id-tie",
+    )));
+    let selector = DatasetSelector::all();
+    let key = QueryActivityKey::new(
+        "analytics-api",
+        test_chain(),
+        DatasetKey::evm_blocks(),
+        &selector,
+        datalens_core::LedgerRangeKind::Block,
+    );
+
+    store
+        .update(&QueryActivity {
+            key: key.clone(),
+            latest_range: LedgerRange::blocks(90, 100).unwrap(),
+            updated_at_unix_seconds: 200,
+            request_id: Some("q002".to_owned()),
+        })
+        .expect("write newer request id");
+    store
+        .update(&QueryActivity {
+            key: key.clone(),
+            latest_range: LedgerRange::blocks(10, 20).unwrap(),
+            updated_at_unix_seconds: 200,
+            request_id: Some("q001".to_owned()),
+        })
+        .expect("older request id update is ignored");
+
+    let activity = store.read(&key).expect("read activity").expect("activity");
+    assert_eq!(activity.latest_range, LedgerRange::blocks(90, 100).unwrap());
+    assert_eq!(activity.updated_at_unix_seconds, 200);
+    assert_eq!(activity.request_id.as_deref(), Some("q002"));
 }
 
 #[test]
