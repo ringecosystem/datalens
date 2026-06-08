@@ -81,6 +81,14 @@ pub enum DurablePromotionIntentCreateOutcome {
     Existing(DurablePromotionIntent),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DurablePromotionIntentBacklog {
+    pub chain: ChainIdentity,
+    pub source: DurablePromotionIntentSource,
+    pub pending_total: usize,
+    pub oldest_pending_age_seconds: u64,
+}
+
 pub trait DurablePromotionIntentRepository: Send + Sync {
     fn create_or_get(
         &self,
@@ -101,6 +109,15 @@ pub trait DurablePromotionIntentRepository: Send + Sync {
     fn rebuild_pending_indexes(&self, now_unix_seconds: u64) -> Result<usize, DatalensError> {
         let _ = now_unix_seconds;
         Ok(0)
+    }
+    fn pending_backlog_for_chain(
+        &self,
+        chain: &ChainIdentity,
+        now_unix_seconds: u64,
+    ) -> Result<Vec<DurablePromotionIntentBacklog>, DatalensError> {
+        let _ = chain;
+        let _ = now_unix_seconds;
+        Ok(Vec::new())
     }
     fn mark_running(
         &self,
@@ -164,6 +181,15 @@ impl DurablePromotionIntentRepository for Arc<dyn DurablePromotionIntentReposito
 
     fn rebuild_pending_indexes(&self, now_unix_seconds: u64) -> Result<usize, DatalensError> {
         self.as_ref().rebuild_pending_indexes(now_unix_seconds)
+    }
+
+    fn pending_backlog_for_chain(
+        &self,
+        chain: &ChainIdentity,
+        now_unix_seconds: u64,
+    ) -> Result<Vec<DurablePromotionIntentBacklog>, DatalensError> {
+        self.as_ref()
+            .pending_backlog_for_chain(chain, now_unix_seconds)
     }
 
     fn mark_running(
@@ -349,6 +375,39 @@ where
         });
         Ok(entries)
     }
+
+    fn pending_index_backlog_for_source(
+        &self,
+        chain: &ChainIdentity,
+        source: DurablePromotionIntentSource,
+        now_unix_seconds: u64,
+    ) -> Result<DurablePromotionIntentBacklog, DatalensError> {
+        let prefix = pending_index_prefix(chain, source_key(source));
+        let mut pending_total = 0;
+        let mut oldest_due_at_unix_seconds = None;
+        for object in self.object_store.list(&prefix)? {
+            let Some(entry) = parse_pending_index_entry(&object.key) else {
+                continue;
+            };
+            if entry.due_at_unix_seconds > now_unix_seconds {
+                continue;
+            }
+            pending_total += 1;
+            oldest_due_at_unix_seconds = Some(
+                oldest_due_at_unix_seconds
+                    .unwrap_or(entry.due_at_unix_seconds)
+                    .min(entry.due_at_unix_seconds),
+            );
+        }
+        Ok(DurablePromotionIntentBacklog {
+            chain: chain.clone(),
+            source,
+            pending_total,
+            oldest_pending_age_seconds: oldest_due_at_unix_seconds
+                .map(|oldest| now_unix_seconds.saturating_sub(oldest))
+                .unwrap_or(0),
+        })
+    }
 }
 
 impl<S> DurablePromotionIntentRepository for DurablePromotionIntentStore<S>
@@ -516,6 +575,21 @@ where
             }
         }
         Ok(rebuilt)
+    }
+
+    fn pending_backlog_for_chain(
+        &self,
+        chain: &ChainIdentity,
+        now_unix_seconds: u64,
+    ) -> Result<Vec<DurablePromotionIntentBacklog>, DatalensError> {
+        let mut backlog = Vec::new();
+        for source in [
+            DurablePromotionIntentSource::Query,
+            DurablePromotionIntentSource::Warmup,
+        ] {
+            backlog.push(self.pending_index_backlog_for_source(chain, source, now_unix_seconds)?);
+        }
+        Ok(backlog)
     }
 
     fn mark_running(

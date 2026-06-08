@@ -312,6 +312,69 @@ fn test_list_pending_for_chain_filters_before_applying_limit() {
 }
 
 #[test]
+fn test_pending_backlog_for_chain_uses_pending_index_without_canonical_reads() {
+    let root = temp_storage_root("pending-backlog-index");
+    let object_store = CountingObjectStore::new(root);
+    let store = DurablePromotionIntentStore::new(object_store.clone());
+    let ethereum = test_chain();
+    let lisk = lisk_chain();
+    create_intent(
+        &store,
+        DurablePromotionIntentSource::Query,
+        "analytics-api",
+        100,
+    );
+    create_intent_with_chain_and_source(&store, lisk, DurablePromotionIntentSource::Query, 95);
+    let warmup = create_intent_with_range(
+        &store,
+        DurablePromotionIntentSource::Warmup,
+        "warmup-api",
+        LedgerRange::blocks(40, 41).expect("valid range"),
+        120,
+    );
+    store
+        .mark_running(&warmup.intent_id, 121)
+        .expect("mark running");
+    store
+        .mark_retryable_failure(&warmup.intent_id, "retry later", 122, 180)
+        .expect("mark retryable");
+
+    object_store.clear_reads();
+    object_store.clear_lists();
+    let backlog = store
+        .pending_backlog_for_chain(&ethereum, 160)
+        .expect("pending backlog");
+
+    assert_eq!(backlog.len(), 2);
+    assert_eq!(backlog[0].source, DurablePromotionIntentSource::Query);
+    assert_eq!(backlog[0].pending_total, 1);
+    assert_eq!(backlog[0].oldest_pending_age_seconds, 60);
+    assert_eq!(backlog[1].source, DurablePromotionIntentSource::Warmup);
+    assert_eq!(backlog[1].pending_total, 0);
+    assert_eq!(backlog[1].oldest_pending_age_seconds, 0);
+    assert!(
+        object_store
+            .read_keys()
+            .into_iter()
+            .all(|key| !key.starts_with("durable-promotion-intents/v1/intents")),
+        "backlog metrics must not read canonical intent JSON"
+    );
+    assert_eq!(
+        object_store.list_prefixes(),
+        vec![
+            format!(
+                "durable-promotion-intents/v1/index/status=pending/chain={}/source=query",
+                ethereum.key_prefix()
+            ),
+            format!(
+                "durable-promotion-intents/v1/index/status=pending/chain={}/source=warmup",
+                ethereum.key_prefix()
+            )
+        ]
+    );
+}
+
+#[test]
 fn test_retryable_failure_stores_error_increments_attempt_and_sets_retry_time() {
     let store =
         DurablePromotionIntentStore::new(LocalObjectStore::new(temp_storage_root("retryable")));
@@ -892,6 +955,34 @@ fn create_intent(
         LedgerRange::blocks(10, 11).expect("valid range"),
         now_unix_seconds,
     )
+}
+
+fn create_intent_with_chain_and_source(
+    store: &impl DurablePromotionIntentRepository,
+    chain: ChainIdentity,
+    source: DurablePromotionIntentSource,
+    now_unix_seconds: u64,
+) -> datalens_storage::DurablePromotionIntent {
+    let outcome = store
+        .create_or_get(datalens_storage::CreateDurablePromotionIntent {
+            source,
+            application: "analytics-api".to_owned(),
+            chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: DatasetSelector::all(),
+            selector_fingerprint: "all".to_owned(),
+            selector_canonical_key: "all".to_owned(),
+            finality: "safe".to_owned(),
+            ranges: vec![LedgerRange::blocks(30, 31).expect("valid range")],
+            request_id: None,
+            task_id: None,
+            now_unix_seconds,
+        })
+        .expect("create intent");
+    match outcome {
+        DurablePromotionIntentCreateOutcome::Created(intent) => intent,
+        DurablePromotionIntentCreateOutcome::Existing(intent) => intent,
+    }
 }
 
 fn create_intent_with_range(
