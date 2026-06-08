@@ -1,4 +1,7 @@
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::{Arc, Once},
+    time::Instant,
+};
 
 use datalens_chain::{
     AdapterCapabilities, ChainAdapter, ChainHeight, DatasetCapability, SelectorKind,
@@ -204,6 +207,17 @@ where
         repository: impl DurablePromotionIntentRepository + 'static,
     ) -> Self {
         self.executor = self.executor.with_durable_intents(repository);
+        self
+    }
+
+    pub fn with_durable_intents_startup_maintenance_once(
+        mut self,
+        repository: impl DurablePromotionIntentRepository + 'static,
+        startup_maintenance_once: Arc<Once>,
+    ) -> Self {
+        self.executor = self
+            .executor
+            .with_durable_intents_startup_maintenance_once(repository, startup_maintenance_once);
         self
     }
 

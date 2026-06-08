@@ -1,7 +1,7 @@
 use std::{
     collections::VecDeque,
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Mutex, Once, OnceLock,
         atomic::{AtomicU64, Ordering},
         mpsc,
     },
@@ -221,15 +221,26 @@ where
         mut self,
         repository: impl DurablePromotionIntentRepository + 'static,
     ) -> Self {
+        self =
+            self.with_durable_intents_startup_maintenance_once(repository, Arc::new(Once::new()));
+        self
+    }
+
+    pub fn with_durable_intents_startup_maintenance_once(
+        mut self,
+        repository: impl DurablePromotionIntentRepository + 'static,
+        startup_maintenance_once: Arc<Once>,
+    ) -> Self {
         let repository: Arc<dyn DurablePromotionIntentRepository> = Arc::new(repository);
         self.durable_intent_worker = Some(
-            DurablePromotionIntentWorker::start(
+            DurablePromotionIntentWorker::start_with_startup_maintenance_once(
                 repository.clone(),
                 self.writer.clone(),
                 self.source.clone(),
                 self.metrics
                     .as_ref()
                     .map(|metrics| metrics.recorder.clone()),
+                startup_maintenance_once,
             )
             .expect("durable intent workers start"),
         );

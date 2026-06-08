@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
 use datalens_core::{DatalensError, DatalensErrorKind};
 use datalens_edge::config::{ChainConfig, DatalensConfig, FinalityConfig};
@@ -29,6 +29,7 @@ struct QueryRuntimeStores {
     query_activity: Arc<dyn QueryActivityRepository>,
     durable_intents: Arc<dyn DurablePromotionIntentRepository>,
     warmup_registry: Option<LocalWarmupRegistry<WarmupRegistryObjectStore>>,
+    durable_intent_startup_maintenance: Arc<Once>,
 }
 
 impl QueryRuntimeStores {
@@ -45,6 +46,7 @@ impl QueryRuntimeStores {
             query_activity: Arc::from(build_query_activity(config)?),
             durable_intents: Arc::from(build_durable_intents(config)?),
             warmup_registry,
+            durable_intent_startup_maintenance: Arc::new(Once::new()),
         })
     }
 }
@@ -148,7 +150,10 @@ fn build_evm_service_with_storage(
         stores.query_activity.clone(),
         ApplicationIdentity::named(config.metrics.default_application.clone()),
     )
-    .with_durable_intents(stores.durable_intents.clone());
+    .with_durable_intents_startup_maintenance_once(
+        stores.durable_intents.clone(),
+        stores.durable_intent_startup_maintenance.clone(),
+    );
     if config.warmup.enabled {
         let mut runtime = WarmupRuntime::new(
             source,
@@ -246,7 +251,10 @@ fn build_solana_service_with_storage(
         stores.query_activity,
         ApplicationIdentity::named(config.metrics.default_application.clone()),
     )
-    .with_durable_intents(stores.durable_intents))
+    .with_durable_intents_startup_maintenance_once(
+        stores.durable_intents,
+        stores.durable_intent_startup_maintenance,
+    ))
 }
 
 fn build_tron_service_with_storage(
@@ -293,7 +301,10 @@ fn build_tron_service_with_storage(
         stores.query_activity,
         ApplicationIdentity::named(config.metrics.default_application.clone()),
     )
-    .with_durable_intents(stores.durable_intents))
+    .with_durable_intents_startup_maintenance_once(
+        stores.durable_intents,
+        stores.durable_intent_startup_maintenance,
+    ))
 }
 
 pub(crate) fn tron_provider(url: String, chain: &ChainConfig) -> TronHttpProvider {

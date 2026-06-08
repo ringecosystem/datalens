@@ -55,15 +55,14 @@ where
     R: StorageRepository + Clone + 'static,
     A: ChainAdapter,
 {
-    pub(crate) fn start(
+    pub(crate) fn start_with_startup_maintenance_once(
         repository: Arc<dyn DurablePromotionIntentRepository>,
         writer: DurableWriter<R>,
         adapter: A,
         metrics: Option<Arc<MetricsRecorder>>,
+        startup_maintenance_once: Arc<Once>,
     ) -> Result<Self, DatalensError> {
-        reset_stale_intents(repository.as_ref())?;
         let claim_lock = Arc::new(Mutex::new(()));
-        let rebuild_once = Arc::new(Once::new());
         for worker_index in 0..DEFAULT_INTENT_WORKERS {
             spawn_intent_worker(
                 worker_index,
@@ -72,7 +71,7 @@ where
                 adapter.clone(),
                 metrics.clone(),
                 claim_lock.clone(),
-                rebuild_once.clone(),
+                startup_maintenance_once.clone(),
             )?;
         }
         Ok(Self {
@@ -388,7 +387,7 @@ fn spawn_intent_worker<R, A>(
     adapter: A,
     metrics: Option<Arc<MetricsRecorder>>,
     claim_lock: Arc<Mutex<()>>,
-    rebuild_once: Arc<Once>,
+    startup_maintenance_once: Arc<Once>,
 ) -> Result<(), DatalensError>
 where
     R: StorageRepository + Clone + 'static,
@@ -398,25 +397,7 @@ where
         .name(format!("datalens-durable-intent-{worker_index}"))
         .spawn(move || {
             let worker_chain = adapter.capabilities().chain().clone();
-            rebuild_once.call_once(|| {
-                match repository.rebuild_pending_indexes(unix_seconds_now()) {
-                    Ok(rebuilt) => {
-                        if rebuilt > 0 {
-                            log::info!(
-                                "durable intent pending index rebuild completed rebuilt={}",
-                                rebuilt
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        log::error!(
-                            "durable intent pending index rebuild failed kind={:?} message={}",
-                            error.kind,
-                            error.message
-                        );
-                    }
-                }
-            });
+            startup_maintenance_once.call_once(|| run_startup_maintenance(repository.as_ref()));
             let mut last_backlog_metric_sample: Option<Instant> = None;
             loop {
                 let now = unix_seconds_now();
@@ -1082,6 +1063,40 @@ fn reset_stale_intents(
         log::warn!("durable intent stale running reset count={}", reset.len());
     }
     Ok(())
+}
+
+fn run_startup_maintenance(repository: &dyn DurablePromotionIntentRepository) {
+    let started = Instant::now();
+    log::info!("durable intent startup maintenance started");
+    match reset_stale_intents(repository) {
+        Ok(()) => {
+            log::info!("durable intent stale running reset completed");
+        }
+        Err(error) => {
+            log::error!(
+                "durable intent stale running reset failed kind={:?} message={}",
+                error.kind,
+                error.message
+            );
+        }
+    }
+    match repository.rebuild_pending_indexes(unix_seconds_now()) {
+        Ok(rebuilt) => {
+            log::info!(
+                "durable intent pending index rebuild completed rebuilt={} duration_ms={}",
+                rebuilt,
+                started.elapsed().as_millis()
+            );
+        }
+        Err(error) => {
+            log::error!(
+                "durable intent pending index rebuild failed kind={:?} message={} duration_ms={}",
+                error.kind,
+                error.message,
+                started.elapsed().as_millis()
+            );
+        }
+    }
 }
 
 fn unix_seconds_now() -> u64 {
