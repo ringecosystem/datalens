@@ -5,6 +5,7 @@ use datalens_core::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 
 use crate::object_store::ObjectStore;
 
@@ -116,6 +117,77 @@ pub trait DurablePromotionIntentRepository: Send + Sync {
         stale_before_unix_seconds: u64,
         now_unix_seconds: u64,
     ) -> Result<Vec<DurablePromotionIntent>, DatalensError>;
+}
+
+impl DurablePromotionIntentRepository for Arc<dyn DurablePromotionIntentRepository> {
+    fn create_or_get(
+        &self,
+        request: CreateDurablePromotionIntent,
+    ) -> Result<DurablePromotionIntentCreateOutcome, DatalensError> {
+        self.as_ref().create_or_get(request)
+    }
+
+    fn get(&self, intent_id: &str) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        self.as_ref().get(intent_id)
+    }
+
+    fn list_pending(
+        &self,
+        now_unix_seconds: u64,
+        limit: usize,
+    ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+        self.as_ref().list_pending(now_unix_seconds, limit)
+    }
+
+    fn mark_running(
+        &self,
+        intent_id: &str,
+        now_unix_seconds: u64,
+    ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        self.as_ref().mark_running(intent_id, now_unix_seconds)
+    }
+
+    fn mark_completed(
+        &self,
+        intent_id: &str,
+        now_unix_seconds: u64,
+    ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        self.as_ref().mark_completed(intent_id, now_unix_seconds)
+    }
+
+    fn mark_retryable_failure(
+        &self,
+        intent_id: &str,
+        error: &str,
+        now_unix_seconds: u64,
+        next_retry_at_unix_seconds: u64,
+    ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        self.as_ref().mark_retryable_failure(
+            intent_id,
+            error,
+            now_unix_seconds,
+            next_retry_at_unix_seconds,
+        )
+    }
+
+    fn mark_terminal_failure(
+        &self,
+        intent_id: &str,
+        error: &str,
+        now_unix_seconds: u64,
+    ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        self.as_ref()
+            .mark_terminal_failure(intent_id, error, now_unix_seconds)
+    }
+
+    fn reset_stale_running(
+        &self,
+        stale_before_unix_seconds: u64,
+        now_unix_seconds: u64,
+    ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+        self.as_ref()
+            .reset_stale_running(stale_before_unix_seconds, now_unix_seconds)
+    }
 }
 
 #[derive(Clone, Debug)]

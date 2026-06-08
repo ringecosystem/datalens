@@ -5,27 +5,67 @@ use std::{
         mpsc::{self, Receiver, SyncSender, TrySendError},
     },
     thread,
-    time::Instant,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use datalens_chain::{DatasetSelector, FinalityLevel};
-use datalens_core::{ChainIdentity, DatalensError, DatasetKey, LedgerRangeKind};
+use datalens_chain::{
+    ChainAdapter, ChainFetchRequest, DatasetSelector, FetchContext, FinalityLevel,
+};
+use datalens_core::{ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey, LedgerRangeKind};
 use datalens_metrics::{
     DurableWriteOutcome as MetricsDurableWriteOutcome, ErrorLabels, MetricsLabels, MetricsRecorder,
 };
-use datalens_storage::StorageRepository;
+use datalens_storage::{
+    DurablePromotionIntent, DurablePromotionIntentRepository, StorageRepository,
+};
 use datalens_writer::{DurableWriteRequest, DurableWriteSegment, DurableWriter};
 
 use crate::helpers::{is_storage_error, metrics_durable_write_outcome};
 
 const DEFAULT_PROMOTION_WORKERS: usize = 4;
 const DEFAULT_PROMOTION_QUEUE_CAPACITY: usize = 1024;
+const DEFAULT_INTENT_WORKERS: usize = 2;
+const DEFAULT_INTENT_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const DEFAULT_INTENT_RETRY_DELAY_SECONDS: u64 = 60;
+const DEFAULT_INTENT_STALE_RUNNING_SECONDS: u64 = 300;
 
 #[derive(Clone)]
 pub(crate) struct DurablePromotionQueue<R> {
     sender: SyncSender<DurablePromotionWork>,
     state: Arc<(Mutex<DurablePromotionState>, Condvar)>,
     _storage: std::marker::PhantomData<R>,
+}
+
+#[derive(Clone)]
+pub(crate) struct DurablePromotionIntentWorker<R, A> {
+    _storage: std::marker::PhantomData<R>,
+    _adapter: std::marker::PhantomData<A>,
+}
+
+impl<R, A> DurablePromotionIntentWorker<R, A>
+where
+    R: StorageRepository + Clone + 'static,
+    A: ChainAdapter,
+{
+    pub(crate) fn start(
+        repository: Arc<dyn DurablePromotionIntentRepository>,
+        writer: DurableWriter<R>,
+        adapter: A,
+    ) -> Result<Self, DatalensError> {
+        reset_stale_intents(repository.as_ref())?;
+        for worker_index in 0..DEFAULT_INTENT_WORKERS {
+            spawn_intent_worker(
+                worker_index,
+                repository.clone(),
+                writer.clone(),
+                adapter.clone(),
+            )?;
+        }
+        Ok(Self {
+            _storage: std::marker::PhantomData,
+            _adapter: std::marker::PhantomData,
+        })
+    }
 }
 
 #[derive(Debug, Default)]
@@ -327,6 +367,233 @@ where
     }
 }
 
+fn spawn_intent_worker<R, A>(
+    worker_index: usize,
+    repository: Arc<dyn DurablePromotionIntentRepository>,
+    writer: DurableWriter<R>,
+    adapter: A,
+) -> Result<(), DatalensError>
+where
+    R: StorageRepository + Clone + 'static,
+    A: ChainAdapter,
+{
+    thread::Builder::new()
+        .name(format!("datalens-durable-intent-{worker_index}"))
+        .spawn(move || {
+            loop {
+                let now = unix_seconds_now();
+                let pending = match repository.list_pending(now, 1) {
+                    Ok(pending) => pending,
+                    Err(error) => {
+                        log::error!(
+                            "durable intent list failed worker={} kind={:?} message={}",
+                            worker_index,
+                            error.kind,
+                            error.message
+                        );
+                        thread::sleep(DEFAULT_INTENT_POLL_INTERVAL);
+                        continue;
+                    }
+                };
+                let Some(intent) = pending.into_iter().next() else {
+                    thread::sleep(DEFAULT_INTENT_POLL_INTERVAL);
+                    continue;
+                };
+                let intent = match repository.mark_running(&intent.intent_id, unix_seconds_now()) {
+                    Ok(Some(intent)) => intent,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        log::error!(
+                            "durable intent claim failed worker={} intent_id={} kind={:?} message={}",
+                            worker_index,
+                            intent.intent_id,
+                            error.kind,
+                            error.message
+                        );
+                        continue;
+                    }
+                };
+                run_intent_work(repository.as_ref(), &writer, &adapter, &intent);
+            }
+        })
+        .map(|_| ())
+        .map_err(|error| {
+            DatalensError::new(
+                datalens_core::DatalensErrorKind::Internal,
+                format!("start durable intent worker: {error}"),
+            )
+        })
+}
+
+fn run_intent_work<R, A>(
+    repository: &dyn DurablePromotionIntentRepository,
+    writer: &DurableWriter<R>,
+    adapter: &A,
+    intent: &DurablePromotionIntent,
+) where
+    R: StorageRepository + Clone + 'static,
+    A: ChainAdapter,
+{
+    let started = Instant::now();
+    log::info!(
+        "durable intent promotion started intent_id={} source={:?} chain_key={} dataset={} selector_fingerprint={} ranges={} attempt={}",
+        intent.intent_id,
+        intent.source,
+        intent.chain.key_prefix(),
+        intent.dataset_key.as_str(),
+        intent.selector_fingerprint,
+        intent_ranges_label(&intent.ranges),
+        intent.attempt_count + 1
+    );
+    let result = promote_intent(writer, adapter, intent);
+    match result {
+        Ok(()) => match repository.mark_completed(&intent.intent_id, unix_seconds_now()) {
+            Ok(_) => {
+                log::info!(
+                    "durable intent promotion completed intent_id={} duration_ms={}",
+                    intent.intent_id,
+                    started.elapsed().as_millis()
+                );
+            }
+            Err(error) => {
+                log::error!(
+                    "durable intent completion mark failed intent_id={} kind={:?} message={} duration_ms={}",
+                    intent.intent_id,
+                    error.kind,
+                    error.message,
+                    started.elapsed().as_millis()
+                );
+            }
+        },
+        Err(error) => {
+            let now = unix_seconds_now();
+            let next_retry = now.saturating_add(DEFAULT_INTENT_RETRY_DELAY_SECONDS);
+            let mark_result = repository.mark_retryable_failure(
+                &intent.intent_id,
+                &error.message,
+                now,
+                next_retry,
+            );
+            if let Err(mark_error) = mark_result {
+                log::error!(
+                    "durable intent retry mark failed intent_id={} kind={:?} message={} original_kind={:?} original_message={}",
+                    intent.intent_id,
+                    mark_error.kind,
+                    mark_error.message,
+                    error.kind,
+                    error.message
+                );
+            }
+            log::error!(
+                "durable intent promotion failed intent_id={} kind={:?} message={} retry_at={} duration_ms={}",
+                intent.intent_id,
+                error.kind,
+                error.message,
+                next_retry,
+                started.elapsed().as_millis()
+            );
+        }
+    }
+}
+
+fn promote_intent<R, A>(
+    writer: &DurableWriter<R>,
+    adapter: &A,
+    intent: &DurablePromotionIntent,
+) -> Result<(), DatalensError>
+where
+    R: StorageRepository + Clone + 'static,
+    A: ChainAdapter,
+{
+    let finality_level = finality_from_intent(&intent.finality)?;
+    if intent
+        .ranges
+        .iter()
+        .all(|range| durable_covered(writer, intent, range).unwrap_or(false))
+    {
+        return Ok(());
+    }
+
+    let mut segments = Vec::new();
+    for range in &intent.ranges {
+        if durable_covered(writer, intent, range)? {
+            continue;
+        }
+        let request = ChainFetchRequest::new(
+            intent.chain.clone(),
+            intent.dataset_key.clone(),
+            range.clone(),
+            intent.selector.clone(),
+        )
+        .with_context(FetchContext {
+            request_id: Some(intent.intent_id.clone()),
+            cache_write: true,
+        });
+        let response = adapter.fetch(request.clone())?;
+        response.validate_for_request(&request)?;
+        segments.push(DurableWriteSegment {
+            range: request.range,
+            rows: response.rows,
+        });
+    }
+    if segments.is_empty() {
+        return Ok(());
+    }
+    let mut result = writer.write(DurableWriteRequest {
+        chain: intent.chain.clone(),
+        dataset_key: intent.dataset_key.clone(),
+        selector: intent.selector.clone(),
+        finality_level,
+        segments,
+    })?;
+    if !result.staged_ranges.is_empty() {
+        let staged_ranges = result.staged_ranges.clone();
+        let flush_result = writer.flush_ranges(
+            &intent.chain,
+            &intent.dataset_key,
+            &intent.selector,
+            &staged_ranges,
+        )?;
+        result.data_objects.extend(flush_result.data_objects);
+        result.empty_coverages.extend(flush_result.empty_coverages);
+        result.skipped_ranges.extend(flush_result.skipped_ranges);
+        result.staged_ranges.clear();
+    }
+    for range in &intent.ranges {
+        if !durable_covered(writer, intent, range)? {
+            return Err(DatalensError::new(
+                datalens_core::DatalensErrorKind::StorageWriteFailure,
+                format!(
+                    "durable coverage not visible after promotion {}:{}-{}",
+                    range_kind_key(range.kind()),
+                    range.start(),
+                    range.end()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn durable_covered<R>(
+    writer: &DurableWriter<R>,
+    intent: &DurablePromotionIntent,
+    range: &datalens_core::LedgerRange,
+) -> Result<bool, DatalensError>
+where
+    R: StorageRepository + Clone + 'static,
+{
+    let covered = writer.storage().covered_ranges(
+        &intent.chain,
+        &intent.dataset_key,
+        &intent.selector,
+        range.clone(),
+    )?;
+    Ok(covered
+        .iter()
+        .any(|covered_range| covered_range.intersection(range) == Some(range.clone())))
+}
+
 fn promotion_key(request: &DurablePromotionRequest) -> String {
     let ranges = request
         .segments
@@ -359,6 +626,51 @@ fn finality_key(finality: FinalityLevel) -> &'static str {
         FinalityLevel::Finalized => "finalized",
         FinalityLevel::ChainSpecific(value) => value,
     }
+}
+
+fn finality_from_intent(finality: &str) -> Result<FinalityLevel, DatalensError> {
+    match finality {
+        "safe" => Ok(FinalityLevel::Safe),
+        "finalized" => Ok(FinalityLevel::Finalized),
+        value => Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            format!("durable intent finality {value} is not supported"),
+        )),
+    }
+}
+
+fn intent_ranges_label(ranges: &[datalens_core::LedgerRange]) -> String {
+    ranges
+        .iter()
+        .map(|range| {
+            format!(
+                "{}:{}-{}",
+                range_kind_key(range.kind()),
+                range.start(),
+                range.end()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn reset_stale_intents(
+    repository: &dyn DurablePromotionIntentRepository,
+) -> Result<(), DatalensError> {
+    let now = unix_seconds_now();
+    let stale_before = now.saturating_sub(DEFAULT_INTENT_STALE_RUNNING_SECONDS);
+    let reset = repository.reset_stale_running(stale_before, now)?;
+    if !reset.is_empty() {
+        log::warn!("durable intent stale running reset count={}", reset.len());
+    }
+    Ok(())
+}
+
+fn unix_seconds_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
 }
 
 fn range_kind_key(kind: LedgerRangeKind) -> String {

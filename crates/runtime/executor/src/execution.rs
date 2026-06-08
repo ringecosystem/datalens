@@ -24,10 +24,12 @@ use datalens_planner::{
     CoverageSummary, FinalityPolicy, NativePlanner, NativePlannerConfig, NativeQueryInput,
 };
 use datalens_storage::{
-    CacheOutcome as LedgerCacheOutcome, DurableWriteOutcome as LedgerDurableWriteOutcome,
-    FillOutcome as LedgerFillOutcome, QueryOutcome as LedgerQueryOutcome, QueryWatermark,
-    QueryWatermarkKey, QueryWatermarkRepository, StorageRepository, UsageLedgerEntry,
-    UsageLedgerRepository,
+    CacheOutcome as LedgerCacheOutcome, DurableIntentSubmissionOutcome,
+    DurableIntentSubmissionRequest, DurableIntentSubmissionService,
+    DurablePromotionIntentRepository, DurablePromotionIntentSource,
+    DurableWriteOutcome as LedgerDurableWriteOutcome, FillOutcome as LedgerFillOutcome,
+    QueryOutcome as LedgerQueryOutcome, QueryWatermark, QueryWatermarkKey,
+    QueryWatermarkRepository, StorageRepository, UsageLedgerEntry, UsageLedgerRepository,
 };
 use datalens_writer::{
     DurableWriteResult, DurableWriteSegment, DurableWriter, DurableWriterConfig,
@@ -37,8 +39,8 @@ use crate::helpers::*;
 pub use crate::hot_promotion::HotCachePromoter;
 use crate::{
     durable_promotion::{
-        DurablePromotionMetrics, DurablePromotionQueue, DurablePromotionRequest,
-        PromotionEnqueueOutcome,
+        DurablePromotionIntentWorker, DurablePromotionMetrics, DurablePromotionQueue,
+        DurablePromotionRequest, PromotionEnqueueOutcome,
     },
     provider_singleflight::ProviderSingleflight,
 };
@@ -102,6 +104,8 @@ pub struct NativeQueryExecutor<R, S> {
     metrics: Option<ExecutorMetrics>,
     usage_ledger: Option<ExecutorUsageLedger>,
     query_watermarks: Option<ExecutorQueryWatermarks>,
+    durable_intents: Option<Arc<dyn DurablePromotionIntentRepository>>,
+    durable_intent_worker: Option<DurablePromotionIntentWorker<R, S>>,
 }
 
 #[derive(Clone)]
@@ -143,6 +147,8 @@ where
             metrics: None,
             usage_ledger: None,
             query_watermarks: None,
+            durable_intents: None,
+            durable_intent_worker: None,
         }
     }
 
@@ -179,6 +185,23 @@ where
             repository: Arc::new(repository),
             application,
         });
+        self
+    }
+
+    pub fn with_durable_intents(
+        mut self,
+        repository: impl DurablePromotionIntentRepository + 'static,
+    ) -> Self {
+        let repository: Arc<dyn DurablePromotionIntentRepository> = Arc::new(repository);
+        self.durable_intent_worker = Some(
+            DurablePromotionIntentWorker::start(
+                repository.clone(),
+                self.writer.clone(),
+                self.source.clone(),
+            )
+            .expect("durable intent workers start"),
+        );
+        self.durable_intents = Some(repository);
         self
     }
 
@@ -582,6 +605,13 @@ where
                 .iter()
                 .map(|segment| segment.range.clone())
                 .collect::<Vec<_>>();
+            self.submit_durable_intent_for_plan(
+                &query_id,
+                &ledger_application,
+                &plan,
+                finality_level,
+                pending_ranges.clone(),
+            );
             let enqueue_start = Instant::now();
             match self.durable_promotions.enqueue(DurablePromotionRequest {
                 query_id: query_id.clone(),
@@ -1107,6 +1137,92 @@ where
             durable_write_outcome,
             row_count,
         )
+    }
+
+    fn submit_durable_intent_for_plan(
+        &self,
+        query_id: &str,
+        application: &Option<ApplicationIdentity>,
+        plan: &datalens_planner::NativeQueryPlan,
+        finality_level: FinalityLevel,
+        ranges: Vec<LedgerRange>,
+    ) {
+        let Some(repository) = &self.durable_intents else {
+            return;
+        };
+        let Ok(now_unix_seconds) = unix_seconds_now() else {
+            log::error!(
+                "durable intent scheduling skipped query_id={} dataset={} range={}-{} reason=clock",
+                query_id,
+                plan.dataset_key.as_str(),
+                plan.ledger_range.start(),
+                plan.ledger_range.end()
+            );
+            return;
+        };
+        let application = application
+            .as_ref()
+            .map(ApplicationIdentity::as_str)
+            .unwrap_or("default")
+            .to_owned();
+        let service = DurableIntentSubmissionService::new(repository.clone());
+        match service.submit(DurableIntentSubmissionRequest {
+            source: DurablePromotionIntentSource::Query,
+            application,
+            chain: plan.chain.clone(),
+            dataset_key: plan.dataset_key.clone(),
+            selector: plan.selector.clone(),
+            finality: finality_level,
+            ranges,
+            request_id: Some(query_id.to_owned()),
+            task_id: None,
+            now_unix_seconds,
+        }) {
+            DurableIntentSubmissionOutcome::Submitted(intent) => {
+                log::info!(
+                    "durable intent submitted source=query query_id={} intent_id={} chain_key={} dataset={} selector_fingerprint={} ranges={}",
+                    query_id,
+                    intent.intent_id,
+                    intent.chain.key_prefix(),
+                    intent.dataset_key.as_str(),
+                    intent.selector_fingerprint,
+                    format_ranges(&intent.ranges)
+                );
+            }
+            DurableIntentSubmissionOutcome::AlreadyPending(intent) => {
+                log::info!(
+                    "durable intent already pending source=query query_id={} intent_id={} chain_key={} dataset={} selector_fingerprint={} ranges={}",
+                    query_id,
+                    intent.intent_id,
+                    intent.chain.key_prefix(),
+                    intent.dataset_key.as_str(),
+                    intent.selector_fingerprint,
+                    format_ranges(&intent.ranges)
+                );
+            }
+            DurableIntentSubmissionOutcome::AlreadyCompleted(intent) => {
+                log::info!(
+                    "durable intent already completed source=query query_id={} intent_id={} chain_key={} dataset={} selector_fingerprint={} ranges={}",
+                    query_id,
+                    intent.intent_id,
+                    intent.chain.key_prefix(),
+                    intent.dataset_key.as_str(),
+                    intent.selector_fingerprint,
+                    format_ranges(&intent.ranges)
+                );
+            }
+            DurableIntentSubmissionOutcome::Failed(error) => {
+                log::error!(
+                    "durable intent scheduling failed source=query query_id={} dataset={} range={}-{} kind={:?} message={}",
+                    query_id,
+                    plan.dataset_key.as_str(),
+                    plan.ledger_range.start(),
+                    plan.ledger_range.end(),
+                    error.kind,
+                    error.message
+                );
+            }
+        }
     }
 
     fn record_query_watermark_for_plan(
