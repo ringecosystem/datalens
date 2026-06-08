@@ -39,6 +39,15 @@ impl WarmupCursor {
         self.updated_at = now;
     }
 
+    pub(crate) fn realign(&mut self, next: u64, now: u64) {
+        self.next = next;
+        self.last_committed = None;
+        self.current_attempt = 0;
+        self.last_processed_range = None;
+        self.last_error = None;
+        self.updated_at = now;
+    }
+
     pub(crate) fn mark_failure(
         &mut self,
         range: LedgerRange,

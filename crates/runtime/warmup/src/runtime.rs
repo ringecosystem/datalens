@@ -329,9 +329,8 @@ where
                 return self.finish_or_stop(task, WarmupRunResult::default());
             }
         };
-        if target_start > cursor.next {
-            cursor.next = target_start;
-            cursor.updated_at = unix_seconds_now()?;
+        if target_start != cursor.next {
+            cursor.realign(target_start, unix_seconds_now()?);
             self.registry.save_cursor(&cursor)?;
         }
         if cursor.next > target_end {
@@ -1004,8 +1003,12 @@ fn log_target_plan(
         PlannedWarmupTarget::Range { start, end } => (Some(*start), Some(*end), None),
         PlannedWarmupTarget::Noop(reason) => (None, None, Some(*reason)),
     };
+    let cursor_query_distance =
+        query_watermark.and_then(|watermark| cursor_next.checked_sub(watermark));
+    let planned_query_distance = query_watermark
+        .and_then(|watermark| planned_start.and_then(|start| start.checked_sub(watermark)));
     log::info!(
-        "warmup target plan task_id={} application={} chain={} dataset={} selector_fingerprint={} selector_canonical_key={} cursor_next={} query_watermark={:?} safe_head={} lookahead_blocks={} planned_start={:?} planned_end={:?} no_op_reason={:?}",
+        "warmup target plan task_id={} application={} chain={} dataset={} selector_fingerprint={} selector_canonical_key={} cursor_next={} query_watermark={:?} cursor_query_distance={:?} safe_head={} lookahead_blocks={} planned_start={:?} planned_end={:?} planned_query_distance={:?} no_op_reason={:?}",
         task.task_id.as_str(),
         task.application_id,
         task.chain.key_prefix(),
@@ -1014,10 +1017,12 @@ fn log_target_plan(
         task.selector.canonical_key(),
         cursor_next,
         query_watermark,
+        cursor_query_distance,
         safe_head,
         lookahead_blocks,
         planned_start,
         planned_end,
+        planned_query_distance,
         no_op_reason,
     );
 }

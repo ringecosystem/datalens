@@ -66,15 +66,21 @@ impl WarmupTargetPlanner {
 
 fn follow_query_start(input: &WarmupTargetPlanInput, query_watermark: u64) -> u64 {
     let safe_delta = input.safe_head.saturating_sub(query_watermark);
+    let target_offset = smallest_fitting_offset(input, 0, safe_delta).unwrap_or(1);
     let Some(cursor_distance) = input.cursor_next.checked_sub(query_watermark) else {
-        let offset = smallest_fitting_offset(input, 0, safe_delta).unwrap_or(1);
-        return query_watermark.saturating_add(offset);
+        return query_watermark.saturating_add(target_offset);
     };
 
     if cursor_distance <= input.catchup_threshold_blocks
         && let Some(offset) = smallest_fitting_offset(input, cursor_distance, safe_delta)
     {
         return query_watermark.saturating_add(offset);
+    }
+
+    if max_healthy_cursor_distance(input, safe_delta)
+        .is_some_and(|max_distance| cursor_distance > max_distance)
+    {
+        return query_watermark.saturating_add(target_offset);
     }
 
     input.cursor_next
@@ -105,6 +111,19 @@ fn configured_offset_tiers(input: &WarmupTargetPlanInput) -> Vec<u64> {
         .into_iter()
         .filter(|offset| *offset > 0)
         .collect()
+}
+
+fn largest_fitting_offset(input: &WarmupTargetPlanInput, safe_delta: u64) -> Option<u64> {
+    configured_offset_tiers(input)
+        .into_iter()
+        .chain([500, 100, 50, 10, 1])
+        .filter(|offset| *offset <= safe_delta)
+        .max()
+}
+
+fn max_healthy_cursor_distance(input: &WarmupTargetPlanInput, safe_delta: u64) -> Option<u64> {
+    largest_fitting_offset(input, safe_delta)
+        .map(|offset| offset.saturating_add(input.lookahead_blocks.saturating_sub(1)))
 }
 
 fn adaptive_fallback_offset(greater_than: u64, safe_delta: u64) -> Option<u64> {

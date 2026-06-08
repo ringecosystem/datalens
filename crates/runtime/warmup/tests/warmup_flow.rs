@@ -663,7 +663,7 @@ fn test_follow_query_jumps_forward_when_query_nears_current_cursor() {
 }
 
 #[test]
-fn test_follow_query_keeps_cursor_when_query_is_outside_catchup_threshold() {
+fn test_follow_query_keeps_healthy_cursor_ahead_when_query_is_outside_catchup_threshold() {
     let root = temp_root("follow-query-keeps-cursor-outside-threshold");
     let storage = LocalStorage::new(&root);
     let watermarks = QueryWatermarkStore::new(LocalObjectStore::new(&root));
@@ -701,6 +701,47 @@ fn test_follow_query_keeps_cursor_when_query_is_outside_catchup_threshold() {
     assert_eq!(adapter.fetches(), vec![blocks(102_000, 102_000)]);
     let cursor = registry.load_cursor(&task_id).unwrap().expect("cursor");
     assert_eq!(cursor.next, 102_001);
+}
+
+#[test]
+fn test_follow_query_reanchors_far_ahead_cursor_to_adaptive_offset() {
+    let root = temp_root("follow-query-reanchors-far-ahead-cursor");
+    let storage = LocalStorage::new(&root);
+    let watermarks = QueryWatermarkStore::new(LocalObjectStore::new(&root));
+    let registry =
+        LocalWarmupRegistry::new(object_store("follow-query-reanchors-far-ahead-cursor"));
+    let adapter = FixtureAdapter::new(140_000_000)
+        .with_max_range_len(1)
+        .with_logs(vec![log_record(101_800, 0)]);
+    let runtime = runtime(adapter.clone(), storage.clone(), registry.clone())
+        .with_query_watermarks(watermarks.clone())
+        .with_follow_query_lookahead_blocks(3)
+        .with_runtime_config(WarmupRuntimeConfig {
+            max_fetches_per_task_loop: 1,
+        });
+    let task_id = registry
+        .submit(follow_query_request())
+        .expect("submit follow query")
+        .task_id;
+    registry
+        .save_cursor(&datalens_warmup::WarmupCursor {
+            task_id: task_id.clone(),
+            next: 130_797_500,
+            last_committed: None,
+            current_attempt: 0,
+            last_processed_range: None,
+            last_error: None,
+            updated_at: 1,
+        })
+        .unwrap();
+    save_query_watermark(&watermarks, 100_800);
+
+    let result = runtime.run_task_once(&task_id).expect("warmup run");
+
+    assert_eq!(result.status, WarmupRunStatus::Partial);
+    assert_eq!(adapter.fetches(), vec![blocks(101_800, 101_800)]);
+    let cursor = registry.load_cursor(&task_id).unwrap().expect("cursor");
+    assert_eq!(cursor.next, 101_801);
 }
 
 #[test]

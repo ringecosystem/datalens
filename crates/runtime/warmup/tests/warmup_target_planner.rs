@@ -197,7 +197,7 @@ fn test_follow_query_jumps_forward_when_query_catches_current_window() {
 }
 
 #[test]
-fn test_follow_query_keeps_cursor_when_query_is_outside_catchup_threshold() {
+fn test_follow_query_keeps_healthy_cursor_ahead_when_query_is_outside_catchup_threshold() {
     let plan = WarmupTargetPlanner::plan(WarmupTargetPlanInput {
         mode: WarmupTaskMode::FollowQuery,
         fixed_end: None,
@@ -215,6 +215,98 @@ fn test_follow_query_keeps_cursor_when_query_is_outside_catchup_threshold() {
         PlannedWarmupTarget::Range {
             start: 102_000,
             end: 102_002
+        }
+    );
+}
+
+#[test]
+fn test_follow_query_keeps_cursor_one_block_beyond_largest_offset_inside_lookahead() {
+    let plan = WarmupTargetPlanner::plan(WarmupTargetPlanInput {
+        mode: WarmupTaskMode::FollowQuery,
+        fixed_end: None,
+        cursor_next: 105_001,
+        query_watermark: Some(100_000),
+        safe_head: 110_000,
+        lookahead_blocks: 100,
+        start_offset_blocks: None,
+        start_offset_tiers_blocks: None,
+        catchup_threshold_blocks: 200,
+    });
+
+    assert_eq!(
+        plan,
+        PlannedWarmupTarget::Range {
+            start: 105_001,
+            end: 105_100
+        }
+    );
+}
+
+#[test]
+fn test_follow_query_reanchors_cursor_beyond_largest_offset_and_lookahead() {
+    let plan = WarmupTargetPlanner::plan(WarmupTargetPlanInput {
+        mode: WarmupTaskMode::FollowQuery,
+        fixed_end: None,
+        cursor_next: 105_100,
+        query_watermark: Some(100_000),
+        safe_head: 110_000,
+        lookahead_blocks: 100,
+        start_offset_blocks: None,
+        start_offset_tiers_blocks: None,
+        catchup_threshold_blocks: 200,
+    });
+
+    assert_eq!(
+        plan,
+        PlannedWarmupTarget::Range {
+            start: 101_000,
+            end: 101_099
+        }
+    );
+}
+
+#[test]
+fn test_follow_query_reanchors_production_shaped_far_ahead_cursor() {
+    let plan = WarmupTargetPlanner::plan(WarmupTargetPlanInput {
+        mode: WarmupTaskMode::FollowQuery,
+        fixed_end: None,
+        cursor_next: 387_254_544,
+        query_watermark: Some(357_257_044),
+        safe_head: 388_000_000,
+        lookahead_blocks: 100,
+        start_offset_blocks: None,
+        start_offset_tiers_blocks: None,
+        catchup_threshold_blocks: 200,
+    });
+
+    assert_eq!(
+        plan,
+        PlannedWarmupTarget::Range {
+            start: 357_258_044,
+            end: 357_258_143
+        }
+    );
+}
+
+#[test]
+fn test_follow_query_reanchors_far_ahead_cursor_to_adaptive_offset() {
+    let plan = WarmupTargetPlanner::plan(WarmupTargetPlanInput {
+        mode: WarmupTaskMode::FollowQuery,
+        fixed_end: None,
+        cursor_next: 130_797_500,
+        query_watermark: Some(100_800),
+        safe_head: 140_000_000,
+        lookahead_blocks: 3,
+        start_offset_blocks: None,
+        start_offset_tiers_blocks: None,
+        catchup_threshold_blocks: 200,
+    });
+
+    assert_eq!(
+        plan,
+        PlannedWarmupTarget::Range {
+            start: 101_800,
+            end: 101_802
         }
     );
 }
