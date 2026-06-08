@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, VecDeque},
     hash::{DefaultHasher, Hash, Hasher},
     sync::{
         Arc, Condvar, Mutex,
@@ -29,6 +29,7 @@ const DEFAULT_PROMOTION_WORKERS: usize = 4;
 const DEFAULT_PROMOTION_QUEUE_CAPACITY: usize = 1024;
 const DEFAULT_INTENT_WORKERS: usize = 2;
 const DEFAULT_INTENT_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const DEFAULT_INTENT_CLAIM_BATCH_SIZE: usize = 1;
 const DEFAULT_INTENT_RETRY_BASE_DELAY_SECONDS: u64 = 60;
 const DEFAULT_INTENT_RETRY_MAX_DELAY_SECONDS: u64 = 3600;
 const DEFAULT_INTENT_RETRY_MAX_JITTER_SECONDS: u64 = 60;
@@ -398,42 +399,19 @@ where
                         Ok(claim) => claim,
                         Err(_) => return,
                     };
-                    let pending = match repository.list_pending(now, usize::MAX) {
-                        Ok(pending) => pending,
-                        Err(error) => {
-                            log::error!(
-                                "durable intent list failed worker={} kind={:?} message={}",
-                                worker_index,
-                                error.kind,
-                                error.message
-                            );
-                            Vec::new()
-                        }
-                    };
-                    record_intent_backlog_metric(metrics.as_ref(), &pending, now);
-                    match pending.into_iter().next() {
-                        Some(intent) => match repository.mark_running(&intent.intent_id, unix_seconds_now()) {
-                            Ok(Some(intent)) => Some(intent),
-                            Ok(None) => None,
-                            Err(error) => {
-                                log::error!(
-                                    "durable intent claim failed worker={} intent_id={} kind={:?} message={}",
-                                    worker_index,
-                                    intent.intent_id,
-                                    error.kind,
-                                    error.message
-                                );
-                                None
-                            }
-                        },
-                        None => None,
-                    }
+                    claim_pending_intent(repository.as_ref(), metrics.as_ref(), now, worker_index)
                 };
                 let Some(intent) = intent else {
                     thread::sleep(DEFAULT_INTENT_POLL_INTERVAL);
                     continue;
                 };
-                run_intent_work(repository.as_ref(), &writer, &adapter, &intent, metrics.as_ref());
+                run_intent_work(
+                    repository.as_ref(),
+                    &writer,
+                    &adapter,
+                    &intent,
+                    metrics.as_ref(),
+                );
             }
         })
         .map(|_| ())
@@ -718,12 +696,15 @@ where
             request_id: Some(intent.intent_id.clone()),
             cache_write: true,
         });
-        let response = adapter.fetch(request.clone())?;
-        response.validate_for_request(&request)?;
-        segments.push(DurableWriteSegment {
-            range: request.range,
-            rows: response.rows,
-        });
+        for (request, response) in
+            fetch_intent_with_provider_limit_splits(adapter, request, intent)?
+        {
+            response.validate_for_request(&request)?;
+            segments.push(DurableWriteSegment {
+                range: request.range,
+                rows: response.rows,
+            });
+        }
     }
     if segments.is_empty() {
         return Ok(());
@@ -781,6 +762,107 @@ where
     Ok(covered
         .iter()
         .any(|covered_range| covered_range.intersection(range) == Some(range.clone())))
+}
+
+fn claim_pending_intent(
+    repository: &dyn DurablePromotionIntentRepository,
+    metrics: Option<&Arc<MetricsRecorder>>,
+    now: u64,
+    worker_index: usize,
+) -> Option<DurablePromotionIntent> {
+    let pending = match repository.list_pending(now, DEFAULT_INTENT_CLAIM_BATCH_SIZE) {
+        Ok(pending) => pending,
+        Err(error) => {
+            log::error!(
+                "durable intent list failed worker={} kind={:?} message={}",
+                worker_index,
+                error.kind,
+                error.message
+            );
+            return None;
+        }
+    };
+    record_intent_backlog_metric(metrics, &pending, now);
+    match pending.into_iter().next() {
+        Some(intent) => match repository.mark_running(&intent.intent_id, unix_seconds_now()) {
+            Ok(Some(intent)) => Some(intent),
+            Ok(None) => None,
+            Err(error) => {
+                log::error!(
+                    "durable intent claim failed worker={} intent_id={} kind={:?} message={}",
+                    worker_index,
+                    intent.intent_id,
+                    error.kind,
+                    error.message
+                );
+                None
+            }
+        },
+        None => None,
+    }
+}
+
+fn fetch_intent_with_provider_limit_splits<A>(
+    adapter: &A,
+    fetch_request: ChainFetchRequest,
+    intent: &DurablePromotionIntent,
+) -> Result<Vec<(ChainFetchRequest, datalens_chain::ChainFetchResponse)>, DatalensError>
+where
+    A: ChainAdapter,
+{
+    let mut responses = Vec::new();
+    let mut queue = VecDeque::from([fetch_request]);
+    while let Some(fetch_request) = queue.pop_front() {
+        let fetch_start = Instant::now();
+        match adapter.fetch(fetch_request.clone()) {
+            Ok(response) => {
+                log::info!(
+                    "durable intent provider fetch completed intent_id={} dataset={} range={}-{} duration_ms={}",
+                    intent.intent_id,
+                    fetch_request.dataset_key.as_str(),
+                    fetch_request.range.start(),
+                    fetch_request.range.end(),
+                    fetch_start.elapsed().as_millis()
+                );
+                responses.push((fetch_request, response));
+            }
+            Err(error)
+                if error.kind == DatalensErrorKind::ProviderLimit
+                    && fetch_request.range.len() > 1 =>
+            {
+                log::warn!(
+                    "durable intent provider limit split intent_id={} dataset={} range={}-{} duration_ms={}",
+                    intent.intent_id,
+                    fetch_request.dataset_key.as_str(),
+                    fetch_request.range.start(),
+                    fetch_request.range.end(),
+                    fetch_start.elapsed().as_millis()
+                );
+                for range in crate::helpers::split_provider_limit_range(&fetch_request.range)?
+                    .into_iter()
+                    .rev()
+                {
+                    queue.push_front(ChainFetchRequest {
+                        range,
+                        ..fetch_request.clone()
+                    });
+                }
+            }
+            Err(error) => {
+                log::warn!(
+                    "durable intent provider fetch failed intent_id={} dataset={} range={}-{} kind={:?} duration_ms={}",
+                    intent.intent_id,
+                    fetch_request.dataset_key.as_str(),
+                    fetch_request.range.start(),
+                    fetch_request.range.end(),
+                    error.kind,
+                    fetch_start.elapsed().as_millis()
+                );
+                return Err(error);
+            }
+        }
+    }
+    Ok(responses)
 }
 
 fn promotion_key(request: &DurablePromotionRequest) -> String {
@@ -875,34 +957,200 @@ fn range_kind_key(kind: LedgerRangeKind) -> String {
 mod tests {
     use super::*;
     use datalens_core::{ChainFamily, NetworkId};
+    use datalens_storage::{CreateDurablePromotionIntent, DurablePromotionIntentCreateOutcome};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct FailingListIntentRepository {
+        last_limit: AtomicUsize,
+    }
+
+    struct PendingListIntentRepository {
+        intent: DurablePromotionIntent,
+        last_limit: AtomicUsize,
+    }
+
+    impl DurablePromotionIntentRepository for FailingListIntentRepository {
+        fn create_or_get(
+            &self,
+            _request: CreateDurablePromotionIntent,
+        ) -> Result<DurablePromotionIntentCreateOutcome, DatalensError> {
+            Err(DatalensError::new(
+                DatalensErrorKind::StorageWriteFailure,
+                "unused create",
+            ))
+        }
+
+        fn get(&self, _intent_id: &str) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+            Ok(None)
+        }
+
+        fn list_pending(
+            &self,
+            _now_unix_seconds: u64,
+            limit: usize,
+        ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+            self.last_limit.store(limit, Ordering::SeqCst);
+            Err(DatalensError::new(
+                DatalensErrorKind::StorageReadFailure,
+                "intent list failed",
+            ))
+        }
+
+        fn mark_running(
+            &self,
+            _intent_id: &str,
+            _now_unix_seconds: u64,
+        ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+            Ok(None)
+        }
+
+        fn mark_completed(
+            &self,
+            _intent_id: &str,
+            _now_unix_seconds: u64,
+        ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+            Ok(None)
+        }
+
+        fn mark_retryable_failure(
+            &self,
+            _intent_id: &str,
+            _error: &str,
+            _now_unix_seconds: u64,
+            _next_retry_at_unix_seconds: u64,
+        ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+            Ok(None)
+        }
+
+        fn mark_terminal_failure(
+            &self,
+            _intent_id: &str,
+            _error: &str,
+            _now_unix_seconds: u64,
+        ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+            Ok(None)
+        }
+
+        fn reset_stale_running(
+            &self,
+            _stale_before_unix_seconds: u64,
+            _now_unix_seconds: u64,
+        ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+            Ok(Vec::new())
+        }
+    }
+
+    impl DurablePromotionIntentRepository for PendingListIntentRepository {
+        fn create_or_get(
+            &self,
+            _request: CreateDurablePromotionIntent,
+        ) -> Result<DurablePromotionIntentCreateOutcome, DatalensError> {
+            Err(DatalensError::new(
+                DatalensErrorKind::StorageWriteFailure,
+                "unused create",
+            ))
+        }
+
+        fn get(&self, _intent_id: &str) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+            Ok(None)
+        }
+
+        fn list_pending(
+            &self,
+            _now_unix_seconds: u64,
+            limit: usize,
+        ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+            self.last_limit.store(limit, Ordering::SeqCst);
+            Ok(vec![self.intent.clone()])
+        }
+
+        fn mark_running(
+            &self,
+            _intent_id: &str,
+            _now_unix_seconds: u64,
+        ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+            Ok(None)
+        }
+
+        fn mark_completed(
+            &self,
+            _intent_id: &str,
+            _now_unix_seconds: u64,
+        ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+            Ok(None)
+        }
+
+        fn mark_retryable_failure(
+            &self,
+            _intent_id: &str,
+            _error: &str,
+            _now_unix_seconds: u64,
+            _next_retry_at_unix_seconds: u64,
+        ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+            Ok(None)
+        }
+
+        fn mark_terminal_failure(
+            &self,
+            _intent_id: &str,
+            _error: &str,
+            _now_unix_seconds: u64,
+        ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+            Ok(None)
+        }
+
+        fn reset_stale_running(
+            &self,
+            _stale_before_unix_seconds: u64,
+            _now_unix_seconds: u64,
+        ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn test_claim_intent_uses_bounded_pending_list_and_preserves_backlog_on_list_failure() {
+        let repository = FailingListIntentRepository::default();
+        let metrics = Arc::new(MetricsRecorder::new().expect("metrics recorder"));
+        metrics.set_durable_intent_backlog(7, 30);
+
+        let claimed = claim_pending_intent(&repository, Some(&metrics), 123, 0);
+
+        assert!(claimed.is_none());
+        assert_eq!(
+            repository.last_limit.load(Ordering::SeqCst),
+            DEFAULT_INTENT_CLAIM_BATCH_SIZE
+        );
+        let output = metrics.encode().expect("prometheus text");
+        assert!(output.contains("datalens_durable_intent_pending_count 7"));
+        assert!(output.contains("datalens_durable_intent_oldest_pending_age_seconds 30"));
+    }
+
+    #[test]
+    fn test_claim_intent_updates_bounded_positive_backlog_sample() {
+        let repository = PendingListIntentRepository {
+            intent: test_intent_with_created_at(100),
+            last_limit: AtomicUsize::new(0),
+        };
+        let metrics = Arc::new(MetricsRecorder::new().expect("metrics recorder"));
+
+        let claimed = claim_pending_intent(&repository, Some(&metrics), 130, 0);
+
+        assert!(claimed.is_none());
+        assert_eq!(
+            repository.last_limit.load(Ordering::SeqCst),
+            DEFAULT_INTENT_CLAIM_BATCH_SIZE
+        );
+        let output = metrics.encode().expect("prometheus text");
+        assert!(output.contains("datalens_durable_intent_pending_count 1"));
+        assert!(output.contains("datalens_durable_intent_oldest_pending_age_seconds 30"));
+    }
 
     #[test]
     fn test_intent_retry_delay_uses_exponential_backoff_with_bounded_jitter() {
-        let mut intent = DurablePromotionIntent {
-            intent_id: "intent-a".to_owned(),
-            dedupe_key: "dedupe-a".to_owned(),
-            source: DurablePromotionIntentSource::Query,
-            application: "app".to_owned(),
-            chain: ChainIdentity::expect_with_network_id(
-                ChainFamily::Evm,
-                "ethereum",
-                NetworkId::numeric(1),
-            ),
-            dataset_key: DatasetKey::evm_logs(),
-            selector: DatasetSelector::all(),
-            selector_fingerprint: "all".to_owned(),
-            selector_canonical_key: "all".to_owned(),
-            finality: "safe".to_owned(),
-            ranges: vec![],
-            status: datalens_storage::DurablePromotionIntentStatus::FailedRetryable,
-            attempt_count: 0,
-            next_retry_at_unix_seconds: None,
-            created_at_unix_seconds: 100,
-            updated_at_unix_seconds: 100,
-            last_error: None,
-            request_id: None,
-            task_id: None,
-        };
+        let mut intent = test_intent_with_created_at(100);
+        intent.status = datalens_storage::DurablePromotionIntentStatus::FailedRetryable;
 
         let first = intent_retry_delay_seconds(&intent);
         assert!(first >= DEFAULT_INTENT_RETRY_BASE_DELAY_SECONDS);
@@ -928,5 +1176,33 @@ mod tests {
             capped
                 <= DEFAULT_INTENT_RETRY_MAX_DELAY_SECONDS + DEFAULT_INTENT_RETRY_MAX_JITTER_SECONDS
         );
+    }
+
+    fn test_intent_with_created_at(created_at_unix_seconds: u64) -> DurablePromotionIntent {
+        DurablePromotionIntent {
+            intent_id: "intent-a".to_owned(),
+            dedupe_key: "dedupe-a".to_owned(),
+            source: DurablePromotionIntentSource::Query,
+            application: "app".to_owned(),
+            chain: ChainIdentity::expect_with_network_id(
+                ChainFamily::Evm,
+                "ethereum",
+                NetworkId::numeric(1),
+            ),
+            dataset_key: DatasetKey::evm_logs(),
+            selector: DatasetSelector::all(),
+            selector_fingerprint: "all".to_owned(),
+            selector_canonical_key: "all".to_owned(),
+            finality: "safe".to_owned(),
+            ranges: vec![],
+            status: datalens_storage::DurablePromotionIntentStatus::Pending,
+            attempt_count: 0,
+            next_retry_at_unix_seconds: None,
+            created_at_unix_seconds,
+            updated_at_unix_seconds: created_at_unix_seconds,
+            last_error: None,
+            request_id: None,
+            task_id: None,
+        }
     }
 }

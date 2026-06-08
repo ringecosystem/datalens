@@ -129,6 +129,75 @@ fn test_executor_miss_submits_durable_intent_when_configured() {
 }
 
 #[test]
+fn test_executor_miss_with_durable_intent_does_not_enqueue_legacy_promotion() {
+    let storage = LocalStorage::new(temp_storage_root("executor-intent-no-legacy-queue"));
+    let source = MockSource::default().with_blocks(vec![block(1, "0x01")]);
+    let intents = RecordingIntentRepository::default();
+    let executor = executor(storage.clone(), source).with_durable_intents(intents);
+
+    let result = executor.execute(blocks_input(1, 1)).expect("query result");
+    executor
+        .wait_for_durable_promotions()
+        .expect("legacy promotion queue drains");
+
+    assert_eq!(block_numbers(&result.rows), vec![1]);
+    let covered = storage
+        .covered_ranges(
+            &ethereum_identity(),
+            &DatasetKey::evm_blocks(),
+            &DatasetSelector::all(),
+            LedgerRange::blocks(1, 1).expect("range"),
+        )
+        .expect("covered ranges");
+    assert!(covered.is_empty());
+}
+
+#[test]
+fn test_executor_miss_with_completed_durable_intent_reports_no_pending_promotion() {
+    let storage = LocalStorage::new(temp_storage_root("executor-intent-completed"));
+    let source = MockSource::default().with_blocks(vec![block(1, "0x01")]);
+    let executor =
+        executor(storage.clone(), source).with_durable_intents(CompletedIntentRepository);
+
+    let result = executor.execute(blocks_input(1, 1)).expect("query result");
+    executor
+        .wait_for_durable_promotions()
+        .expect("legacy promotion queue drains");
+
+    assert_eq!(block_numbers(&result.rows), vec![1]);
+    assert_eq!(
+        result.cache.promotion_pending_ranges,
+        Vec::<LedgerRange>::new()
+    );
+    let covered = storage
+        .covered_ranges(
+            &ethereum_identity(),
+            &DatasetKey::evm_blocks(),
+            &DatasetSelector::all(),
+            LedgerRange::blocks(1, 1).expect("range"),
+        )
+        .expect("covered ranges");
+    assert!(covered.is_empty());
+}
+
+#[test]
+fn test_executor_miss_with_durable_intent_records_staged_write_metric() {
+    let storage = LocalStorage::new(temp_storage_root("executor-intent-staged-metric"));
+    let source = MockSource::default().with_blocks(vec![block(1, "0x01")]);
+    let recorder = MetricsRecorder::new().expect("metrics recorder");
+    let executor = executor(storage, source)
+        .with_metrics(recorder.clone(), ApplicationIdentity::named("api"))
+        .with_durable_intents(RecordingIntentRepository::default());
+
+    executor.execute(blocks_input(1, 1)).expect("query result");
+
+    let output = recorder.encode().expect("prometheus text");
+    assert!(output.contains(
+        r#"datalens_durable_write_total{application="api",chain="ethereum",chain_kind="evm",dataset="evm.blocks",outcome="staged"} 1"#
+    ));
+}
+
+#[test]
 fn test_executor_miss_returns_rows_when_durable_intent_scheduling_fails() {
     let storage = LocalStorage::new(temp_storage_root("executor-intent-fail"));
     let source = MockSource::default().with_blocks(vec![block(1, "0x01")]);
@@ -182,6 +251,70 @@ fn test_durable_intent_worker_replays_pending_intent_into_coverage() {
         thread::sleep(Duration::from_millis(10));
     }
 
+    let pending = intents.list_pending(u64::MAX, 10).expect("list pending");
+    assert!(pending.is_empty());
+}
+
+#[test]
+fn test_durable_intent_worker_splits_provider_limit_ranges_into_coverage() {
+    let root = temp_storage_root("executor-intent-worker-provider-limit");
+    let storage = LocalStorage::new(root.join("storage"));
+    let intents = DurablePromotionIntentStore::new(LocalObjectStore::new(root.join("intents")));
+    let source = MockSource::default()
+        .with_blocks(vec![
+            block(1, "0x01"),
+            block(2, "0x02"),
+            block(3, "0x03"),
+            block(4, "0x04"),
+        ])
+        .with_provider_limit_for_ranges_longer_than(1);
+    intents
+        .create_or_get(CreateDurablePromotionIntent {
+            source: DurablePromotionIntentSource::Warmup,
+            application: "app-a".to_owned(),
+            chain: ethereum_identity(),
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: DatasetSelector::all(),
+            selector_fingerprint: DatasetSelector::all().fingerprint(),
+            selector_canonical_key: DatasetSelector::all().canonical_key(),
+            finality: "safe".to_owned(),
+            ranges: vec![LedgerRange::blocks(1, 4).expect("range")],
+            request_id: None,
+            task_id: Some("task-1".to_owned()),
+            now_unix_seconds: 100,
+        })
+        .expect("create intent");
+
+    let _executor = executor(storage.clone(), source.clone()).with_durable_intents(intents.clone());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let covered = storage
+            .covered_ranges(
+                &ethereum_identity(),
+                &DatasetKey::evm_blocks(),
+                &DatasetSelector::all(),
+                LedgerRange::blocks(1, 4).expect("range"),
+            )
+            .expect("covered ranges");
+        if covered == vec![LedgerRange::blocks(1, 4).expect("range")] {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("durable intent worker did not publish split coverage");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    assert!(
+        source
+            .calls()
+            .contains(&SourceCall::Blocks(BlockRange::expect_new(1, 1)))
+    );
+    assert!(
+        source
+            .calls()
+            .contains(&SourceCall::Blocks(BlockRange::expect_new(4, 4)))
+    );
     let pending = intents.list_pending(u64::MAX, 10).expect("list pending");
     assert!(pending.is_empty());
 }
@@ -1202,6 +1335,75 @@ impl DurablePromotionIntentRepository for RecordingIntentRepository {
             .push(request.clone());
         Ok(DurablePromotionIntentCreateOutcome::Created(
             intent_from_request(request, DurablePromotionIntentStatus::Pending),
+        ))
+    }
+
+    fn get(&self, _intent_id: &str) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        Ok(None)
+    }
+
+    fn list_pending(
+        &self,
+        _now_unix_seconds: u64,
+        _limit: usize,
+    ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+        Ok(Vec::new())
+    }
+
+    fn mark_running(
+        &self,
+        _intent_id: &str,
+        _now_unix_seconds: u64,
+    ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        Ok(None)
+    }
+
+    fn mark_completed(
+        &self,
+        _intent_id: &str,
+        _now_unix_seconds: u64,
+    ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        Ok(None)
+    }
+
+    fn mark_retryable_failure(
+        &self,
+        _intent_id: &str,
+        _error: &str,
+        _now_unix_seconds: u64,
+        _next_retry_at_unix_seconds: u64,
+    ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        Ok(None)
+    }
+
+    fn mark_terminal_failure(
+        &self,
+        _intent_id: &str,
+        _error: &str,
+        _now_unix_seconds: u64,
+    ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        Ok(None)
+    }
+
+    fn reset_stale_running(
+        &self,
+        _stale_before_unix_seconds: u64,
+        _now_unix_seconds: u64,
+    ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+        Ok(Vec::new())
+    }
+}
+
+#[derive(Clone)]
+struct CompletedIntentRepository;
+
+impl DurablePromotionIntentRepository for CompletedIntentRepository {
+    fn create_or_get(
+        &self,
+        request: CreateDurablePromotionIntent,
+    ) -> Result<DurablePromotionIntentCreateOutcome, DatalensError> {
+        Ok(DurablePromotionIntentCreateOutcome::Existing(
+            intent_from_request(request, DurablePromotionIntentStatus::Completed),
         ))
     }
 

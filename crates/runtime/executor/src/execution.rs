@@ -129,6 +129,13 @@ pub(crate) struct ExecutorQueryWatermarks {
 
 type ProviderFetchResponse = (ChainFetchRequest, ChainFetchResponse);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DurableIntentPlanSubmissionOutcome {
+    Pending,
+    Completed,
+    Failed,
+}
+
 impl<R, S> NativeQueryExecutor<R, S>
 where
     R: StorageRepository + Clone + 'static,
@@ -609,77 +616,108 @@ where
                 .iter()
                 .map(|segment| segment.range.clone())
                 .collect::<Vec<_>>();
-            self.submit_durable_intent_for_plan(
-                &query_id,
-                &ledger_application,
-                &plan,
-                finality_level,
-                pending_ranges.clone(),
-            );
-            let enqueue_start = Instant::now();
-            match self.durable_promotions.enqueue(DurablePromotionRequest {
-                query_id: query_id.clone(),
-                chain: plan.chain.clone(),
-                dataset_key: plan.dataset_key.clone(),
-                selector: plan.selector.clone(),
-                finality_level,
-                segments: fetched_segments,
-                metrics: self.promotion_metrics(&labels),
-            }) {
-                Ok(PromotionEnqueueOutcome::Queued) => {
-                    promotion_pending_ranges = pending_ranges;
-                    durable_write_outcome = LedgerDurableWriteOutcome::Staged;
-                    self.record_durable_write(&labels, MetricsDurableWriteOutcome::Staged);
-                    log::info!(
-                        "durable promotion enqueued query_id={} dataset={} range={}-{} pending_ranges={} duration_ms={}",
-                        query_id,
-                        plan.dataset_key.as_str(),
-                        plan.ledger_range.start(),
-                        plan.ledger_range.end(),
-                        promotion_pending_ranges.len(),
-                        enqueue_start.elapsed().as_millis()
-                    );
+            if self.durable_intents.is_some() {
+                match self.submit_durable_intent_for_plan(
+                    &query_id,
+                    &ledger_application,
+                    &plan,
+                    finality_level,
+                    pending_ranges.clone(),
+                ) {
+                    DurableIntentPlanSubmissionOutcome::Pending => {
+                        promotion_pending_ranges = pending_ranges;
+                        durable_write_outcome = LedgerDurableWriteOutcome::Staged;
+                        self.record_durable_write(&labels, MetricsDurableWriteOutcome::Staged);
+                        log::info!(
+                            "durable promotion intent pending query_id={} dataset={} range={}-{} pending_ranges={}",
+                            query_id,
+                            plan.dataset_key.as_str(),
+                            plan.ledger_range.start(),
+                            plan.ledger_range.end(),
+                            promotion_pending_ranges.len()
+                        );
+                    }
+                    DurableIntentPlanSubmissionOutcome::Completed => {}
+                    DurableIntentPlanSubmissionOutcome::Failed => {
+                        self.record_durable_write(
+                            &labels,
+                            MetricsDurableWriteOutcome::StorageError,
+                        );
+                        durable_write_outcome = LedgerDurableWriteOutcome::StorageError;
+                    }
                 }
-                Ok(PromotionEnqueueOutcome::AlreadyInFlight) => {
-                    promotion_pending_ranges = pending_ranges;
-                    durable_write_outcome = LedgerDurableWriteOutcome::Staged;
-                    self.record_durable_write(&labels, MetricsDurableWriteOutcome::Staged);
-                    log::info!(
-                        "durable promotion already in flight query_id={} dataset={} range={}-{} pending_ranges={} duration_ms={}",
-                        query_id,
-                        plan.dataset_key.as_str(),
-                        plan.ledger_range.start(),
-                        plan.ledger_range.end(),
-                        promotion_pending_ranges.len(),
-                        enqueue_start.elapsed().as_millis()
-                    );
-                }
-                Ok(PromotionEnqueueOutcome::Rejected) => {
-                    self.record_durable_write(&labels, MetricsDurableWriteOutcome::StorageError);
-                    durable_write_outcome = LedgerDurableWriteOutcome::StorageError;
-                    log::error!(
-                        "durable promotion enqueue rejected query_id={} dataset={} range={}-{} duration_ms={}",
-                        query_id,
-                        plan.dataset_key.as_str(),
-                        plan.ledger_range.start(),
-                        plan.ledger_range.end(),
-                        enqueue_start.elapsed().as_millis()
-                    );
-                }
-                Err(error) => {
-                    log::error!(
-                        "durable promotion enqueue failed query_id={} dataset={} range={}-{} kind={:?}",
-                        query_id,
-                        plan.dataset_key.as_str(),
-                        plan.ledger_range.start(),
-                        plan.ledger_range.end(),
-                        error.kind
-                    );
-                    self.record_error(&labels, &error);
-                    self.record_durable_write(&labels, MetricsDurableWriteOutcome::StorageError);
-                    durable_write_outcome = LedgerDurableWriteOutcome::StorageError;
-                }
-            };
+            } else {
+                let enqueue_start = Instant::now();
+                match self.durable_promotions.enqueue(DurablePromotionRequest {
+                    query_id: query_id.clone(),
+                    chain: plan.chain.clone(),
+                    dataset_key: plan.dataset_key.clone(),
+                    selector: plan.selector.clone(),
+                    finality_level,
+                    segments: fetched_segments,
+                    metrics: self.promotion_metrics(&labels),
+                }) {
+                    Ok(PromotionEnqueueOutcome::Queued) => {
+                        promotion_pending_ranges = pending_ranges;
+                        durable_write_outcome = LedgerDurableWriteOutcome::Staged;
+                        self.record_durable_write(&labels, MetricsDurableWriteOutcome::Staged);
+                        log::info!(
+                            "durable promotion enqueued query_id={} dataset={} range={}-{} pending_ranges={} duration_ms={}",
+                            query_id,
+                            plan.dataset_key.as_str(),
+                            plan.ledger_range.start(),
+                            plan.ledger_range.end(),
+                            promotion_pending_ranges.len(),
+                            enqueue_start.elapsed().as_millis()
+                        );
+                    }
+                    Ok(PromotionEnqueueOutcome::AlreadyInFlight) => {
+                        promotion_pending_ranges = pending_ranges;
+                        durable_write_outcome = LedgerDurableWriteOutcome::Staged;
+                        self.record_durable_write(&labels, MetricsDurableWriteOutcome::Staged);
+                        log::info!(
+                            "durable promotion already in flight query_id={} dataset={} range={}-{} pending_ranges={} duration_ms={}",
+                            query_id,
+                            plan.dataset_key.as_str(),
+                            plan.ledger_range.start(),
+                            plan.ledger_range.end(),
+                            promotion_pending_ranges.len(),
+                            enqueue_start.elapsed().as_millis()
+                        );
+                    }
+                    Ok(PromotionEnqueueOutcome::Rejected) => {
+                        self.record_durable_write(
+                            &labels,
+                            MetricsDurableWriteOutcome::StorageError,
+                        );
+                        durable_write_outcome = LedgerDurableWriteOutcome::StorageError;
+                        log::error!(
+                            "durable promotion enqueue rejected query_id={} dataset={} range={}-{} duration_ms={}",
+                            query_id,
+                            plan.dataset_key.as_str(),
+                            plan.ledger_range.start(),
+                            plan.ledger_range.end(),
+                            enqueue_start.elapsed().as_millis()
+                        );
+                    }
+                    Err(error) => {
+                        log::error!(
+                            "durable promotion enqueue failed query_id={} dataset={} range={}-{} kind={:?}",
+                            query_id,
+                            plan.dataset_key.as_str(),
+                            plan.ledger_range.start(),
+                            plan.ledger_range.end(),
+                            error.kind
+                        );
+                        self.record_error(&labels, &error);
+                        self.record_durable_write(
+                            &labels,
+                            MetricsDurableWriteOutcome::StorageError,
+                        );
+                        durable_write_outcome = LedgerDurableWriteOutcome::StorageError;
+                    }
+                };
+            }
         }
         if provider_fetch_attempted {
             let fill_outcome = if !cache_fill_attempted {
@@ -1150,9 +1188,9 @@ where
         plan: &datalens_planner::NativeQueryPlan,
         finality_level: FinalityLevel,
         ranges: Vec<LedgerRange>,
-    ) {
+    ) -> DurableIntentPlanSubmissionOutcome {
         let Some(repository) = &self.durable_intents else {
-            return;
+            return DurableIntentPlanSubmissionOutcome::Failed;
         };
         let Ok(now_unix_seconds) = unix_seconds_now() else {
             log::error!(
@@ -1162,7 +1200,7 @@ where
                 plan.ledger_range.start(),
                 plan.ledger_range.end()
             );
-            return;
+            return DurableIntentPlanSubmissionOutcome::Failed;
         };
         let application = application
             .as_ref()
@@ -1199,6 +1237,7 @@ where
                     intent.selector_fingerprint,
                     format_ranges(&intent.ranges)
                 );
+                DurableIntentPlanSubmissionOutcome::Pending
             }
             DurableIntentSubmissionOutcome::AlreadyPending(intent) => {
                 self.record_durable_intent(
@@ -1216,6 +1255,7 @@ where
                     intent.selector_fingerprint,
                     format_ranges(&intent.ranges)
                 );
+                DurableIntentPlanSubmissionOutcome::Pending
             }
             DurableIntentSubmissionOutcome::AlreadyCompleted(intent) => {
                 self.record_durable_intent(
@@ -1233,6 +1273,7 @@ where
                     intent.selector_fingerprint,
                     format_ranges(&intent.ranges)
                 );
+                DurableIntentPlanSubmissionOutcome::Completed
             }
             DurableIntentSubmissionOutcome::Failed(error) => {
                 self.record_durable_intent(
@@ -1250,6 +1291,7 @@ where
                     error.kind,
                     error.message
                 );
+                DurableIntentPlanSubmissionOutcome::Failed
             }
         }
     }
@@ -1636,15 +1678,6 @@ fn process_metadata_job(job: MetadataJob) {
 
 fn elapsed_ms(start: Instant) -> u128 {
     start.elapsed().as_millis()
-}
-
-fn split_provider_limit_range(range: &LedgerRange) -> Result<Vec<LedgerRange>, DatalensError> {
-    let first_len = u64::try_from(range.len() / 2).unwrap_or(u64::MAX).max(1);
-    let first_end = range.start().saturating_add(first_len - 1);
-    Ok(vec![
-        LedgerRange::try_new(range.kind(), range.start(), first_end)?,
-        LedgerRange::try_new(range.kind(), first_end + 1, range.end())?,
-    ])
 }
 
 fn durable_watermark_block(plan: &datalens_planner::NativeQueryPlan) -> Option<u64> {
