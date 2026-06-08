@@ -390,6 +390,13 @@ impl QueryServiceRegistry {
             .map(|service| service.flush_staged_writes_for_shutdown())
             .collect()
     }
+
+    pub fn wait_for_durable_promotions(&self) -> Result<(), DatalensError> {
+        for service in self.services.values() {
+            service.wait_for_durable_promotions()?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]

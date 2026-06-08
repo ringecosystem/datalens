@@ -1,6 +1,7 @@
 use datalens_chain::DatasetSelector;
 use datalens_core::{ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey, LedgerRange};
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
 
 use crate::{Manifest, ManifestEntry, ManifestFinalityLevel, ObjectStore, range_kind_key};
 
@@ -89,6 +90,7 @@ where
     for (bucket_start, bucket_end) in
         bucket_ranges(&entry.range, DEFAULT_COVERAGE_INDEX_BUCKET_SIZE)
     {
+        let started = Instant::now();
         let key = coverage_index_key(
             &entry.chain,
             &entry.dataset_key,
@@ -122,6 +124,17 @@ where
                 format!("write coverage index {key}: {}", error.message),
             )
         })?;
+        log::info!(
+            "storage wrote coverage index chain_key={} dataset={} selector_fingerprint={} range_kind={} bucket={}-{} entries_count={} duration_ms={}",
+            entry.chain.key_prefix(),
+            entry.dataset_key.as_str(),
+            entry.selector_fingerprint,
+            range_kind_key(entry.range.kind()),
+            bucket_start,
+            bucket_end,
+            index.entries.len(),
+            started.elapsed().as_millis()
+        );
     }
     Ok(())
 }

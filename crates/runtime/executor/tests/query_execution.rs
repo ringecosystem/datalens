@@ -1,9 +1,11 @@
 use std::{
     path::PathBuf,
     sync::{
-        Arc, Mutex,
+        Arc, Barrier, Condvar, Mutex,
         atomic::{AtomicUsize, Ordering},
+        mpsc,
     },
+    thread,
     time::{Duration, Instant},
 };
 
@@ -77,6 +79,13 @@ fn test_executor_miss_fetches_and_persists_through_writer() {
     let first = executor
         .execute(blocks_input(10, 11))
         .expect("miss succeeds");
+    assert_eq!(
+        first.cache.promotion_pending_ranges,
+        vec![LedgerRange::blocks(10, 11).unwrap()]
+    );
+    executor
+        .wait_for_durable_promotions()
+        .expect("promotion drain");
     let second = executor
         .execute(blocks_input(10, 11))
         .expect("subsequent hit succeeds");
@@ -94,6 +103,170 @@ fn test_executor_miss_fetches_and_persists_through_writer() {
         vec![SourceCall::Blocks(BlockRange::expect_new(10, 11))]
     );
     assert_eq!(block_numbers(&second.rows), vec![10, 11]);
+}
+
+#[test]
+fn test_executor_miss_returns_before_slow_durable_promotion_completes() {
+    let root = temp_storage_root("executor-async-promotion");
+    let storage = BlockingWriteStorage::new(LocalStorage::new(&root));
+    let write_gate = storage.write_gate();
+    let source = MockSource::default().with_blocks(vec![block(10, "0x10")]);
+    let executor = executor(storage.clone(), source);
+    let (sender, receiver) = mpsc::channel();
+    let query_executor = executor.clone();
+
+    let query = thread::spawn(move || {
+        sender
+            .send(query_executor.execute(blocks_input(10, 10)))
+            .expect("send query result");
+    });
+
+    write_gate.wait_until_blocked();
+    let result = match receiver.recv_timeout(Duration::from_millis(150)) {
+        Ok(result) => result,
+        Err(error) => {
+            write_gate.release();
+            query.join().expect("query thread after timeout");
+            panic!("query response waited for durable promotion: {error}");
+        }
+    };
+    let result = result.expect("query succeeds while promotion is blocked");
+    assert_eq!(block_numbers(&result.rows), vec![10]);
+    assert_eq!(
+        result.cache.promotion_pending_ranges,
+        vec![LedgerRange::blocks(10, 10).expect("valid range")]
+    );
+    assert!(
+        storage
+            .covered_ranges(
+                &ethereum_identity(),
+                &DatasetKey::evm_blocks(),
+                &DatasetSelector::all(),
+                LedgerRange::blocks(10, 10).expect("valid range"),
+            )
+            .expect("covered ranges before release")
+            .is_empty()
+    );
+
+    write_gate.release();
+    query.join().expect("query thread");
+    executor
+        .wait_for_durable_promotions()
+        .expect("promotion drain");
+    assert_eq!(
+        storage
+            .covered_ranges(
+                &ethereum_identity(),
+                &DatasetKey::evm_blocks(),
+                &DatasetSelector::all(),
+                LedgerRange::blocks(10, 10).expect("valid range"),
+            )
+            .expect("covered ranges after release"),
+        vec![LedgerRange::blocks(10, 10).expect("valid range")]
+    );
+}
+
+#[test]
+fn test_executor_identical_concurrent_misses_share_provider_fetch_and_promote_once() {
+    let storage = LocalStorage::new(temp_storage_root("executor-provider-singleflight"));
+    let source = MockSource::default()
+        .with_blocks(vec![block(20, "0x20")])
+        .with_fetch_delay(Duration::from_millis(200));
+    let executor = executor(storage.clone(), source.clone());
+    let barrier = Arc::new(Barrier::new(3));
+    let mut handles = Vec::new();
+
+    for _ in 0..2 {
+        let query_executor = executor.clone();
+        let barrier = barrier.clone();
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            query_executor
+                .execute(blocks_input(20, 20))
+                .expect("query succeeds")
+        }));
+    }
+
+    barrier.wait();
+    let first = handles.remove(0).join().expect("first query");
+    let second = handles.remove(0).join().expect("second query");
+
+    assert_eq!(block_numbers(&first.rows), vec![20]);
+    assert_eq!(block_numbers(&second.rows), vec![20]);
+    assert_eq!(
+        source.calls(),
+        vec![SourceCall::Blocks(BlockRange::expect_new(20, 20))]
+    );
+    assert_eq!(
+        first.cache.promotion_pending_ranges,
+        vec![LedgerRange::blocks(20, 20).expect("valid range")]
+    );
+    assert_eq!(
+        second.cache.promotion_pending_ranges,
+        vec![LedgerRange::blocks(20, 20).expect("valid range")]
+    );
+
+    executor
+        .wait_for_durable_promotions()
+        .expect("promotion drain");
+    let hit = executor
+        .execute(blocks_input(20, 20))
+        .expect("subsequent hit succeeds");
+    assert_eq!(
+        hit.cache.hit_ranges,
+        vec![LedgerRange::blocks(20, 20).expect("valid range")]
+    );
+    assert_eq!(
+        source.calls(),
+        vec![SourceCall::Blocks(BlockRange::expect_new(20, 20))]
+    );
+}
+
+#[test]
+fn test_executor_duplicate_retry_does_not_queue_duplicate_durable_promotion() {
+    let storage = BlockingWriteStorage::new(LocalStorage::new(temp_storage_root(
+        "executor-promotion-singleflight",
+    )));
+    let write_gate = storage.write_gate();
+    let source = MockSource::default().with_blocks(vec![block(30, "0x30")]);
+    let executor = executor(storage.clone(), source);
+    let (sender, receiver) = mpsc::channel();
+    let first_executor = executor.clone();
+
+    let first_query = thread::spawn(move || {
+        sender
+            .send(first_executor.execute(blocks_input(30, 30)))
+            .expect("send first query");
+    });
+    write_gate.wait_until_blocked();
+    let first = match receiver.recv_timeout(Duration::from_millis(150)) {
+        Ok(result) => result.expect("first miss succeeds"),
+        Err(error) => {
+            write_gate.release();
+            first_query.join().expect("first query after timeout");
+            panic!("first query waited for durable promotion: {error}");
+        }
+    };
+    let second = executor
+        .execute(blocks_input(30, 30))
+        .expect("retry succeeds while promotion is in flight");
+
+    assert_eq!(
+        first.cache.promotion_pending_ranges,
+        vec![LedgerRange::blocks(30, 30).expect("valid range")]
+    );
+    assert_eq!(
+        second.cache.promotion_pending_ranges,
+        vec![LedgerRange::blocks(30, 30).expect("valid range")]
+    );
+    assert_eq!(storage.write_attempts(), 1);
+
+    write_gate.release();
+    first_query.join().expect("first query");
+    executor
+        .wait_for_durable_promotions()
+        .expect("promotion drain");
+    assert_eq!(storage.write_attempts(), 1);
 }
 
 #[test]
@@ -234,6 +407,9 @@ fn test_executor_returns_staged_query_fill_without_forcing_manifest_flush() {
         .expect("query miss returns provider rows");
     assert_eq!(block_numbers(&first.rows), vec![10]);
     assert_eq!(storage.manifest().expect("manifest").entries.len(), 0);
+    executor
+        .wait_for_durable_promotions()
+        .expect("promotion drain");
 
     let second = executor
         .execute(blocks_input(10, 10))
@@ -337,7 +513,7 @@ fn test_executor_writes_usage_ledger_for_miss_fill_and_empty_coverage() {
     assert_eq!(events[0].fill_outcome, FillOutcome::LiveFetch);
     assert_eq!(
         events[0].durable_write_outcome,
-        datalens_storage::DurableWriteOutcome::Flushed
+        datalens_storage::DurableWriteOutcome::Staged
     );
     assert_eq!(events[0].row_count, 1);
 }
@@ -401,6 +577,10 @@ fn test_executor_latest_only_fetches_latest_without_durable_read_or_write() {
     assert_eq!(
         result.cache.provider_fill_ranges,
         vec![LedgerRange::blocks(99, 100).expect("valid range")]
+    );
+    assert_eq!(
+        result.cache.promotion_pending_ranges,
+        Vec::<LedgerRange>::new()
     );
     assert_eq!(result.cache.segments.len(), 1);
     assert_eq!(
@@ -515,10 +695,14 @@ fn test_executor_records_separate_usage_for_shared_durable_cache() {
     let ledger = UsageLedgerStore::new(LocalObjectStore::new(&root));
     let source = MockSource::default().with_blocks(vec![block(20, "0x20")]);
 
-    executor(storage.clone(), source.clone())
-        .with_usage_ledger(ledger.clone(), ApplicationIdentity::named("app-a"))
+    let app_a_executor = executor(storage.clone(), source.clone())
+        .with_usage_ledger(ledger.clone(), ApplicationIdentity::named("app-a"));
+    app_a_executor
         .execute(blocks_input(20, 20))
         .expect("first application fills cache");
+    app_a_executor
+        .wait_for_durable_promotions()
+        .expect("promotion drain");
     executor(storage.clone(), source.clone())
         .with_usage_ledger(ledger.clone(), ApplicationIdentity::named("app-b"))
         .execute(blocks_input(20, 20))
@@ -529,7 +713,7 @@ fn test_executor_records_separate_usage_for_shared_durable_cache() {
     assert_eq!(app_a_events[0].fill_outcome, FillOutcome::LiveFetch);
     assert_eq!(
         app_a_events[0].durable_write_outcome,
-        datalens_storage::DurableWriteOutcome::Flushed
+        datalens_storage::DurableWriteOutcome::Staged
     );
     assert_eq!(app_b_events[0].cache_outcome, CacheOutcome::Hit);
     assert_eq!(storage.manifest().expect("manifest").entries.len(), 1);
@@ -751,6 +935,9 @@ fn test_executor_records_metrics_for_cache_hit_and_fill_paths() {
     executor
         .execute(blocks_input(1, 4))
         .expect("partial fill succeeds");
+    executor
+        .wait_for_durable_promotions()
+        .expect("promotion drain");
 
     let output = recorder.encode().expect("prometheus text");
     assert!(output.contains(
@@ -892,7 +1079,7 @@ fn assert_response_mismatch_not_cached(name: &str, mutation: ResponseMutation) {
 
 fn executor<R>(storage: R, source: MockSource) -> NativeQueryExecutor<R, MockSource>
 where
-    R: StorageRepository + Clone,
+    R: StorageRepository + Clone + 'static,
 {
     NativeQueryExecutor::new(
         storage,
@@ -966,6 +1153,114 @@ impl StorageRepository for CountingStorage {
         request: StorageWriteRequest<'_>,
     ) -> Result<StorageWriteOutcome, DatalensError> {
         self.inner.write_rows(request)
+    }
+}
+
+#[derive(Clone)]
+struct BlockingWriteStorage {
+    inner: LocalStorage,
+    write_gate: WriteGate,
+    write_attempts: Arc<AtomicUsize>,
+}
+
+impl BlockingWriteStorage {
+    fn new(inner: LocalStorage) -> Self {
+        Self {
+            inner,
+            write_gate: WriteGate::default(),
+            write_attempts: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn write_gate(&self) -> WriteGate {
+        self.write_gate.clone()
+    }
+
+    fn write_attempts(&self) -> usize {
+        self.write_attempts.load(Ordering::SeqCst)
+    }
+}
+
+impl StorageRepository for BlockingWriteStorage {
+    fn manifest(&self) -> Result<Manifest, DatalensError> {
+        self.inner.manifest()
+    }
+
+    fn covered_ranges(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+    ) -> Result<Vec<LedgerRange>, DatalensError> {
+        self.inner
+            .covered_ranges(chain, dataset_key, selector, range)
+    }
+
+    fn read_rows(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+    ) -> Result<DatasetRows, DatalensError> {
+        self.inner.read_rows(chain, dataset_key, selector, range)
+    }
+
+    fn write_rows(
+        &self,
+        request: StorageWriteRequest<'_>,
+    ) -> Result<StorageWriteOutcome, DatalensError> {
+        self.write_attempts.fetch_add(1, Ordering::SeqCst);
+        self.write_gate.block_until_released();
+        self.inner.write_rows(request)
+    }
+}
+
+#[derive(Clone, Default)]
+struct WriteGate {
+    state: Arc<(Mutex<WriteGateState>, Condvar)>,
+}
+
+#[derive(Default)]
+struct WriteGateState {
+    blocked: bool,
+    released: bool,
+}
+
+impl WriteGate {
+    fn wait_until_blocked(&self) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let (lock, condvar) = self.state.as_ref();
+        let mut state = lock.lock().expect("write gate lock");
+        while !state.blocked {
+            let now = Instant::now();
+            if now >= deadline {
+                panic!("write_rows did not block");
+            }
+            let timeout = deadline.saturating_duration_since(now);
+            let (next, _) = condvar
+                .wait_timeout(state, timeout)
+                .expect("write gate wait");
+            state = next;
+        }
+    }
+
+    fn release(&self) {
+        let (lock, condvar) = self.state.as_ref();
+        let mut state = lock.lock().expect("write gate lock");
+        state.released = true;
+        condvar.notify_all();
+    }
+
+    fn block_until_released(&self) {
+        let (lock, condvar) = self.state.as_ref();
+        let mut state = lock.lock().expect("write gate lock");
+        state.blocked = true;
+        condvar.notify_all();
+        while !state.released {
+            state = condvar.wait(state).expect("write gate wait");
+        }
     }
 }
 
@@ -1331,6 +1626,7 @@ struct MockSource {
     error: Arc<Mutex<Option<DatalensErrorKind>>>,
     provider_limit_len: Arc<Mutex<Option<u128>>>,
     capability_max_range_len: Arc<Mutex<u64>>,
+    fetch_delay: Arc<Mutex<Option<Duration>>>,
 }
 
 impl Default for MockSource {
@@ -1346,6 +1642,7 @@ impl Default for MockSource {
             error: Arc::new(Mutex::new(None)),
             provider_limit_len: Arc::new(Mutex::new(None)),
             capability_max_range_len: Arc::new(Mutex::new(2)),
+            fetch_delay: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -1400,6 +1697,11 @@ impl MockSource {
             .provider_limit_len
             .lock()
             .expect("provider limit len lock") = Some(len);
+        self
+    }
+
+    fn with_fetch_delay(self, delay: Duration) -> Self {
+        *self.fetch_delay.lock().expect("fetch delay lock") = Some(delay);
         self
     }
 
@@ -1471,6 +1773,9 @@ impl ChainAdapter for MockSource {
             .lock()
             .expect("request ids lock")
             .push(request.context.request_id.clone());
+        if let Some(delay) = *self.fetch_delay.lock().expect("fetch delay lock") {
+            thread::sleep(delay);
+        }
         if let Some(kind) = self.error.lock().expect("error lock").clone() {
             return Err(DatalensError::new(kind, "injected provider failure"));
         }

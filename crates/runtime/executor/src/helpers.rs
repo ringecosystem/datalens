@@ -4,9 +4,8 @@ use datalens_metrics::{
     CacheCoverageOutcome, DurableWriteOutcome as MetricsDurableWriteOutcome, QueryOutcome,
 };
 use datalens_storage::{
-    CacheOutcome as LedgerCacheOutcome, DurableWriteOutcome as LedgerDurableWriteOutcome,
-    FillOutcome as LedgerFillOutcome, HotCacheCandidateStatus, HotCacheEntryMetadata,
-    HotCacheFinalityStatus, QueryOutcome as LedgerQueryOutcome,
+    CacheOutcome as LedgerCacheOutcome, FillOutcome as LedgerFillOutcome, HotCacheCandidateStatus,
+    HotCacheEntryMetadata, HotCacheFinalityStatus, QueryOutcome as LedgerQueryOutcome,
 };
 use datalens_writer::DurableWriteResult;
 
@@ -114,22 +113,6 @@ pub(crate) fn ledger_fill_outcome(
         LedgerFillOutcome::NotAttempted
     } else {
         LedgerFillOutcome::LiveFetch
-    }
-}
-
-pub(crate) fn ledger_durable_write_outcome(
-    result: &DurableWriteResult,
-) -> LedgerDurableWriteOutcome {
-    if !result.data_objects.is_empty() {
-        LedgerDurableWriteOutcome::Flushed
-    } else if !result.empty_coverages.is_empty() {
-        LedgerDurableWriteOutcome::EmptyCoverageRecorded
-    } else if !result.staged_ranges.is_empty() {
-        LedgerDurableWriteOutcome::Staged
-    } else if !result.skipped_ranges.is_empty() {
-        LedgerDurableWriteOutcome::Skipped
-    } else {
-        LedgerDurableWriteOutcome::NotAttempted
     }
 }
 

@@ -1,7 +1,7 @@
 use std::{
     path::PathBuf,
     sync::{
-        Arc, Condvar, Mutex,
+        Arc, Barrier, Condvar, Mutex,
         atomic::{AtomicUsize, Ordering},
         mpsc,
     },
@@ -3174,6 +3174,59 @@ fn test_cloned_storage_serializes_concurrent_manifest_updates() {
             && entry.object_key.is_none()
             && entry.row_count == 0
     }));
+}
+
+#[test]
+fn test_concurrent_same_bucket_coverage_index_writes_do_not_lose_entries() {
+    let storage = LocalStorage::new(temp_storage_root("same-bucket-coverage-index-writes"));
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let barrier = Arc::new(Barrier::new(5));
+    let ranges = [10, 12, 14, 16]
+        .into_iter()
+        .map(|block| LedgerRange::blocks(block, block).expect("valid range"))
+        .collect::<Vec<_>>();
+    let mut handles = Vec::new();
+
+    for range in ranges.clone() {
+        let storage = storage.clone();
+        let chain = chain.clone();
+        let selector = selector.clone();
+        let barrier = barrier.clone();
+        handles.push(std::thread::spawn(move || {
+            let rows = DatasetRows::new(DatasetKey::evm_logs(), QueryRows::EvmLogs(Vec::new()))
+                .expect("dataset rows");
+            barrier.wait();
+            storage
+                .write_rows(StorageWriteRequest {
+                    chain: &chain,
+                    dataset_key: DatasetKey::evm_logs(),
+                    selector: &selector,
+                    range,
+                    rows: &rows,
+                    finality_level: FinalityLevel::Safe,
+                    record_empty_coverage: true,
+                })
+                .expect("write coverage");
+        }));
+    }
+
+    barrier.wait();
+    for handle in handles {
+        handle.join().expect("writer");
+    }
+
+    assert_eq!(
+        storage
+            .covered_ranges(
+                &chain,
+                &DatasetKey::evm_logs(),
+                &selector,
+                LedgerRange::blocks(10, 16).expect("valid range"),
+            )
+            .expect("covered ranges"),
+        ranges
+    );
 }
 
 #[test]

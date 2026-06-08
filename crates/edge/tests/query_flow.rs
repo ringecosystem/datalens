@@ -12,6 +12,9 @@ fn test_query_blocks_miss_persists_then_equivalent_hit_uses_cache() {
     let first = service
         .query_native(request.clone())
         .expect("first query succeeds");
+    service
+        .wait_for_durable_promotions()
+        .expect("promotion drain");
     let second = service
         .query_native(request)
         .expect("second query succeeds");
@@ -45,6 +48,9 @@ fn test_query_blocks_partial_hit_fetches_only_missing_range() {
     service
         .query_native(blocks_request(1, 2))
         .expect("seed cache");
+    service
+        .wait_for_durable_promotions()
+        .expect("seed promotion drain");
     source.clear_calls();
     let response = service
         .query_native(blocks_request(1, 4))
@@ -76,6 +82,9 @@ fn test_query_empty_logs_records_empty_coverage_without_data_object() {
     let first = service
         .query_native(request.clone())
         .expect("empty log query succeeds");
+    service
+        .wait_for_durable_promotions()
+        .expect("promotion drain");
     let second = service
         .query_native(request)
         .expect("empty log query hits cache");
@@ -137,6 +146,9 @@ fn test_query_logs_miss_persists_then_equivalent_hit_uses_cache() {
     let first = service
         .query_native(request.clone())
         .expect("first log query succeeds");
+    service
+        .wait_for_durable_promotions()
+        .expect("promotion drain");
     let second = service
         .query_native(request)
         .expect("second log query succeeds");
@@ -173,6 +185,9 @@ fn test_query_staged_non_empty_range_survives_service_restart() {
     let first = service
         .query_native(blocks_request(10, 10))
         .expect("first query succeeds");
+    service
+        .wait_for_durable_promotions()
+        .expect("promotion drain");
     assert_eq!(block_numbers(&first), vec![10]);
     assert_eq!(
         source.calls(),
@@ -212,6 +227,9 @@ fn test_query_empty_coverage_survives_service_restart() {
     service
         .query_native(request.clone())
         .expect("first empty query succeeds");
+    service
+        .wait_for_durable_promotions()
+        .expect("promotion drain");
     assert_eq!(
         source.calls(),
         vec![SourceCall::Logs(BlockRange::expect_new(50, 50))]
@@ -284,6 +302,9 @@ fn test_query_allows_range_at_safe_height_and_writes_cache() {
     let response = service
         .query_native(blocks_request(98, 99))
         .expect("safe range succeeds");
+    service
+        .wait_for_durable_promotions()
+        .expect("promotion drain");
 
     assert_eq!(block_numbers(&response), vec![98, 99]);
     assert_eq!(
@@ -720,6 +741,9 @@ fn test_registry_shared_storage_keeps_manifest_isolated_by_chain_identity() {
     registry
         .query_native(blocks_request_for(polygon_identity(), 1, 1))
         .expect("polygon query succeeds");
+    registry
+        .wait_for_durable_promotions()
+        .expect("promotion drain");
 
     assert!(
         root.join("chains/evm/ethereum/1/manifest-segments")
@@ -781,6 +805,9 @@ fn test_registry_routes_evm_and_solana_native_queries_side_by_side() {
             finality: QueryFinalityRequirement::DurableOnly,
         })
         .expect("solana query succeeds");
+    registry
+        .wait_for_durable_promotions()
+        .expect("promotion drain");
 
     assert_eq!(block_numbers(&ethereum), vec![1]);
     let QueryRows::AdapterJson { rows, .. } = solana_response.rows.rows() else {

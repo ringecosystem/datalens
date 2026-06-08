@@ -327,6 +327,10 @@ where
         self.executor.flush_staged_writes_for_shutdown()
     }
 
+    pub fn wait_for_durable_promotions(&self) -> Result<(), DatalensError> {
+        self.executor.wait_for_durable_promotions()
+    }
+
     pub fn discovery(&self) -> Result<ChainDiscovery, DatalensError> {
         Ok(ChainDiscovery {
             identity: self.capabilities.chain().clone(),
@@ -436,6 +440,8 @@ pub(crate) trait RegisteredQueryService: Send + Sync {
 
     fn flush_staged_writes_for_shutdown(&self) -> Result<DurableWriteResult, DatalensError>;
 
+    fn wait_for_durable_promotions(&self) -> Result<(), DatalensError>;
+
     fn discovery(&self) -> Result<ChainDiscovery, DatalensError>;
 
     fn warmup(&self) -> Option<Arc<dyn RegisteredWarmupService>>;
@@ -538,6 +544,10 @@ where
 
     fn flush_staged_writes_for_shutdown(&self) -> Result<DurableWriteResult, DatalensError> {
         QueryService::flush_staged_writes_for_shutdown(self)
+    }
+
+    fn wait_for_durable_promotions(&self) -> Result<(), DatalensError> {
+        QueryService::wait_for_durable_promotions(self)
     }
 
     fn discovery(&self) -> Result<ChainDiscovery, DatalensError> {

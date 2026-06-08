@@ -150,6 +150,9 @@ fn test_query_native_reuses_durable_non_evm_rows_before_shutdown_flush() {
     let first = service
         .query_native(input.clone())
         .expect("first query fetches provider rows");
+    service
+        .wait_for_durable_promotions()
+        .expect("promotion drain");
     let second = new_service()
         .query_native(input.clone())
         .expect("second query reads durable rows");

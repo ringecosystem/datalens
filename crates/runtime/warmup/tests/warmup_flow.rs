@@ -953,7 +953,7 @@ fn follow_query_request() -> WarmupSubmitRequest {
 
 fn execute_log_query<R>(executor: &NativeQueryExecutor<R, FixtureAdapter>, range: LedgerRange)
 where
-    R: datalens_storage::StorageRepository + Clone,
+    R: datalens_storage::StorageRepository + Clone + 'static,
 {
     executor
         .execute_with_application(
