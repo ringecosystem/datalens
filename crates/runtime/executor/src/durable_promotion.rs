@@ -29,7 +29,7 @@ const DEFAULT_PROMOTION_WORKERS: usize = 4;
 const DEFAULT_PROMOTION_QUEUE_CAPACITY: usize = 1024;
 const DEFAULT_INTENT_WORKERS: usize = 2;
 const DEFAULT_INTENT_POLL_INTERVAL: Duration = Duration::from_millis(500);
-const DEFAULT_INTENT_CLAIM_BATCH_SIZE: usize = 1;
+const DEFAULT_INTENT_CLAIM_BATCH_SIZE: usize = 16;
 const DEFAULT_INTENT_RETRY_BASE_DELAY_SECONDS: u64 = 60;
 const DEFAULT_INTENT_RETRY_MAX_DELAY_SECONDS: u64 = 3600;
 const DEFAULT_INTENT_RETRY_MAX_JITTER_SECONDS: u64 = 60;
@@ -392,6 +392,7 @@ where
     thread::Builder::new()
         .name(format!("datalens-durable-intent-{worker_index}"))
         .spawn(move || {
+            let worker_chain = adapter.capabilities().chain().clone();
             loop {
                 let now = unix_seconds_now();
                 let intent = {
@@ -399,7 +400,13 @@ where
                         Ok(claim) => claim,
                         Err(_) => return,
                     };
-                    claim_pending_intent(repository.as_ref(), metrics.as_ref(), now, worker_index)
+                    claim_pending_intent(
+                        repository.as_ref(),
+                        &worker_chain,
+                        metrics.as_ref(),
+                        now,
+                        worker_index,
+                    )
                 };
                 let Some(intent) = intent else {
                     thread::sleep(DEFAULT_INTENT_POLL_INTERVAL);
@@ -766,6 +773,7 @@ where
 
 fn claim_pending_intent(
     repository: &dyn DurablePromotionIntentRepository,
+    chain: &ChainIdentity,
     metrics: Option<&Arc<MetricsRecorder>>,
     now: u64,
     worker_index: usize,
@@ -783,7 +791,7 @@ fn claim_pending_intent(
         }
     };
     record_intent_backlog_metric(metrics, &pending, now);
-    match pending.into_iter().next() {
+    match pending.into_iter().find(|intent| &intent.chain == chain) {
         Some(intent) => match repository.mark_running(&intent.intent_id, unix_seconds_now()) {
             Ok(Some(intent)) => Some(intent),
             Ok(None) => None,
@@ -970,6 +978,13 @@ mod tests {
         last_limit: AtomicUsize,
     }
 
+    struct SampleIntentRepository {
+        intents: Mutex<Vec<DurablePromotionIntent>>,
+        marked_running: Mutex<Vec<String>>,
+        marked_terminal: Mutex<Vec<String>>,
+        last_limit: AtomicUsize,
+    }
+
     impl DurablePromotionIntentRepository for FailingListIntentRepository {
         fn create_or_get(
             &self,
@@ -1109,13 +1124,98 @@ mod tests {
         }
     }
 
+    impl DurablePromotionIntentRepository for SampleIntentRepository {
+        fn create_or_get(
+            &self,
+            _request: CreateDurablePromotionIntent,
+        ) -> Result<DurablePromotionIntentCreateOutcome, DatalensError> {
+            Err(DatalensError::new(
+                DatalensErrorKind::StorageWriteFailure,
+                "unused create",
+            ))
+        }
+
+        fn get(&self, _intent_id: &str) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+            Ok(None)
+        }
+
+        fn list_pending(
+            &self,
+            _now_unix_seconds: u64,
+            limit: usize,
+        ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+            self.last_limit.store(limit, Ordering::SeqCst);
+            let intents = self.intents.lock().expect("sample intent repository lock");
+            Ok(intents.iter().take(limit).cloned().collect())
+        }
+
+        fn mark_running(
+            &self,
+            intent_id: &str,
+            _now_unix_seconds: u64,
+        ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+            self.marked_running
+                .lock()
+                .expect("marked running lock")
+                .push(intent_id.to_owned());
+            let mut intents = self.intents.lock().expect("sample intent repository lock");
+            let Some(intent) = intents
+                .iter_mut()
+                .find(|intent| intent.intent_id == intent_id)
+            else {
+                return Ok(None);
+            };
+            intent.status = datalens_storage::DurablePromotionIntentStatus::Running;
+            Ok(Some(intent.clone()))
+        }
+
+        fn mark_completed(
+            &self,
+            _intent_id: &str,
+            _now_unix_seconds: u64,
+        ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+            Ok(None)
+        }
+
+        fn mark_retryable_failure(
+            &self,
+            _intent_id: &str,
+            _error: &str,
+            _now_unix_seconds: u64,
+            _next_retry_at_unix_seconds: u64,
+        ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+            Ok(None)
+        }
+
+        fn mark_terminal_failure(
+            &self,
+            intent_id: &str,
+            _error: &str,
+            _now_unix_seconds: u64,
+        ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+            self.marked_terminal
+                .lock()
+                .expect("marked terminal lock")
+                .push(intent_id.to_owned());
+            Ok(None)
+        }
+
+        fn reset_stale_running(
+            &self,
+            _stale_before_unix_seconds: u64,
+            _now_unix_seconds: u64,
+        ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+            Ok(Vec::new())
+        }
+    }
+
     #[test]
     fn test_claim_intent_uses_bounded_pending_list_and_preserves_backlog_on_list_failure() {
         let repository = FailingListIntentRepository::default();
         let metrics = Arc::new(MetricsRecorder::new().expect("metrics recorder"));
         metrics.set_durable_intent_backlog(7, 30);
 
-        let claimed = claim_pending_intent(&repository, Some(&metrics), 123, 0);
+        let claimed = claim_pending_intent(&repository, &ethereum_chain(), Some(&metrics), 123, 0);
 
         assert!(claimed.is_none());
         assert_eq!(
@@ -1135,7 +1235,7 @@ mod tests {
         };
         let metrics = Arc::new(MetricsRecorder::new().expect("metrics recorder"));
 
-        let claimed = claim_pending_intent(&repository, Some(&metrics), 130, 0);
+        let claimed = claim_pending_intent(&repository, &ethereum_chain(), Some(&metrics), 130, 0);
 
         assert!(claimed.is_none());
         assert_eq!(
@@ -1145,6 +1245,71 @@ mod tests {
         let output = metrics.encode().expect("prometheus text");
         assert!(output.contains("datalens_durable_intent_pending_count 1"));
         assert!(output.contains("datalens_durable_intent_oldest_pending_age_seconds 30"));
+    }
+
+    #[test]
+    fn test_claim_intent_skips_pending_intents_for_other_chain() {
+        let ethereum = ethereum_chain();
+        let lisk = lisk_chain();
+        let repository = sample_repository(vec![test_intent_with_chain("intent-lisk", lisk, 100)]);
+
+        let claimed = claim_pending_intent(&repository, &ethereum, None, 130, 0);
+
+        assert!(claimed.is_none());
+        assert_eq!(
+            repository.last_limit.load(Ordering::SeqCst),
+            DEFAULT_INTENT_CLAIM_BATCH_SIZE
+        );
+        assert!(
+            repository
+                .marked_running
+                .lock()
+                .expect("marked running lock")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_claim_intent_does_not_mark_wrong_chain_intent_terminal() {
+        let ethereum = ethereum_chain();
+        let lisk = lisk_chain();
+        let repository = sample_repository(vec![test_intent_with_chain("intent-lisk", lisk, 100)]);
+
+        let claimed = claim_pending_intent(&repository, &ethereum, None, 130, 0);
+
+        assert!(claimed.is_none());
+        assert!(
+            repository
+                .marked_terminal
+                .lock()
+                .expect("marked terminal lock")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_claim_intent_claims_matching_chain_after_unrelated_sample_entry() {
+        let ethereum = ethereum_chain();
+        let lisk = lisk_chain();
+        let repository = sample_repository(vec![
+            test_intent_with_chain("intent-lisk", lisk, 100),
+            test_intent_with_chain("intent-ethereum", ethereum.clone(), 105),
+        ]);
+
+        let claimed = claim_pending_intent(&repository, &ethereum, None, 130, 0);
+
+        assert_eq!(
+            claimed.map(|intent| intent.intent_id),
+            Some("intent-ethereum".to_owned())
+        );
+        assert_eq!(
+            repository
+                .marked_running
+                .lock()
+                .expect("marked running lock")
+                .as_slice(),
+            ["intent-ethereum"]
+        );
     }
 
     #[test]
@@ -1178,17 +1343,30 @@ mod tests {
         );
     }
 
+    fn sample_repository(intents: Vec<DurablePromotionIntent>) -> SampleIntentRepository {
+        SampleIntentRepository {
+            intents: Mutex::new(intents),
+            marked_running: Mutex::new(Vec::new()),
+            marked_terminal: Mutex::new(Vec::new()),
+            last_limit: AtomicUsize::new(0),
+        }
+    }
+
     fn test_intent_with_created_at(created_at_unix_seconds: u64) -> DurablePromotionIntent {
+        test_intent_with_chain("intent-a", ethereum_chain(), created_at_unix_seconds)
+    }
+
+    fn test_intent_with_chain(
+        intent_id: &str,
+        chain: ChainIdentity,
+        created_at_unix_seconds: u64,
+    ) -> DurablePromotionIntent {
         DurablePromotionIntent {
-            intent_id: "intent-a".to_owned(),
-            dedupe_key: "dedupe-a".to_owned(),
+            intent_id: intent_id.to_owned(),
+            dedupe_key: format!("dedupe-{intent_id}"),
             source: DurablePromotionIntentSource::Query,
             application: "app".to_owned(),
-            chain: ChainIdentity::expect_with_network_id(
-                ChainFamily::Evm,
-                "ethereum",
-                NetworkId::numeric(1),
-            ),
+            chain,
             dataset_key: DatasetKey::evm_logs(),
             selector: DatasetSelector::all(),
             selector_fingerprint: "all".to_owned(),
@@ -1204,5 +1382,13 @@ mod tests {
             request_id: None,
             task_id: None,
         }
+    }
+
+    fn ethereum_chain() -> ChainIdentity {
+        ChainIdentity::expect_with_network_id(ChainFamily::Evm, "ethereum", NetworkId::numeric(1))
+    }
+
+    fn lisk_chain() -> ChainIdentity {
+        ChainIdentity::expect_with_network_id(ChainFamily::Evm, "lisk", NetworkId::numeric(1135))
     }
 }
