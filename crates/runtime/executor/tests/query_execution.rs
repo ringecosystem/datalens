@@ -1,7 +1,7 @@
 use std::{
     path::PathBuf,
     sync::{
-        Arc, Barrier, Condvar, Mutex,
+        Arc, Barrier, Condvar, Mutex, Once,
         atomic::{AtomicUsize, Ordering},
         mpsc,
     },
@@ -126,6 +126,23 @@ fn test_executor_miss_submits_durable_intent_when_configured() {
     assert_eq!(
         recorded[0].ranges,
         vec![LedgerRange::blocks(1, 1).expect("range")]
+    );
+}
+
+#[test]
+fn test_durable_intent_startup_maintenance_does_not_block_executor_configuration() {
+    let storage = LocalStorage::new(temp_storage_root("executor-intent-nonblocking-startup"));
+    let source = MockSource::default();
+    let started = Instant::now();
+
+    let _executor = executor(storage, source).with_durable_intents_startup_maintenance_once(
+        SlowStartupMaintenanceIntentRepository,
+        Arc::new(Once::new()),
+    );
+
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "durable intent worker startup must not synchronously wait for startup maintenance"
     );
 }
 
@@ -1373,6 +1390,9 @@ struct RecordingIntentRepository {
     recorded: Arc<Mutex<Vec<CreateDurablePromotionIntent>>>,
 }
 
+#[derive(Clone)]
+struct SlowStartupMaintenanceIntentRepository;
+
 impl DurablePromotionIntentRepository for RecordingIntentRepository {
     fn create_or_get(
         &self,
@@ -1448,6 +1468,82 @@ impl DurablePromotionIntentRepository for RecordingIntentRepository {
         _stale_before_unix_seconds: u64,
         _now_unix_seconds: u64,
     ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+        Ok(Vec::new())
+    }
+}
+
+impl DurablePromotionIntentRepository for SlowStartupMaintenanceIntentRepository {
+    fn create_or_get(
+        &self,
+        request: CreateDurablePromotionIntent,
+    ) -> Result<DurablePromotionIntentCreateOutcome, DatalensError> {
+        Ok(DurablePromotionIntentCreateOutcome::Created(
+            intent_from_request(request, DurablePromotionIntentStatus::Pending),
+        ))
+    }
+
+    fn get(&self, _intent_id: &str) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        Ok(None)
+    }
+
+    fn list_pending(
+        &self,
+        _now_unix_seconds: u64,
+        _limit: usize,
+    ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+        Ok(Vec::new())
+    }
+
+    fn list_pending_for_chain(
+        &self,
+        _chain: &ChainIdentity,
+        _now_unix_seconds: u64,
+        _limit: usize,
+    ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+        Ok(Vec::new())
+    }
+
+    fn mark_running(
+        &self,
+        _intent_id: &str,
+        _now_unix_seconds: u64,
+    ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        Ok(None)
+    }
+
+    fn mark_completed(
+        &self,
+        _intent_id: &str,
+        _now_unix_seconds: u64,
+    ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        Ok(None)
+    }
+
+    fn mark_retryable_failure(
+        &self,
+        _intent_id: &str,
+        _error: &str,
+        _now_unix_seconds: u64,
+        _next_retry_at_unix_seconds: u64,
+    ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        Ok(None)
+    }
+
+    fn mark_terminal_failure(
+        &self,
+        _intent_id: &str,
+        _error: &str,
+        _now_unix_seconds: u64,
+    ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        Ok(None)
+    }
+
+    fn reset_stale_running(
+        &self,
+        _stale_before_unix_seconds: u64,
+        _now_unix_seconds: u64,
+    ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+        thread::sleep(Duration::from_secs(1));
         Ok(Vec::new())
     }
 }
