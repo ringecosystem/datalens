@@ -164,7 +164,24 @@ impl WarmupTask {
         now: u64,
     ) -> Result<Self, DatalensError> {
         validate_submit(&request)?;
-        let dedupe_key = task_dedupe_key(&request);
+        Self::from_validated_request(request, now, task_dedupe_key)
+    }
+
+    pub(crate) fn from_ensure(
+        request: WarmupSubmitRequest,
+        now: u64,
+    ) -> Result<Self, DatalensError> {
+        validate_submit(&request)?;
+        validate_follow_query_ensure(&request)?;
+        Self::from_validated_request(request, now, task_ensure_key)
+    }
+
+    fn from_validated_request(
+        request: WarmupSubmitRequest,
+        now: u64,
+        identity_key: fn(&WarmupSubmitRequest) -> String,
+    ) -> Result<Self, DatalensError> {
+        let dedupe_key = identity_key(&request);
         Ok(Self {
             task_id: WarmupTaskId::from_dedupe_key(&dedupe_key),
             application_id: request.application_id,
@@ -235,6 +252,16 @@ fn validate_submit(request: &WarmupSubmitRequest) -> Result<(), DatalensError> {
     Ok(())
 }
 
+fn validate_follow_query_ensure(request: &WarmupSubmitRequest) -> Result<(), DatalensError> {
+    if request.mode != WarmupTaskMode::FollowQuery {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "warmup ensure requires follow_query mode",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn task_dedupe_key(request: &WarmupSubmitRequest) -> String {
     format!(
         "application={};chain={};dataset={};selector={};range_kind={:?};start={};end={:?};mode={:?}",
@@ -246,6 +273,47 @@ pub(crate) fn task_dedupe_key(request: &WarmupSubmitRequest) -> String {
         request.start,
         request.end,
         request.mode,
+    )
+}
+
+pub(crate) fn task_ensure_key(request: &WarmupSubmitRequest) -> String {
+    task_identity_key(
+        request.application_id.trim(),
+        &request.chain,
+        &request.dataset_key,
+        &request.selector,
+        &request.range_kind,
+        request.mode,
+    )
+}
+
+pub(crate) fn task_ensure_key_for_task(task: &WarmupTask) -> String {
+    task_identity_key(
+        task.application_id.trim(),
+        &task.chain,
+        &task.dataset_key,
+        &task.selector,
+        &task.range_kind,
+        task.mode,
+    )
+}
+
+fn task_identity_key(
+    application_id: &str,
+    chain: &ChainIdentity,
+    dataset_key: &DatasetKey,
+    selector: &DatasetSelector,
+    range_kind: &LedgerRangeKind,
+    mode: WarmupTaskMode,
+) -> String {
+    format!(
+        "application={};chain={};dataset={};selector={};range_kind={:?};mode={:?}",
+        application_id,
+        chain.key_prefix(),
+        dataset_key.as_str(),
+        selector.canonical_key(),
+        range_kind,
+        mode,
     )
 }
 

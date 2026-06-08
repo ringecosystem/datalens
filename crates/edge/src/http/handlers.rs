@@ -23,9 +23,9 @@ use crate::{
         head::{ChainHeadApiResponse, ChainHeadFinalityApi},
         query::{QueryApiRequest, QueryApiResponse, QueryRangeApi},
         warmup::{
-            WarmupRunOnceApiResponse, WarmupSubmitApiRequest, WarmupSubmitApiResponse,
-            WarmupTaskApiResponse, WarmupTaskListApiResponse, WarmupTaskListQuery,
-            warmup_task_view,
+            WarmupEnsureApiResponse, WarmupRunOnceApiResponse, WarmupSubmitApiRequest,
+            WarmupSubmitApiResponse, WarmupTaskApiResponse, WarmupTaskListApiResponse,
+            WarmupTaskListQuery, warmup_task_view,
         },
     },
     http::AppState,
@@ -340,6 +340,52 @@ pub(crate) async fn warmup_submit(
         Json(WarmupSubmitApiResponse {
             task_id: outcome.task_id,
             created: outcome.created,
+        }),
+    )
+        .into_response())
+}
+
+pub(crate) async fn warmup_ensure(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<WarmupSubmitApiRequest>,
+) -> Result<Response, ApiError> {
+    let registry = state.registry.clone();
+    let dataset = request.dataset_for_auth().map_err(ApiError)?;
+    let application_context = registry
+        .authenticate_warmup_headers(
+            &headers,
+            request.chain().configured_name(),
+            &dataset,
+            ApplicationOperationConfig::WarmupSubmit,
+        )
+        .map_err(ApiError)?;
+    let application_id = application_context
+        .as_ref()
+        .map(|application| application.id.clone())
+        .or_else(|| application_id_from_headers(&headers))
+        .unwrap_or_else(|| "unknown".to_owned());
+    let request = warmup_submit_request(application_id, request).map_err(ApiError)?;
+    let outcome = tokio::task::spawn_blocking(move || registry.ensure_warmup_task(request))
+        .await
+        .map_err(|error| {
+            ApiError(DatalensError::new(
+                DatalensErrorKind::Internal,
+                format!("warmup ensure task failed: {error}"),
+            ))
+        })?
+        .map_err(ApiError)?;
+    let status = if outcome.created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    Ok((
+        status,
+        Json(WarmupEnsureApiResponse {
+            task_id: outcome.task_id,
+            created: outcome.created,
+            state: outcome.state,
         }),
     )
         .into_response())

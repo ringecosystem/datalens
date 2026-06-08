@@ -141,6 +141,75 @@ async fn test_api_warmup_routes_manage_application_scoped_tasks() {
 }
 
 #[tokio::test]
+async fn test_api_warmup_ensure_reuses_follow_query_task_without_start_in_identity() {
+    let root = temp_storage_root("api-warmup-ensure-follow-query");
+    let source = MockSource::default();
+    let service = service(LocalStorage::new(&root), source).with_warmup_pool(warmup_pool(&root));
+    let registry = QueryServiceRegistry::new()
+        .with_service(service)
+        .expect("registry");
+    let app = router(registry);
+
+    let first = app
+        .clone()
+        .oneshot(native_warmup_ensure_request(serde_json::json!({
+            "chain": ethereum_identity(),
+            "dataset_key": "evm.logs",
+            "selector": {
+                "kind": "evm_logs",
+                "value": evm_logs_selector_value(&logs_request(20, 21))
+            },
+            "range_kind": { "kind": "block" },
+            "start": 20,
+            "end": null,
+            "mode": "follow_query"
+        })))
+        .await
+        .expect("first ensure response");
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let first_body = body_json(first.into_body()).await;
+    let task_id = first_body["task_id"].as_str().expect("task id").to_owned();
+    assert_eq!(first_body["created"], true);
+    assert_eq!(first_body["state"], "queued");
+
+    let second = app
+        .clone()
+        .oneshot(native_warmup_ensure_request(serde_json::json!({
+            "chain": ethereum_identity(),
+            "dataset_key": "evm.logs",
+            "selector": {
+                "kind": "evm_logs",
+                "value": evm_logs_selector_value(&logs_request(20, 21))
+            },
+            "range_kind": { "kind": "block" },
+            "start": 500,
+            "end": 550,
+            "mode": "follow_query"
+        })))
+        .await
+        .expect("second ensure response");
+    assert_eq!(second.status(), StatusCode::OK);
+    let second_body = body_json(second.into_body()).await;
+    assert_eq!(second_body["task_id"], task_id);
+    assert_eq!(second_body["created"], false);
+    assert_eq!(second_body["state"], "queued");
+
+    let list = app
+        .oneshot(
+            Request::get("/v1/warmup/tasks")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("list response");
+    assert_eq!(list.status(), StatusCode::OK);
+    let list_body = body_json(list.into_body()).await;
+    assert_eq!(list_body["tasks"].as_array().expect("tasks").len(), 1);
+    assert_eq!(list_body["tasks"][0]["start"], 20);
+    assert_eq!(list_body["tasks"][0]["end"], serde_json::Value::Null);
+}
+
+#[tokio::test]
 async fn test_api_warmup_run_once_requires_warmup_run_operation() {
     let root = temp_storage_root("api-warmup-run-once-auth");
     let source = MockSource::default();

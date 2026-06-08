@@ -8,7 +8,9 @@ mod target_planner;
 mod task;
 
 pub use cursor::{WarmupCheckpoint, WarmupCursor};
-pub use registry::{LocalWarmupRegistry, WarmupRegistry, WarmupSubmitOutcome, WarmupTaskFilter};
+pub use registry::{
+    LocalWarmupRegistry, WarmupEnsureOutcome, WarmupRegistry, WarmupSubmitOutcome, WarmupTaskFilter,
+};
 pub use runtime::{
     WarmupRunResult, WarmupRunStatus, WarmupRuntime, WarmupRuntimeConfig, WarmupSchedulerConfig,
     WarmupTaskPool,

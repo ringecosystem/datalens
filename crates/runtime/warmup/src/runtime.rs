@@ -121,6 +121,14 @@ where
         self.runtime.registry.submit(request)
     }
 
+    pub fn ensure(
+        &self,
+        request: crate::WarmupSubmitRequest,
+    ) -> Result<crate::WarmupEnsureOutcome, DatalensError> {
+        validate_request(&request, &self.runtime.adapter)?;
+        self.runtime.registry.ensure(request)
+    }
+
     pub fn get(&self, task_id: &WarmupTaskId) -> Result<Option<WarmupTask>, DatalensError> {
         self.runtime.registry.get(task_id)
     }

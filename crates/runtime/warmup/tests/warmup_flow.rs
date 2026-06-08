@@ -49,6 +49,109 @@ fn test_submit_duplicate_task_returns_existing_task_id() {
 }
 
 #[test]
+fn test_ensure_follow_query_with_different_start_returns_existing_task_id() {
+    let registry = LocalWarmupRegistry::new(object_store("ensure-follow-query-dedupe"));
+    let first_request = follow_query_request();
+    let mut second_request = follow_query_request();
+    second_request.start = 500;
+    second_request.end = Some(550);
+
+    let first = registry.ensure(first_request).expect("first ensure");
+    let second = registry.ensure(second_request).expect("second ensure");
+
+    assert!(first.created);
+    assert!(!second.created);
+    assert_eq!(first.task_id, second.task_id);
+    assert_eq!(first.state, WarmupTaskState::Queued);
+    assert_eq!(second.state, WarmupTaskState::Queued);
+    let tasks = registry
+        .list(datalens_warmup::WarmupTaskFilter::default())
+        .unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].start, 1);
+    assert_eq!(tasks[0].end, None);
+}
+
+#[test]
+fn test_submit_follow_query_with_different_start_uses_ensure_identity() {
+    let registry = LocalWarmupRegistry::new(object_store("submit-follow-query-ensure-identity"));
+    let first_request = follow_query_request();
+    let mut second_request = follow_query_request();
+    second_request.start = 500;
+    second_request.end = Some(550);
+
+    let first = registry.submit(first_request).expect("first submit");
+    let second = registry.submit(second_request).expect("second submit");
+
+    assert!(first.created);
+    assert!(!second.created);
+    assert_eq!(first.task_id, second.task_id);
+    let tasks = registry
+        .list(datalens_warmup::WarmupTaskFilter::default())
+        .unwrap();
+    assert_eq!(tasks.len(), 1);
+}
+
+#[test]
+fn test_ensure_follow_query_different_selector_or_chain_creates_different_tasks() {
+    let registry = LocalWarmupRegistry::new(object_store("ensure-follow-query-scope"));
+    let base = registry
+        .ensure(follow_query_request())
+        .expect("base ensure")
+        .task_id;
+    let mut selector_request = follow_query_request();
+    selector_request.selector = DatasetSelector::try_evm_logs(LogFilter {
+        addresses: vec!["0x0000000000000000000000000000000000000002".to_owned()],
+        topics: Vec::new(),
+    })
+    .unwrap();
+    let selector = registry
+        .ensure(selector_request)
+        .expect("selector ensure")
+        .task_id;
+    let mut chain_request = follow_query_request();
+    chain_request.chain = polygon_chain();
+    let chain = registry
+        .ensure(chain_request)
+        .expect("chain ensure")
+        .task_id;
+
+    assert_ne!(base, selector);
+    assert_ne!(base, chain);
+    assert_ne!(selector, chain);
+    let tasks = registry
+        .list(datalens_warmup::WarmupTaskFilter::default())
+        .unwrap();
+    assert_eq!(tasks.len(), 3);
+}
+
+#[test]
+fn test_ensure_follow_query_returns_existing_non_running_task_state() {
+    let registry = LocalWarmupRegistry::new(object_store("ensure-follow-query-states"));
+
+    let paused = registry
+        .ensure(follow_query_request())
+        .expect("paused ensure")
+        .task_id;
+    registry.pause(&paused).expect("pause task");
+    assert_existing_ensure_state(&registry, WarmupTaskState::Paused);
+
+    let mut failed_task = registry.get(&paused).unwrap().unwrap();
+    failed_task.state = WarmupTaskState::Failed;
+    failed_task.last_error = Some("provider unavailable".to_owned());
+    registry.save_task(&failed_task).expect("save failed task");
+    assert_existing_ensure_state(&registry, WarmupTaskState::Failed);
+
+    registry.cancel(&paused).expect("cancel task");
+    assert_existing_ensure_state(&registry, WarmupTaskState::Cancelled);
+
+    let tasks = registry
+        .list(datalens_warmup::WarmupTaskFilter::default())
+        .unwrap();
+    assert_eq!(tasks.len(), 1);
+}
+
+#[test]
 fn test_warmup_fetches_evm_logs_in_chunks_and_writes_durable_cache() {
     let storage = LocalStorage::new(temp_root("chunked-storage"));
     let registry = LocalWarmupRegistry::new(object_store("chunked-registry"));
@@ -949,6 +1052,19 @@ fn follow_query_request() -> WarmupSubmitRequest {
         mode: WarmupTaskMode::FollowQuery,
         ..submit_request(None, WarmupTaskMode::FollowQuery)
     }
+}
+
+fn assert_existing_ensure_state(
+    registry: &LocalWarmupRegistry<LocalObjectStore>,
+    state: WarmupTaskState,
+) {
+    let mut request = follow_query_request();
+    request.start = 100;
+
+    let outcome = registry.ensure(request).expect("ensure existing task");
+
+    assert!(!outcome.created);
+    assert_eq!(outcome.state, state);
 }
 
 fn execute_log_query<R>(executor: &NativeQueryExecutor<R, FixtureAdapter>, range: LedgerRange)

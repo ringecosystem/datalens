@@ -50,6 +50,13 @@ pub struct WarmupSubmitApiResponse {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WarmupEnsureApiResponse {
+    pub task_id: WarmupTaskId,
+    pub created: bool,
+    pub state: WarmupTaskState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct WarmupTaskApiResponse {
     pub task: WarmupTaskView,
 }
