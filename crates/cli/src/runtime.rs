@@ -28,16 +28,23 @@ struct QueryRuntimeStores {
     query_watermarks: Arc<dyn QueryWatermarkRepository>,
     query_activity: Arc<dyn QueryActivityRepository>,
     durable_intents: Arc<dyn DurablePromotionIntentRepository>,
+    warmup_registry: Option<LocalWarmupRegistry<WarmupRegistryObjectStore>>,
 }
 
 impl QueryRuntimeStores {
     fn build(config: &DatalensConfig) -> Result<Self, DatalensError> {
+        let warmup_registry = if config.warmup.enabled {
+            Some(build_warmup_registry(config)?)
+        } else {
+            None
+        };
         Ok(Self {
             storage: Arc::from(build_storage(config)?),
             usage_ledger: Arc::from(build_usage_ledger(config)?),
             query_watermarks: Arc::from(build_query_watermarks(config)?),
             query_activity: Arc::from(build_query_activity(config)?),
             durable_intents: Arc::from(build_durable_intents(config)?),
+            warmup_registry,
         })
     }
 }
@@ -146,7 +153,10 @@ fn build_evm_service_with_storage(
         let mut runtime = WarmupRuntime::new(
             source,
             stores.storage,
-            build_warmup_registry(config)?,
+            stores
+                .warmup_registry
+                .clone()
+                .ok_or_else(|| DatalensError::internal("warmup registry was not initialized"))?,
             durable_writer_config(&config.writer),
         )
         .with_durable_writer(service.durable_writer())
