@@ -8,12 +8,14 @@ use datalens_core::{
     DatalensError, DatalensErrorKind, DatasetKey, DatasetRows, LedgerRange, missing_ranges,
 };
 use datalens_metrics::{
-    ApplicationIdentity, MetricsLabels, MetricsRecorder, WarmupFetchOutcome, WarmupTaskOutcome,
-    WarmupWriteOutcome,
+    ApplicationIdentity, DurableIntentOutcome as MetricsDurableIntentOutcome, MetricsLabels,
+    MetricsRecorder, WarmupFetchOutcome, WarmupTaskOutcome, WarmupWriteOutcome,
 };
 use datalens_storage::{
-    CacheOutcome, FillOutcome, QueryOutcome, QueryWatermarkKey, QueryWatermarkRepository,
-    StorageRepository, UsageLedgerEntry, UsageLedgerRepository,
+    CacheOutcome, DurableIntentSubmissionOutcome, DurableIntentSubmissionRequest,
+    DurableIntentSubmissionService, DurablePromotionIntentRepository, DurablePromotionIntentSource,
+    FillOutcome, QueryOutcome, QueryWatermarkKey, QueryWatermarkRepository, StorageRepository,
+    UsageLedgerEntry, UsageLedgerRepository,
 };
 use datalens_writer::{
     DurableWriteRequest, DurableWriteSegment, DurableWriter, DurableWriterConfig,
@@ -93,6 +95,7 @@ pub struct WarmupRuntime<A, S, R> {
     metrics: Option<MetricsRecorder>,
     usage_ledger: Option<Arc<dyn UsageLedgerRepository>>,
     query_watermarks: Option<Arc<dyn QueryWatermarkRepository>>,
+    durable_intents: Option<Arc<dyn DurablePromotionIntentRepository>>,
 }
 
 #[derive(Clone)]
@@ -216,6 +219,7 @@ where
             metrics: None,
             usage_ledger: None,
             query_watermarks: None,
+            durable_intents: None,
         }
     }
 
@@ -273,6 +277,14 @@ where
         repository: impl QueryWatermarkRepository + 'static,
     ) -> Self {
         self.query_watermarks = Some(Arc::new(repository));
+        self
+    }
+
+    pub fn with_durable_intents(
+        mut self,
+        repository: impl DurablePromotionIntentRepository + 'static,
+    ) -> Self {
+        self.durable_intents = Some(Arc::new(repository));
         self
     }
 
@@ -437,6 +449,14 @@ where
                 continue;
             }
 
+            if self.durable_intents.is_some() {
+                self.submit_durable_intent(&task, &missing, safe_height.finality)?;
+                result.status = WarmupRunStatus::Partial;
+                self.registry.save_task(&task)?;
+                self.registry.save_cursor(&cursor)?;
+                return Ok(result);
+            }
+
             let fetched = match self.fetch_missing(&task, &missing) {
                 Ok(fetched) => fetched,
                 Err(error) => {
@@ -542,6 +562,80 @@ where
             return Ok(result);
         }
         self.finish_or_stop(task, result)
+    }
+
+    fn submit_durable_intent(
+        &self,
+        task: &WarmupTask,
+        ranges: &[LedgerRange],
+        finality: FinalityLevel,
+    ) -> Result<(), DatalensError> {
+        let Some(repository) = &self.durable_intents else {
+            return Ok(());
+        };
+        let service = DurableIntentSubmissionService::new(repository.clone());
+        match service.submit(DurableIntentSubmissionRequest {
+            source: DurablePromotionIntentSource::Warmup,
+            application: task.application_id.clone(),
+            chain: task.chain.clone(),
+            dataset_key: task.dataset_key.clone(),
+            selector: task.selector.clone(),
+            finality,
+            ranges: ranges.to_vec(),
+            request_id: None,
+            task_id: Some(task.task_id.as_str().to_owned()),
+            now_unix_seconds: unix_seconds_now()?,
+        }) {
+            DurableIntentSubmissionOutcome::Submitted(intent) => {
+                self.record_durable_intent_metric(task, MetricsDurableIntentOutcome::Submitted);
+                log::info!(
+                    "warmup durable intent scheduled task_id={} intent_id={} chain_key={} dataset={} selector_fingerprint={} ranges={}",
+                    task.task_id.as_str(),
+                    intent.intent_id,
+                    intent.chain.key_prefix(),
+                    intent.dataset_key.as_str(),
+                    intent.selector_fingerprint,
+                    format_ranges(&intent.ranges)
+                );
+                Ok(())
+            }
+            DurableIntentSubmissionOutcome::AlreadyPending(intent) => {
+                self.record_durable_intent_metric(
+                    task,
+                    MetricsDurableIntentOutcome::AlreadyPending,
+                );
+                log::info!(
+                    "warmup durable intent already pending task_id={} intent_id={} chain_key={} dataset={} selector_fingerprint={} ranges={}",
+                    task.task_id.as_str(),
+                    intent.intent_id,
+                    intent.chain.key_prefix(),
+                    intent.dataset_key.as_str(),
+                    intent.selector_fingerprint,
+                    format_ranges(&intent.ranges)
+                );
+                Ok(())
+            }
+            DurableIntentSubmissionOutcome::AlreadyCompleted(intent) => {
+                self.record_durable_intent_metric(
+                    task,
+                    MetricsDurableIntentOutcome::AlreadyCompleted,
+                );
+                log::info!(
+                    "warmup durable intent already completed task_id={} intent_id={} chain_key={} dataset={} selector_fingerprint={} ranges={}",
+                    task.task_id.as_str(),
+                    intent.intent_id,
+                    intent.chain.key_prefix(),
+                    intent.dataset_key.as_str(),
+                    intent.selector_fingerprint,
+                    format_ranges(&intent.ranges)
+                );
+                Ok(())
+            }
+            DurableIntentSubmissionOutcome::Failed(error) => {
+                self.record_durable_intent_metric(task, MetricsDurableIntentOutcome::Error);
+                Err(error)
+            }
+        }
     }
 
     fn fetch_missing(
@@ -943,6 +1037,17 @@ where
             error.kind.clone(),
         );
     }
+
+    fn record_durable_intent_metric(
+        &self,
+        task: &WarmupTask,
+        outcome: MetricsDurableIntentOutcome,
+    ) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        metrics.record_durable_intent(&metrics_labels(task), "warmup", outcome);
+    }
 }
 
 struct FetchedSegments {
@@ -1125,6 +1230,14 @@ fn log_target_plan(
         planned_query_distance,
         no_op_reason,
     );
+}
+
+fn format_ranges(ranges: &[LedgerRange]) -> String {
+    ranges
+        .iter()
+        .map(|range| format!("{}-{}", range.start(), range.end()))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn is_runnable_task(task: &WarmupTask) -> bool {

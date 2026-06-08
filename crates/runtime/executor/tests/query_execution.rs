@@ -22,9 +22,12 @@ use datalens_executor::{NativeQueryExecutionConfig, NativeQueryExecutor};
 use datalens_metrics::{ApplicationIdentity, MetricsRecorder};
 use datalens_planner::{FieldSelection, NativePlannerConfig, NativeQueryInput};
 use datalens_storage::{
-    CacheOutcome, FillOutcome, LocalObjectStore, LocalStorage, Manifest, QueryOutcome,
-    QueryWatermarkKey, QueryWatermarkRepository, QueryWatermarkStore, StorageRepository,
-    StorageWriteOutcome, StorageWriteRequest, UsageLedgerRepository, UsageLedgerStore,
+    CacheOutcome, CreateDurablePromotionIntent, DurablePromotionIntent,
+    DurablePromotionIntentCreateOutcome, DurablePromotionIntentRepository,
+    DurablePromotionIntentSource, DurablePromotionIntentStatus, DurablePromotionIntentStore,
+    FillOutcome, LocalObjectStore, LocalStorage, Manifest, QueryOutcome, QueryWatermarkKey,
+    QueryWatermarkRepository, QueryWatermarkStore, StorageRepository, StorageWriteOutcome,
+    StorageWriteRequest, UsageLedgerRepository, UsageLedgerStore,
 };
 use datalens_writer::{
     DurableWriteRequest, DurableWriteSegment, DurableWriterConfig, WriteStagingConfig,
@@ -103,6 +106,84 @@ fn test_executor_miss_fetches_and_persists_through_writer() {
         vec![SourceCall::Blocks(BlockRange::expect_new(10, 11))]
     );
     assert_eq!(block_numbers(&second.rows), vec![10, 11]);
+}
+
+#[test]
+fn test_executor_miss_submits_durable_intent_when_configured() {
+    let storage = LocalStorage::new(temp_storage_root("executor-intent-submit"));
+    let source = MockSource::default().with_blocks(vec![block(1, "0x01")]);
+    let intents = RecordingIntentRepository::default();
+    let recorded = intents.recorded.clone();
+    let executor = executor(storage, source).with_durable_intents(intents);
+
+    let result = executor.execute(blocks_input(1, 1)).expect("query result");
+
+    assert_eq!(result.rows.row_count(), 1);
+    let recorded = recorded.lock().expect("recorded lock");
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].source, DurablePromotionIntentSource::Query);
+    assert_eq!(
+        recorded[0].ranges,
+        vec![LedgerRange::blocks(1, 1).expect("range")]
+    );
+}
+
+#[test]
+fn test_executor_miss_returns_rows_when_durable_intent_scheduling_fails() {
+    let storage = LocalStorage::new(temp_storage_root("executor-intent-fail"));
+    let source = MockSource::default().with_blocks(vec![block(1, "0x01")]);
+    let executor = executor(storage, source).with_durable_intents(FailingIntentRepository);
+
+    let result = executor.execute(blocks_input(1, 1)).expect("query result");
+
+    assert_eq!(result.rows.row_count(), 1);
+}
+
+#[test]
+fn test_durable_intent_worker_replays_pending_intent_into_coverage() {
+    let root = temp_storage_root("executor-intent-worker");
+    let storage = LocalStorage::new(root.join("storage"));
+    let intents = DurablePromotionIntentStore::new(LocalObjectStore::new(root.join("intents")));
+    let source = MockSource::default().with_blocks(vec![block(1, "0x01")]);
+    intents
+        .create_or_get(CreateDurablePromotionIntent {
+            source: DurablePromotionIntentSource::Warmup,
+            application: "app-a".to_owned(),
+            chain: ethereum_identity(),
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: DatasetSelector::all(),
+            selector_fingerprint: DatasetSelector::all().fingerprint(),
+            selector_canonical_key: DatasetSelector::all().canonical_key(),
+            finality: "safe".to_owned(),
+            ranges: vec![LedgerRange::blocks(1, 1).expect("range")],
+            request_id: None,
+            task_id: Some("task-1".to_owned()),
+            now_unix_seconds: 100,
+        })
+        .expect("create intent");
+
+    let _executor = executor(storage.clone(), source).with_durable_intents(intents.clone());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let covered = storage
+            .covered_ranges(
+                &ethereum_identity(),
+                &DatasetKey::evm_blocks(),
+                &DatasetSelector::all(),
+                LedgerRange::blocks(1, 1).expect("range"),
+            )
+            .expect("covered ranges");
+        if covered == vec![LedgerRange::blocks(1, 1).expect("range")] {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("durable intent worker did not publish coverage");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let pending = intents.list_pending(u64::MAX, 10).expect("list pending");
+    assert!(pending.is_empty());
 }
 
 #[test]
@@ -1103,6 +1184,178 @@ where
 struct CountingStorage {
     inner: LocalStorage,
     read_ranges: Arc<Mutex<Vec<LedgerRange>>>,
+}
+
+#[derive(Clone, Default)]
+struct RecordingIntentRepository {
+    recorded: Arc<Mutex<Vec<CreateDurablePromotionIntent>>>,
+}
+
+impl DurablePromotionIntentRepository for RecordingIntentRepository {
+    fn create_or_get(
+        &self,
+        request: CreateDurablePromotionIntent,
+    ) -> Result<DurablePromotionIntentCreateOutcome, DatalensError> {
+        self.recorded
+            .lock()
+            .expect("recorded intent lock")
+            .push(request.clone());
+        Ok(DurablePromotionIntentCreateOutcome::Created(
+            intent_from_request(request, DurablePromotionIntentStatus::Pending),
+        ))
+    }
+
+    fn get(&self, _intent_id: &str) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        Ok(None)
+    }
+
+    fn list_pending(
+        &self,
+        _now_unix_seconds: u64,
+        _limit: usize,
+    ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+        Ok(Vec::new())
+    }
+
+    fn mark_running(
+        &self,
+        _intent_id: &str,
+        _now_unix_seconds: u64,
+    ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        Ok(None)
+    }
+
+    fn mark_completed(
+        &self,
+        _intent_id: &str,
+        _now_unix_seconds: u64,
+    ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        Ok(None)
+    }
+
+    fn mark_retryable_failure(
+        &self,
+        _intent_id: &str,
+        _error: &str,
+        _now_unix_seconds: u64,
+        _next_retry_at_unix_seconds: u64,
+    ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        Ok(None)
+    }
+
+    fn mark_terminal_failure(
+        &self,
+        _intent_id: &str,
+        _error: &str,
+        _now_unix_seconds: u64,
+    ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        Ok(None)
+    }
+
+    fn reset_stale_running(
+        &self,
+        _stale_before_unix_seconds: u64,
+        _now_unix_seconds: u64,
+    ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+        Ok(Vec::new())
+    }
+}
+
+#[derive(Clone)]
+struct FailingIntentRepository;
+
+impl DurablePromotionIntentRepository for FailingIntentRepository {
+    fn create_or_get(
+        &self,
+        _request: CreateDurablePromotionIntent,
+    ) -> Result<DurablePromotionIntentCreateOutcome, DatalensError> {
+        Err(DatalensError::new(
+            DatalensErrorKind::StorageWriteFailure,
+            "intent repository unavailable",
+        ))
+    }
+
+    fn get(&self, _intent_id: &str) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        Ok(None)
+    }
+
+    fn list_pending(
+        &self,
+        _now_unix_seconds: u64,
+        _limit: usize,
+    ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+        Ok(Vec::new())
+    }
+
+    fn mark_running(
+        &self,
+        _intent_id: &str,
+        _now_unix_seconds: u64,
+    ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        Ok(None)
+    }
+
+    fn mark_completed(
+        &self,
+        _intent_id: &str,
+        _now_unix_seconds: u64,
+    ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        Ok(None)
+    }
+
+    fn mark_retryable_failure(
+        &self,
+        _intent_id: &str,
+        _error: &str,
+        _now_unix_seconds: u64,
+        _next_retry_at_unix_seconds: u64,
+    ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        Ok(None)
+    }
+
+    fn mark_terminal_failure(
+        &self,
+        _intent_id: &str,
+        _error: &str,
+        _now_unix_seconds: u64,
+    ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        Ok(None)
+    }
+
+    fn reset_stale_running(
+        &self,
+        _stale_before_unix_seconds: u64,
+        _now_unix_seconds: u64,
+    ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+        Ok(Vec::new())
+    }
+}
+
+fn intent_from_request(
+    request: CreateDurablePromotionIntent,
+    status: DurablePromotionIntentStatus,
+) -> DurablePromotionIntent {
+    DurablePromotionIntent {
+        intent_id: "test-intent".to_owned(),
+        dedupe_key: "test-dedupe".to_owned(),
+        source: request.source,
+        application: request.application,
+        chain: request.chain,
+        dataset_key: request.dataset_key,
+        selector: request.selector,
+        selector_fingerprint: request.selector_fingerprint,
+        selector_canonical_key: request.selector_canonical_key,
+        finality: request.finality,
+        ranges: request.ranges,
+        status,
+        attempt_count: 0,
+        next_retry_at_unix_seconds: None,
+        created_at_unix_seconds: request.now_unix_seconds,
+        updated_at_unix_seconds: request.now_unix_seconds,
+        last_error: None,
+        request_id: request.request_id,
+        task_id: request.task_id,
+    }
 }
 
 impl CountingStorage {

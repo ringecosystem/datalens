@@ -19,8 +19,9 @@ use datalens_metrics::{ApplicationIdentity, MetricsRecorder};
 use datalens_planner::{FieldSelection, NativePlannerConfig, NativeQueryInput};
 use datalens_solana::{SolanaAdapter, solana_all_selector};
 use datalens_storage::{
-    LocalObjectStore, LocalStorage, QueryWatermark, QueryWatermarkKey, QueryWatermarkRepository,
-    QueryWatermarkStore,
+    CreateDurablePromotionIntent, DurablePromotionIntent, DurablePromotionIntentCreateOutcome,
+    DurablePromotionIntentRepository, DurablePromotionIntentStatus, LocalObjectStore, LocalStorage,
+    QueryWatermark, QueryWatermarkKey, QueryWatermarkRepository, QueryWatermarkStore,
 };
 use datalens_tron::{TronAdapter, tron_all_selector};
 use datalens_warmup::{
@@ -185,6 +186,33 @@ fn test_warmup_fetches_evm_logs_in_chunks_and_writes_durable_cache() {
     assert_eq!(task.state, WarmupTaskState::Completed);
     assert_eq!(task.stats.rows_fetched, 3);
     assert_eq!(task.stats.provider_calls, 3);
+}
+
+#[test]
+fn test_warmup_with_durable_intents_schedules_without_fetching_or_advancing_cursor() {
+    let adapter = FixtureAdapter::new(10).with_logs(vec![log_record(1, 0)]);
+    let storage = LocalStorage::new(temp_root("intent-warmup-storage"));
+    let registry = LocalWarmupRegistry::new(object_store("intent-warmup-registry"));
+    let intents = RecordingIntentRepository::default();
+    let recorded = intents.recorded.clone();
+    let runtime = WarmupRuntime::new(adapter.clone(), storage, registry.clone(), writer_config())
+        .with_durable_intents(intents);
+    let request = submit_request(Some(3), WarmupTaskMode::FixedRange);
+    let task_id = registry.submit(request).expect("submit").task_id;
+
+    let result = runtime.run_task_once(&task_id).expect("warmup run");
+
+    assert_eq!(result.status, WarmupRunStatus::Partial);
+    assert!(adapter.fetches().is_empty());
+    let cursor = registry
+        .load_cursor(&task_id)
+        .expect("load cursor")
+        .expect("cursor exists");
+    assert_eq!(cursor.next, 1);
+    let recorded = recorded.lock().expect("recorded intents");
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].application, "app-a");
+    assert_eq!(recorded[0].ranges, vec![blocks(1, 3)]);
 }
 
 #[test]
@@ -1325,6 +1353,105 @@ struct FixtureState {
     logs: Vec<LogRecord>,
     failures: Vec<(LedgerRange, DatalensError)>,
     fetches: Vec<LedgerRange>,
+}
+
+#[derive(Clone, Default)]
+struct RecordingIntentRepository {
+    recorded: Arc<Mutex<Vec<CreateDurablePromotionIntent>>>,
+}
+
+impl DurablePromotionIntentRepository for RecordingIntentRepository {
+    fn create_or_get(
+        &self,
+        request: CreateDurablePromotionIntent,
+    ) -> Result<DurablePromotionIntentCreateOutcome, DatalensError> {
+        self.recorded
+            .lock()
+            .expect("recorded intent lock")
+            .push(request.clone());
+        Ok(DurablePromotionIntentCreateOutcome::Created(
+            intent_from_request(request),
+        ))
+    }
+
+    fn get(&self, _intent_id: &str) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        Ok(None)
+    }
+
+    fn list_pending(
+        &self,
+        _now_unix_seconds: u64,
+        _limit: usize,
+    ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+        Ok(Vec::new())
+    }
+
+    fn mark_running(
+        &self,
+        _intent_id: &str,
+        _now_unix_seconds: u64,
+    ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        Ok(None)
+    }
+
+    fn mark_completed(
+        &self,
+        _intent_id: &str,
+        _now_unix_seconds: u64,
+    ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        Ok(None)
+    }
+
+    fn mark_retryable_failure(
+        &self,
+        _intent_id: &str,
+        _error: &str,
+        _now_unix_seconds: u64,
+        _next_retry_at_unix_seconds: u64,
+    ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        Ok(None)
+    }
+
+    fn mark_terminal_failure(
+        &self,
+        _intent_id: &str,
+        _error: &str,
+        _now_unix_seconds: u64,
+    ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        Ok(None)
+    }
+
+    fn reset_stale_running(
+        &self,
+        _stale_before_unix_seconds: u64,
+        _now_unix_seconds: u64,
+    ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+        Ok(Vec::new())
+    }
+}
+
+fn intent_from_request(request: CreateDurablePromotionIntent) -> DurablePromotionIntent {
+    DurablePromotionIntent {
+        intent_id: "test-intent".to_owned(),
+        dedupe_key: "test-dedupe".to_owned(),
+        source: request.source,
+        application: request.application,
+        chain: request.chain,
+        dataset_key: request.dataset_key,
+        selector: request.selector,
+        selector_fingerprint: request.selector_fingerprint,
+        selector_canonical_key: request.selector_canonical_key,
+        finality: request.finality,
+        ranges: request.ranges,
+        status: DurablePromotionIntentStatus::Pending,
+        attempt_count: 0,
+        next_retry_at_unix_seconds: None,
+        created_at_unix_seconds: request.now_unix_seconds,
+        updated_at_unix_seconds: request.now_unix_seconds,
+        last_error: None,
+        request_id: request.request_id,
+        task_id: request.task_id,
+    }
 }
 
 impl FixtureAdapter {

@@ -131,6 +131,12 @@ pub struct CacheCommonCommand {
     #[arg(long = "topic")]
     pub topics: Vec<String>,
 
+    #[arg(long = "topic0-any-of")]
+    pub topic0_any_of: Vec<String>,
+
+    #[arg(long = "selector-json")]
+    pub selector_json: Option<String>,
+
     #[arg(long = "event-name")]
     pub event_names: Vec<String>,
 }
@@ -418,15 +424,7 @@ fn dataset_selector(
     common: &CacheCommonCommand,
 ) -> Result<DatasetSelector, DatalensError> {
     if chain.kind == "evm" && dataset == "logs" {
-        return DatasetSelector::try_evm_logs(LogFilter {
-            addresses: common.addresses.clone(),
-            topics: common
-                .topics
-                .iter()
-                .cloned()
-                .map(|topic| Some(vec![topic]))
-                .collect(),
-        });
+        return DatasetSelector::try_evm_logs(evm_log_filter(common)?);
     }
     if chain.kind == "tron" && dataset == "events" && !common.addresses.is_empty() {
         return tron_event_selector(TronEventFilter {
@@ -441,6 +439,57 @@ fn dataset_selector(
         return solana_dataset_selector(dataset, common);
     }
     Ok(DatasetSelector::all())
+}
+
+fn evm_log_filter(common: &CacheCommonCommand) -> Result<LogFilter, DatalensError> {
+    if let Some(path) = common.selector_json.as_deref() {
+        if !common.addresses.is_empty()
+            || !common.topics.is_empty()
+            || !common.topic0_any_of.is_empty()
+        {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                "cache --selector-json cannot be combined with address or topic filters",
+            ));
+        }
+        let content = std::fs::read_to_string(path).map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                format!("read selector json {path}: {error}"),
+            )
+        })?;
+        return serde_json::from_str(&content).map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                format!("parse selector json {path}: {error}"),
+            )
+        });
+    }
+
+    let mut topic_slots = common
+        .topics
+        .iter()
+        .cloned()
+        .map(|topic| Some(vec![topic]))
+        .collect::<Vec<_>>();
+    if !common.topic0_any_of.is_empty() {
+        if topic_slots.first().and_then(|slot| slot.as_ref()).is_some() {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                "cache --topic0-any-of cannot be combined with the first --topic slot",
+            ));
+        }
+        if topic_slots.is_empty() {
+            topic_slots.push(Some(common.topic0_any_of.clone()));
+        } else {
+            topic_slots[0] = Some(common.topic0_any_of.clone());
+        }
+    }
+
+    Ok(LogFilter {
+        addresses: common.addresses.clone(),
+        topics: topic_slots,
+    })
 }
 
 fn solana_dataset_selector(

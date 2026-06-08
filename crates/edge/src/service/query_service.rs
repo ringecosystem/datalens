@@ -7,7 +7,10 @@ use datalens_core::{DatalensError, DatalensErrorKind, DatasetKey, DatasetRows, L
 use datalens_executor::{NativeQueryExecutionConfig, NativeQueryExecutor, generate_query_id};
 use datalens_metrics::{ApplicationIdentity, MetricsRecorder};
 use datalens_planner::{NativePlannerConfig, NativeQueryInput};
-use datalens_storage::{QueryWatermarkRepository, StorageRepository, UsageLedgerRepository};
+use datalens_storage::{
+    DurablePromotionIntentRepository, QueryWatermarkRepository, StorageRepository,
+    UsageLedgerRepository,
+};
 use datalens_warmup::{
     WarmupEnsureOutcome, WarmupRegistry, WarmupRunResult, WarmupSubmitOutcome, WarmupSubmitRequest,
     WarmupTask, WarmupTaskFilter, WarmupTaskId, WarmupTaskPool,
@@ -184,6 +187,14 @@ where
         application: ApplicationIdentity,
     ) -> Self {
         self.executor = self.executor.with_query_watermarks(repository, application);
+        self
+    }
+
+    pub fn with_durable_intents(
+        mut self,
+        repository: impl DurablePromotionIntentRepository + 'static,
+    ) -> Self {
+        self.executor = self.executor.with_durable_intents(repository);
         self
     }
 

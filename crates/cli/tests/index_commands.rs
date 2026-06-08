@@ -831,6 +831,34 @@ fn test_cache_backfill_tron_events_builds_tron_event_selector() {
 }
 
 #[test]
+fn test_cache_backfill_evm_logs_builds_topic0_any_of_selector() {
+    let root = temp_storage_root("index-evm-topic0-any-of-selector");
+    let config = write_config("index-evm-topic0-any-of-selector", &root);
+    let mut common = cache_common(config, 10, 12);
+    common.datasets = vec!["logs".to_owned()];
+    common.addresses = vec!["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()];
+    common.topic0_any_of = vec![
+        "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+        "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_owned(),
+    ];
+
+    let output = cache_summary_with_adapter(
+        CacheWorkflowCommand::Backfill(CacheBackfillCommand {
+            common,
+            dry_run: true,
+        }),
+        IndexFixtureAdapter::default(),
+    )
+    .expect("dry-run");
+
+    assert_eq!(output["datasets"][0]["selector_kind"], "evm_logs");
+    assert_eq!(
+        output["datasets"][0]["selector_canonical_key"],
+        "evm-logs/addr=0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/topics=0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb,0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    );
+}
+
+#[test]
 fn test_cache_backfill_tron_blocks_builds_tron_all_selector() {
     let root = temp_storage_root("index-tron-blocks-selector");
     let config = write_tron_config("index-tron-blocks-selector", &root);
@@ -1578,6 +1606,8 @@ fn cache_common(config: String, start: u64, end: u64) -> CacheCommonCommand {
         program_id: None,
         signature: None,
         topics: Vec::new(),
+        topic0_any_of: Vec::new(),
+        selector_json: None,
         event_names: Vec::new(),
     }
 }
@@ -1724,22 +1754,43 @@ impl IndexFixtureAdapter {
 
 impl ChainAdapter for IndexFixtureAdapter {
     fn capabilities(&self) -> AdapterCapabilities {
-        AdapterCapabilities::new(self.chain.clone()).with_dataset_capability(
-            DatasetCapability::new(if self.chain.family() == ChainFamily::Evm {
-                DatasetKey::evm_blocks()
-            } else {
-                DatasetKey::tron_events()
-            })
-            .with_selector(SelectorKind::All)
-            .with_selector(SelectorKind::Other(
-                datalens_chain::AdapterKey::try_new("tron_events").expect("selector"),
-            ))
-            .with_range(HeightRangeKind::Block)
-            .with_max_range_len(2)
-            .with_empty_coverage(true)
-            .with_safe_height(true)
-            .with_finalized_height(true)
-            .with_range_split(true),
+        let base = AdapterCapabilities::new(self.chain.clone());
+        if self.chain.family() == ChainFamily::Evm {
+            return base
+                .with_dataset_capability(
+                    DatasetCapability::new(DatasetKey::evm_blocks())
+                        .with_selector(SelectorKind::All)
+                        .with_range(HeightRangeKind::Block)
+                        .with_max_range_len(2)
+                        .with_empty_coverage(true)
+                        .with_safe_height(true)
+                        .with_finalized_height(true)
+                        .with_range_split(true),
+                )
+                .with_dataset_capability(
+                    DatasetCapability::new(DatasetKey::evm_logs())
+                        .with_selector(SelectorKind::EvmLogs)
+                        .with_range(HeightRangeKind::Block)
+                        .with_max_range_len(2)
+                        .with_empty_coverage(true)
+                        .with_safe_height(true)
+                        .with_finalized_height(true)
+                        .with_range_split(true),
+                );
+        }
+
+        base.with_dataset_capability(
+            DatasetCapability::new(DatasetKey::tron_events())
+                .with_selector(SelectorKind::All)
+                .with_selector(SelectorKind::Other(
+                    datalens_chain::AdapterKey::try_new("tron_events").expect("selector"),
+                ))
+                .with_range(HeightRangeKind::Block)
+                .with_max_range_len(2)
+                .with_empty_coverage(true)
+                .with_safe_height(true)
+                .with_finalized_height(true)
+                .with_range_split(true),
         )
     }
 

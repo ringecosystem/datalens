@@ -142,6 +142,13 @@ where
         }
     }
 
+    pub fn storage(&self) -> R
+    where
+        R: Clone,
+    {
+        self.storage.clone()
+    }
+
     pub fn write(&self, request: DurableWriteRequest) -> Result<DurableWriteResult, DatalensError> {
         if self.config.staging.enabled {
             return self.ingest(request);
