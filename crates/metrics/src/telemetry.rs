@@ -1,5 +1,7 @@
 use datalens_core::{ChainIdentity, DatalensErrorKind, DatasetKey};
-use prometheus::{CounterVec, GaugeVec, HistogramOpts, HistogramVec, Opts, Registry, TextEncoder};
+use prometheus::{
+    CounterVec, Gauge, GaugeVec, HistogramOpts, HistogramVec, Opts, Registry, TextEncoder,
+};
 
 const APPLICATION: &str = "unknown";
 
@@ -209,6 +211,31 @@ pub enum DurableWriteOutcome {
     StorageError,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DurableIntentOutcome {
+    Submitted,
+    AlreadyPending,
+    AlreadyCompleted,
+    Completed,
+    RetryableFailed,
+    TerminalFailed,
+    Error,
+}
+
+impl DurableIntentOutcome {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Submitted => "submitted",
+            Self::AlreadyPending => "already_pending",
+            Self::AlreadyCompleted => "already_completed",
+            Self::Completed => "completed",
+            Self::RetryableFailed => "retryable_failed",
+            Self::TerminalFailed => "terminal_failed",
+            Self::Error => "error",
+        }
+    }
+}
+
 impl DurableWriteOutcome {
     fn as_str(&self) -> &'static str {
         match self {
@@ -333,6 +360,10 @@ pub struct MetricsRecorder {
     cache_coverage_total: CounterVec,
     fill_total: CounterVec,
     durable_write_total: CounterVec,
+    durable_intent_total: CounterVec,
+    durable_intent_duration_seconds: HistogramVec,
+    durable_intent_pending_count: Gauge,
+    durable_intent_oldest_pending_age_seconds: Gauge,
     hot_reorg_total: CounterVec,
     hot_promotion_total: CounterVec,
     fill_duration_seconds: HistogramVec,
@@ -411,6 +442,42 @@ impl MetricsRecorder {
             ),
             &["application", "chain", "chain_kind", "dataset", "outcome"],
         )?;
+        let durable_intent_total = CounterVec::new(
+            Opts::new(
+                "datalens_durable_intent_total",
+                "Datalens durable promotion intents by source and outcome.",
+            ),
+            &[
+                "application",
+                "chain",
+                "chain_kind",
+                "dataset",
+                "source",
+                "outcome",
+            ],
+        )?;
+        let durable_intent_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "datalens_durable_intent_duration_seconds",
+                "Datalens durable promotion intent processing duration in seconds.",
+            ),
+            &[
+                "application",
+                "chain",
+                "chain_kind",
+                "dataset",
+                "source",
+                "outcome",
+            ],
+        )?;
+        let durable_intent_pending_count = Gauge::with_opts(Opts::new(
+            "datalens_durable_intent_pending_count",
+            "Datalens durable promotion intents currently eligible for processing.",
+        ))?;
+        let durable_intent_oldest_pending_age_seconds = Gauge::with_opts(Opts::new(
+            "datalens_durable_intent_oldest_pending_age_seconds",
+            "Age in seconds of the oldest currently eligible durable promotion intent.",
+        ))?;
         let hot_reorg_total = CounterVec::new(
             Opts::new(
                 "datalens_hot_reorg_total",
@@ -557,6 +624,10 @@ impl MetricsRecorder {
         registry.register(Box::new(cache_coverage_total.clone()))?;
         registry.register(Box::new(fill_total.clone()))?;
         registry.register(Box::new(durable_write_total.clone()))?;
+        registry.register(Box::new(durable_intent_total.clone()))?;
+        registry.register(Box::new(durable_intent_duration_seconds.clone()))?;
+        registry.register(Box::new(durable_intent_pending_count.clone()))?;
+        registry.register(Box::new(durable_intent_oldest_pending_age_seconds.clone()))?;
         registry.register(Box::new(hot_reorg_total.clone()))?;
         registry.register(Box::new(hot_promotion_total.clone()))?;
         registry.register(Box::new(fill_duration_seconds.clone()))?;
@@ -582,6 +653,10 @@ impl MetricsRecorder {
             cache_coverage_total,
             fill_total,
             durable_write_total,
+            durable_intent_total,
+            durable_intent_duration_seconds,
+            durable_intent_pending_count,
+            durable_intent_oldest_pending_age_seconds,
             hot_reorg_total,
             hot_promotion_total,
             fill_duration_seconds,
@@ -630,6 +705,47 @@ impl MetricsRecorder {
         self.durable_write_total
             .with_label_values(&labels.query_label_values(outcome.as_str()))
             .inc();
+    }
+
+    pub fn record_durable_intent(
+        &self,
+        labels: &MetricsLabels,
+        source: &str,
+        outcome: DurableIntentOutcome,
+    ) {
+        self.durable_intent_total
+            .with_label_values(&durable_intent_label_values(
+                labels,
+                source,
+                outcome.as_str(),
+            ))
+            .inc();
+    }
+
+    pub fn observe_durable_intent_duration(
+        &self,
+        labels: &MetricsLabels,
+        source: &str,
+        outcome: DurableIntentOutcome,
+        seconds: f64,
+    ) {
+        self.durable_intent_duration_seconds
+            .with_label_values(&durable_intent_label_values(
+                labels,
+                source,
+                outcome.as_str(),
+            ))
+            .observe(seconds);
+    }
+
+    pub fn set_durable_intent_backlog(
+        &self,
+        pending_count: usize,
+        oldest_pending_age_seconds: u64,
+    ) {
+        self.durable_intent_pending_count.set(pending_count as f64);
+        self.durable_intent_oldest_pending_age_seconds
+            .set(oldest_pending_age_seconds as f64);
     }
 
     pub fn record_hot_reorg(&self, labels: &MetricsLabels, outcome: HotReorgOutcome, count: u64) {
@@ -787,6 +903,21 @@ fn warmup_selector_label_values<'a>(
         &labels.chain_kind,
         &labels.dataset,
         selector_kind,
+        outcome,
+    ]
+}
+
+fn durable_intent_label_values<'a>(
+    labels: &'a MetricsLabels,
+    source: &'a str,
+    outcome: &'a str,
+) -> [&'a str; 6] {
+    [
+        labels.application.as_str(),
+        &labels.chain,
+        &labels.chain_kind,
+        &labels.dataset,
+        source,
         outcome,
     ]
 }

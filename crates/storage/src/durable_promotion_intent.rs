@@ -395,12 +395,27 @@ where
         intent_id: &str,
         now_unix_seconds: u64,
     ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
-        self.update_intent(intent_id, |intent| {
-            intent.status = DurablePromotionIntentStatus::Running;
-            intent.updated_at_unix_seconds = now_unix_seconds;
-            intent.next_retry_at_unix_seconds = None;
-            intent.last_error = None;
-        })
+        let Some(mut intent) = self.get(intent_id)? else {
+            return Ok(None);
+        };
+        let eligible = match intent.status {
+            DurablePromotionIntentStatus::Pending => true,
+            DurablePromotionIntentStatus::FailedRetryable => intent
+                .next_retry_at_unix_seconds
+                .is_none_or(|next_retry| next_retry <= now_unix_seconds),
+            DurablePromotionIntentStatus::Running
+            | DurablePromotionIntentStatus::Completed
+            | DurablePromotionIntentStatus::FailedTerminal => false,
+        };
+        if !eligible {
+            return Ok(None);
+        }
+        intent.status = DurablePromotionIntentStatus::Running;
+        intent.updated_at_unix_seconds = now_unix_seconds;
+        intent.next_retry_at_unix_seconds = None;
+        intent.last_error = None;
+        self.write_intent(&intent)?;
+        Ok(Some(intent))
     }
 
     fn mark_completed(

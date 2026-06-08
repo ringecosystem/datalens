@@ -281,6 +281,38 @@ fn test_query_logs_accepts_address_and_topic_filters() {
 }
 
 #[test]
+fn test_query_logs_accepts_topic0_any_of_filter() {
+    let cli = Cli::parse_from([
+        "datalens",
+        "query",
+        "logs",
+        "--config",
+        "custom.toml",
+        "--chain",
+        "ethereum",
+        "--from-block",
+        "10",
+        "--to-block",
+        "12",
+        "--topic0-any-of",
+        "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "--topic0-any-of",
+        "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    ]);
+
+    match cli.command {
+        Command::Query(QueryCommand {
+            command: QuerySubcommand::Logs(command),
+            ..
+        }) => {
+            assert_eq!(command.topics.len(), 0);
+            assert_eq!(command.topic0_any_of.len(), 2);
+        }
+        command => panic!("expected query logs command, got {command:?}"),
+    }
+}
+
+#[test]
 fn test_inspect_manifest_accepts_config_path_after_subcommand() {
     let cli = Cli::parse_from(["datalens", "inspect", "manifest", "--config", "custom.toml"]);
 

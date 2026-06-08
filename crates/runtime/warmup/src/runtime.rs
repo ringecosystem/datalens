@@ -8,8 +8,8 @@ use datalens_core::{
     DatalensError, DatalensErrorKind, DatasetKey, DatasetRows, LedgerRange, missing_ranges,
 };
 use datalens_metrics::{
-    ApplicationIdentity, MetricsLabels, MetricsRecorder, WarmupFetchOutcome, WarmupTaskOutcome,
-    WarmupWriteOutcome,
+    ApplicationIdentity, DurableIntentOutcome as MetricsDurableIntentOutcome, MetricsLabels,
+    MetricsRecorder, WarmupFetchOutcome, WarmupTaskOutcome, WarmupWriteOutcome,
 };
 use datalens_storage::{
     CacheOutcome, DurableIntentSubmissionOutcome, DurableIntentSubmissionRequest,
@@ -586,9 +586,8 @@ where
             task_id: Some(task.task_id.as_str().to_owned()),
             now_unix_seconds: unix_seconds_now()?,
         }) {
-            DurableIntentSubmissionOutcome::Submitted(intent)
-            | DurableIntentSubmissionOutcome::AlreadyPending(intent)
-            | DurableIntentSubmissionOutcome::AlreadyCompleted(intent) => {
+            DurableIntentSubmissionOutcome::Submitted(intent) => {
+                self.record_durable_intent_metric(task, MetricsDurableIntentOutcome::Submitted);
                 log::info!(
                     "warmup durable intent scheduled task_id={} intent_id={} chain_key={} dataset={} selector_fingerprint={} ranges={}",
                     task.task_id.as_str(),
@@ -600,7 +599,42 @@ where
                 );
                 Ok(())
             }
-            DurableIntentSubmissionOutcome::Failed(error) => Err(error),
+            DurableIntentSubmissionOutcome::AlreadyPending(intent) => {
+                self.record_durable_intent_metric(
+                    task,
+                    MetricsDurableIntentOutcome::AlreadyPending,
+                );
+                log::info!(
+                    "warmup durable intent already pending task_id={} intent_id={} chain_key={} dataset={} selector_fingerprint={} ranges={}",
+                    task.task_id.as_str(),
+                    intent.intent_id,
+                    intent.chain.key_prefix(),
+                    intent.dataset_key.as_str(),
+                    intent.selector_fingerprint,
+                    format_ranges(&intent.ranges)
+                );
+                Ok(())
+            }
+            DurableIntentSubmissionOutcome::AlreadyCompleted(intent) => {
+                self.record_durable_intent_metric(
+                    task,
+                    MetricsDurableIntentOutcome::AlreadyCompleted,
+                );
+                log::info!(
+                    "warmup durable intent already completed task_id={} intent_id={} chain_key={} dataset={} selector_fingerprint={} ranges={}",
+                    task.task_id.as_str(),
+                    intent.intent_id,
+                    intent.chain.key_prefix(),
+                    intent.dataset_key.as_str(),
+                    intent.selector_fingerprint,
+                    format_ranges(&intent.ranges)
+                );
+                Ok(())
+            }
+            DurableIntentSubmissionOutcome::Failed(error) => {
+                self.record_durable_intent_metric(task, MetricsDurableIntentOutcome::Error);
+                Err(error)
+            }
         }
     }
 
@@ -1002,6 +1036,17 @@ where
             &selector_label(&task.selector),
             error.kind.clone(),
         );
+    }
+
+    fn record_durable_intent_metric(
+        &self,
+        task: &WarmupTask,
+        outcome: MetricsDurableIntentOutcome,
+    ) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        metrics.record_durable_intent(&metrics_labels(task), "warmup", outcome);
     }
 }
 

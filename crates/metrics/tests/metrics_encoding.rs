@@ -1,8 +1,8 @@
 use datalens_core::{ChainFamily, ChainIdentity, DatalensErrorKind, DatasetKey};
 use datalens_metrics::{
-    ApplicationIdentity, CacheCoverageOutcome, DurableWriteOutcome, ErrorLabels, FillOutcome,
-    HotReorgOutcome, MetricsLabels, MetricsRecorder, QueryOutcome, WarmupFetchOutcome,
-    WarmupTaskOutcome, WarmupWriteOutcome,
+    ApplicationIdentity, CacheCoverageOutcome, DurableIntentOutcome, DurableWriteOutcome,
+    ErrorLabels, FillOutcome, HotReorgOutcome, MetricsLabels, MetricsRecorder, QueryOutcome,
+    WarmupFetchOutcome, WarmupTaskOutcome, WarmupWriteOutcome,
 };
 
 #[test]
@@ -15,6 +15,14 @@ fn test_record_metrics_renders_prometheus_text_with_expected_labels() {
     recorder.record_cache_coverage(&labels, CacheCoverageOutcome::PartialHit);
     recorder.record_fill(&labels, FillOutcome::Filled);
     recorder.record_durable_write(&labels, DurableWriteOutcome::Staged);
+    recorder.record_durable_intent(&labels, "query", DurableIntentOutcome::Submitted);
+    recorder.observe_durable_intent_duration(
+        &labels,
+        "query",
+        DurableIntentOutcome::Completed,
+        2.0,
+    );
+    recorder.set_durable_intent_backlog(3, 15);
     recorder.observe_fill_duration(&labels, 1.5);
     recorder.set_latest_requested_block(&labels, 42);
     recorder.set_latest_filled_block(&labels, 40);
@@ -43,6 +51,12 @@ fn test_record_metrics_renders_prometheus_text_with_expected_labels() {
     assert!(output.contains(
         r#"datalens_durable_write_total{application="indexer",chain="ethereum",chain_kind="evm",dataset="evm.logs",outcome="staged"} 1"#
     ));
+    assert!(output.contains(
+        r#"datalens_durable_intent_total{application="indexer",chain="ethereum",chain_kind="evm",dataset="evm.logs",outcome="submitted",source="query"} 1"#
+    ));
+    assert!(output.contains("datalens_durable_intent_duration_seconds"));
+    assert!(output.contains("datalens_durable_intent_pending_count 3"));
+    assert!(output.contains("datalens_durable_intent_oldest_pending_age_seconds 15"));
     assert!(output.contains("datalens_fill_duration_seconds"));
     assert!(output.contains(
         r#"datalens_provider_error_total{chain="ethereum",chain_kind="evm",dataset="evm.logs",error_kind="provider_timeout"} 1"#

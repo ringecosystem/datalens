@@ -17,8 +17,9 @@ use datalens_core::{
     QueryFinalityRequirement, missing_ranges,
 };
 use datalens_metrics::{
-    ApplicationIdentity, CacheCoverageOutcome, DurableWriteOutcome as MetricsDurableWriteOutcome,
-    ErrorLabels, FillOutcome, MetricsLabels, MetricsRecorder, QueryOutcome,
+    ApplicationIdentity, CacheCoverageOutcome, DurableIntentOutcome as MetricsDurableIntentOutcome,
+    DurableWriteOutcome as MetricsDurableWriteOutcome, ErrorLabels, FillOutcome, MetricsLabels,
+    MetricsRecorder, QueryOutcome,
 };
 use datalens_planner::{
     CoverageSummary, FinalityPolicy, NativePlanner, NativePlannerConfig, NativeQueryInput,
@@ -198,6 +199,9 @@ where
                 repository.clone(),
                 self.writer.clone(),
                 self.source.clone(),
+                self.metrics
+                    .as_ref()
+                    .map(|metrics| metrics.recorder.clone()),
             )
             .expect("durable intent workers start"),
         );
@@ -1165,6 +1169,7 @@ where
             .map(ApplicationIdentity::as_str)
             .unwrap_or("default")
             .to_owned();
+        let application_label = application.clone();
         let service = DurableIntentSubmissionService::new(repository.clone());
         match service.submit(DurableIntentSubmissionRequest {
             source: DurablePromotionIntentSource::Query,
@@ -1179,6 +1184,12 @@ where
             now_unix_seconds,
         }) {
             DurableIntentSubmissionOutcome::Submitted(intent) => {
+                self.record_durable_intent(
+                    plan,
+                    &intent.application,
+                    "query",
+                    MetricsDurableIntentOutcome::Submitted,
+                );
                 log::info!(
                     "durable intent submitted source=query query_id={} intent_id={} chain_key={} dataset={} selector_fingerprint={} ranges={}",
                     query_id,
@@ -1190,6 +1201,12 @@ where
                 );
             }
             DurableIntentSubmissionOutcome::AlreadyPending(intent) => {
+                self.record_durable_intent(
+                    plan,
+                    &intent.application,
+                    "query",
+                    MetricsDurableIntentOutcome::AlreadyPending,
+                );
                 log::info!(
                     "durable intent already pending source=query query_id={} intent_id={} chain_key={} dataset={} selector_fingerprint={} ranges={}",
                     query_id,
@@ -1201,6 +1218,12 @@ where
                 );
             }
             DurableIntentSubmissionOutcome::AlreadyCompleted(intent) => {
+                self.record_durable_intent(
+                    plan,
+                    &intent.application,
+                    "query",
+                    MetricsDurableIntentOutcome::AlreadyCompleted,
+                );
                 log::info!(
                     "durable intent already completed source=query query_id={} intent_id={} chain_key={} dataset={} selector_fingerprint={} ranges={}",
                     query_id,
@@ -1212,6 +1235,12 @@ where
                 );
             }
             DurableIntentSubmissionOutcome::Failed(error) => {
+                self.record_durable_intent(
+                    plan,
+                    &application_label,
+                    "query",
+                    MetricsDurableIntentOutcome::Error,
+                );
                 log::error!(
                     "durable intent scheduling failed source=query query_id={} dataset={} range={}-{} kind={:?} message={}",
                     query_id,
@@ -1223,6 +1252,26 @@ where
                 );
             }
         }
+    }
+
+    fn record_durable_intent(
+        &self,
+        plan: &datalens_planner::NativeQueryPlan,
+        application: &str,
+        source: &str,
+        outcome: MetricsDurableIntentOutcome,
+    ) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        let labels = MetricsLabels::from_dataset_key(
+            ApplicationIdentity::named(application.to_owned()),
+            plan.chain.clone(),
+            plan.dataset_key.clone(),
+        );
+        metrics
+            .recorder
+            .record_durable_intent(&labels, source, outcome);
     }
 
     fn record_query_watermark_for_plan(

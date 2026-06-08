@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeSet,
+    hash::{DefaultHasher, Hash, Hasher},
     sync::{
         Arc, Condvar, Mutex,
         mpsc::{self, Receiver, SyncSender, TrySendError},
@@ -13,10 +14,12 @@ use datalens_chain::{
 };
 use datalens_core::{ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey, LedgerRangeKind};
 use datalens_metrics::{
+    ApplicationIdentity, DurableIntentOutcome as MetricsDurableIntentOutcome,
     DurableWriteOutcome as MetricsDurableWriteOutcome, ErrorLabels, MetricsLabels, MetricsRecorder,
 };
 use datalens_storage::{
-    DurablePromotionIntent, DurablePromotionIntentRepository, StorageRepository,
+    DurablePromotionIntent, DurablePromotionIntentRepository, DurablePromotionIntentSource,
+    StorageRepository,
 };
 use datalens_writer::{DurableWriteRequest, DurableWriteSegment, DurableWriter};
 
@@ -26,7 +29,9 @@ const DEFAULT_PROMOTION_WORKERS: usize = 4;
 const DEFAULT_PROMOTION_QUEUE_CAPACITY: usize = 1024;
 const DEFAULT_INTENT_WORKERS: usize = 2;
 const DEFAULT_INTENT_POLL_INTERVAL: Duration = Duration::from_millis(500);
-const DEFAULT_INTENT_RETRY_DELAY_SECONDS: u64 = 60;
+const DEFAULT_INTENT_RETRY_BASE_DELAY_SECONDS: u64 = 60;
+const DEFAULT_INTENT_RETRY_MAX_DELAY_SECONDS: u64 = 3600;
+const DEFAULT_INTENT_RETRY_MAX_JITTER_SECONDS: u64 = 60;
 const DEFAULT_INTENT_STALE_RUNNING_SECONDS: u64 = 300;
 
 #[derive(Clone)]
@@ -51,14 +56,18 @@ where
         repository: Arc<dyn DurablePromotionIntentRepository>,
         writer: DurableWriter<R>,
         adapter: A,
+        metrics: Option<Arc<MetricsRecorder>>,
     ) -> Result<Self, DatalensError> {
         reset_stale_intents(repository.as_ref())?;
+        let claim_lock = Arc::new(Mutex::new(()));
         for worker_index in 0..DEFAULT_INTENT_WORKERS {
             spawn_intent_worker(
                 worker_index,
                 repository.clone(),
                 writer.clone(),
                 adapter.clone(),
+                metrics.clone(),
+                claim_lock.clone(),
             )?;
         }
         Ok(Self {
@@ -372,6 +381,8 @@ fn spawn_intent_worker<R, A>(
     repository: Arc<dyn DurablePromotionIntentRepository>,
     writer: DurableWriter<R>,
     adapter: A,
+    metrics: Option<Arc<MetricsRecorder>>,
+    claim_lock: Arc<Mutex<()>>,
 ) -> Result<(), DatalensError>
 where
     R: StorageRepository + Clone + 'static,
@@ -382,38 +393,47 @@ where
         .spawn(move || {
             loop {
                 let now = unix_seconds_now();
-                let pending = match repository.list_pending(now, 1) {
-                    Ok(pending) => pending,
-                    Err(error) => {
-                        log::error!(
-                            "durable intent list failed worker={} kind={:?} message={}",
-                            worker_index,
-                            error.kind,
-                            error.message
-                        );
-                        thread::sleep(DEFAULT_INTENT_POLL_INTERVAL);
-                        continue;
+                let intent = {
+                    let _claim = match claim_lock.lock() {
+                        Ok(claim) => claim,
+                        Err(_) => return,
+                    };
+                    let pending = match repository.list_pending(now, usize::MAX) {
+                        Ok(pending) => pending,
+                        Err(error) => {
+                            log::error!(
+                                "durable intent list failed worker={} kind={:?} message={}",
+                                worker_index,
+                                error.kind,
+                                error.message
+                            );
+                            Vec::new()
+                        }
+                    };
+                    record_intent_backlog_metric(metrics.as_ref(), &pending, now);
+                    match pending.into_iter().next() {
+                        Some(intent) => match repository.mark_running(&intent.intent_id, unix_seconds_now()) {
+                            Ok(Some(intent)) => Some(intent),
+                            Ok(None) => None,
+                            Err(error) => {
+                                log::error!(
+                                    "durable intent claim failed worker={} intent_id={} kind={:?} message={}",
+                                    worker_index,
+                                    intent.intent_id,
+                                    error.kind,
+                                    error.message
+                                );
+                                None
+                            }
+                        },
+                        None => None,
                     }
                 };
-                let Some(intent) = pending.into_iter().next() else {
+                let Some(intent) = intent else {
                     thread::sleep(DEFAULT_INTENT_POLL_INTERVAL);
                     continue;
                 };
-                let intent = match repository.mark_running(&intent.intent_id, unix_seconds_now()) {
-                    Ok(Some(intent)) => intent,
-                    Ok(None) => continue,
-                    Err(error) => {
-                        log::error!(
-                            "durable intent claim failed worker={} intent_id={} kind={:?} message={}",
-                            worker_index,
-                            intent.intent_id,
-                            error.kind,
-                            error.message
-                        );
-                        continue;
-                    }
-                };
-                run_intent_work(repository.as_ref(), &writer, &adapter, &intent);
+                run_intent_work(repository.as_ref(), &writer, &adapter, &intent, metrics.as_ref());
             }
         })
         .map(|_| ())
@@ -430,6 +450,7 @@ fn run_intent_work<R, A>(
     writer: &DurableWriter<R>,
     adapter: &A,
     intent: &DurablePromotionIntent,
+    metrics: Option<&Arc<MetricsRecorder>>,
 ) where
     R: StorageRepository + Clone + 'static,
     A: ChainAdapter,
@@ -449,6 +470,17 @@ fn run_intent_work<R, A>(
     match result {
         Ok(()) => match repository.mark_completed(&intent.intent_id, unix_seconds_now()) {
             Ok(_) => {
+                record_intent_worker_metric(
+                    metrics,
+                    intent,
+                    MetricsDurableIntentOutcome::Completed,
+                );
+                observe_intent_worker_duration(
+                    metrics,
+                    intent,
+                    MetricsDurableIntentOutcome::Completed,
+                    started,
+                );
                 log::info!(
                     "durable intent promotion completed intent_id={} duration_ms={}",
                     intent.intent_id,
@@ -456,6 +488,13 @@ fn run_intent_work<R, A>(
                 );
             }
             Err(error) => {
+                record_intent_worker_metric(metrics, intent, MetricsDurableIntentOutcome::Error);
+                observe_intent_worker_duration(
+                    metrics,
+                    intent,
+                    MetricsDurableIntentOutcome::Error,
+                    started,
+                );
                 log::error!(
                     "durable intent completion mark failed intent_id={} kind={:?} message={} duration_ms={}",
                     intent.intent_id,
@@ -467,33 +506,183 @@ fn run_intent_work<R, A>(
         },
         Err(error) => {
             let now = unix_seconds_now();
-            let next_retry = now.saturating_add(DEFAULT_INTENT_RETRY_DELAY_SECONDS);
-            let mark_result = repository.mark_retryable_failure(
-                &intent.intent_id,
-                &error.message,
-                now,
-                next_retry,
-            );
-            if let Err(mark_error) = mark_result {
+            if error.kind.is_retryable() {
+                let retry_delay = intent_retry_delay_seconds(intent);
+                let next_retry = now.saturating_add(retry_delay);
+                let mark_result = repository.mark_retryable_failure(
+                    &intent.intent_id,
+                    &error.message,
+                    now,
+                    next_retry,
+                );
+                if let Err(mark_error) = mark_result {
+                    record_intent_worker_metric(
+                        metrics,
+                        intent,
+                        MetricsDurableIntentOutcome::Error,
+                    );
+                    observe_intent_worker_duration(
+                        metrics,
+                        intent,
+                        MetricsDurableIntentOutcome::Error,
+                        started,
+                    );
+                    log::error!(
+                        "durable intent retry mark failed intent_id={} kind={:?} message={} original_kind={:?} original_message={}",
+                        intent.intent_id,
+                        mark_error.kind,
+                        mark_error.message,
+                        error.kind,
+                        error.message
+                    );
+                } else {
+                    record_intent_worker_metric(
+                        metrics,
+                        intent,
+                        MetricsDurableIntentOutcome::RetryableFailed,
+                    );
+                    observe_intent_worker_duration(
+                        metrics,
+                        intent,
+                        MetricsDurableIntentOutcome::RetryableFailed,
+                        started,
+                    );
+                }
                 log::error!(
-                    "durable intent retry mark failed intent_id={} kind={:?} message={} original_kind={:?} original_message={}",
+                    "durable intent promotion failed intent_id={} kind={:?} message={} retry_delay_seconds={} retry_at={} duration_ms={}",
                     intent.intent_id,
-                    mark_error.kind,
-                    mark_error.message,
                     error.kind,
-                    error.message
+                    error.message,
+                    retry_delay,
+                    next_retry,
+                    started.elapsed().as_millis()
+                );
+            } else {
+                let mark_result =
+                    repository.mark_terminal_failure(&intent.intent_id, &error.message, now);
+                if let Err(mark_error) = mark_result {
+                    record_intent_worker_metric(
+                        metrics,
+                        intent,
+                        MetricsDurableIntentOutcome::Error,
+                    );
+                    observe_intent_worker_duration(
+                        metrics,
+                        intent,
+                        MetricsDurableIntentOutcome::Error,
+                        started,
+                    );
+                    log::error!(
+                        "durable intent terminal mark failed intent_id={} kind={:?} message={} original_kind={:?} original_message={}",
+                        intent.intent_id,
+                        mark_error.kind,
+                        mark_error.message,
+                        error.kind,
+                        error.message
+                    );
+                } else {
+                    record_intent_worker_metric(
+                        metrics,
+                        intent,
+                        MetricsDurableIntentOutcome::TerminalFailed,
+                    );
+                    observe_intent_worker_duration(
+                        metrics,
+                        intent,
+                        MetricsDurableIntentOutcome::TerminalFailed,
+                        started,
+                    );
+                }
+                log::error!(
+                    "durable intent promotion terminal failure intent_id={} kind={:?} message={} duration_ms={}",
+                    intent.intent_id,
+                    error.kind,
+                    error.message,
+                    started.elapsed().as_millis()
                 );
             }
-            log::error!(
-                "durable intent promotion failed intent_id={} kind={:?} message={} retry_at={} duration_ms={}",
-                intent.intent_id,
-                error.kind,
-                error.message,
-                next_retry,
-                started.elapsed().as_millis()
-            );
         }
     }
+}
+
+fn record_intent_worker_metric(
+    metrics: Option<&Arc<MetricsRecorder>>,
+    intent: &DurablePromotionIntent,
+    outcome: MetricsDurableIntentOutcome,
+) {
+    let Some(metrics) = metrics else {
+        return;
+    };
+    let labels = MetricsLabels::from_dataset_key(
+        ApplicationIdentity::named(intent.application.clone()),
+        intent.chain.clone(),
+        intent.dataset_key.clone(),
+    );
+    metrics.record_durable_intent(&labels, intent_source_label(intent.source), outcome);
+}
+
+fn observe_intent_worker_duration(
+    metrics: Option<&Arc<MetricsRecorder>>,
+    intent: &DurablePromotionIntent,
+    outcome: MetricsDurableIntentOutcome,
+    started: Instant,
+) {
+    let Some(metrics) = metrics else {
+        return;
+    };
+    let labels = MetricsLabels::from_dataset_key(
+        ApplicationIdentity::named(intent.application.clone()),
+        intent.chain.clone(),
+        intent.dataset_key.clone(),
+    );
+    metrics.observe_durable_intent_duration(
+        &labels,
+        intent_source_label(intent.source),
+        outcome,
+        started.elapsed().as_secs_f64(),
+    );
+}
+
+fn record_intent_backlog_metric(
+    metrics: Option<&Arc<MetricsRecorder>>,
+    pending: &[DurablePromotionIntent],
+    now_unix_seconds: u64,
+) {
+    let Some(metrics) = metrics else {
+        return;
+    };
+    let oldest_age = pending
+        .iter()
+        .map(|intent| now_unix_seconds.saturating_sub(intent.created_at_unix_seconds))
+        .max()
+        .unwrap_or(0);
+    metrics.set_durable_intent_backlog(pending.len(), oldest_age);
+}
+
+fn intent_source_label(source: DurablePromotionIntentSource) -> &'static str {
+    match source {
+        DurablePromotionIntentSource::Query => "query",
+        DurablePromotionIntentSource::Warmup => "warmup",
+    }
+}
+
+fn intent_retry_delay_seconds(intent: &DurablePromotionIntent) -> u64 {
+    let shift = intent.attempt_count.min(10);
+    let exponential = DEFAULT_INTENT_RETRY_BASE_DELAY_SECONDS
+        .saturating_mul(1_u64 << shift)
+        .min(DEFAULT_INTENT_RETRY_MAX_DELAY_SECONDS);
+    exponential.saturating_add(intent_retry_jitter_seconds(intent, exponential))
+}
+
+fn intent_retry_jitter_seconds(intent: &DurablePromotionIntent, delay_seconds: u64) -> u64 {
+    let jitter_cap = DEFAULT_INTENT_RETRY_MAX_JITTER_SECONDS.min(delay_seconds / 5);
+    if jitter_cap == 0 {
+        return 0;
+    }
+    let mut hasher = DefaultHasher::new();
+    intent.intent_id.hash(&mut hasher);
+    intent.attempt_count.hash(&mut hasher);
+    hasher.finish() % (jitter_cap + 1)
 }
 
 fn promote_intent<R, A>(
@@ -679,5 +868,65 @@ fn range_kind_key(kind: LedgerRangeKind) -> String {
         LedgerRangeKind::Slot => "slot".to_owned(),
         LedgerRangeKind::Height => "height".to_owned(),
         LedgerRangeKind::Other(value) => value,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datalens_core::{ChainFamily, NetworkId};
+
+    #[test]
+    fn test_intent_retry_delay_uses_exponential_backoff_with_bounded_jitter() {
+        let mut intent = DurablePromotionIntent {
+            intent_id: "intent-a".to_owned(),
+            dedupe_key: "dedupe-a".to_owned(),
+            source: DurablePromotionIntentSource::Query,
+            application: "app".to_owned(),
+            chain: ChainIdentity::expect_with_network_id(
+                ChainFamily::Evm,
+                "ethereum",
+                NetworkId::numeric(1),
+            ),
+            dataset_key: DatasetKey::evm_logs(),
+            selector: DatasetSelector::all(),
+            selector_fingerprint: "all".to_owned(),
+            selector_canonical_key: "all".to_owned(),
+            finality: "safe".to_owned(),
+            ranges: vec![],
+            status: datalens_storage::DurablePromotionIntentStatus::FailedRetryable,
+            attempt_count: 0,
+            next_retry_at_unix_seconds: None,
+            created_at_unix_seconds: 100,
+            updated_at_unix_seconds: 100,
+            last_error: None,
+            request_id: None,
+            task_id: None,
+        };
+
+        let first = intent_retry_delay_seconds(&intent);
+        assert!(first >= DEFAULT_INTENT_RETRY_BASE_DELAY_SECONDS);
+        assert!(
+            first
+                <= DEFAULT_INTENT_RETRY_BASE_DELAY_SECONDS
+                    + DEFAULT_INTENT_RETRY_MAX_JITTER_SECONDS
+                        .min(DEFAULT_INTENT_RETRY_BASE_DELAY_SECONDS / 5)
+        );
+
+        intent.attempt_count = 3;
+        let later = intent_retry_delay_seconds(&intent);
+        assert!(later >= DEFAULT_INTENT_RETRY_BASE_DELAY_SECONDS * 8);
+        assert!(
+            later
+                <= DEFAULT_INTENT_RETRY_MAX_DELAY_SECONDS + DEFAULT_INTENT_RETRY_MAX_JITTER_SECONDS
+        );
+
+        intent.attempt_count = 32;
+        let capped = intent_retry_delay_seconds(&intent);
+        assert!(capped >= DEFAULT_INTENT_RETRY_MAX_DELAY_SECONDS);
+        assert!(
+            capped
+                <= DEFAULT_INTENT_RETRY_MAX_DELAY_SECONDS + DEFAULT_INTENT_RETRY_MAX_JITTER_SECONDS
+        );
     }
 }

@@ -261,6 +261,56 @@ fn test_retryable_failure_stores_error_increments_attempt_and_sets_retry_time() 
 }
 
 #[test]
+fn test_mark_running_only_claims_eligible_pending_or_due_retryable_intents() {
+    let store = DurablePromotionIntentStore::new(LocalObjectStore::new(temp_storage_root(
+        "claim-eligible-intents",
+    )));
+    let created = create_intent(
+        &store,
+        DurablePromotionIntentSource::Query,
+        "analytics-api",
+        100,
+    );
+
+    let running = store
+        .mark_running(&created.intent_id, 110)
+        .expect("mark running")
+        .expect("intent exists");
+    assert_eq!(running.status, DurablePromotionIntentStatus::Running);
+    assert!(
+        store
+            .mark_running(&created.intent_id, 111)
+            .expect("second claim is rejected")
+            .is_none()
+    );
+
+    store
+        .mark_retryable_failure(&created.intent_id, "retry later", 120, 200)
+        .expect("mark retryable");
+    assert!(
+        store
+            .mark_running(&created.intent_id, 199)
+            .expect("early retry claim is rejected")
+            .is_none()
+    );
+    assert!(
+        store
+            .mark_running(&created.intent_id, 200)
+            .expect("due retry claim is accepted")
+            .is_some()
+    );
+    store
+        .mark_completed(&created.intent_id, 210)
+        .expect("mark completed");
+    assert!(
+        store
+            .mark_running(&created.intent_id, 211)
+            .expect("completed claim is rejected")
+            .is_none()
+    );
+}
+
+#[test]
 fn test_stale_running_reset_changes_old_running_back_to_pending() {
     let store = DurablePromotionIntentStore::new(LocalObjectStore::new(temp_storage_root("stale")));
     let stale = create_intent(
