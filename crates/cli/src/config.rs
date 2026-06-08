@@ -250,6 +250,12 @@ fn validate_warmup_config(config: &DatalensConfig) -> Result<(), DatalensError> 
             "warmup.max_fetches_per_loop must be greater than zero",
         ));
     }
+    if config.warmup.query_activity_ttl_seconds == 0 {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "warmup.query_activity_ttl_seconds must be greater than zero",
+        ));
+    }
     if config
         .warmup
         .follow_query_start_offset_blocks

@@ -14,8 +14,8 @@ use datalens_metrics::{
 use datalens_storage::{
     CacheOutcome, DurableIntentSubmissionOutcome, DurableIntentSubmissionRequest,
     DurableIntentSubmissionService, DurablePromotionIntentRepository, DurablePromotionIntentSource,
-    FillOutcome, QueryOutcome, QueryWatermarkKey, QueryWatermarkRepository, StorageRepository,
-    UsageLedgerEntry, UsageLedgerRepository,
+    FillOutcome, QueryActivityKey, QueryActivityRepository, QueryOutcome, QueryWatermarkKey,
+    QueryWatermarkRepository, StorageRepository, UsageLedgerEntry, UsageLedgerRepository,
 };
 use datalens_writer::{
     DurableWriteRequest, DurableWriteSegment, DurableWriter, DurableWriterConfig,
@@ -92,8 +92,10 @@ pub struct WarmupRuntime<A, S, R> {
     follow_query_start_offset_blocks: Option<u64>,
     follow_query_start_offset_tiers_blocks: Option<Vec<u64>>,
     follow_query_catchup_threshold_blocks: u64,
+    query_activity_ttl_seconds: u64,
     metrics: Option<MetricsRecorder>,
     usage_ledger: Option<Arc<dyn UsageLedgerRepository>>,
+    query_activity: Option<Arc<dyn QueryActivityRepository>>,
     query_watermarks: Option<Arc<dyn QueryWatermarkRepository>>,
     durable_intents: Option<Arc<dyn DurablePromotionIntentRepository>>,
 }
@@ -216,8 +218,10 @@ where
             follow_query_start_offset_blocks: None,
             follow_query_start_offset_tiers_blocks: None,
             follow_query_catchup_threshold_blocks: 200,
+            query_activity_ttl_seconds: 300,
             metrics: None,
             usage_ledger: None,
+            query_activity: None,
             query_watermarks: None,
             durable_intents: None,
         }
@@ -262,6 +266,11 @@ where
         self
     }
 
+    pub fn with_query_activity_ttl_seconds(mut self, ttl_seconds: u64) -> Self {
+        self.query_activity_ttl_seconds = ttl_seconds;
+        self
+    }
+
     pub fn with_metrics(mut self, recorder: MetricsRecorder) -> Self {
         self.metrics = Some(recorder);
         self
@@ -277,6 +286,14 @@ where
         repository: impl QueryWatermarkRepository + 'static,
     ) -> Self {
         self.query_watermarks = Some(Arc::new(repository));
+        self
+    }
+
+    pub fn with_query_activity(
+        mut self,
+        repository: impl QueryActivityRepository + 'static,
+    ) -> Self {
+        self.query_activity = Some(Arc::new(repository));
         self
     }
 
@@ -897,6 +914,23 @@ where
         if task.mode != WarmupTaskMode::FollowQuery {
             return Ok(None);
         }
+        if let Some(repository) = &self.query_activity {
+            let key = QueryActivityKey::new(
+                task.application_id.clone(),
+                task.chain.clone(),
+                task.dataset_key.clone(),
+                &task.selector,
+                task.range_kind.clone(),
+            );
+            if let Some(activity) = repository.read(&key)?
+                && query_activity_is_fresh(
+                    activity.updated_at_unix_seconds,
+                    self.query_activity_ttl_seconds,
+                )?
+            {
+                return Ok(Some(activity.latest_range.end()));
+            }
+        }
         let Some(repository) = &self.query_watermarks else {
             return Ok(None);
         };
@@ -1168,6 +1202,17 @@ where
         .max_range_len
         .max(1)
         .min(capability.max(1)))
+}
+
+fn query_activity_is_fresh(
+    updated_at_unix_seconds: u64,
+    ttl_seconds: u64,
+) -> Result<bool, DatalensError> {
+    let now = unix_seconds_now()?;
+    Ok(
+        updated_at_unix_seconds >= now
+            || now.saturating_sub(updated_at_unix_seconds) <= ttl_seconds,
+    )
 }
 
 fn sleep_backoff(policy: &crate::WarmupRetryPolicy, attempts: u32) {

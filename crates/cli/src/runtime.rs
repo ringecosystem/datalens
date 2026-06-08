@@ -10,8 +10,9 @@ use datalens_metrics::ApplicationIdentity;
 use datalens_solana::{SolanaAdapter, SolanaHttpRpc};
 use datalens_storage::{
     DurablePromotionIntentRepository, DurablePromotionIntentStore, DurableStorage,
-    LocalObjectStore, LocalStorage, ObjectMetadata, ObjectStore, QueryWatermarkRepository,
-    QueryWatermarkStore, S3ObjectStore, UsageLedgerRepository, UsageLedgerStore,
+    LocalObjectStore, LocalStorage, ObjectMetadata, ObjectStore, QueryActivityRepository,
+    QueryActivityStore, QueryWatermarkRepository, QueryWatermarkStore, S3ObjectStore,
+    UsageLedgerRepository, UsageLedgerStore,
 };
 use datalens_tron::{TronAdapter, TronHttpProvider};
 use datalens_warmup::{
@@ -19,6 +20,27 @@ use datalens_warmup::{
 };
 
 use crate::chain_identity;
+
+#[derive(Clone)]
+struct QueryRuntimeStores {
+    storage: Arc<dyn datalens_storage::StorageRepository>,
+    usage_ledger: Arc<dyn UsageLedgerRepository>,
+    query_watermarks: Arc<dyn QueryWatermarkRepository>,
+    query_activity: Arc<dyn QueryActivityRepository>,
+    durable_intents: Arc<dyn DurablePromotionIntentRepository>,
+}
+
+impl QueryRuntimeStores {
+    fn build(config: &DatalensConfig) -> Result<Self, DatalensError> {
+        Ok(Self {
+            storage: Arc::from(build_storage(config)?),
+            usage_ledger: Arc::from(build_usage_ledger(config)?),
+            query_watermarks: Arc::from(build_query_watermarks(config)?),
+            query_activity: Arc::from(build_query_activity(config)?),
+            durable_intents: Arc::from(build_durable_intents(config)?),
+        })
+    }
+}
 
 pub(crate) fn build_service(
     config: &DatalensConfig,
@@ -31,42 +53,21 @@ pub(crate) fn build_service(
             "CLI query commands only support evm chains",
         ));
     }
-    let storage: Arc<dyn datalens_storage::StorageRepository> = Arc::from(build_storage(config)?);
-    let usage_ledger: Arc<dyn UsageLedgerRepository> = Arc::from(build_usage_ledger(config)?);
-    let query_watermarks: Arc<dyn QueryWatermarkRepository> =
-        Arc::from(build_query_watermarks(config)?);
-    let durable_intents: Arc<dyn DurablePromotionIntentRepository> =
-        Arc::from(build_durable_intents(config)?);
-    build_evm_service_with_storage(
-        storage,
-        usage_ledger,
-        query_watermarks,
-        durable_intents,
-        config,
-        chain_name,
-        chain,
-    )
+    let stores = QueryRuntimeStores::build(config)?;
+    build_evm_service_with_storage(stores, config, chain_name, chain)
 }
 
 pub(crate) fn build_service_registry(
     config: &DatalensConfig,
 ) -> Result<QueryServiceRegistry, DatalensError> {
-    let storage: Arc<dyn datalens_storage::StorageRepository> = Arc::from(build_storage(config)?);
-    let usage_ledger: Arc<dyn UsageLedgerRepository> = Arc::from(build_usage_ledger(config)?);
-    let query_watermarks: Arc<dyn QueryWatermarkRepository> =
-        Arc::from(build_query_watermarks(config)?);
-    let durable_intents: Arc<dyn DurablePromotionIntentRepository> =
-        Arc::from(build_durable_intents(config)?);
+    let stores = QueryRuntimeStores::build(config)?;
     let mut registry =
         QueryServiceRegistry::new().with_application_registry(config.applications.clone())?;
     for (chain_name, chain) in &config.chains {
         match chain.kind.as_str() {
             "evm" => {
                 let service = build_evm_service_with_storage(
-                    storage.clone(),
-                    usage_ledger.clone(),
-                    query_watermarks.clone(),
-                    durable_intents.clone(),
+                    stores.clone(),
                     config,
                     chain_name.as_str(),
                     chain,
@@ -75,10 +76,7 @@ pub(crate) fn build_service_registry(
             }
             "solana" => {
                 let service = build_solana_service_with_storage(
-                    storage.clone(),
-                    usage_ledger.clone(),
-                    query_watermarks.clone(),
-                    durable_intents.clone(),
+                    stores.clone(),
                     config,
                     chain_name.as_str(),
                     chain,
@@ -87,10 +85,7 @@ pub(crate) fn build_service_registry(
             }
             "tron" => {
                 let service = build_tron_service_with_storage(
-                    storage.clone(),
-                    usage_ledger.clone(),
-                    query_watermarks.clone(),
-                    durable_intents.clone(),
+                    stores.clone(),
                     config,
                     chain_name.as_str(),
                     chain,
@@ -104,10 +99,7 @@ pub(crate) fn build_service_registry(
 }
 
 fn build_evm_service_with_storage(
-    storage: Arc<dyn datalens_storage::StorageRepository>,
-    usage_ledger: Arc<dyn UsageLedgerRepository>,
-    query_watermarks: Arc<dyn QueryWatermarkRepository>,
-    durable_intents: Arc<dyn DurablePromotionIntentRepository>,
+    stores: QueryRuntimeStores,
     config: &DatalensConfig,
     chain_name: &str,
     chain: &ChainConfig,
@@ -129,7 +121,7 @@ fn build_evm_service_with_storage(
     .with_logs_query_strategy(chain.datasets.logs.query_strategy)
     .with_block_header_metadata_config(evm_block_header_metadata_config(chain)?);
     let mut service = datalens_edge::QueryService::new_with_metrics_config(
-        storage.clone(),
+        stores.storage.clone(),
         source.clone(),
         config.planner.clone(),
         config.writer.clone(),
@@ -138,18 +130,22 @@ fn build_evm_service_with_storage(
         config.metrics.clone(),
     )?
     .with_usage_ledger(
-        usage_ledger.clone(),
+        stores.usage_ledger.clone(),
         ApplicationIdentity::named(config.metrics.default_application.clone()),
     )
     .with_query_watermarks(
-        query_watermarks.clone(),
+        stores.query_watermarks.clone(),
         ApplicationIdentity::named(config.metrics.default_application.clone()),
     )
-    .with_durable_intents(durable_intents.clone());
+    .with_query_activity(
+        stores.query_activity.clone(),
+        ApplicationIdentity::named(config.metrics.default_application.clone()),
+    )
+    .with_durable_intents(stores.durable_intents.clone());
     if config.warmup.enabled {
         let mut runtime = WarmupRuntime::new(
             source,
-            storage,
+            stores.storage,
             build_warmup_registry(config)?,
             durable_writer_config(&config.writer),
         )
@@ -177,9 +173,11 @@ fn build_evm_service_with_storage(
                 .follow_query_catchup_threshold_blocks
                 .unwrap_or(config.warmup.follow_query_catchup_threshold_blocks),
         )
-        .with_usage_ledger(usage_ledger)
-        .with_query_watermarks(query_watermarks)
-        .with_durable_intents(durable_intents);
+        .with_usage_ledger(stores.usage_ledger)
+        .with_query_activity_ttl_seconds(config.warmup.query_activity_ttl_seconds)
+        .with_query_activity(stores.query_activity)
+        .with_query_watermarks(stores.query_watermarks)
+        .with_durable_intents(stores.durable_intents);
         if let Some(recorder) = service.metrics_recorder() {
             runtime = runtime.with_metrics(recorder);
         }
@@ -195,10 +193,7 @@ fn build_evm_service_with_storage(
 }
 
 fn build_solana_service_with_storage(
-    storage: Arc<dyn datalens_storage::StorageRepository>,
-    usage_ledger: Arc<dyn UsageLedgerRepository>,
-    query_watermarks: Arc<dyn QueryWatermarkRepository>,
-    durable_intents: Arc<dyn DurablePromotionIntentRepository>,
+    stores: QueryRuntimeStores,
     config: &DatalensConfig,
     chain_name: &str,
     chain: &ChainConfig,
@@ -221,7 +216,7 @@ fn build_solana_service_with_storage(
     .with_max_slot_range_len(chain.datasets.blocks.max_batch_blocks.max(1))
     .with_query_strategy(chain.datasets.logs.query_strategy);
     Ok(datalens_edge::QueryService::new_with_metrics_config(
-        storage,
+        stores.storage,
         source,
         config.planner.clone(),
         config.writer.clone(),
@@ -230,21 +225,22 @@ fn build_solana_service_with_storage(
         config.metrics.clone(),
     )?
     .with_usage_ledger(
-        usage_ledger,
+        stores.usage_ledger,
         ApplicationIdentity::named(config.metrics.default_application.clone()),
     )
     .with_query_watermarks(
-        query_watermarks,
+        stores.query_watermarks,
         ApplicationIdentity::named(config.metrics.default_application.clone()),
     )
-    .with_durable_intents(durable_intents))
+    .with_query_activity(
+        stores.query_activity,
+        ApplicationIdentity::named(config.metrics.default_application.clone()),
+    )
+    .with_durable_intents(stores.durable_intents))
 }
 
 fn build_tron_service_with_storage(
-    storage: Arc<dyn datalens_storage::StorageRepository>,
-    usage_ledger: Arc<dyn UsageLedgerRepository>,
-    query_watermarks: Arc<dyn QueryWatermarkRepository>,
-    durable_intents: Arc<dyn DurablePromotionIntentRepository>,
+    stores: QueryRuntimeStores,
     config: &DatalensConfig,
     chain_name: &str,
     chain: &ChainConfig,
@@ -267,7 +263,7 @@ fn build_tron_service_with_storage(
     .with_max_block_range_len(chain.datasets.blocks.max_batch_blocks.max(1))
     .with_events_query_strategy(chain.datasets.logs.query_strategy);
     Ok(datalens_edge::QueryService::new_with_metrics_config(
-        storage,
+        stores.storage,
         source,
         config.planner.clone(),
         config.writer.clone(),
@@ -276,14 +272,18 @@ fn build_tron_service_with_storage(
         config.metrics.clone(),
     )?
     .with_usage_ledger(
-        usage_ledger,
+        stores.usage_ledger,
         ApplicationIdentity::named(config.metrics.default_application.clone()),
     )
     .with_query_watermarks(
-        query_watermarks,
+        stores.query_watermarks,
         ApplicationIdentity::named(config.metrics.default_application.clone()),
     )
-    .with_durable_intents(durable_intents))
+    .with_query_activity(
+        stores.query_activity,
+        ApplicationIdentity::named(config.metrics.default_application.clone()),
+    )
+    .with_durable_intents(stores.durable_intents))
 }
 
 pub(crate) fn tron_provider(url: String, chain: &ChainConfig) -> TronHttpProvider {
@@ -423,6 +423,39 @@ pub fn build_query_watermarks(
                 )
             })?;
             Ok(Box::new(QueryWatermarkStore::new(
+                S3ObjectStore::from_config(s3)?,
+            )))
+        }
+        _ => Err(DatalensError::new(
+            DatalensErrorKind::UnsupportedDataset,
+            "storage.backend must be local or s3",
+        )),
+    }
+}
+
+pub fn build_query_activity(
+    config: &DatalensConfig,
+) -> Result<Box<dyn QueryActivityRepository>, DatalensError> {
+    match config.storage.backend.as_str() {
+        "local" => {
+            let local = config.storage.local.as_ref().ok_or_else(|| {
+                DatalensError::new(
+                    DatalensErrorKind::InvalidInput,
+                    "storage.local.root must be set",
+                )
+            })?;
+            Ok(Box::new(QueryActivityStore::new(LocalObjectStore::new(
+                &local.root,
+            ))))
+        }
+        "s3" => {
+            let s3 = config.storage.s3.clone().ok_or_else(|| {
+                DatalensError::new(
+                    DatalensErrorKind::InvalidInput,
+                    "storage.s3 must be set when storage.backend is s3",
+                )
+            })?;
+            Ok(Box::new(QueryActivityStore::new(
                 S3ObjectStore::from_config(s3)?,
             )))
         }

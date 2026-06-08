@@ -210,6 +210,8 @@ pub struct WarmupConfig {
     pub follow_query_start_offset_tiers_blocks: Option<Vec<u64>>,
     #[serde(default = "default_warmup_follow_query_catchup_threshold_blocks")]
     pub follow_query_catchup_threshold_blocks: u64,
+    #[serde(default = "default_warmup_query_activity_ttl_seconds")]
+    pub query_activity_ttl_seconds: u64,
     #[serde(default = "default_warmup_flush_on_shutdown")]
     pub flush_on_shutdown: bool,
 }
@@ -228,6 +230,7 @@ impl Default for WarmupConfig {
             follow_query_start_offset_tiers_blocks: None,
             follow_query_catchup_threshold_blocks:
                 default_warmup_follow_query_catchup_threshold_blocks(),
+            query_activity_ttl_seconds: default_warmup_query_activity_ttl_seconds(),
             flush_on_shutdown: default_warmup_flush_on_shutdown(),
         }
     }
@@ -373,6 +376,10 @@ fn default_warmup_follow_query_lookahead_blocks() -> u64 {
 
 fn default_warmup_follow_query_catchup_threshold_blocks() -> u64 {
     200
+}
+
+fn default_warmup_query_activity_ttl_seconds() -> u64 {
+    300
 }
 
 fn default_warmup_flush_on_shutdown() -> bool {

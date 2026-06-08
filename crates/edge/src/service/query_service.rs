@@ -8,8 +8,8 @@ use datalens_executor::{NativeQueryExecutionConfig, NativeQueryExecutor, generat
 use datalens_metrics::{ApplicationIdentity, MetricsRecorder};
 use datalens_planner::{NativePlannerConfig, NativeQueryInput};
 use datalens_storage::{
-    DurablePromotionIntentRepository, QueryWatermarkRepository, StorageRepository,
-    UsageLedgerRepository,
+    DurablePromotionIntentRepository, QueryActivityRepository, QueryWatermarkRepository,
+    StorageRepository, UsageLedgerRepository,
 };
 use datalens_warmup::{
     WarmupEnsureOutcome, WarmupRegistry, WarmupRunResult, WarmupSubmitOutcome, WarmupSubmitRequest,
@@ -187,6 +187,15 @@ where
         application: ApplicationIdentity,
     ) -> Self {
         self.executor = self.executor.with_query_watermarks(repository, application);
+        self
+    }
+
+    pub fn with_query_activity(
+        mut self,
+        repository: impl QueryActivityRepository + 'static,
+        application: ApplicationIdentity,
+    ) -> Self {
+        self.executor = self.executor.with_query_activity(repository, application);
         self
     }
 

@@ -2,7 +2,7 @@ use std::{
     fs,
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use datalens_chain::{
@@ -21,7 +21,8 @@ use datalens_solana::{SolanaAdapter, solana_all_selector};
 use datalens_storage::{
     CreateDurablePromotionIntent, DurablePromotionIntent, DurablePromotionIntentCreateOutcome,
     DurablePromotionIntentRepository, DurablePromotionIntentStatus, LocalObjectStore, LocalStorage,
-    QueryWatermark, QueryWatermarkKey, QueryWatermarkRepository, QueryWatermarkStore,
+    QueryActivity, QueryActivityKey, QueryActivityRepository, QueryActivityStore, QueryWatermark,
+    QueryWatermarkKey, QueryWatermarkRepository, QueryWatermarkStore,
 };
 use datalens_tron::{TronAdapter, tron_all_selector};
 use datalens_warmup::{
@@ -927,6 +928,74 @@ fn test_follow_query_skips_existing_coverage_inside_lookahead_range() {
 }
 
 #[test]
+fn test_follow_query_uses_fresh_query_activity_before_monotonic_watermark() {
+    let root = temp_root("follow-query-fresh-activity-before-watermark");
+    let storage = LocalStorage::new(&root);
+    let watermarks = QueryWatermarkStore::new(LocalObjectStore::new(&root));
+    let activities = QueryActivityStore::new(LocalObjectStore::new(&root));
+    let registry = LocalWarmupRegistry::new(object_store(
+        "follow-query-fresh-activity-before-watermark-registry",
+    ));
+    let adapter = FixtureAdapter::new(10_000)
+        .with_max_range_len(1)
+        .with_logs(vec![log_record(2_001, 0)]);
+    let runtime = runtime(adapter.clone(), storage.clone(), registry.clone())
+        .with_query_watermarks(watermarks.clone())
+        .with_query_activity(activities.clone())
+        .with_follow_query_lookahead_blocks(3)
+        .with_runtime_config(WarmupRuntimeConfig {
+            max_fetches_per_task_loop: 1,
+        });
+    let task_id = registry
+        .submit(follow_query_request())
+        .expect("submit follow query")
+        .task_id;
+    save_query_watermark(&watermarks, 100_000);
+    save_query_activity(&activities, blocks(990, 1_000), now_unix_seconds());
+    seed_coverage(&storage, blocks(2_000, 2_000));
+
+    let result = runtime.run_task_once(&task_id).expect("warmup run");
+
+    assert_eq!(result.status, WarmupRunStatus::Partial);
+    assert_eq!(adapter.fetches(), vec![blocks(2_001, 2_001)]);
+    let cursor = registry.load_cursor(&task_id).unwrap().expect("cursor");
+    assert_eq!(cursor.next, 2_002);
+}
+
+#[test]
+fn test_follow_query_falls_back_to_watermark_when_query_activity_is_stale() {
+    let root = temp_root("follow-query-stale-activity-fallback");
+    let storage = LocalStorage::new(&root);
+    let watermarks = QueryWatermarkStore::new(LocalObjectStore::new(&root));
+    let activities = QueryActivityStore::new(LocalObjectStore::new(&root));
+    let registry = LocalWarmupRegistry::new(object_store("follow-query-stale-activity-fallback"));
+    let adapter = FixtureAdapter::new(110_000)
+        .with_max_range_len(1)
+        .with_logs(vec![log_record(101_000, 0)]);
+    let runtime = runtime(adapter.clone(), storage, registry.clone())
+        .with_query_watermarks(watermarks.clone())
+        .with_query_activity(activities.clone())
+        .with_query_activity_ttl_seconds(5)
+        .with_follow_query_lookahead_blocks(3)
+        .with_runtime_config(WarmupRuntimeConfig {
+            max_fetches_per_task_loop: 1,
+        });
+    let task_id = registry
+        .submit(follow_query_request())
+        .expect("submit follow query")
+        .task_id;
+    save_query_watermark(&watermarks, 100_000);
+    save_query_activity(&activities, blocks(990, 1_000), 1);
+
+    let result = runtime.run_task_once(&task_id).expect("warmup run");
+
+    assert_eq!(result.status, WarmupRunStatus::Partial);
+    assert_eq!(adapter.fetches(), vec![blocks(101_000, 101_000)]);
+    let cursor = registry.load_cursor(&task_id).unwrap().expect("cursor");
+    assert_eq!(cursor.next, 101_001);
+}
+
+#[test]
 fn test_task_pool_runs_available_tasks_with_global_bound() {
     let storage = LocalStorage::new(temp_root("pool-storage"));
     let registry = LocalWarmupRegistry::new(object_store("pool-registry"));
@@ -1243,6 +1312,29 @@ fn save_query_watermark_for<S>(
         .expect("save query watermark");
 }
 
+fn save_query_activity<S>(
+    activities: &QueryActivityStore<S>,
+    latest_range: LedgerRange,
+    updated_at: u64,
+) where
+    S: datalens_storage::ObjectStore + 'static,
+{
+    activities
+        .update(&QueryActivity {
+            key: QueryActivityKey::new(
+                "app-a",
+                chain(),
+                DatasetKey::evm_logs(),
+                &selector(),
+                LedgerRangeKind::Block,
+            ),
+            latest_range,
+            updated_at_unix_seconds: updated_at,
+            request_id: Some("query-activity-test".to_owned()),
+        })
+        .expect("save query activity");
+}
+
 fn wait_for_query_watermark<S>(watermarks: &QueryWatermarkStore<S>, expected: u64) -> u64
 where
     S: datalens_storage::ObjectStore + 'static,
@@ -1266,6 +1358,13 @@ where
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn now_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock after unix epoch")
+        .as_secs()
 }
 
 fn object_store(name: &str) -> LocalObjectStore {
