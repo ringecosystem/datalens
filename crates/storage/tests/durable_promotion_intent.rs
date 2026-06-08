@@ -219,6 +219,64 @@ fn test_repository_rejects_non_durable_finality() {
 }
 
 #[test]
+fn test_list_pending_for_chain_filters_before_applying_limit() {
+    let store = DurablePromotionIntentStore::new(LocalObjectStore::new(temp_storage_root(
+        "chain-pending-limit",
+    )));
+    let ethereum = test_chain();
+    let lisk = lisk_chain();
+    for index in 0..16 {
+        store
+            .create_or_get(datalens_storage::CreateDurablePromotionIntent {
+                source: DurablePromotionIntentSource::Query,
+                application: "analytics-api".to_owned(),
+                chain: lisk.clone(),
+                dataset_key: DatasetKey::evm_blocks(),
+                selector: DatasetSelector::all(),
+                selector_fingerprint: "all".to_owned(),
+                selector_canonical_key: "all".to_owned(),
+                finality: "safe".to_owned(),
+                ranges: vec![LedgerRange::blocks(100 + index, 101 + index).expect("valid range")],
+                request_id: None,
+                task_id: None,
+                now_unix_seconds: 100 + index,
+            })
+            .expect("create lisk intent");
+    }
+    let ethereum_intent = store
+        .create_or_get(datalens_storage::CreateDurablePromotionIntent {
+            source: DurablePromotionIntentSource::Query,
+            application: "analytics-api".to_owned(),
+            chain: ethereum.clone(),
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: DatasetSelector::all(),
+            selector_fingerprint: "all".to_owned(),
+            selector_canonical_key: "all".to_owned(),
+            finality: "safe".to_owned(),
+            ranges: vec![LedgerRange::blocks(200, 201).expect("valid range")],
+            request_id: None,
+            task_id: None,
+            now_unix_seconds: 116,
+        })
+        .expect("create ethereum intent");
+    let DurablePromotionIntentCreateOutcome::Created(ethereum_intent) = ethereum_intent else {
+        panic!("ethereum intent should be created");
+    };
+
+    let global = store.list_pending(200, 1).expect("list global pending");
+    assert_eq!(global.len(), 1);
+    assert_eq!(global[0].chain, lisk);
+
+    let scoped = store
+        .list_pending_for_chain(&ethereum, 200, 1)
+        .expect("list chain pending");
+    assert_eq!(
+        scoped.first().map(|intent| intent.intent_id.as_str()),
+        Some(ethereum_intent.intent_id.as_str())
+    );
+}
+
+#[test]
 fn test_retryable_failure_stores_error_increments_attempt_and_sets_retry_time() {
     let store =
         DurablePromotionIntentStore::new(LocalObjectStore::new(temp_storage_root("retryable")));
@@ -501,6 +559,11 @@ fn temp_storage_root(name: &str) -> PathBuf {
 
 fn test_chain() -> ChainIdentity {
     ChainIdentity::try_new(ChainFamily::Evm, "ethereum", Some(NetworkId::numeric(1)))
+        .expect("valid chain identity")
+}
+
+fn lisk_chain() -> ChainIdentity {
+    ChainIdentity::try_new(ChainFamily::Evm, "lisk", Some(NetworkId::numeric(1135)))
         .expect("valid chain identity")
 }
 

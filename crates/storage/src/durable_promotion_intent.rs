@@ -89,6 +89,12 @@ pub trait DurablePromotionIntentRepository: Send + Sync {
         now_unix_seconds: u64,
         limit: usize,
     ) -> Result<Vec<DurablePromotionIntent>, DatalensError>;
+    fn list_pending_for_chain(
+        &self,
+        chain: &ChainIdentity,
+        now_unix_seconds: u64,
+        limit: usize,
+    ) -> Result<Vec<DurablePromotionIntent>, DatalensError>;
     fn mark_running(
         &self,
         intent_id: &str,
@@ -137,6 +143,16 @@ impl DurablePromotionIntentRepository for Arc<dyn DurablePromotionIntentReposito
         limit: usize,
     ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
         self.as_ref().list_pending(now_unix_seconds, limit)
+    }
+
+    fn list_pending_for_chain(
+        &self,
+        chain: &ChainIdentity,
+        now_unix_seconds: u64,
+        limit: usize,
+    ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+        self.as_ref()
+            .list_pending_for_chain(chain, now_unix_seconds, limit)
     }
 
     fn mark_running(
@@ -375,6 +391,44 @@ where
                 DurablePromotionIntentStatus::Running
                 | DurablePromotionIntentStatus::Completed
                 | DurablePromotionIntentStatus::FailedTerminal => false,
+            })
+            .collect::<Vec<_>>();
+        pending.sort_by_key(|intent| {
+            (
+                intent
+                    .next_retry_at_unix_seconds
+                    .unwrap_or(intent.created_at_unix_seconds),
+                intent.created_at_unix_seconds,
+                intent.intent_id.clone(),
+            )
+        });
+        pending.truncate(limit);
+        Ok(pending)
+    }
+
+    fn list_pending_for_chain(
+        &self,
+        chain: &ChainIdentity,
+        now_unix_seconds: u64,
+        limit: usize,
+    ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut pending = self
+            .read_all_intents()?
+            .into_iter()
+            .filter(|intent| {
+                &intent.chain == chain
+                    && match intent.status {
+                        DurablePromotionIntentStatus::Pending => true,
+                        DurablePromotionIntentStatus::FailedRetryable => intent
+                            .next_retry_at_unix_seconds
+                            .is_none_or(|next_retry| next_retry <= now_unix_seconds),
+                        DurablePromotionIntentStatus::Running
+                        | DurablePromotionIntentStatus::Completed
+                        | DurablePromotionIntentStatus::FailedTerminal => false,
+                    }
             })
             .collect::<Vec<_>>();
         pending.sort_by_key(|intent| {
