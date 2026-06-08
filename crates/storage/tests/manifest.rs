@@ -64,6 +64,12 @@ impl StaleManifestObjectStore {
             manifest_get_count: Arc::new(AtomicUsize::new(0)),
         }
     }
+
+    fn publish_concurrent_manifest(&self) {
+        self.inner
+            .put(&self.manifest_key, &self.concurrent_manifest_bytes)
+            .expect("publish concurrent manifest");
+    }
 }
 
 impl ObjectStore for StaleManifestObjectStore {
@@ -235,7 +241,9 @@ impl ObjectStore for ManifestGetCountingStore {
 struct ManifestAccessCountingStore {
     inner: LocalObjectStore,
     manifest_access_count: Arc<AtomicUsize>,
+    manifest_segment_list_count: Arc<AtomicUsize>,
     coverage_index_list_count: Arc<AtomicUsize>,
+    data_object_put_count: Arc<AtomicUsize>,
 }
 
 impl ManifestAccessCountingStore {
@@ -243,7 +251,9 @@ impl ManifestAccessCountingStore {
         Self {
             inner: LocalObjectStore::new(root),
             manifest_access_count: Arc::new(AtomicUsize::new(0)),
+            manifest_segment_list_count: Arc::new(AtomicUsize::new(0)),
             coverage_index_list_count: Arc::new(AtomicUsize::new(0)),
+            data_object_put_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -255,12 +265,28 @@ impl ManifestAccessCountingStore {
         self.manifest_access_count.store(0, Ordering::SeqCst);
     }
 
+    fn manifest_segment_list_count(&self) -> usize {
+        self.manifest_segment_list_count.load(Ordering::SeqCst)
+    }
+
+    fn reset_manifest_segment_list_count(&self) {
+        self.manifest_segment_list_count.store(0, Ordering::SeqCst);
+    }
+
     fn coverage_index_list_count(&self) -> usize {
         self.coverage_index_list_count.load(Ordering::SeqCst)
     }
 
     fn reset_coverage_index_list_count(&self) {
         self.coverage_index_list_count.store(0, Ordering::SeqCst);
+    }
+
+    fn data_object_put_count(&self) -> usize {
+        self.data_object_put_count.load(Ordering::SeqCst)
+    }
+
+    fn reset_data_object_put_count(&self) {
+        self.data_object_put_count.store(0, Ordering::SeqCst);
     }
 
     fn put_inner(&self, key: &str, bytes: &[u8]) {
@@ -283,6 +309,9 @@ impl ObjectStore for ManifestAccessCountingStore {
     }
 
     fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
+        if key.contains("/datasets/") {
+            self.data_object_put_count.fetch_add(1, Ordering::SeqCst);
+        }
         self.inner.put(key, bytes)
     }
 
@@ -296,6 +325,10 @@ impl ObjectStore for ManifestAccessCountingStore {
     fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
         if Self::is_manifest_access(prefix) {
             self.manifest_access_count.fetch_add(1, Ordering::SeqCst);
+        }
+        if prefix.contains("/manifest-segments") {
+            self.manifest_segment_list_count
+                .fetch_add(1, Ordering::SeqCst);
         }
         if prefix.contains("/coverage-index") {
             self.coverage_index_list_count
@@ -2940,6 +2973,95 @@ fn test_exact_indexed_query_does_not_load_unrelated_manifest_segments() {
 }
 
 #[test]
+fn test_non_empty_write_does_not_list_unrelated_manifest_segments() {
+    let store =
+        ManifestAccessCountingStore::new(temp_storage_root("non-empty-write-no-manifest-scan"));
+    let storage = DurableStorage::from_object_store(store.clone());
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let rows = single_block_rows(1_000);
+
+    for index in 0..64 {
+        let segment_key = format!(
+            "chains/{}/manifest-segments/evm.logs/block/unrelated-{index}/safe/{:020}-{:020}.json",
+            chain.key_prefix(),
+            index,
+            index
+        );
+        store.put_inner(&segment_key, br#"{"entries":[]}"#);
+    }
+
+    store.reset_manifest_segment_list_count();
+    store.reset_data_object_put_count();
+    let outcome = storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &selector,
+            range: LedgerRange::blocks(1_000, 1_000).expect("valid range"),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write data rows");
+
+    assert!(outcome.data_object.is_some());
+    assert_eq!(store.data_object_put_count(), 1);
+    assert_eq!(store.manifest_segment_list_count(), 0);
+}
+
+#[test]
+fn test_duplicate_non_empty_write_reuses_object_without_manifest_segment_scan() {
+    let store = ManifestAccessCountingStore::new(temp_storage_root("duplicate-data-write-scoped"));
+    let storage = DurableStorage::from_object_store(store.clone());
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let range = LedgerRange::blocks(40, 40).expect("valid range");
+    let rows = single_block_rows(40);
+
+    let first = storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &selector,
+            range: range.clone(),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write first data rows");
+
+    store.reset_manifest_segment_list_count();
+    store.reset_data_object_put_count();
+    let second = storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &selector,
+            range: range.clone(),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write duplicate data rows");
+
+    assert_eq!(store.data_object_put_count(), 0);
+    assert_eq!(store.manifest_segment_list_count(), 0);
+    assert_eq!(
+        first.data_object.as_ref().map(|object| &object.object_key),
+        second.data_object.as_ref().map(|object| &object.object_key)
+    );
+    assert_eq!(
+        storage
+            .object_store()
+            .list(&format!("chains/{}/manifest-segments", chain.key_prefix()))
+            .expect("manifest segment list")
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn test_write_rows_is_idempotent_for_same_logical_shard() {
     let storage = LocalStorage::new(temp_storage_root("idempotent-write"));
     let chain = test_chain();
@@ -3057,7 +3179,7 @@ fn test_full_manifest_shadows_stale_compacted_segments() {
 }
 
 #[test]
-fn test_write_rows_merges_latest_manifest_before_persisting_stale_snapshot() {
+fn test_segment_publish_preserves_latest_full_manifest_entries() {
     let root = temp_storage_root("stale-manifest-merge");
     let chain = test_chain();
     let manifest_key = "chains/evm/ethereum/1/manifest.json".to_owned();
@@ -3080,11 +3202,8 @@ fn test_write_rows_merges_latest_manifest_before_persisting_stale_snapshot() {
             written_at_unix_seconds: None,
         }],
     };
-    let storage = DurableStorage::from_object_store(StaleManifestObjectStore::new(
-        root,
-        manifest_key,
-        concurrent_manifest,
-    ));
+    let store = StaleManifestObjectStore::new(root, manifest_key, concurrent_manifest);
+    let storage = DurableStorage::from_object_store(store.clone());
     let data_range = LedgerRange::blocks(1, 1).expect("valid range");
     let rows = single_block_rows(1);
 
@@ -3100,6 +3219,7 @@ fn test_write_rows_merges_latest_manifest_before_persisting_stale_snapshot() {
         })
         .expect("write rows");
 
+    store.publish_concurrent_manifest();
     let manifest = storage.manifest().expect("manifest");
     assert_eq!(manifest.entries.len(), 2);
     assert!(manifest.entries.iter().any(|entry| {
