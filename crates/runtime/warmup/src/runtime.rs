@@ -21,8 +21,8 @@ use datalens_writer::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    WarmupCheckpoint, WarmupCursor, WarmupRegistry, WarmupTask, WarmupTaskId, WarmupTaskMode,
-    WarmupTaskState,
+    WarmupCheckpoint, WarmupCursor, WarmupFollowQueryStatus, WarmupRegistry, WarmupTask,
+    WarmupTaskId, WarmupTaskMode, WarmupTaskState,
     pending_commit::PendingWarmupCommit,
     registry::unix_seconds_now,
     target_planner::{PlannedWarmupTarget, WarmupTargetPlanInput, WarmupTargetPlanner},
@@ -130,7 +130,11 @@ where
     }
 
     pub fn get(&self, task_id: &WarmupTaskId) -> Result<Option<WarmupTask>, DatalensError> {
-        self.runtime.registry.get(task_id)
+        self.runtime
+            .registry
+            .get(task_id)?
+            .map(|task| self.runtime.task_with_follow_query_status(task))
+            .transpose()
     }
 
     pub fn list(
@@ -146,7 +150,12 @@ where
             return Ok(Vec::new());
         }
         filter.chain_key = Some(chain_key);
-        self.runtime.registry.list(filter)
+        self.runtime
+            .registry
+            .list(filter)?
+            .into_iter()
+            .map(|task| self.runtime.task_with_follow_query_status(task))
+            .collect()
     }
 
     pub fn pause(&self, task_id: &WarmupTaskId) -> Result<(), DatalensError> {
@@ -166,7 +175,8 @@ where
         let max_global = self.config.max_global_concurrent_tasks.max(1);
         let max_per_chain = self.config.max_concurrent_tasks_per_chain.max(1);
         let mut chain_counts: HashMap<String, usize> = HashMap::new();
-        let tasks = self.list(crate::WarmupTaskFilter::default())?;
+        let mut tasks = self.list(crate::WarmupTaskFilter::default())?;
+        tasks.sort_by_key(warmup_priority_key);
         for task in tasks {
             if results.len() >= max_global {
                 break;
@@ -805,6 +815,67 @@ where
             .map(|watermark| watermark.latest_block))
     }
 
+    fn task_with_follow_query_status(
+        &self,
+        mut task: WarmupTask,
+    ) -> Result<WarmupTask, DatalensError> {
+        if task.mode != WarmupTaskMode::FollowQuery {
+            task.follow_query_status = None;
+            return Ok(task);
+        }
+        let safe_height = self.adapter.cache_safe_height()?;
+        let cursor_next = self
+            .registry
+            .load_cursor(&task.task_id)?
+            .map(|cursor| cursor.next)
+            .unwrap_or(task.start);
+        let query_watermark = self.query_watermark(&task)?;
+        let target_plan = WarmupTargetPlanner::plan(WarmupTargetPlanInput {
+            mode: task.mode,
+            fixed_end: task.end,
+            cursor_next,
+            query_watermark,
+            safe_head: safe_height.value,
+            lookahead_blocks: self.follow_query_lookahead_blocks,
+            start_offset_blocks: self.follow_query_start_offset_blocks,
+            start_offset_tiers_blocks: self.follow_query_start_offset_tiers_blocks.clone(),
+            catchup_threshold_blocks: self.follow_query_catchup_threshold_blocks,
+        });
+        let (planned_start, planned_end, no_op_reason) = match target_plan {
+            PlannedWarmupTarget::Range { start, end } => (Some(start), Some(end), None),
+            PlannedWarmupTarget::Noop(reason) => (None, None, Some(reason.to_owned())),
+        };
+        let published_coverage_end = match (planned_start, planned_end) {
+            (Some(start), Some(end)) => {
+                let range = LedgerRange::try_new(task.range_kind.clone(), start, end)?;
+                self.storage
+                    .covered_ranges(&task.chain, &task.dataset_key, &task.selector, range)?
+                    .into_iter()
+                    .map(|range| range.end())
+                    .max()
+            }
+            _ => None,
+        };
+        task.follow_query_status = Some(WarmupFollowQueryStatus {
+            query_watermark,
+            cursor_next,
+            cursor_query_distance: query_watermark
+                .and_then(|watermark| cursor_next.checked_sub(watermark)),
+            safe_head: safe_height.value,
+            lookahead_blocks: self.follow_query_lookahead_blocks,
+            planned_start,
+            planned_end,
+            planned_query_distance: query_watermark
+                .and_then(|watermark| planned_start.and_then(|start| start.checked_sub(watermark))),
+            no_op_reason,
+            published_coverage_end,
+            published_query_distance: query_watermark.and_then(|watermark| {
+                published_coverage_end.and_then(|covered_end| covered_end.checked_sub(watermark))
+            }),
+        });
+        Ok(task)
+    }
+
     fn record_metrics(&self, task: &WarmupTask, range: &LedgerRange, rows_written: usize) {
         let Some(metrics) = &self.metrics else {
             return;
@@ -1033,6 +1104,47 @@ fn log_target_plan(
         planned_query_distance,
         no_op_reason,
     );
+}
+
+fn warmup_priority_key(task: &WarmupTask) -> (u8, u64, u64, u64, String, String, String) {
+    let rank = match (task.mode, task.follow_query_status.as_ref()) {
+        (WarmupTaskMode::FollowQuery, Some(status))
+            if status.query_watermark.is_some() && status.planned_start.is_some() =>
+        {
+            let planned_end = status.planned_end.unwrap_or_default();
+            if status
+                .published_coverage_end
+                .is_none_or(|covered_end| covered_end < planned_end)
+            {
+                0
+            } else {
+                1
+            }
+        }
+        (WarmupTaskMode::FollowQuery, Some(status)) if status.query_watermark.is_some() => 2,
+        (WarmupTaskMode::FollowQuery, _) => 3,
+        _ => 4,
+    };
+    (
+        rank,
+        task.follow_query_status
+            .as_ref()
+            .and_then(|status| status.published_query_distance)
+            .or_else(|| {
+                task.follow_query_status
+                    .as_ref()
+                    .and_then(|status| status.planned_query_distance)
+            })
+            .unwrap_or(u64::MAX),
+        task.follow_query_status
+            .as_ref()
+            .and_then(|status| status.cursor_query_distance)
+            .unwrap_or(u64::MAX),
+        task.updated_at,
+        task.chain.key_prefix(),
+        task.selector.fingerprint(),
+        task.task_id.as_str().to_owned(),
+    )
 }
 
 fn missing_task(task_id: &WarmupTaskId) -> DatalensError {

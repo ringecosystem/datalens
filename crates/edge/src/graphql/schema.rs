@@ -355,6 +355,17 @@ pub(crate) struct WarmupTask {
     updated_at: u64,
     last_error: Option<String>,
     stats: Json<datalens_warmup::WarmupStats>,
+    query_watermark: Option<u64>,
+    cursor_next: Option<u64>,
+    cursor_query_distance: Option<u64>,
+    safe_head: Option<u64>,
+    lookahead_blocks: Option<u64>,
+    planned_start: Option<u64>,
+    planned_end: Option<u64>,
+    planned_query_distance: Option<u64>,
+    no_op_reason: Option<String>,
+    published_coverage_end: Option<u64>,
+    published_query_distance: Option<u64>,
 }
 
 #[derive(SimpleObject)]
@@ -385,6 +396,17 @@ impl From<WarmupTaskView> for WarmupTask {
             updated_at: task.updated_at,
             last_error: task.last_error,
             stats: Json(task.stats),
+            query_watermark: task.query_watermark,
+            cursor_next: task.cursor_next,
+            cursor_query_distance: task.cursor_query_distance,
+            safe_head: task.safe_head,
+            lookahead_blocks: task.lookahead_blocks,
+            planned_start: task.planned_start,
+            planned_end: task.planned_end,
+            planned_query_distance: task.planned_query_distance,
+            no_op_reason: task.no_op_reason,
+            published_coverage_end: task.published_coverage_end,
+            published_query_distance: task.published_query_distance,
         }
     }
 }

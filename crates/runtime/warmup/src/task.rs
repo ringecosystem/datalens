@@ -120,6 +120,21 @@ pub struct WarmupStats {
     pub rows_fetched: usize,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WarmupFollowQueryStatus {
+    pub query_watermark: Option<u64>,
+    pub cursor_next: u64,
+    pub cursor_query_distance: Option<u64>,
+    pub safe_head: u64,
+    pub lookahead_blocks: u64,
+    pub planned_start: Option<u64>,
+    pub planned_end: Option<u64>,
+    pub planned_query_distance: Option<u64>,
+    pub no_op_reason: Option<String>,
+    pub published_coverage_end: Option<u64>,
+    pub published_query_distance: Option<u64>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WarmupSubmitRequest {
     pub application_id: String,
@@ -155,6 +170,7 @@ pub struct WarmupTask {
     pub updated_at: u64,
     pub last_error: Option<String>,
     pub stats: WarmupStats,
+    pub follow_query_status: Option<WarmupFollowQueryStatus>,
     pub(crate) dedupe_key: String,
 }
 
@@ -206,6 +222,7 @@ impl WarmupTask {
             updated_at: now,
             last_error: None,
             stats: WarmupStats::default(),
+            follow_query_status: None,
             dedupe_key,
         })
     }

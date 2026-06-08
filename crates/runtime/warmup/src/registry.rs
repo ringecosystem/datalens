@@ -364,6 +364,7 @@ impl StoredWarmupTask {
             updated_at: self.updated_at,
             last_error: self.last_error,
             stats: self.stats,
+            follow_query_status: None,
             dedupe_key: self.dedupe_key,
         })
     }
