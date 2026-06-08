@@ -778,20 +778,21 @@ fn claim_pending_intent(
     now: u64,
     worker_index: usize,
 ) -> Option<DurablePromotionIntent> {
-    let pending = match repository.list_pending(now, DEFAULT_INTENT_CLAIM_BATCH_SIZE) {
-        Ok(pending) => pending,
-        Err(error) => {
-            log::error!(
-                "durable intent list failed worker={} kind={:?} message={}",
-                worker_index,
-                error.kind,
-                error.message
-            );
-            return None;
-        }
-    };
+    let pending =
+        match repository.list_pending_for_chain(chain, now, DEFAULT_INTENT_CLAIM_BATCH_SIZE) {
+            Ok(pending) => pending,
+            Err(error) => {
+                log::error!(
+                    "durable intent list failed worker={} kind={:?} message={}",
+                    worker_index,
+                    error.kind,
+                    error.message
+                );
+                return None;
+            }
+        };
     record_intent_backlog_metric(metrics, &pending, now);
-    match pending.into_iter().find(|intent| &intent.chain == chain) {
+    match pending.into_iter().next() {
         Some(intent) => match repository.mark_running(&intent.intent_id, unix_seconds_now()) {
             Ok(Some(intent)) => Some(intent),
             Ok(None) => None,
@@ -1012,6 +1013,19 @@ mod tests {
             ))
         }
 
+        fn list_pending_for_chain(
+            &self,
+            _chain: &ChainIdentity,
+            _now_unix_seconds: u64,
+            limit: usize,
+        ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+            self.last_limit.store(limit, Ordering::SeqCst);
+            Err(DatalensError::new(
+                DatalensErrorKind::StorageReadFailure,
+                "intent list failed",
+            ))
+        }
+
         fn mark_running(
             &self,
             _intent_id: &str,
@@ -1078,6 +1092,20 @@ mod tests {
         ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
             self.last_limit.store(limit, Ordering::SeqCst);
             Ok(vec![self.intent.clone()])
+        }
+
+        fn list_pending_for_chain(
+            &self,
+            chain: &ChainIdentity,
+            _now_unix_seconds: u64,
+            limit: usize,
+        ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+            self.last_limit.store(limit, Ordering::SeqCst);
+            if &self.intent.chain == chain {
+                Ok(vec![self.intent.clone()])
+            } else {
+                Ok(Vec::new())
+            }
         }
 
         fn mark_running(
@@ -1147,6 +1175,22 @@ mod tests {
             self.last_limit.store(limit, Ordering::SeqCst);
             let intents = self.intents.lock().expect("sample intent repository lock");
             Ok(intents.iter().take(limit).cloned().collect())
+        }
+
+        fn list_pending_for_chain(
+            &self,
+            chain: &ChainIdentity,
+            _now_unix_seconds: u64,
+            limit: usize,
+        ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+            self.last_limit.store(limit, Ordering::SeqCst);
+            let intents = self.intents.lock().expect("sample intent repository lock");
+            Ok(intents
+                .iter()
+                .filter(|intent| &intent.chain == chain)
+                .take(limit)
+                .cloned()
+                .collect())
         }
 
         fn mark_running(
@@ -1309,6 +1353,33 @@ mod tests {
                 .expect("marked running lock")
                 .as_slice(),
             ["intent-ethereum"]
+        );
+    }
+
+    #[test]
+    fn test_claim_intent_claims_matching_chain_beyond_first_global_batch() {
+        let ethereum = ethereum_chain();
+        let lisk = lisk_chain();
+        let mut intents = Vec::new();
+        for index in 0..DEFAULT_INTENT_CLAIM_BATCH_SIZE {
+            intents.push(test_intent_with_chain(
+                &format!("intent-lisk-{index}"),
+                lisk.clone(),
+                100 + index as u64,
+            ));
+        }
+        intents.push(test_intent_with_chain(
+            "intent-ethereum",
+            ethereum.clone(),
+            100 + DEFAULT_INTENT_CLAIM_BATCH_SIZE as u64,
+        ));
+        let repository = sample_repository(intents);
+
+        let claimed = claim_pending_intent(&repository, &ethereum, None, 130, 0);
+
+        assert_eq!(
+            claimed.map(|intent| intent.intent_id),
+            Some("intent-ethereum".to_owned())
         );
     }
 

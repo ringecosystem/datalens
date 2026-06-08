@@ -1386,6 +1386,15 @@ impl DurablePromotionIntentRepository for RecordingIntentRepository {
         Ok(Vec::new())
     }
 
+    fn list_pending_for_chain(
+        &self,
+        _chain: &ChainIdentity,
+        _now_unix_seconds: u64,
+        _limit: usize,
+    ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+        Ok(Vec::new())
+    }
+
     fn mark_running(
         &self,
         _intent_id: &str,
