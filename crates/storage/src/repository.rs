@@ -765,7 +765,7 @@ where
                 && existing.checksum.is_some()
                 && existing.checksum_algorithm.is_some()
                 && let Some(written_at_unix_seconds) = existing.written_at_unix_seconds
-                && self.existing_data_object_matches(&data_object)?
+                && self.object_store.exists(&data_object.object_key)?
             {
                 data_object.written_at_unix_seconds = written_at_unix_seconds;
                 return Ok(data_object);

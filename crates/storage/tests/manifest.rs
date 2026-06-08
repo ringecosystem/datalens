@@ -244,6 +244,7 @@ struct ManifestAccessCountingStore {
     manifest_segment_list_count: Arc<AtomicUsize>,
     coverage_index_list_count: Arc<AtomicUsize>,
     data_object_put_count: Arc<AtomicUsize>,
+    data_object_get_count: Arc<AtomicUsize>,
 }
 
 impl ManifestAccessCountingStore {
@@ -254,6 +255,7 @@ impl ManifestAccessCountingStore {
             manifest_segment_list_count: Arc::new(AtomicUsize::new(0)),
             coverage_index_list_count: Arc::new(AtomicUsize::new(0)),
             data_object_put_count: Arc::new(AtomicUsize::new(0)),
+            data_object_get_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -289,6 +291,14 @@ impl ManifestAccessCountingStore {
         self.data_object_put_count.store(0, Ordering::SeqCst);
     }
 
+    fn data_object_get_count(&self) -> usize {
+        self.data_object_get_count.load(Ordering::SeqCst)
+    }
+
+    fn reset_data_object_get_count(&self) {
+        self.data_object_get_count.store(0, Ordering::SeqCst);
+    }
+
     fn put_inner(&self, key: &str, bytes: &[u8]) {
         self.inner.put(key, bytes).expect("put inner object");
     }
@@ -304,6 +314,9 @@ impl ObjectStore for ManifestAccessCountingStore {
     fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError> {
         if Self::is_manifest_access(key) {
             self.manifest_access_count.fetch_add(1, Ordering::SeqCst);
+        }
+        if key.contains("/datasets/") {
+            self.data_object_get_count.fetch_add(1, Ordering::SeqCst);
         }
         self.inner.get(key)
     }
@@ -3033,6 +3046,7 @@ fn test_duplicate_non_empty_write_reuses_object_without_manifest_segment_scan() 
 
     store.reset_manifest_segment_list_count();
     store.reset_data_object_put_count();
+    store.reset_data_object_get_count();
     let second = storage
         .write_rows(StorageWriteRequest {
             chain: &chain,
@@ -3046,6 +3060,7 @@ fn test_duplicate_non_empty_write_reuses_object_without_manifest_segment_scan() 
         .expect("write duplicate data rows");
 
     assert_eq!(store.data_object_put_count(), 0);
+    assert_eq!(store.data_object_get_count(), 0);
     assert_eq!(store.manifest_segment_list_count(), 0);
     assert_eq!(
         first.data_object.as_ref().map(|object| &object.object_key),
