@@ -224,3 +224,14 @@ pub(crate) fn empty_query_rows(dataset_key: &DatasetKey) -> QueryRows {
         },
     }
 }
+
+pub(crate) fn split_provider_limit_range(
+    range: &LedgerRange,
+) -> Result<Vec<LedgerRange>, DatalensError> {
+    let first_len = u64::try_from(range.len() / 2).unwrap_or(u64::MAX).max(1);
+    let first_end = range.start().saturating_add(first_len - 1);
+    Ok(vec![
+        LedgerRange::try_new(range.kind(), range.start(), first_end)?,
+        LedgerRange::try_new(range.kind(), first_end + 1, range.end())?,
+    ])
+}
