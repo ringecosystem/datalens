@@ -70,6 +70,93 @@ fn test_duplicate_submission_is_idempotent_by_durable_coverage() {
 }
 
 #[test]
+fn test_equivalent_contiguous_ranges_dedupe_to_same_coverage_intent() {
+    let store = DurablePromotionIntentStore::new(LocalObjectStore::new(temp_storage_root(
+        "normalized-dedupe",
+    )));
+    let split = store
+        .create_or_get(datalens_storage::CreateDurablePromotionIntent {
+            source: DurablePromotionIntentSource::Query,
+            application: "analytics-api".to_owned(),
+            chain: test_chain(),
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: DatasetSelector::all(),
+            selector_fingerprint: "all".to_owned(),
+            selector_canonical_key: "all".to_owned(),
+            finality: "safe".to_owned(),
+            ranges: vec![
+                LedgerRange::blocks(16, 20).expect("valid range"),
+                LedgerRange::blocks(10, 15).expect("valid range"),
+            ],
+            request_id: Some("request-1".to_owned()),
+            task_id: None,
+            now_unix_seconds: 100,
+        })
+        .expect("create split intent");
+    let DurablePromotionIntentCreateOutcome::Created(split) = split else {
+        panic!("split range should create intent");
+    };
+    assert_eq!(
+        split.ranges,
+        vec![LedgerRange::blocks(10, 20).expect("valid range")]
+    );
+
+    let single = store
+        .create_or_get(datalens_storage::CreateDurablePromotionIntent {
+            source: DurablePromotionIntentSource::Warmup,
+            application: "warmup-api".to_owned(),
+            chain: test_chain(),
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: DatasetSelector::all(),
+            selector_fingerprint: "all".to_owned(),
+            selector_canonical_key: "all".to_owned(),
+            finality: "safe".to_owned(),
+            ranges: vec![LedgerRange::blocks(10, 20).expect("valid range")],
+            request_id: None,
+            task_id: Some("task-1".to_owned()),
+            now_unix_seconds: 101,
+        })
+        .expect("create equivalent single intent");
+    let DurablePromotionIntentCreateOutcome::Existing(single) = single else {
+        panic!("equivalent coverage should reuse intent");
+    };
+    assert_eq!(split.intent_id, single.intent_id);
+}
+
+#[test]
+fn test_equivalent_overlapping_ranges_dedupe_to_same_coverage_intent() {
+    let store = DurablePromotionIntentStore::new(LocalObjectStore::new(temp_storage_root(
+        "overlap-dedupe",
+    )));
+    let overlapping = store
+        .create_or_get(datalens_storage::CreateDurablePromotionIntent {
+            source: DurablePromotionIntentSource::Query,
+            application: "analytics-api".to_owned(),
+            chain: test_chain(),
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: DatasetSelector::all(),
+            selector_fingerprint: "all".to_owned(),
+            selector_canonical_key: "all".to_owned(),
+            finality: "safe".to_owned(),
+            ranges: vec![
+                LedgerRange::blocks(10, 18).expect("valid range"),
+                LedgerRange::blocks(15, 20).expect("valid range"),
+            ],
+            request_id: Some("request-1".to_owned()),
+            task_id: None,
+            now_unix_seconds: 100,
+        })
+        .expect("create overlapping intent");
+    let DurablePromotionIntentCreateOutcome::Created(overlapping) = overlapping else {
+        panic!("overlapping range should create intent");
+    };
+    assert_eq!(
+        overlapping.ranges,
+        vec![LedgerRange::blocks(10, 20).expect("valid range")]
+    );
+}
+
+#[test]
 fn test_status_transitions_pending_running_completed() {
     let store =
         DurablePromotionIntentStore::new(LocalObjectStore::new(temp_storage_root("transitions")));
@@ -95,6 +182,40 @@ fn test_status_transitions_pending_running_completed() {
     assert_eq!(completed.updated_at_unix_seconds, 120);
     assert!(completed.next_retry_at_unix_seconds.is_none());
     assert!(completed.last_error.is_none());
+}
+
+#[test]
+fn test_repository_rejects_non_durable_finality() {
+    let store = DurablePromotionIntentStore::new(LocalObjectStore::new(temp_storage_root(
+        "repository-finality",
+    )));
+
+    for finality in ["latest", "checkpoint"] {
+        let error = store
+            .create_or_get(datalens_storage::CreateDurablePromotionIntent {
+                source: DurablePromotionIntentSource::Query,
+                application: "analytics-api".to_owned(),
+                chain: test_chain(),
+                dataset_key: DatasetKey::evm_blocks(),
+                selector: DatasetSelector::all(),
+                selector_fingerprint: "all".to_owned(),
+                selector_canonical_key: "all".to_owned(),
+                finality: finality.to_owned(),
+                ranges: vec![LedgerRange::blocks(10, 11).expect("valid range")],
+                request_id: Some("request-1".to_owned()),
+                task_id: None,
+                now_unix_seconds: 100,
+            })
+            .expect_err("non-durable finality should fail");
+        assert!(error.message.contains("safe or finalized"));
+    }
+
+    assert!(
+        store
+            .list_pending(100, 10)
+            .expect("list pending")
+            .is_empty()
+    );
 }
 
 #[test]
@@ -278,6 +399,7 @@ fn create_intent_with_range(
             application: application.to_owned(),
             chain: test_chain(),
             dataset_key: DatasetKey::evm_blocks(),
+            selector: DatasetSelector::all(),
             selector_fingerprint: "all".to_owned(),
             selector_canonical_key: "all".to_owned(),
             finality: "safe".to_owned(),
@@ -348,6 +470,7 @@ fn test_coverage_dedupe_key_includes_range_kind_start_end_and_finality() {
             application: "warmup-api".to_owned(),
             chain: test_chain(),
             dataset_key: DatasetKey::evm_blocks(),
+            selector: DatasetSelector::all(),
             selector_fingerprint: "all".to_owned(),
             selector_canonical_key: "all".to_owned(),
             finality: "safe".to_owned(),
@@ -366,6 +489,7 @@ fn test_coverage_dedupe_key_includes_range_kind_start_end_and_finality() {
             application: "warmup-api".to_owned(),
             chain: test_chain(),
             dataset_key: DatasetKey::evm_blocks(),
+            selector: DatasetSelector::all(),
             selector_fingerprint: "all".to_owned(),
             selector_canonical_key: "all".to_owned(),
             finality: "finalized".to_owned(),

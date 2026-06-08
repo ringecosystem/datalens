@@ -1,6 +1,7 @@
-use datalens_chain::{DatasetSelector, FinalityLevel};
+use datalens_chain::{AdapterKey, DatasetSelector, FinalityLevel};
 use datalens_core::{
-    ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey, LedgerRange, LedgerRangeKind,
+    ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey, EvmLogFilter, LedgerRange,
+    LedgerRangeKind,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -34,6 +35,8 @@ pub struct DurablePromotionIntent {
     pub application: String,
     pub chain: ChainIdentity,
     pub dataset_key: DatasetKey,
+    #[serde(with = "stored_selector")]
+    pub selector: DatasetSelector,
     pub selector_fingerprint: String,
     pub selector_canonical_key: String,
     pub finality: String,
@@ -58,6 +61,7 @@ pub struct CreateDurablePromotionIntent {
     pub application: String,
     pub chain: ChainIdentity,
     pub dataset_key: DatasetKey,
+    pub selector: DatasetSelector,
     pub selector_fingerprint: String,
     pub selector_canonical_key: String,
     pub finality: String,
@@ -220,6 +224,12 @@ where
                 "durable promotion intent finality must not be empty",
             ));
         }
+        if !is_durable_finality(&request.finality) {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                "durable promotion intent finality must be safe or finalized",
+            ));
+        }
         if request.ranges.is_empty() {
             return Err(DatalensError::new(
                 DatalensErrorKind::InvalidInput,
@@ -227,7 +237,7 @@ where
             ));
         }
 
-        let ranges = sorted_ranges(request.ranges);
+        let ranges = normalize_ranges(request.ranges);
         let dedupe_key = durable_coverage_dedupe_key(
             &request.chain,
             &request.dataset_key,
@@ -248,6 +258,7 @@ where
             application: request.application.trim().to_owned(),
             chain: request.chain,
             dataset_key: request.dataset_key,
+            selector: request.selector,
             selector_fingerprint: request.selector_fingerprint,
             selector_canonical_key: request.selector_canonical_key,
             finality: request.finality,
@@ -441,6 +452,7 @@ where
             application: request.application,
             chain: request.chain,
             dataset_key: request.dataset_key,
+            selector: request.selector.clone(),
             selector_fingerprint: request.selector.fingerprint(),
             selector_canonical_key: request.selector.canonical_key(),
             finality: finality_name(request.finality).to_owned(),
@@ -518,9 +530,23 @@ fn durable_coverage_dedupe_key(
     )
 }
 
-fn sorted_ranges(mut ranges: Vec<LedgerRange>) -> Vec<LedgerRange> {
+fn normalize_ranges(mut ranges: Vec<LedgerRange>) -> Vec<LedgerRange> {
     ranges.sort_by_key(|range| (range_kind_key(range.kind()), range.start(), range.end()));
-    ranges
+    let mut normalized: Vec<LedgerRange> = Vec::new();
+    for range in ranges {
+        let Some(last) = normalized.last_mut() else {
+            normalized.push(range);
+            continue;
+        };
+        if last.kind() == range.kind() && range.start() <= last.end().saturating_add(1) {
+            let end = last.end().max(range.end());
+            *last = LedgerRange::try_new(last.kind(), last.start(), end)
+                .expect("merged ledger range remains valid");
+        } else {
+            normalized.push(range);
+        }
+    }
+    normalized
 }
 
 fn range_kind_key(kind: LedgerRangeKind) -> String {
@@ -541,10 +567,70 @@ fn finality_name(finality: FinalityLevel) -> &'static str {
     }
 }
 
+fn is_durable_finality(finality: &str) -> bool {
+    matches!(finality, "safe" | "finalized")
+}
+
 fn hex_bytes(bytes: &[u8]) -> String {
     let mut value = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         value.push_str(&format!("{byte:02x}"));
     }
     value
+}
+
+mod stored_selector {
+    use super::*;
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+    enum StoredSelector {
+        All,
+        EvmLogs(EvmLogFilter),
+        Other(StoredOtherSelector),
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct StoredOtherSelector {
+        kind: String,
+        fingerprint: String,
+        canonical_key: String,
+    }
+
+    pub fn serialize<S>(selector: &DatasetSelector, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let stored = match selector {
+            DatasetSelector::All => StoredSelector::All,
+            DatasetSelector::EvmLogs(filter) => StoredSelector::EvmLogs(filter.clone()),
+            DatasetSelector::Other {
+                kind,
+                fingerprint,
+                canonical_key,
+            } => StoredSelector::Other(StoredOtherSelector {
+                kind: kind.as_str().to_owned(),
+                fingerprint: fingerprint.clone(),
+                canonical_key: canonical_key.clone(),
+            }),
+        };
+        stored.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<DatasetSelector, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let stored = StoredSelector::deserialize(deserializer)?;
+        match stored {
+            StoredSelector::All => Ok(DatasetSelector::All),
+            StoredSelector::EvmLogs(filter) => Ok(DatasetSelector::EvmLogs(filter)),
+            StoredSelector::Other(selector) => DatasetSelector::try_other(
+                AdapterKey::try_new(selector.kind).map_err(serde::de::Error::custom)?,
+                selector.fingerprint,
+                selector.canonical_key,
+            )
+            .map_err(serde::de::Error::custom),
+        }
+    }
 }
