@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeSet, VecDeque},
     hash::{DefaultHasher, Hash, Hasher},
     sync::{
-        Arc, Condvar, Mutex,
+        Arc, Condvar, Mutex, Once,
         mpsc::{self, Receiver, SyncSender, TrySendError},
     },
     thread,
@@ -61,6 +61,7 @@ where
     ) -> Result<Self, DatalensError> {
         reset_stale_intents(repository.as_ref())?;
         let claim_lock = Arc::new(Mutex::new(()));
+        let rebuild_once = Arc::new(Once::new());
         for worker_index in 0..DEFAULT_INTENT_WORKERS {
             spawn_intent_worker(
                 worker_index,
@@ -69,6 +70,7 @@ where
                 adapter.clone(),
                 metrics.clone(),
                 claim_lock.clone(),
+                rebuild_once.clone(),
             )?;
         }
         Ok(Self {
@@ -384,6 +386,7 @@ fn spawn_intent_worker<R, A>(
     adapter: A,
     metrics: Option<Arc<MetricsRecorder>>,
     claim_lock: Arc<Mutex<()>>,
+    rebuild_once: Arc<Once>,
 ) -> Result<(), DatalensError>
 where
     R: StorageRepository + Clone + 'static,
@@ -393,6 +396,25 @@ where
         .name(format!("datalens-durable-intent-{worker_index}"))
         .spawn(move || {
             let worker_chain = adapter.capabilities().chain().clone();
+            rebuild_once.call_once(|| {
+                match repository.rebuild_pending_indexes(unix_seconds_now()) {
+                    Ok(rebuilt) => {
+                        if rebuilt > 0 {
+                            log::info!(
+                                "durable intent pending index rebuild completed rebuilt={}",
+                                rebuilt
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        log::error!(
+                            "durable intent pending index rebuild failed kind={:?} message={}",
+                            error.kind,
+                            error.message
+                        );
+                    }
+                }
+            });
             loop {
                 let now = unix_seconds_now();
                 let intent = {

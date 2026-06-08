@@ -10,6 +10,9 @@ use std::sync::Arc;
 use crate::object_store::ObjectStore;
 
 const INTENT_PREFIX: &str = "durable-promotion-intents/v1/intents";
+const PENDING_INDEX_PREFIX: &str = "durable-promotion-intents/v1/index/status=pending";
+const QUERY_SOURCE_KEY: &str = "query";
+const WARMUP_SOURCE_KEY: &str = "warmup";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -95,6 +98,10 @@ pub trait DurablePromotionIntentRepository: Send + Sync {
         now_unix_seconds: u64,
         limit: usize,
     ) -> Result<Vec<DurablePromotionIntent>, DatalensError>;
+    fn rebuild_pending_indexes(&self, now_unix_seconds: u64) -> Result<usize, DatalensError> {
+        let _ = now_unix_seconds;
+        Ok(0)
+    }
     fn mark_running(
         &self,
         intent_id: &str,
@@ -153,6 +160,10 @@ impl DurablePromotionIntentRepository for Arc<dyn DurablePromotionIntentReposito
     ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
         self.as_ref()
             .list_pending_for_chain(chain, now_unix_seconds, limit)
+    }
+
+    fn rebuild_pending_indexes(&self, now_unix_seconds: u64) -> Result<usize, DatalensError> {
+        self.as_ref().rebuild_pending_indexes(now_unix_seconds)
     }
 
     fn mark_running(
@@ -249,6 +260,36 @@ where
         })
     }
 
+    fn write_pending_index(&self, intent: &DurablePromotionIntent) -> Result<(), DatalensError> {
+        let Some(key) = pending_index_key(intent) else {
+            return Ok(());
+        };
+        self.object_store.put(&key, b"{}\n").map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::StorageWriteFailure,
+                format!(
+                    "write durable promotion intent pending index {key}: {}",
+                    error.message
+                ),
+            )
+        })
+    }
+
+    fn delete_pending_index(&self, intent: &DurablePromotionIntent) -> Result<(), DatalensError> {
+        let Some(key) = pending_index_key(intent) else {
+            return Ok(());
+        };
+        self.object_store.delete(&key).map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::StorageWriteFailure,
+                format!(
+                    "delete durable promotion intent pending index {key}: {}",
+                    error.message
+                ),
+            )
+        })
+    }
+
     fn update_intent(
         &self,
         intent_id: &str,
@@ -257,8 +298,11 @@ where
         let Some(mut intent) = self.get(intent_id)? else {
             return Ok(None);
         };
+        let previous = intent.clone();
         update(&mut intent);
         self.write_intent(&intent)?;
+        self.delete_pending_index(&previous)?;
+        self.write_pending_index(&intent)?;
         Ok(Some(intent))
     }
 
@@ -277,6 +321,33 @@ where
             )
         });
         Ok(intents)
+    }
+
+    fn pending_index_entries_for_chain(
+        &self,
+        chain: &ChainIdentity,
+        now_unix_seconds: u64,
+    ) -> Result<Vec<PendingIndexEntry>, DatalensError> {
+        let mut entries = Vec::new();
+        for source in [QUERY_SOURCE_KEY, WARMUP_SOURCE_KEY] {
+            let prefix = pending_index_prefix(chain, source);
+            for object in self.object_store.list(&prefix)? {
+                let Some(entry) = parse_pending_index_entry(&object.key) else {
+                    continue;
+                };
+                if entry.due_at_unix_seconds <= now_unix_seconds {
+                    entries.push(entry);
+                }
+            }
+        }
+        entries.sort_by_key(|entry| {
+            (
+                entry.due_at_unix_seconds,
+                entry.intent_id.clone(),
+                entry.key.clone(),
+            )
+        });
+        Ok(entries)
     }
 }
 
@@ -336,6 +407,7 @@ where
         );
         let intent_id = intent_id_for_dedupe_key(&dedupe_key);
         if let Some(existing) = self.get(&intent_id)? {
+            self.write_pending_index(&existing)?;
             return Ok(DurablePromotionIntentCreateOutcome::Existing(existing));
         }
 
@@ -361,6 +433,7 @@ where
             task_id: request.task_id,
         };
         self.write_intent(&intent)?;
+        self.write_pending_index(&intent)?;
         Ok(DurablePromotionIntentCreateOutcome::Created(intent))
     }
 
@@ -415,33 +488,34 @@ where
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let mut pending = self
-            .read_all_intents()?
-            .into_iter()
-            .filter(|intent| {
-                &intent.chain == chain
-                    && match intent.status {
-                        DurablePromotionIntentStatus::Pending => true,
-                        DurablePromotionIntentStatus::FailedRetryable => intent
-                            .next_retry_at_unix_seconds
-                            .is_none_or(|next_retry| next_retry <= now_unix_seconds),
-                        DurablePromotionIntentStatus::Running
-                        | DurablePromotionIntentStatus::Completed
-                        | DurablePromotionIntentStatus::FailedTerminal => false,
-                    }
-            })
-            .collect::<Vec<_>>();
-        pending.sort_by_key(|intent| {
-            (
-                intent
-                    .next_retry_at_unix_seconds
-                    .unwrap_or(intent.created_at_unix_seconds),
-                intent.created_at_unix_seconds,
-                intent.intent_id.clone(),
-            )
-        });
-        pending.truncate(limit);
+        let mut pending = Vec::new();
+        for entry in self.pending_index_entries_for_chain(chain, now_unix_seconds)? {
+            let Some(intent) = self.get(&entry.intent_id)? else {
+                let _ = self.object_store.delete(&entry.key);
+                continue;
+            };
+            if &intent.chain == chain && intent_is_eligible_for_claim(&intent, now_unix_seconds) {
+                pending.push(intent);
+                if pending.len() >= limit {
+                    break;
+                }
+            } else {
+                let _ = self.object_store.delete(&entry.key);
+            }
+        }
         Ok(pending)
+    }
+
+    fn rebuild_pending_indexes(&self, now_unix_seconds: u64) -> Result<usize, DatalensError> {
+        let _ = now_unix_seconds;
+        let mut rebuilt = 0;
+        for intent in self.read_all_intents()? {
+            if intent_is_indexable_for_claim(&intent) {
+                self.write_pending_index(&intent)?;
+                rebuilt += 1;
+            }
+        }
+        Ok(rebuilt)
     }
 
     fn mark_running(
@@ -464,11 +538,13 @@ where
         if !eligible {
             return Ok(None);
         }
+        let previous = intent.clone();
         intent.status = DurablePromotionIntentStatus::Running;
         intent.updated_at_unix_seconds = now_unix_seconds;
         intent.next_retry_at_unix_seconds = None;
         intent.last_error = None;
         self.write_intent(&intent)?;
+        self.delete_pending_index(&previous)?;
         Ok(Some(intent))
     }
 
@@ -528,11 +604,14 @@ where
             intent.status == DurablePromotionIntentStatus::Running
                 && intent.updated_at_unix_seconds <= stale_before_unix_seconds
         }) {
+            let previous = intent.clone();
             intent.status = DurablePromotionIntentStatus::Pending;
             intent.updated_at_unix_seconds = now_unix_seconds;
             intent.next_retry_at_unix_seconds = None;
             intent.last_error = None;
             self.write_intent(&intent)?;
+            self.delete_pending_index(&previous)?;
+            self.write_pending_index(&intent)?;
             reset.push(intent);
         }
         Ok(reset)
@@ -632,6 +711,82 @@ where
 
 fn intent_object_key(intent_id: &str) -> String {
     format!("{INTENT_PREFIX}/{intent_id}.json")
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingIndexEntry {
+    key: String,
+    intent_id: String,
+    due_at_unix_seconds: u64,
+}
+
+fn pending_index_prefix(chain: &ChainIdentity, source: &str) -> String {
+    format!(
+        "{PENDING_INDEX_PREFIX}/chain={}/source={source}",
+        chain.key_prefix()
+    )
+}
+
+fn pending_index_key(intent: &DurablePromotionIntent) -> Option<String> {
+    let due_at_unix_seconds = match intent.status {
+        DurablePromotionIntentStatus::Pending => intent.created_at_unix_seconds,
+        DurablePromotionIntentStatus::FailedRetryable => intent
+            .next_retry_at_unix_seconds
+            .unwrap_or(intent.created_at_unix_seconds),
+        DurablePromotionIntentStatus::Running
+        | DurablePromotionIntentStatus::Completed
+        | DurablePromotionIntentStatus::FailedTerminal => return None,
+    };
+    Some(format!(
+        "{}/created={:019}/intent={}.json",
+        pending_index_prefix(&intent.chain, source_key(intent.source)),
+        due_at_unix_seconds,
+        intent.intent_id
+    ))
+}
+
+fn parse_pending_index_entry(key: &str) -> Option<PendingIndexEntry> {
+    let created = key
+        .split('/')
+        .find_map(|segment| segment.strip_prefix("created="))?;
+    let due_at_unix_seconds = created.parse().ok()?;
+    let intent_id = key
+        .rsplit('/')
+        .next()?
+        .strip_prefix("intent=")?
+        .strip_suffix(".json")?
+        .to_owned();
+    Some(PendingIndexEntry {
+        key: key.to_owned(),
+        intent_id,
+        due_at_unix_seconds,
+    })
+}
+
+fn source_key(source: DurablePromotionIntentSource) -> &'static str {
+    match source {
+        DurablePromotionIntentSource::Query => QUERY_SOURCE_KEY,
+        DurablePromotionIntentSource::Warmup => WARMUP_SOURCE_KEY,
+    }
+}
+
+fn intent_is_eligible_for_claim(intent: &DurablePromotionIntent, now_unix_seconds: u64) -> bool {
+    match intent.status {
+        DurablePromotionIntentStatus::Pending => true,
+        DurablePromotionIntentStatus::FailedRetryable => intent
+            .next_retry_at_unix_seconds
+            .is_none_or(|next_retry| next_retry <= now_unix_seconds),
+        DurablePromotionIntentStatus::Running
+        | DurablePromotionIntentStatus::Completed
+        | DurablePromotionIntentStatus::FailedTerminal => false,
+    }
+}
+
+fn intent_is_indexable_for_claim(intent: &DurablePromotionIntent) -> bool {
+    matches!(
+        intent.status,
+        DurablePromotionIntentStatus::Pending | DurablePromotionIntentStatus::FailedRetryable
+    )
 }
 
 fn intent_id_for_dedupe_key(dedupe_key: &str) -> String {

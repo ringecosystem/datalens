@@ -1,14 +1,21 @@
-use std::path::PathBuf;
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use datalens_chain::{DatasetSelector, FinalityLevel};
 use datalens_core::{
-    ChainFamily, ChainIdentity, DatasetKey, LedgerRange, LedgerRangeKind, NetworkId,
+    ChainFamily, ChainIdentity, DatalensError, DatasetKey, LedgerRange, LedgerRangeKind, NetworkId,
 };
 use datalens_storage::{
     DurableIntentSubmissionOutcome, DurableIntentSubmissionRequest, DurableIntentSubmissionService,
     DurablePromotionIntentCreateOutcome, DurablePromotionIntentRepository,
     DurablePromotionIntentSource, DurablePromotionIntentStatus, DurablePromotionIntentStore,
-    LocalObjectStore,
+    LocalObjectStore, ObjectMetadata, ObjectStore,
 };
 
 #[test]
@@ -185,6 +192,34 @@ fn test_status_transitions_pending_running_completed() {
 }
 
 #[test]
+fn test_pending_index_tracks_create_running_completed_lifecycle() {
+    let root = temp_storage_root("pending-index-lifecycle");
+    let object_store = LocalObjectStore::new(root);
+    let store = DurablePromotionIntentStore::new(object_store.clone());
+    let created = create_intent(
+        &store,
+        DurablePromotionIntentSource::Query,
+        "analytics-api",
+        100,
+    );
+
+    assert_eq!(
+        pending_index_keys(&object_store, &test_chain(), "query").len(),
+        1
+    );
+
+    store
+        .mark_running(&created.intent_id, 110)
+        .expect("mark running");
+    assert!(pending_index_keys(&object_store, &test_chain(), "query").is_empty());
+
+    store
+        .mark_completed(&created.intent_id, 120)
+        .expect("mark completed");
+    assert!(pending_index_keys(&object_store, &test_chain(), "query").is_empty());
+}
+
+#[test]
 fn test_repository_rejects_non_durable_finality() {
     let store = DurablePromotionIntentStore::new(LocalObjectStore::new(temp_storage_root(
         "repository-finality",
@@ -319,6 +354,48 @@ fn test_retryable_failure_stores_error_increments_attempt_and_sets_retry_time() 
 }
 
 #[test]
+fn test_retryable_pending_index_is_only_eligible_at_retry_time() {
+    let root = temp_storage_root("retryable-index");
+    let object_store = LocalObjectStore::new(root);
+    let store = DurablePromotionIntentStore::new(object_store.clone());
+    let created = create_intent(
+        &store,
+        DurablePromotionIntentSource::Warmup,
+        "warmup-api",
+        100,
+    );
+    store
+        .mark_running(&created.intent_id, 110)
+        .expect("mark running");
+
+    store
+        .mark_retryable_failure(&created.intent_id, "temporary storage error", 130, 160)
+        .expect("mark retryable");
+
+    let index_keys = pending_index_keys(&object_store, &test_chain(), "warmup");
+    assert_eq!(index_keys.len(), 1);
+    assert!(
+        index_keys[0].contains("/created=0000000000000000160/"),
+        "{:?}",
+        index_keys
+    );
+    assert!(
+        store
+            .list_pending_for_chain(&test_chain(), 159, 10)
+            .expect("list pending")
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .list_pending_for_chain(&test_chain(), 160, 10)
+            .expect("list pending")
+            .first()
+            .map(|intent| intent.intent_id.as_str()),
+        Some(created.intent_id.as_str())
+    );
+}
+
+#[test]
 fn test_mark_running_only_claims_eligible_pending_or_due_retryable_intents() {
     let store = DurablePromotionIntentStore::new(LocalObjectStore::new(temp_storage_root(
         "claim-eligible-intents",
@@ -410,6 +487,329 @@ fn test_stale_running_reset_changes_old_running_back_to_pending() {
 }
 
 #[test]
+fn test_reset_stale_running_restores_pending_index() {
+    let root = temp_storage_root("stale-index");
+    let object_store = LocalObjectStore::new(root);
+    let store = DurablePromotionIntentStore::new(object_store.clone());
+    let stale = create_intent(
+        &store,
+        DurablePromotionIntentSource::Query,
+        "analytics-api",
+        100,
+    );
+    store
+        .mark_running(&stale.intent_id, 120)
+        .expect("mark stale running");
+    assert!(pending_index_keys(&object_store, &test_chain(), "query").is_empty());
+
+    store
+        .reset_stale_running(150, 200)
+        .expect("reset stale running");
+
+    let index_keys = pending_index_keys(&object_store, &test_chain(), "query");
+    assert_eq!(index_keys.len(), 1);
+    assert!(
+        index_keys[0].contains("/created=0000000000000000100/"),
+        "{:?}",
+        index_keys
+    );
+    assert_eq!(
+        store
+            .list_pending_for_chain(&test_chain(), 200, 10)
+            .expect("list pending")
+            .first()
+            .map(|intent| intent.intent_id.as_str()),
+        Some(stale.intent_id.as_str())
+    );
+}
+
+#[test]
+fn test_list_pending_for_chain_does_not_read_unrelated_chain_intent_json() {
+    let root = temp_storage_root("chain-scoped-index-reads");
+    let counting_store = CountingObjectStore::new(root);
+    let store = DurablePromotionIntentStore::new(counting_store.clone());
+    for index in 0..8 {
+        store
+            .create_or_get(datalens_storage::CreateDurablePromotionIntent {
+                source: DurablePromotionIntentSource::Query,
+                application: "analytics-api".to_owned(),
+                chain: lisk_chain(),
+                dataset_key: DatasetKey::evm_blocks(),
+                selector: DatasetSelector::all(),
+                selector_fingerprint: "all".to_owned(),
+                selector_canonical_key: "all".to_owned(),
+                finality: "safe".to_owned(),
+                ranges: vec![LedgerRange::blocks(100 + index, 101 + index).expect("valid range")],
+                request_id: None,
+                task_id: None,
+                now_unix_seconds: 100 + index,
+            })
+            .expect("create lisk intent");
+    }
+    let ethereum = store
+        .create_or_get(datalens_storage::CreateDurablePromotionIntent {
+            source: DurablePromotionIntentSource::Warmup,
+            application: "warmup-api".to_owned(),
+            chain: test_chain(),
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: DatasetSelector::all(),
+            selector_fingerprint: "all".to_owned(),
+            selector_canonical_key: "all".to_owned(),
+            finality: "safe".to_owned(),
+            ranges: vec![LedgerRange::blocks(200, 201).expect("valid range")],
+            request_id: None,
+            task_id: None,
+            now_unix_seconds: 200,
+        })
+        .expect("create ethereum intent");
+    let DurablePromotionIntentCreateOutcome::Created(ethereum) = ethereum else {
+        panic!("ethereum intent should be created");
+    };
+    counting_store.clear_reads();
+
+    let scoped = store
+        .list_pending_for_chain(&test_chain(), 300, 1)
+        .expect("list scoped pending");
+
+    assert_eq!(scoped.len(), 1);
+    assert_eq!(scoped[0].intent_id, ethereum.intent_id);
+    assert!(
+        counting_store.read_keys().into_iter().all(|key| key
+            == format!(
+                "durable-promotion-intents/v1/intents/{}.json",
+                ethereum.intent_id
+            )),
+        "unexpected canonical reads: {:?}",
+        counting_store.read_keys()
+    );
+}
+
+#[test]
+fn test_list_pending_for_chain_with_missing_index_does_not_scan_canonical_intents() {
+    let root = temp_storage_root("missing-index-no-hot-scan");
+    let object_store = CountingObjectStore::new(root);
+    let store = DurablePromotionIntentStore::new(object_store.clone());
+    let created = create_intent(
+        &store,
+        DurablePromotionIntentSource::Query,
+        "analytics-api",
+        100,
+    );
+    for key in pending_index_keys(object_store.inner(), &test_chain(), "query") {
+        object_store.delete(&key).expect("remove pending index");
+    }
+    object_store.clear_reads();
+    object_store.clear_lists();
+
+    let pending = store
+        .list_pending_for_chain(&test_chain(), 200, 10)
+        .expect("list pending");
+
+    assert!(pending.is_empty(), "{created:?} should remain index-only");
+    assert!(object_store.read_keys().is_empty());
+    assert!(
+        object_store
+            .list_prefixes()
+            .into_iter()
+            .all(|prefix| !prefix.starts_with("durable-promotion-intents/v1/intents")),
+        "unexpected canonical lists: {:?}",
+        object_store.list_prefixes()
+    );
+}
+
+#[test]
+fn test_list_pending_for_chain_with_insufficient_index_does_not_scan_missing_canonical_intents() {
+    let root = temp_storage_root("insufficient-index-no-hot-scan");
+    let object_store = CountingObjectStore::new(root);
+    let store = DurablePromotionIntentStore::new(object_store.clone());
+    let indexed = create_intent(
+        &store,
+        DurablePromotionIntentSource::Query,
+        "analytics-api",
+        100,
+    );
+    let missing_index = create_intent_with_range(
+        &store,
+        DurablePromotionIntentSource::Query,
+        "analytics-api",
+        LedgerRange::blocks(20, 21).expect("valid range"),
+        101,
+    );
+    for key in pending_index_keys(object_store.inner(), &test_chain(), "query") {
+        if key.contains(&missing_index.intent_id) {
+            object_store.delete(&key).expect("remove pending index");
+        }
+    }
+    object_store.clear_reads();
+    object_store.clear_lists();
+
+    let pending = store
+        .list_pending_for_chain(&test_chain(), 200, 10)
+        .expect("list pending");
+
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].intent_id, indexed.intent_id);
+    assert_eq!(
+        object_store.read_keys(),
+        vec![format!(
+            "durable-promotion-intents/v1/intents/{}.json",
+            indexed.intent_id
+        )]
+    );
+    assert!(
+        object_store
+            .list_prefixes()
+            .into_iter()
+            .all(|prefix| !prefix.starts_with("durable-promotion-intents/v1/intents")),
+        "unexpected canonical lists: {:?}",
+        object_store.list_prefixes()
+    );
+}
+
+#[test]
+fn test_rebuild_pending_indexes_heals_legacy_pending_beyond_first_128_intents() {
+    let root = temp_storage_root("legacy-pending-index-rebuild");
+    let object_store = LocalObjectStore::new(root);
+    let store = DurablePromotionIntentStore::new(object_store.clone());
+    for index in 0..130 {
+        store
+            .create_or_get(datalens_storage::CreateDurablePromotionIntent {
+                source: DurablePromotionIntentSource::Query,
+                application: "analytics-api".to_owned(),
+                chain: lisk_chain(),
+                dataset_key: DatasetKey::evm_blocks(),
+                selector: DatasetSelector::all(),
+                selector_fingerprint: "all".to_owned(),
+                selector_canonical_key: "all".to_owned(),
+                finality: "safe".to_owned(),
+                ranges: vec![LedgerRange::blocks(1000 + index, 1001 + index).expect("valid range")],
+                request_id: None,
+                task_id: None,
+                now_unix_seconds: 100 + index,
+            })
+            .expect("create lisk intent");
+    }
+    let created = create_intent_with_range(
+        &store,
+        DurablePromotionIntentSource::Query,
+        "analytics-api",
+        LedgerRange::blocks(5000, 5001).expect("valid range"),
+        500,
+    );
+    for key in object_store
+        .list("durable-promotion-intents/v1/index/status=pending")
+        .expect("list pending indexes")
+        .into_iter()
+        .map(|object| object.key)
+    {
+        object_store.delete(&key).expect("remove pending index");
+    }
+    assert!(
+        store
+            .list_pending_for_chain(&test_chain(), 600, 10)
+            .expect("list pending before rebuild")
+            .is_empty()
+    );
+
+    let rebuilt = store
+        .rebuild_pending_indexes(600)
+        .expect("rebuild pending indexes");
+    let pending = store
+        .list_pending_for_chain(&test_chain(), 600, 10)
+        .expect("list pending after rebuild");
+
+    assert!(
+        rebuilt > 128,
+        "expected rebuild to scan all canonical intents"
+    );
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].intent_id, created.intent_id);
+}
+
+#[test]
+fn test_rebuild_pending_indexes_heals_due_retryable_when_index_write_failed() {
+    let root = temp_storage_root("retryable-index-write-failure");
+    let object_store = FailOnceIndexPutObjectStore::new(root);
+    let store = DurablePromotionIntentStore::new(object_store.clone());
+    let created = create_intent(
+        &store,
+        DurablePromotionIntentSource::Warmup,
+        "warmup-api",
+        100,
+    );
+    store
+        .mark_running(&created.intent_id, 110)
+        .expect("mark running");
+    object_store.fail_next_index_put();
+
+    store
+        .mark_retryable_failure(&created.intent_id, "temporary storage error", 130, 160)
+        .expect_err("index write should fail after canonical retryable update");
+    assert!(
+        store
+            .list_pending_for_chain(&test_chain(), 160, 10)
+            .expect("list pending before rebuild")
+            .is_empty()
+    );
+
+    store
+        .rebuild_pending_indexes(160)
+        .expect("rebuild pending indexes");
+
+    let pending = store
+        .list_pending_for_chain(&test_chain(), 160, 10)
+        .expect("list pending");
+
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].intent_id, created.intent_id);
+    assert_eq!(
+        pending_index_keys(object_store.inner(), &test_chain(), "warmup").len(),
+        1
+    );
+}
+
+#[test]
+fn test_rebuild_pending_indexes_heals_future_retryable_before_it_is_due() {
+    let root = temp_storage_root("future-retryable-index-rebuild");
+    let object_store = LocalObjectStore::new(root);
+    let store = DurablePromotionIntentStore::new(object_store.clone());
+    let created = create_intent(
+        &store,
+        DurablePromotionIntentSource::Warmup,
+        "warmup-api",
+        100,
+    );
+    store
+        .mark_running(&created.intent_id, 110)
+        .expect("mark running");
+    store
+        .mark_retryable_failure(&created.intent_id, "retry later", 120, 500)
+        .expect("mark retryable");
+    for key in pending_index_keys(&object_store, &test_chain(), "warmup") {
+        object_store.delete(&key).expect("remove retry index");
+    }
+
+    store
+        .rebuild_pending_indexes(200)
+        .expect("rebuild pending indexes");
+
+    assert!(
+        store
+            .list_pending_for_chain(&test_chain(), 499, 10)
+            .expect("list before retry")
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .list_pending_for_chain(&test_chain(), 500, 10)
+            .expect("list at retry")
+            .first()
+            .map(|intent| intent.intent_id.as_str()),
+        Some(created.intent_id.as_str())
+    );
+}
+
+#[test]
 fn test_submission_service_handles_query_and_warmup_sources() {
     let store =
         DurablePromotionIntentStore::new(LocalObjectStore::new(temp_storage_root("sources")));
@@ -480,7 +880,7 @@ fn test_submission_service_rejects_non_durable_finality_without_writing_intent()
 }
 
 fn create_intent(
-    store: &DurablePromotionIntentStore<LocalObjectStore>,
+    store: &impl DurablePromotionIntentRepository,
     source: DurablePromotionIntentSource,
     application: &str,
     now_unix_seconds: u64,
@@ -495,7 +895,7 @@ fn create_intent(
 }
 
 fn create_intent_with_range(
-    store: &DurablePromotionIntentStore<LocalObjectStore>,
+    store: &impl DurablePromotionIntentRepository,
     source: DurablePromotionIntentSource,
     application: &str,
     range: LedgerRange,
@@ -557,6 +957,23 @@ fn temp_storage_root(name: &str) -> PathBuf {
     root
 }
 
+fn pending_index_keys(
+    object_store: &LocalObjectStore,
+    chain: &ChainIdentity,
+    source: &str,
+) -> Vec<String> {
+    object_store
+        .list(&format!(
+            "durable-promotion-intents/v1/index/status=pending/chain={}/source={}",
+            chain.key_prefix(),
+            source
+        ))
+        .expect("list pending index")
+        .into_iter()
+        .map(|object| object.key)
+        .collect()
+}
+
 fn test_chain() -> ChainIdentity {
     ChainIdentity::try_new(ChainFamily::Evm, "ethereum", Some(NetworkId::numeric(1)))
         .expect("valid chain identity")
@@ -565,6 +982,133 @@ fn test_chain() -> ChainIdentity {
 fn lisk_chain() -> ChainIdentity {
     ChainIdentity::try_new(ChainFamily::Evm, "lisk", Some(NetworkId::numeric(1135)))
         .expect("valid chain identity")
+}
+
+#[derive(Clone, Debug)]
+struct CountingObjectStore {
+    inner: LocalObjectStore,
+    reads: Arc<Mutex<BTreeMap<String, usize>>>,
+    lists: Arc<Mutex<Vec<String>>>,
+}
+
+impl CountingObjectStore {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            inner: LocalObjectStore::new(root),
+            reads: Arc::new(Mutex::new(BTreeMap::new())),
+            lists: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn inner(&self) -> &LocalObjectStore {
+        &self.inner
+    }
+
+    fn clear_reads(&self) {
+        self.reads.lock().expect("read counts").clear();
+    }
+
+    fn clear_lists(&self) {
+        self.lists.lock().expect("list prefixes").clear();
+    }
+
+    fn read_keys(&self) -> Vec<String> {
+        self.reads
+            .lock()
+            .expect("read counts")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    fn list_prefixes(&self) -> Vec<String> {
+        self.lists.lock().expect("list prefixes").clone()
+    }
+}
+
+impl ObjectStore for CountingObjectStore {
+    fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError> {
+        *self
+            .reads
+            .lock()
+            .expect("read counts")
+            .entry(key.to_owned())
+            .or_default() += 1;
+        self.inner.get(key)
+    }
+
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
+        self.inner.put(key, bytes)
+    }
+
+    fn exists(&self, key: &str) -> Result<bool, DatalensError> {
+        self.inner.exists(key)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
+        self.lists
+            .lock()
+            .expect("list prefixes")
+            .push(prefix.to_owned());
+        self.inner.list(prefix)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), DatalensError> {
+        self.inner.delete(key)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FailOnceIndexPutObjectStore {
+    inner: LocalObjectStore,
+    fail_next_index_put: Arc<AtomicBool>,
+}
+
+impl FailOnceIndexPutObjectStore {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            inner: LocalObjectStore::new(root),
+            fail_next_index_put: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn inner(&self) -> &LocalObjectStore {
+        &self.inner
+    }
+
+    fn fail_next_index_put(&self) {
+        self.fail_next_index_put.store(true, Ordering::SeqCst);
+    }
+}
+
+impl ObjectStore for FailOnceIndexPutObjectStore {
+    fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError> {
+        self.inner.get(key)
+    }
+
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
+        if key.starts_with("durable-promotion-intents/v1/index/status=pending/")
+            && self.fail_next_index_put.swap(false, Ordering::SeqCst)
+        {
+            return Err(DatalensError::new(
+                datalens_core::DatalensErrorKind::StorageWriteFailure,
+                "injected pending index put failure",
+            ));
+        }
+        self.inner.put(key, bytes)
+    }
+
+    fn exists(&self, key: &str) -> Result<bool, DatalensError> {
+        self.inner.exists(key)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
+        self.inner.list(prefix)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), DatalensError> {
+        self.inner.delete(key)
+    }
 }
 
 #[test]
