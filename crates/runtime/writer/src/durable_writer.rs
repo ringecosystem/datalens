@@ -153,6 +153,24 @@ where
         self.flush_with_reason(WriteFlushReason::Manual)
     }
 
+    pub fn flush_ranges(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        ranges: &[LedgerRange],
+    ) -> Result<DurableWriteResult, DatalensError> {
+        if !self.config.staging.enabled || ranges.is_empty() {
+            return Ok(DurableWriteResult::default());
+        }
+        self.flush_matching_with_reason(WriteFlushReason::Manual, |write| {
+            write.chain == *chain
+                && write.dataset_key == *dataset_key
+                && write.selector == *selector
+                && ranges.contains(&write.segment.range)
+        })
+    }
+
     pub fn flush_for_shutdown(&self) -> Result<DurableWriteResult, DatalensError> {
         if !self.config.staging.enabled || !self.config.staging.flush_on_shutdown {
             return Ok(DurableWriteResult::default());

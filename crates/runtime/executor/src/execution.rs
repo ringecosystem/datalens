@@ -30,12 +30,18 @@ use datalens_storage::{
     UsageLedgerRepository,
 };
 use datalens_writer::{
-    DurableWriteRequest, DurableWriteResult, DurableWriteSegment, DurableWriter,
-    DurableWriterConfig,
+    DurableWriteResult, DurableWriteSegment, DurableWriter, DurableWriterConfig,
 };
 
 use crate::helpers::*;
 pub use crate::hot_promotion::HotCachePromoter;
+use crate::{
+    durable_promotion::{
+        DurablePromotionMetrics, DurablePromotionQueue, DurablePromotionRequest,
+        PromotionEnqueueOutcome,
+    },
+    provider_singleflight::ProviderSingleflight,
+};
 
 static QUERY_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -91,6 +97,8 @@ pub struct NativeQueryExecutor<R, S> {
     source: S,
     planner: NativePlanner,
     writer: DurableWriter<R>,
+    durable_promotions: DurablePromotionQueue<R>,
+    provider_singleflight: ProviderSingleflight,
     metrics: Option<ExecutorMetrics>,
     usage_ledger: Option<ExecutorUsageLedger>,
     query_watermarks: Option<ExecutorQueryWatermarks>,
@@ -118,16 +126,20 @@ type ProviderFetchResponse = (ChainFetchRequest, ChainFetchResponse);
 
 impl<R, S> NativeQueryExecutor<R, S>
 where
-    R: StorageRepository + Clone,
+    R: StorageRepository + Clone + 'static,
     S: ChainAdapter,
 {
     pub fn new(storage: R, source: S, config: NativeQueryExecutionConfig) -> Self {
         let writer = DurableWriter::new(storage.clone(), config.writer);
+        let durable_promotions =
+            DurablePromotionQueue::new(writer.clone()).expect("durable promotion workers start");
         Self {
             storage,
             source,
             planner: NativePlanner::new(config.planner),
             writer,
+            durable_promotions,
+            provider_singleflight: ProviderSingleflight::default(),
             metrics: None,
             usage_ledger: None,
             query_watermarks: None,
@@ -190,15 +202,21 @@ where
     }
 
     pub fn flush_staged_writes(&self) -> Result<DurableWriteResult, DatalensError> {
+        self.durable_promotions.wait_for_idle()?;
         self.writer.flush()
     }
 
     pub fn flush_staged_writes_for_shutdown(&self) -> Result<DurableWriteResult, DatalensError> {
+        self.durable_promotions.wait_for_idle()?;
         self.writer.flush_for_shutdown()
     }
 
     pub fn durable_writer(&self) -> DurableWriter<R> {
         self.writer.clone()
+    }
+
+    pub fn wait_for_durable_promotions(&self) -> Result<(), DatalensError> {
+        self.durable_promotions.wait_for_idle()
     }
 
     pub fn execute_with_application(
@@ -558,24 +576,66 @@ where
         let provider_fetch_attempted = !plan.fetch_tasks.is_empty();
         let cache_fill_attempted = !fetched_segments.is_empty();
         let mut durable_write_outcome = LedgerDurableWriteOutcome::NotAttempted;
+        let mut promotion_pending_ranges = Vec::new();
         if cache_fill_attempted {
-            match self.writer.write(DurableWriteRequest {
+            let pending_ranges = fetched_segments
+                .iter()
+                .map(|segment| segment.range.clone())
+                .collect::<Vec<_>>();
+            let enqueue_start = Instant::now();
+            match self.durable_promotions.enqueue(DurablePromotionRequest {
+                query_id: query_id.clone(),
                 chain: plan.chain.clone(),
                 dataset_key: plan.dataset_key.clone(),
                 selector: plan.selector.clone(),
                 finality_level,
                 segments: fetched_segments,
+                metrics: self.promotion_metrics(&labels),
             }) {
-                Ok(write_result) => {
-                    durable_write_outcome = ledger_durable_write_outcome(&write_result);
-                    self.record_durable_write(
-                        &labels,
-                        metrics_durable_write_outcome(&write_result),
+                Ok(PromotionEnqueueOutcome::Queued) => {
+                    promotion_pending_ranges = pending_ranges;
+                    durable_write_outcome = LedgerDurableWriteOutcome::Staged;
+                    self.record_durable_write(&labels, MetricsDurableWriteOutcome::Staged);
+                    log::info!(
+                        "durable promotion enqueued query_id={} dataset={} range={}-{} pending_ranges={} duration_ms={}",
+                        query_id,
+                        plan.dataset_key.as_str(),
+                        plan.ledger_range.start(),
+                        plan.ledger_range.end(),
+                        promotion_pending_ranges.len(),
+                        enqueue_start.elapsed().as_millis()
+                    );
+                }
+                Ok(PromotionEnqueueOutcome::AlreadyInFlight) => {
+                    promotion_pending_ranges = pending_ranges;
+                    durable_write_outcome = LedgerDurableWriteOutcome::Staged;
+                    self.record_durable_write(&labels, MetricsDurableWriteOutcome::Staged);
+                    log::info!(
+                        "durable promotion already in flight query_id={} dataset={} range={}-{} pending_ranges={} duration_ms={}",
+                        query_id,
+                        plan.dataset_key.as_str(),
+                        plan.ledger_range.start(),
+                        plan.ledger_range.end(),
+                        promotion_pending_ranges.len(),
+                        enqueue_start.elapsed().as_millis()
+                    );
+                }
+                Ok(PromotionEnqueueOutcome::Rejected) => {
+                    self.record_durable_write(&labels, MetricsDurableWriteOutcome::StorageError);
+                    durable_write_outcome = LedgerDurableWriteOutcome::StorageError;
+                    log::error!(
+                        "durable promotion enqueue rejected query_id={} dataset={} range={}-{} duration_ms={}",
+                        query_id,
+                        plan.dataset_key.as_str(),
+                        plan.ledger_range.start(),
+                        plan.ledger_range.end(),
+                        enqueue_start.elapsed().as_millis()
                     );
                 }
                 Err(error) => {
                     log::error!(
-                        "cache write failed dataset={} range={}-{} kind={:?}",
+                        "durable promotion enqueue failed query_id={} dataset={} range={}-{} kind={:?}",
+                        query_id,
                         plan.dataset_key.as_str(),
                         plan.ledger_range.start(),
                         plan.ledger_range.end(),
@@ -606,6 +666,7 @@ where
         rows.sort();
         let mut cache = plan.coverage.clone();
         cache.provider_fill_ranges = provider_fill_ranges;
+        cache.promotion_pending_ranges = promotion_pending_ranges;
 
         let result = NativeQueryExecutionResult {
             chain: plan.chain.clone(),
@@ -821,18 +882,34 @@ where
         let mut responses = Vec::new();
         let mut queue = VecDeque::from([fetch_request]);
         while let Some(fetch_request) = queue.pop_front() {
-            match self.source.fetch(fetch_request.clone()) {
-                Ok(response) => responses.push((fetch_request, response)),
+            let fetch_start = Instant::now();
+            match self
+                .provider_singleflight
+                .fetch(&fetch_request, || self.source.fetch(fetch_request.clone()))
+            {
+                Ok(outcome) => {
+                    log::info!(
+                        "provider fetch completed query_id={} dataset={} range={}-{} shared={} duration_ms={}",
+                        query_id,
+                        fetch_request.dataset_key.as_str(),
+                        fetch_request.range.start(),
+                        fetch_request.range.end(),
+                        outcome.shared,
+                        fetch_start.elapsed().as_millis()
+                    );
+                    responses.push((fetch_request, outcome.response));
+                }
                 Err(error)
                     if error.kind == DatalensErrorKind::ProviderLimit
                         && fetch_request.range.len() > 1 =>
                 {
                     log::warn!(
-                        "provider limit split query_id={} dataset={} range={}-{}",
+                        "provider limit split query_id={} dataset={} range={}-{} duration_ms={}",
                         query_id,
                         fetch_request.dataset_key.as_str(),
                         fetch_request.range.start(),
-                        fetch_request.range.end()
+                        fetch_request.range.end(),
+                        fetch_start.elapsed().as_millis()
                     );
                     for range in split_provider_limit_range(&fetch_request.range)?
                         .into_iter()
@@ -844,7 +921,18 @@ where
                         });
                     }
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    log::warn!(
+                        "provider fetch failed query_id={} dataset={} range={}-{} kind={:?} duration_ms={}",
+                        query_id,
+                        fetch_request.dataset_key.as_str(),
+                        fetch_request.range.start(),
+                        fetch_request.range.end(),
+                        error.kind,
+                        fetch_start.elapsed().as_millis()
+                    );
+                    return Err(error);
+                }
             }
         }
         Ok(responses)
@@ -892,6 +980,16 @@ where
             .as_ref()
             .zip(labels.as_ref())
             .map(|(metrics, labels)| (metrics.recorder.as_ref(), labels))
+    }
+
+    fn promotion_metrics(&self, labels: &Option<MetricsLabels>) -> Option<DurablePromotionMetrics> {
+        self.metrics
+            .as_ref()
+            .zip(labels.as_ref())
+            .map(|(metrics, labels)| DurablePromotionMetrics {
+                recorder: metrics.recorder.clone(),
+                labels: labels.clone(),
+            })
     }
 
     fn record_query(&self, labels: &Option<MetricsLabels>, outcome: QueryOutcome, start: Instant) {

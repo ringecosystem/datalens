@@ -3,7 +3,8 @@ use std::{
     future::Future,
     io::Write,
     path::{Path, PathBuf},
-    sync::mpsc,
+    sync::{Arc, Mutex, mpsc},
+    time::Instant,
 };
 
 use aws_sdk_s3::{
@@ -14,6 +15,7 @@ use aws_sdk_s3::{
 };
 use datalens_core::{DatalensError, DatalensErrorKind};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ObjectMetadata {
@@ -257,11 +259,17 @@ pub struct S3ObjectStore {
     runtime: S3Runtime,
 }
 
-type S3RuntimeJob = Box<dyn FnOnce(&tokio::runtime::Runtime) + Send + 'static>;
+const DEFAULT_S3_RUNTIME_WORKER_THREADS: usize = 4;
+const DEFAULT_S3_MAX_CONCURRENT_OPERATIONS: usize = 16;
 
 #[derive(Clone)]
 struct S3Runtime {
-    sender: mpsc::Sender<S3RuntimeJob>,
+    inner: Arc<S3RuntimeInner>,
+}
+
+struct S3RuntimeInner {
+    runtime: Mutex<Option<tokio::runtime::Runtime>>,
+    semaphore: Arc<Semaphore>,
 }
 
 impl std::fmt::Debug for S3Runtime {
@@ -272,43 +280,104 @@ impl std::fmt::Debug for S3Runtime {
 
 impl S3Runtime {
     fn new() -> Result<Self, DatalensError> {
-        let runtime = tokio::runtime::Runtime::new().map_err(|error| {
-            DatalensError::new(
-                DatalensErrorKind::InvalidInput,
-                format!("create S3 runtime: {error}"),
-            )
-        })?;
-        let (sender, receiver) = mpsc::channel::<S3RuntimeJob>();
-        std::thread::Builder::new()
-            .name("datalens-s3-runtime".to_owned())
-            .spawn(move || {
-                while let Ok(job) = receiver.recv() {
-                    job(&runtime);
-                }
-            })
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(DEFAULT_S3_RUNTIME_WORKER_THREADS)
+            .thread_name("datalens-s3-runtime")
+            .build()
             .map_err(|error| {
                 DatalensError::new(
                     DatalensErrorKind::InvalidInput,
-                    format!("start S3 runtime thread: {error}"),
+                    format!("create S3 runtime: {error}"),
                 )
             })?;
-        Ok(Self { sender })
+        Ok(Self {
+            inner: Arc::new(S3RuntimeInner {
+                runtime: Mutex::new(Some(runtime)),
+                semaphore: Arc::new(Semaphore::new(DEFAULT_S3_MAX_CONCURRENT_OPERATIONS)),
+            }),
+        })
     }
 
-    fn block_on<F, T>(&self, future: F) -> Result<T, DatalensError>
+    fn block_on_operation<F, T>(
+        &self,
+        operation: &'static str,
+        key: String,
+        future: F,
+    ) -> Result<T, DatalensError>
     where
         F: Future<Output = Result<T, DatalensError>> + Send + 'static,
         T: Send + 'static,
     {
         let (sender, receiver) = mpsc::sync_channel(1);
-        self.sender
-            .send(Box::new(move |runtime| {
-                let _ = sender.send(runtime.block_on(future));
-            }))
-            .map_err(|_| DatalensError::internal("S3 runtime thread stopped"))?;
+        let semaphore = self.inner.semaphore.clone();
+        let handle = {
+            let runtime = self
+                .inner
+                .runtime
+                .lock()
+                .map_err(|_| DatalensError::internal("S3 runtime lock poisoned"))?;
+            runtime
+                .as_ref()
+                .ok_or_else(|| DatalensError::internal("S3 runtime stopped"))?
+                .handle()
+                .clone()
+        };
+        let queued_at = Instant::now();
+        handle.spawn(async move {
+            let permit = semaphore.acquire_owned().await.map_err(|error| {
+                DatalensError::internal(format!("acquire S3 runtime permit: {error}"))
+            });
+            let queue_ms = queued_at.elapsed().as_millis();
+            let run_started = Instant::now();
+            let result = match permit {
+                Ok(permit) => {
+                    let _permit = permit;
+                    future.await
+                }
+                Err(error) => Err(error),
+            };
+            let run_ms = run_started.elapsed().as_millis();
+            match &result {
+                Ok(_) => log::debug!(
+                    "s3 operation completed operation={} key={} queue_ms={} run_ms={}",
+                    operation,
+                    key,
+                    queue_ms,
+                    run_ms
+                ),
+                Err(error) => log::warn!(
+                    "s3 operation failed operation={} key={} kind={:?} queue_ms={} run_ms={}",
+                    operation,
+                    key,
+                    error.kind,
+                    queue_ms,
+                    run_ms
+                ),
+            }
+            let _ = sender.send(result);
+        });
         receiver
             .recv()
-            .map_err(|_| DatalensError::internal("S3 runtime thread stopped"))?
+            .map_err(|_| DatalensError::internal("S3 runtime stopped"))?
+    }
+}
+
+impl Drop for S3RuntimeInner {
+    fn drop(&mut self) {
+        let Ok(runtime) = self.runtime.get_mut() else {
+            return;
+        };
+        let Some(runtime) = runtime.take() else {
+            return;
+        };
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let _ = std::thread::Builder::new()
+                .name("datalens-s3-runtime-drop".to_owned())
+                .spawn(move || drop(runtime));
+        } else {
+            drop(runtime);
+        }
     }
 }
 
@@ -338,24 +407,25 @@ impl S3ObjectStore {
         };
         let endpoint_url = config.endpoint_url;
         let force_path_style = config.force_path_style;
-        let client = runtime.block_on(async move {
-            let mut loader =
-                aws_config::defaults(BehaviorVersion::latest()).region(Region::new(region));
-            if let Some(endpoint_url) = endpoint_url.as_ref() {
-                if endpoint_url.trim().is_empty() {
-                    return Err(DatalensError::new(
-                        DatalensErrorKind::InvalidInput,
-                        "storage.s3.endpoint_url must not be empty when set",
-                    ));
+        let client =
+            runtime.block_on_operation("config_load", config.bucket.clone(), async move {
+                let mut loader =
+                    aws_config::defaults(BehaviorVersion::latest()).region(Region::new(region));
+                if let Some(endpoint_url) = endpoint_url.as_ref() {
+                    if endpoint_url.trim().is_empty() {
+                        return Err(DatalensError::new(
+                            DatalensErrorKind::InvalidInput,
+                            "storage.s3.endpoint_url must not be empty when set",
+                        ));
+                    }
+                    loader = loader.endpoint_url(endpoint_url);
                 }
-                loader = loader.endpoint_url(endpoint_url);
-            }
-            let shared = loader.load().await;
-            let conf = aws_sdk_s3::config::Builder::from(&shared)
-                .force_path_style(force_path_style)
-                .build();
-            Ok(Client::from_conf(conf))
-        })?;
+                let shared = loader.load().await;
+                let conf = aws_sdk_s3::config::Builder::from(&shared)
+                    .force_path_style(force_path_style)
+                    .build();
+                Ok(Client::from_conf(conf))
+            })?;
         Ok(Self {
             client,
             bucket: config.bucket,
@@ -384,9 +454,10 @@ impl S3ObjectStore {
 impl ObjectStore for S3ObjectStore {
     fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError> {
         let key = self.key(key)?;
+        let log_key = key.clone();
         let client = self.client.clone();
         let bucket = self.bucket.clone();
-        self.runtime.block_on(async move {
+        self.runtime.block_on_operation("get", log_key, async move {
             let object = client
                 .get_object()
                 .bucket(&bucket)
@@ -413,10 +484,11 @@ impl ObjectStore for S3ObjectStore {
 
     fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
         let key = self.key(key)?;
+        let log_key = key.clone();
         let bytes = bytes.to_vec();
         let client = self.client.clone();
         let bucket = self.bucket.clone();
-        self.runtime.block_on(async move {
+        self.runtime.block_on_operation("put", log_key, async move {
             client
                 .put_object()
                 .bucket(&bucket)
@@ -436,87 +508,93 @@ impl ObjectStore for S3ObjectStore {
 
     fn exists(&self, key: &str) -> Result<bool, DatalensError> {
         let key = self.key(key)?;
+        let log_key = key.clone();
         let client = self.client.clone();
         let bucket = self.bucket.clone();
-        self.runtime.block_on(async move {
-            match client.head_object().bucket(&bucket).key(&key).send().await {
-                Ok(_) => Ok(true),
-                Err(error) if service_error_code(&error).is_some_and(is_not_found_code) => {
-                    Ok(false)
+        self.runtime
+            .block_on_operation("exists", log_key, async move {
+                match client.head_object().bucket(&bucket).key(&key).send().await {
+                    Ok(_) => Ok(true),
+                    Err(error) if service_error_code(&error).is_some_and(is_not_found_code) => {
+                        Ok(false)
+                    }
+                    Err(error) => Err(DatalensError::new(
+                        DatalensErrorKind::StorageReadFailure,
+                        format!("S3 head object {key}: {error}"),
+                    )),
                 }
-                Err(error) => Err(DatalensError::new(
-                    DatalensErrorKind::StorageReadFailure,
-                    format!("S3 head object {key}: {error}"),
-                )),
-            }
-        })
+            })
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
         let prefix_key = self.key(prefix)?;
+        let log_key = prefix_key.clone();
         let strip_prefix = self.prefix.clone().map(|prefix| format!("{prefix}/"));
         let client = self.client.clone();
         let bucket = self.bucket.clone();
-        self.runtime.block_on(async move {
-            let mut continuation = None;
-            let mut objects = Vec::new();
-            loop {
-                let response = client
-                    .list_objects_v2()
-                    .bucket(&bucket)
-                    .prefix(&prefix_key)
-                    .set_continuation_token(continuation)
-                    .send()
-                    .await
-                    .map_err(|error| {
-                        DatalensError::new(
-                            DatalensErrorKind::StorageReadFailure,
-                            format!("S3 list objects {prefix_key}: {error}"),
-                        )
-                    })?;
-                for object in response.contents() {
-                    let Some(key) = object.key() else {
-                        continue;
-                    };
-                    let key = strip_prefix
-                        .as_ref()
-                        .and_then(|prefix| key.strip_prefix(prefix))
-                        .unwrap_or(key)
-                        .to_owned();
-                    objects.push(ObjectMetadata {
-                        key,
-                        size: object.size().unwrap_or_default().max(0) as u64,
-                    });
+        self.runtime
+            .block_on_operation("list", log_key, async move {
+                let mut continuation = None;
+                let mut objects = Vec::new();
+                loop {
+                    let response = client
+                        .list_objects_v2()
+                        .bucket(&bucket)
+                        .prefix(&prefix_key)
+                        .set_continuation_token(continuation)
+                        .send()
+                        .await
+                        .map_err(|error| {
+                            DatalensError::new(
+                                DatalensErrorKind::StorageReadFailure,
+                                format!("S3 list objects {prefix_key}: {error}"),
+                            )
+                        })?;
+                    for object in response.contents() {
+                        let Some(key) = object.key() else {
+                            continue;
+                        };
+                        let key = strip_prefix
+                            .as_ref()
+                            .and_then(|prefix| key.strip_prefix(prefix))
+                            .unwrap_or(key)
+                            .to_owned();
+                        objects.push(ObjectMetadata {
+                            key,
+                            size: object.size().unwrap_or_default().max(0) as u64,
+                        });
+                    }
+                    if response.is_truncated().unwrap_or(false) {
+                        continuation = response.next_continuation_token().map(ToOwned::to_owned);
+                    } else {
+                        break;
+                    }
                 }
-                if response.is_truncated().unwrap_or(false) {
-                    continuation = response.next_continuation_token().map(ToOwned::to_owned);
-                } else {
-                    break;
-                }
-            }
-            Ok(objects)
-        })
+                Ok(objects)
+            })
     }
 
     fn delete(&self, key: &str) -> Result<(), DatalensError> {
         let key = self.key(key)?;
+        let log_key = key.clone();
         let client = self.client.clone();
         let bucket = self.bucket.clone();
-        self.runtime.block_on(async move {
-            client
-                .delete_object()
-                .bucket(&bucket)
-                .key(&key)
-                .send()
-                .await
-                .map_err(|error| {
-                    DatalensError::new(
-                        DatalensErrorKind::StorageWriteFailure,
-                        format!("S3 delete object {key}: {error}"),
-                    )
-                })?;
-            Ok(())
-        })
+        self.runtime
+            .block_on_operation("delete", log_key, async move {
+                client
+                    .delete_object()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .send()
+                    .await
+                    .map_err(|error| {
+                        DatalensError::new(
+                            DatalensErrorKind::StorageWriteFailure,
+                            format!("S3 delete object {key}: {error}"),
+                        )
+                    })?;
+                Ok(())
+            })
     }
 }
 
@@ -541,4 +619,42 @@ fn normalize_prefix(prefix: Option<&str>) -> Result<Option<String>, DatalensErro
     }
     validate_object_key(prefix)?;
     Ok(Some(prefix.to_owned()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        thread,
+        time::{Duration, Instant},
+    };
+
+    use datalens_core::DatalensError;
+
+    use super::S3Runtime;
+
+    #[test]
+    fn test_s3_runtime_runs_independent_operations_concurrently() {
+        let runtime = S3Runtime::new().expect("runtime");
+        let start = Instant::now();
+        let mut handles = Vec::new();
+
+        for _ in 0..4 {
+            let runtime = runtime.clone();
+            handles.push(thread::spawn(move || {
+                runtime.block_on_operation("test", "delay".to_owned(), async {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    Ok::<(), DatalensError>(())
+                })
+            }));
+        }
+
+        for handle in handles {
+            handle.join().expect("runtime worker").expect("operation");
+        }
+
+        assert!(
+            start.elapsed() < Duration::from_millis(650),
+            "S3 runtime serialized independent operations"
+        );
+    }
 }

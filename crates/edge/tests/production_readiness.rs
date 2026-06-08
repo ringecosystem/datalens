@@ -78,21 +78,23 @@ async fn test_production_readiness_validates_service_staging_warmup_metrics_and_
         staged.cache.missing_ranges,
         vec![LedgerRange::blocks(10, 10).expect("range")]
     );
-    let manifest = storage.manifest().expect("manifest after query flush");
+    service
+        .wait_for_durable_promotions()
+        .expect("promotion drain");
+    let manifest = storage.manifest().expect("manifest after promotion drain");
     assert_eq!(
         manifest.entries.len(),
         1,
-        "writer boundary should flush staged query rows into durable coverage"
+        "background promotion should flush sub-threshold query rows into durable coverage"
     );
-    let object_key = manifest.entries[0]
-        .object_key
-        .clone()
-        .expect("flushed data object key");
-
     let shutdown_flush = service
         .flush_staged_writes_for_shutdown()
         .expect("writer boundary has no remaining staged rows");
     assert!(shutdown_flush.data_objects.is_empty());
+    let object_key = manifest.entries[0]
+        .object_key
+        .clone()
+        .expect("flushed data object key");
 
     let first_hit = service
         .query_native(blocks_request(10, 10))
@@ -114,6 +116,9 @@ async fn test_production_readiness_validates_service_staging_warmup_metrics_and_
         .query_native(blocks_request(12, 14))
         .expect("writer boundary flushes when staged rows reach threshold");
     assert_eq!(block_numbers(&flushed), vec![12, 13, 14]);
+    service
+        .wait_for_durable_promotions()
+        .expect("threshold promotion drain");
     assert!(
         storage
             .manifest()

@@ -563,7 +563,7 @@ async fn test_application_identity_does_not_partition_durable_cache_key() {
         .expect("application registry")
         .with_service(service(LocalStorage::new(&root), source.clone()))
         .expect("register service");
-    let app = router(registry);
+    let app = router(registry.clone());
 
     let first = app
         .clone()
@@ -574,6 +574,10 @@ async fn test_application_identity_does_not_partition_durable_cache_key() {
         ))
         .await
         .expect("first response");
+    assert_eq!(first.status(), StatusCode::OK);
+    registry
+        .wait_for_durable_promotions()
+        .expect("promotion drain");
     let second = app
         .oneshot(query_http_request(
             blocks_request(10, 10),
@@ -582,8 +586,6 @@ async fn test_application_identity_does_not_partition_durable_cache_key() {
         ))
         .await
         .expect("second response");
-
-    assert_eq!(first.status(), StatusCode::OK);
     assert_eq!(second.status(), StatusCode::OK);
     assert_eq!(
         source.calls(),

@@ -17,6 +17,9 @@ fn test_local_lifecycle_records_metrics_for_miss_fill_hit_and_provider_error() {
         .query_native(request.clone())
         .expect("miss fills cache");
     lifecycle_service
+        .wait_for_durable_promotions()
+        .expect("promotion drain");
+    lifecycle_service
         .query_native(request)
         .expect("hit reads cache");
 
@@ -238,6 +241,12 @@ fn test_local_lifecycle_covers_multichain_storage_isolation_and_unknown_chain() 
             ..blocks_request(40, 40)
         })
         .expect("polygon query");
+    ethereum
+        .wait_for_durable_promotions()
+        .expect("ethereum promotion drain");
+    polygon
+        .wait_for_durable_promotions()
+        .expect("polygon promotion drain");
 
     assert!(
         root.join("chains/evm/ethereum/1/manifest-segments")
@@ -275,6 +284,9 @@ fn test_empty_logs_lifecycle_records_empty_coverage_without_data_object_and_hits
     let first = service
         .query_native(request.clone())
         .expect("empty logs miss");
+    service
+        .wait_for_durable_promotions()
+        .expect("promotion drain");
     let second = service.query_native(request).expect("empty logs hit");
 
     assert_eq!(
@@ -320,6 +332,9 @@ fn test_local_lifecycle_returns_provider_rows_when_durable_write_fails_without_c
     let response = service
         .query_native(blocks_request(65, 65))
         .expect("provider rows are returned despite durable write failure");
+    service
+        .wait_for_durable_promotions()
+        .expect("failed promotion drain");
 
     assert_eq!(block_numbers(&response), vec![65]);
     assert_eq!(
@@ -369,6 +384,9 @@ fn test_local_lifecycle_durable_hit_reads_through_cache_after_manifest_coverage(
     let first = service
         .query_native(request.clone())
         .expect("miss fills cache");
+    service
+        .wait_for_durable_promotions()
+        .expect("promotion drain");
     let object_key = storage
         .manifest()
         .expect("manifest")
@@ -401,6 +419,41 @@ fn test_local_lifecycle_durable_hit_reads_through_cache_after_manifest_coverage(
 }
 
 #[test]
+fn test_local_lifecycle_reports_pending_promotion_then_hits_after_publish() {
+    let storage = LocalStorage::new(temp_storage_root("pending-promotion-lifecycle"));
+    let source = MockSource::default().with_blocks(vec![block(75)]);
+    let service = service(storage.clone(), source.clone());
+    let request = blocks_request(75, 75);
+
+    let first = service
+        .query_native(request.clone())
+        .expect("miss returns provider rows");
+
+    assert_eq!(block_numbers(&first), vec![75]);
+    assert_eq!(
+        first.cache.promotion_pending_ranges,
+        vec![LedgerRange::blocks(75, 75).expect("range")]
+    );
+    wait_for_coverage(
+        &storage,
+        LedgerRange::blocks(75, 75).expect("range"),
+        vec![LedgerRange::blocks(75, 75).expect("range")],
+    );
+
+    let second = service
+        .query_native(request)
+        .expect("later query hits cache");
+    assert_eq!(
+        second.cache.hit_ranges,
+        vec![LedgerRange::blocks(75, 75).expect("range")]
+    );
+    assert_eq!(
+        source.calls(),
+        vec![SourceCall::Blocks(BlockRange::expect_new(75, 75))]
+    );
+}
+
+#[test]
 fn test_s3_lifecycle_is_gated_and_uses_dedicated_prefix() {
     let Some(config) = s3_test_config() else {
         return;
@@ -430,6 +483,9 @@ fn test_s3_lifecycle_is_gated_and_uses_dedicated_prefix() {
     let first = service
         .query_native(request.clone())
         .expect("S3 miss fills cache");
+    service
+        .wait_for_durable_promotions()
+        .expect("S3 promotion drain");
     let second = service.query_native(request).expect("S3 hit reads cache");
 
     assert_eq!(
@@ -458,4 +514,25 @@ fn test_s3_lifecycle_is_gated_and_uses_dedicated_prefix() {
     assert_eq!(entry.checksum_algorithm.as_deref(), Some("sha256"));
 
     cleanup_s3_prefix(&store);
+}
+
+fn wait_for_coverage(storage: &LocalStorage, range: LedgerRange, expected: Vec<LedgerRange>) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let covered = storage
+            .covered_ranges(
+                &ethereum_identity(),
+                &DatasetKey::evm_blocks(),
+                &DatasetSelector::all(),
+                range.clone(),
+            )
+            .expect("covered ranges");
+        if covered == expected {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            assert_eq!(covered, expected);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
