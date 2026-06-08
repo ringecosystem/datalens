@@ -287,6 +287,18 @@ async fn test_api_warmup_list_exposes_follow_query_status() {
         .expect("submit response");
     assert_eq!(submit.status(), StatusCode::CREATED);
 
+    let run_once = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/warmup/run-once")
+                .header("x-datalens-application", "app-a")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("run-once response");
+    assert_eq!(run_once.status(), StatusCode::OK);
+
     let list = app
         .oneshot(
             Request::get("/v1/warmup/tasks")

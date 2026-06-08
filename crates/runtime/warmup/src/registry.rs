@@ -4,7 +4,8 @@ use datalens_storage::ObjectStore;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    WarmupCursor, WarmupSubmitRequest, WarmupTask, WarmupTaskId, WarmupTaskMode, WarmupTaskState,
+    WarmupCursor, WarmupFollowQueryStatus, WarmupSubmitRequest, WarmupTask, WarmupTaskId,
+    WarmupTaskMode, WarmupTaskState,
     task::{task_dedupe_key, task_ensure_key, task_ensure_key_for_task},
 };
 
@@ -283,6 +284,8 @@ struct StoredWarmupTask {
     updated_at: u64,
     last_error: Option<String>,
     stats: crate::WarmupStats,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    follow_query_status: Option<WarmupFollowQueryStatus>,
     dedupe_key: String,
 }
 
@@ -333,6 +336,7 @@ impl StoredWarmupTask {
             updated_at: task.updated_at,
             last_error: task.last_error.clone(),
             stats: task.stats.clone(),
+            follow_query_status: task.follow_query_status.clone(),
             dedupe_key: task.dedupe_key.clone(),
         })
     }
@@ -364,7 +368,7 @@ impl StoredWarmupTask {
             updated_at: self.updated_at,
             last_error: self.last_error,
             stats: self.stats,
-            follow_query_status: None,
+            follow_query_status: self.follow_query_status,
             dedupe_key: self.dedupe_key,
         })
     }
