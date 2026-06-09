@@ -24,7 +24,11 @@ use datalens_storage::{
 };
 use datalens_writer::{DurableWriteRequest, DurableWriteSegment, DurableWriter};
 
-use crate::helpers::{is_storage_error, metrics_durable_write_outcome};
+use crate::helpers::{
+    dataset_capability_max_range_len, is_storage_error, metrics_durable_write_outcome,
+    parse_provider_limit_hint, provider_limit_split_target, split_fetch_request_by_max_len,
+    split_provider_limit_range,
+};
 
 const DEFAULT_PROMOTION_WORKERS: usize = 4;
 const DEFAULT_PROMOTION_QUEUE_CAPACITY: usize = 1024;
@@ -1263,8 +1267,22 @@ fn fetch_intent_with_provider_limit_splits<A>(
 where
     A: ChainAdapter,
 {
+    let capability_max_len =
+        dataset_capability_max_range_len(&adapter.capabilities(), &fetch_request.dataset_key);
+    let initial_requests = split_fetch_request_by_max_len(&fetch_request, capability_max_len)?;
+    if initial_requests.len() > 1 {
+        log::info!(
+            "durable intent provider fetch pre-split intent_id={} dataset={} range={}-{} target_max_len={:?} chunks={}",
+            intent.intent_id,
+            fetch_request.dataset_key.as_str(),
+            fetch_request.range.start(),
+            fetch_request.range.end(),
+            capability_max_len,
+            initial_requests.len()
+        );
+    }
     let mut responses = Vec::new();
-    let mut queue = VecDeque::from([fetch_request]);
+    let mut queue = VecDeque::from(initial_requests);
     while let Some(fetch_request) = queue.pop_front() {
         let fetch_start = Instant::now();
         match adapter.fetch(fetch_request.clone()) {
@@ -1283,18 +1301,22 @@ where
                 if error.kind == DatalensErrorKind::ProviderLimit
                     && fetch_request.range.len() > 1 =>
             {
+                let hint_max_len = parse_provider_limit_hint(&error.message);
+                let split_target = provider_limit_split_target(capability_max_len, hint_max_len);
+                let split_ranges = split_provider_limit_range(&fetch_request.range, split_target)?;
                 log::warn!(
-                    "durable intent provider limit split intent_id={} dataset={} range={}-{} duration_ms={}",
+                    "durable intent provider limit split intent_id={} dataset={} range={}-{} target_max_len={:?} configured_max_len={:?} hint_max_len={:?} chunks={} duration_ms={}",
                     intent.intent_id,
                     fetch_request.dataset_key.as_str(),
                     fetch_request.range.start(),
                     fetch_request.range.end(),
+                    split_target,
+                    capability_max_len,
+                    hint_max_len,
+                    split_ranges.len(),
                     fetch_start.elapsed().as_millis()
                 );
-                for range in crate::helpers::split_provider_limit_range(&fetch_request.range)?
-                    .into_iter()
-                    .rev()
-                {
+                for range in split_ranges.into_iter().rev() {
                     queue.push_front(ChainFetchRequest {
                         range,
                         ..fetch_request.clone()
@@ -1447,7 +1469,11 @@ fn range_kind_key(kind: LedgerRangeKind) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datalens_core::{ChainFamily, NetworkId};
+    use datalens_chain::{
+        AdapterCapabilities, ChainFetchResponse, ChainHeight, DatasetCapability, HeightRangeKind,
+        SelectorKind,
+    };
+    use datalens_core::{BlockRange, ChainFamily, Dataset, LedgerRange, NetworkId, QueryRows};
     use datalens_storage::{CreateDurablePromotionIntent, DurablePromotionIntentCreateOutcome};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1466,6 +1492,58 @@ mod tests {
         marked_running: Mutex<Vec<String>>,
         marked_terminal: Mutex<Vec<String>>,
         last_limit: AtomicUsize,
+    }
+
+    #[derive(Clone)]
+    struct LimitHintAdapter {
+        calls: Arc<Mutex<Vec<BlockRange>>>,
+    }
+
+    impl LimitHintAdapter {
+        fn calls(&self) -> Vec<BlockRange> {
+            self.calls.lock().expect("adapter calls lock").clone()
+        }
+    }
+
+    impl ChainAdapter for LimitHintAdapter {
+        fn capabilities(&self) -> AdapterCapabilities {
+            AdapterCapabilities::new(ethereum_chain()).with_dataset_capability(
+                DatasetCapability::new(Dataset::Logs)
+                    .with_selector(SelectorKind::All)
+                    .with_range(HeightRangeKind::Block)
+                    .with_max_range_len(5_000)
+                    .with_empty_coverage(true)
+                    .with_safe_height(true)
+                    .with_finalized_height(true)
+                    .with_range_split(true),
+            )
+        }
+
+        fn latest_height(&self) -> Result<ChainHeight, DatalensError> {
+            Ok(ChainHeight::block(5_000))
+        }
+
+        fn cache_safe_height(&self) -> Result<ChainHeight, DatalensError> {
+            Ok(ChainHeight::block(5_000).with_finality(datalens_chain::FinalityKind::Safe))
+        }
+
+        fn fetch(&self, request: ChainFetchRequest) -> Result<ChainFetchResponse, DatalensError> {
+            let range = request.range.block_range().expect("expected block range");
+            self.calls.lock().expect("adapter calls lock").push(range);
+            if request.range.len() > 1_000 {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::ProviderLimit,
+                    "query block range exceeds server limit, narrow your filter: 1000",
+                ));
+            }
+            ChainFetchResponse::try_new(
+                request.chain,
+                request.dataset_key,
+                request.range,
+                request.selector,
+                QueryRows::EvmLogs(Vec::new()),
+            )
+        }
     }
 
     impl DurablePromotionIntentRepository for FailingListIntentRepository {
@@ -1925,6 +2003,41 @@ mod tests {
         assert_eq!(
             batch_ranges(&[first, second]),
             vec![datalens_core::LedgerRange::blocks(10, 12).expect("range")]
+        );
+    }
+
+    #[test]
+    fn test_fetch_intent_uses_provider_limit_hint_instead_of_repeated_halving() {
+        let adapter = LimitHintAdapter {
+            calls: Arc::new(Mutex::new(Vec::new())),
+        };
+        let intent = test_intent_with_chain("intent-provider-limit-hint", ethereum_chain(), 100);
+        let request = ChainFetchRequest::new(
+            ethereum_chain(),
+            DatasetKey::evm_logs(),
+            LedgerRange::blocks(1, 5_000).expect("valid range"),
+            DatasetSelector::all(),
+        );
+
+        fetch_intent_with_provider_limit_splits(&adapter, request, &intent)
+            .expect("provider hint split succeeds");
+
+        assert_eq!(
+            adapter.calls(),
+            vec![
+                BlockRange::expect_new(1, 5_000),
+                BlockRange::expect_new(1, 1_000),
+                BlockRange::expect_new(1_001, 2_000),
+                BlockRange::expect_new(2_001, 3_000),
+                BlockRange::expect_new(3_001, 4_000),
+                BlockRange::expect_new(4_001, 5_000),
+            ]
+        );
+        assert!(
+            !adapter.calls().iter().any(|range| {
+                range.from_block == 1 && (range.to_block == 2_500 || range.to_block == 1_250)
+            }),
+            "provider limit hint should avoid 2500/1250 retry ranges"
         );
     }
 

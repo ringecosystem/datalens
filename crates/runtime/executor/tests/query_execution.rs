@@ -598,6 +598,98 @@ fn test_executor_splits_provider_limit_ranges_without_changing_logical_query_ran
 }
 
 #[test]
+fn test_executor_uses_provider_limit_hint_instead_of_repeated_halving() {
+    let storage = LocalStorage::new(temp_storage_root("executor-provider-limit-hint"));
+    let source = MockSource::default()
+        .with_safe_height(5_000)
+        .with_capability_max_range_len(5_000)
+        .with_provider_limit_for_ranges_longer_than(1_000)
+        .with_provider_limit_message(
+            "query block range exceeds server limit, narrow your filter: 1000",
+        );
+    let executor = NativeQueryExecutor::new(
+        storage,
+        source.clone(),
+        NativeQueryExecutionConfig {
+            planner: NativePlannerConfig {
+                max_query_range_len: 5_000,
+                default_chunk_range_len: 5_000,
+            },
+            writer: DurableWriterConfig {
+                target_object_bytes: 1024,
+                min_object_rows: 1,
+                record_empty_coverage: true,
+                staging: Default::default(),
+            },
+        },
+    );
+
+    executor
+        .execute(blocks_input(1, 5_000))
+        .expect("provider hint split succeeds");
+
+    assert_eq!(
+        source.calls(),
+        vec![
+            SourceCall::Blocks(BlockRange::expect_new(1, 5_000)),
+            SourceCall::Blocks(BlockRange::expect_new(1, 1_000)),
+            SourceCall::Blocks(BlockRange::expect_new(1_001, 2_000)),
+            SourceCall::Blocks(BlockRange::expect_new(2_001, 3_000)),
+            SourceCall::Blocks(BlockRange::expect_new(3_001, 4_000)),
+            SourceCall::Blocks(BlockRange::expect_new(4_001, 5_000)),
+        ]
+    );
+    assert!(
+        !source.calls().iter().any(|call| matches!(
+            call,
+            SourceCall::Blocks(range)
+                if range.from_block == 1 && (range.to_block == 2_500 || range.to_block == 1_250)
+        )),
+        "provider limit hint should avoid 2500/1250 retry ranges"
+    );
+}
+
+#[test]
+fn test_executor_pre_splits_by_capability_before_provider_fetch() {
+    let storage = LocalStorage::new(temp_storage_root("executor-provider-capability-presplit"));
+    let source = MockSource::default()
+        .with_safe_height(5_000)
+        .with_capability_max_range_len(1_000)
+        .with_provider_limit_for_ranges_longer_than(1_000);
+    let executor = NativeQueryExecutor::new(
+        storage,
+        source.clone(),
+        NativeQueryExecutionConfig {
+            planner: NativePlannerConfig {
+                max_query_range_len: 5_000,
+                default_chunk_range_len: 5_000,
+            },
+            writer: DurableWriterConfig {
+                target_object_bytes: 1024,
+                min_object_rows: 1,
+                record_empty_coverage: true,
+                staging: Default::default(),
+            },
+        },
+    );
+
+    executor
+        .execute(blocks_input(1, 5_000))
+        .expect("provider capability pre-split succeeds");
+
+    assert_eq!(
+        source.calls(),
+        vec![
+            SourceCall::Blocks(BlockRange::expect_new(1, 1_000)),
+            SourceCall::Blocks(BlockRange::expect_new(1_001, 2_000)),
+            SourceCall::Blocks(BlockRange::expect_new(2_001, 3_000)),
+            SourceCall::Blocks(BlockRange::expect_new(3_001, 4_000)),
+            SourceCall::Blocks(BlockRange::expect_new(4_001, 5_000)),
+        ]
+    );
+}
+
+#[test]
 fn test_executor_passes_query_id_to_provider_fetch_context() {
     let storage = LocalStorage::new(temp_storage_root("executor-query-id"));
     let source = MockSource::default().with_blocks(vec![block(10, "0x10"), block(11, "0x11")]);
@@ -2465,6 +2557,7 @@ struct MockSource {
     safe_height_error: Arc<Mutex<Option<DatalensErrorKind>>>,
     error: Arc<Mutex<Option<DatalensErrorKind>>>,
     provider_limit_len: Arc<Mutex<Option<u128>>>,
+    provider_limit_message: Arc<Mutex<Option<String>>>,
     capability_max_range_len: Arc<Mutex<u64>>,
     fetch_delay: Arc<Mutex<Option<Duration>>>,
 }
@@ -2481,6 +2574,7 @@ impl Default for MockSource {
             safe_height_error: Arc::new(Mutex::new(None)),
             error: Arc::new(Mutex::new(None)),
             provider_limit_len: Arc::new(Mutex::new(None)),
+            provider_limit_message: Arc::new(Mutex::new(None)),
             capability_max_range_len: Arc::new(Mutex::new(2)),
             fetch_delay: Arc::new(Mutex::new(None)),
         }
@@ -2537,6 +2631,14 @@ impl MockSource {
             .provider_limit_len
             .lock()
             .expect("provider limit len lock") = Some(len);
+        self
+    }
+
+    fn with_provider_limit_message(self, message: impl Into<String>) -> Self {
+        *self
+            .provider_limit_message
+            .lock()
+            .expect("provider limit message lock") = Some(message.into());
         self
     }
 
@@ -2627,7 +2729,11 @@ impl ChainAdapter for MockSource {
         {
             return Err(DatalensError::new(
                 DatalensErrorKind::ProviderLimit,
-                "injected provider limit",
+                self.provider_limit_message
+                    .lock()
+                    .expect("provider limit message lock")
+                    .clone()
+                    .unwrap_or_else(|| "injected provider limit".to_owned()),
             ));
         }
         let rows = self
