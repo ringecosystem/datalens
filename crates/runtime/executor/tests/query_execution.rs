@@ -650,6 +650,56 @@ fn test_executor_uses_provider_limit_hint_instead_of_repeated_halving() {
 }
 
 #[test]
+fn test_executor_reuses_provider_limit_hint_on_repeated_latest_query() {
+    let storage = LocalStorage::new(temp_storage_root("executor-provider-limit-hint-reuse"));
+    let source = MockSource::default()
+        .with_latest_height(5_000)
+        .with_safe_height(5_000)
+        .with_capability_max_range_len(5_000)
+        .with_provider_limit_for_ranges_longer_than(1_000)
+        .with_provider_limit_message(
+            "query block range exceeds server limit, narrow your filter: 1000",
+        );
+    let executor = NativeQueryExecutor::new(
+        storage,
+        source.clone(),
+        NativeQueryExecutionConfig {
+            planner: NativePlannerConfig {
+                max_query_range_len: 5_000,
+                default_chunk_range_len: 5_000,
+            },
+            writer: DurableWriterConfig {
+                target_object_bytes: 1024,
+                min_object_rows: 1,
+                record_empty_coverage: true,
+                staging: Default::default(),
+            },
+        },
+    );
+    let mut input = blocks_input(1, 5_000);
+    input.finality = QueryFinalityRequirement::LatestOnly;
+
+    executor
+        .execute(input.clone())
+        .expect("first provider hint split succeeds");
+    source.clear_calls();
+    executor
+        .execute(input)
+        .expect("second provider hint split succeeds");
+
+    assert_eq!(
+        source.calls(),
+        vec![
+            SourceCall::Blocks(BlockRange::expect_new(1, 1_000)),
+            SourceCall::Blocks(BlockRange::expect_new(1_001, 2_000)),
+            SourceCall::Blocks(BlockRange::expect_new(2_001, 3_000)),
+            SourceCall::Blocks(BlockRange::expect_new(3_001, 4_000)),
+            SourceCall::Blocks(BlockRange::expect_new(4_001, 5_000)),
+        ]
+    );
+}
+
+#[test]
 fn test_executor_pre_splits_by_capability_before_provider_fetch() {
     let storage = LocalStorage::new(temp_storage_root("executor-provider-capability-presplit"));
     let source = MockSource::default()
@@ -2649,6 +2699,11 @@ impl MockSource {
 
     fn calls(&self) -> Vec<SourceCall> {
         self.calls.lock().expect("calls lock").clone()
+    }
+
+    fn clear_calls(&self) {
+        self.calls.lock().expect("calls lock").clear();
+        self.request_ids.lock().expect("request ids lock").clear();
     }
 
     fn request_ids(&self) -> Vec<Option<String>> {

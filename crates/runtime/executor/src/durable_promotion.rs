@@ -26,9 +26,9 @@ use datalens_writer::{DurableWriteRequest, DurableWriteSegment, DurableWriter};
 
 use crate::helpers::{
     dataset_capability_max_range_len, is_storage_error, metrics_durable_write_outcome,
-    parse_provider_limit_hint, provider_limit_split_target, split_fetch_request_by_max_len,
-    split_provider_limit_range,
+    parse_provider_limit_hint, split_fetch_request_by_max_len, split_provider_limit_range,
 };
+use crate::provider_range::{ProviderRangeController, ProviderRangeKey};
 
 const DEFAULT_PROMOTION_WORKERS: usize = 4;
 const DEFAULT_PROMOTION_QUEUE_CAPACITY: usize = 1024;
@@ -64,18 +64,23 @@ where
         writer: DurableWriter<R>,
         adapter: A,
         metrics: Option<Arc<MetricsRecorder>>,
+        provider_ranges: ProviderRangeController,
         startup_maintenance_once: Arc<Once>,
     ) -> Result<Self, DatalensError> {
         let claim_lock = Arc::new(Mutex::new(()));
+        let shared = IntentWorkerShared {
+            repository,
+            metrics,
+            provider_ranges,
+            claim_lock,
+            startup_maintenance_once,
+        };
         for worker_index in 0..DEFAULT_INTENT_WORKERS {
             spawn_intent_worker(
                 worker_index,
-                repository.clone(),
                 writer.clone(),
                 adapter.clone(),
-                metrics.clone(),
-                claim_lock.clone(),
-                startup_maintenance_once.clone(),
+                shared.clone(),
             )?;
         }
         Ok(Self {
@@ -83,6 +88,15 @@ where
             _adapter: std::marker::PhantomData,
         })
     }
+}
+
+#[derive(Clone)]
+struct IntentWorkerShared {
+    repository: Arc<dyn DurablePromotionIntentRepository>,
+    metrics: Option<Arc<MetricsRecorder>>,
+    provider_ranges: ProviderRangeController,
+    claim_lock: Arc<Mutex<()>>,
+    startup_maintenance_once: Arc<Once>,
 }
 
 #[derive(Debug, Default)]
@@ -386,12 +400,9 @@ where
 
 fn spawn_intent_worker<R, A>(
     worker_index: usize,
-    repository: Arc<dyn DurablePromotionIntentRepository>,
     writer: DurableWriter<R>,
     adapter: A,
-    metrics: Option<Arc<MetricsRecorder>>,
-    claim_lock: Arc<Mutex<()>>,
-    startup_maintenance_once: Arc<Once>,
+    shared: IntentWorkerShared,
 ) -> Result<(), DatalensError>
 where
     R: StorageRepository + Clone + 'static,
@@ -401,7 +412,10 @@ where
         .name(format!("datalens-durable-intent-{worker_index}"))
         .spawn(move || {
             let worker_chain = adapter.capabilities().chain().clone();
-            spawn_startup_maintenance_once(repository.clone(), startup_maintenance_once.as_ref());
+            spawn_startup_maintenance_once(
+                shared.repository.clone(),
+                shared.startup_maintenance_once.as_ref(),
+            );
             let mut last_backlog_metric_sample: Option<Instant> = None;
             loop {
                 let now = unix_seconds_now();
@@ -409,14 +423,14 @@ where
                     sampled.elapsed() >= DEFAULT_INTENT_BACKLOG_METRIC_INTERVAL
                 });
                 let intents = {
-                    let _claim = match claim_lock.lock() {
+                    let _claim = match shared.claim_lock.lock() {
                         Ok(claim) => claim,
                         Err(_) => return,
                     };
                     claim_pending_intents(
-                        repository.as_ref(),
+                        shared.repository.as_ref(),
                         &worker_chain,
-                        metrics.as_ref(),
+                        shared.metrics.as_ref(),
                         now,
                         worker_index,
                         record_backlog_metrics,
@@ -430,11 +444,12 @@ where
                     continue;
                 }
                 run_intent_batch_work(
-                    repository.as_ref(),
+                    shared.repository.as_ref(),
                     &writer,
                     &adapter,
                     &intents,
-                    metrics.as_ref(),
+                    shared.metrics.as_ref(),
+                    &shared.provider_ranges,
                 );
             }
         })
@@ -453,13 +468,21 @@ fn run_intent_batch_work<R, A>(
     adapter: &A,
     intents: &[DurablePromotionIntent],
     metrics: Option<&Arc<MetricsRecorder>>,
+    provider_ranges: &ProviderRangeController,
 ) where
     R: StorageRepository + Clone + 'static,
     A: ChainAdapter,
 {
     if intents.len() <= 1 {
         if let Some(intent) = intents.first() {
-            run_intent_work(repository, writer, adapter, intent, metrics);
+            run_intent_work(
+                repository,
+                writer,
+                adapter,
+                intent,
+                metrics,
+                provider_ranges,
+            );
         }
         return;
     }
@@ -479,7 +502,7 @@ fn run_intent_batch_work<R, A>(
         batch.selector_fingerprint,
         intent_ranges_label(&batch.ranges)
     );
-    let result = promote_intent(writer, adapter, &batch);
+    let result = promote_intent(writer, adapter, &batch, provider_ranges);
     for intent in intents {
         match &result {
             Ok(()) => {
@@ -555,6 +578,7 @@ fn run_intent_work<R, A>(
     adapter: &A,
     intent: &DurablePromotionIntent,
     metrics: Option<&Arc<MetricsRecorder>>,
+    provider_ranges: &ProviderRangeController,
 ) where
     R: StorageRepository + Clone + 'static,
     A: ChainAdapter,
@@ -570,7 +594,7 @@ fn run_intent_work<R, A>(
         intent_ranges_label(&intent.ranges),
         intent.attempt_count + 1
     );
-    let result = promote_intent(writer, adapter, intent);
+    let result = promote_intent(writer, adapter, intent, provider_ranges);
     match result {
         Ok(()) => match repository.mark_completed(&intent.intent_id, unix_seconds_now()) {
             Ok(_) => {
@@ -911,6 +935,7 @@ fn promote_intent<R, A>(
     writer: &DurableWriter<R>,
     adapter: &A,
     intent: &DurablePromotionIntent,
+    provider_ranges: &ProviderRangeController,
 ) -> Result<(), DatalensError>
 where
     R: StorageRepository + Clone + 'static,
@@ -941,7 +966,7 @@ where
             cache_write: true,
         });
         for (request, response) in
-            fetch_intent_with_provider_limit_splits(adapter, request, intent)?
+            fetch_intent_with_provider_limit_splits(adapter, request, intent, provider_ranges)?
         {
             response.validate_for_request(&request)?;
             segments.push(DurableWriteSegment {
@@ -1263,13 +1288,16 @@ fn fetch_intent_with_provider_limit_splits<A>(
     adapter: &A,
     fetch_request: ChainFetchRequest,
     intent: &DurablePromotionIntent,
+    provider_ranges: &ProviderRangeController,
 ) -> Result<Vec<(ChainFetchRequest, datalens_chain::ChainFetchResponse)>, DatalensError>
 where
     A: ChainAdapter,
 {
     let capability_max_len =
         dataset_capability_max_range_len(&adapter.capabilities(), &fetch_request.dataset_key);
-    let initial_requests = split_fetch_request_by_max_len(&fetch_request, capability_max_len)?;
+    let range_key = ProviderRangeKey::from_request(&fetch_request);
+    let effective_max_len = provider_ranges.effective_limit(&range_key, capability_max_len);
+    let initial_requests = split_fetch_request_by_max_len(&fetch_request, effective_max_len)?;
     if initial_requests.len() > 1 {
         log::info!(
             "durable intent provider fetch pre-split intent_id={} dataset={} range={}-{} target_max_len={:?} chunks={}",
@@ -1277,7 +1305,7 @@ where
             fetch_request.dataset_key.as_str(),
             fetch_request.range.start(),
             fetch_request.range.end(),
-            capability_max_len,
+            effective_max_len,
             initial_requests.len()
         );
     }
@@ -1295,6 +1323,11 @@ where
                     fetch_request.range.end(),
                     fetch_start.elapsed().as_millis()
                 );
+                provider_ranges.record_success(
+                    &range_key,
+                    capability_max_len,
+                    fetch_request.range.len(),
+                );
                 responses.push((fetch_request, response));
             }
             Err(error)
@@ -1302,7 +1335,12 @@ where
                     && fetch_request.range.len() > 1 =>
             {
                 let hint_max_len = parse_provider_limit_hint(&error.message);
-                let split_target = provider_limit_split_target(capability_max_len, hint_max_len);
+                let split_target = provider_ranges.record_provider_limit(
+                    &range_key,
+                    capability_max_len,
+                    fetch_request.range.len(),
+                    hint_max_len,
+                );
                 let split_ranges = split_provider_limit_range(&fetch_request.range, split_target)?;
                 log::warn!(
                     "durable intent provider limit split intent_id={} dataset={} range={}-{} target_max_len={:?} configured_max_len={:?} hint_max_len={:?} chunks={} duration_ms={}",
@@ -1502,6 +1540,10 @@ mod tests {
     impl LimitHintAdapter {
         fn calls(&self) -> Vec<BlockRange> {
             self.calls.lock().expect("adapter calls lock").clone()
+        }
+
+        fn clear_calls(&self) {
+            self.calls.lock().expect("adapter calls lock").clear();
         }
     }
 
@@ -2011,6 +2053,7 @@ mod tests {
         let adapter = LimitHintAdapter {
             calls: Arc::new(Mutex::new(Vec::new())),
         };
+        let provider_ranges = ProviderRangeController::default();
         let intent = test_intent_with_chain("intent-provider-limit-hint", ethereum_chain(), 100);
         let request = ChainFetchRequest::new(
             ethereum_chain(),
@@ -2019,7 +2062,7 @@ mod tests {
             DatasetSelector::all(),
         );
 
-        fetch_intent_with_provider_limit_splits(&adapter, request, &intent)
+        fetch_intent_with_provider_limit_splits(&adapter, request, &intent, &provider_ranges)
             .expect("provider hint split succeeds");
 
         assert_eq!(
@@ -2038,6 +2081,44 @@ mod tests {
                 range.from_block == 1 && (range.to_block == 2_500 || range.to_block == 1_250)
             }),
             "provider limit hint should avoid 2500/1250 retry ranges"
+        );
+    }
+
+    #[test]
+    fn test_fetch_intent_reuses_provider_limit_hint_on_repeated_fetch() {
+        let adapter = LimitHintAdapter {
+            calls: Arc::new(Mutex::new(Vec::new())),
+        };
+        let provider_ranges = ProviderRangeController::default();
+        let intent =
+            test_intent_with_chain("intent-provider-limit-hint-reuse", ethereum_chain(), 100);
+        let request = ChainFetchRequest::new(
+            ethereum_chain(),
+            DatasetKey::evm_logs(),
+            LedgerRange::blocks(1, 5_000).expect("valid range"),
+            DatasetSelector::all(),
+        );
+
+        fetch_intent_with_provider_limit_splits(
+            &adapter,
+            request.clone(),
+            &intent,
+            &provider_ranges,
+        )
+        .expect("first provider hint split succeeds");
+        adapter.clear_calls();
+        fetch_intent_with_provider_limit_splits(&adapter, request, &intent, &provider_ranges)
+            .expect("second provider hint split succeeds");
+
+        assert_eq!(
+            adapter.calls(),
+            vec![
+                BlockRange::expect_new(1, 1_000),
+                BlockRange::expect_new(1_001, 2_000),
+                BlockRange::expect_new(2_001, 3_000),
+                BlockRange::expect_new(3_001, 4_000),
+                BlockRange::expect_new(4_001, 5_000),
+            ]
         );
     }
 

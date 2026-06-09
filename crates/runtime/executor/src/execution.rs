@@ -44,6 +44,7 @@ use crate::{
         DurablePromotionIntentWorker, DurablePromotionMetrics, DurablePromotionQueue,
         DurablePromotionRequest, PromotionEnqueueOutcome,
     },
+    provider_range::{ProviderRangeController, ProviderRangeKey},
     provider_singleflight::ProviderSingleflight,
 };
 
@@ -103,6 +104,7 @@ pub struct NativeQueryExecutor<R, S> {
     writer: DurableWriter<R>,
     durable_promotions: DurablePromotionQueue<R>,
     provider_singleflight: ProviderSingleflight,
+    provider_ranges: ProviderRangeController,
     metrics: Option<ExecutorMetrics>,
     usage_ledger: Option<ExecutorUsageLedger>,
     query_watermarks: Option<ExecutorQueryWatermarks>,
@@ -160,6 +162,7 @@ where
             writer,
             durable_promotions,
             provider_singleflight: ProviderSingleflight::default(),
+            provider_ranges: ProviderRangeController::default(),
             metrics: None,
             usage_ledger: None,
             query_watermarks: None,
@@ -240,6 +243,7 @@ where
                 self.metrics
                     .as_ref()
                     .map(|metrics| metrics.recorder.clone()),
+                self.provider_ranges.clone(),
                 startup_maintenance_once,
             )
             .expect("durable intent workers start"),
@@ -988,7 +992,11 @@ where
             &self.source.capabilities(),
             &fetch_request.dataset_key,
         );
-        let initial_requests = split_fetch_request_by_max_len(&fetch_request, capability_max_len)?;
+        let range_key = ProviderRangeKey::from_request(&fetch_request);
+        let effective_max_len = self
+            .provider_ranges
+            .effective_limit(&range_key, capability_max_len);
+        let initial_requests = split_fetch_request_by_max_len(&fetch_request, effective_max_len)?;
         if initial_requests.len() > 1 {
             log::info!(
                 "provider fetch pre-split query_id={} dataset={} range={}-{} target_max_len={:?} chunks={}",
@@ -996,7 +1004,7 @@ where
                 fetch_request.dataset_key.as_str(),
                 fetch_request.range.start(),
                 fetch_request.range.end(),
-                capability_max_len,
+                effective_max_len,
                 initial_requests.len()
             );
         }
@@ -1018,6 +1026,11 @@ where
                         outcome.shared,
                         fetch_start.elapsed().as_millis()
                     );
+                    self.provider_ranges.record_success(
+                        &range_key,
+                        capability_max_len,
+                        fetch_request.range.len(),
+                    );
                     responses.push((fetch_request, outcome.response));
                 }
                 Err(error)
@@ -1025,8 +1038,12 @@ where
                         && fetch_request.range.len() > 1 =>
                 {
                     let hint_max_len = parse_provider_limit_hint(&error.message);
-                    let split_target =
-                        provider_limit_split_target(capability_max_len, hint_max_len);
+                    let split_target = self.provider_ranges.record_provider_limit(
+                        &range_key,
+                        capability_max_len,
+                        fetch_request.range.len(),
+                        hint_max_len,
+                    );
                     let split_ranges =
                         split_provider_limit_range(&fetch_request.range, split_target)?;
                     log::warn!(
