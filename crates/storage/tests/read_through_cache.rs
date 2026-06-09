@@ -83,6 +83,10 @@ impl ObjectStore for CountingObjectStore {
     fn delete(&self, key: &str) -> Result<(), datalens_core::DatalensError> {
         self.inner.delete(key)
     }
+
+    fn lock_namespace(&self) -> String {
+        self.inner.lock_namespace()
+    }
 }
 
 #[test]

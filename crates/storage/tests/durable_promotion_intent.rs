@@ -1156,6 +1156,10 @@ impl ObjectStore for CountingObjectStore {
     fn delete(&self, key: &str) -> Result<(), DatalensError> {
         self.inner.delete(key)
     }
+
+    fn lock_namespace(&self) -> String {
+        self.inner.lock_namespace()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1217,6 +1221,10 @@ impl ObjectStore for FailOnceIndexPutObjectStore {
 
     fn delete(&self, key: &str) -> Result<(), DatalensError> {
         self.inner.delete(key)
+    }
+
+    fn lock_namespace(&self) -> String {
+        self.inner.lock_namespace()
     }
 }
 

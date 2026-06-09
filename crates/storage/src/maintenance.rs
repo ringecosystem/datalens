@@ -497,7 +497,7 @@ where
         rows.sort();
         let rows = DatasetRows::new(candidate.dataset_key.clone(), rows)?;
         let object_compression = match candidate.object_encoding {
-            ObjectEncoding::ParquetV1 => Some(ParquetCompression::None),
+            ObjectEncoding::ParquetV1 => Some(self.parquet_compression()),
             ObjectEncoding::Json => None,
         };
         let bytes = encode_object_rows(
