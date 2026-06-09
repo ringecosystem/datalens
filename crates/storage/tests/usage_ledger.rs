@@ -581,6 +581,10 @@ impl ObjectStore for PausingFirstPutObjectStore {
     fn delete(&self, key: &str) -> Result<(), DatalensError> {
         self.inner.delete(key)
     }
+
+    fn lock_namespace(&self) -> String {
+        self.inner.lock_namespace()
+    }
 }
 
 impl CountingObjectStore {
@@ -626,6 +630,10 @@ impl ObjectStore for CountingObjectStore {
 
     fn delete(&self, key: &str) -> Result<(), DatalensError> {
         self.inner.delete(key)
+    }
+
+    fn lock_namespace(&self) -> String {
+        self.inner.lock_namespace()
     }
 }
 

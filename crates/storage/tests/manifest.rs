@@ -107,6 +107,10 @@ impl ObjectStore for StaleManifestObjectStore {
     fn delete(&self, key: &str) -> Result<(), DatalensError> {
         self.inner.delete(key)
     }
+
+    fn lock_namespace(&self) -> String {
+        self.inner.lock_namespace()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -164,6 +168,10 @@ impl ObjectStore for CountingDataObjectExistsStore {
     fn delete(&self, key: &str) -> Result<(), DatalensError> {
         self.inner.delete(key)
     }
+
+    fn lock_namespace(&self) -> String {
+        self.inner.lock_namespace()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -210,6 +218,10 @@ impl ObjectStore for MissingDataObjectExistsStore {
 
     fn delete(&self, key: &str) -> Result<(), DatalensError> {
         self.inner.delete(key)
+    }
+
+    fn lock_namespace(&self) -> String {
+        self.inner.lock_namespace()
     }
 }
 
@@ -270,6 +282,10 @@ impl ObjectStore for ManifestGetCountingStore {
 
     fn delete(&self, key: &str) -> Result<(), DatalensError> {
         self.inner.delete(key)
+    }
+
+    fn lock_namespace(&self) -> String {
+        self.inner.lock_namespace()
     }
 }
 
@@ -409,6 +425,10 @@ impl ObjectStore for ManifestAccessCountingStore {
     fn delete(&self, key: &str) -> Result<(), DatalensError> {
         self.inner.delete(key)
     }
+
+    fn lock_namespace(&self) -> String {
+        self.inner.lock_namespace()
+    }
 }
 
 #[derive(Debug)]
@@ -424,6 +444,18 @@ struct PausedManifestPutStore {
     inner: LocalObjectStore,
     paused_put_prefix: String,
     state: Arc<PausedManifestPutState>,
+}
+
+#[derive(Debug)]
+struct RacingCoverageIndexPutState {
+    waiting_puts: Mutex<usize>,
+    ready: Condvar,
+}
+
+#[derive(Clone, Debug)]
+struct RacingCoverageIndexPutStore {
+    inner: LocalObjectStore,
+    state: Arc<RacingCoverageIndexPutState>,
 }
 
 impl PausedManifestPutStore {
@@ -455,6 +487,18 @@ impl PausedManifestPutStore {
         let mut release_put = self.state.release_put.lock().expect("lock release put");
         *release_put = true;
         self.state.release_put_ready.notify_all();
+    }
+}
+
+impl RacingCoverageIndexPutStore {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            inner: LocalObjectStore::new(root),
+            state: Arc::new(RacingCoverageIndexPutState {
+                waiting_puts: Mutex::new(0),
+                ready: Condvar::new(),
+            }),
+        }
     }
 }
 
@@ -502,6 +546,62 @@ impl ObjectStore for PausedManifestPutStore {
     fn delete(&self, key: &str) -> Result<(), DatalensError> {
         self.inner.delete(key)
     }
+
+    fn lock_namespace(&self) -> String {
+        self.inner.lock_namespace()
+    }
+}
+
+impl ObjectStore for RacingCoverageIndexPutStore {
+    fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError> {
+        self.inner.get(key)
+    }
+
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
+        if key.contains("/coverage-index/") {
+            let mut waiting_puts = self.state.waiting_puts.lock().expect("lock waiting puts");
+            *waiting_puts += 1;
+            self.state.ready.notify_all();
+            while *waiting_puts < 2 {
+                let (guard, timeout) = self
+                    .state
+                    .ready
+                    .wait_timeout(waiting_puts, Duration::from_millis(250))
+                    .expect("wait coverage index put");
+                waiting_puts = guard;
+                if timeout.timed_out() {
+                    break;
+                }
+            }
+            self.state.ready.notify_all();
+        }
+        self.inner.put(key, bytes)
+    }
+
+    fn exists(&self, key: &str) -> Result<bool, DatalensError> {
+        self.inner.exists(key)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
+        self.inner.list(prefix)
+    }
+
+    fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ObjectListPage, DatalensError> {
+        self.inner.list_page(prefix, start_after, limit)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), DatalensError> {
+        self.inner.delete(key)
+    }
+
+    fn lock_namespace(&self) -> String {
+        self.inner.lock_namespace()
+    }
 }
 
 impl ObjectStore for FailingPutObjectStore {
@@ -535,6 +635,10 @@ impl ObjectStore for FailingPutObjectStore {
 
     fn delete(&self, key: &str) -> Result<(), DatalensError> {
         self.inner.delete(key)
+    }
+
+    fn lock_namespace(&self) -> String {
+        self.inner.lock_namespace()
     }
 }
 
@@ -3420,6 +3524,79 @@ fn test_concurrent_same_bucket_coverage_index_writes_do_not_lose_entries() {
             )
             .expect("covered ranges"),
         ranges
+    );
+}
+
+#[test]
+fn test_independent_storage_instances_serialize_same_bucket_coverage_index_writes() {
+    let root = temp_storage_root("independent-same-bucket-coverage-index-writes");
+    let expected_lock_namespace = LocalObjectStore::new(root.clone()).lock_namespace();
+    let store = RacingCoverageIndexPutStore::new(root);
+    assert_eq!(store.lock_namespace(), expected_lock_namespace);
+    let first_storage = DurableStorage::from_object_store(store.clone());
+    let second_storage = DurableStorage::from_object_store(store.clone());
+    let reader = DurableStorage::from_object_store(store);
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let first_range = LedgerRange::blocks(10, 10).expect("valid range");
+    let second_range = LedgerRange::blocks(11, 11).expect("valid range");
+    let expected_range = LedgerRange::blocks(10, 11).expect("valid range");
+    let first_chain = chain.clone();
+    let second_chain = chain.clone();
+    let first_selector = selector.clone();
+    let second_selector = selector.clone();
+    let barrier = Arc::new(Barrier::new(3));
+
+    let first_barrier = barrier.clone();
+    let first = std::thread::spawn(move || {
+        let rows = DatasetRows::new(DatasetKey::evm_logs(), QueryRows::EvmLogs(Vec::new()))
+            .expect("dataset rows");
+        first_barrier.wait();
+        first_storage
+            .write_rows(StorageWriteRequest {
+                chain: &first_chain,
+                dataset_key: DatasetKey::evm_logs(),
+                selector: &first_selector,
+                range: first_range,
+                rows: &rows,
+                finality_level: FinalityLevel::Safe,
+                record_empty_coverage: true,
+            })
+            .expect("write first coverage");
+    });
+
+    let second_barrier = barrier.clone();
+    let second = std::thread::spawn(move || {
+        let rows = DatasetRows::new(DatasetKey::evm_logs(), QueryRows::EvmLogs(Vec::new()))
+            .expect("dataset rows");
+        second_barrier.wait();
+        second_storage
+            .write_rows(StorageWriteRequest {
+                chain: &second_chain,
+                dataset_key: DatasetKey::evm_logs(),
+                selector: &second_selector,
+                range: second_range,
+                rows: &rows,
+                finality_level: FinalityLevel::Safe,
+                record_empty_coverage: true,
+            })
+            .expect("write second coverage");
+    });
+
+    barrier.wait();
+    first.join().expect("first writer");
+    second.join().expect("second writer");
+
+    assert_eq!(
+        reader
+            .covered_ranges(
+                &chain,
+                &DatasetKey::evm_logs(),
+                &selector,
+                expected_range.clone(),
+            )
+            .expect("covered ranges"),
+        vec![expected_range]
     );
 }
 

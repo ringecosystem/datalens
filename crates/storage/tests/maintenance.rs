@@ -6,9 +6,14 @@ use datalens_core::{
     DatasetRows, LedgerRange, NetworkId, QueryRows,
 };
 use datalens_storage::{
-    DurableStorage, LocalObjectStore, LocalStorage, MaintenanceCompactionConfig,
-    MaintenanceCompactionTickStatus, MaintenanceIssueKind, MaintenanceOperationMode, Manifest,
-    ObjectListPage, ObjectMetadata, ObjectStore, StorageWriteRequest,
+    DurableStorage, DurableStorageConfig, LocalObjectStore, LocalStorage,
+    MaintenanceCompactionConfig, MaintenanceCompactionTickStatus, MaintenanceIssueKind,
+    MaintenanceOperationMode, Manifest, ObjectListPage, ObjectMetadata, ObjectStore,
+    ParquetCompression, StorageWriteRequest,
+};
+use parquet::{
+    basic::Compression,
+    file::reader::{FileReader, SerializedFileReader},
 };
 use std::sync::{Arc, Mutex};
 
@@ -95,6 +100,10 @@ impl ObjectStore for FailingDataObjectPutStore {
     fn delete(&self, key: &str) -> Result<(), DatalensError> {
         self.inner.delete(key)
     }
+
+    fn lock_namespace(&self) -> String {
+        self.inner.lock_namespace()
+    }
 }
 
 impl ObjectStore for CountingListStore {
@@ -133,6 +142,10 @@ impl ObjectStore for CountingListStore {
 
     fn delete(&self, key: &str) -> Result<(), DatalensError> {
         self.inner.delete(key)
+    }
+
+    fn lock_namespace(&self) -> String {
+        self.inner.lock_namespace()
     }
 }
 
@@ -367,6 +380,49 @@ fn test_compaction_merges_adjacent_small_objects_and_retains_old_objects() {
             .issues
             .is_empty()
     );
+}
+
+#[test]
+fn test_compaction_uses_configured_parquet_compression() {
+    let storage = LocalStorage::new_with_config(
+        temp_storage_root("compaction-zstd"),
+        DurableStorageConfig {
+            parquet_compression: ParquetCompression::Zstd,
+        },
+    );
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 60, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 61, FinalityLevel::Safe);
+
+    storage
+        .compact_small_objects(MaintenanceCompactionConfig {
+            min_object_bytes: u64::MAX,
+            max_merge_ranges: 8,
+            max_tick_duration_ms: 30_000,
+            max_candidates_per_tick: 8,
+            max_manifest_entries_per_tick: 20_000,
+        })
+        .expect("compact small objects");
+
+    let manifest = storage.manifest().expect("manifest");
+    let compacted_entry = manifest
+        .entries
+        .iter()
+        .find(|entry| entry.range == LedgerRange::blocks(60, 61).expect("range"))
+        .expect("compacted entry");
+    assert_eq!(
+        compacted_entry.object_compression,
+        Some(ParquetCompression::Zstd)
+    );
+    let compacted_object = compacted_entry
+        .object_key
+        .as_ref()
+        .expect("compacted object key");
+    let compacted_bytes = storage
+        .object_store()
+        .get(compacted_object)
+        .expect("compacted object bytes");
+    assert_parquet_compression(&compacted_bytes, Compression::ZSTD(Default::default()));
 }
 
 #[test]
@@ -896,6 +952,16 @@ fn temp_storage_root(name: &str) -> PathBuf {
     ));
     std::fs::create_dir_all(&root).expect("create temp storage root");
     root
+}
+
+fn assert_parquet_compression(bytes: &[u8], expected: Compression) {
+    let reader = SerializedFileReader::new(bytes::Bytes::copy_from_slice(bytes))
+        .expect("parquet file reader");
+    for row_group in reader.metadata().row_groups() {
+        for column in row_group.columns() {
+            assert_eq!(column.compression(), expected);
+        }
+    }
 }
 
 fn read_manifest_json(storage: &LocalStorage, chain: &ChainIdentity) -> serde_json::Value {

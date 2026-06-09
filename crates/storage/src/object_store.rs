@@ -42,6 +42,10 @@ pub trait ObjectStore: Clone + Send + Sync {
         limit: usize,
     ) -> Result<ObjectListPage, DatalensError>;
     fn delete(&self, key: &str) -> Result<(), DatalensError>;
+
+    fn lock_namespace(&self) -> String {
+        std::any::type_name::<Self>().to_owned()
+    }
 }
 
 pub fn validate_object_key(key: &str) -> Result<(), DatalensError> {
@@ -198,6 +202,14 @@ impl ObjectStore for LocalObjectStore {
                 format!("delete object {}: {error}", path.display()),
             )),
         }
+    }
+
+    fn lock_namespace(&self) -> String {
+        let root = self
+            .root
+            .canonicalize()
+            .unwrap_or_else(|_| self.root.clone());
+        format!("local:{}", root.display())
     }
 }
 
@@ -751,6 +763,14 @@ impl ObjectStore for S3ObjectStore {
                     })?;
                 Ok(())
             })
+    }
+
+    fn lock_namespace(&self) -> String {
+        format!(
+            "s3:{}/{}",
+            self.bucket,
+            self.prefix.as_deref().unwrap_or_default()
+        )
     }
 }
 

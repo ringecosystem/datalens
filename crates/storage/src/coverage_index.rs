@@ -1,11 +1,18 @@
 use datalens_chain::DatasetSelector;
 use datalens_core::{ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey, LedgerRange};
 use serde::{Deserialize, Serialize};
-use std::time::Instant;
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex, MutexGuard, OnceLock, Weak},
+    time::Instant,
+};
 
 use crate::{Manifest, ManifestEntry, ManifestFinalityLevel, ObjectStore, range_kind_key};
 
 pub(crate) const DEFAULT_COVERAGE_INDEX_BUCKET_SIZE: u64 = 100_000;
+
+static COVERAGE_INDEX_UPDATE_LOCKS: OnceLock<Mutex<BTreeMap<String, Weak<Mutex<()>>>>> =
+    OnceLock::new();
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -100,6 +107,8 @@ where
             bucket_start,
             bucket_end,
         );
+        let lock = coverage_index_update_lock(object_store, &key)?;
+        let _guard = lock_coverage_index_update(&lock)?;
         let mut index = if object_store.exists(&key)? {
             let bytes = object_store.get(&key)?;
             serde_json::from_slice(&bytes).map_err(|error| {
@@ -137,6 +146,38 @@ where
         );
     }
     Ok(())
+}
+
+fn coverage_index_update_lock<S>(
+    object_store: &S,
+    key: &str,
+) -> Result<Arc<Mutex<()>>, DatalensError>
+where
+    S: ObjectStore,
+{
+    let lock_key = format!("{}:{key}", object_store.lock_namespace());
+    let mut locks = COVERAGE_INDEX_UPDATE_LOCKS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .map_err(|_| DatalensError::internal("coverage index update lock poisoned"))?;
+    prune_stale_coverage_index_update_locks(&mut locks);
+    if let Some(lock) = locks.get(&lock_key).and_then(Weak::upgrade) {
+        return Ok(lock);
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(lock_key, Arc::downgrade(&lock));
+    Ok(lock)
+}
+
+fn lock_coverage_index_update<'a>(
+    lock: &'a Mutex<()>,
+) -> Result<MutexGuard<'a, ()>, DatalensError> {
+    lock.lock()
+        .map_err(|_| DatalensError::internal("coverage index update lock poisoned"))
+}
+
+fn prune_stale_coverage_index_update_locks(locks: &mut BTreeMap<String, Weak<Mutex<()>>>) {
+    locks.retain(|_, lock| lock.strong_count() > 0);
 }
 
 #[allow(dead_code)]
@@ -262,4 +303,25 @@ fn can_merge_empty(left: &ManifestEntry, right: &ManifestEntry) -> bool {
         && left.finality_level == right.finality_level
         && left.range.kind() == right.range.kind()
         && left.range.end().saturating_add(1) >= right.range.start()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_prune_stale_coverage_index_update_locks_retains_live_locks_only() {
+        let live_lock = Arc::new(Mutex::new(()));
+        let stale_lock = Arc::new(Mutex::new(()));
+        let mut locks = BTreeMap::from([
+            ("live".to_owned(), Arc::downgrade(&live_lock)),
+            ("stale".to_owned(), Arc::downgrade(&stale_lock)),
+        ]);
+        drop(stale_lock);
+
+        prune_stale_coverage_index_update_locks(&mut locks);
+
+        assert!(locks.contains_key("live"));
+        assert!(!locks.contains_key("stale"));
+    }
 }

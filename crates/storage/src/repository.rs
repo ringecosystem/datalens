@@ -353,6 +353,10 @@ where
         &self.object_store
     }
 
+    pub(crate) fn parquet_compression(&self) -> ParquetCompression {
+        self.config.parquet_compression
+    }
+
     pub fn covered_ranges(
         &self,
         chain: &ChainIdentity,
