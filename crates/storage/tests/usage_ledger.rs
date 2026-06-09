@@ -14,10 +14,10 @@ use datalens_core::{
     NetworkId,
 };
 use datalens_storage::{
-    CacheOutcome, FillOutcome, LocalObjectStore, ObjectMetadata, ObjectStore, QueryActivity,
-    QueryActivityKey, QueryActivityRepository, QueryActivityStore, QueryOutcome, QueryWatermark,
-    QueryWatermarkKey, QueryWatermarkRepository, QueryWatermarkStore, UsageLedgerEntry,
-    UsageLedgerRepository, UsageLedgerStore,
+    CacheOutcome, FillOutcome, LocalObjectStore, ObjectListPage, ObjectMetadata, ObjectStore,
+    QueryActivity, QueryActivityKey, QueryActivityRepository, QueryActivityStore, QueryOutcome,
+    QueryWatermark, QueryWatermarkKey, QueryWatermarkRepository, QueryWatermarkStore,
+    UsageLedgerEntry, UsageLedgerRepository, UsageLedgerStore,
 };
 
 #[test]
@@ -569,6 +569,15 @@ impl ObjectStore for PausingFirstPutObjectStore {
         self.inner.list(prefix)
     }
 
+    fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ObjectListPage, DatalensError> {
+        self.inner.list_page(prefix, start_after, limit)
+    }
+
     fn delete(&self, key: &str) -> Result<(), DatalensError> {
         self.inner.delete(key)
     }
@@ -606,6 +615,15 @@ impl ObjectStore for CountingObjectStore {
         self.inner.list(prefix)
     }
 
+    fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ObjectListPage, DatalensError> {
+        self.inner.list_page(prefix, start_after, limit)
+    }
+
     fn delete(&self, key: &str) -> Result<(), DatalensError> {
         self.inner.delete(key)
     }
@@ -632,6 +650,18 @@ impl ObjectStore for FailingPutObjectStore {
 
     fn list(&self, _prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
         Ok(Vec::new())
+    }
+
+    fn list_page(
+        &self,
+        _prefix: &str,
+        _start_after: Option<&str>,
+        _limit: usize,
+    ) -> Result<ObjectListPage, DatalensError> {
+        Ok(ObjectListPage {
+            objects: Vec::new(),
+            has_more: false,
+        })
     }
 
     fn delete(&self, _key: &str) -> Result<(), DatalensError> {

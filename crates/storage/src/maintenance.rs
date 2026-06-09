@@ -1,4 +1,7 @@
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    time::{Duration, Instant},
+};
 
 use datalens_core::{
     ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey, DatasetRows, LedgerRange,
@@ -9,7 +12,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     DurableStorage, Manifest, ManifestEntry, ManifestFinalityLevel, ObjectEncoding, ObjectStore,
     ParquetCompression, StorageDataObject, checksum_hex, decode_object_rows, encode_object_rows,
-    range_kind_key, unix_seconds_now, verify_manifest_object_metadata,
+    manifest_key, manifest_segment_prefix, range_kind_key, unix_seconds_now,
+    verify_manifest_object_metadata,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -79,14 +83,39 @@ pub enum MaintenanceIssueKind {
 pub struct MaintenanceCompactionReport {
     pub read_only: bool,
     pub candidates: Vec<CompactionCandidate>,
+    pub candidate_count: usize,
+    pub processed_candidates: usize,
+    pub duration_ms: u64,
+    pub tick_status: MaintenanceCompactionTickStatus,
     pub compacted_objects: usize,
     pub compacted_rows: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaintenanceCompactionTickStatus {
+    Completed,
+    Partial,
+    Failed,
+}
+
+impl MaintenanceCompactionTickStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Partial => "partial",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MaintenanceCompactionConfig {
     pub min_object_bytes: u64,
     pub max_merge_ranges: usize,
+    pub max_tick_duration_ms: u64,
+    pub max_candidates_per_tick: usize,
+    pub max_manifest_entries_per_tick: usize,
 }
 
 impl Default for MaintenanceCompactionConfig {
@@ -94,6 +123,9 @@ impl Default for MaintenanceCompactionConfig {
         Self {
             min_object_bytes: u64::MAX,
             max_merge_ranges: 32,
+            max_tick_duration_ms: 30_000,
+            max_candidates_per_tick: 8,
+            max_manifest_entries_per_tick: 20_000,
         }
     }
 }
@@ -195,7 +227,11 @@ where
             },
             compaction: MaintenanceCompactionReport {
                 read_only: true,
+                candidate_count: candidates.len(),
                 candidates,
+                processed_candidates: 0,
+                duration_ms: 0,
+                tick_status: MaintenanceCompactionTickStatus::Completed,
                 compacted_objects: 0,
                 compacted_rows: 0,
             },
@@ -224,8 +260,17 @@ where
         &self,
         config: MaintenanceCompactionConfig,
     ) -> Result<MaintenanceCompactionReport, DatalensError> {
+        let started = Instant::now();
         let manifest = self.manifest()?;
-        self.compact_manifest_small_objects(manifest, config)
+        let entries = manifest
+            .entries
+            .into_iter()
+            .map(|entry| SelectedManifestEntry {
+                segment_key: None,
+                entry,
+            })
+            .collect::<Vec<_>>();
+        self.compact_selected_manifest_entries(entries, config, started, None, false)
     }
 
     pub fn compact_small_objects_for_chain(
@@ -233,34 +278,119 @@ where
         chain: &ChainIdentity,
         config: MaintenanceCompactionConfig,
     ) -> Result<MaintenanceCompactionReport, DatalensError> {
-        let manifest = self.manifest_for_chain(chain)?;
-        self.compact_manifest_small_objects(manifest, config)
+        let started = Instant::now();
+        log::info!(
+            "storage compaction tick started chain_key={} max_tick_duration_ms={} max_candidates_per_tick={} max_manifest_entries_per_tick={}",
+            chain.key_prefix(),
+            config.max_tick_duration_ms,
+            config.max_candidates_per_tick,
+            config.max_manifest_entries_per_tick
+        );
+        let scan = self.scan_compaction_manifest_entries(chain, config, started)?;
+        let report = self.compact_selected_manifest_entries(
+            scan.entries,
+            config,
+            started,
+            Some((chain, scan.cursor_advance)),
+            scan.partial,
+        )?;
+        Ok(report)
     }
 
-    fn compact_manifest_small_objects(
+    fn compact_selected_manifest_entries(
         &self,
-        manifest: Manifest,
+        entries: Vec<SelectedManifestEntry>,
         config: MaintenanceCompactionConfig,
+        started: Instant,
+        cursor: Option<(&ChainIdentity, Option<CompactionCursor>)>,
+        scan_partial: bool,
     ) -> Result<MaintenanceCompactionReport, DatalensError> {
-        let candidates = compaction_candidates(&manifest.entries, config);
+        let build_started = Instant::now();
+        let manifest_entries = entries
+            .iter()
+            .map(|entry| entry.entry.clone())
+            .collect::<Vec<_>>();
+        let candidates = compaction_candidates(&manifest_entries, config);
+        log::info!(
+            "storage compaction candidate build candidate_count={} entry_count={} duration_ms={}",
+            candidates.len(),
+            manifest_entries.len(),
+            build_started.elapsed().as_millis()
+        );
         let mut compacted_objects = 0usize;
         let mut compacted_rows = 0usize;
+        let mut processed_candidates = 0usize;
+        let mut cursor_advance_key = None;
+        let max_candidates = config.max_candidates_per_tick.max(1);
+        let max_duration = Duration::from_millis(config.max_tick_duration_ms.max(1));
+        let mut partial = scan_partial;
 
         for candidate in &candidates {
-            let chain_manifest = self.manifest_for_chain(&candidate.chain)?;
-            let entries = candidate_entries(&chain_manifest.entries, candidate);
-            if entries.len() != candidate.entry_count {
+            if processed_candidates >= max_candidates || started.elapsed() >= max_duration {
+                partial = true;
+                break;
+            }
+            let candidate_started = Instant::now();
+            let selected_entries = candidate_selected_entries(&entries, candidate);
+            if selected_entries.len() != candidate.entry_count {
                 continue;
             }
-            let compacted = self.write_compacted_object(candidate, &entries)?;
+            let candidate_entries = selected_entries
+                .iter()
+                .map(|entry| entry.entry.clone())
+                .collect::<Vec<_>>();
+            let compacted = self.write_compacted_object(candidate, &candidate_entries)?;
             compacted_rows += compacted.row_count;
             compacted_objects += 1;
+            processed_candidates += 1;
+            cursor_advance_key = selected_entries
+                .iter()
+                .filter_map(|entry| entry.segment_key.clone())
+                .max()
+                .or(cursor_advance_key);
+            let publish_started = Instant::now();
             self.write_manifest_entry(&candidate.chain, compacted.entry)?;
+            log::info!(
+                "storage compaction manifest publish chain_key={} duration_ms={}",
+                candidate.chain.key_prefix(),
+                publish_started.elapsed().as_millis()
+            );
+            log::info!(
+                "storage compaction candidate compacted chain_key={} range_kind={} range={}-{} processed_candidates={} duration_ms={}",
+                candidate.chain.key_prefix(),
+                candidate.range_kind,
+                candidate.range.start(),
+                candidate.range.end(),
+                processed_candidates,
+                candidate_started.elapsed().as_millis()
+            );
         }
+
+        if let Some((chain, scan_cursor_advance_key)) = cursor {
+            let next_key = if partial && processed_candidates < candidates.len() {
+                cursor_advance_key
+                    .map(segment_compaction_cursor)
+                    .or(scan_cursor_advance_key)
+            } else if partial {
+                scan_cursor_advance_key
+            } else {
+                None
+            };
+            self.write_compaction_cursor(chain, next_key)?;
+        }
+        let tick_status = if partial {
+            MaintenanceCompactionTickStatus::Partial
+        } else {
+            MaintenanceCompactionTickStatus::Completed
+        };
 
         Ok(MaintenanceCompactionReport {
             read_only: false,
+            candidate_count: candidates.len(),
             candidates,
+            processed_candidates,
+            duration_ms: duration_millis(started),
+            tick_status,
             compacted_objects,
             compacted_rows,
         })
@@ -337,7 +467,15 @@ where
                     "compaction candidate includes empty coverage",
                 ));
             };
+            let read_started = Instant::now();
             let bytes = self.object_store().get(object_key)?;
+            log::info!(
+                "storage compaction object read chain_key={} object_key={} object_bytes={} duration_ms={}",
+                candidate.chain.key_prefix(),
+                object_key,
+                bytes.len(),
+                read_started.elapsed().as_millis()
+            );
             verify_manifest_object_metadata(entry, object_key, &bytes)?;
             let mut object_rows = decode_object_rows(
                 candidate.object_encoding,
@@ -379,7 +517,16 @@ where
             checksum_algorithm: "sha256".to_owned(),
             written_at_unix_seconds: unix_seconds_now()?,
         };
+        let write_started = Instant::now();
         self.object_store().put(&object_key, &bytes)?;
+        log::info!(
+            "storage compaction object write chain_key={} object_key={} object_bytes={} rows={} duration_ms={}",
+            candidate.chain.key_prefix(),
+            object_key,
+            bytes.len(),
+            rows.row_count(),
+            write_started.elapsed().as_millis()
+        );
         Ok(CompactedObject {
             row_count: rows.row_count(),
             entry: ManifestEntry {
@@ -400,6 +547,263 @@ where
             },
         })
     }
+
+    fn scan_compaction_manifest_entries(
+        &self,
+        chain: &ChainIdentity,
+        config: MaintenanceCompactionConfig,
+        tick_started: Instant,
+    ) -> Result<CompactionManifestScan, DatalensError> {
+        let load_started = Instant::now();
+        let prefix = manifest_segment_prefix(chain);
+        let cursor = self.read_compaction_cursor(chain)?;
+        let max_entries = config.max_manifest_entries_per_tick.max(1);
+        if cursor.legacy_entry_offset.is_some() {
+            return self.scan_legacy_compaction_manifest_entries(
+                chain,
+                &cursor,
+                max_entries,
+                load_started,
+            );
+        }
+        let mut list_page = self.object_store().list_page(
+            &prefix,
+            cursor.next_segment_key.as_deref(),
+            max_entries,
+        )?;
+        if list_page.objects.is_empty() && cursor.next_segment_key.is_some() && !list_page.has_more
+        {
+            list_page = self.object_store().list_page(&prefix, None, max_entries)?;
+        }
+        let mut segment_objects = list_page
+            .objects
+            .into_iter()
+            .filter(|object| object.key.ends_with(".json"))
+            .collect::<Vec<_>>();
+        segment_objects.sort_by(|left, right| left.key.cmp(&right.key));
+        let mut entries = Vec::new();
+        let mut scanned_objects = 0usize;
+        let mut scanned_entries = 0usize;
+        let mut cursor_advance_key = None;
+        let mut active_scope_prefix = None;
+
+        if segment_objects.is_empty() {
+            return self.scan_legacy_compaction_manifest_entries(
+                chain,
+                &cursor,
+                max_entries,
+                load_started,
+            );
+        }
+
+        let base_entries = if self.object_store().exists(&manifest_key(chain))? {
+            let key = manifest_key(chain);
+            let bytes = self.object_store().get(&key)?;
+            decode_manifest_object(&key, &bytes)?.entries
+        } else {
+            Vec::new()
+        };
+        for object in &segment_objects {
+            if entries.len() >= max_entries
+                || tick_started.elapsed().as_millis() >= config.max_tick_duration_ms.max(1) as u128
+            {
+                break;
+            }
+            let object_scope_prefix = manifest_segment_scope_prefix(&object.key);
+            if active_scope_prefix.is_none() {
+                active_scope_prefix = object_scope_prefix.clone();
+            } else if active_scope_prefix != object_scope_prefix {
+                break;
+            }
+            let bytes = self.object_store().get(&object.key)?;
+            let manifest = decode_manifest_object(&object.key, &bytes)?;
+            scanned_objects += 1;
+            scanned_entries += manifest.entries.len();
+            cursor_advance_key = Some(object.key.clone());
+            for entry in manifest.entries {
+                if base_entries
+                    .iter()
+                    .any(|base_entry| base_entry.shadows_segment(&entry))
+                {
+                    continue;
+                }
+                entries.push(SelectedManifestEntry {
+                    segment_key: Some(object.key.clone()),
+                    entry,
+                });
+                if entries.len() >= max_entries {
+                    break;
+                }
+            }
+        }
+        let partial = list_page.has_more || scanned_objects < segment_objects.len();
+        log::info!(
+            "storage compaction manifest load chain_key={} source=manifest_segments listed_object_count={} scanned_object_count={} scanned_entry_count={} selected_entry_count={} scope_prefix={} partial={} duration_ms={}",
+            chain.key_prefix(),
+            segment_objects.len(),
+            scanned_objects,
+            scanned_entries,
+            entries.len(),
+            active_scope_prefix.as_deref().unwrap_or("none"),
+            partial,
+            load_started.elapsed().as_millis()
+        );
+        Ok(CompactionManifestScan {
+            entries,
+            partial,
+            cursor_advance: cursor_advance_key.map(segment_compaction_cursor),
+        })
+    }
+
+    fn scan_legacy_compaction_manifest_entries(
+        &self,
+        chain: &ChainIdentity,
+        cursor: &CompactionCursor,
+        max_entries: usize,
+        load_started: Instant,
+    ) -> Result<CompactionManifestScan, DatalensError> {
+        let key = manifest_key(chain);
+        if !self.object_store().exists(&key)? {
+            log::info!(
+                "storage compaction manifest load chain_key={} source=legacy_manifest object_count=0 entry_count=0 selected_entry_count=0 legacy_entry_offset=0 partial=false duration_ms={}",
+                chain.key_prefix(),
+                load_started.elapsed().as_millis()
+            );
+            return Ok(CompactionManifestScan {
+                entries: Vec::new(),
+                partial: false,
+                cursor_advance: None,
+            });
+        }
+        let bytes = self.object_store().get(&key)?;
+        let manifest = decode_manifest_object(&key, &bytes)?;
+        let entry_count = manifest.entries.len();
+        let offset = cursor
+            .legacy_entry_offset
+            .unwrap_or_default()
+            .min(entry_count);
+        let entries = manifest
+            .entries
+            .into_iter()
+            .skip(offset)
+            .take(max_entries)
+            .map(|entry| SelectedManifestEntry {
+                segment_key: None,
+                entry,
+            })
+            .collect::<Vec<_>>();
+        let next_offset = offset.saturating_add(entries.len());
+        let partial = next_offset < entry_count;
+        log::info!(
+            "storage compaction manifest load chain_key={} source=legacy_manifest object_count=1 entry_count={} selected_entry_count={} legacy_entry_offset={} partial={} duration_ms={}",
+            chain.key_prefix(),
+            entry_count,
+            entries.len(),
+            offset,
+            partial,
+            load_started.elapsed().as_millis()
+        );
+        Ok(CompactionManifestScan {
+            entries,
+            partial,
+            cursor_advance: partial.then_some(CompactionCursor {
+                schema_version: 1,
+                next_segment_key: None,
+                legacy_entry_offset: Some(next_offset),
+            }),
+        })
+    }
+
+    fn read_compaction_cursor(
+        &self,
+        chain: &ChainIdentity,
+    ) -> Result<CompactionCursor, DatalensError> {
+        let key = compaction_cursor_key(chain);
+        if !self.object_store().exists(&key)? {
+            return Ok(CompactionCursor::default());
+        }
+        let bytes = self.object_store().get(&key)?;
+        serde_json::from_slice(&bytes).map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::StorageReadFailure,
+                format!("decode compaction cursor {key}: {error}"),
+            )
+        })
+    }
+
+    fn write_compaction_cursor(
+        &self,
+        chain: &ChainIdentity,
+        cursor: Option<CompactionCursor>,
+    ) -> Result<(), DatalensError> {
+        let key = compaction_cursor_key(chain);
+        let Some(cursor) = cursor else {
+            self.object_store().delete(&key)?;
+            return Ok(());
+        };
+        let bytes = serde_json::to_vec_pretty(&cursor).map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::Internal,
+                format!("encode compaction cursor: {error}"),
+            )
+        })?;
+        self.object_store().put(&key, &bytes)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SelectedManifestEntry {
+    segment_key: Option<String>,
+    entry: ManifestEntry,
+}
+
+#[derive(Clone, Debug)]
+struct CompactionManifestScan {
+    entries: Vec<SelectedManifestEntry>,
+    partial: bool,
+    cursor_advance: Option<CompactionCursor>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+struct CompactionCursor {
+    #[serde(default)]
+    schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    next_segment_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    legacy_entry_offset: Option<usize>,
+}
+
+fn compaction_cursor_key(chain: &ChainIdentity) -> String {
+    format!(
+        "chains/{}/metadata/compaction-cursor.json",
+        chain.key_prefix()
+    )
+}
+
+fn segment_compaction_cursor(next_segment_key: String) -> CompactionCursor {
+    CompactionCursor {
+        schema_version: 1,
+        next_segment_key: Some(next_segment_key),
+        legacy_entry_offset: None,
+    }
+}
+
+fn decode_manifest_object(key: &str, bytes: &[u8]) -> Result<Manifest, DatalensError> {
+    serde_json::from_slice(bytes).map_err(|error| {
+        DatalensError::new(
+            DatalensErrorKind::StorageReadFailure,
+            format!("decode manifest segment {key}: {error}"),
+        )
+    })
+}
+
+fn manifest_segment_scope_prefix(key: &str) -> Option<String> {
+    key.rsplit_once('/').map(|(prefix, _)| prefix.to_owned())
+}
+
+fn duration_millis(started: Instant) -> u64 {
+    started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
 }
 
 fn metadata_issues(entry: &ManifestEntry, object_key: &str, bytes: &[u8]) -> Vec<MaintenanceIssue> {
@@ -528,31 +932,33 @@ struct CompactedObject {
     entry: ManifestEntry,
 }
 
-fn candidate_entries(
-    entries: &[ManifestEntry],
+fn candidate_selected_entries(
+    entries: &[SelectedManifestEntry],
     candidate: &CompactionCandidate,
-) -> Vec<ManifestEntry> {
+) -> Vec<SelectedManifestEntry> {
     let mut entries = entries
         .iter()
-        .filter(|entry| {
-            entry.chain == candidate.chain
-                && entry.dataset_key == candidate.dataset_key
-                && entry.selector_fingerprint == candidate.selector_fingerprint
-                && entry.selector_canonical_key == candidate.selector_canonical_key
-                && entry.range.kind() == candidate.range.kind()
-                && entry.finality_level == candidate.finality_level
-                && entry.object_encoding == Some(candidate.object_encoding)
-                && entry.object_key.as_ref().is_some_and(|object_key| {
-                    candidate
-                        .object_keys
-                        .iter()
-                        .any(|candidate_key| candidate_key == object_key)
-                })
-        })
+        .filter(|selected| candidate_entry_matches(&selected.entry, candidate))
         .cloned()
         .collect::<Vec<_>>();
-    entries.sort_by_key(|entry| (entry.range.start(), entry.range.end()));
+    entries.sort_by_key(|entry| (entry.entry.range.start(), entry.entry.range.end()));
     entries
+}
+
+fn candidate_entry_matches(entry: &ManifestEntry, candidate: &CompactionCandidate) -> bool {
+    entry.chain == candidate.chain
+        && entry.dataset_key == candidate.dataset_key
+        && entry.selector_fingerprint == candidate.selector_fingerprint
+        && entry.selector_canonical_key == candidate.selector_canonical_key
+        && entry.range.kind() == candidate.range.kind()
+        && entry.finality_level == candidate.finality_level
+        && entry.object_encoding == Some(candidate.object_encoding)
+        && entry.object_key.as_ref().is_some_and(|object_key| {
+            candidate
+                .object_keys
+                .iter()
+                .any(|candidate_key| candidate_key == object_key)
+        })
 }
 
 fn push_candidate(

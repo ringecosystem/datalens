@@ -95,6 +95,15 @@ impl ObjectStore for StaleManifestObjectStore {
         self.inner.list(prefix)
     }
 
+    fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ObjectListPage, DatalensError> {
+        self.inner.list_page(prefix, start_after, limit)
+    }
+
     fn delete(&self, key: &str) -> Result<(), DatalensError> {
         self.inner.delete(key)
     }
@@ -143,6 +152,15 @@ impl ObjectStore for CountingDataObjectExistsStore {
         self.inner.list(prefix)
     }
 
+    fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ObjectListPage, DatalensError> {
+        self.inner.list_page(prefix, start_after, limit)
+    }
+
     fn delete(&self, key: &str) -> Result<(), DatalensError> {
         self.inner.delete(key)
     }
@@ -179,6 +197,15 @@ impl ObjectStore for MissingDataObjectExistsStore {
 
     fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
         self.inner.list(prefix)
+    }
+
+    fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ObjectListPage, DatalensError> {
+        self.inner.list_page(prefix, start_after, limit)
     }
 
     fn delete(&self, key: &str) -> Result<(), DatalensError> {
@@ -230,6 +257,15 @@ impl ObjectStore for ManifestGetCountingStore {
 
     fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
         self.inner.list(prefix)
+    }
+
+    fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ObjectListPage, DatalensError> {
+        self.inner.list_page(prefix, start_after, limit)
     }
 
     fn delete(&self, key: &str) -> Result<(), DatalensError> {
@@ -350,6 +386,26 @@ impl ObjectStore for ManifestAccessCountingStore {
         self.inner.list(prefix)
     }
 
+    fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ObjectListPage, DatalensError> {
+        if Self::is_manifest_access(prefix) {
+            self.manifest_access_count.fetch_add(1, Ordering::SeqCst);
+        }
+        if prefix.contains("/manifest-segments") {
+            self.manifest_segment_list_count
+                .fetch_add(1, Ordering::SeqCst);
+        }
+        if prefix.contains("/coverage-index") {
+            self.coverage_index_list_count
+                .fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.list_page(prefix, start_after, limit)
+    }
+
     fn delete(&self, key: &str) -> Result<(), DatalensError> {
         self.inner.delete(key)
     }
@@ -434,6 +490,15 @@ impl ObjectStore for PausedManifestPutStore {
         self.inner.list(prefix)
     }
 
+    fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ObjectListPage, DatalensError> {
+        self.inner.list_page(prefix, start_after, limit)
+    }
+
     fn delete(&self, key: &str) -> Result<(), DatalensError> {
         self.inner.delete(key)
     }
@@ -457,6 +522,15 @@ impl ObjectStore for FailingPutObjectStore {
 
     fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
         self.inner.list(prefix)
+    }
+
+    fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ObjectListPage, DatalensError> {
+        self.inner.list_page(prefix, start_after, limit)
     }
 
     fn delete(&self, key: &str) -> Result<(), DatalensError> {

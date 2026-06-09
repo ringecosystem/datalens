@@ -95,15 +95,26 @@ pub struct StorageCompactionConfig {
     pub min_object_bytes: u64,
     #[serde(default = "default_storage_compaction_max_merge_ranges")]
     pub max_merge_ranges: usize,
+    #[serde(default = "default_storage_compaction_max_tick_duration_ms")]
+    pub max_tick_duration_ms: u64,
+    #[serde(default = "default_storage_compaction_max_candidates_per_tick")]
+    pub max_candidates_per_tick: usize,
+    #[serde(default = "default_storage_compaction_max_manifest_entries_per_tick")]
+    pub max_manifest_entries_per_tick: usize,
 }
 
 impl Default for StorageCompactionConfig {
     fn default() -> Self {
+        let max_manifest_entries_per_tick =
+            default_storage_compaction_max_manifest_entries_per_tick();
         Self {
             enabled: default_storage_compaction_enabled(),
             interval_ms: default_storage_compaction_interval_ms(),
             min_object_bytes: default_storage_compaction_min_object_bytes(),
             max_merge_ranges: default_storage_compaction_max_merge_ranges(),
+            max_tick_duration_ms: default_storage_compaction_max_tick_duration_ms(),
+            max_candidates_per_tick: default_storage_compaction_max_candidates_per_tick(),
+            max_manifest_entries_per_tick,
         }
     }
 }
@@ -348,6 +359,18 @@ fn default_storage_compaction_min_object_bytes() -> u64 {
 
 fn default_storage_compaction_max_merge_ranges() -> usize {
     32
+}
+
+fn default_storage_compaction_max_tick_duration_ms() -> u64 {
+    30_000
+}
+
+fn default_storage_compaction_max_candidates_per_tick() -> usize {
+    8
+}
+
+fn default_storage_compaction_max_manifest_entries_per_tick() -> usize {
+    20_000
 }
 
 fn default_native_query_surface() -> GraphqlSurfaceConfig {

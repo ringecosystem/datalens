@@ -31,8 +31,8 @@ pub(crate) use datalens_solana::{
     SolanaAdapter, SolanaBlock, SolanaCommitment, SolanaFixtureRpc, SolanaRpc, solana_all_selector,
 };
 pub(crate) use datalens_storage::{
-    DurableStorage, LocalObjectStore, LocalStorage, Manifest, ObjectMetadata, ObjectStore,
-    ReadThroughCacheConfig, S3ObjectStore, S3ObjectStoreConfig, StorageRepository,
+    DurableStorage, LocalObjectStore, LocalStorage, Manifest, ObjectListPage, ObjectMetadata,
+    ObjectStore, ReadThroughCacheConfig, S3ObjectStore, S3ObjectStoreConfig, StorageRepository,
     StorageWriteOutcome, StorageWriteRequest,
 };
 pub(crate) use datalens_tron::{
@@ -89,6 +89,15 @@ impl ObjectStore for CountingObjectStore {
 
     fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
         self.inner.list(prefix)
+    }
+
+    fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ObjectListPage, DatalensError> {
+        self.inner.list_page(prefix, start_after, limit)
     }
 
     fn delete(&self, key: &str) -> Result<(), DatalensError> {

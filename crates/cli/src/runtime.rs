@@ -17,9 +17,9 @@ use datalens_metrics::ApplicationIdentity;
 use datalens_solana::{SolanaAdapter, SolanaHttpRpc};
 use datalens_storage::{
     DurablePromotionIntentRepository, DurablePromotionIntentStore, DurableStorage,
-    LocalObjectStore, LocalStorage, MaintenanceCompactionConfig, ObjectMetadata, ObjectStore,
-    QueryActivityRepository, QueryActivityStore, QueryWatermarkRepository, QueryWatermarkStore,
-    S3ObjectStore, UsageLedgerRepository, UsageLedgerStore,
+    LocalObjectStore, LocalStorage, MaintenanceCompactionConfig, ObjectListPage, ObjectMetadata,
+    ObjectStore, QueryActivityRepository, QueryActivityStore, QueryWatermarkRepository,
+    QueryWatermarkStore, S3ObjectStore, UsageLedgerRepository, UsageLedgerStore,
 };
 use datalens_tron::{TronAdapter, TronHttpProvider};
 use datalens_warmup::{
@@ -130,6 +130,9 @@ pub(crate) fn start_storage_compaction_worker(
     let compaction = MaintenanceCompactionConfig {
         min_object_bytes: config.storage.compaction.min_object_bytes,
         max_merge_ranges: config.storage.compaction.max_merge_ranges.max(2),
+        max_tick_duration_ms: config.storage.compaction.max_tick_duration_ms,
+        max_candidates_per_tick: config.storage.compaction.max_candidates_per_tick,
+        max_manifest_entries_per_tick: config.storage.compaction.max_manifest_entries_per_tick,
     };
     let storage = match config.storage.backend.as_str() {
         "local" => {
@@ -192,10 +195,13 @@ impl StorageCompactionWorker {
             .name("datalens-storage-compaction".to_owned())
             .spawn(move || {
                 log::info!(
-                    "storage compaction worker started interval_ms={} min_object_bytes={} max_merge_ranges={} chain_count={}",
+                    "storage compaction worker started interval_ms={} min_object_bytes={} max_merge_ranges={} max_tick_duration_ms={} max_candidates_per_tick={} max_manifest_entries_per_tick={} chain_count={}",
                     interval.as_millis(),
                     config.min_object_bytes,
                     config.max_merge_ranges,
+                    config.max_tick_duration_ms,
+                    config.max_candidates_per_tick,
+                    config.max_manifest_entries_per_tick,
                     chains.len()
                 );
                 let mut consecutive_failures = 0u32;
@@ -220,18 +226,20 @@ impl StorageCompactionWorker {
                         Ok(report) => {
                             consecutive_failures = 0;
                             log::info!(
-                                "storage compaction tick completed chain_key={} candidates={} compacted_objects={} compacted_rows={} duration_ms={}",
+                                "storage compaction tick completed chain_key={} candidate_count={} processed_candidates={} compacted_objects={} compacted_rows={} tick_status={} duration_ms={}",
                                 chain.key_prefix(),
-                                report.candidates.len(),
+                                report.candidate_count,
+                                report.processed_candidates,
                                 report.compacted_objects,
                                 report.compacted_rows,
+                                report.tick_status.as_str(),
                                 started.elapsed().as_millis()
                             );
                         }
                         Err(error) => {
                             consecutive_failures = consecutive_failures.saturating_add(1);
                             log::warn!(
-                                "storage compaction tick failed chain_key={} kind={:?} message={} consecutive_failures={} duration_ms={}",
+                                "storage compaction tick failed chain_key={} tick_status=failed kind={:?} message={} consecutive_failures={} duration_ms={}",
                                 chain.key_prefix(),
                                 error.kind,
                                 error.message,
@@ -730,6 +738,18 @@ impl ObjectStore for WarmupRegistryObjectStore {
         match self {
             Self::Local(store) => store.list(prefix),
             Self::S3(store) => store.list(prefix),
+        }
+    }
+
+    fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ObjectListPage, DatalensError> {
+        match self {
+            Self::Local(store) => store.list_page(prefix, start_after, limit),
+            Self::S3(store) => store.list_page(prefix, start_after, limit),
         }
     }
 

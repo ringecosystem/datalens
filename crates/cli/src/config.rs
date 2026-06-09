@@ -105,6 +105,24 @@ pub fn validate_config(config: &DatalensConfig) -> Result<(), DatalensError> {
                 "storage.compaction.max_merge_ranges must be at least two when compaction is enabled",
             ));
         }
+        if config.storage.compaction.max_tick_duration_ms == 0 {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                "storage.compaction.max_tick_duration_ms must be greater than zero when compaction is enabled",
+            ));
+        }
+        if config.storage.compaction.max_candidates_per_tick == 0 {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                "storage.compaction.max_candidates_per_tick must be greater than zero when compaction is enabled",
+            ));
+        }
+        if config.storage.compaction.max_manifest_entries_per_tick == 0 {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                "storage.compaction.max_manifest_entries_per_tick must be greater than zero when compaction is enabled",
+            ));
+        }
     }
     if config.metrics.enabled && config.metrics.default_application.trim().is_empty() {
         return Err(DatalensError::new(

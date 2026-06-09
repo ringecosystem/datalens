@@ -92,6 +92,51 @@ fn test_local_object_store_lists_valid_tmp_extension_objects() {
 }
 
 #[test]
+fn test_local_object_store_list_page_respects_limit_and_start_after() {
+    let store = LocalObjectStore::new(temp_storage_root("local-list-page"));
+    for key in [
+        "chains/ethereum/manifest-segments/a/000.json",
+        "chains/ethereum/manifest-segments/a/001.json",
+        "chains/ethereum/manifest-segments/a/002.json",
+    ] {
+        store.put(key, b"{}").expect("put object");
+    }
+
+    let first = store
+        .list_page("chains/ethereum/manifest-segments", None, 2)
+        .expect("first page");
+    assert_eq!(
+        first
+            .objects
+            .iter()
+            .map(|object| object.key.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "chains/ethereum/manifest-segments/a/000.json",
+            "chains/ethereum/manifest-segments/a/001.json",
+        ]
+    );
+    assert!(first.has_more);
+
+    let second = store
+        .list_page(
+            "chains/ethereum/manifest-segments",
+            Some("chains/ethereum/manifest-segments/a/001.json"),
+            2,
+        )
+        .expect("second page");
+    assert_eq!(
+        second
+            .objects
+            .iter()
+            .map(|object| object.key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["chains/ethereum/manifest-segments/a/002.json"]
+    );
+    assert!(!second.has_more);
+}
+
+#[test]
 fn test_s3_object_store_builds_from_compatible_backend_config() {
     let store = S3ObjectStore::from_config(S3ObjectStoreConfig {
         bucket: "datalens".to_owned(),
