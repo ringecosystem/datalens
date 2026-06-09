@@ -1,4 +1,8 @@
-use std::sync::{Arc, Once};
+use std::{
+    sync::{Arc, Once},
+    thread,
+    time::{Duration, Instant},
+};
 
 use datalens_core::{DatalensError, DatalensErrorKind};
 use datalens_edge::config::{ChainConfig, DatalensConfig, FinalityConfig};
@@ -10,9 +14,9 @@ use datalens_metrics::ApplicationIdentity;
 use datalens_solana::{SolanaAdapter, SolanaHttpRpc};
 use datalens_storage::{
     DurablePromotionIntentRepository, DurablePromotionIntentStore, DurableStorage,
-    LocalObjectStore, LocalStorage, ObjectMetadata, ObjectStore, QueryActivityRepository,
-    QueryActivityStore, QueryWatermarkRepository, QueryWatermarkStore, S3ObjectStore,
-    UsageLedgerRepository, UsageLedgerStore,
+    LocalObjectStore, LocalStorage, MaintenanceCompactionConfig, ObjectMetadata, ObjectStore,
+    QueryActivityRepository, QueryActivityStore, QueryWatermarkRepository, QueryWatermarkStore,
+    S3ObjectStore, UsageLedgerRepository, UsageLedgerStore,
 };
 use datalens_tron::{TronAdapter, TronHttpProvider};
 use datalens_warmup::{
@@ -105,6 +109,127 @@ pub(crate) fn build_service_registry(
         }
     }
     Ok(registry)
+}
+
+pub(crate) fn start_storage_compaction_worker(
+    config: &DatalensConfig,
+) -> Result<Option<StorageCompactionWorker>, DatalensError> {
+    if !config.storage.compaction.enabled {
+        log::info!("storage compaction worker disabled");
+        return Ok(None);
+    }
+    let interval = Duration::from_millis(config.storage.compaction.interval_ms.max(1));
+    let compaction = MaintenanceCompactionConfig {
+        min_object_bytes: config.storage.compaction.min_object_bytes,
+        max_merge_ranges: config.storage.compaction.max_merge_ranges.max(2),
+    };
+    let storage = match config.storage.backend.as_str() {
+        "local" => {
+            let local = config.storage.local.as_ref().ok_or_else(|| {
+                DatalensError::new(
+                    DatalensErrorKind::InvalidInput,
+                    "storage.local.root must be set",
+                )
+            })?;
+            CompactionStorage::Local(LocalStorage::new_with_config(
+                &local.root,
+                config.storage.parquet.into(),
+            ))
+        }
+        "s3" => {
+            let s3 = config.storage.s3.clone().ok_or_else(|| {
+                DatalensError::new(
+                    DatalensErrorKind::InvalidInput,
+                    "storage.s3 must be set when storage.backend is s3",
+                )
+            })?;
+            CompactionStorage::S3(DurableStorage::from_object_store_with_config(
+                S3ObjectStore::from_config(s3)?,
+                config.storage.parquet.into(),
+            ))
+        }
+        _ => {
+            return Err(DatalensError::new(
+                DatalensErrorKind::UnsupportedDataset,
+                "storage.backend must be local or s3",
+            ));
+        }
+    };
+    Ok(Some(StorageCompactionWorker::start(
+        storage, compaction, interval,
+    )?))
+}
+
+pub(crate) struct StorageCompactionWorker {
+    _handle: thread::JoinHandle<()>,
+}
+
+#[derive(Clone)]
+enum CompactionStorage {
+    Local(LocalStorage),
+    S3(DurableStorage<S3ObjectStore>),
+}
+
+impl StorageCompactionWorker {
+    fn start(
+        storage: CompactionStorage,
+        config: MaintenanceCompactionConfig,
+        interval: Duration,
+    ) -> Result<Self, DatalensError> {
+        let handle = thread::Builder::new()
+            .name("datalens-storage-compaction".to_owned())
+            .spawn(move || {
+                log::info!(
+                    "storage compaction worker started interval_ms={} min_object_bytes={} max_merge_ranges={}",
+                    interval.as_millis(),
+                    config.min_object_bytes,
+                    config.max_merge_ranges
+                );
+                let mut consecutive_failures = 0u32;
+                loop {
+                    thread::sleep(compaction_sleep_duration(interval, consecutive_failures));
+                    let started = Instant::now();
+                    let result = match &storage {
+                        CompactionStorage::Local(storage) => storage.compact_small_objects(config),
+                        CompactionStorage::S3(storage) => storage.compact_small_objects(config),
+                    };
+                    match result {
+                        Ok(report) => {
+                            consecutive_failures = 0;
+                            log::info!(
+                                "storage compaction tick completed candidates={} compacted_objects={} compacted_rows={} duration_ms={}",
+                                report.candidates.len(),
+                                report.compacted_objects,
+                                report.compacted_rows,
+                                started.elapsed().as_millis()
+                            );
+                        }
+                        Err(error) => {
+                            consecutive_failures = consecutive_failures.saturating_add(1);
+                            log::warn!(
+                                "storage compaction tick failed kind={:?} message={} consecutive_failures={} duration_ms={}",
+                                error.kind,
+                                error.message,
+                                consecutive_failures,
+                                started.elapsed().as_millis()
+                            );
+                        }
+                    }
+                }
+            })
+            .map_err(|error| {
+                DatalensError::new(
+                    DatalensErrorKind::Internal,
+                    format!("start storage compaction worker: {error}"),
+                )
+            })?;
+        Ok(Self { _handle: handle })
+    }
+}
+
+fn compaction_sleep_duration(interval: Duration, consecutive_failures: u32) -> Duration {
+    let multiplier = 1_u32 << consecutive_failures.min(4);
+    interval.saturating_mul(multiplier)
 }
 
 fn build_evm_service_with_storage(

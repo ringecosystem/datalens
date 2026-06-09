@@ -5,7 +5,7 @@ use datalens_core::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
     time::{Instant, SystemTime, UNIX_EPOCH},
@@ -13,6 +13,8 @@ use std::{
 
 use crate::selector_coverage::{filter_evm_log_rows_for_selector, selector_coverage_candidates};
 use crate::{coverage_index, read_through_cache};
+
+const STORAGE_READ_GET_PARALLELISM: usize = 8;
 
 #[derive(Debug)]
 /// Storage write request for one durable coverage segment. The caller must pass
@@ -185,6 +187,83 @@ impl StorageWriteLogContext {
                 "empty_coverage"
             },
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct StorageReadPlan {
+    coverage_entries_count: usize,
+    data_object_count: usize,
+    empty_coverage_count: usize,
+    objects: Vec<StorageReadPlanObject>,
+    reads: Vec<StorageReadPlanRead>,
+}
+
+#[derive(Clone, Debug)]
+struct StorageReadPlanObject {
+    object_key: String,
+    entry: ManifestEntry,
+    encoding: ObjectEncoding,
+}
+
+#[derive(Clone, Debug)]
+struct StorageReadPlanRead {
+    object_key: String,
+    ranges: Vec<LedgerRange>,
+}
+
+#[derive(Debug)]
+struct FetchedReadPlanObject {
+    object_key: String,
+    entry: ManifestEntry,
+    encoding: ObjectEncoding,
+    bytes_len: usize,
+    rows: DatasetRows,
+}
+
+impl StorageReadPlan {
+    fn from_candidates(
+        candidates: Vec<crate::selector_coverage::SelectorCoverageCandidate<'_>>,
+    ) -> Result<Self, DatalensError> {
+        let coverage_entries_count = candidates.len();
+        let mut data_object_count = 0usize;
+        let mut empty_coverage_count = 0usize;
+        let mut seen_objects = BTreeSet::new();
+        let mut objects = Vec::new();
+        let mut reads = Vec::new();
+
+        for candidate in candidates {
+            let Some(object_key) = candidate.entry.object_key.clone() else {
+                empty_coverage_count += 1;
+                continue;
+            };
+            data_object_count += 1;
+            let Some(encoding) = candidate.entry.object_encoding else {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::StorageReadFailure,
+                    format!("manifest entry object {object_key} missing object_encoding"),
+                ));
+            };
+            if seen_objects.insert(object_key.clone()) {
+                objects.push(StorageReadPlanObject {
+                    object_key: object_key.clone(),
+                    entry: candidate.entry.clone(),
+                    encoding,
+                });
+            }
+            reads.push(StorageReadPlanRead {
+                object_key,
+                ranges: candidate.ranges,
+            });
+        }
+
+        Ok(Self {
+            coverage_entries_count,
+            data_object_count,
+            empty_coverage_count,
+            objects,
+            reads,
+        })
     }
 }
 
@@ -362,42 +441,67 @@ where
             empty_coverage_count,
             coverage_started.elapsed().as_millis()
         );
-        let mut rows = empty_rows(dataset_key.clone())?.into_rows();
-        for candidate in candidates {
-            let entry = candidate.entry;
-            let Some(object_key) = entry.object_key.as_deref() else {
-                continue;
-            };
-            if !self.object_store.exists(object_key)? {
-                return Err(DatalensError::new(
-                    DatalensErrorKind::StorageReadFailure,
-                    format!("manifest entry object not found {object_key}"),
-                ));
+        let plan = StorageReadPlan::from_candidates(candidates)?;
+        let mut object_rows_by_key = BTreeMap::new();
+        let mut cache_hits = 0usize;
+        for object in &plan.objects {
+            if let Some(rows) =
+                self.read_through_cache
+                    .get(&object.object_key, &object.entry, object.encoding)
+            {
+                cache_hits += 1;
+                object_rows_by_key.insert(object.object_key.clone(), rows);
             }
-            let Some(encoding) = entry.object_encoding else {
-                return Err(DatalensError::new(
+        }
+        let cache_misses = plan.objects.len().saturating_sub(cache_hits);
+        let get_started = Instant::now();
+        let fetched_objects = self.fetch_read_plan_objects(&plan, &object_rows_by_key)?;
+        let object_get_count = fetched_objects.len();
+        let object_get_bytes = fetched_objects
+            .iter()
+            .map(|object| object.bytes_len as u64)
+            .sum::<u64>();
+        for fetched in fetched_objects {
+            self.read_through_cache.put(
+                &fetched.object_key,
+                &fetched.entry,
+                fetched.encoding,
+                fetched.rows.clone(),
+            );
+            object_rows_by_key.insert(fetched.object_key, fetched.rows);
+        }
+        log::info!(
+            "storage read plan chain_key={} dataset={} selector_fingerprint={} range_kind={} range={}-{} coverage_entries_count={} data_object_count={} unique_object_count={} empty_coverage_count={} fragmented_read={} read_through_cache_hits={} read_through_cache_misses={} object_get_count={} object_get_bytes={} get_duration_ms={}",
+            chain.key_prefix(),
+            dataset_key.as_str(),
+            selector.fingerprint(),
+            range_kind_key(range.kind()),
+            range.start(),
+            range.end(),
+            plan.coverage_entries_count,
+            plan.data_object_count,
+            plan.objects.len(),
+            plan.empty_coverage_count,
+            plan.objects.len() > 1,
+            cache_hits,
+            cache_misses,
+            object_get_count,
+            object_get_bytes,
+            get_started.elapsed().as_millis()
+        );
+
+        let mut rows = empty_rows(dataset_key.clone())?.into_rows();
+        for read in plan.reads {
+            let object_rows = object_rows_by_key.get(&read.object_key).ok_or_else(|| {
+                DatalensError::new(
                     DatalensErrorKind::StorageReadFailure,
-                    format!("manifest entry object {object_key} missing object_encoding"),
-                ));
-            };
-            let object_rows =
-                if let Some(rows) = self.read_through_cache.get(object_key, entry, encoding) {
-                    rows
-                } else {
-                    let bytes = self.object_store.get(object_key)?;
-                    verify_manifest_object_metadata(entry, object_key, &bytes)?;
-                    let object_rows = decode_object_rows(encoding, dataset_key.clone(), &bytes)
-                        .map_err(|error| {
-                            DatalensError::new(
-                                DatalensErrorKind::StorageReadFailure,
-                                format!("decode cached object {object_key}: {}", error.message),
-                            )
-                        })?;
-                    self.read_through_cache
-                        .put(object_key, entry, encoding, object_rows.clone());
-                    object_rows
-                };
-            for candidate_range in candidate.ranges {
+                    format!(
+                        "storage read plan object {} was not loaded",
+                        read.object_key
+                    ),
+                )
+            })?;
+            for candidate_range in read.ranges {
                 let mut candidate_rows = filter_rows(object_rows.clone(), candidate_range);
                 candidate_rows = filter_evm_log_rows_for_selector(candidate_rows, selector);
                 rows.try_append(candidate_rows.into_rows())?;
@@ -405,6 +509,71 @@ where
         }
         rows.sort();
         DatasetRows::new(dataset_key.clone(), rows)
+    }
+
+    fn fetch_read_plan_objects(
+        &self,
+        plan: &StorageReadPlan,
+        cached: &BTreeMap<String, DatasetRows>,
+    ) -> Result<Vec<FetchedReadPlanObject>, DatalensError> {
+        let misses = plan
+            .objects
+            .iter()
+            .filter(|object| !cached.contains_key(&object.object_key))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut fetched = Vec::new();
+        for chunk in misses.chunks(STORAGE_READ_GET_PARALLELISM.max(1)) {
+            let mut chunk_results = std::thread::scope(|scope| {
+                let handles = chunk
+                    .iter()
+                    .map(|object| {
+                        scope.spawn(move || {
+                            let bytes = self.object_store.get(&object.object_key)?;
+                            verify_manifest_object_metadata(
+                                &object.entry,
+                                &object.object_key,
+                                &bytes,
+                            )?;
+                            let rows = decode_object_rows(
+                                object.encoding,
+                                object.entry.dataset_key.clone(),
+                                &bytes,
+                            )
+                            .map_err(|error| {
+                                DatalensError::new(
+                                    DatalensErrorKind::StorageReadFailure,
+                                    format!(
+                                        "decode cached object {}: {}",
+                                        object.object_key, error.message
+                                    ),
+                                )
+                            })?;
+                            Ok(FetchedReadPlanObject {
+                                object_key: object.object_key.clone(),
+                                entry: object.entry.clone(),
+                                encoding: object.encoding,
+                                bytes_len: bytes.len(),
+                                rows,
+                            })
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                handles
+                    .into_iter()
+                    .map(|handle| {
+                        handle.join().map_err(|_| {
+                            DatalensError::new(
+                                DatalensErrorKind::StorageReadFailure,
+                                "storage read object worker panicked",
+                            )
+                        })?
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })?;
+            fetched.append(&mut chunk_results);
+        }
+        Ok(fetched)
     }
 
     pub fn write_rows(

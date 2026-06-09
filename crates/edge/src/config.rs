@@ -59,6 +59,8 @@ pub struct StorageConfig {
     pub s3: Option<S3ObjectStoreConfig>,
     #[serde(default)]
     pub parquet: StorageParquetConfig,
+    #[serde(default)]
+    pub compaction: StorageCompactionConfig,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -78,6 +80,30 @@ impl From<StorageParquetConfig> for DurableStorageConfig {
     fn from(config: StorageParquetConfig) -> Self {
         Self {
             parquet_compression: config.compression,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageCompactionConfig {
+    #[serde(default = "default_storage_compaction_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_storage_compaction_interval_ms")]
+    pub interval_ms: u64,
+    #[serde(default = "default_storage_compaction_min_object_bytes")]
+    pub min_object_bytes: u64,
+    #[serde(default = "default_storage_compaction_max_merge_ranges")]
+    pub max_merge_ranges: usize,
+}
+
+impl Default for StorageCompactionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_storage_compaction_enabled(),
+            interval_ms: default_storage_compaction_interval_ms(),
+            min_object_bytes: default_storage_compaction_min_object_bytes(),
+            max_merge_ranges: default_storage_compaction_max_merge_ranges(),
         }
     }
 }
@@ -306,6 +332,22 @@ fn default_graphql_enabled() -> bool {
 
 fn default_graphql_playground_enabled() -> bool {
     false
+}
+
+fn default_storage_compaction_enabled() -> bool {
+    true
+}
+
+fn default_storage_compaction_interval_ms() -> u64 {
+    60_000
+}
+
+fn default_storage_compaction_min_object_bytes() -> u64 {
+    1_048_576
+}
+
+fn default_storage_compaction_max_merge_ranges() -> usize {
+    32
 }
 
 fn default_native_query_surface() -> GraphqlSurfaceConfig {
