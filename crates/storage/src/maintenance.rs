@@ -706,7 +706,7 @@ where
         Ok(CompactionManifestScan {
             entries,
             partial,
-            cursor_advance: partial.then(|| CompactionCursor {
+            cursor_advance: partial.then_some(CompactionCursor {
                 schema_version: 1,
                 next_segment_key: None,
                 legacy_entry_offset: Some(next_offset),
