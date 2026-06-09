@@ -4,6 +4,7 @@ mod durable_promotion;
 mod execution;
 mod helpers;
 mod hot_promotion;
+mod provider_range;
 mod provider_singleflight;
 
 pub use execution::*;

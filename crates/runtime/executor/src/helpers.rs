@@ -264,18 +264,6 @@ pub(crate) fn split_fetch_request_by_max_len(
     })
 }
 
-pub(crate) fn provider_limit_split_target(
-    configured_max_len: Option<u64>,
-    hint_max_len: Option<u64>,
-) -> Option<u64> {
-    match (configured_max_len, hint_max_len) {
-        (Some(configured), Some(hint)) => Some(configured.min(hint)),
-        (Some(configured), None) => Some(configured),
-        (None, Some(hint)) => Some(hint),
-        (None, None) => None,
-    }
-}
-
 pub(crate) fn parse_provider_limit_hint(message: &str) -> Option<u64> {
     let normalized = message.to_ascii_lowercase();
     parse_number_after_marker(&normalized, "filter:")
