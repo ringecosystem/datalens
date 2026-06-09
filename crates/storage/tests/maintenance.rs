@@ -683,6 +683,73 @@ fn test_compaction_legacy_cursor_continues_after_partial_tick_writes_segment() {
 }
 
 #[test]
+fn test_compaction_legacy_cursor_survives_candidate_budget_partial() {
+    let storage = LocalStorage::new(temp_storage_root("legacy-cursor-candidate-budget"));
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 3, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 4, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 200, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 201, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 300, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 301, FinalityLevel::Safe);
+    let manifest = storage.manifest().expect("manifest");
+    for object in storage
+        .object_store()
+        .list(&format!("chains/{}/manifest-segments", chain.key_prefix()))
+        .expect("manifest segments")
+    {
+        storage
+            .object_store()
+            .delete(&object.key)
+            .expect("delete segment");
+    }
+    std::fs::create_dir_all(
+        storage
+            .manifest_path(&chain)
+            .parent()
+            .expect("manifest parent"),
+    )
+    .expect("create manifest parent");
+    std::fs::write(
+        storage.manifest_path(&chain),
+        serde_json::to_vec_pretty(&manifest).expect("manifest bytes"),
+    )
+    .expect("write full manifest");
+    let config = MaintenanceCompactionConfig {
+        min_object_bytes: u64::MAX,
+        max_merge_ranges: 2,
+        max_tick_duration_ms: 30_000,
+        max_candidates_per_tick: 1,
+        max_manifest_entries_per_tick: 4,
+    };
+
+    let first = storage
+        .compact_small_objects_for_chain(&chain, config)
+        .expect("first legacy tick");
+    assert_eq!(first.tick_status, MaintenanceCompactionTickStatus::Partial);
+    assert_eq!(first.compacted_objects, 1);
+    let cursor_key = format!(
+        "chains/{}/metadata/compaction-cursor.json",
+        chain.key_prefix()
+    );
+    let cursor = serde_json::from_slice::<serde_json::Value>(
+        &storage.object_store().get(&cursor_key).expect("cursor"),
+    )
+    .expect("cursor json");
+    assert_eq!(cursor["legacy_entry_offset"], 4);
+
+    let second = storage
+        .compact_small_objects_for_chain(&chain, config)
+        .expect("second legacy tick");
+
+    assert_eq!(
+        second.candidates[0].range,
+        LedgerRange::blocks(300, 301).expect("range")
+    );
+    assert_eq!(second.compacted_objects, 1);
+}
+
+#[test]
 fn test_compaction_ignores_segments_shadowed_by_full_manifest() {
     let storage = LocalStorage::new(temp_storage_root("shadowed-segments"));
     let chain = test_chain();

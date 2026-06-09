@@ -368,7 +368,9 @@ where
 
         if let Some((chain, scan_cursor_advance_key)) = cursor {
             let next_key = if partial && processed_candidates < candidates.len() {
-                cursor_advance_key.map(segment_compaction_cursor)
+                cursor_advance_key
+                    .map(segment_compaction_cursor)
+                    .or(scan_cursor_advance_key)
             } else if partial {
                 scan_cursor_advance_key
             } else {
