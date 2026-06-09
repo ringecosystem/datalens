@@ -612,6 +612,77 @@ fn test_compaction_legacy_full_manifest_partial_tick_persists_offset_cursor() {
 }
 
 #[test]
+fn test_compaction_legacy_cursor_continues_after_partial_tick_writes_segment() {
+    let storage = LocalStorage::new(temp_storage_root("legacy-cursor-after-segment"));
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 1, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 2, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 100, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 101, FinalityLevel::Safe);
+    let manifest = storage.manifest().expect("manifest");
+    for object in storage
+        .object_store()
+        .list(&format!("chains/{}/manifest-segments", chain.key_prefix()))
+        .expect("manifest segments")
+    {
+        storage
+            .object_store()
+            .delete(&object.key)
+            .expect("delete segment");
+    }
+    std::fs::create_dir_all(
+        storage
+            .manifest_path(&chain)
+            .parent()
+            .expect("manifest parent"),
+    )
+    .expect("create manifest parent");
+    std::fs::write(
+        storage.manifest_path(&chain),
+        serde_json::to_vec_pretty(&manifest).expect("manifest bytes"),
+    )
+    .expect("write full manifest");
+    let config = MaintenanceCompactionConfig {
+        min_object_bytes: u64::MAX,
+        max_merge_ranges: 2,
+        max_tick_duration_ms: 30_000,
+        max_candidates_per_tick: 8,
+        max_manifest_entries_per_tick: 2,
+    };
+
+    let first = storage
+        .compact_small_objects_for_chain(&chain, config)
+        .expect("first legacy tick");
+    assert_eq!(first.tick_status, MaintenanceCompactionTickStatus::Partial);
+    assert_eq!(first.compacted_objects, 1);
+    assert_eq!(
+        first.candidates[0].range,
+        LedgerRange::blocks(1, 2).expect("range")
+    );
+    assert!(
+        !storage
+            .object_store()
+            .list(&format!("chains/{}/manifest-segments", chain.key_prefix()))
+            .expect("manifest segments")
+            .is_empty()
+    );
+
+    let second = storage
+        .compact_small_objects_for_chain(&chain, config)
+        .expect("second legacy tick");
+
+    assert_eq!(
+        second.tick_status,
+        MaintenanceCompactionTickStatus::Completed
+    );
+    assert_eq!(second.compacted_objects, 1);
+    assert_eq!(
+        second.candidates[0].range,
+        LedgerRange::blocks(100, 101).expect("range")
+    );
+}
+
+#[test]
 fn test_compaction_ignores_segments_shadowed_by_full_manifest() {
     let storage = LocalStorage::new(temp_storage_root("shadowed-segments"));
     let chain = test_chain();

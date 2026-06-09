@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs::{self, OpenOptions},
     future::Future,
     io::Write,
@@ -173,7 +174,7 @@ impl ObjectStore for LocalObjectStore {
                 has_more: false,
             });
         }
-        let mut objects = Vec::new();
+        let mut objects = BTreeMap::new();
         collect_local_objects_page(
             &self.root,
             &prefix_path,
@@ -182,6 +183,7 @@ impl ObjectStore for LocalObjectStore {
             &mut objects,
         )?;
         let has_more = objects.len() > limit;
+        let mut objects = objects.into_values().collect::<Vec<_>>();
         objects.truncate(limit);
         Ok(ObjectListPage { objects, has_more })
     }
@@ -204,30 +206,20 @@ fn collect_local_objects_page(
     path: &Path,
     start_after: Option<&str>,
     limit: usize,
-    objects: &mut Vec<ObjectMetadata>,
+    objects: &mut BTreeMap<String, ObjectMetadata>,
 ) -> Result<(), DatalensError> {
-    if objects.len() >= limit {
-        return Ok(());
-    }
-    let mut entries = fs::read_dir(path)
-        .map_err(|error| {
-            DatalensError::new(
-                DatalensErrorKind::StorageReadFailure,
-                format!("list object directory {}: {error}", path.display()),
-            )
-        })?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| {
+    for entry in fs::read_dir(path).map_err(|error| {
+        DatalensError::new(
+            DatalensErrorKind::StorageReadFailure,
+            format!("list object directory {}: {error}", path.display()),
+        )
+    })? {
+        let entry = entry.map_err(|error| {
             DatalensError::new(
                 DatalensErrorKind::StorageReadFailure,
                 format!("read object directory entry {}: {error}", path.display()),
             )
         })?;
-    entries.sort_by_key(|entry| entry.path());
-    for entry in entries {
-        if objects.len() >= limit {
-            break;
-        }
         let metadata = entry.metadata().map_err(|error| {
             DatalensError::new(
                 DatalensErrorKind::StorageReadFailure,
@@ -244,10 +236,16 @@ fn collect_local_objects_page(
                 .to_string_lossy()
                 .replace('\\', "/");
             if start_after.is_none_or(|cursor| key.as_str() > cursor) {
-                objects.push(ObjectMetadata {
-                    key,
-                    size: metadata.len(),
-                });
+                objects.insert(
+                    key.clone(),
+                    ObjectMetadata {
+                        key,
+                        size: metadata.len(),
+                    },
+                );
+                while objects.len() > limit {
+                    objects.pop_last();
+                }
             }
         }
     }

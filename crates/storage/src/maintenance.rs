@@ -556,6 +556,14 @@ where
         let prefix = manifest_segment_prefix(chain);
         let cursor = self.read_compaction_cursor(chain)?;
         let max_entries = config.max_manifest_entries_per_tick.max(1);
+        if cursor.legacy_entry_offset.is_some() {
+            return self.scan_legacy_compaction_manifest_entries(
+                chain,
+                &cursor,
+                max_entries,
+                load_started,
+            );
+        }
         let mut list_page = self.object_store().list_page(
             &prefix,
             cursor.next_segment_key.as_deref(),
@@ -578,62 +586,12 @@ where
         let mut active_scope_prefix = None;
 
         if segment_objects.is_empty() {
-            let key = manifest_key(chain);
-            if self.object_store().exists(&key)? {
-                let bytes = self.object_store().get(&key)?;
-                let manifest = decode_manifest_object(&key, &bytes)?;
-                scanned_objects = 1;
-                scanned_entries = manifest.entries.len();
-                let offset = cursor
-                    .legacy_entry_offset
-                    .unwrap_or_default()
-                    .min(scanned_entries);
-                entries.extend(
-                    manifest
-                        .entries
-                        .into_iter()
-                        .skip(offset)
-                        .take(max_entries)
-                        .map(|entry| SelectedManifestEntry {
-                            segment_key: None,
-                            entry,
-                        }),
-                );
-                let next_offset = offset.saturating_add(entries.len());
-                let partial = next_offset < scanned_entries;
-                log::info!(
-                    "storage compaction manifest load chain_key={} source=legacy_manifest object_count={} entry_count={} selected_entry_count={} legacy_entry_offset={} partial={} duration_ms={}",
-                    chain.key_prefix(),
-                    scanned_objects,
-                    scanned_entries,
-                    entries.len(),
-                    offset,
-                    partial,
-                    load_started.elapsed().as_millis()
-                );
-                return Ok(CompactionManifestScan {
-                    entries,
-                    partial,
-                    cursor_advance: partial.then(|| CompactionCursor {
-                        schema_version: 1,
-                        next_segment_key: None,
-                        legacy_entry_offset: Some(next_offset),
-                    }),
-                });
-            }
-            log::info!(
-                "storage compaction manifest load chain_key={} source=legacy_manifest object_count={} entry_count={} selected_entry_count={} legacy_entry_offset=0 partial=false duration_ms={}",
-                chain.key_prefix(),
-                scanned_objects,
-                scanned_entries,
-                entries.len(),
-                load_started.elapsed().as_millis()
+            return self.scan_legacy_compaction_manifest_entries(
+                chain,
+                &cursor,
+                max_entries,
+                load_started,
             );
-            return Ok(CompactionManifestScan {
-                entries,
-                partial: false,
-                cursor_advance: None,
-            });
         }
 
         let base_entries = if self.object_store().exists(&manifest_key(chain))? {
@@ -692,6 +650,65 @@ where
             entries,
             partial,
             cursor_advance: cursor_advance_key.map(segment_compaction_cursor),
+        })
+    }
+
+    fn scan_legacy_compaction_manifest_entries(
+        &self,
+        chain: &ChainIdentity,
+        cursor: &CompactionCursor,
+        max_entries: usize,
+        load_started: Instant,
+    ) -> Result<CompactionManifestScan, DatalensError> {
+        let key = manifest_key(chain);
+        if !self.object_store().exists(&key)? {
+            log::info!(
+                "storage compaction manifest load chain_key={} source=legacy_manifest object_count=0 entry_count=0 selected_entry_count=0 legacy_entry_offset=0 partial=false duration_ms={}",
+                chain.key_prefix(),
+                load_started.elapsed().as_millis()
+            );
+            return Ok(CompactionManifestScan {
+                entries: Vec::new(),
+                partial: false,
+                cursor_advance: None,
+            });
+        }
+        let bytes = self.object_store().get(&key)?;
+        let manifest = decode_manifest_object(&key, &bytes)?;
+        let entry_count = manifest.entries.len();
+        let offset = cursor
+            .legacy_entry_offset
+            .unwrap_or_default()
+            .min(entry_count);
+        let entries = manifest
+            .entries
+            .into_iter()
+            .skip(offset)
+            .take(max_entries)
+            .map(|entry| SelectedManifestEntry {
+                segment_key: None,
+                entry,
+            })
+            .collect::<Vec<_>>();
+        let next_offset = offset.saturating_add(entries.len());
+        let partial = next_offset < entry_count;
+        log::info!(
+            "storage compaction manifest load chain_key={} source=legacy_manifest object_count=1 entry_count={} selected_entry_count={} legacy_entry_offset={} partial={} duration_ms={}",
+            chain.key_prefix(),
+            entry_count,
+            entries.len(),
+            offset,
+            partial,
+            load_started.elapsed().as_millis()
+        );
+        Ok(CompactionManifestScan {
+            entries,
+            partial,
+            cursor_advance: partial.then(|| CompactionCursor {
+                schema_version: 1,
+                next_segment_key: None,
+                legacy_entry_offset: Some(next_offset),
+            }),
         })
     }
 
