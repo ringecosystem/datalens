@@ -229,10 +229,25 @@ impl StorageReadPlan {
         let mut data_object_count = 0usize;
         let mut empty_coverage_count = 0usize;
         let mut seen_objects = BTreeSet::new();
+        let mut emitted_ranges = Vec::new();
         let mut objects = Vec::new();
         let mut reads = Vec::new();
 
         for candidate in candidates {
+            let ranges = candidate
+                .ranges
+                .into_iter()
+                .flat_map(|range| missing_ranges(range, &emitted_ranges))
+                .collect::<Vec<_>>();
+            if ranges.is_empty() {
+                continue;
+            }
+            emitted_ranges = merge_ranges(
+                emitted_ranges
+                    .into_iter()
+                    .chain(ranges.iter().cloned())
+                    .collect(),
+            );
             let Some(object_key) = candidate.entry.object_key.clone() else {
                 empty_coverage_count += 1;
                 continue;
@@ -251,10 +266,7 @@ impl StorageReadPlan {
                     encoding,
                 });
             }
-            reads.push(StorageReadPlanRead {
-                object_key,
-                ranges: candidate.ranges,
-            });
+            reads.push(StorageReadPlanRead { object_key, ranges });
         }
 
         Ok(Self {
@@ -806,6 +818,7 @@ where
         Ok(manifest)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn write_manifest(
         &self,
         chain: &ChainIdentity,
@@ -817,6 +830,7 @@ where
         self.write_manifest_unlocked(chain, manifest, started)
     }
 
+    #[allow(dead_code)]
     fn write_manifest_unlocked(
         &self,
         chain: &ChainIdentity,
@@ -844,6 +858,7 @@ where
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn publish_manifest_unlocked(
         &self,
         chain: &ChainIdentity,
@@ -884,6 +899,7 @@ where
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn delete_manifest_segments_unlocked(
         &self,
         chain: &ChainIdentity,
@@ -899,7 +915,7 @@ where
         Ok(())
     }
 
-    fn write_manifest_entry(
+    pub(crate) fn write_manifest_entry(
         &self,
         chain: &ChainIdentity,
         entry: ManifestEntry,

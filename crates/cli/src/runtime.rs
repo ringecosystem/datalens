@@ -1,10 +1,13 @@
 use std::{
-    sync::{Arc, Once},
+    sync::{
+        Arc, Once,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
 
-use datalens_core::{DatalensError, DatalensErrorKind};
+use datalens_core::{ChainIdentity, DatalensError, DatalensErrorKind};
 use datalens_edge::config::{ChainConfig, DatalensConfig, FinalityConfig};
 use datalens_edge::{QueryService, QueryServiceRegistry};
 use datalens_evm::{
@@ -118,6 +121,11 @@ pub(crate) fn start_storage_compaction_worker(
         log::info!("storage compaction worker disabled");
         return Ok(None);
     }
+    let chains = configured_compaction_chains(config)?;
+    if chains.is_empty() {
+        log::info!("storage compaction worker disabled because no chains are configured");
+        return Ok(None);
+    }
     let interval = Duration::from_millis(config.storage.compaction.interval_ms.max(1));
     let compaction = MaintenanceCompactionConfig {
         min_object_bytes: config.storage.compaction.min_object_bytes,
@@ -156,12 +164,13 @@ pub(crate) fn start_storage_compaction_worker(
         }
     };
     Ok(Some(StorageCompactionWorker::start(
-        storage, compaction, interval,
+        storage, chains, compaction, interval,
     )?))
 }
 
 pub(crate) struct StorageCompactionWorker {
-    _handle: thread::JoinHandle<()>,
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
 }
 
 #[derive(Clone)]
@@ -173,31 +182,46 @@ enum CompactionStorage {
 impl StorageCompactionWorker {
     fn start(
         storage: CompactionStorage,
+        chains: Vec<ChainIdentity>,
         config: MaintenanceCompactionConfig,
         interval: Duration,
     ) -> Result<Self, DatalensError> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
         let handle = thread::Builder::new()
             .name("datalens-storage-compaction".to_owned())
             .spawn(move || {
                 log::info!(
-                    "storage compaction worker started interval_ms={} min_object_bytes={} max_merge_ranges={}",
+                    "storage compaction worker started interval_ms={} min_object_bytes={} max_merge_ranges={} chain_count={}",
                     interval.as_millis(),
                     config.min_object_bytes,
-                    config.max_merge_ranges
+                    config.max_merge_ranges,
+                    chains.len()
                 );
                 let mut consecutive_failures = 0u32;
-                loop {
-                    thread::sleep(compaction_sleep_duration(interval, consecutive_failures));
+                let mut next_chain_index = 0usize;
+                while !worker_stop.load(Ordering::Relaxed) {
+                    thread::park_timeout(compaction_sleep_duration(interval, consecutive_failures));
+                    if worker_stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let chain = chains[next_chain_index % chains.len()].clone();
+                    next_chain_index = next_chain_index.saturating_add(1);
                     let started = Instant::now();
                     let result = match &storage {
-                        CompactionStorage::Local(storage) => storage.compact_small_objects(config),
-                        CompactionStorage::S3(storage) => storage.compact_small_objects(config),
+                        CompactionStorage::Local(storage) => {
+                            storage.compact_small_objects_for_chain(&chain, config)
+                        }
+                        CompactionStorage::S3(storage) => {
+                            storage.compact_small_objects_for_chain(&chain, config)
+                        }
                     };
                     match result {
                         Ok(report) => {
                             consecutive_failures = 0;
                             log::info!(
-                                "storage compaction tick completed candidates={} compacted_objects={} compacted_rows={} duration_ms={}",
+                                "storage compaction tick completed chain_key={} candidates={} compacted_objects={} compacted_rows={} duration_ms={}",
+                                chain.key_prefix(),
                                 report.candidates.len(),
                                 report.compacted_objects,
                                 report.compacted_rows,
@@ -207,7 +231,8 @@ impl StorageCompactionWorker {
                         Err(error) => {
                             consecutive_failures = consecutive_failures.saturating_add(1);
                             log::warn!(
-                                "storage compaction tick failed kind={:?} message={} consecutive_failures={} duration_ms={}",
+                                "storage compaction tick failed chain_key={} kind={:?} message={} consecutive_failures={} duration_ms={}",
+                                chain.key_prefix(),
                                 error.kind,
                                 error.message,
                                 consecutive_failures,
@@ -216,6 +241,7 @@ impl StorageCompactionWorker {
                         }
                     }
                 }
+                log::info!("storage compaction worker stopped");
             })
             .map_err(|error| {
                 DatalensError::new(
@@ -223,8 +249,35 @@ impl StorageCompactionWorker {
                     format!("start storage compaction worker: {error}"),
                 )
             })?;
-        Ok(Self { _handle: handle })
+        Ok(Self {
+            stop,
+            handle: Some(handle),
+        })
     }
+}
+
+impl Drop for StorageCompactionWorker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = &self.handle {
+            handle.thread().unpark();
+        }
+        if let Some(handle) = self.handle.take()
+            && let Err(error) = handle.join()
+        {
+            log::warn!("storage compaction worker join failed error={error:?}");
+        }
+    }
+}
+
+fn configured_compaction_chains(
+    config: &DatalensConfig,
+) -> Result<Vec<ChainIdentity>, DatalensError> {
+    config
+        .chains
+        .iter()
+        .map(|(name, chain)| chain_identity(name, chain))
+        .collect()
 }
 
 fn compaction_sleep_duration(interval: Duration, consecutive_failures: u32) -> Duration {

@@ -15,6 +15,7 @@ pub struct Manifest {
 }
 
 impl Manifest {
+    #[allow(dead_code)]
     pub(crate) fn upsert(&mut self, entry: ManifestEntry) {
         self.entries.push(entry);
         self.normalize();
