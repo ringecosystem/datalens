@@ -397,7 +397,7 @@ where
         .name(format!("datalens-durable-intent-{worker_index}"))
         .spawn(move || {
             let worker_chain = adapter.capabilities().chain().clone();
-            startup_maintenance_once.call_once(|| run_startup_maintenance(repository.as_ref()));
+            spawn_startup_maintenance_once(repository.clone(), startup_maintenance_once.as_ref());
             let mut last_backlog_metric_sample: Option<Instant> = None;
             loop {
                 let now = unix_seconds_now();
@@ -441,6 +441,20 @@ where
                 format!("start durable intent worker: {error}"),
             )
         })
+}
+
+fn spawn_startup_maintenance_once(
+    repository: Arc<dyn DurablePromotionIntentRepository>,
+    startup_maintenance_once: &Once,
+) {
+    startup_maintenance_once.call_once(|| {
+        if let Err(error) = thread::Builder::new()
+            .name("datalens-durable-intent-maintenance".to_owned())
+            .spawn(move || run_startup_maintenance(repository.as_ref()))
+        {
+            log::error!("durable intent startup maintenance spawn failed error={error}");
+        }
+    });
 }
 
 fn run_intent_work<R, A>(
@@ -1097,6 +1111,10 @@ fn run_startup_maintenance(repository: &dyn DurablePromotionIntentRepository) {
             );
         }
     }
+    log::info!(
+        "durable intent startup maintenance finished duration_ms={}",
+        started.elapsed().as_millis()
+    );
 }
 
 fn unix_seconds_now() -> u64 {

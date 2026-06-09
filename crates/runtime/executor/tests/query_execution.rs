@@ -23,10 +23,10 @@ use datalens_metrics::{ApplicationIdentity, MetricsRecorder};
 use datalens_planner::{FieldSelection, NativePlannerConfig, NativeQueryInput};
 use datalens_storage::{
     CacheOutcome, CreateDurablePromotionIntent, DurablePromotionIntent,
-    DurablePromotionIntentCreateOutcome, DurablePromotionIntentRepository,
-    DurablePromotionIntentSource, DurablePromotionIntentStatus, DurablePromotionIntentStore,
-    FillOutcome, LocalObjectStore, LocalStorage, Manifest, QueryActivityKey,
-    QueryActivityRepository, QueryActivityStore, QueryOutcome, QueryWatermarkKey,
+    DurablePromotionIntentBacklog, DurablePromotionIntentCreateOutcome,
+    DurablePromotionIntentRepository, DurablePromotionIntentSource, DurablePromotionIntentStatus,
+    DurablePromotionIntentStore, FillOutcome, LocalObjectStore, LocalStorage, Manifest,
+    QueryActivityKey, QueryActivityRepository, QueryActivityStore, QueryOutcome, QueryWatermarkKey,
     QueryWatermarkRepository, QueryWatermarkStore, StorageRepository, StorageWriteOutcome,
     StorageWriteRequest, UsageLedgerRepository, UsageLedgerStore,
 };
@@ -144,6 +144,49 @@ fn test_durable_intent_startup_maintenance_does_not_block_executor_configuration
         started.elapsed() < Duration::from_millis(250),
         "durable intent worker startup must not synchronously wait for startup maintenance"
     );
+}
+
+#[test]
+fn test_durable_intent_worker_claims_while_startup_maintenance_is_blocked() {
+    let root = temp_storage_root("executor-intent-worker-nonblocking-maintenance");
+    let storage = LocalStorage::new(root.join("storage"));
+    let inner = DurablePromotionIntentStore::new(LocalObjectStore::new(root.join("intents")));
+    inner
+        .create_or_get(CreateDurablePromotionIntent {
+            source: DurablePromotionIntentSource::Warmup,
+            application: "app-a".to_owned(),
+            chain: ethereum_identity(),
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: DatasetSelector::all(),
+            selector_fingerprint: DatasetSelector::all().fingerprint(),
+            selector_canonical_key: DatasetSelector::all().canonical_key(),
+            finality: "safe".to_owned(),
+            ranges: vec![LedgerRange::blocks(1, 1).expect("range")],
+            request_id: None,
+            task_id: Some("task-1".to_owned()),
+            now_unix_seconds: 100,
+        })
+        .expect("create intent");
+    let repository = BlockingStartupMaintenancePendingIntentRepository::new(inner);
+    let maintenance_gate = repository.maintenance_gate();
+    let claimed = repository.claimed();
+    let source = MockSource::default().with_blocks(vec![block(1, "0x01")]);
+
+    let _executor = executor(storage, source)
+        .with_durable_intents_startup_maintenance_once(repository, Arc::new(Once::new()));
+    maintenance_gate.wait_until_blocked();
+    let deadline = Instant::now() + Duration::from_millis(250);
+    loop {
+        if claimed.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        if Instant::now() >= deadline {
+            maintenance_gate.release();
+            panic!("durable intent worker did not claim while startup maintenance was blocked");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    maintenance_gate.release();
 }
 
 #[test]
@@ -1393,6 +1436,31 @@ struct RecordingIntentRepository {
 #[derive(Clone)]
 struct SlowStartupMaintenanceIntentRepository;
 
+#[derive(Clone)]
+struct BlockingStartupMaintenancePendingIntentRepository {
+    inner: DurablePromotionIntentStore<LocalObjectStore>,
+    maintenance_gate: WriteGate,
+    claimed: Arc<AtomicUsize>,
+}
+
+impl BlockingStartupMaintenancePendingIntentRepository {
+    fn new(inner: DurablePromotionIntentStore<LocalObjectStore>) -> Self {
+        Self {
+            inner,
+            maintenance_gate: WriteGate::default(),
+            claimed: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn maintenance_gate(&self) -> WriteGate {
+        self.maintenance_gate.clone()
+    }
+
+    fn claimed(&self) -> Arc<AtomicUsize> {
+        self.claimed.clone()
+    }
+}
+
 impl DurablePromotionIntentRepository for RecordingIntentRepository {
     fn create_or_get(
         &self,
@@ -1468,6 +1536,104 @@ impl DurablePromotionIntentRepository for RecordingIntentRepository {
         _stale_before_unix_seconds: u64,
         _now_unix_seconds: u64,
     ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+        Ok(Vec::new())
+    }
+}
+
+impl DurablePromotionIntentRepository for BlockingStartupMaintenancePendingIntentRepository {
+    fn create_or_get(
+        &self,
+        request: CreateDurablePromotionIntent,
+    ) -> Result<DurablePromotionIntentCreateOutcome, DatalensError> {
+        self.inner.create_or_get(request)
+    }
+
+    fn get(&self, intent_id: &str) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        self.inner.get(intent_id)
+    }
+
+    fn list_pending(
+        &self,
+        now_unix_seconds: u64,
+        limit: usize,
+    ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+        self.inner.list_pending(now_unix_seconds, limit)
+    }
+
+    fn list_pending_for_chain(
+        &self,
+        chain: &ChainIdentity,
+        now_unix_seconds: u64,
+        limit: usize,
+    ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+        self.inner
+            .list_pending_for_chain(chain, now_unix_seconds, limit)
+    }
+
+    fn rebuild_pending_indexes(&self, now_unix_seconds: u64) -> Result<usize, DatalensError> {
+        self.inner.rebuild_pending_indexes(now_unix_seconds)
+    }
+
+    fn pending_backlog_for_chain(
+        &self,
+        chain: &ChainIdentity,
+        now_unix_seconds: u64,
+    ) -> Result<Vec<DurablePromotionIntentBacklog>, DatalensError> {
+        self.inner
+            .pending_backlog_for_chain(chain, now_unix_seconds)
+    }
+
+    fn mark_running(
+        &self,
+        intent_id: &str,
+        now_unix_seconds: u64,
+    ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        let intent = self.inner.mark_running(intent_id, now_unix_seconds)?;
+        if intent.is_some() {
+            self.claimed.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(intent)
+    }
+
+    fn mark_completed(
+        &self,
+        intent_id: &str,
+        now_unix_seconds: u64,
+    ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        self.inner.mark_completed(intent_id, now_unix_seconds)
+    }
+
+    fn mark_retryable_failure(
+        &self,
+        intent_id: &str,
+        error: &str,
+        now_unix_seconds: u64,
+        next_retry_at_unix_seconds: u64,
+    ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        self.inner.mark_retryable_failure(
+            intent_id,
+            error,
+            now_unix_seconds,
+            next_retry_at_unix_seconds,
+        )
+    }
+
+    fn mark_terminal_failure(
+        &self,
+        intent_id: &str,
+        error: &str,
+        now_unix_seconds: u64,
+    ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        self.inner
+            .mark_terminal_failure(intent_id, error, now_unix_seconds)
+    }
+
+    fn reset_stale_running(
+        &self,
+        _stale_before_unix_seconds: u64,
+        _now_unix_seconds: u64,
+    ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+        self.maintenance_gate.block_until_released();
         Ok(Vec::new())
     }
 }
