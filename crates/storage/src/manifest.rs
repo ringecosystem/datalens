@@ -15,6 +15,7 @@ pub struct Manifest {
 }
 
 impl Manifest {
+    #[allow(dead_code)]
     pub(crate) fn upsert(&mut self, entry: ManifestEntry) {
         self.entries.push(entry);
         self.normalize();
@@ -48,7 +49,7 @@ impl Manifest {
         for entry in self.entries.drain(..) {
             entries.insert(entry.logical_key(), entry);
         }
-        self.entries = entries.into_values().collect();
+        self.entries = coalesce_empty_entries(entries.into_values().collect());
     }
 
     pub(crate) fn find_logical(
@@ -67,6 +68,34 @@ impl Manifest {
                 && existing.finality_level == finality_level
         })
     }
+}
+
+fn coalesce_empty_entries(entries: Vec<ManifestEntry>) -> Vec<ManifestEntry> {
+    let mut coalesced: Vec<ManifestEntry> = Vec::new();
+    for entry in entries {
+        if let Some(last) = coalesced.last_mut()
+            && can_merge_empty(last, &entry)
+        {
+            let end = last.range.end().max(entry.range.end());
+            last.range = LedgerRange::try_new(last.range.kind(), last.range.start(), end)
+                .expect("merged range remains valid");
+            continue;
+        }
+        coalesced.push(entry);
+    }
+    coalesced
+}
+
+fn can_merge_empty(left: &ManifestEntry, right: &ManifestEntry) -> bool {
+    left.object_key.is_none()
+        && right.object_key.is_none()
+        && left.chain == right.chain
+        && left.dataset_key == right.dataset_key
+        && left.selector_fingerprint == right.selector_fingerprint
+        && left.selector_canonical_key == right.selector_canonical_key
+        && left.finality_level == right.finality_level
+        && left.range.kind() == right.range.kind()
+        && left.range.end().saturating_add(1) >= right.range.start()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]

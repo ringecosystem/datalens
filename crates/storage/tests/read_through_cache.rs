@@ -36,6 +36,16 @@ impl CountingObjectStore {
             .get(key)
             .unwrap_or(&0)
     }
+
+    fn data_object_read_count(&self) -> usize {
+        self.reads
+            .lock()
+            .expect("read counts")
+            .iter()
+            .filter(|(key, _)| key.contains("/datasets/"))
+            .map(|(_, count)| *count)
+            .sum()
+    }
 }
 
 impl ObjectStore for CountingObjectStore {
@@ -300,6 +310,38 @@ fn test_read_through_cache_disabled_preserves_object_fetches() {
         .expect("second read");
 
     assert_eq!(store.read_count(&object_key), 2);
+}
+
+#[test]
+fn test_storage_read_plan_skips_empty_coverage_object_fetches() {
+    let root = temp_storage_root("empty-coverage-no-get");
+    let store = CountingObjectStore::new(root);
+    let storage = DurableStorage::from_object_store_with_read_through_cache_config(
+        store.clone(),
+        ReadThroughCacheConfig::enabled(16),
+    );
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let range = LedgerRange::blocks(20, 21).expect("valid range");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &selector,
+            range: range.clone(),
+            rows: &block_rows(&[]),
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write empty coverage");
+
+    let rows = storage
+        .read_rows(&chain, &DatasetKey::evm_blocks(), &selector, range)
+        .expect("read empty coverage");
+
+    assert_eq!(rows, block_rows(&[]));
+    assert_eq!(store.data_object_read_count(), 0);
 }
 
 fn temp_storage_root(name: &str) -> PathBuf {

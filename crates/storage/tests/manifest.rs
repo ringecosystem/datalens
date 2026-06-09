@@ -2448,19 +2448,9 @@ fn test_legacy_full_manifest_and_segments_merge() {
         .expect("write segment coverage");
 
     let manifest = storage.manifest().expect("manifest");
-    assert_eq!(manifest.entries.len(), 2);
-    assert!(
-        manifest
-            .entries
-            .iter()
-            .any(|entry| entry.range == legacy_range)
-    );
-    assert!(
-        manifest
-            .entries
-            .iter()
-            .any(|entry| entry.range == segment_range)
-    );
+    assert_eq!(manifest.entries.len(), 1);
+    assert!(manifest.entries.iter().any(|entry| entry.range
+        == LedgerRange::blocks(legacy_range.start(), segment_range.end()).expect("merged range")));
     assert_eq!(legacy_rows.row_count(), 0);
 }
 
@@ -3297,15 +3287,10 @@ fn test_cloned_storage_serializes_concurrent_manifest_updates() {
     second.join().expect("second writer");
 
     let manifest = storage.manifest().expect("manifest");
-    assert_eq!(manifest.entries.len(), 2);
+    assert_eq!(manifest.entries.len(), 1);
     assert_eq!(manifest_segment_keys(&storage, &chain).len(), 2);
     assert!(manifest.entries.iter().any(|entry| {
-        entry.range == LedgerRange::blocks(10, 10).expect("valid range")
-            && entry.object_key.is_none()
-            && entry.row_count == 0
-    }));
-    assert!(manifest.entries.iter().any(|entry| {
-        entry.range == LedgerRange::blocks(11, 11).expect("valid range")
+        entry.range == LedgerRange::blocks(10, 11).expect("valid range")
             && entry.object_key.is_none()
             && entry.row_count == 0
     }));

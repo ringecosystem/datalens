@@ -92,6 +92,20 @@ pub fn validate_config(config: &DatalensConfig) -> Result<(), DatalensError> {
             "writer.min_object_rows must be greater than zero",
         ));
     }
+    if config.storage.compaction.enabled {
+        if config.storage.compaction.interval_ms == 0 {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                "storage.compaction.interval_ms must be greater than zero when compaction is enabled",
+            ));
+        }
+        if config.storage.compaction.max_merge_ranges < 2 {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                "storage.compaction.max_merge_ranges must be at least two when compaction is enabled",
+            ));
+        }
+    }
     if config.metrics.enabled && config.metrics.default_application.trim().is_empty() {
         return Err(DatalensError::new(
             DatalensErrorKind::InvalidInput,

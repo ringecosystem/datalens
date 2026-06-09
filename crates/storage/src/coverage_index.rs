@@ -139,6 +139,7 @@ where
     Ok(())
 }
 
+#[allow(dead_code)]
 pub(crate) fn write_entries<S>(
     object_store: &S,
     entries: &[ManifestEntry],
@@ -152,6 +153,7 @@ where
     Ok(())
 }
 
+#[allow(dead_code)]
 pub(crate) fn delete_chain<S>(object_store: &S, chain: &ChainIdentity) -> Result<(), DatalensError>
 where
     S: ObjectStore,
@@ -167,6 +169,7 @@ where
     Ok(())
 }
 
+#[allow(dead_code)]
 fn coverage_index_prefix(chain: &ChainIdentity) -> String {
     format!("chains/{}/coverage-index", chain.key_prefix())
 }

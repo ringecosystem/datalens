@@ -404,12 +404,12 @@ where
                 let record_backlog_metrics = last_backlog_metric_sample.is_none_or(|sampled| {
                     sampled.elapsed() >= DEFAULT_INTENT_BACKLOG_METRIC_INTERVAL
                 });
-                let intent = {
+                let intents = {
                     let _claim = match claim_lock.lock() {
                         Ok(claim) => claim,
                         Err(_) => return,
                     };
-                    claim_pending_intent(
+                    claim_pending_intents(
                         repository.as_ref(),
                         &worker_chain,
                         metrics.as_ref(),
@@ -421,15 +421,15 @@ where
                 if record_backlog_metrics {
                     last_backlog_metric_sample = Some(Instant::now());
                 }
-                let Some(intent) = intent else {
+                if intents.is_empty() {
                     thread::sleep(DEFAULT_INTENT_POLL_INTERVAL);
                     continue;
-                };
-                run_intent_work(
+                }
+                run_intent_batch_work(
                     repository.as_ref(),
                     &writer,
                     &adapter,
-                    &intent,
+                    &intents,
                     metrics.as_ref(),
                 );
             }
@@ -441,6 +441,94 @@ where
                 format!("start durable intent worker: {error}"),
             )
         })
+}
+
+fn run_intent_batch_work<R, A>(
+    repository: &dyn DurablePromotionIntentRepository,
+    writer: &DurableWriter<R>,
+    adapter: &A,
+    intents: &[DurablePromotionIntent],
+    metrics: Option<&Arc<MetricsRecorder>>,
+) where
+    R: StorageRepository + Clone + 'static,
+    A: ChainAdapter,
+{
+    if intents.len() <= 1 {
+        if let Some(intent) = intents.first() {
+            run_intent_work(repository, writer, adapter, intent, metrics);
+        }
+        return;
+    }
+    let mut batch = intents[0].clone();
+    batch.intent_id = intents
+        .iter()
+        .map(|intent| intent.intent_id.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    batch.ranges = batch_ranges(intents);
+    let started = Instant::now();
+    log::info!(
+        "durable intent promotion batch started count={} chain_key={} dataset={} selector_fingerprint={} ranges={}",
+        intents.len(),
+        batch.chain.key_prefix(),
+        batch.dataset_key.as_str(),
+        batch.selector_fingerprint,
+        intent_ranges_label(&batch.ranges)
+    );
+    let result = promote_intent(writer, adapter, &batch);
+    for intent in intents {
+        match &result {
+            Ok(()) => {
+                if let Err(error) = repository.mark_completed(&intent.intent_id, unix_seconds_now())
+                {
+                    record_intent_worker_metric(
+                        metrics,
+                        intent,
+                        MetricsDurableIntentOutcome::Error,
+                    );
+                    observe_intent_worker_duration(
+                        metrics,
+                        intent,
+                        MetricsDurableIntentOutcome::Error,
+                        started,
+                    );
+                    log::error!(
+                        "durable intent batch completion mark failed intent_id={} kind={:?} message={}",
+                        intent.intent_id,
+                        error.kind,
+                        error.message
+                    );
+                } else {
+                    record_intent_worker_metric(
+                        metrics,
+                        intent,
+                        MetricsDurableIntentOutcome::Completed,
+                    );
+                    observe_intent_worker_duration(
+                        metrics,
+                        intent,
+                        MetricsDurableIntentOutcome::Completed,
+                        started,
+                    );
+                }
+            }
+            Err(error) => mark_intent_failure(repository, intent, error, metrics, started),
+        }
+    }
+    match result {
+        Ok(()) => log::info!(
+            "durable intent promotion batch completed count={} duration_ms={}",
+            intents.len(),
+            started.elapsed().as_millis()
+        ),
+        Err(error) => log::error!(
+            "durable intent promotion batch failed count={} kind={:?} message={} duration_ms={}",
+            intents.len(),
+            error.kind,
+            error.message,
+            started.elapsed().as_millis()
+        ),
+    }
 }
 
 fn spawn_startup_maintenance_once(
@@ -655,6 +743,86 @@ fn observe_intent_worker_duration(
     );
 }
 
+fn mark_intent_failure(
+    repository: &dyn DurablePromotionIntentRepository,
+    intent: &DurablePromotionIntent,
+    error: &DatalensError,
+    metrics: Option<&Arc<MetricsRecorder>>,
+    started: Instant,
+) {
+    let now = unix_seconds_now();
+    if error.kind.is_retryable() {
+        let retry_delay = intent_retry_delay_seconds(intent);
+        let next_retry = now.saturating_add(retry_delay);
+        match repository.mark_retryable_failure(&intent.intent_id, &error.message, now, next_retry)
+        {
+            Ok(_) => {
+                record_intent_worker_metric(
+                    metrics,
+                    intent,
+                    MetricsDurableIntentOutcome::RetryableFailed,
+                );
+                observe_intent_worker_duration(
+                    metrics,
+                    intent,
+                    MetricsDurableIntentOutcome::RetryableFailed,
+                    started,
+                );
+            }
+            Err(mark_error) => {
+                record_intent_worker_metric(metrics, intent, MetricsDurableIntentOutcome::Error);
+                observe_intent_worker_duration(
+                    metrics,
+                    intent,
+                    MetricsDurableIntentOutcome::Error,
+                    started,
+                );
+                log::error!(
+                    "durable intent retry mark failed intent_id={} kind={:?} message={} original_kind={:?} original_message={}",
+                    intent.intent_id,
+                    mark_error.kind,
+                    mark_error.message,
+                    error.kind,
+                    error.message
+                );
+            }
+        }
+    } else {
+        match repository.mark_terminal_failure(&intent.intent_id, &error.message, now) {
+            Ok(_) => {
+                record_intent_worker_metric(
+                    metrics,
+                    intent,
+                    MetricsDurableIntentOutcome::TerminalFailed,
+                );
+                observe_intent_worker_duration(
+                    metrics,
+                    intent,
+                    MetricsDurableIntentOutcome::TerminalFailed,
+                    started,
+                );
+            }
+            Err(mark_error) => {
+                record_intent_worker_metric(metrics, intent, MetricsDurableIntentOutcome::Error);
+                observe_intent_worker_duration(
+                    metrics,
+                    intent,
+                    MetricsDurableIntentOutcome::Error,
+                    started,
+                );
+                log::error!(
+                    "durable intent terminal mark failed intent_id={} kind={:?} message={} original_kind={:?} original_message={}",
+                    intent.intent_id,
+                    mark_error.kind,
+                    mark_error.message,
+                    error.kind,
+                    error.message
+                );
+            }
+        }
+    }
+}
+
 fn record_intent_backlog_metric(
     metrics: Option<&Arc<MetricsRecorder>>,
     backlog: &[DurablePromotionIntentBacklog],
@@ -836,6 +1004,89 @@ where
         .any(|covered_range| covered_range.intersection(range) == Some(range.clone())))
 }
 
+fn claim_pending_intents(
+    repository: &dyn DurablePromotionIntentRepository,
+    chain: &ChainIdentity,
+    metrics: Option<&Arc<MetricsRecorder>>,
+    now: u64,
+    worker_index: usize,
+    record_backlog_metrics: bool,
+) -> Vec<DurablePromotionIntent> {
+    let Some(first) = claim_pending_intent(
+        repository,
+        chain,
+        metrics,
+        now,
+        worker_index,
+        record_backlog_metrics,
+    ) else {
+        return Vec::new();
+    };
+    let pending =
+        match repository.list_pending_for_chain(chain, now, DEFAULT_INTENT_CLAIM_BATCH_SIZE) {
+            Ok(pending) => pending,
+            Err(error) => {
+                log::warn!(
+                    "durable intent batch list failed worker={} kind={:?} message={}",
+                    worker_index,
+                    error.kind,
+                    error.message
+                );
+                return vec![first];
+            }
+        };
+    let mut claimed = vec![first.clone()];
+    for candidate in pending {
+        if candidate.intent_id == first.intent_id {
+            continue;
+        }
+        if !intent_batch_compatible(&first, &candidate) {
+            continue;
+        }
+        if !ranges_adjacent_to_batch(&claimed, &candidate) {
+            continue;
+        }
+        let source = intent_source_label(candidate.source);
+        let claim_started = Instant::now();
+        match repository.mark_running(&candidate.intent_id, unix_seconds_now()) {
+            Ok(Some(intent)) => {
+                record_intent_claim_metric(
+                    metrics,
+                    chain,
+                    source,
+                    MetricsDurableIntentClaimOutcome::Claimed,
+                    claim_started,
+                );
+                claimed.push(intent);
+            }
+            Ok(None) => record_intent_claim_metric(
+                metrics,
+                chain,
+                source,
+                MetricsDurableIntentClaimOutcome::SkippedIneligible,
+                claim_started,
+            ),
+            Err(error) => {
+                record_intent_claim_metric(
+                    metrics,
+                    chain,
+                    source,
+                    MetricsDurableIntentClaimOutcome::MarkRunningError,
+                    claim_started,
+                );
+                log::error!(
+                    "durable intent batch claim failed worker={} intent_id={} kind={:?} message={}",
+                    worker_index,
+                    candidate.intent_id,
+                    error.kind,
+                    error.message
+                );
+            }
+        }
+    }
+    claimed
+}
+
 fn claim_pending_intent(
     repository: &dyn DurablePromotionIntentRepository,
     chain: &ChainIdentity,
@@ -942,6 +1193,66 @@ fn claim_pending_intent(
         }
         None => None,
     }
+}
+
+fn intent_batch_compatible(
+    first: &DurablePromotionIntent,
+    candidate: &DurablePromotionIntent,
+) -> bool {
+    first.chain == candidate.chain
+        && first.dataset_key == candidate.dataset_key
+        && first.selector_fingerprint == candidate.selector_fingerprint
+        && first.selector_canonical_key == candidate.selector_canonical_key
+        && first.finality == candidate.finality
+        && first
+            .ranges
+            .first()
+            .zip(candidate.ranges.first())
+            .is_some_and(|(left, right)| left.kind() == right.kind())
+}
+
+fn ranges_adjacent_to_batch(
+    claimed: &[DurablePromotionIntent],
+    candidate: &DurablePromotionIntent,
+) -> bool {
+    let mut ranges = batch_ranges(claimed);
+    let candidate_ranges = normalized_intent_ranges(candidate);
+    ranges.extend(candidate_ranges.clone());
+    ranges.sort_by_key(|range| (range.start(), range.end()));
+    for pair in ranges.windows(2) {
+        if pair[1].start() > pair[0].end().saturating_add(1) {
+            return false;
+        }
+    }
+    !candidate_ranges.is_empty()
+}
+
+fn batch_ranges(intents: &[DurablePromotionIntent]) -> Vec<datalens_core::LedgerRange> {
+    let mut ranges = intents
+        .iter()
+        .flat_map(normalized_intent_ranges)
+        .collect::<Vec<_>>();
+    ranges.sort_by_key(|range| (range.start(), range.end()));
+    let mut merged: Vec<datalens_core::LedgerRange> = Vec::new();
+    for range in ranges {
+        if let Some(last) = merged.last_mut()
+            && last.kind() == range.kind()
+            && range.start() <= last.end().saturating_add(1)
+        {
+            let end = last.end().max(range.end());
+            *last = datalens_core::LedgerRange::try_new(last.kind(), last.start(), end)
+                .expect("merged intent range remains valid");
+            continue;
+        }
+        merged.push(range);
+    }
+    merged
+}
+
+fn normalized_intent_ranges(intent: &DurablePromotionIntent) -> Vec<datalens_core::LedgerRange> {
+    let mut ranges = intent.ranges.clone();
+    ranges.sort_by_key(|range| (range.start(), range.end()));
+    ranges
 }
 
 fn fetch_intent_with_provider_limit_splits<A>(
@@ -1596,6 +1907,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_batch_ranges_merges_only_adjacent_compatible_intents() {
+        let first = test_intent_with_range("intent-10", 10, 10);
+        let second = test_intent_with_range("intent-11", 11, 12);
+        let gap = test_intent_with_range("intent-14", 14, 14);
+
+        assert!(intent_batch_compatible(&first, &second));
+        assert!(ranges_adjacent_to_batch(
+            std::slice::from_ref(&first),
+            &second
+        ));
+        assert!(!ranges_adjacent_to_batch(
+            &[first.clone(), second.clone()],
+            &gap
+        ));
+        assert_eq!(
+            batch_ranges(&[first, second]),
+            vec![datalens_core::LedgerRange::blocks(10, 12).expect("range")]
+        );
+    }
+
     fn sample_repository(intents: Vec<DurablePromotionIntent>) -> SampleIntentRepository {
         SampleIntentRepository {
             intents: Mutex::new(intents),
@@ -1635,6 +1967,12 @@ mod tests {
             request_id: None,
             task_id: None,
         }
+    }
+
+    fn test_intent_with_range(intent_id: &str, start: u64, end: u64) -> DurablePromotionIntent {
+        let mut intent = test_intent_with_chain(intent_id, ethereum_chain(), start);
+        intent.ranges = vec![datalens_core::LedgerRange::blocks(start, end).expect("range")];
+        intent
     }
 
     fn ethereum_chain() -> ChainIdentity {

@@ -214,20 +214,20 @@ fn test_compaction_merges_adjacent_small_objects_and_retains_old_objects() {
     assert_eq!(report.compacted_rows, 2);
 
     let manifest = storage.manifest().expect("manifest");
-    assert_eq!(manifest.entries.len(), 1);
-    assert_eq!(
-        manifest.entries[0].range,
-        LedgerRange::blocks(50, 51).expect("range")
-    );
-    assert_eq!(manifest.entries[0].row_count, 2);
-    assert_ne!(
-        manifest.entries[0].object_key.as_deref(),
-        Some(first_object.as_str())
-    );
-    assert_ne!(
-        manifest.entries[0].object_key.as_deref(),
-        Some(second_object.as_str())
-    );
+    assert_eq!(manifest.entries.len(), 3);
+    let compacted_entry = manifest
+        .entries
+        .iter()
+        .find(|entry| entry.range == LedgerRange::blocks(50, 51).expect("range"))
+        .expect("compacted entry");
+    assert_eq!(compacted_entry.row_count, 2);
+    let compacted_object = compacted_entry
+        .object_key
+        .as_ref()
+        .expect("compacted object key");
+    assert!(compacted_object.contains("/compacted/"));
+    assert_ne!(compacted_object, &first_object);
+    assert_ne!(compacted_object, &second_object);
 
     assert!(
         storage
@@ -242,25 +242,20 @@ fn test_compaction_merges_adjacent_small_objects_and_retains_old_objects() {
             .expect("second exists")
     );
     assert!(
-        storage.manifest_path(&chain).exists(),
-        "compaction should write an authoritative full manifest"
+        storage
+            .object_store()
+            .exists(compacted_object)
+            .expect("compacted exists")
     );
     assert!(
         storage
             .object_store()
             .list(&format!("chains/{}/manifest-segments", chain.key_prefix()))
             .expect("manifest segments")
-            .is_empty(),
-        "compaction should replace per-entry segments with the full manifest"
+            .len()
+            >= 3,
+        "compaction should publish an additional segment without deleting old segments"
     );
-    storage
-        .object_store()
-        .delete(&first_object)
-        .expect("delete old first object");
-    storage
-        .object_store()
-        .delete(&second_object)
-        .expect("delete old second object");
 
     let rows = storage
         .read_rows(

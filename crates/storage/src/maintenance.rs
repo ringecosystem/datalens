@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     DurableStorage, Manifest, ManifestEntry, ManifestFinalityLevel, ObjectEncoding, ObjectStore,
     ParquetCompression, StorageDataObject, checksum_hex, decode_object_rows, encode_object_rows,
-    object_key, range_kind_key, unix_seconds_now, verify_manifest_object_metadata,
+    range_kind_key, unix_seconds_now, verify_manifest_object_metadata,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -225,13 +225,29 @@ where
         config: MaintenanceCompactionConfig,
     ) -> Result<MaintenanceCompactionReport, DatalensError> {
         let manifest = self.manifest()?;
+        self.compact_manifest_small_objects(manifest, config)
+    }
 
+    pub fn compact_small_objects_for_chain(
+        &self,
+        chain: &ChainIdentity,
+        config: MaintenanceCompactionConfig,
+    ) -> Result<MaintenanceCompactionReport, DatalensError> {
+        let manifest = self.manifest_for_chain(chain)?;
+        self.compact_manifest_small_objects(manifest, config)
+    }
+
+    fn compact_manifest_small_objects(
+        &self,
+        manifest: Manifest,
+        config: MaintenanceCompactionConfig,
+    ) -> Result<MaintenanceCompactionReport, DatalensError> {
         let candidates = compaction_candidates(&manifest.entries, config);
         let mut compacted_objects = 0usize;
         let mut compacted_rows = 0usize;
 
         for candidate in &candidates {
-            let mut chain_manifest = self.manifest_for_chain(&candidate.chain)?;
+            let chain_manifest = self.manifest_for_chain(&candidate.chain)?;
             let entries = candidate_entries(&chain_manifest.entries, candidate);
             if entries.len() != candidate.entry_count {
                 continue;
@@ -239,8 +255,7 @@ where
             let compacted = self.write_compacted_object(candidate, &entries)?;
             compacted_rows += compacted.row_count;
             compacted_objects += 1;
-            replace_compacted_entries(&mut chain_manifest, &entries, compacted.entry);
-            self.write_manifest(&candidate.chain, &chain_manifest)?;
+            self.write_manifest_entry(&candidate.chain, compacted.entry)?;
         }
 
         Ok(MaintenanceCompactionReport {
@@ -352,20 +367,15 @@ where
             &rows,
             object_compression.unwrap_or(ParquetCompression::None),
         )?;
-        let object_key = object_key(
-            &candidate.chain,
-            &candidate.dataset_key,
-            candidate.range.clone(),
-            &candidate.selector_fingerprint,
-            candidate.object_encoding,
-        );
+        let checksum = checksum_hex(&bytes);
+        let object_key = compacted_object_key(candidate, &checksum);
         let data_object = StorageDataObject {
             object_key: object_key.clone(),
             object_encoding: candidate.object_encoding,
             object_compression,
             row_count: rows.row_count(),
             object_size_bytes: bytes.len() as u64,
-            checksum: checksum_hex(&bytes),
+            checksum,
             checksum_algorithm: "sha256".to_owned(),
             written_at_unix_seconds: unix_seconds_now()?,
         };
@@ -545,24 +555,6 @@ fn candidate_entries(
     entries
 }
 
-fn replace_compacted_entries(
-    manifest: &mut Manifest,
-    compacted_entries: &[ManifestEntry],
-    compacted_entry: ManifestEntry,
-) {
-    manifest.entries.retain(|entry| {
-        !compacted_entries.iter().any(|compacted| {
-            entry.chain == compacted.chain
-                && entry.dataset_key == compacted.dataset_key
-                && entry.selector_fingerprint == compacted.selector_fingerprint
-                && entry.range == compacted.range
-                && entry.finality_level == compacted.finality_level
-                && entry.object_key == compacted.object_key
-        })
-    });
-    manifest.upsert(compacted_entry);
-}
-
 fn push_candidate(
     candidates: &mut Vec<CompactionCandidate>,
     key: &CompactionKey,
@@ -597,6 +589,22 @@ fn push_candidate(
             .filter_map(|entry| entry.object_key.clone())
             .collect(),
     });
+}
+
+fn compacted_object_key(candidate: &CompactionCandidate, checksum: &str) -> String {
+    let checksum_prefix = checksum.get(..16).unwrap_or(checksum);
+    format!(
+        "chains/{}/datasets/{}/{}/{}/{}/compacted/{:020}-{:020}-{}{}",
+        candidate.chain.key_prefix(),
+        candidate.dataset_key.as_str(),
+        candidate.object_encoding.as_str(),
+        range_kind_key(candidate.range.kind()),
+        candidate.selector_fingerprint,
+        candidate.range.start(),
+        candidate.range.end(),
+        checksum_prefix,
+        candidate.object_encoding.extension(),
+    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
