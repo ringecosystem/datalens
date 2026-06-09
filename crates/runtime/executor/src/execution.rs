@@ -984,8 +984,24 @@ where
         fetch_request: ChainFetchRequest,
         query_id: &str,
     ) -> Result<Vec<ProviderFetchResponse>, DatalensError> {
+        let capability_max_len = dataset_capability_max_range_len(
+            &self.source.capabilities(),
+            &fetch_request.dataset_key,
+        );
+        let initial_requests = split_fetch_request_by_max_len(&fetch_request, capability_max_len)?;
+        if initial_requests.len() > 1 {
+            log::info!(
+                "provider fetch pre-split query_id={} dataset={} range={}-{} target_max_len={:?} chunks={}",
+                query_id,
+                fetch_request.dataset_key.as_str(),
+                fetch_request.range.start(),
+                fetch_request.range.end(),
+                capability_max_len,
+                initial_requests.len()
+            );
+        }
         let mut responses = Vec::new();
-        let mut queue = VecDeque::from([fetch_request]);
+        let mut queue = VecDeque::from(initial_requests);
         while let Some(fetch_request) = queue.pop_front() {
             let fetch_start = Instant::now();
             match self
@@ -1008,18 +1024,24 @@ where
                     if error.kind == DatalensErrorKind::ProviderLimit
                         && fetch_request.range.len() > 1 =>
                 {
+                    let hint_max_len = parse_provider_limit_hint(&error.message);
+                    let split_target =
+                        provider_limit_split_target(capability_max_len, hint_max_len);
+                    let split_ranges =
+                        split_provider_limit_range(&fetch_request.range, split_target)?;
                     log::warn!(
-                        "provider limit split query_id={} dataset={} range={}-{} duration_ms={}",
+                        "provider limit split query_id={} dataset={} range={}-{} target_max_len={:?} configured_max_len={:?} hint_max_len={:?} chunks={} duration_ms={}",
                         query_id,
                         fetch_request.dataset_key.as_str(),
                         fetch_request.range.start(),
                         fetch_request.range.end(),
+                        split_target,
+                        capability_max_len,
+                        hint_max_len,
+                        split_ranges.len(),
                         fetch_start.elapsed().as_millis()
                     );
-                    for range in split_provider_limit_range(&fetch_request.range)?
-                        .into_iter()
-                        .rev()
-                    {
+                    for range in split_ranges.into_iter().rev() {
                         queue.push_front(ChainFetchRequest {
                             range,
                             ..fetch_request.clone()
