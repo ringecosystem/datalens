@@ -73,8 +73,8 @@ pub use crate::maintenance::{
 };
 pub use crate::manifest::{Manifest, ManifestEntry, ManifestFinalityLevel};
 pub use crate::object_store::{
-    LocalObjectStore, ObjectMetadata, ObjectStore, S3ObjectStore, S3ObjectStoreConfig,
-    validate_object_key,
+    LocalObjectStore, ObjectListPage, ObjectMetadata, ObjectStore, S3ObjectStore,
+    S3ObjectStoreConfig, validate_object_key,
 };
 pub use crate::query_activity::{QueryActivity, QueryActivityKey, QueryActivityRepository};
 pub use crate::query_watermark::{QueryWatermark, QueryWatermarkKey, QueryWatermarkRepository};
@@ -96,7 +96,6 @@ pub struct DurableStorage<S> {
     config: DurableStorageConfig,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 struct ManifestCacheEntry {
     manifest: Manifest,
@@ -722,11 +721,7 @@ where
         })
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn manifest_for_chain(
-        &self,
-        chain: &ChainIdentity,
-    ) -> Result<Manifest, DatalensError> {
+    pub fn manifest_for_chain(&self, chain: &ChainIdentity) -> Result<Manifest, DatalensError> {
         let started = Instant::now();
         if let Some(manifest) = self.cached_manifest(chain)? {
             log::debug!(
@@ -821,8 +816,7 @@ where
         Ok(manifest)
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn write_manifest(
+    pub fn write_manifest(
         &self,
         chain: &ChainIdentity,
         manifest: &Manifest,
@@ -833,7 +827,6 @@ where
         self.write_manifest_unlocked(chain, manifest, started)
     }
 
-    #[allow(dead_code)]
     fn write_manifest_unlocked(
         &self,
         chain: &ChainIdentity,
@@ -861,7 +854,6 @@ where
         Ok(())
     }
 
-    #[allow(dead_code)]
     fn publish_manifest_unlocked(
         &self,
         chain: &ChainIdentity,
@@ -902,7 +894,6 @@ where
         Ok(())
     }
 
-    #[allow(dead_code)]
     fn delete_manifest_segments_unlocked(
         &self,
         chain: &ChainIdentity,
@@ -1057,7 +1048,6 @@ where
         Ok(())
     }
 
-    #[allow(dead_code)]
     fn cached_manifest(&self, chain: &ChainIdentity) -> Result<Option<Manifest>, DatalensError> {
         let chain_key = chain.key_prefix();
         let current_version = self.manifest_version(chain)?;

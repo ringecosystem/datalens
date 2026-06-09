@@ -373,6 +373,15 @@ impl ObjectStore for CountingObjectStore {
         self.inner.list(prefix)
     }
 
+    fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<datalens_storage::ObjectListPage, DatalensError> {
+        self.inner.list_page(prefix, start_after, limit)
+    }
+
     fn delete(&self, key: &str) -> Result<(), DatalensError> {
         self.inner.delete(key)
     }

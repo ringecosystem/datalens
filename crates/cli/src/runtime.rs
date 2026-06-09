@@ -17,9 +17,9 @@ use datalens_metrics::ApplicationIdentity;
 use datalens_solana::{SolanaAdapter, SolanaHttpRpc};
 use datalens_storage::{
     DurablePromotionIntentRepository, DurablePromotionIntentStore, DurableStorage,
-    LocalObjectStore, LocalStorage, MaintenanceCompactionConfig, ObjectMetadata, ObjectStore,
-    QueryActivityRepository, QueryActivityStore, QueryWatermarkRepository, QueryWatermarkStore,
-    S3ObjectStore, UsageLedgerRepository, UsageLedgerStore,
+    LocalObjectStore, LocalStorage, MaintenanceCompactionConfig, ObjectListPage, ObjectMetadata,
+    ObjectStore, QueryActivityRepository, QueryActivityStore, QueryWatermarkRepository,
+    QueryWatermarkStore, S3ObjectStore, UsageLedgerRepository, UsageLedgerStore,
 };
 use datalens_tron::{TronAdapter, TronHttpProvider};
 use datalens_warmup::{
@@ -738,6 +738,18 @@ impl ObjectStore for WarmupRegistryObjectStore {
         match self {
             Self::Local(store) => store.list(prefix),
             Self::S3(store) => store.list(prefix),
+        }
+    }
+
+    fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ObjectListPage, DatalensError> {
+        match self {
+            Self::Local(store) => store.list_page(prefix, start_after, limit),
+            Self::S3(store) => store.list_page(prefix, start_after, limit),
         }
     }
 

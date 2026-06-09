@@ -23,11 +23,23 @@ pub struct ObjectMetadata {
     pub size: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObjectListPage {
+    pub objects: Vec<ObjectMetadata>,
+    pub has_more: bool,
+}
+
 pub trait ObjectStore: Clone + Send + Sync {
     fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError>;
     fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError>;
     fn exists(&self, key: &str) -> Result<bool, DatalensError>;
     fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError>;
+    fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ObjectListPage, DatalensError>;
     fn delete(&self, key: &str) -> Result<(), DatalensError>;
 }
 
@@ -138,6 +150,42 @@ impl ObjectStore for LocalObjectStore {
         Ok(objects)
     }
 
+    fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ObjectListPage, DatalensError> {
+        validate_object_key(prefix)?;
+        if let Some(start_after) = start_after {
+            validate_object_key(start_after)?;
+        }
+        if limit == 0 {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                "object list page limit must be greater than zero",
+            ));
+        }
+        let prefix_path = self.root.join(prefix);
+        if !prefix_path.exists() {
+            return Ok(ObjectListPage {
+                objects: Vec::new(),
+                has_more: false,
+            });
+        }
+        let mut objects = Vec::new();
+        collect_local_objects_page(
+            &self.root,
+            &prefix_path,
+            start_after,
+            limit.saturating_add(1),
+            &mut objects,
+        )?;
+        let has_more = objects.len() > limit;
+        objects.truncate(limit);
+        Ok(ObjectListPage { objects, has_more })
+    }
+
     fn delete(&self, key: &str) -> Result<(), DatalensError> {
         let path = self.path(key)?;
         match fs::remove_file(&path) {
@@ -149,6 +197,61 @@ impl ObjectStore for LocalObjectStore {
             )),
         }
     }
+}
+
+fn collect_local_objects_page(
+    root: &Path,
+    path: &Path,
+    start_after: Option<&str>,
+    limit: usize,
+    objects: &mut Vec<ObjectMetadata>,
+) -> Result<(), DatalensError> {
+    if objects.len() >= limit {
+        return Ok(());
+    }
+    let mut entries = fs::read_dir(path)
+        .map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::StorageReadFailure,
+                format!("list object directory {}: {error}", path.display()),
+            )
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::StorageReadFailure,
+                format!("read object directory entry {}: {error}", path.display()),
+            )
+        })?;
+    entries.sort_by_key(|entry| entry.path());
+    for entry in entries {
+        if objects.len() >= limit {
+            break;
+        }
+        let metadata = entry.metadata().map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::StorageReadFailure,
+                format!("stat object {}: {error}", entry.path().display()),
+            )
+        })?;
+        if metadata.is_dir() {
+            collect_local_objects_page(root, &entry.path(), start_after, limit, objects)?;
+        } else if metadata.is_file() {
+            let key = entry
+                .path()
+                .strip_prefix(root)
+                .map_err(|error| DatalensError::internal(format!("strip object root: {error}")))?
+                .to_string_lossy()
+                .replace('\\', "/");
+            if start_after.is_none_or(|cursor| key.as_str() > cursor) {
+                objects.push(ObjectMetadata {
+                    key,
+                    size: metadata.len(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn collect_local_objects(
@@ -571,6 +674,61 @@ impl ObjectStore for S3ObjectStore {
                     }
                 }
                 Ok(objects)
+            })
+    }
+
+    fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ObjectListPage, DatalensError> {
+        if limit == 0 {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                "object list page limit must be greater than zero",
+            ));
+        }
+        let prefix_key = self.key(prefix)?;
+        let start_after_key = start_after.map(|key| self.key(key)).transpose()?;
+        let log_key = prefix_key.clone();
+        let strip_prefix = self.prefix.clone().map(|prefix| format!("{prefix}/"));
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        self.runtime
+            .block_on_operation("list_page", log_key, async move {
+                let response = client
+                    .list_objects_v2()
+                    .bucket(&bucket)
+                    .prefix(&prefix_key)
+                    .set_start_after(start_after_key)
+                    .max_keys(limit.saturating_add(1).min(i32::MAX as usize) as i32)
+                    .send()
+                    .await
+                    .map_err(|error| {
+                        DatalensError::new(
+                            DatalensErrorKind::StorageReadFailure,
+                            format!("S3 list objects {prefix_key}: {error}"),
+                        )
+                    })?;
+                let mut objects = Vec::new();
+                for object in response.contents() {
+                    let Some(key) = object.key() else {
+                        continue;
+                    };
+                    let key = strip_prefix
+                        .as_ref()
+                        .and_then(|prefix| key.strip_prefix(prefix))
+                        .unwrap_or(key)
+                        .to_owned();
+                    objects.push(ObjectMetadata {
+                        key,
+                        size: object.size().unwrap_or_default().max(0) as u64,
+                    });
+                }
+                let has_more = objects.len() > limit || response.is_truncated().unwrap_or(false);
+                objects.truncate(limit);
+                Ok(ObjectListPage { objects, has_more })
             })
     }
 

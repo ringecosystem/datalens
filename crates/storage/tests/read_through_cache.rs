@@ -10,7 +10,7 @@ use datalens_core::{
     QueryRows,
 };
 use datalens_storage::{
-    DurableStorage, LocalObjectStore, Manifest, ObjectMetadata, ObjectStore,
+    DurableStorage, LocalObjectStore, Manifest, ObjectListPage, ObjectMetadata, ObjectStore,
     ReadThroughCacheConfig, StorageWriteRequest,
 };
 
@@ -69,6 +69,15 @@ impl ObjectStore for CountingObjectStore {
 
     fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, datalens_core::DatalensError> {
         self.inner.list(prefix)
+    }
+
+    fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ObjectListPage, datalens_core::DatalensError> {
+        self.inner.list_page(prefix, start_after, limit)
     }
 
     fn delete(&self, key: &str) -> Result<(), datalens_core::DatalensError> {

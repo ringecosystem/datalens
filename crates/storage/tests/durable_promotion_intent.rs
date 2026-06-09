@@ -15,7 +15,7 @@ use datalens_storage::{
     DurableIntentSubmissionOutcome, DurableIntentSubmissionRequest, DurableIntentSubmissionService,
     DurablePromotionIntentCreateOutcome, DurablePromotionIntentRepository,
     DurablePromotionIntentSource, DurablePromotionIntentStatus, DurablePromotionIntentStore,
-    LocalObjectStore, ObjectMetadata, ObjectStore,
+    LocalObjectStore, ObjectListPage, ObjectMetadata, ObjectStore,
 };
 
 #[test]
@@ -1144,6 +1144,15 @@ impl ObjectStore for CountingObjectStore {
         self.inner.list(prefix)
     }
 
+    fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ObjectListPage, DatalensError> {
+        self.inner.list_page(prefix, start_after, limit)
+    }
+
     fn delete(&self, key: &str) -> Result<(), DatalensError> {
         self.inner.delete(key)
     }
@@ -1195,6 +1204,15 @@ impl ObjectStore for FailOnceIndexPutObjectStore {
 
     fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
         self.inner.list(prefix)
+    }
+
+    fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ObjectListPage, DatalensError> {
+        self.inner.list_page(prefix, start_after, limit)
     }
 
     fn delete(&self, key: &str) -> Result<(), DatalensError> {

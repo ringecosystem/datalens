@@ -291,7 +291,7 @@ where
             scan.entries,
             config,
             started,
-            Some((chain, scan.cursor_advance_key)),
+            Some((chain, scan.cursor_advance)),
             scan.partial,
         )?;
         Ok(report)
@@ -302,7 +302,7 @@ where
         entries: Vec<SelectedManifestEntry>,
         config: MaintenanceCompactionConfig,
         started: Instant,
-        cursor: Option<(&ChainIdentity, Option<String>)>,
+        cursor: Option<(&ChainIdentity, Option<CompactionCursor>)>,
         scan_partial: bool,
     ) -> Result<MaintenanceCompactionReport, DatalensError> {
         let build_started = Instant::now();
@@ -368,7 +368,7 @@ where
 
         if let Some((chain, scan_cursor_advance_key)) = cursor {
             let next_key = if partial && processed_candidates < candidates.len() {
-                cursor_advance_key
+                cursor_advance_key.map(segment_compaction_cursor)
             } else if partial {
                 scan_cursor_advance_key
             } else {
@@ -554,15 +554,23 @@ where
     ) -> Result<CompactionManifestScan, DatalensError> {
         let load_started = Instant::now();
         let prefix = manifest_segment_prefix(chain);
-        let mut segment_objects = self
-            .object_store()
-            .list(&prefix)?
+        let cursor = self.read_compaction_cursor(chain)?;
+        let max_entries = config.max_manifest_entries_per_tick.max(1);
+        let mut list_page = self.object_store().list_page(
+            &prefix,
+            cursor.next_segment_key.as_deref(),
+            max_entries,
+        )?;
+        if list_page.objects.is_empty() && cursor.next_segment_key.is_some() && !list_page.has_more
+        {
+            list_page = self.object_store().list_page(&prefix, None, max_entries)?;
+        }
+        let mut segment_objects = list_page
+            .objects
             .into_iter()
             .filter(|object| object.key.ends_with(".json"))
             .collect::<Vec<_>>();
         segment_objects.sort_by(|left, right| left.key.cmp(&right.key));
-        let cursor = self.read_compaction_cursor(chain)?;
-        let max_entries = config.max_manifest_entries_per_tick.max(1);
         let mut entries = Vec::new();
         let mut scanned_objects = 0usize;
         let mut scanned_entries = 0usize;
@@ -576,15 +584,45 @@ where
                 let manifest = decode_manifest_object(&key, &bytes)?;
                 scanned_objects = 1;
                 scanned_entries = manifest.entries.len();
-                entries.extend(manifest.entries.into_iter().take(max_entries).map(|entry| {
-                    SelectedManifestEntry {
-                        segment_key: None,
-                        entry,
-                    }
-                }));
+                let offset = cursor
+                    .legacy_entry_offset
+                    .unwrap_or_default()
+                    .min(scanned_entries);
+                entries.extend(
+                    manifest
+                        .entries
+                        .into_iter()
+                        .skip(offset)
+                        .take(max_entries)
+                        .map(|entry| SelectedManifestEntry {
+                            segment_key: None,
+                            entry,
+                        }),
+                );
+                let next_offset = offset.saturating_add(entries.len());
+                let partial = next_offset < scanned_entries;
+                log::info!(
+                    "storage compaction manifest load chain_key={} source=legacy_manifest object_count={} entry_count={} selected_entry_count={} legacy_entry_offset={} partial={} duration_ms={}",
+                    chain.key_prefix(),
+                    scanned_objects,
+                    scanned_entries,
+                    entries.len(),
+                    offset,
+                    partial,
+                    load_started.elapsed().as_millis()
+                );
+                return Ok(CompactionManifestScan {
+                    entries,
+                    partial,
+                    cursor_advance: partial.then(|| CompactionCursor {
+                        schema_version: 1,
+                        next_segment_key: None,
+                        legacy_entry_offset: Some(next_offset),
+                    }),
+                });
             }
             log::info!(
-                "storage compaction manifest load chain_key={} source=legacy_manifest object_count={} entry_count={} selected_entry_count={} duration_ms={}",
+                "storage compaction manifest load chain_key={} source=legacy_manifest object_count={} entry_count={} selected_entry_count={} legacy_entry_offset=0 partial=false duration_ms={}",
                 chain.key_prefix(),
                 scanned_objects,
                 scanned_entries,
@@ -593,8 +631,8 @@ where
             );
             return Ok(CompactionManifestScan {
                 entries,
-                partial: scanned_entries > max_entries,
-                cursor_advance_key: None,
+                partial: false,
+                cursor_advance: None,
             });
         }
 
@@ -605,22 +643,12 @@ where
         } else {
             Vec::new()
         };
-        let start_index = cursor
-            .next_segment_key
-            .as_deref()
-            .and_then(|cursor_key| {
-                segment_objects
-                    .iter()
-                    .position(|object| object.key.as_str() > cursor_key)
-            })
-            .unwrap_or(0);
-        for offset in 0..segment_objects.len() {
+        for object in &segment_objects {
             if entries.len() >= max_entries
                 || tick_started.elapsed().as_millis() >= config.max_tick_duration_ms.max(1) as u128
             {
                 break;
             }
-            let object = &segment_objects[(start_index + offset) % segment_objects.len()];
             let object_scope_prefix = manifest_segment_scope_prefix(&object.key);
             if active_scope_prefix.is_none() {
                 active_scope_prefix = object_scope_prefix.clone();
@@ -648,7 +676,7 @@ where
                 }
             }
         }
-        let partial = scanned_objects < segment_objects.len();
+        let partial = list_page.has_more || scanned_objects < segment_objects.len();
         log::info!(
             "storage compaction manifest load chain_key={} source=manifest_segments listed_object_count={} scanned_object_count={} scanned_entry_count={} selected_entry_count={} scope_prefix={} partial={} duration_ms={}",
             chain.key_prefix(),
@@ -663,7 +691,7 @@ where
         Ok(CompactionManifestScan {
             entries,
             partial,
-            cursor_advance_key,
+            cursor_advance: cursor_advance_key.map(segment_compaction_cursor),
         })
     }
 
@@ -687,16 +715,12 @@ where
     fn write_compaction_cursor(
         &self,
         chain: &ChainIdentity,
-        next_segment_key: Option<String>,
+        cursor: Option<CompactionCursor>,
     ) -> Result<(), DatalensError> {
         let key = compaction_cursor_key(chain);
-        let Some(next_segment_key) = next_segment_key else {
+        let Some(cursor) = cursor else {
             self.object_store().delete(&key)?;
             return Ok(());
-        };
-        let cursor = CompactionCursor {
-            schema_version: 1,
-            next_segment_key: Some(next_segment_key),
         };
         let bytes = serde_json::to_vec_pretty(&cursor).map_err(|error| {
             DatalensError::new(
@@ -718,15 +742,17 @@ struct SelectedManifestEntry {
 struct CompactionManifestScan {
     entries: Vec<SelectedManifestEntry>,
     partial: bool,
-    cursor_advance_key: Option<String>,
+    cursor_advance: Option<CompactionCursor>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 struct CompactionCursor {
     #[serde(default)]
     schema_version: u32,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     next_segment_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    legacy_entry_offset: Option<usize>,
 }
 
 fn compaction_cursor_key(chain: &ChainIdentity) -> String {
@@ -734,6 +760,14 @@ fn compaction_cursor_key(chain: &ChainIdentity) -> String {
         "chains/{}/metadata/compaction-cursor.json",
         chain.key_prefix()
     )
+}
+
+fn segment_compaction_cursor(next_segment_key: String) -> CompactionCursor {
+    CompactionCursor {
+        schema_version: 1,
+        next_segment_key: Some(next_segment_key),
+        legacy_entry_offset: None,
+    }
 }
 
 fn decode_manifest_object(key: &str, bytes: &[u8]) -> Result<Manifest, DatalensError> {

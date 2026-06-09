@@ -8,7 +8,7 @@ use datalens_core::{
 use datalens_storage::{
     DurableStorage, LocalObjectStore, LocalStorage, MaintenanceCompactionConfig,
     MaintenanceCompactionTickStatus, MaintenanceIssueKind, MaintenanceOperationMode, Manifest,
-    ObjectMetadata, ObjectStore, StorageWriteRequest,
+    ObjectListPage, ObjectMetadata, ObjectStore, StorageWriteRequest,
 };
 use std::sync::{Arc, Mutex};
 
@@ -21,6 +21,7 @@ struct FailingDataObjectPutStore {
 struct CountingListStore {
     inner: LocalObjectStore,
     list_prefixes: Arc<Mutex<Vec<String>>>,
+    list_page_prefixes: Arc<Mutex<Vec<String>>>,
 }
 
 impl FailingDataObjectPutStore {
@@ -36,6 +37,7 @@ impl CountingListStore {
         Self {
             inner: LocalObjectStore::new(root),
             list_prefixes: Arc::new(Mutex::new(Vec::new())),
+            list_page_prefixes: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -43,6 +45,15 @@ impl CountingListStore {
         self.list_prefixes
             .lock()
             .expect("list prefixes")
+            .iter()
+            .filter(|listed_prefix| listed_prefix.as_str() == prefix)
+            .count()
+    }
+
+    fn list_page_count_for_prefix(&self, prefix: &str) -> usize {
+        self.list_page_prefixes
+            .lock()
+            .expect("list page prefixes")
             .iter()
             .filter(|listed_prefix| listed_prefix.as_str() == prefix)
             .count()
@@ -72,6 +83,15 @@ impl ObjectStore for FailingDataObjectPutStore {
         self.inner.list(prefix)
     }
 
+    fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ObjectListPage, DatalensError> {
+        self.inner.list_page(prefix, start_after, limit)
+    }
+
     fn delete(&self, key: &str) -> Result<(), DatalensError> {
         self.inner.delete(key)
     }
@@ -96,6 +116,19 @@ impl ObjectStore for CountingListStore {
             .expect("list prefixes")
             .push(prefix.to_owned());
         self.inner.list(prefix)
+    }
+
+    fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ObjectListPage, DatalensError> {
+        self.list_page_prefixes
+            .lock()
+            .expect("list page prefixes")
+            .push(prefix.to_owned());
+        self.inner.list_page(prefix, start_after, limit)
     }
 
     fn delete(&self, key: &str) -> Result<(), DatalensError> {
@@ -424,7 +457,11 @@ fn test_compaction_tick_does_not_reload_manifest_per_candidate() {
 
     assert_eq!(report.candidate_count, 2);
     assert_eq!(report.processed_candidates, 2);
-    assert_eq!(counting_store.list_count_for_prefix(&manifest_prefix), 1);
+    assert_eq!(counting_store.list_count_for_prefix(&manifest_prefix), 0);
+    assert_eq!(
+        counting_store.list_page_count_for_prefix(&manifest_prefix),
+        1
+    );
 }
 
 #[test]
@@ -509,6 +546,69 @@ fn test_compaction_cursor_resumes_and_loss_recovers_without_affecting_reads() {
         )
         .expect("reads remain correct after cursor loss");
     assert_eq!(rows.row_count(), 4);
+}
+
+#[test]
+fn test_compaction_legacy_full_manifest_partial_tick_persists_offset_cursor() {
+    let storage = LocalStorage::new(temp_storage_root("legacy-cursor"));
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 132, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 133, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 134, FinalityLevel::Safe);
+    let manifest = storage.manifest().expect("manifest");
+    for object in storage
+        .object_store()
+        .list(&format!("chains/{}/manifest-segments", chain.key_prefix()))
+        .expect("manifest segments")
+    {
+        storage
+            .object_store()
+            .delete(&object.key)
+            .expect("delete segment");
+    }
+    std::fs::create_dir_all(
+        storage
+            .manifest_path(&chain)
+            .parent()
+            .expect("manifest parent"),
+    )
+    .expect("create manifest parent");
+    std::fs::write(
+        storage.manifest_path(&chain),
+        serde_json::to_vec_pretty(&manifest).expect("manifest bytes"),
+    )
+    .expect("write full manifest");
+    let config = MaintenanceCompactionConfig {
+        min_object_bytes: u64::MAX,
+        max_merge_ranges: 2,
+        max_tick_duration_ms: 30_000,
+        max_candidates_per_tick: 8,
+        max_manifest_entries_per_tick: 1,
+    };
+
+    let first = storage
+        .compact_small_objects_for_chain(&chain, config)
+        .expect("first legacy tick");
+    assert_eq!(first.tick_status, MaintenanceCompactionTickStatus::Partial);
+    let cursor_key = format!(
+        "chains/{}/metadata/compaction-cursor.json",
+        chain.key_prefix()
+    );
+    let cursor = serde_json::from_slice::<serde_json::Value>(
+        &storage.object_store().get(&cursor_key).expect("cursor"),
+    )
+    .expect("cursor json");
+    assert_eq!(cursor["legacy_entry_offset"], 1);
+
+    let second = storage
+        .compact_small_objects_for_chain(&chain, config)
+        .expect("second legacy tick");
+    assert_eq!(second.tick_status, MaintenanceCompactionTickStatus::Partial);
+    let cursor = serde_json::from_slice::<serde_json::Value>(
+        &storage.object_store().get(&cursor_key).expect("cursor"),
+    )
+    .expect("cursor json");
+    assert_eq!(cursor["legacy_entry_offset"], 2);
 }
 
 #[test]
