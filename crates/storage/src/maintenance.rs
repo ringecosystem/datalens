@@ -598,6 +598,13 @@ where
             });
         }
 
+        let base_entries = if self.object_store().exists(&manifest_key(chain))? {
+            let key = manifest_key(chain);
+            let bytes = self.object_store().get(&key)?;
+            decode_manifest_object(&key, &bytes)?.entries
+        } else {
+            Vec::new()
+        };
         let start_index = cursor
             .next_segment_key
             .as_deref()
@@ -626,6 +633,12 @@ where
             scanned_entries += manifest.entries.len();
             cursor_advance_key = Some(object.key.clone());
             for entry in manifest.entries {
+                if base_entries
+                    .iter()
+                    .any(|base_entry| base_entry.shadows_segment(&entry))
+                {
+                    continue;
+                }
                 entries.push(SelectedManifestEntry {
                     segment_key: Some(object.key.clone()),
                     entry,

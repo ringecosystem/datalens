@@ -7,7 +7,7 @@ use datalens_core::{
 };
 use datalens_storage::{
     DurableStorage, LocalObjectStore, LocalStorage, MaintenanceCompactionConfig,
-    MaintenanceCompactionTickStatus, MaintenanceIssueKind, MaintenanceOperationMode,
+    MaintenanceCompactionTickStatus, MaintenanceIssueKind, MaintenanceOperationMode, Manifest,
     ObjectMetadata, ObjectStore, StorageWriteRequest,
 };
 use std::sync::{Arc, Mutex};
@@ -509,6 +509,82 @@ fn test_compaction_cursor_resumes_and_loss_recovers_without_affecting_reads() {
         )
         .expect("reads remain correct after cursor loss");
     assert_eq!(rows.row_count(), 4);
+}
+
+#[test]
+fn test_compaction_ignores_segments_shadowed_by_full_manifest() {
+    let storage = LocalStorage::new(temp_storage_root("shadowed-segments"));
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    write_block_object(&storage, &chain, 140, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 141, FinalityLevel::Safe);
+    let rows = DatasetRows::new(
+        DatasetKey::evm_blocks(),
+        QueryRows::EvmBlocks(vec![
+            BlockHeader {
+                number: 140,
+                hash: "0xreplacement140".to_owned(),
+                parent_hash: "0xparent".to_owned(),
+                timestamp: 140,
+            },
+            BlockHeader {
+                number: 141,
+                hash: "0xreplacement141".to_owned(),
+                parent_hash: "0xreplacement140".to_owned(),
+                timestamp: 141,
+            },
+        ]),
+    )
+    .expect("replacement rows");
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &selector,
+            range: LedgerRange::blocks(140, 141).expect("range"),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write replacement rows");
+    let full_entry = storage
+        .manifest()
+        .expect("manifest")
+        .entries
+        .into_iter()
+        .find(|entry| entry.range == LedgerRange::blocks(140, 141).expect("range"))
+        .expect("full manifest entry");
+    std::fs::create_dir_all(
+        storage
+            .manifest_path(&chain)
+            .parent()
+            .expect("manifest parent"),
+    )
+    .expect("create manifest parent");
+    std::fs::write(
+        storage.manifest_path(&chain),
+        serde_json::to_vec_pretty(&Manifest {
+            entries: vec![full_entry],
+        })
+        .expect("manifest bytes"),
+    )
+    .expect("write full manifest");
+
+    let report = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                min_object_bytes: u64::MAX,
+                max_merge_ranges: 2,
+                max_tick_duration_ms: 30_000,
+                max_candidates_per_tick: 8,
+                max_manifest_entries_per_tick: 20_000,
+            },
+        )
+        .expect("compaction");
+
+    assert_eq!(report.candidate_count, 0);
+    assert_eq!(report.compacted_objects, 0);
 }
 
 fn write_block_object(

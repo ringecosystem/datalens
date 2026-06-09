@@ -172,7 +172,7 @@ impl ManifestEntry {
         }
     }
 
-    fn shadows_segment(&self, segment: &ManifestEntry) -> bool {
+    pub(crate) fn shadows_segment(&self, segment: &ManifestEntry) -> bool {
         self.chain == segment.chain
             && self.dataset_key == segment.dataset_key
             && self.selector_fingerprint == segment.selector_fingerprint
