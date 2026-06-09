@@ -66,9 +66,10 @@ pub use crate::hot_cache::{
 };
 pub use crate::maintenance::{
     CompactionCandidate, MaintenanceCheckReport, MaintenanceCompactionConfig,
-    MaintenanceCompactionReport, MaintenanceIssue, MaintenanceIssueKind, MaintenanceOperation,
-    MaintenanceOperationMode, MaintenanceReport, MaintenanceRetentionReport,
-    MaintenanceUsageLedgerReport, RetentionPolicy, UsageLedgerRollupModel,
+    MaintenanceCompactionReport, MaintenanceCompactionTickStatus, MaintenanceIssue,
+    MaintenanceIssueKind, MaintenanceOperation, MaintenanceOperationMode, MaintenanceReport,
+    MaintenanceRetentionReport, MaintenanceUsageLedgerReport, RetentionPolicy,
+    UsageLedgerRollupModel,
 };
 pub use crate::manifest::{Manifest, ManifestEntry, ManifestFinalityLevel};
 pub use crate::object_store::{
@@ -95,6 +96,7 @@ pub struct DurableStorage<S> {
     config: DurableStorageConfig,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 struct ManifestCacheEntry {
     manifest: Manifest,
@@ -720,6 +722,7 @@ where
         })
     }
 
+    #[allow(dead_code)]
     pub(crate) fn manifest_for_chain(
         &self,
         chain: &ChainIdentity,
@@ -1054,6 +1057,7 @@ where
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn cached_manifest(&self, chain: &ChainIdentity) -> Result<Option<Manifest>, DatalensError> {
         let chain_key = chain.key_prefix();
         let current_version = self.manifest_version(chain)?;

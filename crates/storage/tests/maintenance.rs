@@ -1,19 +1,26 @@
 use std::path::PathBuf;
 
-use datalens_chain::{DatasetSelector, FinalityLevel};
+use datalens_chain::{AdapterKey, DatasetSelector, FinalityLevel};
 use datalens_core::{
     BlockHeader, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey,
     DatasetRows, LedgerRange, NetworkId, QueryRows,
 };
 use datalens_storage::{
     DurableStorage, LocalObjectStore, LocalStorage, MaintenanceCompactionConfig,
-    MaintenanceIssueKind, MaintenanceOperationMode, ObjectMetadata, ObjectStore,
-    StorageWriteRequest,
+    MaintenanceCompactionTickStatus, MaintenanceIssueKind, MaintenanceOperationMode,
+    ObjectMetadata, ObjectStore, StorageWriteRequest,
 };
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug)]
 struct FailingDataObjectPutStore {
     inner: LocalObjectStore,
+}
+
+#[derive(Clone, Debug)]
+struct CountingListStore {
+    inner: LocalObjectStore,
+    list_prefixes: Arc<Mutex<Vec<String>>>,
 }
 
 impl FailingDataObjectPutStore {
@@ -21,6 +28,24 @@ impl FailingDataObjectPutStore {
         Self {
             inner: LocalObjectStore::new(root),
         }
+    }
+}
+
+impl CountingListStore {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            inner: LocalObjectStore::new(root),
+            list_prefixes: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn list_count_for_prefix(&self, prefix: &str) -> usize {
+        self.list_prefixes
+            .lock()
+            .expect("list prefixes")
+            .iter()
+            .filter(|listed_prefix| listed_prefix.as_str() == prefix)
+            .count()
     }
 }
 
@@ -44,6 +69,32 @@ impl ObjectStore for FailingDataObjectPutStore {
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
+        self.inner.list(prefix)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), DatalensError> {
+        self.inner.delete(key)
+    }
+}
+
+impl ObjectStore for CountingListStore {
+    fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError> {
+        self.inner.get(key)
+    }
+
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
+        self.inner.put(key, bytes)
+    }
+
+    fn exists(&self, key: &str) -> Result<bool, DatalensError> {
+        self.inner.exists(key)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
+        self.list_prefixes
+            .lock()
+            .expect("list prefixes")
+            .push(prefix.to_owned());
         self.inner.list(prefix)
     }
 
@@ -205,11 +256,20 @@ fn test_compaction_merges_adjacent_small_objects_and_retains_old_objects() {
         .compact_small_objects(MaintenanceCompactionConfig {
             min_object_bytes: u64::MAX,
             max_merge_ranges: 8,
+            max_tick_duration_ms: 30_000,
+            max_candidates_per_tick: 8,
+            max_manifest_entries_per_tick: 20_000,
         })
         .expect("compact small objects");
 
     assert!(!report.read_only);
+    assert_eq!(
+        report.tick_status,
+        MaintenanceCompactionTickStatus::Completed
+    );
     assert_eq!(report.candidates.len(), 1);
+    assert_eq!(report.candidate_count, 1);
+    assert_eq!(report.processed_candidates, 1);
     assert_eq!(report.compacted_objects, 1);
     assert_eq!(report.compacted_rows, 2);
 
@@ -289,6 +349,9 @@ fn test_compaction_replacement_write_failure_leaves_old_manifest_readable() {
         .compact_small_objects(MaintenanceCompactionConfig {
             min_object_bytes: u64::MAX,
             max_merge_ranges: 8,
+            max_tick_duration_ms: 30_000,
+            max_candidates_per_tick: 8,
+            max_manifest_entries_per_tick: 20_000,
         })
         .expect_err("compaction replacement write failure");
 
@@ -306,9 +369,161 @@ fn test_compaction_replacement_write_failure_leaves_old_manifest_readable() {
     assert_eq!(rows.row_count(), 2);
 }
 
+#[test]
+fn test_compaction_tick_stops_after_candidate_budget_and_reports_partial() {
+    let storage = LocalStorage::new(temp_storage_root("candidate-budget"));
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 80, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 81, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 90, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 91, FinalityLevel::Safe);
+
+    let report = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                min_object_bytes: u64::MAX,
+                max_merge_ranges: 2,
+                max_tick_duration_ms: 30_000,
+                max_candidates_per_tick: 1,
+                max_manifest_entries_per_tick: 20_000,
+            },
+        )
+        .expect("bounded compaction");
+
+    assert_eq!(report.tick_status, MaintenanceCompactionTickStatus::Partial);
+    assert_eq!(report.candidate_count, 2);
+    assert_eq!(report.processed_candidates, 1);
+    assert_eq!(report.compacted_objects, 1);
+}
+
+#[test]
+fn test_compaction_tick_does_not_reload_manifest_per_candidate() {
+    let storage = LocalStorage::new(temp_storage_root("no-repeated-reload"));
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 100, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 101, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 110, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 111, FinalityLevel::Safe);
+    let counting_store = CountingListStore::new(storage.root().into());
+    let counting_storage = DurableStorage::from_object_store(counting_store.clone());
+    let manifest_prefix = format!("chains/{}/manifest-segments", chain.key_prefix());
+
+    let report = counting_storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                min_object_bytes: u64::MAX,
+                max_merge_ranges: 2,
+                max_tick_duration_ms: 30_000,
+                max_candidates_per_tick: 8,
+                max_manifest_entries_per_tick: 20_000,
+            },
+        )
+        .expect("bounded compaction");
+
+    assert_eq!(report.candidate_count, 2);
+    assert_eq!(report.processed_candidates, 2);
+    assert_eq!(counting_store.list_count_for_prefix(&manifest_prefix), 1);
+}
+
+#[test]
+fn test_compaction_tick_scans_one_manifest_segment_prefix_per_tick() {
+    let storage = LocalStorage::new(temp_storage_root("prefix-scope"));
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 112, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 113, FinalityLevel::Safe);
+    let other_selector = DatasetSelector::try_other(
+        AdapterKey::try_new("test").expect("adapter key"),
+        "selector-b",
+        "selector-b",
+    )
+    .expect("selector");
+    write_block_object_with_selector(&storage, &chain, &other_selector, 114, FinalityLevel::Safe);
+    write_block_object_with_selector(&storage, &chain, &other_selector, 115, FinalityLevel::Safe);
+
+    let report = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                min_object_bytes: u64::MAX,
+                max_merge_ranges: 2,
+                max_tick_duration_ms: 30_000,
+                max_candidates_per_tick: 8,
+                max_manifest_entries_per_tick: 20_000,
+            },
+        )
+        .expect("prefix-scoped compaction");
+
+    assert_eq!(report.tick_status, MaintenanceCompactionTickStatus::Partial);
+    assert_eq!(report.candidate_count, 1);
+    assert_eq!(report.processed_candidates, 1);
+    assert_eq!(report.candidates[0].selector_fingerprint, "all");
+}
+
+#[test]
+fn test_compaction_cursor_resumes_and_loss_recovers_without_affecting_reads() {
+    let storage = LocalStorage::new(temp_storage_root("cursor-resume"));
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 120, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 121, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 130, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 131, FinalityLevel::Safe);
+    let config = MaintenanceCompactionConfig {
+        min_object_bytes: u64::MAX,
+        max_merge_ranges: 2,
+        max_tick_duration_ms: 30_000,
+        max_candidates_per_tick: 8,
+        max_manifest_entries_per_tick: 2,
+    };
+
+    let first = storage
+        .compact_small_objects_for_chain(&chain, config)
+        .expect("first tick");
+    assert_eq!(first.tick_status, MaintenanceCompactionTickStatus::Partial);
+    assert_eq!(first.processed_candidates, 1);
+
+    let second = storage
+        .compact_small_objects_for_chain(&chain, config)
+        .expect("second tick");
+    assert_eq!(second.processed_candidates, 1);
+
+    storage
+        .object_store()
+        .delete(&format!(
+            "chains/{}/metadata/compaction-cursor.json",
+            chain.key_prefix()
+        ))
+        .expect("delete compaction cursor");
+    let recovery = storage
+        .compact_small_objects_for_chain(&chain, config)
+        .expect("recovery tick");
+    assert!(!recovery.read_only);
+
+    let rows = storage
+        .read_rows(
+            &chain,
+            &DatasetKey::evm_blocks(),
+            &DatasetSelector::all(),
+            LedgerRange::blocks(120, 131).expect("range"),
+        )
+        .expect("reads remain correct after cursor loss");
+    assert_eq!(rows.row_count(), 4);
+}
+
 fn write_block_object(
     storage: &LocalStorage,
     chain: &ChainIdentity,
+    number: u64,
+    finality: FinalityLevel,
+) -> String {
+    write_block_object_with_selector(storage, chain, &DatasetSelector::all(), number, finality)
+}
+
+fn write_block_object_with_selector(
+    storage: &LocalStorage,
+    chain: &ChainIdentity,
+    selector: &DatasetSelector,
     number: u64,
     finality: FinalityLevel,
 ) -> String {
@@ -326,7 +541,7 @@ fn write_block_object(
         .write_rows(StorageWriteRequest {
             chain,
             dataset_key: DatasetKey::evm_blocks(),
-            selector: &DatasetSelector::all(),
+            selector,
             range: LedgerRange::blocks(number, number).expect("range"),
             rows: &rows,
             finality_level: finality,
