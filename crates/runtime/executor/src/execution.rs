@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     sync::{
         Arc, Mutex, Once, OnceLock,
         atomic::{AtomicU64, Ordering},
@@ -19,7 +19,7 @@ use datalens_core::{
 use datalens_metrics::{
     ApplicationIdentity, CacheCoverageOutcome, DurableIntentOutcome as MetricsDurableIntentOutcome,
     DurableWriteOutcome as MetricsDurableWriteOutcome, ErrorLabels, FillOutcome, MetricsLabels,
-    MetricsRecorder, QueryOutcome,
+    MetricsRecorder, QueryMetadataEnqueueOutcome, QueryMetadataWriteOutcome, QueryOutcome,
 };
 use datalens_planner::{
     CoverageSummary, FinalityPolicy, NativePlanner, NativePlannerConfig, NativeQueryInput,
@@ -66,6 +66,12 @@ pub fn generate_query_id() -> String {
 pub struct NativeQueryExecutionConfig {
     pub planner: NativePlannerConfig,
     pub writer: DurableWriterConfig,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QueryMetadataWorkerConfig {
+    pub queue_capacity: usize,
+    pub worker_threads: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1225,7 +1231,13 @@ where
         .with_requested_hot(input.finality.allows_hot())
         .with_durable_write_outcome(durable_write_outcome)
         .with_request_id(query_id.to_owned());
-        enqueue_usage_ledger_append(ledger.repository.clone(), entry);
+        enqueue_usage_ledger_append(
+            ledger.repository.clone(),
+            entry,
+            self.metrics
+                .as_ref()
+                .map(|metrics| metrics.recorder.clone()),
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1447,6 +1459,9 @@ where
             watermark,
             plan.ledger_range.start(),
             plan.ledger_range.end(),
+            self.metrics
+                .as_ref()
+                .map(|metrics| metrics.recorder.clone()),
         );
     }
 
@@ -1499,38 +1514,82 @@ where
             activity,
             plan.ledger_range.start(),
             plan.ledger_range.end(),
+            self.metrics
+                .as_ref()
+                .map(|metrics| metrics.recorder.clone()),
         );
     }
 }
 
-const QUERY_METADATA_QUEUE_CAPACITY: usize = 1024;
-const QUERY_METADATA_WORKER_THREADS: usize = 2;
+const DEFAULT_QUERY_METADATA_QUEUE_CAPACITY: usize = 8192;
+const DEFAULT_QUERY_METADATA_WORKER_THREADS: usize = 4;
+
+impl Default for QueryMetadataWorkerConfig {
+    fn default() -> Self {
+        Self {
+            queue_capacity: DEFAULT_QUERY_METADATA_QUEUE_CAPACITY,
+            worker_threads: DEFAULT_QUERY_METADATA_WORKER_THREADS,
+        }
+    }
+}
+
+pub fn configure_query_metadata_worker_pool(config: QueryMetadataWorkerConfig) {
+    QUERY_METADATA_WORKER_POOL.get_or_init(|| {
+        MetadataWorkerPool::new(config.queue_capacity.max(1), config.worker_threads.max(1))
+    });
+}
 
 static QUERY_METADATA_WORKER_POOL: OnceLock<MetadataWorkerPool> = OnceLock::new();
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MetadataEnqueueOutcome {
     Enqueued,
+    Coalesced,
     Full,
     Closed,
 }
 
 struct MetadataWorkerPool {
+    inner: Arc<MetadataWorkerPoolInner>,
+}
+
+struct MetadataWorkerPoolInner {
     sender: mpsc::SyncSender<MetadataJob>,
-    _receiver: Arc<Mutex<mpsc::Receiver<MetadataJob>>>,
+    receiver: Mutex<mpsc::Receiver<MetadataJob>>,
+    pending_watermarks: Mutex<BTreeMap<String, CoalescedQueryWatermark>>,
+    pending_activities: Mutex<BTreeMap<String, CoalescedQueryActivity>>,
+}
+
+struct CoalescedQueryWatermark {
+    repository: Arc<dyn QueryWatermarkRepository>,
+    watermark: QueryWatermark,
+    context: QueryWatermarkMetadataContext,
+    metrics: Option<Arc<MetricsRecorder>>,
+}
+
+struct CoalescedQueryActivity {
+    repository: Arc<dyn QueryActivityRepository>,
+    activity: QueryActivity,
+    context: QueryActivityMetadataContext,
+    metrics: Option<Arc<MetricsRecorder>>,
 }
 
 impl MetadataWorkerPool {
     fn new(capacity: usize, worker_count: usize) -> Self {
         let (sender, receiver) = mpsc::sync_channel(capacity);
-        let receiver = Arc::new(Mutex::new(receiver));
+        let inner = Arc::new(MetadataWorkerPoolInner {
+            sender,
+            receiver: Mutex::new(receiver),
+            pending_watermarks: Mutex::new(BTreeMap::new()),
+            pending_activities: Mutex::new(BTreeMap::new()),
+        });
         for worker_index in 0..worker_count {
-            let receiver = receiver.clone();
+            let inner = inner.clone();
             let name = format!("datalens-query-metadata-{worker_index}");
             if let Err(error) = thread::Builder::new().name(name).spawn(move || {
                 loop {
                     let job = {
-                        let receiver = match receiver.lock() {
+                        let receiver = match inner.receiver.lock() {
                             Ok(receiver) => receiver,
                             Err(error) => {
                                 log::warn!("query metadata worker lock failed message={error}");
@@ -1540,7 +1599,10 @@ impl MetadataWorkerPool {
                         receiver.recv()
                     };
                     match job {
-                        Ok(job) => process_metadata_job(job),
+                        Ok(job) => {
+                            process_metadata_job(job);
+                            inner.flush_coalesced();
+                        }
                         Err(_) => return,
                     }
                 }
@@ -1552,10 +1614,7 @@ impl MetadataWorkerPool {
                 );
             }
         }
-        Self {
-            sender,
-            _receiver: receiver,
-        }
+        Self { inner }
     }
 
     #[cfg(test)]
@@ -1564,10 +1623,184 @@ impl MetadataWorkerPool {
     }
 
     fn enqueue(&self, job: MetadataJob) -> MetadataEnqueueOutcome {
+        self.inner.enqueue(job)
+    }
+
+    #[cfg(test)]
+    fn flush_coalesced(&self) {
+        self.inner.flush_coalesced();
+    }
+
+    #[cfg(test)]
+    fn recv_for_test(&self) -> Option<MetadataJob> {
+        self.inner
+            .receiver
+            .lock()
+            .expect("metadata worker receiver")
+            .try_recv()
+            .ok()
+    }
+
+    #[cfg(test)]
+    fn pending_latest_state_counts_for_test(&self) -> (usize, usize) {
+        (
+            self.inner
+                .pending_watermarks
+                .lock()
+                .expect("pending watermarks")
+                .len(),
+            self.inner
+                .pending_activities
+                .lock()
+                .expect("pending activities")
+                .len(),
+        )
+    }
+}
+
+impl MetadataWorkerPoolInner {
+    fn enqueue(&self, job: MetadataJob) -> MetadataEnqueueOutcome {
         match self.sender.try_send(job) {
             Ok(()) => MetadataEnqueueOutcome::Enqueued,
-            Err(mpsc::TrySendError::Full(_)) => MetadataEnqueueOutcome::Full,
+            Err(mpsc::TrySendError::Full(job)) => self.coalesce_or_full(job),
             Err(mpsc::TrySendError::Disconnected(_)) => MetadataEnqueueOutcome::Closed,
+        }
+    }
+
+    fn coalesce_or_full(&self, job: MetadataJob) -> MetadataEnqueueOutcome {
+        match job {
+            MetadataJob::QueryWatermarkUpdate {
+                repository,
+                watermark,
+                context,
+                metrics,
+            } => {
+                self.coalesce_watermark(repository, watermark, context, metrics);
+                MetadataEnqueueOutcome::Coalesced
+            }
+            MetadataJob::QueryActivityUpdate {
+                repository,
+                activity,
+                context,
+                metrics,
+            } => {
+                self.coalesce_activity(repository, activity, context, metrics);
+                MetadataEnqueueOutcome::Coalesced
+            }
+            _ => MetadataEnqueueOutcome::Full,
+        }
+    }
+
+    fn coalesce_watermark(
+        &self,
+        repository: Arc<dyn QueryWatermarkRepository>,
+        watermark: QueryWatermark,
+        context: QueryWatermarkMetadataContext,
+        metrics: Option<Arc<MetricsRecorder>>,
+    ) {
+        let key = query_watermark_coalesce_key(&watermark.key);
+        let mut pending = match self.pending_watermarks.lock() {
+            Ok(pending) => pending,
+            Err(error) => {
+                log::warn!(
+                    "query metadata coalesce lock failed metadata_kind=query_watermark message={error}"
+                );
+                return;
+            }
+        };
+        let incoming = CoalescedQueryWatermark {
+            repository,
+            watermark,
+            context,
+            metrics,
+        };
+        match pending.get(&key) {
+            Some(existing) if !watermark_is_newer(&incoming.watermark, &existing.watermark) => {}
+            _ => {
+                pending.insert(key, incoming);
+            }
+        }
+    }
+
+    fn coalesce_activity(
+        &self,
+        repository: Arc<dyn QueryActivityRepository>,
+        activity: QueryActivity,
+        context: QueryActivityMetadataContext,
+        metrics: Option<Arc<MetricsRecorder>>,
+    ) {
+        let key = query_activity_coalesce_key(&activity.key);
+        let mut pending = match self.pending_activities.lock() {
+            Ok(pending) => pending,
+            Err(error) => {
+                log::warn!(
+                    "query metadata coalesce lock failed metadata_kind=query_activity message={error}"
+                );
+                return;
+            }
+        };
+        let incoming = CoalescedQueryActivity {
+            repository,
+            activity,
+            context,
+            metrics,
+        };
+        match pending.get(&key) {
+            Some(existing) if !activity_is_newer(&incoming.activity, &existing.activity) => {}
+            _ => {
+                pending.insert(key, incoming);
+            }
+        }
+    }
+
+    fn flush_coalesced(&self) {
+        loop {
+            let Some(job) = self.pop_coalesced_job() else {
+                return;
+            };
+            match self.sender.try_send(job) {
+                Ok(()) => {}
+                Err(mpsc::TrySendError::Full(job)) => {
+                    self.requeue_coalesced_job(job);
+                    return;
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => return,
+            }
+        }
+    }
+
+    fn pop_coalesced_job(&self) -> Option<MetadataJob> {
+        if let Some(coalesced) = pop_first(&self.pending_watermarks) {
+            return Some(MetadataJob::QueryWatermarkUpdate {
+                repository: coalesced.repository,
+                watermark: coalesced.watermark,
+                context: coalesced.context,
+                metrics: coalesced.metrics,
+            });
+        }
+        pop_first(&self.pending_activities).map(|coalesced| MetadataJob::QueryActivityUpdate {
+            repository: coalesced.repository,
+            activity: coalesced.activity,
+            context: coalesced.context,
+            metrics: coalesced.metrics,
+        })
+    }
+
+    fn requeue_coalesced_job(&self, job: MetadataJob) {
+        match job {
+            MetadataJob::QueryWatermarkUpdate {
+                repository,
+                watermark,
+                context,
+                metrics,
+            } => self.coalesce_watermark(repository, watermark, context, metrics),
+            MetadataJob::QueryActivityUpdate {
+                repository,
+                activity,
+                context,
+                metrics,
+            } => self.coalesce_activity(repository, activity, context, metrics),
+            _ => {}
         }
     }
 }
@@ -1577,16 +1810,19 @@ enum MetadataJob {
         repository: Arc<dyn UsageLedgerRepository>,
         entry: UsageLedgerEntry,
         context: UsageLedgerMetadataContext,
+        metrics: Option<Arc<MetricsRecorder>>,
     },
     QueryWatermarkUpdate {
         repository: Arc<dyn QueryWatermarkRepository>,
         watermark: QueryWatermark,
         context: QueryWatermarkMetadataContext,
+        metrics: Option<Arc<MetricsRecorder>>,
     },
     QueryActivityUpdate {
         repository: Arc<dyn QueryActivityRepository>,
         activity: QueryActivity,
         context: QueryActivityMetadataContext,
+        metrics: Option<Arc<MetricsRecorder>>,
     },
     #[cfg(test)]
     NoopForTest,
@@ -1623,15 +1859,95 @@ struct QueryActivityMetadataContext {
 
 fn metadata_worker_pool() -> &'static MetadataWorkerPool {
     QUERY_METADATA_WORKER_POOL.get_or_init(|| {
-        MetadataWorkerPool::new(QUERY_METADATA_QUEUE_CAPACITY, QUERY_METADATA_WORKER_THREADS)
+        let config = QueryMetadataWorkerConfig::default();
+        MetadataWorkerPool::new(config.queue_capacity, config.worker_threads)
     })
+}
+
+fn pop_first<T>(pending: &Mutex<BTreeMap<String, T>>) -> Option<T> {
+    let mut pending = pending.lock().ok()?;
+    let key = pending.keys().next().cloned()?;
+    pending.remove(&key)
+}
+
+fn query_watermark_coalesce_key(key: &QueryWatermarkKey) -> String {
+    format!(
+        "application={}|chain={}|dataset={}|range_kind={:?}|selector={}",
+        key.application_id,
+        key.chain.key_prefix(),
+        key.dataset_key.as_str(),
+        key.range_kind,
+        key.selector_fingerprint,
+    )
+}
+
+fn query_activity_coalesce_key(key: &QueryActivityKey) -> String {
+    format!(
+        "application={}|chain={}|dataset={}|range_kind={:?}|selector={}",
+        key.application_id,
+        key.chain.key_prefix(),
+        key.dataset_key.as_str(),
+        key.range_kind,
+        key.selector_fingerprint,
+    )
+}
+
+fn watermark_is_newer(incoming: &QueryWatermark, existing: &QueryWatermark) -> bool {
+    incoming.latest_block > existing.latest_block
+        || (incoming.latest_block == existing.latest_block
+            && incoming.updated_at_unix_seconds >= existing.updated_at_unix_seconds)
+}
+
+fn activity_is_newer(incoming: &QueryActivity, existing: &QueryActivity) -> bool {
+    incoming.latest_range.end() > existing.latest_range.end()
+        || (incoming.latest_range.end() == existing.latest_range.end()
+            && incoming.updated_at_unix_seconds >= existing.updated_at_unix_seconds)
+}
+
+fn metadata_enqueue_metric_outcome(outcome: MetadataEnqueueOutcome) -> QueryMetadataEnqueueOutcome {
+    match outcome {
+        MetadataEnqueueOutcome::Enqueued => QueryMetadataEnqueueOutcome::Enqueued,
+        MetadataEnqueueOutcome::Coalesced => QueryMetadataEnqueueOutcome::Coalesced,
+        MetadataEnqueueOutcome::Full => QueryMetadataEnqueueOutcome::Dropped,
+        MetadataEnqueueOutcome::Closed => QueryMetadataEnqueueOutcome::Closed,
+    }
+}
+
+fn record_query_metadata_enqueue(
+    metrics: Option<&Arc<MetricsRecorder>>,
+    labels: &MetricsLabels,
+    metadata_kind: &str,
+    outcome: QueryMetadataEnqueueOutcome,
+) {
+    if let Some(metrics) = metrics {
+        metrics.record_query_metadata_enqueue(labels, metadata_kind, outcome);
+    }
+}
+
+fn record_query_metadata_write(
+    metrics: Option<&Arc<MetricsRecorder>>,
+    labels: &MetricsLabels,
+    metadata_kind: &str,
+    outcome: QueryMetadataWriteOutcome,
+    seconds: f64,
+) {
+    if let Some(metrics) = metrics {
+        metrics.record_query_metadata_write(labels, metadata_kind, outcome);
+        metrics.observe_query_metadata_write_duration(labels, metadata_kind, seconds);
+    }
 }
 
 fn enqueue_usage_ledger_append(
     repository: Arc<dyn UsageLedgerRepository>,
     entry: UsageLedgerEntry,
+    metrics: Option<Arc<MetricsRecorder>>,
 ) {
     let enqueue_start = Instant::now();
+    let labels = MetricsLabels::from_dataset_key(
+        ApplicationIdentity::named(entry.application_id.clone()),
+        entry.chain.clone(),
+        entry.dataset_key.clone(),
+    );
     let context = UsageLedgerMetadataContext {
         base: QueryMetadataContext {
             query_id: entry
@@ -1650,10 +1966,27 @@ fn enqueue_usage_ledger_append(
         repository,
         entry,
         context: context.clone(),
+        metrics: metrics.clone(),
     });
+    record_query_metadata_enqueue(
+        metrics.as_ref(),
+        &labels,
+        "usage_ledger",
+        metadata_enqueue_metric_outcome(outcome),
+    );
     match outcome {
         MetadataEnqueueOutcome::Enqueued => log::debug!(
             "query metadata enqueue completed metadata_kind=usage_ledger query_id={} application={} chain={} dataset={} range={}-{} duration_ms={}",
+            context.base.query_id,
+            context.base.application_id,
+            context.base.chain,
+            context.base.dataset,
+            context.base.range_start,
+            context.base.range_end,
+            elapsed_ms(enqueue_start)
+        ),
+        MetadataEnqueueOutcome::Coalesced => log::debug!(
+            "query metadata enqueue coalesced metadata_kind=usage_ledger query_id={} application={} chain={} dataset={} range={}-{} duration_ms={}",
             context.base.query_id,
             context.base.application_id,
             context.base.chain,
@@ -1691,8 +2024,14 @@ fn enqueue_query_watermark_update(
     watermark: QueryWatermark,
     range_start: u64,
     range_end: u64,
+    metrics: Option<Arc<MetricsRecorder>>,
 ) {
     let enqueue_start = Instant::now();
+    let labels = MetricsLabels::from_dataset_key(
+        ApplicationIdentity::named(watermark.key.application_id.clone()),
+        watermark.key.chain.clone(),
+        watermark.key.dataset_key.clone(),
+    );
     let application_id = watermark.key.application_id.clone();
     let chain = watermark.key.chain.configured_name().to_owned();
     let dataset = watermark.key.dataset_key.as_str().to_owned();
@@ -1712,7 +2051,14 @@ fn enqueue_query_watermark_update(
         repository,
         watermark,
         context: context.clone(),
+        metrics: metrics.clone(),
     });
+    record_query_metadata_enqueue(
+        metrics.as_ref(),
+        &labels,
+        "query_watermark",
+        metadata_enqueue_metric_outcome(outcome),
+    );
     match outcome {
         MetadataEnqueueOutcome::Enqueued => log::debug!(
             "query metadata enqueue completed metadata_kind=query_watermark query_id={} application={} chain={} dataset={} range={}-{} latest_block={} duration_ms={}",
@@ -1724,6 +2070,17 @@ fn enqueue_query_watermark_update(
             context.base.range_end,
             context.latest_block,
             elapsed_ms(enqueue_start)
+        ),
+        MetadataEnqueueOutcome::Coalesced => log::debug!(
+            "query metadata enqueue coalesced metadata_kind=query_watermark query_id={} application={} chain={} dataset={} range={}-{} latest_block={} duration_ms={} reason=queue_full",
+            context.base.query_id,
+            context.base.application_id,
+            context.base.chain,
+            context.base.dataset,
+            context.base.range_start,
+            context.base.range_end,
+            context.latest_block,
+            elapsed_ms(enqueue_start),
         ),
         MetadataEnqueueOutcome::Full => log::warn!(
             "query metadata enqueue dropped metadata_kind=query_watermark query_id={} application={} chain={} dataset={} range={}-{} latest_block={} duration_ms={} reason=queue_full",
@@ -1756,8 +2113,14 @@ fn enqueue_query_activity_update(
     activity: QueryActivity,
     range_start: u64,
     range_end: u64,
+    metrics: Option<Arc<MetricsRecorder>>,
 ) {
     let enqueue_start = Instant::now();
+    let labels = MetricsLabels::from_dataset_key(
+        ApplicationIdentity::named(activity.key.application_id.clone()),
+        activity.key.chain.clone(),
+        activity.key.dataset_key.clone(),
+    );
     let application_id = activity.key.application_id.clone();
     let chain = activity.key.chain.configured_name().to_owned();
     let dataset = activity.key.dataset_key.as_str().to_owned();
@@ -1779,7 +2142,14 @@ fn enqueue_query_activity_update(
         repository,
         activity,
         context: context.clone(),
+        metrics: metrics.clone(),
     });
+    record_query_metadata_enqueue(
+        metrics.as_ref(),
+        &labels,
+        "query_activity",
+        metadata_enqueue_metric_outcome(outcome),
+    );
     match outcome {
         MetadataEnqueueOutcome::Enqueued => log::debug!(
             "query metadata enqueue completed metadata_kind=query_activity query_id={} application={} chain={} dataset={} range={}-{} latest_range={}-{} duration_ms={}",
@@ -1792,6 +2162,18 @@ fn enqueue_query_activity_update(
             context.latest_start,
             context.latest_end,
             elapsed_ms(enqueue_start)
+        ),
+        MetadataEnqueueOutcome::Coalesced => log::debug!(
+            "query metadata enqueue coalesced metadata_kind=query_activity query_id={} application={} chain={} dataset={} range={}-{} latest_range={}-{} duration_ms={} reason=queue_full",
+            context.base.query_id,
+            context.base.application_id,
+            context.base.chain,
+            context.base.dataset,
+            context.base.range_start,
+            context.base.range_end,
+            context.latest_start,
+            context.latest_end,
+            elapsed_ms(enqueue_start),
         ),
         MetadataEnqueueOutcome::Full => log::warn!(
             "query metadata enqueue dropped metadata_kind=query_activity query_id={} application={} chain={} dataset={} range={}-{} latest_range={}-{} duration_ms={} reason=queue_full",
@@ -1826,101 +2208,179 @@ fn process_metadata_job(job: MetadataJob) {
             repository,
             entry,
             context,
+            metrics,
         } => {
             let start = Instant::now();
+            let labels = MetricsLabels::from_dataset_key(
+                ApplicationIdentity::named(context.base.application_id.clone()),
+                entry.chain.clone(),
+                entry.dataset_key.clone(),
+            );
             match repository.append(&entry) {
-                Ok(()) => log::info!(
-                    "query metadata background write completed metadata_kind=usage_ledger query_id={} application={} chain={} dataset={} range={}-{} query_outcome={:?} duration_ms={}",
-                    context.base.query_id,
-                    context.base.application_id,
-                    context.base.chain,
-                    context.base.dataset,
-                    context.base.range_start,
-                    context.base.range_end,
-                    context.query_outcome,
-                    elapsed_ms(start)
-                ),
-                Err(error) => log::warn!(
-                    "query metadata background write failed metadata_kind=usage_ledger query_id={} application={} chain={} dataset={} range={}-{} query_outcome={:?} duration_ms={} kind={:?} message={}",
-                    context.base.query_id,
-                    context.base.application_id,
-                    context.base.chain,
-                    context.base.dataset,
-                    context.base.range_start,
-                    context.base.range_end,
-                    context.query_outcome,
-                    elapsed_ms(start),
-                    error.kind,
-                    error.message
-                ),
+                Ok(()) => {
+                    let duration = start.elapsed();
+                    record_query_metadata_write(
+                        metrics.as_ref(),
+                        &labels,
+                        "usage_ledger",
+                        QueryMetadataWriteOutcome::Completed,
+                        duration.as_secs_f64(),
+                    );
+                    log::info!(
+                        "query metadata background write completed metadata_kind=usage_ledger query_id={} application={} chain={} dataset={} range={}-{} query_outcome={:?} duration_ms={}",
+                        context.base.query_id,
+                        context.base.application_id,
+                        context.base.chain,
+                        context.base.dataset,
+                        context.base.range_start,
+                        context.base.range_end,
+                        context.query_outcome,
+                        duration.as_millis()
+                    )
+                }
+                Err(error) => {
+                    let duration = start.elapsed();
+                    record_query_metadata_write(
+                        metrics.as_ref(),
+                        &labels,
+                        "usage_ledger",
+                        QueryMetadataWriteOutcome::Failed,
+                        duration.as_secs_f64(),
+                    );
+                    log::warn!(
+                        "query metadata background write failed metadata_kind=usage_ledger query_id={} application={} chain={} dataset={} range={}-{} query_outcome={:?} duration_ms={} kind={:?} message={}",
+                        context.base.query_id,
+                        context.base.application_id,
+                        context.base.chain,
+                        context.base.dataset,
+                        context.base.range_start,
+                        context.base.range_end,
+                        context.query_outcome,
+                        duration.as_millis(),
+                        error.kind,
+                        error.message
+                    )
+                }
             }
         }
         MetadataJob::QueryWatermarkUpdate {
             repository,
             watermark,
             context,
+            metrics,
         } => {
             let start = Instant::now();
+            let labels = MetricsLabels::from_dataset_key(
+                ApplicationIdentity::named(context.base.application_id.clone()),
+                watermark.key.chain.clone(),
+                watermark.key.dataset_key.clone(),
+            );
             match repository.update(&watermark) {
-                Ok(()) => log::info!(
-                    "query metadata background write completed metadata_kind=query_watermark query_id={} application={} chain={} dataset={} range={}-{} latest_block={} duration_ms={}",
-                    context.base.query_id,
-                    context.base.application_id,
-                    context.base.chain,
-                    context.base.dataset,
-                    context.base.range_start,
-                    context.base.range_end,
-                    context.latest_block,
-                    elapsed_ms(start)
-                ),
-                Err(error) => log::warn!(
-                    "query metadata background write failed metadata_kind=query_watermark query_id={} application={} chain={} dataset={} range={}-{} latest_block={} duration_ms={} kind={:?} message={}",
-                    context.base.query_id,
-                    context.base.application_id,
-                    context.base.chain,
-                    context.base.dataset,
-                    context.base.range_start,
-                    context.base.range_end,
-                    context.latest_block,
-                    elapsed_ms(start),
-                    error.kind,
-                    error.message
-                ),
+                Ok(()) => {
+                    let duration = start.elapsed();
+                    record_query_metadata_write(
+                        metrics.as_ref(),
+                        &labels,
+                        "query_watermark",
+                        QueryMetadataWriteOutcome::Completed,
+                        duration.as_secs_f64(),
+                    );
+                    log::info!(
+                        "query metadata background write completed metadata_kind=query_watermark query_id={} application={} chain={} dataset={} range={}-{} latest_block={} duration_ms={}",
+                        context.base.query_id,
+                        context.base.application_id,
+                        context.base.chain,
+                        context.base.dataset,
+                        context.base.range_start,
+                        context.base.range_end,
+                        context.latest_block,
+                        duration.as_millis()
+                    )
+                }
+                Err(error) => {
+                    let duration = start.elapsed();
+                    record_query_metadata_write(
+                        metrics.as_ref(),
+                        &labels,
+                        "query_watermark",
+                        QueryMetadataWriteOutcome::Failed,
+                        duration.as_secs_f64(),
+                    );
+                    log::warn!(
+                        "query metadata background write failed metadata_kind=query_watermark query_id={} application={} chain={} dataset={} range={}-{} latest_block={} duration_ms={} kind={:?} message={}",
+                        context.base.query_id,
+                        context.base.application_id,
+                        context.base.chain,
+                        context.base.dataset,
+                        context.base.range_start,
+                        context.base.range_end,
+                        context.latest_block,
+                        duration.as_millis(),
+                        error.kind,
+                        error.message
+                    )
+                }
             }
         }
         MetadataJob::QueryActivityUpdate {
             repository,
             activity,
             context,
+            metrics,
         } => {
             let start = Instant::now();
+            let labels = MetricsLabels::from_dataset_key(
+                ApplicationIdentity::named(context.base.application_id.clone()),
+                activity.key.chain.clone(),
+                activity.key.dataset_key.clone(),
+            );
             match repository.update(&activity) {
-                Ok(()) => log::info!(
-                    "query metadata background write completed metadata_kind=query_activity query_id={} application={} chain={} dataset={} range={}-{} latest_range={}-{} duration_ms={}",
-                    context.base.query_id,
-                    context.base.application_id,
-                    context.base.chain,
-                    context.base.dataset,
-                    context.base.range_start,
-                    context.base.range_end,
-                    context.latest_start,
-                    context.latest_end,
-                    elapsed_ms(start)
-                ),
-                Err(error) => log::warn!(
-                    "query metadata background write failed metadata_kind=query_activity query_id={} application={} chain={} dataset={} range={}-{} latest_range={}-{} duration_ms={} kind={:?} message={}",
-                    context.base.query_id,
-                    context.base.application_id,
-                    context.base.chain,
-                    context.base.dataset,
-                    context.base.range_start,
-                    context.base.range_end,
-                    context.latest_start,
-                    context.latest_end,
-                    elapsed_ms(start),
-                    error.kind,
-                    error.message
-                ),
+                Ok(()) => {
+                    let duration = start.elapsed();
+                    record_query_metadata_write(
+                        metrics.as_ref(),
+                        &labels,
+                        "query_activity",
+                        QueryMetadataWriteOutcome::Completed,
+                        duration.as_secs_f64(),
+                    );
+                    log::info!(
+                        "query metadata background write completed metadata_kind=query_activity query_id={} application={} chain={} dataset={} range={}-{} latest_range={}-{} duration_ms={}",
+                        context.base.query_id,
+                        context.base.application_id,
+                        context.base.chain,
+                        context.base.dataset,
+                        context.base.range_start,
+                        context.base.range_end,
+                        context.latest_start,
+                        context.latest_end,
+                        duration.as_millis()
+                    )
+                }
+                Err(error) => {
+                    let duration = start.elapsed();
+                    record_query_metadata_write(
+                        metrics.as_ref(),
+                        &labels,
+                        "query_activity",
+                        QueryMetadataWriteOutcome::Failed,
+                        duration.as_secs_f64(),
+                    );
+                    log::warn!(
+                        "query metadata background write failed metadata_kind=query_activity query_id={} application={} chain={} dataset={} range={}-{} latest_range={}-{} duration_ms={} kind={:?} message={}",
+                        context.base.query_id,
+                        context.base.application_id,
+                        context.base.chain,
+                        context.base.dataset,
+                        context.base.range_start,
+                        context.base.range_end,
+                        context.latest_start,
+                        context.latest_end,
+                        duration.as_millis(),
+                        error.kind,
+                        error.message
+                    )
+                }
             }
         }
         #[cfg(test)]
@@ -2066,5 +2526,168 @@ mod tests {
             start.elapsed() < std::time::Duration::from_millis(50),
             "full metadata queue enqueue should not block"
         );
+    }
+
+    #[test]
+    fn test_metadata_worker_pool_coalesces_latest_state_when_queue_is_full() {
+        let pool = MetadataWorkerPool::new_for_test(1, 0);
+        let watermarks = RecordingQueryWatermarkRepository::default();
+        let activities = RecordingQueryActivityRepository::default();
+
+        assert_eq!(
+            pool.enqueue(MetadataJob::NoopForTest),
+            MetadataEnqueueOutcome::Enqueued
+        );
+        assert_eq!(
+            pool.enqueue(MetadataJob::QueryWatermarkUpdate {
+                repository: Arc::new(watermarks.clone()),
+                watermark: test_watermark(10, 100),
+                context: test_watermark_context("q-low", 10),
+                metrics: None,
+            }),
+            MetadataEnqueueOutcome::Coalesced
+        );
+        assert_eq!(
+            pool.enqueue(MetadataJob::QueryWatermarkUpdate {
+                repository: Arc::new(watermarks),
+                watermark: test_watermark(20, 200),
+                context: test_watermark_context("q-high", 20),
+                metrics: None,
+            }),
+            MetadataEnqueueOutcome::Coalesced
+        );
+        assert_eq!(
+            pool.enqueue(MetadataJob::QueryActivityUpdate {
+                repository: Arc::new(activities.clone()),
+                activity: test_activity(10, 100),
+                context: test_activity_context("q-activity-low", 10),
+                metrics: None,
+            }),
+            MetadataEnqueueOutcome::Coalesced
+        );
+        assert_eq!(
+            pool.enqueue(MetadataJob::QueryActivityUpdate {
+                repository: Arc::new(activities),
+                activity: test_activity(30, 300),
+                context: test_activity_context("q-activity-high", 30),
+                metrics: None,
+            }),
+            MetadataEnqueueOutcome::Coalesced
+        );
+        assert_eq!(pool.pending_latest_state_counts_for_test(), (1, 1));
+
+        assert!(matches!(
+            pool.recv_for_test(),
+            Some(MetadataJob::NoopForTest)
+        ));
+        pool.flush_coalesced();
+        match pool.recv_for_test() {
+            Some(MetadataJob::QueryWatermarkUpdate {
+                watermark, context, ..
+            }) => {
+                assert_eq!(watermark.latest_block, 20);
+                assert_eq!(context.base.query_id, "q-high");
+            }
+            _ => panic!("expected coalesced watermark"),
+        }
+        pool.flush_coalesced();
+        match pool.recv_for_test() {
+            Some(MetadataJob::QueryActivityUpdate {
+                activity, context, ..
+            }) => {
+                assert_eq!(activity.latest_range.end(), 30);
+                assert_eq!(context.base.query_id, "q-activity-high");
+            }
+            _ => panic!("expected coalesced activity"),
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingQueryWatermarkRepository;
+
+    impl QueryWatermarkRepository for RecordingQueryWatermarkRepository {
+        fn update(&self, _watermark: &QueryWatermark) -> Result<(), DatalensError> {
+            Ok(())
+        }
+
+        fn read(&self, _key: &QueryWatermarkKey) -> Result<Option<QueryWatermark>, DatalensError> {
+            Ok(None)
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingQueryActivityRepository;
+
+    impl QueryActivityRepository for RecordingQueryActivityRepository {
+        fn update(&self, _activity: &QueryActivity) -> Result<(), DatalensError> {
+            Ok(())
+        }
+
+        fn read(&self, _key: &QueryActivityKey) -> Result<Option<QueryActivity>, DatalensError> {
+            Ok(None)
+        }
+    }
+
+    fn test_watermark(latest_block: u64, updated_at_unix_seconds: u64) -> QueryWatermark {
+        QueryWatermark {
+            key: test_watermark_key(),
+            latest_block,
+            updated_at_unix_seconds,
+        }
+    }
+
+    fn test_watermark_key() -> QueryWatermarkKey {
+        QueryWatermarkKey::new(
+            "app",
+            ChainIdentity::expect_new(datalens_core::ChainFamily::Evm, "ethereum"),
+            DatasetKey::evm_blocks(),
+            &datalens_chain::DatasetSelector::all(),
+            datalens_core::LedgerRangeKind::Block,
+        )
+    }
+
+    fn test_activity(latest_end: u64, updated_at_unix_seconds: u64) -> QueryActivity {
+        QueryActivity {
+            key: test_activity_key(),
+            latest_range: LedgerRange::blocks(1, latest_end).expect("range"),
+            updated_at_unix_seconds,
+            request_id: Some(format!("q-{latest_end}")),
+        }
+    }
+
+    fn test_activity_key() -> QueryActivityKey {
+        QueryActivityKey::new(
+            "app",
+            ChainIdentity::expect_new(datalens_core::ChainFamily::Evm, "ethereum"),
+            DatasetKey::evm_blocks(),
+            &datalens_chain::DatasetSelector::all(),
+            datalens_core::LedgerRangeKind::Block,
+        )
+    }
+
+    fn test_watermark_context(query_id: &str, latest_block: u64) -> QueryWatermarkMetadataContext {
+        QueryWatermarkMetadataContext {
+            base: test_metadata_context(query_id),
+            latest_block,
+        }
+    }
+
+    fn test_activity_context(query_id: &str, latest_end: u64) -> QueryActivityMetadataContext {
+        QueryActivityMetadataContext {
+            base: test_metadata_context(query_id),
+            latest_start: 1,
+            latest_end,
+        }
+    }
+
+    fn test_metadata_context(query_id: &str) -> QueryMetadataContext {
+        QueryMetadataContext {
+            query_id: query_id.to_owned(),
+            application_id: "app".to_owned(),
+            chain: "ethereum".to_owned(),
+            dataset: "evm.blocks".to_owned(),
+            range_start: 1,
+            range_end: 1,
+        }
     }
 }

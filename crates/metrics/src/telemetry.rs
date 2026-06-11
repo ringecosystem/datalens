@@ -371,6 +371,40 @@ impl WarmupWriteOutcome {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueryMetadataEnqueueOutcome {
+    Enqueued,
+    Coalesced,
+    Dropped,
+    Closed,
+}
+
+impl QueryMetadataEnqueueOutcome {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Enqueued => "enqueued",
+            Self::Coalesced => "coalesced",
+            Self::Dropped => "dropped",
+            Self::Closed => "closed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueryMetadataWriteOutcome {
+    Completed,
+    Failed,
+}
+
+impl QueryMetadataWriteOutcome {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct MetricsRecorder {
     registry: Registry,
@@ -398,6 +432,9 @@ pub struct MetricsRecorder {
     warmup_rows_total: CounterVec,
     warmup_provider_error_total: CounterVec,
     warmup_current_height: GaugeVec,
+    query_metadata_enqueue_total: CounterVec,
+    query_metadata_write_total: CounterVec,
+    query_metadata_write_duration_seconds: HistogramVec,
     indexer_graphql_query_total: CounterVec,
     indexer_graphql_query_duration_seconds: HistogramVec,
     indexer_graphql_auth_failure_total: CounterVec,
@@ -624,6 +661,47 @@ impl MetricsRecorder {
             ),
             &["application", "chain", "chain_kind", "dataset"],
         )?;
+        let query_metadata_enqueue_total = CounterVec::new(
+            Opts::new(
+                "datalens_query_metadata_enqueue_total",
+                "Datalens query metadata enqueue attempts by metadata kind and outcome.",
+            ),
+            &[
+                "application",
+                "chain",
+                "chain_kind",
+                "dataset",
+                "metadata_kind",
+                "outcome",
+            ],
+        )?;
+        let query_metadata_write_total = CounterVec::new(
+            Opts::new(
+                "datalens_query_metadata_write_total",
+                "Datalens query metadata background writes by metadata kind and outcome.",
+            ),
+            &[
+                "application",
+                "chain",
+                "chain_kind",
+                "dataset",
+                "metadata_kind",
+                "outcome",
+            ],
+        )?;
+        let query_metadata_write_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "datalens_query_metadata_write_duration_seconds",
+                "Datalens query metadata background write duration in seconds.",
+            ),
+            &[
+                "application",
+                "chain",
+                "chain_kind",
+                "dataset",
+                "metadata_kind",
+            ],
+        )?;
         let indexer_graphql_query_total = CounterVec::new(
             Opts::new(
                 "datalens_indexer_graphql_query_total",
@@ -684,6 +762,9 @@ impl MetricsRecorder {
         registry.register(Box::new(warmup_rows_total.clone()))?;
         registry.register(Box::new(warmup_provider_error_total.clone()))?;
         registry.register(Box::new(warmup_current_height.clone()))?;
+        registry.register(Box::new(query_metadata_enqueue_total.clone()))?;
+        registry.register(Box::new(query_metadata_write_total.clone()))?;
+        registry.register(Box::new(query_metadata_write_duration_seconds.clone()))?;
         registry.register(Box::new(indexer_graphql_query_total.clone()))?;
         registry.register(Box::new(indexer_graphql_query_duration_seconds.clone()))?;
         registry.register(Box::new(indexer_graphql_auth_failure_total.clone()))?;
@@ -715,6 +796,9 @@ impl MetricsRecorder {
             warmup_rows_total,
             warmup_provider_error_total,
             warmup_current_height,
+            query_metadata_enqueue_total,
+            query_metadata_write_total,
+            query_metadata_write_duration_seconds,
             indexer_graphql_query_total,
             indexer_graphql_query_duration_seconds,
             indexer_graphql_auth_failure_total,
@@ -930,6 +1014,47 @@ impl MetricsRecorder {
             .set(height as f64);
     }
 
+    pub fn record_query_metadata_enqueue(
+        &self,
+        labels: &MetricsLabels,
+        metadata_kind: &str,
+        outcome: QueryMetadataEnqueueOutcome,
+    ) {
+        self.query_metadata_enqueue_total
+            .with_label_values(&query_metadata_outcome_label_values(
+                labels,
+                metadata_kind,
+                outcome.as_str(),
+            ))
+            .inc();
+    }
+
+    pub fn record_query_metadata_write(
+        &self,
+        labels: &MetricsLabels,
+        metadata_kind: &str,
+        outcome: QueryMetadataWriteOutcome,
+    ) {
+        self.query_metadata_write_total
+            .with_label_values(&query_metadata_outcome_label_values(
+                labels,
+                metadata_kind,
+                outcome.as_str(),
+            ))
+            .inc();
+    }
+
+    pub fn observe_query_metadata_write_duration(
+        &self,
+        labels: &MetricsLabels,
+        metadata_kind: &str,
+        seconds: f64,
+    ) {
+        self.query_metadata_write_duration_seconds
+            .with_label_values(&query_metadata_duration_label_values(labels, metadata_kind))
+            .observe(seconds);
+    }
+
     pub fn record_indexer_graphql_query(
         &self,
         labels: &IndexerGraphqlMetricLabels,
@@ -985,6 +1110,34 @@ fn warmup_selector_label_values<'a>(
         &labels.dataset,
         selector_kind,
         outcome,
+    ]
+}
+
+fn query_metadata_outcome_label_values<'a>(
+    labels: &'a MetricsLabels,
+    metadata_kind: &'a str,
+    outcome: &'a str,
+) -> [&'a str; 6] {
+    [
+        labels.application.as_str(),
+        &labels.chain,
+        &labels.chain_kind,
+        &labels.dataset,
+        metadata_kind,
+        outcome,
+    ]
+}
+
+fn query_metadata_duration_label_values<'a>(
+    labels: &'a MetricsLabels,
+    metadata_kind: &'a str,
+) -> [&'a str; 5] {
+    [
+        labels.application.as_str(),
+        &labels.chain,
+        &labels.chain_kind,
+        &labels.dataset,
+        metadata_kind,
     ]
 }
 
