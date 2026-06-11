@@ -790,6 +790,149 @@ fn test_provider_filter_logs_reliability_falls_back_to_transaction_receipts_when
 }
 
 #[test]
+fn test_provider_filter_logs_reliability_block_receipts_malformed_result_errors() {
+    let topic = transfer_topic();
+    let address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let block_hash = block_hash(10);
+    let bloom = EvmLogBloom::from_inputs([
+        EvmLogBloomInput::Address(address),
+        EvmLogBloomInput::Topic(topic),
+    ])
+    .expect("bloom")
+    .as_hex();
+    let (primary_url, primary_requests) = start_rpc_server(vec![
+        logs_response(Vec::new()),
+        json!([block_batch_response_with_bloom(
+            1,
+            10,
+            &block_hash,
+            "0xparent10",
+            10,
+            &bloom
+        )]),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "transactionHash": "0xtx"
+            }
+        }),
+    ]);
+    let client = EvmRpcClient::with_chain(
+        vec![primary_url],
+        ethereum_identity(),
+        EvmFinalityPolicy::Lag {
+            safe_lag_blocks: Some(2),
+            finalized_lag_blocks: Some(4),
+        },
+        10,
+        10,
+        3,
+        10,
+    );
+    let filter = datalens_core::EvmLogFilter::try_from(LogFilter {
+        addresses: vec![address.to_owned()],
+        topics: vec![Some(vec![topic.to_owned()])],
+    })
+    .expect("filter");
+
+    let error = client
+        .fetch(ChainFetchRequest::new(
+            ethereum_identity(),
+            DatasetKey::evm_logs(),
+            LedgerRange::from_block_range(BlockRange::expect_new(10, 10)),
+            DatasetSelector::EvmLogs(filter),
+        ))
+        .expect_err("malformed block receipts should fail");
+
+    assert_eq!(error.kind, DatalensErrorKind::ProviderFailure);
+    assert!(
+        error
+            .message
+            .contains("invalid eth_getBlockReceipts result")
+    );
+    let primary_requests = primary_requests.lock().expect("primary requests");
+    assert_eq!(primary_requests.len(), 3);
+    assert_eq!(primary_requests[2]["method"], "eth_getBlockReceipts");
+}
+
+#[test]
+fn test_provider_filter_logs_reliability_block_receipts_provider_errors_do_not_fallback_to_transaction_receipts()
+ {
+    for (response, expected_kind) in [
+        (
+            provider_error_response(429, "too many requests"),
+            DatalensErrorKind::RateLimited,
+        ),
+        (
+            provider_error_response(-32000, "query returned more than 10000 results"),
+            DatalensErrorKind::ProviderLimit,
+        ),
+        (
+            provider_error_response(-32000, "request timed out"),
+            DatalensErrorKind::ProviderTimeout,
+        ),
+        (
+            provider_error_response(-32000, "upstream failed"),
+            DatalensErrorKind::ProviderFailure,
+        ),
+    ] {
+        let topic = transfer_topic();
+        let address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let block_hash = block_hash(10);
+        let bloom = EvmLogBloom::from_inputs([
+            EvmLogBloomInput::Address(address),
+            EvmLogBloomInput::Topic(topic),
+        ])
+        .expect("bloom")
+        .as_hex();
+        let (primary_url, primary_requests) = start_rpc_server(vec![
+            logs_response(Vec::new()),
+            json!([block_batch_response_with_bloom(
+                1,
+                10,
+                &block_hash,
+                "0xparent10",
+                10,
+                &bloom
+            )]),
+            response,
+        ]);
+        let client = EvmRpcClient::with_chain(
+            vec![primary_url],
+            ethereum_identity(),
+            EvmFinalityPolicy::Lag {
+                safe_lag_blocks: Some(2),
+                finalized_lag_blocks: Some(4),
+            },
+            10,
+            10,
+            3,
+            10,
+        );
+        let filter = datalens_core::EvmLogFilter::try_from(LogFilter {
+            addresses: vec![address.to_owned()],
+            topics: vec![Some(vec![topic.to_owned()])],
+        })
+        .expect("filter");
+
+        let error = client
+            .fetch(ChainFetchRequest::new(
+                ethereum_identity(),
+                DatasetKey::evm_logs(),
+                LedgerRange::from_block_range(BlockRange::expect_new(10, 10)),
+                DatasetSelector::EvmLogs(filter),
+            ))
+            .expect_err("provider failure should not fallback");
+
+        assert_eq!(error.kind, expected_kind);
+        let primary_requests = primary_requests.lock().expect("primary requests");
+        assert_eq!(primary_requests.len(), 3);
+        assert_eq!(primary_requests[2]["method"], "eth_getBlockReceipts");
+    }
+}
+
+#[test]
 fn test_provider_filter_logs_reliability_receipt_fallback_applies_original_filter() {
     let topic = transfer_topic();
     let unrelated = unrelated_topic();
@@ -1950,6 +2093,17 @@ fn unsupported_method_response(message: &str) -> Value {
         "id": 1,
         "error": {
             "code": -32601,
+            "message": message
+        }
+    })
+}
+
+fn provider_error_response(code: i64, message: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "error": {
+            "code": code,
             "message": message
         }
     })

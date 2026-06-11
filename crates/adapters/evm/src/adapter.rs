@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 
 use crate::provider_payload::{
     LagFinalityPolicy, chain_profile, classify_transport_error, evm_log_filter, hex_u64_field,
-    is_finality_tag_unsupported, string_field, zero_lag_error,
+    is_block_receipts_unsupported, is_finality_tag_unsupported, string_field, zero_lag_error,
 };
 pub use crate::provider_payload::{
     classify_provider_error, height_from_latest_lag, parse_log_record, parse_receipt,
@@ -289,6 +289,31 @@ struct LogReliabilityDiagnostics {
 struct ReceiptFallbackFetch {
     logs: Vec<LogRecord>,
     provider_calls: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ReceiptFallbackError {
+    error: DatalensError,
+    provider_calls: usize,
+    unresolved: bool,
+}
+
+impl ReceiptFallbackError {
+    fn fatal(error: DatalensError, provider_calls: usize) -> Self {
+        Self {
+            error,
+            provider_calls,
+            unresolved: false,
+        }
+    }
+
+    fn unresolved(error: DatalensError, provider_calls: usize) -> Self {
+        Self {
+            error,
+            provider_calls,
+            unresolved: true,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -692,13 +717,23 @@ impl EvmRpcClient {
                         merged.append(&mut fallback.logs);
                     }
                 }
-                Err(error) => {
+                Err(error) if error.unresolved => {
+                    diagnostics.receipt_fallback_calls += error.provider_calls;
                     diagnostics.receipt_unresolved_blocks += 1;
                     log::warn!(
                         "EVM log reliability receipt fallback failed block={block_number} kind={:?}: {}",
-                        error.kind,
-                        error.message
+                        error.error.kind,
+                        error.error.message
                     );
+                }
+                Err(error) => {
+                    return Err(DatalensError::new(
+                        error.error.kind,
+                        format!(
+                            "EVM log reliability receipt fallback failed block={block_number} provider_calls={}: {}",
+                            error.provider_calls, error.error.message
+                        ),
+                    ));
                 }
             }
         }
@@ -713,7 +748,7 @@ impl EvmRpcClient {
         &self,
         header: &EvmBlockHeader,
         filter: &EvmLogFilter,
-    ) -> Result<ReceiptFallbackFetch, DatalensError> {
+    ) -> Result<ReceiptFallbackFetch, ReceiptFallbackError> {
         log::warn!(
             "EVM log reliability trying receipt fallback block={}",
             header.block_number
@@ -724,13 +759,17 @@ impl EvmRpcClient {
         ) {
             Ok(Some(value)) => {
                 let receipts = value.as_array().ok_or_else(|| {
-                    DatalensError::new(
-                        DatalensErrorKind::ProviderFailure,
-                        "invalid eth_getBlockReceipts result",
+                    ReceiptFallbackError::fatal(
+                        DatalensError::new(
+                            DatalensErrorKind::ProviderFailure,
+                            "invalid eth_getBlockReceipts result",
+                        ),
+                        1,
                     )
                 })?;
                 Ok(ReceiptFallbackFetch {
-                    logs: receipt_logs_from_receipts(receipts, header, filter)?,
+                    logs: receipt_logs_from_receipts(receipts, header, filter)
+                        .map_err(|error| ReceiptFallbackError::fatal(error, 1))?,
                     provider_calls: 1,
                 })
             }
@@ -741,7 +780,7 @@ impl EvmRpcClient {
                 );
                 self.fetch_logs_from_transaction_receipts(header, filter, 1)
             }
-            Err(error) => {
+            Err(error) if is_block_receipts_unsupported(&error) => {
                 log::warn!(
                     "EVM log reliability eth_getBlockReceipts unavailable block={} kind={:?}: {}; falling back to transaction receipts",
                     header.block_number,
@@ -750,6 +789,7 @@ impl EvmRpcClient {
                 );
                 self.fetch_logs_from_transaction_receipts(header, filter, 1)
             }
+            Err(error) => Err(ReceiptFallbackError::fatal(error, 1)),
         }
     }
 
@@ -758,75 +798,121 @@ impl EvmRpcClient {
         header: &EvmBlockHeader,
         filter: &EvmLogFilter,
         provider_calls: usize,
-    ) -> Result<ReceiptFallbackFetch, DatalensError> {
+    ) -> Result<ReceiptFallbackFetch, ReceiptFallbackError> {
         let mut provider_calls = provider_calls;
-        let result = self.call(
-            "eth_getBlockByNumber",
-            json!([format!("0x{:x}", header.block_number), false]),
-        )?;
         provider_calls += 1;
+        let result = self
+            .call(
+                "eth_getBlockByNumber",
+                json!([format!("0x{:x}", header.block_number), false]),
+            )
+            .map_err(|error| {
+                if is_block_receipts_unsupported(&error) {
+                    ReceiptFallbackError::unresolved(error, provider_calls)
+                } else {
+                    ReceiptFallbackError::fatal(error, provider_calls)
+                }
+            })?;
         let Some(block) = result else {
-            return Err(DatalensError::new(
-                DatalensErrorKind::ProviderFailure,
-                format!("provider returned null block for {}", header.block_number),
+            return Err(ReceiptFallbackError::fatal(
+                DatalensError::new(
+                    DatalensErrorKind::ProviderFailure,
+                    format!("provider returned null block for {}", header.block_number),
+                ),
+                provider_calls,
             ));
         };
-        let block_number = hex_u64_field(&block, "number")?;
+        let block_number = hex_u64_field(&block, "number")
+            .map_err(|error| ReceiptFallbackError::fatal(error, provider_calls))?;
         if block_number != header.block_number {
-            return Err(DatalensError::new(
-                DatalensErrorKind::ProviderFailure,
-                format!(
-                    "receipt fallback block number {} does not match requested block {}",
-                    block_number, header.block_number
+            return Err(ReceiptFallbackError::fatal(
+                DatalensError::new(
+                    DatalensErrorKind::ProviderFailure,
+                    format!(
+                        "receipt fallback block number {} does not match requested block {}",
+                        block_number, header.block_number
+                    ),
                 ),
+                provider_calls,
             ));
         }
-        let block_hash = string_field(&block, "hash")?;
+        let block_hash = string_field(&block, "hash")
+            .map_err(|error| ReceiptFallbackError::fatal(error, provider_calls))?;
         if block_hash != header.block_hash {
-            return Err(DatalensError::new(
-                DatalensErrorKind::ProviderFailure,
-                format!(
-                    "receipt fallback block hash {} does not match header hash {}",
-                    block_hash, header.block_hash
+            return Err(ReceiptFallbackError::fatal(
+                DatalensError::new(
+                    DatalensErrorKind::ProviderFailure,
+                    format!(
+                        "receipt fallback block hash {} does not match header hash {}",
+                        block_hash, header.block_hash
+                    ),
                 ),
+                provider_calls,
             ));
         }
         let transactions = block
             .get("transactions")
             .and_then(Value::as_array)
             .ok_or_else(|| {
-                DatalensError::new(
-                    DatalensErrorKind::ProviderFailure,
-                    "missing block transaction hashes",
+                ReceiptFallbackError::fatal(
+                    DatalensError::new(
+                        DatalensErrorKind::ProviderFailure,
+                        "missing block transaction hashes",
+                    ),
+                    provider_calls,
                 )
             })?;
         let mut logs = Vec::new();
         for transaction in transactions {
             let transaction_hash = match transaction {
                 Value::String(hash) => hash.clone(),
-                Value::Object(_) => string_field(transaction, "hash")?,
+                Value::Object(_) => string_field(transaction, "hash")
+                    .map_err(|error| ReceiptFallbackError::fatal(error, provider_calls))?,
                 _ => {
-                    return Err(DatalensError::new(
-                        DatalensErrorKind::ProviderFailure,
-                        "invalid block transaction hash",
+                    return Err(ReceiptFallbackError::fatal(
+                        DatalensError::new(
+                            DatalensErrorKind::ProviderFailure,
+                            "invalid block transaction hash",
+                        ),
+                        provider_calls,
                     ));
                 }
             };
-            let result = self.call("eth_getTransactionReceipt", json!([transaction_hash]))?;
             provider_calls += 1;
+            let result = self
+                .call("eth_getTransactionReceipt", json!([transaction_hash]))
+                .map_err(|error| {
+                    if is_block_receipts_unsupported(&error) {
+                        ReceiptFallbackError::unresolved(error, provider_calls)
+                    } else {
+                        ReceiptFallbackError::fatal(error, provider_calls)
+                    }
+                })?;
             let Some(receipt) = result else {
-                return Err(DatalensError::new(
-                    DatalensErrorKind::ProviderFailure,
-                    "provider returned null receipt",
+                return Err(ReceiptFallbackError::fatal(
+                    DatalensError::new(
+                        DatalensErrorKind::ProviderFailure,
+                        "provider returned null receipt",
+                    ),
+                    provider_calls,
                 ));
             };
             let receipt_logs = receipt
                 .get("logs")
                 .and_then(Value::as_array)
                 .ok_or_else(|| {
-                    DatalensError::new(DatalensErrorKind::ProviderFailure, "missing receipt logs")
+                    ReceiptFallbackError::fatal(
+                        DatalensError::new(
+                            DatalensErrorKind::ProviderFailure,
+                            "missing receipt logs",
+                        ),
+                        provider_calls,
+                    )
                 })?;
-            logs.append(&mut receipt_logs_from_values(receipt_logs, header, filter)?);
+            logs.append(
+                &mut receipt_logs_from_values(receipt_logs, header, filter)
+                    .map_err(|error| ReceiptFallbackError::fatal(error, provider_calls))?,
+            );
         }
         logs.sort_by_key(|log| (log.block_number, log.transaction_index, log.log_index));
         Ok(ReceiptFallbackFetch {
