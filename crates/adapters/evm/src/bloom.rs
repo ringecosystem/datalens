@@ -156,7 +156,7 @@ fn parse_hex_bytes(
             format!("{field} must be {expected_len} bytes"),
         ));
     }
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         return Err(DatalensError::new(
             DatalensErrorKind::InvalidInput,
             format!("{field} must have an even number of hex digits"),
