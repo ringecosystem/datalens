@@ -141,6 +141,10 @@ fn test_validate_config_rejects_server_index_graphql_surface() {
 fn test_authoritative_server_configs_parse_and_validate() {
     unsafe {
         std::env::set_var("DATALENS_ETHEREUM_RPC_URL", "http://example.invalid");
+        std::env::set_var(
+            "DATALENS_ETHEREUM_SECONDARY_RPC_URL",
+            "http://example.invalid/secondary",
+        );
         std::env::set_var("DATALENS_ARBITRUM_RPC_URL", "http://example.invalid");
         std::env::set_var("DATALENS_BASE_RPC_URL", "http://example.invalid");
         std::env::set_var("DATALENS_DARWINIA_RPC_URL", "http://example.invalid");

@@ -2,6 +2,28 @@ use datalens_edge::config::DatalensConfig;
 use datalens_storage::ParquetCompression;
 
 #[test]
+fn test_config_production_ethereum_rpc_pool_and_log_reliability() {
+    set_production_config_env();
+
+    let config_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../config/datalens.production.toml")
+        .canonicalize()
+        .expect("production config path");
+    let config = DatalensConfig::from_file(&config_path).expect("production config should parse");
+
+    let chain = &config.chains["ethereum"];
+    assert_eq!(
+        chain.primary_rpc_url(),
+        Some("http://primary.example.invalid")
+    );
+    assert_eq!(
+        chain.secondary_rpc_urls(),
+        &["http://secondary.example.invalid".to_owned()]
+    );
+    assert!(chain.datasets.logs.reliability_enabled);
+}
+
+#[test]
 fn test_config_query_native_namespace_controls_native_graphql_settings() {
     let config: DatalensConfig =
         toml::from_str(&config_text("[query.native]")).expect("query native config should parse");
@@ -301,4 +323,23 @@ fn config_text(query_header: &str) -> String {
         max_addresses_per_query = 2
         "#
     )
+}
+
+fn set_production_config_env() {
+    unsafe {
+        std::env::set_var("DATALENS_S3_BUCKET", "datalens");
+        std::env::set_var("DATALENS_S3_PREFIX", "test");
+        std::env::set_var("DATALENS_S3_REGION", "auto");
+        std::env::set_var("DATALENS_S3_ENDPOINT_URL", "http://127.0.0.1:9000");
+        std::env::set_var("DATALENS_METRICS_TOKEN", "replace-with-metrics-token");
+        std::env::set_var("DATALENS_PUBLIC_APP_TOKEN", "replace-with-public-token");
+        std::env::set_var(
+            "DATALENS_ETHEREUM_RPC_URL",
+            "http://primary.example.invalid",
+        );
+        std::env::set_var(
+            "DATALENS_ETHEREUM_SECONDARY_RPC_URL",
+            "http://secondary.example.invalid",
+        );
+    }
 }
