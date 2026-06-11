@@ -2740,8 +2740,8 @@ mod tests {
     #[test]
     fn test_metadata_worker_pool_coalesces_latest_state_when_queue_is_full() {
         let pool = MetadataWorkerPool::new_for_test(1, 0);
-        let watermarks = RecordingQueryWatermarkRepository::default();
-        let activities = RecordingQueryActivityRepository::default();
+        let watermarks = RecordingQueryWatermarkRepository;
+        let activities = RecordingQueryActivityRepository;
 
         assert_eq!(
             pool.enqueue(MetadataJob::NoopForTest),
@@ -2814,7 +2814,7 @@ mod tests {
     #[test]
     fn test_metadata_worker_pool_bounds_distinct_coalesced_keys() {
         let pool = MetadataWorkerPool::new_for_test_with_coalesced_capacity(1, 0, 1);
-        let watermarks = RecordingQueryWatermarkRepository::default();
+        let watermarks = RecordingQueryWatermarkRepository;
 
         assert_eq!(
             pool.enqueue(MetadataJob::NoopForTest),
@@ -2868,8 +2868,8 @@ mod tests {
     #[test]
     fn test_metadata_worker_pool_flushes_coalesced_kinds_fairly() {
         let pool = MetadataWorkerPool::new_for_test_with_coalesced_capacity(4, 0, 4);
-        let watermarks = RecordingQueryWatermarkRepository::default();
-        let activities = RecordingQueryActivityRepository::default();
+        let watermarks = RecordingQueryWatermarkRepository;
+        let activities = RecordingQueryActivityRepository;
 
         for _ in 0..4 {
             assert_eq!(
