@@ -241,6 +241,8 @@ impl StorageReadPlan {
     fn from_candidates(
         candidates: Vec<crate::selector_coverage::SelectorCoverageCandidate<'_>>,
     ) -> Result<Self, DatalensError> {
+        let mut candidates = candidates;
+        candidates.sort_by_key(|candidate| candidate.entry.object_key.is_none());
         let coverage_entries_count = candidates.len();
         let mut data_object_count = 0usize;
         let mut empty_coverage_count = 0usize;
@@ -1257,7 +1259,11 @@ pub trait StorageRepository: Send + Sync {
         &self,
         request: StorageWriteRequest<'_>,
     ) -> Result<StorageWriteOutcome, DatalensError> {
-        self.write_rows(request)
+        let _ = request;
+        Err(DatalensError::new(
+            DatalensErrorKind::UnsupportedDataset,
+            "replacement write is not supported by this storage repository",
+        ))
     }
 }
 

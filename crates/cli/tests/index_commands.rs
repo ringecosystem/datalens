@@ -1449,6 +1449,7 @@ fn test_cache_repair_force_refresh_recovers_vote_cast_log_from_local_rpc_receipt
         "index-repair-force-refresh-local-rpc-vote",
         ADDRESS_A,
         VOTE_CAST_TOPIC,
+        "",
     );
 }
 
@@ -1458,6 +1459,27 @@ fn test_cache_repair_force_refresh_recovers_transfer_log_from_local_rpc_receipts
         "index-repair-force-refresh-local-rpc-transfer",
         ADDRESS_B,
         TRANSFER_TOPIC,
+        "",
+    );
+}
+
+#[test]
+fn test_cache_repair_force_refresh_recovers_log_when_reliability_disabled_in_config() {
+    assert_force_refresh_recovers_log_from_local_rpc_receipts(
+        "index-repair-force-refresh-local-rpc-reliability-disabled",
+        ADDRESS_A,
+        VOTE_CAST_TOPIC,
+        "reliability_enabled = false",
+    );
+}
+
+#[test]
+fn test_cache_repair_force_refresh_recovers_log_when_block_range_configured() {
+    assert_force_refresh_recovers_log_from_local_rpc_receipts(
+        "index-repair-force-refresh-local-rpc-block-range",
+        ADDRESS_A,
+        VOTE_CAST_TOPIC,
+        r#"query_strategy = "block_range""#,
     );
 }
 
@@ -1465,6 +1487,7 @@ fn assert_force_refresh_recovers_log_from_local_rpc_receipts(
     name: &str,
     address: &str,
     topic: &str,
+    log_config_override: &str,
 ) {
     let root = temp_storage_root("index-repair-force-refresh-local-rpc");
     let selector = evm_log_selector(address, topic);
@@ -1504,7 +1527,7 @@ fn assert_force_refresh_recovers_log_from_local_rpc_receipts(
             vec![receipt_log],
         )]),
     ]);
-    let config = write_config_with_rpc(name, &root, &rpc_url);
+    let config = write_config_with_rpc_and_logs_extra(name, &root, &rpc_url, log_config_override);
     let mut common = cache_common(config, 50, 50);
     common.datasets = vec!["logs".to_owned()];
     common.addresses = vec![address.to_owned()];
@@ -1739,7 +1762,12 @@ fn write_config(name: &str, storage_root: &std::path::Path) -> String {
     config_path.to_string_lossy().into_owned()
 }
 
-fn write_config_with_rpc(name: &str, storage_root: &std::path::Path, rpc_url: &str) -> String {
+fn write_config_with_rpc_and_logs_extra(
+    name: &str,
+    storage_root: &std::path::Path,
+    rpc_url: &str,
+    logs_extra: &str,
+) -> String {
     let config_path = storage_root.with_file_name(format!("{name}.toml"));
     std::fs::write(
         &config_path,
@@ -1785,7 +1813,7 @@ fn write_config_with_rpc(name: &str, storage_root: &std::path::Path, rpc_url: &s
 
             [chains.ethereum.datasets.logs]
             enabled = true
-            reliability_enabled = true
+            {logs_extra}
             max_get_logs_range_blocks = 10
             max_addresses_per_query = 2
             "#,

@@ -7,10 +7,10 @@ use datalens_chain::{
 };
 use datalens_core::{
     ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey, LedgerRange, LedgerRangeKind,
-    LogFilter,
+    LogFilter, QueryStrategy,
 };
 use datalens_edge::auth::normalize_application_id;
-use datalens_evm::EvmRpcClient;
+use datalens_evm::{EvmLogReliabilityConfig, EvmRpcClient};
 use datalens_metrics::ApplicationIdentity;
 use datalens_runtime_indexer::{
     FileIndexCursorStore, IndexDatasetProviderLimit, IndexDatasetRequest, IndexDatasetSelection,
@@ -180,18 +180,28 @@ pub fn cache_summary(command: CacheWorkflowCommand) -> Result<serde_json::Value,
     let chain = chain.clone();
     match chain.kind.as_str() {
         "evm" => {
-            let adapter = EvmRpcClient::with_chain(
-                chain.rpc_provider_urls(),
-                chain_identity(&chain_name, &chain)?,
-                evm_finality_policy(&chain.finality),
-                chain.datasets.blocks.max_batch_blocks,
-                chain.datasets.logs.max_get_logs_range_blocks,
-                chain.datasets.logs.max_block_scan_range_blocks,
-                chain.datasets.logs.max_addresses_per_query,
-            )
-            .with_logs_query_strategy(chain.datasets.logs.query_strategy)
-            .with_log_reliability_config(evm_log_reliability_config(&chain))
-            .with_block_header_metadata_config(evm_block_header_metadata_config(&chain)?);
+            let adapter = if matches!(
+                command,
+                CacheWorkflowCommand::Repair(CacheRepairCommand {
+                    force_refresh: true,
+                    ..
+                })
+            ) {
+                force_refresh_evm_adapter(&chain_name, &chain)?
+            } else {
+                EvmRpcClient::with_chain(
+                    chain.rpc_provider_urls(),
+                    chain_identity(&chain_name, &chain)?,
+                    evm_finality_policy(&chain.finality),
+                    chain.datasets.blocks.max_batch_blocks,
+                    chain.datasets.logs.max_get_logs_range_blocks,
+                    chain.datasets.logs.max_block_scan_range_blocks,
+                    chain.datasets.logs.max_addresses_per_query,
+                )
+                .with_logs_query_strategy(chain.datasets.logs.query_strategy)
+                .with_log_reliability_config(evm_log_reliability_config(&chain))
+                .with_block_header_metadata_config(evm_block_header_metadata_config(&chain)?)
+            };
             cache_summary_with_context(command, config, &chain_name, &chain, adapter)
         }
         "solana" => {
@@ -230,6 +240,25 @@ pub fn cache_summary(command: CacheWorkflowCommand) -> Result<serde_json::Value,
         )),
     }
 }
+
+fn force_refresh_evm_adapter(
+    chain_name: &str,
+    chain: &ChainConfig,
+) -> Result<EvmRpcClient, DatalensError> {
+    Ok(EvmRpcClient::with_chain(
+        chain.rpc_provider_urls(),
+        chain_identity(chain_name, chain)?,
+        evm_finality_policy(&chain.finality),
+        chain.datasets.blocks.max_batch_blocks,
+        chain.datasets.logs.max_get_logs_range_blocks,
+        chain.datasets.logs.max_block_scan_range_blocks,
+        chain.datasets.logs.max_addresses_per_query,
+    )
+    .with_logs_query_strategy(QueryStrategy::ProviderFilter)
+    .with_log_reliability_config(EvmLogReliabilityConfig::default().with_enabled(true))
+    .with_block_header_metadata_config(evm_block_header_metadata_config(chain)?))
+}
+
 pub fn cache_summary_with_adapter<A>(
     command: CacheWorkflowCommand,
     adapter: A,

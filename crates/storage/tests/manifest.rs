@@ -3455,6 +3455,124 @@ fn test_replacement_write_overwrites_same_logical_data_object() {
 }
 
 #[test]
+fn test_replacement_write_wins_over_wider_empty_coverage() {
+    let storage = LocalStorage::new(temp_storage_root("replacement-write-over-empty-coverage"));
+    let chain = test_chain();
+    let selector = evm_log_selector(vec![ADDRESS_A], vec![Some(vec![TOPIC_1])]);
+    let empty_range = LedgerRange::blocks(49, 51).expect("valid range");
+    let replacement_range = LedgerRange::blocks(50, 50).expect("valid range");
+    let empty_rows = DatasetRows::new(DatasetKey::evm_logs(), QueryRows::EvmLogs(Vec::new()))
+        .expect("empty rows");
+    let replacement_rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![log_record(50, 7, ADDRESS_A, vec![TOPIC_1])]),
+    )
+    .expect("replacement rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &selector,
+            range: empty_range,
+            rows: &empty_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write empty coverage");
+    storage
+        .write_rows_replacing_existing(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &selector,
+            range: replacement_range.clone(),
+            rows: &replacement_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write replacement rows");
+
+    let rows = storage
+        .read_rows(
+            &chain,
+            &DatasetKey::evm_logs(),
+            &selector,
+            replacement_range,
+        )
+        .expect("read replacement rows");
+    match rows.into_rows() {
+        QueryRows::EvmLogs(logs) => {
+            assert_eq!(logs.len(), 1);
+            assert_eq!(logs[0].log_index, 7);
+        }
+        rows => panic!("expected log rows, got {rows:?}"),
+    }
+}
+
+#[test]
+fn test_storage_repository_default_rejects_replacement_write() {
+    struct NonReplacingStorage;
+
+    impl StorageRepository for NonReplacingStorage {
+        fn manifest(&self) -> Result<Manifest, DatalensError> {
+            Ok(Manifest::default())
+        }
+
+        fn covered_ranges(
+            &self,
+            _chain: &ChainIdentity,
+            _dataset_key: &DatasetKey,
+            _selector: &DatasetSelector,
+            _range: LedgerRange,
+        ) -> Result<Vec<LedgerRange>, DatalensError> {
+            Ok(Vec::new())
+        }
+
+        fn read_rows(
+            &self,
+            _chain: &ChainIdentity,
+            dataset_key: &DatasetKey,
+            _selector: &DatasetSelector,
+            _range: LedgerRange,
+        ) -> Result<DatasetRows, DatalensError> {
+            DatasetRows::new(dataset_key.clone(), QueryRows::EvmBlocks(Vec::new()))
+        }
+
+        fn write_rows(
+            &self,
+            request: StorageWriteRequest<'_>,
+        ) -> Result<StorageWriteOutcome, DatalensError> {
+            Ok(StorageWriteOutcome {
+                range: request.range,
+                row_count: request.rows.row_count(),
+                data_object: None,
+                recorded_empty_coverage: false,
+            })
+        }
+    }
+
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let range = LedgerRange::blocks(1, 1).expect("valid range");
+    let rows = single_block_rows(1);
+
+    let error = NonReplacingStorage
+        .write_rows_replacing_existing(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &selector,
+            range,
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect_err("default replacement write should be unsupported");
+
+    assert_eq!(error.kind, DatalensErrorKind::UnsupportedDataset);
+    assert!(error.message.contains("replacement write"));
+}
+
+#[test]
 fn test_full_manifest_shadows_stale_compacted_segments() {
     let root = temp_storage_root("full-manifest-shadows-stale-segments");
     let storage = LocalStorage::new(&root);
