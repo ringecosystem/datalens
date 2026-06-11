@@ -187,7 +187,9 @@ pub(crate) fn service_named_with_datasets(
         ChainConfig {
             kind: "evm".to_owned(),
             chain_id,
+            rpc_url: None,
             rpc_urls: vec!["http://example.invalid".to_owned()],
+            rpc: None,
             warmup: Default::default(),
             trongrid: Default::default(),
             finality: datalens_edge::config::FinalityConfig::Auto,
@@ -231,7 +233,9 @@ pub(crate) fn chain_config(chain_id: u64) -> ChainConfig {
     ChainConfig {
         kind: "evm".to_owned(),
         chain_id,
+        rpc_url: None,
         rpc_urls: vec!["http://example.invalid".to_owned()],
+        rpc: None,
         warmup: Default::default(),
         trongrid: Default::default(),
         finality: datalens_edge::config::FinalityConfig::Auto,
@@ -289,7 +293,9 @@ pub(crate) fn solana_chain_config() -> ChainConfig {
     ChainConfig {
         kind: "solana".to_owned(),
         chain_id: 0,
+        rpc_url: None,
         rpc_urls: vec!["http://example.invalid".to_owned()],
+        rpc: None,
         warmup: Default::default(),
         trongrid: Default::default(),
         finality: datalens_edge::config::FinalityConfig::Auto,

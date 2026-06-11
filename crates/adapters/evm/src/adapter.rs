@@ -305,6 +305,18 @@ impl EvmRpcClient {
         &self.block_header_metadata
     }
 
+    pub fn primary_provider_url(&self) -> Option<&str> {
+        self.rpc_urls.first().map(String::as_str)
+    }
+
+    pub fn secondary_provider_urls(&self) -> &[String] {
+        if self.rpc_urls.len() > 1 {
+            &self.rpc_urls[1..]
+        } else {
+            &[]
+        }
+    }
+
     pub fn fetch_blocks(&self, range: BlockRange) -> Result<Vec<BlockHeader>, DatalensError> {
         log::info!(
             "fetching EVM blocks range={}-{}",

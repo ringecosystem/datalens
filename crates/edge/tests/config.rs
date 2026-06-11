@@ -120,6 +120,71 @@ fn test_config_evm_log_header_fetch_mode_defaults_to_batch() {
 }
 
 #[test]
+fn test_config_legacy_rpc_urls_provides_primary_rpc() {
+    let config: DatalensConfig =
+        toml::from_str(&config_text("[query.native]")).expect("config should parse");
+
+    let chain = &config.chains["ethereum"];
+    assert_eq!(chain.primary_rpc_url(), Some("http://example.invalid"));
+    assert!(chain.secondary_rpc_urls().is_empty());
+    assert_eq!(
+        chain.rpc_provider_urls(),
+        vec!["http://example.invalid".to_owned()]
+    );
+}
+
+#[test]
+fn test_config_legacy_rpc_url_provides_primary_rpc() {
+    let input = config_text("[query.native]").replace(
+        r#"rpc_urls = ["http://example.invalid"]"#,
+        r#"rpc_url = "http://legacy.example.invalid""#,
+    );
+    let config: DatalensConfig = toml::from_str(&input).expect("config should parse");
+
+    let chain = &config.chains["ethereum"];
+    assert_eq!(
+        chain.primary_rpc_url(),
+        Some("http://legacy.example.invalid")
+    );
+    assert!(chain.secondary_rpc_urls().is_empty());
+}
+
+#[test]
+fn test_config_rpc_pool_parses_primary_and_secondary_urls() {
+    let input = config_text("[query.native]").replace(
+        r#"rpc_urls = ["http://example.invalid"]"#,
+        r#"[chains.ethereum.rpc]
+        primary_url = "http://primary.example.invalid"
+        secondary_urls = [
+            "http://secondary-a.example.invalid",
+            "http://secondary-b.example.invalid",
+        ]"#,
+    );
+    let config: DatalensConfig = toml::from_str(&input).expect("config should parse");
+
+    let chain = &config.chains["ethereum"];
+    assert_eq!(
+        chain.primary_rpc_url(),
+        Some("http://primary.example.invalid")
+    );
+    assert_eq!(
+        chain.secondary_rpc_urls(),
+        &[
+            "http://secondary-a.example.invalid".to_owned(),
+            "http://secondary-b.example.invalid".to_owned()
+        ]
+    );
+    assert_eq!(
+        chain.rpc_provider_urls(),
+        vec![
+            "http://primary.example.invalid".to_owned(),
+            "http://secondary-a.example.invalid".to_owned(),
+            "http://secondary-b.example.invalid".to_owned()
+        ]
+    );
+}
+
+#[test]
 fn test_config_storage_parquet_compression_accepts_zstd_and_snappy() {
     for codec in ["zstd", "snappy"] {
         let input = config_text("[query.native]").replace(

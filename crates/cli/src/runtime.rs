@@ -305,7 +305,7 @@ fn build_evm_service_with_storage(
         chain.chain_id
     );
     let source = EvmRpcClient::with_chain(
-        chain.rpc_urls.clone(),
+        chain.rpc_provider_urls(),
         chain_identity(chain_name, chain).expect("validated chain identity"),
         evm_finality_policy(&chain.finality),
         chain.datasets.blocks.max_batch_blocks,
@@ -404,7 +404,7 @@ fn build_solana_service_with_storage(
         chain.kind,
         chain.chain_id
     );
-    let url = chain.rpc_urls.first().ok_or_else(|| {
+    let url = chain.primary_rpc_url().ok_or_else(|| {
         DatalensError::new(
             DatalensErrorKind::InvalidInput,
             format!("chain {chain_name} must define at least one rpc URL"),
@@ -412,7 +412,7 @@ fn build_solana_service_with_storage(
     })?;
     let source = SolanaAdapter::with_provider(
         chain_identity(chain_name, chain).expect("validated chain identity"),
-        SolanaHttpRpc::new(url.clone()),
+        SolanaHttpRpc::new(url.to_owned()),
     )
     .with_max_slot_range_len(chain.datasets.blocks.max_batch_blocks.max(1))
     .with_query_strategy(chain.datasets.logs.query_strategy);
@@ -454,7 +454,7 @@ fn build_tron_service_with_storage(
         chain.kind,
         chain.chain_id
     );
-    let url = chain.rpc_urls.first().ok_or_else(|| {
+    let url = chain.primary_rpc_url().ok_or_else(|| {
         DatalensError::new(
             DatalensErrorKind::InvalidInput,
             format!("chain {chain_name} must define at least one rpc URL"),
@@ -462,7 +462,7 @@ fn build_tron_service_with_storage(
     })?;
     let source = TronAdapter::with_provider(
         chain_identity(chain_name, chain).expect("validated chain identity"),
-        tron_provider(url.clone(), chain),
+        tron_provider(url.to_owned(), chain),
     )
     .with_max_block_range_len(chain.datasets.blocks.max_batch_blocks.max(1))
     .with_events_query_strategy(chain.datasets.logs.query_strategy);

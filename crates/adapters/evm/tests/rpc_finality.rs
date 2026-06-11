@@ -260,6 +260,67 @@ fn test_provider_filter_logs_use_eth_get_logs() {
 }
 
 #[test]
+fn test_provider_filter_logs_do_not_use_secondary_rpc_provider() {
+    let topic = transfer_topic();
+    let address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let (primary_url, primary_requests) = start_rpc_server(vec![
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": [provider_log(10, "0xaaa", topic)]
+        }),
+        block_response(10, "0xaaa", "0xparent", 1),
+    ]);
+    let (secondary_url, secondary_requests) = start_rpc_server(Vec::new());
+    let expected_primary_url = primary_url.clone();
+    let client = EvmRpcClient::with_chain(
+        vec![primary_url, secondary_url],
+        ethereum_identity(),
+        EvmFinalityPolicy::Auto,
+        10,
+        10,
+        3,
+        10,
+    )
+    .with_logs_query_strategy(QueryStrategy::ProviderFilter)
+    .with_block_header_metadata_config(
+        EvmBlockHeaderMetadataConfig::default()
+            .with_fetch_mode(EvmBlockHeaderFetchMode::Concurrent),
+    );
+    let filter = datalens_core::EvmLogFilter::try_from(LogFilter {
+        addresses: vec![address.to_owned()],
+        topics: vec![Some(vec![topic.to_owned()])],
+    })
+    .expect("filter");
+
+    let response = client
+        .fetch(ChainFetchRequest::new(
+            ethereum_identity(),
+            DatasetKey::evm_logs(),
+            LedgerRange::from_block_range(BlockRange::expect_new(10, 10)),
+            DatasetSelector::EvmLogs(filter),
+        ))
+        .expect("logs");
+
+    assert_eq!(
+        client.primary_provider_url(),
+        Some(expected_primary_url.as_str())
+    );
+    assert_eq!(client.secondary_provider_urls().len(), 1);
+    let QueryRows::EvmLogs(rows) = response.rows.rows() else {
+        panic!("expected EVM logs");
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(primary_requests.lock().expect("primary requests").len(), 2);
+    assert!(
+        secondary_requests
+            .lock()
+            .expect("secondary requests")
+            .is_empty()
+    );
+}
+
+#[test]
 fn test_provider_filter_logs_support_degov_style_address_and_topic0_unions() {
     let governor = "0x1111111111111111111111111111111111111111";
     let token = "0x2222222222222222222222222222222222222222";

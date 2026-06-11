@@ -537,7 +537,12 @@ fn default_application_enabled() -> bool {
 pub struct ChainConfig {
     pub kind: String,
     pub chain_id: u64,
+    #[serde(default)]
+    pub rpc_url: Option<String>,
+    #[serde(default)]
     pub rpc_urls: Vec<String>,
+    #[serde(default)]
+    pub rpc: Option<ChainRpcConfig>,
     #[serde(default)]
     pub warmup: ChainWarmupConfig,
     #[serde(default)]
@@ -545,6 +550,44 @@ pub struct ChainConfig {
     #[serde(default)]
     pub finality: FinalityConfig,
     pub datasets: DatasetsConfig,
+}
+
+impl ChainConfig {
+    pub fn primary_rpc_url(&self) -> Option<&str> {
+        if let Some(rpc) = &self.rpc {
+            return Some(rpc.primary_url.as_str());
+        }
+        self.rpc_url
+            .as_deref()
+            .or_else(|| self.rpc_urls.first().map(String::as_str))
+    }
+
+    pub fn secondary_rpc_urls(&self) -> &[String] {
+        if let Some(rpc) = &self.rpc {
+            return &rpc.secondary_urls;
+        }
+        if self.rpc_urls.len() > 1 {
+            return &self.rpc_urls[1..];
+        }
+        &[]
+    }
+
+    pub fn rpc_provider_urls(&self) -> Vec<String> {
+        let Some(primary_url) = self.primary_rpc_url() else {
+            return Vec::new();
+        };
+        let mut urls = vec![primary_url.to_owned()];
+        urls.extend(self.secondary_rpc_urls().iter().cloned());
+        urls
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChainRpcConfig {
+    pub primary_url: String,
+    #[serde(default)]
+    pub secondary_urls: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

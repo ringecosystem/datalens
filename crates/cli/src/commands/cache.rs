@@ -175,7 +175,7 @@ pub fn cache_summary(command: CacheWorkflowCommand) -> Result<serde_json::Value,
     match chain.kind.as_str() {
         "evm" => {
             let adapter = EvmRpcClient::with_chain(
-                chain.rpc_urls.clone(),
+                chain.rpc_provider_urls(),
                 chain_identity(&chain_name, &chain)?,
                 evm_finality_policy(&chain.finality),
                 chain.datasets.blocks.max_batch_blocks,
@@ -188,7 +188,7 @@ pub fn cache_summary(command: CacheWorkflowCommand) -> Result<serde_json::Value,
             cache_summary_with_context(command, config, &chain_name, &chain, adapter)
         }
         "solana" => {
-            let url = chain.rpc_urls.first().ok_or_else(|| {
+            let url = chain.primary_rpc_url().ok_or_else(|| {
                 DatalensError::new(
                     DatalensErrorKind::InvalidInput,
                     format!("chain {chain_name} must define at least one rpc URL"),
@@ -196,14 +196,14 @@ pub fn cache_summary(command: CacheWorkflowCommand) -> Result<serde_json::Value,
             })?;
             let adapter = SolanaAdapter::with_provider(
                 chain_identity(&chain_name, &chain)?,
-                SolanaHttpRpc::new(url.clone()),
+                SolanaHttpRpc::new(url.to_owned()),
             )
             .with_max_slot_range_len(chain.datasets.blocks.max_batch_blocks.max(1))
             .with_query_strategy(chain.datasets.logs.query_strategy);
             cache_summary_with_context(command, config, &chain_name, &chain, adapter)
         }
         "tron" => {
-            let url = chain.rpc_urls.first().ok_or_else(|| {
+            let url = chain.primary_rpc_url().ok_or_else(|| {
                 DatalensError::new(
                     DatalensErrorKind::InvalidInput,
                     format!("chain {chain_name} must define at least one rpc URL"),
@@ -211,7 +211,7 @@ pub fn cache_summary(command: CacheWorkflowCommand) -> Result<serde_json::Value,
             })?;
             let adapter = TronAdapter::with_provider(
                 chain_identity(&chain_name, &chain)?,
-                tron_provider(url.clone(), &chain),
+                tron_provider(url.to_owned(), &chain),
             )
             .with_max_block_range_len(chain.datasets.blocks.max_batch_blocks.max(1))
             .with_events_query_strategy(chain.datasets.logs.query_strategy);
