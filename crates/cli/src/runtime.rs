@@ -11,7 +11,8 @@ use datalens_core::{ChainIdentity, DatalensError, DatalensErrorKind};
 use datalens_edge::config::{ChainConfig, DatalensConfig, FinalityConfig};
 use datalens_edge::{QueryService, QueryServiceRegistry};
 use datalens_evm::{
-    EvmBlockHeaderFetchMode, EvmBlockHeaderMetadataConfig, EvmFinalityPolicy, EvmRpcClient,
+    EvmBlockHeaderFetchMode, EvmBlockHeaderMetadataConfig, EvmFinalityPolicy,
+    EvmLogReliabilityConfig, EvmRpcClient,
 };
 use datalens_metrics::ApplicationIdentity;
 use datalens_solana::{SolanaAdapter, SolanaHttpRpc};
@@ -314,6 +315,7 @@ fn build_evm_service_with_storage(
         chain.datasets.logs.max_addresses_per_query,
     )
     .with_logs_query_strategy(chain.datasets.logs.query_strategy)
+    .with_log_reliability_config(evm_log_reliability_config(chain))
     .with_block_header_metadata_config(evm_block_header_metadata_config(chain)?);
     let mut service = datalens_edge::QueryService::new_with_metrics_config(
         stores.storage.clone(),
@@ -854,6 +856,10 @@ pub(crate) fn evm_block_header_metadata_config(
         .with_fetch_concurrency(chain.datasets.logs.header_fetch_concurrency)
         .with_fetch_mode(fetch_mode)
         .with_batch_size(chain.datasets.logs.header_fetch_batch_size))
+}
+
+pub(crate) fn evm_log_reliability_config(chain: &ChainConfig) -> EvmLogReliabilityConfig {
+    EvmLogReliabilityConfig::default().with_enabled(chain.datasets.logs.reliability_enabled)
 }
 
 pub(crate) fn finality_summary(chain: &ChainConfig) -> serde_json::Value {

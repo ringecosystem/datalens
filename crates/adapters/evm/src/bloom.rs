@@ -52,6 +52,10 @@ impl EvmLogBloom {
         value
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.bytes.iter().all(|byte| *byte == 0)
+    }
+
     pub fn may_contain_address(&self, address: &str) -> Result<bool, DatalensError> {
         self.may_contain_bytes(&parse_hex_bytes("address", address, 20)?)
     }

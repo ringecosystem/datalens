@@ -200,6 +200,7 @@ pub(crate) fn service_named_with_datasets(
                 },
                 logs: LogsDatasetConfig {
                     enabled: logs_enabled,
+                    reliability_enabled: true,
                     query_strategy: Default::default(),
                     max_get_logs_range_blocks: 2,
                     max_block_scan_range_blocks: 2,
@@ -246,6 +247,7 @@ pub(crate) fn chain_config(chain_id: u64) -> ChainConfig {
             },
             logs: LogsDatasetConfig {
                 enabled: true,
+                reliability_enabled: true,
                 query_strategy: Default::default(),
                 max_get_logs_range_blocks: 2,
                 max_block_scan_range_blocks: 2,
@@ -306,6 +308,7 @@ pub(crate) fn solana_chain_config() -> ChainConfig {
             },
             logs: LogsDatasetConfig {
                 enabled: false,
+                reliability_enabled: true,
                 query_strategy: Default::default(),
                 max_get_logs_range_blocks: 2,
                 max_block_scan_range_blocks: 2,

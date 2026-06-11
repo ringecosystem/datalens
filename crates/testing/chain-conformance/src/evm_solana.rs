@@ -650,7 +650,8 @@ fn evm_block(number: u64) -> Value {
         "number": format!("0x{number:x}"),
         "hash": block_hash(number),
         "parentHash": if number == 0 { block_hash(0) } else { block_hash(number - 1) },
-        "timestamp": format!("0x{:x}", 1_700_000_000 + number)
+        "timestamp": format!("0x{:x}", 1_700_000_000 + number),
+        "logsBloom": format!("0x{}", "0".repeat(512))
     })
 }
 

@@ -8,7 +8,7 @@ use std::{
 use datalens_chain::{
     AdapterCapabilities, CanonicalBlock, CanonicalBlockRequest, ChainAdapter, ChainFetchRequest,
     ChainFetchResponse, ChainHeight, DatasetCapability, DatasetSelector, FinalityKind,
-    HeightRangeKind, ReorgSignal, SelectorKind,
+    FinalityLevel, HeightRangeKind, ReorgSignal, SelectorKind,
 };
 use datalens_core::{
     BlockHeader, BlockRange, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, Dataset,
@@ -27,6 +27,7 @@ pub use crate::provider_payload::{
     parse_transaction,
 };
 use crate::{EvmBlockHeaderFetch, EvmBlockHeaderFetcher};
+use crate::{EvmBlockHeaderResolveRequest, EvmBlockHeaderResolver, EvmLogBloom};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EvmAdapterMetadata {
@@ -106,6 +107,24 @@ pub enum EvmFinalityPolicy {
 const DEFAULT_BLOCK_HEADER_CACHE_MAX_ENTRIES: usize = 50_000;
 const DEFAULT_BLOCK_HEADER_FETCH_CONCURRENCY: usize = 8;
 const DEFAULT_BLOCK_HEADER_BATCH_SIZE: usize = 20;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvmLogReliabilityConfig {
+    pub enabled: bool,
+}
+
+impl Default for EvmLogReliabilityConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+impl EvmLogReliabilityConfig {
+    pub fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum EvmBlockHeaderFetchMode {
@@ -188,6 +207,9 @@ struct LogBlockHeaderDiagnostics {
     fallback_reason: Option<String>,
     fetch_concurrency: usize,
     batch_size: usize,
+    reliability_checked: bool,
+    reliability_suspicious_blocks: usize,
+    reliability_secondary_calls: usize,
 }
 
 impl LogBlockHeaderDiagnostics {
@@ -207,6 +229,12 @@ impl LogBlockHeaderDiagnostics {
         }
         if let Some(fallback_reason) = &self.fallback_reason {
             warning.push_str(&format!(" header_fallback_reason={fallback_reason}"));
+        }
+        if self.reliability_checked {
+            warning.push_str(&format!(
+                " reliability_suspicious_blocks={} reliability_secondary_calls={}",
+                self.reliability_suspicious_blocks, self.reliability_secondary_calls
+            ));
         }
         warning
     }
@@ -232,6 +260,13 @@ struct LogBlockHeaderFetch {
     fallback_reason: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct LogReliabilityDiagnostics {
+    header_provider_calls: usize,
+    suspicious_blocks: usize,
+    secondary_provider_calls: usize,
+}
+
 #[derive(Clone)]
 pub struct EvmRpcClient {
     rpc_urls: Vec<String>,
@@ -244,6 +279,7 @@ pub struct EvmRpcClient {
     max_addresses_per_query: usize,
     logs_query_strategy: QueryStrategy,
     block_header_metadata: EvmBlockHeaderMetadataConfig,
+    log_reliability: EvmLogReliabilityConfig,
     block_header_cache: Arc<Mutex<BlockHeaderCache>>,
 }
 
@@ -260,6 +296,7 @@ impl EvmRpcClient {
             max_addresses_per_query: usize::MAX,
             logs_query_strategy: QueryStrategy::ProviderFilter,
             block_header_metadata: EvmBlockHeaderMetadataConfig::default(),
+            log_reliability: EvmLogReliabilityConfig::default(),
             block_header_cache: Arc::new(Mutex::new(BlockHeaderCache::default())),
         }
     }
@@ -284,6 +321,7 @@ impl EvmRpcClient {
             max_addresses_per_query,
             logs_query_strategy: QueryStrategy::ProviderFilter,
             block_header_metadata: EvmBlockHeaderMetadataConfig::default(),
+            log_reliability: EvmLogReliabilityConfig::default(),
             block_header_cache: Arc::new(Mutex::new(BlockHeaderCache::default())),
         }
     }
@@ -291,6 +329,15 @@ impl EvmRpcClient {
     pub fn with_logs_query_strategy(mut self, query_strategy: QueryStrategy) -> Self {
         self.logs_query_strategy = query_strategy;
         self
+    }
+
+    pub fn with_log_reliability_config(mut self, config: EvmLogReliabilityConfig) -> Self {
+        self.log_reliability = config;
+        self
+    }
+
+    pub fn log_reliability_config(&self) -> &EvmLogReliabilityConfig {
+        &self.log_reliability
     }
 
     pub fn with_block_header_metadata_config(
@@ -446,7 +493,37 @@ impl EvmRpcClient {
                 filter.topics().len()
             ),
         }
-        let result = self.call("eth_getLogs", json!([evm_log_filter(range, filter)]))?;
+        let logs = self.fetch_primary_logs(range, filter)?;
+        let (logs, reliability_diagnostics) =
+            self.verify_and_merge_logs_with_secondary(range, filter, logs)?;
+        let (mut logs, mut diagnostics) = self.enrich_logs_with_block_metadata(logs)?;
+        if let Some(reliability_diagnostics) = reliability_diagnostics {
+            diagnostics.provider_calls += reliability_diagnostics.header_provider_calls;
+            diagnostics.reliability_checked = true;
+            diagnostics.reliability_suspicious_blocks = reliability_diagnostics.suspicious_blocks;
+            diagnostics.reliability_secondary_calls =
+                reliability_diagnostics.secondary_provider_calls;
+        }
+        log::info!("{}", diagnostics.warning());
+        logs.sort_by_key(|log| (log.block_number, log.transaction_index, log.log_index));
+        Ok((logs, diagnostics))
+    }
+
+    fn fetch_primary_logs(
+        &self,
+        range: BlockRange,
+        filter: &EvmLogFilter,
+    ) -> Result<Vec<LogRecord>, DatalensError> {
+        self.fetch_logs_from_url(self.primary_rpc_url_result()?, range, filter)
+    }
+
+    fn fetch_logs_from_url(
+        &self,
+        url: &str,
+        range: BlockRange,
+        filter: &EvmLogFilter,
+    ) -> Result<Vec<LogRecord>, DatalensError> {
+        let result = self.call_url(url, "eth_getLogs", json!([evm_log_filter(range, filter)]))?;
         let logs = result
             .and_then(|value| value.as_array().cloned())
             .ok_or_else(|| {
@@ -457,14 +534,110 @@ impl EvmRpcClient {
                 )
             })?;
 
-        let logs = logs
-            .into_iter()
+        logs.into_iter()
             .map(|log| parse_log_record(&log))
-            .collect::<Result<Vec<_>, _>>()?;
-        let (mut logs, diagnostics) = self.enrich_logs_with_block_metadata(logs)?;
-        log::info!("{}", diagnostics.warning());
-        logs.sort_by_key(|log| (log.block_number, log.transaction_index, log.log_index));
-        Ok((logs, diagnostics))
+            .collect::<Result<Vec<_>, _>>()
+    }
+
+    fn verify_and_merge_logs_with_secondary(
+        &self,
+        range: BlockRange,
+        filter: &EvmLogFilter,
+        primary_logs: Vec<LogRecord>,
+    ) -> Result<(Vec<LogRecord>, Option<LogReliabilityDiagnostics>), DatalensError> {
+        if !self.log_reliability.enabled {
+            return Ok((primary_logs, None));
+        }
+
+        let resolver = EvmBlockHeaderResolver::without_store(self.clone());
+        let headers = resolver.resolve(EvmBlockHeaderResolveRequest {
+            chain: self.chain.clone(),
+            range,
+            finality_level: FinalityLevel::Safe,
+        })?;
+        self.insert_evm_block_headers_into_cache(&headers);
+
+        let primary_blocks = primary_logs
+            .iter()
+            .filter(|log| range.contains(log.block_number))
+            .map(|log| log.block_number)
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut suspicious_blocks = Vec::new();
+        for header in &headers {
+            if !range.contains(header.block_number) || primary_blocks.contains(&header.block_number)
+            {
+                continue;
+            }
+            if header_bloom_may_match_filter(header, filter)? {
+                suspicious_blocks.push(header.block_number);
+            }
+        }
+
+        let mut diagnostics = LogReliabilityDiagnostics {
+            header_provider_calls: self.block_header_resolve_provider_call_count(range),
+            suspicious_blocks: suspicious_blocks.len(),
+            secondary_provider_calls: 0,
+        };
+        if suspicious_blocks.is_empty() {
+            return Ok((primary_logs, Some(diagnostics)));
+        }
+        if self.secondary_provider_urls().is_empty() {
+            return Err(DatalensError::new(
+                DatalensErrorKind::ProviderFailure,
+                format!(
+                    "EVM log reliability found {} bloom-positive block(s) missing primary logs but no secondary RPC provider is configured",
+                    suspicious_blocks.len()
+                ),
+            ));
+        }
+
+        let mut merged = primary_logs;
+        for suspicious_range in adjacent_block_ranges(&suspicious_blocks) {
+            let mut last_error = None;
+            let mut range_logs = None;
+            for url in self.secondary_provider_urls() {
+                diagnostics.secondary_provider_calls += 1;
+                match self.fetch_logs_from_url(url, suspicious_range, filter) {
+                    Ok(logs) => {
+                        range_logs = Some(logs);
+                        break;
+                    }
+                    Err(error) => {
+                        last_error = Some(error);
+                    }
+                }
+            }
+            let Some(mut logs) = range_logs else {
+                let error = last_error.unwrap_or_else(|| {
+                    DatalensError::new(
+                        DatalensErrorKind::ProviderFailure,
+                        "EVM log reliability secondary provider failed",
+                    )
+                });
+                return Err(DatalensError::new(
+                    error.kind,
+                    format!(
+                        "EVM log reliability secondary eth_getLogs failed for range {}-{}: {}",
+                        suspicious_range.from_block, suspicious_range.to_block, error.message
+                    ),
+                ));
+            };
+            logs.retain(|log| suspicious_range.contains(log.block_number));
+            merged.append(&mut logs);
+        }
+
+        dedupe_and_sort_logs(&mut merged);
+        Ok((merged, Some(diagnostics)))
+    }
+
+    fn block_header_resolve_provider_call_count(&self, range: BlockRange) -> usize {
+        match self.block_header_metadata.fetch_mode {
+            EvmBlockHeaderFetchMode::Concurrent => range.len().min(usize::MAX as u128) as usize,
+            EvmBlockHeaderFetchMode::Batch => range
+                .split(self.block_header_metadata.batch_size as u64)
+                .map(|ranges| ranges.len())
+                .unwrap_or_default(),
+        }
     }
 
     fn fetch_evm_logs_from_receipts_with_request_id(
@@ -557,9 +730,24 @@ impl EvmRpcClient {
     }
 
     fn call(&self, method: &str, params: Value) -> Result<Option<Value>, DatalensError> {
-        let url = self.rpc_urls.first().ok_or_else(|| {
-            DatalensError::new(DatalensErrorKind::InvalidInput, "chain has no rpc_urls")
-        })?;
+        self.post_rpc(self.primary_rpc_url_result()?, method, params)
+    }
+
+    fn call_url(
+        &self,
+        url: &str,
+        method: &str,
+        params: Value,
+    ) -> Result<Option<Value>, DatalensError> {
+        self.post_rpc(url, method, params)
+    }
+
+    fn post_rpc(
+        &self,
+        url: &str,
+        method: &str,
+        params: Value,
+    ) -> Result<Option<Value>, DatalensError> {
         log::debug!("sending EVM provider request method={method}");
         let response = self
             .client
@@ -619,9 +807,7 @@ impl EvmRpcClient {
     }
 
     fn batch_call(&self, method: &str, requests: Vec<Value>) -> Result<Vec<Value>, DatalensError> {
-        let url = self.rpc_urls.first().ok_or_else(|| {
-            DatalensError::new(DatalensErrorKind::InvalidInput, "chain has no rpc_urls")
-        })?;
+        let url = self.primary_rpc_url_result()?;
         log::debug!(
             "sending EVM provider batch request method={method} requests={}",
             requests.len()
@@ -664,6 +850,12 @@ impl EvmRpcClient {
                 DatalensErrorKind::ProviderFailure,
                 "invalid JSON-RPC batch response",
             )
+        })
+    }
+
+    fn primary_rpc_url_result(&self) -> Result<&str, DatalensError> {
+        self.rpc_urls.first().map(String::as_str).ok_or_else(|| {
+            DatalensError::new(DatalensErrorKind::InvalidInput, "chain has no rpc_urls")
         })
     }
 }
@@ -951,7 +1143,9 @@ impl ChainAdapter for EvmRpcClient {
                             &filter,
                             request_id.as_deref(),
                         )?;
-                        let provider_calls = 1 + diagnostics.provider_calls;
+                        let provider_calls = 1
+                            + diagnostics.provider_calls
+                            + diagnostics.reliability_secondary_calls;
                         warnings.push(diagnostics.warning());
                         logs.retain(|log| range.contains(log.block_number));
                         logs.sort_by_key(|log| {
@@ -978,7 +1172,9 @@ impl ChainAdapter for EvmRpcClient {
                             filter,
                             request_id.as_deref(),
                         )?;
-                        let provider_calls = 1 + diagnostics.provider_calls;
+                        let provider_calls = 1
+                            + diagnostics.provider_calls
+                            + diagnostics.reliability_secondary_calls;
                         warnings.push(diagnostics.warning());
                         logs.retain(|log| range.contains(log.block_number));
                         logs.sort_by_key(|log| {
@@ -1096,6 +1292,64 @@ fn log_matches_filter(log: &LogRecord, filter: &EvmLogFilter) -> bool {
         }
     }
     true
+}
+
+fn header_bloom_may_match_filter(
+    header: &EvmBlockHeader,
+    filter: &EvmLogFilter,
+) -> Result<bool, DatalensError> {
+    let bloom = EvmLogBloom::from_hex(&header.logs_bloom)?;
+    if filter.addresses().is_empty()
+        && filter
+            .topics()
+            .iter()
+            .all(|topic| matches!(topic, TopicFilter::Wildcard))
+    {
+        return Ok(!bloom.is_empty());
+    }
+    bloom.may_match_filter(filter)
+}
+
+fn adjacent_block_ranges(blocks: &[u64]) -> Vec<BlockRange> {
+    let mut blocks = blocks.to_vec();
+    blocks.sort_unstable();
+    blocks.dedup();
+    let mut ranges = Vec::new();
+    let mut iter = blocks.into_iter();
+    let Some(mut start) = iter.next() else {
+        return ranges;
+    };
+    let mut end = start;
+    for block in iter {
+        if block == end.saturating_add(1) {
+            end = block;
+        } else {
+            ranges.push(BlockRange::expect_new(start, end));
+            start = block;
+            end = block;
+        }
+    }
+    ranges.push(BlockRange::expect_new(start, end));
+    ranges
+}
+
+fn dedupe_and_sort_logs(logs: &mut Vec<LogRecord>) {
+    logs.sort_by_key(|log| {
+        (
+            log.block_number,
+            log.transaction_index,
+            log.log_index,
+            log.block_hash.clone(),
+            log.transaction_hash.clone(),
+        )
+    });
+    logs.dedup_by(|left, right| {
+        left.block_number == right.block_number
+            && left.transaction_index == right.transaction_index
+            && left.log_index == right.log_index
+            && left.block_hash == right.block_hash
+            && left.transaction_hash == right.transaction_hash
+    });
 }
 
 impl EvmRpcClient {
@@ -1396,6 +1650,24 @@ impl EvmRpcClient {
             };
             cache.headers.remove(&key);
         }
+    }
+
+    fn insert_evm_block_headers_into_cache(&self, headers: &[EvmBlockHeader]) {
+        let headers = headers
+            .iter()
+            .map(|header| {
+                (
+                    self.block_header_cache_key(header.block_number, &header.block_hash),
+                    BlockHeader {
+                        number: header.block_number,
+                        hash: header.block_hash.clone(),
+                        parent_hash: header.parent_hash.clone(),
+                        timestamp: header.timestamp,
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        self.insert_block_headers_into_cache(&headers);
     }
 
     fn fetch_log_block_headers_concurrently(

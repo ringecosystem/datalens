@@ -80,6 +80,7 @@ pub(crate) fn chain_config(max_addresses_per_query: usize) -> ChainConfig {
             },
             logs: LogsDatasetConfig {
                 enabled: true,
+                reliability_enabled: true,
                 query_strategy: Default::default(),
                 max_get_logs_range_blocks: 2,
                 max_block_scan_range_blocks: 2,

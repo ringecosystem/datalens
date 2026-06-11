@@ -9,7 +9,8 @@ use datalens_solana::{SolanaAdapter, SolanaHttpRpc};
 use datalens_tron::TronAdapter;
 
 use crate::runtime::{
-    evm_block_header_metadata_config, evm_finality_policy, finality_summary, tron_provider,
+    evm_block_header_metadata_config, evm_finality_policy, evm_log_reliability_config,
+    finality_summary, tron_provider,
 };
 use crate::{chain_identity, parse_bind, redact_url};
 
@@ -603,6 +604,7 @@ pub fn doctor_chain_summary(
         chain.datasets.logs.max_addresses_per_query,
     )
     .with_logs_query_strategy(chain.datasets.logs.query_strategy)
+    .with_log_reliability_config(evm_log_reliability_config(chain))
     .with_block_header_metadata_config(evm_block_header_metadata_config(chain)?);
     let safe_height = source.cache_safe_height().map_err(|error| {
         DatalensError::new(
@@ -630,6 +632,7 @@ pub fn doctor_chain_summary(
             },
             "logs": {
                 "enabled": chain.datasets.logs.enabled,
+                "reliability_enabled": chain.datasets.logs.reliability_enabled,
                 "query_strategy": chain.datasets.logs.query_strategy,
                 "max_get_logs_range_blocks": chain.datasets.logs.max_get_logs_range_blocks,
                 "max_block_scan_range_blocks": chain.datasets.logs.max_block_scan_range_blocks,

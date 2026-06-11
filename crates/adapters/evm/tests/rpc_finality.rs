@@ -1,6 +1,6 @@
 use std::{
     io::{Read, Write},
-    net::{SocketAddr, TcpListener},
+    net::{SocketAddr, TcpListener, TcpStream},
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -318,6 +318,279 @@ fn test_provider_filter_logs_do_not_use_secondary_rpc_provider() {
             .expect("secondary requests")
             .is_empty()
     );
+}
+
+#[test]
+fn test_provider_filter_logs_reliability_recovers_primary_empty_bloom_candidate_from_secondary() {
+    let topic = transfer_topic();
+    let address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let block_hash = block_hash(10);
+    let bloom = EvmLogBloom::from_inputs([
+        EvmLogBloomInput::Address(address),
+        EvmLogBloomInput::Topic(topic),
+    ])
+    .expect("bloom")
+    .as_hex();
+    let (primary_url, primary_requests) = start_rpc_server(vec![
+        logs_response(Vec::new()),
+        json!([block_batch_response_with_bloom(
+            1,
+            10,
+            &block_hash,
+            "0xparent10",
+            10,
+            &bloom
+        )]),
+    ]);
+    let (secondary_url, secondary_requests) =
+        start_rpc_server(vec![logs_response(vec![provider_log_with_address(
+            10,
+            &block_hash,
+            "0xtx",
+            0,
+            7,
+            address,
+            topic,
+        )])]);
+    let client = EvmRpcClient::with_chain(
+        vec![primary_url, secondary_url],
+        ethereum_identity(),
+        EvmFinalityPolicy::Lag {
+            safe_lag_blocks: Some(2),
+            finalized_lag_blocks: Some(4),
+        },
+        10,
+        10,
+        3,
+        10,
+    );
+    let filter = datalens_core::EvmLogFilter::try_from(LogFilter {
+        addresses: vec![address.to_owned()],
+        topics: vec![Some(vec![topic.to_owned()])],
+    })
+    .expect("filter");
+
+    let response = client
+        .fetch(ChainFetchRequest::new(
+            ethereum_identity(),
+            DatasetKey::evm_logs(),
+            LedgerRange::from_block_range(BlockRange::expect_new(10, 10)),
+            DatasetSelector::EvmLogs(filter),
+        ))
+        .expect("logs");
+
+    let QueryRows::EvmLogs(rows) = response.rows.rows() else {
+        panic!("expected EVM logs");
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].address, address);
+    assert_eq!(rows[0].topics, vec![topic.to_owned()]);
+    assert_eq!(rows[0].log_index, 7);
+    assert_eq!(rows[0].parent_hash.as_deref(), Some("0xparent10"));
+    assert_eq!(rows[0].block_timestamp, Some(10));
+    assert_eq!(response.provider_diagnostics.calls, 3);
+    assert!(
+        response
+            .provider_diagnostics
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("reliability_suspicious_blocks=1"))
+    );
+    assert_eq!(primary_requests.lock().expect("primary requests").len(), 2);
+    let secondary_requests = secondary_requests.lock().expect("secondary requests");
+    assert_eq!(secondary_requests.len(), 1);
+    assert_eq!(secondary_requests[0]["method"], "eth_getLogs");
+    assert_eq!(secondary_requests[0]["params"][0]["fromBlock"], "0xa");
+    assert_eq!(secondary_requests[0]["params"][0]["toBlock"], "0xa");
+}
+
+#[test]
+fn test_provider_filter_logs_reliability_merges_dedupes_and_sorts_secondary_rows() {
+    let topic = transfer_topic();
+    let address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let hash10 = block_hash(10);
+    let hash11 = block_hash(11);
+    let hash12 = block_hash(12);
+    let bloom = EvmLogBloom::from_inputs([
+        EvmLogBloomInput::Address(address),
+        EvmLogBloomInput::Topic(topic),
+    ])
+    .expect("bloom")
+    .as_hex();
+    let primary_10 = provider_log_with_address(10, &hash10, "0xtx10", 0, 0, address, topic);
+    let primary_12 = provider_log_with_address(12, &hash12, "0xtx12", 0, 0, address, topic);
+    let secondary_11 = provider_log_with_address(11, &hash11, "0xtx11", 0, 1, address, topic);
+    let (primary_url, _primary_requests) = start_rpc_server(vec![
+        logs_response(vec![primary_12.clone(), primary_10.clone()]),
+        json!([
+            block_batch_response_with_bloom(1, 10, &hash10, "0xparent10", 10, &bloom),
+            block_batch_response_with_bloom(2, 11, &hash11, "0xparent11", 11, &bloom),
+            block_batch_response_with_bloom(3, 12, &hash12, "0xparent12", 12, &bloom),
+        ]),
+    ]);
+    let (secondary_url, secondary_requests) = start_rpc_server(vec![logs_response(vec![
+        secondary_11.clone(),
+        primary_12.clone(),
+    ])]);
+    let client = EvmRpcClient::with_chain(
+        vec![primary_url, secondary_url],
+        ethereum_identity(),
+        EvmFinalityPolicy::Lag {
+            safe_lag_blocks: Some(2),
+            finalized_lag_blocks: Some(4),
+        },
+        10,
+        10,
+        3,
+        10,
+    );
+    let filter = datalens_core::EvmLogFilter::try_from(LogFilter {
+        addresses: vec![address.to_owned()],
+        topics: vec![Some(vec![topic.to_owned()])],
+    })
+    .expect("filter");
+
+    let response = client
+        .fetch(ChainFetchRequest::new(
+            ethereum_identity(),
+            DatasetKey::evm_logs(),
+            LedgerRange::from_block_range(BlockRange::expect_new(10, 12)),
+            DatasetSelector::EvmLogs(filter),
+        ))
+        .expect("logs");
+
+    let QueryRows::EvmLogs(rows) = response.rows.rows() else {
+        panic!("expected EVM logs");
+    };
+    assert_eq!(
+        rows.iter()
+            .map(|log| (log.block_number, log.log_index))
+            .collect::<Vec<_>>(),
+        vec![(10, 0), (11, 1), (12, 0)]
+    );
+    assert_eq!(
+        rows.iter()
+            .map(|log| log.parent_hash.as_deref())
+            .collect::<Vec<_>>(),
+        vec![Some("0xparent10"), Some("0xparent11"), Some("0xparent12")]
+    );
+    assert_eq!(response.provider_diagnostics.calls, 3);
+    let secondary_requests = secondary_requests.lock().expect("secondary requests");
+    assert_eq!(secondary_requests.len(), 1);
+    assert_eq!(secondary_requests[0]["params"][0]["fromBlock"], "0xb");
+    assert_eq!(secondary_requests[0]["params"][0]["toBlock"], "0xb");
+}
+
+#[test]
+fn test_provider_filter_logs_reliability_disabled_preserves_primary_only_empty_coverage() {
+    let topic = transfer_topic();
+    let address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let block_hash = block_hash(10);
+    let (primary_url, primary_requests) = start_rpc_server(vec![logs_response(Vec::new())]);
+    let (secondary_url, secondary_requests) =
+        start_rpc_server(vec![logs_response(vec![provider_log_with_address(
+            10,
+            &block_hash,
+            "0xtx",
+            0,
+            0,
+            address,
+            topic,
+        )])]);
+    let client = EvmRpcClient::with_chain(
+        vec![primary_url, secondary_url],
+        ethereum_identity(),
+        EvmFinalityPolicy::Lag {
+            safe_lag_blocks: Some(2),
+            finalized_lag_blocks: Some(4),
+        },
+        10,
+        10,
+        3,
+        10,
+    )
+    .with_log_reliability_config(EvmLogReliabilityConfig::default().with_enabled(false));
+    let filter = datalens_core::EvmLogFilter::try_from(LogFilter {
+        addresses: vec![address.to_owned()],
+        topics: vec![Some(vec![topic.to_owned()])],
+    })
+    .expect("filter");
+
+    let response = client
+        .fetch(ChainFetchRequest::new(
+            ethereum_identity(),
+            DatasetKey::evm_logs(),
+            LedgerRange::from_block_range(BlockRange::expect_new(10, 10)),
+            DatasetSelector::EvmLogs(filter),
+        ))
+        .expect("logs");
+
+    let QueryRows::EvmLogs(rows) = response.rows.rows() else {
+        panic!("expected EVM logs");
+    };
+    assert!(rows.is_empty());
+    assert_eq!(response.provider_diagnostics.calls, 1);
+    assert_eq!(primary_requests.lock().expect("primary requests").len(), 1);
+    assert!(
+        secondary_requests
+            .lock()
+            .expect("secondary requests")
+            .is_empty()
+    );
+}
+
+#[test]
+fn test_provider_filter_logs_reliability_errors_on_bloom_candidate_without_secondary_provider() {
+    let topic = transfer_topic();
+    let address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let block_hash = block_hash(10);
+    let bloom = EvmLogBloom::from_inputs([
+        EvmLogBloomInput::Address(address),
+        EvmLogBloomInput::Topic(topic),
+    ])
+    .expect("bloom")
+    .as_hex();
+    let (primary_url, _primary_requests) = start_rpc_server(vec![
+        logs_response(Vec::new()),
+        json!([block_batch_response_with_bloom(
+            1,
+            10,
+            &block_hash,
+            "0xparent10",
+            10,
+            &bloom
+        )]),
+    ]);
+    let client = EvmRpcClient::with_chain(
+        vec![primary_url],
+        ethereum_identity(),
+        EvmFinalityPolicy::Lag {
+            safe_lag_blocks: Some(2),
+            finalized_lag_blocks: Some(4),
+        },
+        10,
+        10,
+        3,
+        10,
+    );
+    let filter = datalens_core::EvmLogFilter::try_from(LogFilter {
+        addresses: vec![address.to_owned()],
+        topics: vec![Some(vec![topic.to_owned()])],
+    })
+    .expect("filter");
+
+    let error = client
+        .fetch(ChainFetchRequest::new(
+            ethereum_identity(),
+            DatasetKey::evm_logs(),
+            LedgerRange::from_block_range(BlockRange::expect_new(10, 10)),
+            DatasetSelector::EvmLogs(filter),
+        ))
+        .expect_err("missing secondary should fail closed");
+
+    assert_eq!(error.kind, DatalensErrorKind::ProviderFailure);
+    assert!(error.message.contains("secondary"));
+    assert!(error.message.contains("bloom"));
 }
 
 #[test]
@@ -1301,6 +1574,7 @@ fn evm_test_client(url: String) -> EvmRpcClient {
         10,
         10,
     )
+    .with_log_reliability_config(EvmLogReliabilityConfig::default().with_enabled(false))
 }
 
 fn logs_fetch_request(from_block: u64, to_block: u64) -> ChainFetchRequest {
@@ -1391,6 +1665,22 @@ fn receipt(
 }
 
 fn block_response(number: u64, hash: &str, parent_hash: &str, timestamp: u64) -> Value {
+    block_response_with_bloom(
+        number,
+        hash,
+        parent_hash,
+        timestamp,
+        &format!("0x{}", "0".repeat(512)),
+    )
+}
+
+fn block_response_with_bloom(
+    number: u64,
+    hash: &str,
+    parent_hash: &str,
+    timestamp: u64,
+    logs_bloom: &str,
+) -> Value {
     json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -1398,7 +1688,8 @@ fn block_response(number: u64, hash: &str, parent_hash: &str, timestamp: u64) ->
             "number": format!("0x{number:x}"),
             "hash": hash,
             "parentHash": parent_hash,
-            "timestamp": format!("0x{timestamp:x}")
+            "timestamp": format!("0x{timestamp:x}"),
+            "logsBloom": logs_bloom
         }
     })
 }
@@ -1418,6 +1709,24 @@ fn block_batch_response(
     parent_hash: &str,
     timestamp: u64,
 ) -> Value {
+    block_batch_response_with_bloom(
+        id,
+        number,
+        hash,
+        parent_hash,
+        timestamp,
+        &format!("0x{}", "0".repeat(512)),
+    )
+}
+
+fn block_batch_response_with_bloom(
+    id: u64,
+    number: u64,
+    hash: &str,
+    parent_hash: &str,
+    timestamp: u64,
+    logs_bloom: &str,
+) -> Value {
     json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -1425,7 +1734,8 @@ fn block_batch_response(
             "number": format!("0x{number:x}"),
             "hash": hash,
             "parentHash": parent_hash,
-            "timestamp": format!("0x{timestamp:x}")
+            "timestamp": format!("0x{timestamp:x}"),
+            "logsBloom": logs_bloom
         }
     })
 }
@@ -1496,11 +1806,7 @@ fn start_rpc_server(responses: Vec<Value>) -> (String, Arc<Mutex<Vec<Value>>>) {
     thread::spawn(move || {
         for stream in listener.incoming() {
             let mut stream = stream.expect("test server connection");
-            let mut buffer = [0; 8192];
-            let bytes = stream.read(&mut buffer).expect("read request");
-            let request = String::from_utf8_lossy(&buffer[..bytes]);
-            let body = request.split("\r\n\r\n").nth(1).expect("request body");
-            let request_json: Value = serde_json::from_str(body).expect("request JSON");
+            let request_json = read_http_json(&mut stream);
             request_log.lock().expect("request log").push(request_json);
             let response = responses.lock().expect("responses").remove(0);
             let response = response.to_string();
@@ -1537,11 +1843,7 @@ fn start_concurrent_header_server(
             let max_active = Arc::clone(&max_active_log);
             let active = Arc::clone(&active_log);
             thread::spawn(move || {
-                let mut buffer = [0; 8192];
-                let bytes = stream.read(&mut buffer).expect("read request");
-                let request = String::from_utf8_lossy(&buffer[..bytes]);
-                let body = request.split("\r\n\r\n").nth(1).expect("request body");
-                let request_json: Value = serde_json::from_str(body).expect("request JSON");
+                let request_json = read_http_json(&mut stream);
                 request_log
                     .lock()
                     .expect("request log")
@@ -1586,4 +1888,38 @@ fn start_concurrent_header_server(
     });
 
     (format!("http://{address}"), requests, max_active)
+}
+
+fn read_http_json(stream: &mut TcpStream) -> Value {
+    let mut buffer = Vec::new();
+    let header_end = loop {
+        let mut chunk = [0; 1024];
+        let bytes = stream.read(&mut chunk).expect("read request");
+        assert!(bytes > 0, "connection closed before headers");
+        buffer.extend_from_slice(&chunk[..bytes]);
+        if let Some(index) = find_header_end(&buffer) {
+            break index;
+        }
+    };
+    let header_text = String::from_utf8_lossy(&buffer[..header_end]);
+    let content_length = header_text
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().expect("content length"))
+        })
+        .expect("content-length header");
+    let body_start = header_end + 4;
+    while buffer.len() < body_start + content_length {
+        let mut chunk = [0; 1024];
+        let bytes = stream.read(&mut chunk).expect("read request body");
+        assert!(bytes > 0, "connection closed before request body");
+        buffer.extend_from_slice(&chunk[..bytes]);
+    }
+    serde_json::from_slice(&buffer[body_start..body_start + content_length]).expect("request JSON")
+}
+
+fn find_header_end(buffer: &[u8]) -> Option<usize> {
+    buffer.windows(4).position(|window| window == b"\r\n\r\n")
 }

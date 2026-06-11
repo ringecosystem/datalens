@@ -120,6 +120,28 @@ fn test_config_evm_log_header_fetch_mode_defaults_to_batch() {
 }
 
 #[test]
+fn test_config_evm_log_reliability_defaults_to_enabled() {
+    let config: DatalensConfig =
+        toml::from_str(&config_text("[query.native]")).expect("config should parse");
+
+    assert!(config.chains["ethereum"].datasets.logs.reliability_enabled);
+}
+
+#[test]
+fn test_config_evm_log_reliability_can_be_disabled() {
+    let input = config_text("[query.native]").replace(
+        r#"enabled = true
+        max_get_logs_range_blocks = 10"#,
+        r#"enabled = true
+        reliability_enabled = false
+        max_get_logs_range_blocks = 10"#,
+    );
+    let config: DatalensConfig = toml::from_str(&input).expect("config should parse");
+
+    assert!(!config.chains["ethereum"].datasets.logs.reliability_enabled);
+}
+
+#[test]
 fn test_config_legacy_rpc_urls_provides_primary_rpc() {
     let config: DatalensConfig =
         toml::from_str(&config_text("[query.native]")).expect("config should parse");

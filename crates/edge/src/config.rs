@@ -642,6 +642,8 @@ pub struct BlocksDatasetConfig {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LogsDatasetConfig {
     pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub reliability_enabled: bool,
     #[serde(default)]
     pub query_strategy: QueryStrategy,
     pub max_get_logs_range_blocks: u64,
@@ -660,6 +662,10 @@ pub struct LogsDatasetConfig {
 
 fn default_max_block_scan_range_blocks() -> u64 {
     100
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_evm_log_header_fetch_mode() -> String {
