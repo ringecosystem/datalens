@@ -11,7 +11,8 @@ use datalens_core::{ChainIdentity, DatalensError, DatalensErrorKind};
 use datalens_edge::config::{ChainConfig, DatalensConfig, FinalityConfig};
 use datalens_edge::{QueryService, QueryServiceRegistry};
 use datalens_evm::{
-    EvmBlockHeaderFetchMode, EvmBlockHeaderMetadataConfig, EvmFinalityPolicy, EvmRpcClient,
+    DurableEvmBlockHeaderStore, EvmBlockHeaderFetchMode, EvmBlockHeaderMetadataConfig,
+    EvmFinalityPolicy, EvmLogReliabilityConfig, EvmRpcClient,
 };
 use datalens_metrics::ApplicationIdentity;
 use datalens_solana::{SolanaAdapter, SolanaHttpRpc};
@@ -305,7 +306,7 @@ fn build_evm_service_with_storage(
         chain.chain_id
     );
     let source = EvmRpcClient::with_chain(
-        chain.rpc_urls.clone(),
+        chain.rpc_provider_urls(),
         chain_identity(chain_name, chain).expect("validated chain identity"),
         evm_finality_policy(&chain.finality),
         chain.datasets.blocks.max_batch_blocks,
@@ -314,7 +315,12 @@ fn build_evm_service_with_storage(
         chain.datasets.logs.max_addresses_per_query,
     )
     .with_logs_query_strategy(chain.datasets.logs.query_strategy)
-    .with_block_header_metadata_config(evm_block_header_metadata_config(chain)?);
+    .with_log_reliability_config(evm_log_reliability_config(chain))
+    .with_block_header_metadata_config(evm_block_header_metadata_config(chain)?)
+    .with_block_header_store(DurableEvmBlockHeaderStore::new(
+        stores.storage.clone(),
+        durable_writer_config(&config.writer),
+    ));
     let mut service = datalens_edge::QueryService::new_with_metrics_config(
         stores.storage.clone(),
         source.clone(),
@@ -404,7 +410,7 @@ fn build_solana_service_with_storage(
         chain.kind,
         chain.chain_id
     );
-    let url = chain.rpc_urls.first().ok_or_else(|| {
+    let url = chain.primary_rpc_url().ok_or_else(|| {
         DatalensError::new(
             DatalensErrorKind::InvalidInput,
             format!("chain {chain_name} must define at least one rpc URL"),
@@ -412,7 +418,7 @@ fn build_solana_service_with_storage(
     })?;
     let source = SolanaAdapter::with_provider(
         chain_identity(chain_name, chain).expect("validated chain identity"),
-        SolanaHttpRpc::new(url.clone()),
+        SolanaHttpRpc::new(url.to_owned()),
     )
     .with_max_slot_range_len(chain.datasets.blocks.max_batch_blocks.max(1))
     .with_query_strategy(chain.datasets.logs.query_strategy);
@@ -454,7 +460,7 @@ fn build_tron_service_with_storage(
         chain.kind,
         chain.chain_id
     );
-    let url = chain.rpc_urls.first().ok_or_else(|| {
+    let url = chain.primary_rpc_url().ok_or_else(|| {
         DatalensError::new(
             DatalensErrorKind::InvalidInput,
             format!("chain {chain_name} must define at least one rpc URL"),
@@ -462,7 +468,7 @@ fn build_tron_service_with_storage(
     })?;
     let source = TronAdapter::with_provider(
         chain_identity(chain_name, chain).expect("validated chain identity"),
-        tron_provider(url.clone(), chain),
+        tron_provider(url.to_owned(), chain),
     )
     .with_max_block_range_len(chain.datasets.blocks.max_batch_blocks.max(1))
     .with_events_query_strategy(chain.datasets.logs.query_strategy);
@@ -854,6 +860,10 @@ pub(crate) fn evm_block_header_metadata_config(
         .with_fetch_concurrency(chain.datasets.logs.header_fetch_concurrency)
         .with_fetch_mode(fetch_mode)
         .with_batch_size(chain.datasets.logs.header_fetch_batch_size))
+}
+
+pub(crate) fn evm_log_reliability_config(chain: &ChainConfig) -> EvmLogReliabilityConfig {
+    EvmLogReliabilityConfig::default().with_enabled(chain.datasets.logs.reliability_enabled)
 }
 
 pub(crate) fn finality_summary(chain: &ChainConfig) -> serde_json::Value {

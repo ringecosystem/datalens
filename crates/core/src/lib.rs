@@ -21,8 +21,8 @@ pub use coverage::CoverageLevel;
 pub use dataset::{Dataset, DatasetId, DatasetKey};
 pub use error::{DatalensError, DatalensErrorKind, QuotaErrorKind, QuotaErrorMetadata};
 pub use query::{
-    BlockHeader, DatasetRows, EvmLogFilter, EvmReceipt, EvmTransaction, LogFilter, LogRecord,
-    QueryRows, QueryStrategy, TopicFilter,
+    BlockHeader, DatasetRows, EvmBlockHeader, EvmLogFilter, EvmReceipt, EvmTransaction, LogFilter,
+    LogRecord, QueryRows, QueryStrategy, TopicFilter,
 };
 pub use range::{BlockRange, LedgerRange, LedgerRangeKind, TimeRange, missing_ranges};
 pub use redaction::{redact_url, redact_urls_in_text};

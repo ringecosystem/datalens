@@ -200,6 +200,7 @@ pub(crate) fn object_encoding_for_dataset(dataset_key: &DatasetKey) -> ObjectEnc
     match dataset_key.evm_dataset() {
         Some(
             datalens_core::Dataset::Blocks
+            | datalens_core::Dataset::BlockHeaders
             | datalens_core::Dataset::Transactions
             | datalens_core::Dataset::Receipts
             | datalens_core::Dataset::Logs,
@@ -243,6 +244,7 @@ pub(crate) fn decode_object_rows(
 pub(crate) fn empty_rows(dataset_key: DatasetKey) -> Result<DatasetRows, DatalensError> {
     let rows = match dataset_key.evm_dataset() {
         Some(datalens_core::Dataset::Blocks) => QueryRows::EvmBlocks(Vec::new()),
+        Some(datalens_core::Dataset::BlockHeaders) => QueryRows::EvmBlockHeaders(Vec::new()),
         Some(datalens_core::Dataset::Transactions) => QueryRows::EvmTransactions(Vec::new()),
         Some(datalens_core::Dataset::Receipts) => QueryRows::EvmReceipts(Vec::new()),
         Some(datalens_core::Dataset::Logs) => QueryRows::EvmLogs(Vec::new()),
@@ -263,6 +265,11 @@ pub(crate) fn filter_rows(rows: DatasetRows, range: LedgerRange) -> DatasetRows 
         QueryRows::EvmBlocks(rows) => QueryRows::EvmBlocks(
             rows.into_iter()
                 .filter(|row| block_range.contains(row.number))
+                .collect(),
+        ),
+        QueryRows::EvmBlockHeaders(rows) => QueryRows::EvmBlockHeaders(
+            rows.into_iter()
+                .filter(|row| block_range.contains(row.block_number))
                 .collect(),
         ),
         QueryRows::EvmTransactions(rows) => QueryRows::EvmTransactions(

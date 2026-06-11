@@ -9,7 +9,8 @@ use datalens_solana::{SolanaAdapter, SolanaHttpRpc};
 use datalens_tron::TronAdapter;
 
 use crate::runtime::{
-    evm_block_header_metadata_config, evm_finality_policy, finality_summary, tron_provider,
+    evm_block_header_metadata_config, evm_finality_policy, evm_log_reliability_config,
+    finality_summary, tron_provider,
 };
 use crate::{chain_identity, parse_bind, redact_url};
 
@@ -371,10 +372,23 @@ fn validate_chain(name: &str, chain: &ChainConfig) -> Result<(), DatalensError> 
             "only evm, solana, and tron chains are supported",
         ));
     }
-    if chain.rpc_urls.is_empty() || chain.rpc_urls.iter().any(|url| url.trim().is_empty()) {
+    if chain
+        .primary_rpc_url()
+        .is_none_or(|url| url.trim().is_empty())
+    {
         return Err(DatalensError::new(
             DatalensErrorKind::InvalidInput,
-            format!("chain {name} must define at least one rpc URL"),
+            format!("chain {name} must define a primary RPC URL"),
+        ));
+    }
+    if chain
+        .secondary_rpc_urls()
+        .iter()
+        .any(|url| url.trim().is_empty())
+    {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            format!("chain {name} secondary RPC URLs must not be empty"),
         ));
     }
     if chain.datasets.blocks.max_batch_blocks == 0 {
@@ -483,7 +497,7 @@ pub fn doctor_chain_summary(
     if chain.kind == "solana" {
         let source = SolanaAdapter::with_provider(
             chain_identity(name, chain)?,
-            SolanaHttpRpc::new(chain.rpc_urls.first().cloned().unwrap_or_default()),
+            SolanaHttpRpc::new(chain.primary_rpc_url().unwrap_or_default().to_owned()),
         )
         .with_max_slot_range_len(chain.datasets.blocks.max_batch_blocks.max(1))
         .with_query_strategy(chain.datasets.logs.query_strategy);
@@ -500,7 +514,7 @@ pub fn doctor_chain_summary(
             "name": name,
             "kind": chain.kind,
             "chain_id": chain.chain_id,
-            "rpc_urls": chain.rpc_urls.iter().map(|url| redact_url(url)).collect::<Vec<_>>(),
+            "rpc_urls": chain.rpc_provider_urls().iter().map(|url| redact_url(url)).collect::<Vec<_>>(),
             "finality": {
                 "config": "solana_finalized",
                 "detected_height": safe_height.value,
@@ -536,7 +550,10 @@ pub fn doctor_chain_summary(
     if chain.kind == "tron" {
         let source = TronAdapter::with_provider(
             chain_identity(name, chain)?,
-            tron_provider(chain.rpc_urls.first().cloned().unwrap_or_default(), chain),
+            tron_provider(
+                chain.primary_rpc_url().unwrap_or_default().to_owned(),
+                chain,
+            ),
         )
         .with_max_block_range_len(chain.datasets.blocks.max_batch_blocks.max(1))
         .with_events_query_strategy(chain.datasets.logs.query_strategy);
@@ -553,7 +570,7 @@ pub fn doctor_chain_summary(
             "name": name,
             "kind": chain.kind,
             "chain_id": chain.chain_id,
-            "rpc_urls": chain.rpc_urls.iter().map(|url| redact_url(url)).collect::<Vec<_>>(),
+            "rpc_urls": chain.rpc_provider_urls().iter().map(|url| redact_url(url)).collect::<Vec<_>>(),
             "finality": {
                 "config": "tron_solidity_finalized",
                 "detected_height": safe_height.value,
@@ -578,7 +595,7 @@ pub fn doctor_chain_summary(
         }));
     }
     let source = EvmRpcClient::with_chain(
-        chain.rpc_urls.clone(),
+        chain.rpc_provider_urls(),
         chain_identity(name, chain)?,
         evm_finality_policy(&chain.finality),
         chain.datasets.blocks.max_batch_blocks,
@@ -587,6 +604,7 @@ pub fn doctor_chain_summary(
         chain.datasets.logs.max_addresses_per_query,
     )
     .with_logs_query_strategy(chain.datasets.logs.query_strategy)
+    .with_log_reliability_config(evm_log_reliability_config(chain))
     .with_block_header_metadata_config(evm_block_header_metadata_config(chain)?);
     let safe_height = source.cache_safe_height().map_err(|error| {
         DatalensError::new(
@@ -601,7 +619,7 @@ pub fn doctor_chain_summary(
         "name": name,
         "kind": chain.kind,
         "chain_id": chain.chain_id,
-        "rpc_urls": chain.rpc_urls.iter().map(|url| redact_url(url)).collect::<Vec<_>>(),
+        "rpc_urls": chain.rpc_provider_urls().iter().map(|url| redact_url(url)).collect::<Vec<_>>(),
         "finality": {
             "config": finality_summary(chain),
             "detected_height": safe_height.value,
@@ -614,6 +632,7 @@ pub fn doctor_chain_summary(
             },
             "logs": {
                 "enabled": chain.datasets.logs.enabled,
+                "reliability_enabled": chain.datasets.logs.reliability_enabled,
                 "query_strategy": chain.datasets.logs.query_strategy,
                 "max_get_logs_range_blocks": chain.datasets.logs.max_get_logs_range_blocks,
                 "max_block_scan_range_blocks": chain.datasets.logs.max_block_scan_range_blocks,

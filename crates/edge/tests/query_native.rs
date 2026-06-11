@@ -25,7 +25,9 @@ fn test_query_native_executes_non_evm_plan_without_evm_route_validation() {
         ChainConfig {
             kind: "tron".to_owned(),
             chain_id: 1,
+            rpc_url: None,
             rpc_urls: vec!["http://example.invalid".to_owned()],
+            rpc: None,
             warmup: Default::default(),
             trongrid: Default::default(),
             finality: datalens_edge::config::FinalityConfig::Auto,
@@ -36,6 +38,7 @@ fn test_query_native_executes_non_evm_plan_without_evm_route_validation() {
                 },
                 logs: LogsDatasetConfig {
                     enabled: false,
+                    reliability_enabled: true,
                     query_strategy: Default::default(),
                     max_get_logs_range_blocks: 2,
                     max_block_scan_range_blocks: 2,
@@ -108,7 +111,9 @@ fn test_query_native_reuses_durable_non_evm_rows_before_shutdown_flush() {
             ChainConfig {
                 kind: "tron".to_owned(),
                 chain_id: 1,
+                rpc_url: None,
                 rpc_urls: vec!["http://example.invalid".to_owned()],
+                rpc: None,
                 warmup: Default::default(),
                 trongrid: Default::default(),
                 finality: datalens_edge::config::FinalityConfig::Auto,
@@ -119,6 +124,7 @@ fn test_query_native_reuses_durable_non_evm_rows_before_shutdown_flush() {
                     },
                     logs: LogsDatasetConfig {
                         enabled: false,
+                        reliability_enabled: true,
                         query_strategy: Default::default(),
                         max_get_logs_range_blocks: 2,
                         max_block_scan_range_blocks: 2,

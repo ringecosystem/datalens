@@ -597,6 +597,7 @@ impl ChainFetchResponse {
     ) -> Result<Self, DatalensError> {
         let rows = match dataset_key.evm_dataset() {
             Some(Dataset::Blocks) => QueryRows::EvmBlocks(Vec::new()),
+            Some(Dataset::BlockHeaders) => QueryRows::EvmBlockHeaders(Vec::new()),
             Some(Dataset::Transactions) => QueryRows::EvmTransactions(Vec::new()),
             Some(Dataset::Receipts) => QueryRows::EvmReceipts(Vec::new()),
             Some(Dataset::Logs) => QueryRows::EvmLogs(Vec::new()),

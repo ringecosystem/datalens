@@ -32,6 +32,7 @@ impl DatasetId {
 #[serde(rename_all = "snake_case")]
 pub enum Dataset {
     Blocks,
+    BlockHeaders,
     Transactions,
     Receipts,
     Logs,
@@ -41,6 +42,7 @@ impl Dataset {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Blocks => "blocks",
+            Self::BlockHeaders => "block_headers",
             Self::Transactions => "transactions",
             Self::Receipts => "receipts",
             Self::Logs => "logs",
@@ -103,6 +105,10 @@ impl DatasetKey {
 
     pub fn evm_blocks() -> Self {
         Self::from(Dataset::Blocks)
+    }
+
+    pub fn evm_block_headers() -> Self {
+        Self::from(Dataset::BlockHeaders)
     }
 
     pub fn evm_logs() -> Self {
@@ -168,6 +174,7 @@ impl DatasetKey {
     pub fn evm_dataset(&self) -> Option<Dataset> {
         match (self.family(), self.name().as_str()) {
             (ChainFamily::Evm, "blocks") => Some(Dataset::Blocks),
+            (ChainFamily::Evm, "block_headers") => Some(Dataset::BlockHeaders),
             (ChainFamily::Evm, "transactions") => Some(Dataset::Transactions),
             (ChainFamily::Evm, "receipts") => Some(Dataset::Receipts),
             (ChainFamily::Evm, "logs") => Some(Dataset::Logs),
@@ -180,6 +187,7 @@ impl From<Dataset> for DatasetKey {
     fn from(dataset: Dataset) -> Self {
         match dataset {
             Dataset::Blocks => Self::try_new(ChainFamily::Evm, "blocks").unwrap(),
+            Dataset::BlockHeaders => Self::try_new(ChainFamily::Evm, "block_headers").unwrap(),
             Dataset::Transactions => Self::try_new(ChainFamily::Evm, "transactions").unwrap(),
             Dataset::Receipts => Self::try_new(ChainFamily::Evm, "receipts").unwrap(),
             Dataset::Logs => Self::try_new(ChainFamily::Evm, "logs").unwrap(),

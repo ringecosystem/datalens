@@ -4,8 +4,8 @@ use arrow::array::{Array, ArrayRef, BooleanArray, RecordBatch, StringArray, UInt
 use arrow::datatypes::{DataType, Field, Schema};
 use bytes::Bytes;
 use datalens_core::{
-    BlockHeader, DatalensError, DatalensErrorKind, DatasetKey, DatasetRows, EvmReceipt,
-    EvmTransaction, LogRecord, QueryRows,
+    BlockHeader, DatalensError, DatalensErrorKind, DatasetKey, DatasetRows, EvmBlockHeader,
+    EvmReceipt, EvmTransaction, LogRecord, QueryRows,
 };
 use parquet::{
     arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder},
@@ -21,13 +21,14 @@ pub fn encode_rows(
 ) -> Result<Vec<u8>, DatalensError> {
     let batch = match rows.rows() {
         QueryRows::EvmBlocks(rows) => evm_blocks_batch(rows)?,
+        QueryRows::EvmBlockHeaders(rows) => evm_block_headers_batch(rows)?,
         QueryRows::EvmTransactions(rows) => evm_transactions_batch(rows)?,
         QueryRows::EvmReceipts(rows) => evm_receipts_batch(rows)?,
         QueryRows::EvmLogs(rows) => evm_logs_batch(rows)?,
         QueryRows::AdapterJson { .. } => {
             return Err(DatalensError::new(
                 DatalensErrorKind::Internal,
-                "parquet-v1 encoding supports only evm.blocks and evm.logs",
+                "parquet-v1 encoding supports only typed evm datasets",
             ));
         }
     };
@@ -77,12 +78,13 @@ pub fn decode_rows(dataset_key: DatasetKey, bytes: &[u8]) -> Result<DatasetRows,
             batch.map_err(|error| parquet_read_error(format!("read parquet batch: {error}")))?;
         let batch_rows = match dataset_key.evm_dataset() {
             Some(datalens_core::Dataset::Blocks) => decode_evm_blocks(&batch)?,
+            Some(datalens_core::Dataset::BlockHeaders) => decode_evm_block_headers(&batch)?,
             Some(datalens_core::Dataset::Transactions) => decode_evm_transactions(&batch)?,
             Some(datalens_core::Dataset::Receipts) => decode_evm_receipts(&batch)?,
             Some(datalens_core::Dataset::Logs) => decode_evm_logs(&batch)?,
             None => {
                 return Err(parquet_read_error(
-                    "parquet-v1 decoding supports only evm.blocks and evm.logs",
+                    "parquet-v1 decoding supports only typed evm datasets",
                 ));
             }
         };
@@ -119,6 +121,36 @@ fn evm_blocks_batch(rows: &[BlockHeader]) -> Result<RecordBatch, DatalensError> 
         DatalensError::new(
             DatalensErrorKind::Internal,
             format!("build evm.blocks parquet batch: {error}"),
+        )
+    })
+}
+
+fn evm_block_headers_batch(rows: &[EvmBlockHeader]) -> Result<RecordBatch, DatalensError> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("block_number", DataType::UInt64, false),
+        Field::new("block_hash", DataType::Utf8, false),
+        Field::new("parent_hash", DataType::Utf8, false),
+        Field::new("timestamp", DataType::UInt64, false),
+        Field::new("logs_bloom", DataType::Utf8, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(UInt64Array::from_iter_values(
+                rows.iter().map(|row| row.block_number),
+            )) as ArrayRef,
+            string_values(rows.iter().map(|row| row.block_hash.as_str())),
+            string_values(rows.iter().map(|row| row.parent_hash.as_str())),
+            Arc::new(UInt64Array::from_iter_values(
+                rows.iter().map(|row| row.timestamp),
+            )),
+            string_values(rows.iter().map(|row| row.logs_bloom.as_str())),
+        ],
+    )
+    .map_err(|error| {
+        DatalensError::new(
+            DatalensErrorKind::Internal,
+            format!("build evm.block_headers parquet batch: {error}"),
         )
     })
 }
@@ -306,6 +338,25 @@ fn decode_evm_blocks(batch: &RecordBatch) -> Result<QueryRows, DatalensError> {
     Ok(QueryRows::EvmBlocks(rows))
 }
 
+fn decode_evm_block_headers(batch: &RecordBatch) -> Result<QueryRows, DatalensError> {
+    let block_number = uint64_column(batch, "block_number")?;
+    let block_hash = string_column(batch, "block_hash")?;
+    let parent_hash = string_column(batch, "parent_hash")?;
+    let timestamp = uint64_column(batch, "timestamp")?;
+    let logs_bloom = string_column(batch, "logs_bloom")?;
+
+    let rows = (0..batch.num_rows())
+        .map(|index| EvmBlockHeader {
+            block_number: block_number.value(index),
+            block_hash: block_hash.value(index).to_owned(),
+            parent_hash: parent_hash.value(index).to_owned(),
+            timestamp: timestamp.value(index),
+            logs_bloom: logs_bloom.value(index).to_owned(),
+        })
+        .collect();
+    Ok(QueryRows::EvmBlockHeaders(rows))
+}
+
 fn decode_evm_logs(batch: &RecordBatch) -> Result<QueryRows, DatalensError> {
     let block_number = uint64_column(batch, "block_number")?;
     let block_hash = string_column(batch, "block_hash")?;
@@ -413,6 +464,7 @@ fn decode_evm_receipts(batch: &RecordBatch) -> Result<QueryRows, DatalensError> 
 fn empty_query_rows(dataset_key: &DatasetKey) -> QueryRows {
     match dataset_key.evm_dataset() {
         Some(datalens_core::Dataset::Blocks) => QueryRows::EvmBlocks(Vec::new()),
+        Some(datalens_core::Dataset::BlockHeaders) => QueryRows::EvmBlockHeaders(Vec::new()),
         Some(datalens_core::Dataset::Transactions) => QueryRows::EvmTransactions(Vec::new()),
         Some(datalens_core::Dataset::Receipts) => QueryRows::EvmReceipts(Vec::new()),
         Some(datalens_core::Dataset::Logs) => QueryRows::EvmLogs(Vec::new()),

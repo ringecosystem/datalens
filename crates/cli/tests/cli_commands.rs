@@ -141,6 +141,10 @@ fn test_validate_config_rejects_server_index_graphql_surface() {
 fn test_authoritative_server_configs_parse_and_validate() {
     unsafe {
         std::env::set_var("DATALENS_ETHEREUM_RPC_URL", "http://example.invalid");
+        std::env::set_var(
+            "DATALENS_ETHEREUM_SECONDARY_RPC_URL",
+            "http://example.invalid/secondary",
+        );
         std::env::set_var("DATALENS_ARBITRUM_RPC_URL", "http://example.invalid");
         std::env::set_var("DATALENS_BASE_RPC_URL", "http://example.invalid");
         std::env::set_var("DATALENS_DARWINIA_RPC_URL", "http://example.invalid");
@@ -1575,6 +1579,53 @@ fn test_validate_config_accepts_evm_and_solana_chains_together() {
 }
 
 #[test]
+fn test_validate_config_rejects_enabled_evm_chain_with_empty_primary_rpc_url() {
+    let config: DatalensConfig = toml::from_str(
+        r#"
+        [server]
+        bind = "127.0.0.1:8080"
+
+        [storage]
+        backend = "local"
+
+        [storage.local]
+        root = ".datalens/storage"
+
+        [planner]
+        max_query_range_blocks = 100
+        default_chunk_range_blocks = 10
+
+        [writer]
+        target_object_bytes = 1024
+        min_object_rows = 1
+        record_empty_coverage = true
+
+        [chains.ethereum]
+        kind = "evm"
+        chain_id = 1
+
+        [chains.ethereum.rpc]
+        primary_url = " "
+        secondary_urls = ["http://secondary.example.invalid"]
+
+        [chains.ethereum.datasets.blocks]
+        enabled = true
+        max_batch_blocks = 10
+
+        [chains.ethereum.datasets.logs]
+        enabled = true
+        max_get_logs_range_blocks = 10
+        max_addresses_per_query = 2
+        "#,
+    )
+    .expect("config parses");
+
+    let error = validate_config(&config).expect_err("empty primary URL is rejected");
+
+    assert!(error.to_string().contains("primary RPC URL"));
+}
+
+#[test]
 fn test_validate_config_accepts_per_chain_log_query_strategy_differences() {
     let config: DatalensConfig = toml::from_str(
         r#"
@@ -1892,7 +1943,9 @@ fn test_doctor_chain_summary_rejects_unknown_auto_finality_without_profile() {
     let chain = ChainConfig {
         kind: "evm".to_owned(),
         chain_id: 999999,
+        rpc_url: None,
         rpc_urls: vec![url],
+        rpc: None,
         warmup: Default::default(),
         trongrid: Default::default(),
         finality: FinalityConfig::Auto,
@@ -1903,6 +1956,7 @@ fn test_doctor_chain_summary_rejects_unknown_auto_finality_without_profile() {
             },
             logs: datalens_edge::config::LogsDatasetConfig {
                 enabled: true,
+                reliability_enabled: true,
                 query_strategy: Default::default(),
                 max_get_logs_range_blocks: 10,
                 max_block_scan_range_blocks: 10,

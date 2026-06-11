@@ -22,6 +22,15 @@ pub struct BlockHeader {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EvmBlockHeader {
+    pub block_number: u64,
+    pub block_hash: String,
+    pub parent_hash: String,
+    pub timestamp: u64,
+    pub logs_bloom: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EvmTransaction {
     pub hash: String,
     pub block_number: u64,
@@ -336,6 +345,8 @@ impl TopicFilter {
 pub enum QueryRows {
     #[serde(rename = "blocks", alias = "evm_blocks")]
     EvmBlocks(Vec<BlockHeader>),
+    #[serde(rename = "block_headers", alias = "evm_block_headers")]
+    EvmBlockHeaders(Vec<EvmBlockHeader>),
     #[serde(rename = "transactions", alias = "evm_transactions")]
     EvmTransactions(Vec<EvmTransaction>),
     #[serde(rename = "receipts", alias = "evm_receipts")]
@@ -352,6 +363,7 @@ impl QueryRows {
     pub fn dataset_key(&self) -> DatasetKey {
         match self {
             Self::EvmBlocks(_) => DatasetKey::evm_blocks(),
+            Self::EvmBlockHeaders(_) => DatasetKey::evm_block_headers(),
             Self::EvmTransactions(_) => DatasetKey::evm_transactions(),
             Self::EvmReceipts(_) => DatasetKey::evm_receipts(),
             Self::EvmLogs(_) => DatasetKey::evm_logs(),
@@ -362,6 +374,7 @@ impl QueryRows {
     pub fn row_count(&self) -> usize {
         match self {
             Self::EvmBlocks(rows) => rows.len(),
+            Self::EvmBlockHeaders(rows) => rows.len(),
             Self::EvmTransactions(rows) => rows.len(),
             Self::EvmReceipts(rows) => rows.len(),
             Self::EvmLogs(rows) => rows.len(),
@@ -372,6 +385,10 @@ impl QueryRows {
     pub fn try_append(&mut self, other: QueryRows) -> Result<(), DatalensError> {
         match (self, other) {
             (Self::EvmBlocks(left), Self::EvmBlocks(mut right)) => {
+                left.append(&mut right);
+                Ok(())
+            }
+            (Self::EvmBlockHeaders(left), Self::EvmBlockHeaders(mut right)) => {
                 left.append(&mut right);
                 Ok(())
             }
@@ -412,6 +429,10 @@ impl QueryRows {
             Self::EvmBlocks(rows) => {
                 rows.sort_by_key(|row| row.number);
                 rows.dedup_by_key(|row| row.number);
+            }
+            Self::EvmBlockHeaders(rows) => {
+                rows.sort_by_key(|row| row.block_number);
+                rows.dedup_by_key(|row| row.block_number);
             }
             Self::EvmTransactions(rows) => {
                 rows.sort_by_key(|row| (row.block_number, row.transaction_index));

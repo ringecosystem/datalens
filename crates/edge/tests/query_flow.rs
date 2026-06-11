@@ -500,7 +500,9 @@ async fn test_discovery_route_lists_chain_identities_and_native_dataset_capabili
             ChainConfig {
                 kind: "tron".to_owned(),
                 chain_id: 1,
+                rpc_url: None,
                 rpc_urls: vec!["http://example.invalid".to_owned()],
+                rpc: None,
                 warmup: Default::default(),
                 trongrid: Default::default(),
                 finality: datalens_edge::config::FinalityConfig::Auto,
@@ -511,6 +513,7 @@ async fn test_discovery_route_lists_chain_identities_and_native_dataset_capabili
                     },
                     logs: LogsDatasetConfig {
                         enabled: false,
+                        reliability_enabled: true,
                         query_strategy: Default::default(),
                         max_get_logs_range_blocks: 2,
                         max_block_scan_range_blocks: 2,

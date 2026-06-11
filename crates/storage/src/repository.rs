@@ -155,6 +155,21 @@ fn merged_selector_ranges(
     merge_ranges(ranges)
 }
 
+fn durable_finality_satisfies(
+    entry: ManifestFinalityLevel,
+    requested: ManifestFinalityLevel,
+) -> bool {
+    match requested {
+        ManifestFinalityLevel::Safe => {
+            matches!(
+                entry,
+                ManifestFinalityLevel::Safe | ManifestFinalityLevel::Finalized
+            )
+        }
+        ManifestFinalityLevel::Finalized => entry == ManifestFinalityLevel::Finalized,
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct StorageWriteLogContext {
     chain_key: String,
@@ -226,6 +241,8 @@ impl StorageReadPlan {
     fn from_candidates(
         candidates: Vec<crate::selector_coverage::SelectorCoverageCandidate<'_>>,
     ) -> Result<Self, DatalensError> {
+        let mut candidates = candidates;
+        candidates.sort_by_key(|candidate| candidate.entry.object_key.is_none());
         let coverage_entries_count = candidates.len();
         let mut data_object_count = 0usize;
         let mut empty_coverage_count = 0usize;
@@ -411,6 +428,34 @@ where
         selector: &DatasetSelector,
         range: LedgerRange,
     ) -> Result<DatasetRows, DatalensError> {
+        self.read_rows_with_finality_filter(chain, dataset_key, selector, range, None)
+    }
+
+    pub fn read_rows_for_finality(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+        finality_level: FinalityLevel,
+    ) -> Result<DatasetRows, DatalensError> {
+        self.read_rows_with_finality_filter(
+            chain,
+            dataset_key,
+            selector,
+            range,
+            Some(ManifestFinalityLevel::try_from(finality_level)?),
+        )
+    }
+
+    fn read_rows_with_finality_filter(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+        finality_level: Option<ManifestFinalityLevel>,
+    ) -> Result<DatasetRows, DatalensError> {
         log::debug!(
             "storage read dataset={} range={}-{}",
             dataset_key.as_str(),
@@ -430,6 +475,16 @@ where
         } else {
             ("coverage_index_absent", Vec::new())
         };
+        let entries = entries
+            .into_iter()
+            .filter(|entry| {
+                finality_level
+                    .map(|finality_level| {
+                        durable_finality_satisfies(entry.finality_level, finality_level)
+                    })
+                    .unwrap_or(true)
+            })
+            .collect::<Vec<_>>();
         let entries_count = entries.len();
         let covered = merged_selector_ranges(&entries, chain, dataset_key, selector, &range);
         let missing_range_count = missing_ranges(range.clone(), &covered).len();
@@ -597,6 +652,21 @@ where
         &self,
         request: StorageWriteRequest<'_>,
     ) -> Result<StorageWriteOutcome, DatalensError> {
+        self.write_rows_with_replacement(request, false)
+    }
+
+    pub fn write_rows_replacing_existing(
+        &self,
+        request: StorageWriteRequest<'_>,
+    ) -> Result<StorageWriteOutcome, DatalensError> {
+        self.write_rows_with_replacement(request, true)
+    }
+
+    fn write_rows_with_replacement(
+        &self,
+        request: StorageWriteRequest<'_>,
+        replace_existing: bool,
+    ) -> Result<StorageWriteOutcome, DatalensError> {
         let StorageWriteRequest {
             chain,
             dataset_key,
@@ -709,9 +779,13 @@ where
             log_context.coverage_kind
         );
         let data_object = match (data_object, data_object_bytes) {
-            (Some(data_object), Some(bytes)) => {
-                Some(self.write_data_object_manifest_entry(chain, entry, data_object, bytes)?)
-            }
+            (Some(data_object), Some(bytes)) => Some(self.write_data_object_manifest_entry(
+                chain,
+                entry,
+                data_object,
+                bytes,
+                replace_existing,
+            )?),
             _ => {
                 self.write_manifest_entry(chain, entry)?;
                 None
@@ -938,12 +1012,15 @@ where
         entry: ManifestEntry,
         mut data_object: StorageDataObject,
         bytes: Vec<u8>,
+        replace_existing: bool,
     ) -> Result<StorageDataObject, DatalensError> {
         let started = Instant::now();
         let lock = self.manifest_update_lock(chain)?;
         let _guard = self.lock_manifest_updates(&lock)?;
 
-        if let Some(existing) = self.exact_manifest_segment_entry(chain, &entry)? {
+        if !replace_existing
+            && let Some(existing) = self.exact_manifest_segment_entry(chain, &entry)?
+        {
             validate_existing_data_object(&existing, &data_object)?;
             if existing.object_size_bytes.is_some()
                 && existing.checksum.is_some()
@@ -956,7 +1033,7 @@ where
             }
         }
 
-        if !self.existing_data_object_matches(&data_object)? {
+        if replace_existing || !self.existing_data_object_matches(&data_object)? {
             self.object_store.put(&data_object.object_key, &bytes)?;
         }
         if !self.object_store.exists(&data_object.object_key)? {
@@ -1161,10 +1238,33 @@ pub trait StorageRepository: Send + Sync {
         range: LedgerRange,
     ) -> Result<DatasetRows, DatalensError>;
 
+    fn read_rows_for_finality(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+        finality_level: FinalityLevel,
+    ) -> Result<DatasetRows, DatalensError> {
+        let _ = finality_level;
+        self.read_rows(chain, dataset_key, selector, range)
+    }
+
     fn write_rows(
         &self,
         request: StorageWriteRequest<'_>,
     ) -> Result<StorageWriteOutcome, DatalensError>;
+
+    fn write_rows_replacing_existing(
+        &self,
+        request: StorageWriteRequest<'_>,
+    ) -> Result<StorageWriteOutcome, DatalensError> {
+        let _ = request;
+        Err(DatalensError::new(
+            DatalensErrorKind::UnsupportedDataset,
+            "replacement write is not supported by this storage repository",
+        ))
+    }
 }
 
 impl<S> StorageRepository for DurableStorage<S>
@@ -1195,11 +1295,29 @@ where
         Self::read_rows(self, chain, dataset_key, selector, range)
     }
 
+    fn read_rows_for_finality(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+        finality_level: FinalityLevel,
+    ) -> Result<DatasetRows, DatalensError> {
+        Self::read_rows_for_finality(self, chain, dataset_key, selector, range, finality_level)
+    }
+
     fn write_rows(
         &self,
         request: StorageWriteRequest<'_>,
     ) -> Result<StorageWriteOutcome, DatalensError> {
         Self::write_rows(self, request)
+    }
+
+    fn write_rows_replacing_existing(
+        &self,
+        request: StorageWriteRequest<'_>,
+    ) -> Result<StorageWriteOutcome, DatalensError> {
+        Self::write_rows_replacing_existing(self, request)
     }
 }
 
@@ -1229,11 +1347,30 @@ impl StorageRepository for Box<dyn StorageRepository> {
         self.as_ref().read_rows(chain, dataset_key, selector, range)
     }
 
+    fn read_rows_for_finality(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+        finality_level: FinalityLevel,
+    ) -> Result<DatasetRows, DatalensError> {
+        self.as_ref()
+            .read_rows_for_finality(chain, dataset_key, selector, range, finality_level)
+    }
+
     fn write_rows(
         &self,
         request: StorageWriteRequest<'_>,
     ) -> Result<StorageWriteOutcome, DatalensError> {
         self.as_ref().write_rows(request)
+    }
+
+    fn write_rows_replacing_existing(
+        &self,
+        request: StorageWriteRequest<'_>,
+    ) -> Result<StorageWriteOutcome, DatalensError> {
+        self.as_ref().write_rows_replacing_existing(request)
     }
 }
 
@@ -1263,11 +1400,30 @@ impl StorageRepository for Arc<dyn StorageRepository> {
         self.as_ref().read_rows(chain, dataset_key, selector, range)
     }
 
+    fn read_rows_for_finality(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+        finality_level: FinalityLevel,
+    ) -> Result<DatasetRows, DatalensError> {
+        self.as_ref()
+            .read_rows_for_finality(chain, dataset_key, selector, range, finality_level)
+    }
+
     fn write_rows(
         &self,
         request: StorageWriteRequest<'_>,
     ) -> Result<StorageWriteOutcome, DatalensError> {
         self.as_ref().write_rows(request)
+    }
+
+    fn write_rows_replacing_existing(
+        &self,
+        request: StorageWriteRequest<'_>,
+    ) -> Result<StorageWriteOutcome, DatalensError> {
+        self.as_ref().write_rows_replacing_existing(request)
     }
 }
 

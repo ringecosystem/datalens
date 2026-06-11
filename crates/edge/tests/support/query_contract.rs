@@ -67,7 +67,9 @@ pub(crate) fn chain_config(max_addresses_per_query: usize) -> ChainConfig {
     ChainConfig {
         kind: "evm".to_owned(),
         chain_id: 1,
+        rpc_url: None,
         rpc_urls: vec!["http://example.invalid".to_owned()],
+        rpc: None,
         warmup: Default::default(),
         trongrid: Default::default(),
         finality: datalens_edge::config::FinalityConfig::Auto,
@@ -78,6 +80,7 @@ pub(crate) fn chain_config(max_addresses_per_query: usize) -> ChainConfig {
             },
             logs: LogsDatasetConfig {
                 enabled: true,
+                reliability_enabled: true,
                 query_strategy: Default::default(),
                 max_get_logs_range_blocks: 2,
                 max_block_scan_range_blocks: 2,

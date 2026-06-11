@@ -1,13 +1,16 @@
 use std::sync::Arc;
 
 use clap::{Args, Subcommand};
-use datalens_chain::{ChainAdapter, DatasetSelector, HeightRangeKind};
+use datalens_chain::{
+    ChainAdapter, ChainFetchRequest, DatasetSelector, FetchContext, FinalityLevel, HeightRangeKind,
+    SelectorKind, validate_durable_range,
+};
 use datalens_core::{
     ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey, LedgerRange, LedgerRangeKind,
-    LogFilter,
+    LogFilter, QueryStrategy,
 };
 use datalens_edge::auth::normalize_application_id;
-use datalens_evm::EvmRpcClient;
+use datalens_evm::{EvmLogReliabilityConfig, EvmRpcClient};
 use datalens_metrics::ApplicationIdentity;
 use datalens_runtime_indexer::{
     FileIndexCursorStore, IndexDatasetProviderLimit, IndexDatasetRequest, IndexDatasetSelection,
@@ -18,7 +21,7 @@ use datalens_solana::{
     SolanaAdapter, SolanaHttpRpc, solana_address_selector, solana_program_selector,
     solana_signature_selector,
 };
-use datalens_storage::StorageRepository;
+use datalens_storage::{StorageRepository, StorageWriteRequest};
 use datalens_tron::{
     TronAdapter, TronEventFilter, TronHttpProvider, tron_all_selector, tron_event_selector,
 };
@@ -26,8 +29,8 @@ use datalens_writer::DurableWriterConfig;
 
 use crate::{
     ChainConfig, DatalensConfig, build_storage, build_usage_ledger, chain_identity,
-    configured_chain, evm_block_header_metadata_config, evm_finality_policy, load_config,
-    validate_config,
+    configured_chain, evm_block_header_metadata_config, evm_finality_policy,
+    evm_log_reliability_config, load_config, validate_config,
 };
 
 use super::index_report::{plan_summary, run_summary};
@@ -76,6 +79,9 @@ pub struct CacheRepairCommand {
 
     #[arg(long)]
     pub dry_run: bool,
+
+    #[arg(long)]
+    pub force_refresh: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -174,21 +180,32 @@ pub fn cache_summary(command: CacheWorkflowCommand) -> Result<serde_json::Value,
     let chain = chain.clone();
     match chain.kind.as_str() {
         "evm" => {
-            let adapter = EvmRpcClient::with_chain(
-                chain.rpc_urls.clone(),
-                chain_identity(&chain_name, &chain)?,
-                evm_finality_policy(&chain.finality),
-                chain.datasets.blocks.max_batch_blocks,
-                chain.datasets.logs.max_get_logs_range_blocks,
-                chain.datasets.logs.max_block_scan_range_blocks,
-                chain.datasets.logs.max_addresses_per_query,
-            )
-            .with_logs_query_strategy(chain.datasets.logs.query_strategy)
-            .with_block_header_metadata_config(evm_block_header_metadata_config(&chain)?);
+            let adapter = if matches!(
+                command,
+                CacheWorkflowCommand::Repair(CacheRepairCommand {
+                    force_refresh: true,
+                    ..
+                })
+            ) {
+                force_refresh_evm_adapter(&chain_name, &chain)?
+            } else {
+                EvmRpcClient::with_chain(
+                    chain.rpc_provider_urls(),
+                    chain_identity(&chain_name, &chain)?,
+                    evm_finality_policy(&chain.finality),
+                    chain.datasets.blocks.max_batch_blocks,
+                    chain.datasets.logs.max_get_logs_range_blocks,
+                    chain.datasets.logs.max_block_scan_range_blocks,
+                    chain.datasets.logs.max_addresses_per_query,
+                )
+                .with_logs_query_strategy(chain.datasets.logs.query_strategy)
+                .with_log_reliability_config(evm_log_reliability_config(&chain))
+                .with_block_header_metadata_config(evm_block_header_metadata_config(&chain)?)
+            };
             cache_summary_with_context(command, config, &chain_name, &chain, adapter)
         }
         "solana" => {
-            let url = chain.rpc_urls.first().ok_or_else(|| {
+            let url = chain.primary_rpc_url().ok_or_else(|| {
                 DatalensError::new(
                     DatalensErrorKind::InvalidInput,
                     format!("chain {chain_name} must define at least one rpc URL"),
@@ -196,14 +213,14 @@ pub fn cache_summary(command: CacheWorkflowCommand) -> Result<serde_json::Value,
             })?;
             let adapter = SolanaAdapter::with_provider(
                 chain_identity(&chain_name, &chain)?,
-                SolanaHttpRpc::new(url.clone()),
+                SolanaHttpRpc::new(url.to_owned()),
             )
             .with_max_slot_range_len(chain.datasets.blocks.max_batch_blocks.max(1))
             .with_query_strategy(chain.datasets.logs.query_strategy);
             cache_summary_with_context(command, config, &chain_name, &chain, adapter)
         }
         "tron" => {
-            let url = chain.rpc_urls.first().ok_or_else(|| {
+            let url = chain.primary_rpc_url().ok_or_else(|| {
                 DatalensError::new(
                     DatalensErrorKind::InvalidInput,
                     format!("chain {chain_name} must define at least one rpc URL"),
@@ -211,7 +228,7 @@ pub fn cache_summary(command: CacheWorkflowCommand) -> Result<serde_json::Value,
             })?;
             let adapter = TronAdapter::with_provider(
                 chain_identity(&chain_name, &chain)?,
-                tron_provider(url.clone(), &chain),
+                tron_provider(url.to_owned(), &chain),
             )
             .with_max_block_range_len(chain.datasets.blocks.max_batch_blocks.max(1))
             .with_events_query_strategy(chain.datasets.logs.query_strategy);
@@ -223,6 +240,25 @@ pub fn cache_summary(command: CacheWorkflowCommand) -> Result<serde_json::Value,
         )),
     }
 }
+
+fn force_refresh_evm_adapter(
+    chain_name: &str,
+    chain: &ChainConfig,
+) -> Result<EvmRpcClient, DatalensError> {
+    Ok(EvmRpcClient::with_chain(
+        chain.rpc_provider_urls(),
+        chain_identity(chain_name, chain)?,
+        evm_finality_policy(&chain.finality),
+        chain.datasets.blocks.max_batch_blocks,
+        chain.datasets.logs.max_get_logs_range_blocks,
+        chain.datasets.logs.max_block_scan_range_blocks,
+        chain.datasets.logs.max_addresses_per_query,
+    )
+    .with_logs_query_strategy(QueryStrategy::ProviderFilter)
+    .with_log_reliability_config(EvmLogReliabilityConfig::default().with_enabled(true))
+    .with_block_header_metadata_config(evm_block_header_metadata_config(chain)?))
+}
+
 pub fn cache_summary_with_adapter<A>(
     command: CacheWorkflowCommand,
     adapter: A,
@@ -253,6 +289,19 @@ where
     let dry_run = cache_dry_run(&command);
     let job = cache_job(&config, chain_name, chain, &command)?;
     let storage: Arc<dyn StorageRepository> = Arc::from(build_storage(&config)?);
+    if let CacheWorkflowCommand::Repair(repair) = &command
+        && repair.force_refresh
+    {
+        return cache_force_refresh_summary(
+            &common.config,
+            chain_name,
+            chain,
+            adapter,
+            storage,
+            &job,
+            dry_run,
+        );
+    }
     let covered_ranges = covered_ranges(storage.clone(), &job)?;
     let finality_boundary = match job.finality_requirement {
         IndexFinalityRequirement::Safe => adapter.cache_safe_height()?,
@@ -309,7 +358,140 @@ where
         &config,
         &result,
         matches!(command, CacheWorkflowCommand::Verify(_)),
-    ))
+    )
+    .as_object()
+    .map(|summary| {
+        let mut summary = summary.clone();
+        summary.insert("force_refresh".to_owned(), serde_json::json!(false));
+        serde_json::Value::Object(summary)
+    })
+    .unwrap_or_else(|| serde_json::json!({ "force_refresh": false })))
+}
+
+fn cache_force_refresh_summary<A>(
+    config_path: &str,
+    chain_name: &str,
+    chain: &ChainConfig,
+    adapter: A,
+    storage: Arc<dyn StorageRepository>,
+    job: &IndexJob,
+    dry_run: bool,
+) -> Result<serde_json::Value, DatalensError>
+where
+    A: ChainAdapter,
+{
+    if chain.kind != "evm" {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "cache repair --force-refresh is only supported for EVM logs",
+        ));
+    }
+    let datasets = selected_datasets(job)?;
+    if datasets.len() != 1 || datasets[0].dataset_key != DatasetKey::evm_logs() {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "cache repair --force-refresh requires exactly one --dataset logs selector",
+        ));
+    }
+    if job.range.kind() != LedgerRangeKind::Block {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "cache repair --force-refresh for EVM logs requires --range-kind block",
+        ));
+    }
+    let dataset = &datasets[0];
+    let finality_boundary = match job.finality_requirement {
+        IndexFinalityRequirement::Safe => adapter.cache_safe_height()?,
+        IndexFinalityRequirement::Finalized => adapter.finalized_height()?,
+    };
+    validate_durable_range(&job.range, &finality_boundary)?;
+
+    if dry_run {
+        return Ok(serde_json::json!({
+            "config": config_path,
+            "chain": chain_name,
+            "mode": "repair",
+            "status": "planned",
+            "dry_run": true,
+            "force_refresh": true,
+            "dataset": dataset.dataset_key.as_str(),
+            "selector": {
+                "kind": selector_kind_name(dataset.selector.kind()),
+                "fingerprint": dataset.selector.fingerprint(),
+                "canonical_key": dataset.selector.canonical_key(),
+            },
+            "refreshed_range": {
+                "kind": range_kind_name(job.range.kind()),
+                "start": job.range.start(),
+                "end": job.range.end(),
+            },
+            "rows_written": 0,
+            "accounting": {
+                "chunks_planned": 1,
+                "chunks_written": 0,
+                "rows_written": 0,
+            },
+            "provider_diagnostics": null,
+        }));
+    }
+
+    let request = ChainFetchRequest::new(
+        job.chain.clone(),
+        dataset.dataset_key.clone(),
+        job.range.clone(),
+        dataset.selector.clone(),
+    )
+    .with_context(FetchContext {
+        request_id: Some(job.id.as_str().to_owned()),
+        cache_write: true,
+    });
+    let response = adapter.fetch(request.clone())?;
+    response.validate_for_request(&request)?;
+    let diagnostics = response.provider_diagnostics.clone();
+    let rows = response.rows;
+    let outcome = storage.write_rows_replacing_existing(StorageWriteRequest {
+        chain: &job.chain,
+        dataset_key: dataset.dataset_key.clone(),
+        selector: &dataset.selector,
+        range: job.range.clone(),
+        rows: &rows,
+        finality_level: match job.finality_requirement {
+            IndexFinalityRequirement::Safe => FinalityLevel::Safe,
+            IndexFinalityRequirement::Finalized => FinalityLevel::Finalized,
+        },
+        record_empty_coverage: true,
+    })?;
+
+    Ok(serde_json::json!({
+        "config": config_path,
+        "chain": chain_name,
+        "mode": "repair",
+        "status": "completed",
+        "dry_run": false,
+        "force_refresh": true,
+        "dataset": dataset.dataset_key.as_str(),
+        "selector": {
+            "kind": selector_kind_name(dataset.selector.kind()),
+            "fingerprint": dataset.selector.fingerprint(),
+            "canonical_key": dataset.selector.canonical_key(),
+        },
+        "refreshed_range": {
+            "kind": range_kind_name(outcome.range.kind()),
+            "start": outcome.range.start(),
+            "end": outcome.range.end(),
+        },
+        "rows_written": outcome.row_count,
+        "accounting": {
+            "chunks_planned": 1,
+            "chunks_written": 1,
+            "rows_written": outcome.row_count,
+        },
+        "provider_diagnostics": {
+            "calls": diagnostics.calls,
+            "rows_scanned": diagnostics.rows_scanned,
+            "warnings": diagnostics.warnings,
+        },
+    }))
 }
 
 fn cache_job(
@@ -561,6 +743,23 @@ fn range_kind(value: &str) -> Result<HeightRangeKind, DatalensError> {
             DatalensErrorKind::InvalidInput,
             "range kind must not be empty",
         )),
+    }
+}
+
+fn range_kind_name(kind: HeightRangeKind) -> String {
+    match kind {
+        LedgerRangeKind::Block => "block".to_owned(),
+        LedgerRangeKind::Slot => "slot".to_owned(),
+        LedgerRangeKind::Height => "height".to_owned(),
+        LedgerRangeKind::Other(value) => value,
+    }
+}
+
+fn selector_kind_name(kind: SelectorKind) -> String {
+    match kind {
+        SelectorKind::All => "all".to_owned(),
+        SelectorKind::EvmLogs => "evm_logs".to_owned(),
+        SelectorKind::Other(value) => value.as_str().to_owned(),
     }
 }
 

@@ -154,6 +154,19 @@ pub(crate) fn is_finality_tag_unsupported(error: &DatalensError) -> bool {
     )
 }
 
+pub(crate) fn is_block_receipts_unsupported(error: &DatalensError) -> bool {
+    if error.kind == DatalensErrorKind::UnsupportedDataset {
+        return true;
+    }
+    if error.kind != DatalensErrorKind::ProviderFailure {
+        return false;
+    }
+    let lower = error.message.to_ascii_lowercase();
+    lower.contains("method unavailable")
+        || lower.contains("method not available")
+        || lower.contains("method is not available")
+}
+
 pub(crate) fn zero_lag_error() -> DatalensError {
     DatalensError::new(
         DatalensErrorKind::InvalidInput,
