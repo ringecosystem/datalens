@@ -15,6 +15,7 @@ use datalens_core::{
     DatasetKey, EvmBlockHeader, EvmLogFilter, EvmReceipt, EvmTransaction, LedgerRange, LogFilter,
     LogRecord, QueryRows, QueryStrategy, TopicFilter, redact_urls_in_text,
 };
+use datalens_storage::StorageRepository;
 use reqwest::blocking::Client;
 use serde_json::{Value, json};
 
@@ -26,7 +27,7 @@ pub use crate::provider_payload::{
     classify_provider_error, height_from_latest_lag, parse_log_record, parse_receipt,
     parse_transaction,
 };
-use crate::{EvmBlockHeaderFetch, EvmBlockHeaderFetcher};
+use crate::{DurableEvmBlockHeaderStore, EvmBlockHeaderFetch, EvmBlockHeaderFetcher};
 use crate::{EvmBlockHeaderResolveRequest, EvmBlockHeaderResolver, EvmLogBloom};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -330,6 +331,7 @@ pub struct EvmRpcClient {
     block_header_metadata: EvmBlockHeaderMetadataConfig,
     log_reliability: EvmLogReliabilityConfig,
     block_header_cache: Arc<Mutex<BlockHeaderCache>>,
+    block_header_store: Option<DurableEvmBlockHeaderStore<Arc<dyn StorageRepository>>>,
 }
 
 impl EvmRpcClient {
@@ -347,6 +349,7 @@ impl EvmRpcClient {
             block_header_metadata: EvmBlockHeaderMetadataConfig::default(),
             log_reliability: EvmLogReliabilityConfig::default(),
             block_header_cache: Arc::new(Mutex::new(BlockHeaderCache::default())),
+            block_header_store: None,
         }
     }
 
@@ -372,6 +375,7 @@ impl EvmRpcClient {
             block_header_metadata: EvmBlockHeaderMetadataConfig::default(),
             log_reliability: EvmLogReliabilityConfig::default(),
             block_header_cache: Arc::new(Mutex::new(BlockHeaderCache::default())),
+            block_header_store: None,
         }
     }
 
@@ -400,6 +404,14 @@ impl EvmRpcClient {
 
     pub fn block_header_metadata_config(&self) -> &EvmBlockHeaderMetadataConfig {
         &self.block_header_metadata
+    }
+
+    pub fn with_block_header_store(
+        mut self,
+        store: DurableEvmBlockHeaderStore<Arc<dyn StorageRepository>>,
+    ) -> Self {
+        self.block_header_store = Some(store);
+        self
     }
 
     pub fn primary_provider_url(&self) -> Option<&str> {
@@ -606,8 +618,7 @@ impl EvmRpcClient {
             return Ok((primary_logs, None));
         }
 
-        let resolver = EvmBlockHeaderResolver::without_store(self.clone());
-        let headers = resolver.resolve(EvmBlockHeaderResolveRequest {
+        let headers = self.resolve_reliability_headers(EvmBlockHeaderResolveRequest {
             chain: self.chain.clone(),
             range,
             finality_level: FinalityLevel::Safe,
@@ -619,7 +630,11 @@ impl EvmRpcClient {
             if !range.contains(header.block_number) {
                 continue;
             }
-            if header_bloom_may_match_filter(header, filter)? {
+            if header_bloom_may_match_filter(header, filter)?
+                && !primary_logs.iter().any(|log| {
+                    log.block_number == header.block_number && log_matches_filter(log, filter)
+                })
+            {
                 suspicious_blocks.push(header.block_number);
             }
         }
@@ -671,13 +686,14 @@ impl EvmRpcClient {
                             "EVM log reliability secondary provider failed",
                         )
                     });
-                    return Err(DatalensError::new(
+                    log::warn!(
+                        "EVM log reliability secondary eth_getLogs failed for range {}-{} kind={:?}: {}; trying receipt fallback",
+                        suspicious_range.from_block,
+                        suspicious_range.to_block,
                         error.kind,
-                        format!(
-                            "EVM log reliability secondary eth_getLogs failed for range {}-{}: {}",
-                            suspicious_range.from_block, suspicious_range.to_block, error.message
-                        ),
-                    ));
+                        error.message
+                    );
+                    continue;
                 };
                 logs.retain(|log| suspicious_range.contains(log.block_number));
                 merged.append(&mut logs);
@@ -742,6 +758,17 @@ impl EvmRpcClient {
             diagnostics.recovery_available || diagnostics.receipt_fallback_calls > 0;
         dedupe_and_sort_logs(&mut merged);
         Ok((merged, Some(diagnostics)))
+    }
+
+    fn resolve_reliability_headers(
+        &self,
+        request: EvmBlockHeaderResolveRequest,
+    ) -> Result<Vec<EvmBlockHeader>, DatalensError> {
+        if let Some(store) = &self.block_header_store {
+            EvmBlockHeaderResolver::with_store(self.clone(), store.clone()).resolve(request)
+        } else {
+            EvmBlockHeaderResolver::without_store(self.clone()).resolve(request)
+        }
     }
 
     fn fetch_logs_from_receipt_fallback(
@@ -1190,6 +1217,21 @@ impl ChainAdapter for EvmRpcClient {
                     .with_reorg_signals(true),
             )
             .with_dataset_capability(
+                DatasetCapability::new(Dataset::BlockHeaders)
+                    .with_selector(SelectorKind::All)
+                    .with_range(HeightRangeKind::Block)
+                    .with_max_range_len(self.max_block_batch_blocks)
+                    .with_empty_coverage(true)
+                    .with_safe_height(true)
+                    .with_finalized_height(true)
+                    .with_provider_native_finality_tags(matches!(
+                        self.finality_policy,
+                        EvmFinalityPolicy::Auto | EvmFinalityPolicy::RpcTags { .. }
+                    ))
+                    .with_range_split(true)
+                    .with_reorg_signals(true),
+            )
+            .with_dataset_capability(
                 DatasetCapability::new(Dataset::Logs)
                     .with_selector(SelectorKind::All)
                     .with_selector(SelectorKind::EvmLogs)
@@ -1412,6 +1454,13 @@ impl ChainAdapter for EvmRpcClient {
                 let provider_calls = range.len().min(usize::MAX as u128) as usize + receipts.len();
                 (QueryRows::EvmReceipts(receipts), provider_calls)
             }
+            (dataset, DatasetSelector::All) if *dataset == DatasetKey::evm_block_headers() => {
+                let headers = self.fetch_block_headers(range)?.headers;
+                (
+                    QueryRows::EvmBlockHeaders(headers),
+                    range.len().min(usize::MAX as u128) as usize,
+                )
+            }
             (dataset, DatasetSelector::All) if *dataset == DatasetKey::evm_logs() => {
                 let filter = EvmLogFilter::try_from(LogFilter {
                     addresses: Vec::new(),
@@ -1492,6 +1541,12 @@ impl ChainAdapter for EvmRpcClient {
                 return Err(DatalensError::new(
                     DatalensErrorKind::UnsupportedDataset,
                     "receipts require all selector",
+                ));
+            }
+            (dataset, _) if *dataset == DatasetKey::evm_block_headers() => {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::UnsupportedDataset,
+                    "block headers require all selector",
                 ));
             }
             (dataset, _) if *dataset == DatasetKey::evm_logs() => {

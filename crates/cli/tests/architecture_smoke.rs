@@ -144,7 +144,11 @@ fn production_boundary_artifacts_are_declared() {
     assert!(dockerignore.contains("tests/fixtures"));
     assert!(dockerignore.contains(".tmp"));
 
-    assert!(production_config.contains("rpc_urls = [\"${DATALENS_ETHEREUM_RPC_URL}\"]"));
+    assert!(production_config.contains("[chains.ethereum.rpc]"));
+    assert!(production_config.contains("primary_url = \"${DATALENS_ETHEREUM_RPC_URL}\""));
+    assert!(
+        production_config.contains("secondary_urls = [\"${DATALENS_ETHEREUM_SECONDARY_RPC_URL}\"]")
+    );
     assert!(production_config.contains("token = \"${DATALENS_PUBLIC_APP_TOKEN}\""));
     assert!(production_config.contains("bucket = \"${DATALENS_S3_BUCKET}\""));
     assert!(production_config.contains("prefix = \"${DATALENS_S3_PREFIX}\""));

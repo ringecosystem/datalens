@@ -484,8 +484,8 @@ fn test_provider_filter_logs_reliability_merges_dedupes_and_sorts_secondary_rows
     assert_eq!(response.provider_diagnostics.calls, 2);
     let secondary_requests = secondary_requests.lock().expect("secondary requests");
     assert_eq!(secondary_requests.len(), 1);
-    assert_eq!(secondary_requests[0]["params"][0]["fromBlock"], "0xa");
-    assert_eq!(secondary_requests[0]["params"][0]["toBlock"], "0xc");
+    assert_eq!(secondary_requests[0]["params"][0]["fromBlock"], "0xb");
+    assert_eq!(secondary_requests[0]["params"][0]["toBlock"], "0xb");
 }
 
 #[test]
@@ -700,6 +700,82 @@ fn test_provider_filter_logs_reliability_recovers_secondary_empty_bloom_candidat
     assert_eq!(rows[0].address, address);
     assert_eq!(rows[0].parent_hash.as_deref(), Some("0xparent10"));
     assert_eq!(rows[0].block_timestamp, Some(10));
+    assert!(
+        response
+            .provider_diagnostics
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("reliability_receipt_recovered_blocks=1"))
+    );
+    assert_eq!(
+        secondary_requests.lock().expect("secondary requests").len(),
+        1
+    );
+    let primary_requests = primary_requests.lock().expect("primary requests");
+    assert_eq!(primary_requests.len(), 3);
+    assert_eq!(primary_requests[2]["method"], "eth_getBlockReceipts");
+}
+
+#[test]
+fn test_provider_filter_logs_reliability_falls_back_to_receipts_when_secondary_fails() {
+    let topic = transfer_topic();
+    let address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let block_hash = block_hash(10);
+    let bloom = EvmLogBloom::from_inputs([
+        EvmLogBloomInput::Address(address),
+        EvmLogBloomInput::Topic(topic),
+    ])
+    .expect("bloom")
+    .as_hex();
+    let receipt_log = provider_log_with_address(10, &block_hash, "0xtx", 0, 0, address, topic);
+    let (primary_url, primary_requests) = start_rpc_server(vec![
+        logs_response(Vec::new()),
+        json!([block_batch_response_with_bloom(
+            1,
+            10,
+            &block_hash,
+            "0xparent10",
+            10,
+            &bloom
+        )]),
+        block_receipts_response(vec![receipt(10, &block_hash, "0xtx", 0, vec![receipt_log])]),
+    ]);
+    let (secondary_url, secondary_requests) = start_rpc_server(vec![provider_error_response(
+        -32000,
+        "secondary unavailable",
+    )]);
+    let client = EvmRpcClient::with_chain(
+        vec![primary_url, secondary_url],
+        ethereum_identity(),
+        EvmFinalityPolicy::Lag {
+            safe_lag_blocks: Some(2),
+            finalized_lag_blocks: Some(4),
+        },
+        10,
+        10,
+        3,
+        10,
+    );
+    let filter = datalens_core::EvmLogFilter::try_from(LogFilter {
+        addresses: vec![address.to_owned()],
+        topics: vec![Some(vec![topic.to_owned()])],
+    })
+    .expect("filter");
+
+    let response = client
+        .fetch(ChainFetchRequest::new(
+            ethereum_identity(),
+            DatasetKey::evm_logs(),
+            LedgerRange::from_block_range(BlockRange::expect_new(10, 10)),
+            DatasetSelector::EvmLogs(filter),
+        ))
+        .expect("receipt fallback should recover after secondary failure");
+
+    let QueryRows::EvmLogs(rows) = response.rows.rows() else {
+        panic!("expected EVM logs");
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].address, address);
     assert!(
         response
             .provider_diagnostics
@@ -999,7 +1075,7 @@ fn test_provider_filter_logs_reliability_receipt_fallback_applies_original_filte
 }
 
 #[test]
-fn test_provider_filter_logs_reliability_recovers_partial_omission_inside_block() {
+fn test_provider_filter_logs_reliability_does_not_recheck_primary_covered_block() {
     let topic = transfer_topic();
     let address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let block_hash = block_hash(10);
@@ -1010,7 +1086,6 @@ fn test_provider_filter_logs_reliability_recovers_partial_omission_inside_block(
     .expect("bloom")
     .as_hex();
     let primary_log = provider_log_with_address(10, &block_hash, "0xtx0", 0, 0, address, topic);
-    let secondary_log = provider_log_with_address(10, &block_hash, "0xtx1", 1, 1, address, topic);
     let (primary_url, _primary_requests) = start_rpc_server(vec![
         logs_response(vec![primary_log.clone()]),
         json!([block_batch_response_with_bloom(
@@ -1022,8 +1097,7 @@ fn test_provider_filter_logs_reliability_recovers_partial_omission_inside_block(
             &bloom
         )]),
     ]);
-    let (secondary_url, secondary_requests) =
-        start_rpc_server(vec![logs_response(vec![primary_log, secondary_log])]);
+    let (secondary_url, secondary_requests) = start_rpc_server(Vec::new());
     let client = EvmRpcClient::with_chain(
         vec![primary_url, secondary_url],
         ethereum_identity(),
@@ -1054,22 +1128,19 @@ fn test_provider_filter_logs_reliability_recovers_partial_omission_inside_block(
     let QueryRows::EvmLogs(rows) = response.rows.rows() else {
         panic!("expected EVM logs");
     };
-    assert_eq!(
-        rows.iter()
-            .map(|log| (log.transaction_index, log.log_index))
-            .collect::<Vec<_>>(),
-        vec![(0, 0), (1, 1)]
-    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].transaction_index, 0);
+    assert_eq!(rows[0].log_index, 0);
     assert!(
         rows.iter()
             .all(|log| log.parent_hash.as_deref() == Some("0xparent10"))
     );
     assert!(rows.iter().all(|log| log.block_timestamp == Some(10)));
     let secondary_requests = secondary_requests.lock().expect("secondary requests");
-    assert_eq!(secondary_requests.len(), 1);
-    assert_eq!(secondary_requests[0]["method"], "eth_getLogs");
-    assert_eq!(secondary_requests[0]["params"][0]["fromBlock"], "0xa");
-    assert_eq!(secondary_requests[0]["params"][0]["toBlock"], "0xa");
+    assert!(
+        secondary_requests.is_empty(),
+        "primary-covered bloom-positive blocks should stay on the primary eth_getLogs fast path"
+    );
 }
 
 #[test]

@@ -11,8 +11,8 @@ use datalens_core::{ChainIdentity, DatalensError, DatalensErrorKind};
 use datalens_edge::config::{ChainConfig, DatalensConfig, FinalityConfig};
 use datalens_edge::{QueryService, QueryServiceRegistry};
 use datalens_evm::{
-    EvmBlockHeaderFetchMode, EvmBlockHeaderMetadataConfig, EvmFinalityPolicy,
-    EvmLogReliabilityConfig, EvmRpcClient,
+    DurableEvmBlockHeaderStore, EvmBlockHeaderFetchMode, EvmBlockHeaderMetadataConfig,
+    EvmFinalityPolicy, EvmLogReliabilityConfig, EvmRpcClient,
 };
 use datalens_metrics::ApplicationIdentity;
 use datalens_solana::{SolanaAdapter, SolanaHttpRpc};
@@ -316,7 +316,11 @@ fn build_evm_service_with_storage(
     )
     .with_logs_query_strategy(chain.datasets.logs.query_strategy)
     .with_log_reliability_config(evm_log_reliability_config(chain))
-    .with_block_header_metadata_config(evm_block_header_metadata_config(chain)?);
+    .with_block_header_metadata_config(evm_block_header_metadata_config(chain)?)
+    .with_block_header_store(DurableEvmBlockHeaderStore::new(
+        stores.storage.clone(),
+        durable_writer_config(&config.writer),
+    ));
     let mut service = datalens_edge::QueryService::new_with_metrics_config(
         stores.storage.clone(),
         source.clone(),
