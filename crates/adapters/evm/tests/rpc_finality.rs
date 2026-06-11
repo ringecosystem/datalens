@@ -547,17 +547,24 @@ fn test_provider_filter_logs_reliability_disabled_preserves_primary_only_empty_c
 }
 
 #[test]
-fn test_provider_filter_logs_reliability_warns_on_bloom_candidate_without_secondary_provider() {
-    let topic = transfer_topic();
-    let address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+fn test_provider_filter_logs_reliability_recovers_no_secondary_bloom_candidate_from_block_receipts()
+{
+    let vote_cast = topic_with_prefix("bb");
+    let transfer = transfer_topic();
+    let governor = "0x1111111111111111111111111111111111111111";
+    let token = "0x2222222222222222222222222222222222222222";
     let block_hash = block_hash(10);
     let bloom = EvmLogBloom::from_inputs([
-        EvmLogBloomInput::Address(address),
-        EvmLogBloomInput::Topic(topic),
+        EvmLogBloomInput::Address(governor),
+        EvmLogBloomInput::Address(token),
+        EvmLogBloomInput::Topic(&vote_cast),
+        EvmLogBloomInput::Topic(transfer),
     ])
     .expect("bloom")
     .as_hex();
-    let (primary_url, _primary_requests) = start_rpc_server(vec![
+    let vote_log = provider_log_with_address(10, &block_hash, "0xtx0", 0, 0, governor, &vote_cast);
+    let transfer_log = provider_log_with_address(10, &block_hash, "0xtx1", 1, 1, token, transfer);
+    let (primary_url, primary_requests) = start_rpc_server(vec![
         logs_response(Vec::new()),
         json!([block_batch_response_with_bloom(
             1,
@@ -567,6 +574,174 @@ fn test_provider_filter_logs_reliability_warns_on_bloom_candidate_without_second
             10,
             &bloom
         )]),
+        block_receipts_response(vec![
+            receipt(10, &block_hash, "0xtx0", 0, vec![vote_log]),
+            receipt(10, &block_hash, "0xtx1", 1, vec![transfer_log]),
+        ]),
+    ]);
+    let client = EvmRpcClient::with_chain(
+        vec![primary_url],
+        ethereum_identity(),
+        EvmFinalityPolicy::Lag {
+            safe_lag_blocks: Some(2),
+            finalized_lag_blocks: Some(4),
+        },
+        10,
+        10,
+        3,
+        10,
+    );
+    let filter = datalens_core::EvmLogFilter::try_from(LogFilter {
+        addresses: vec![governor.to_owned(), token.to_owned()],
+        topics: vec![Some(vec![vote_cast.to_owned(), transfer.to_owned()])],
+    })
+    .expect("filter");
+
+    let response = client
+        .fetch(ChainFetchRequest::new(
+            ethereum_identity(),
+            DatasetKey::evm_logs(),
+            LedgerRange::from_block_range(BlockRange::expect_new(10, 10)),
+            DatasetSelector::EvmLogs(filter),
+        ))
+        .expect("logs");
+
+    let QueryRows::EvmLogs(rows) = response.rows.rows() else {
+        panic!("expected EVM logs");
+    };
+    assert_eq!(
+        rows.iter()
+            .map(|log| (log.address.as_str(), log.topics[0].as_str()))
+            .collect::<Vec<_>>(),
+        vec![(governor, vote_cast.as_str()), (token, transfer)]
+    );
+    assert!(
+        rows.iter()
+            .all(|log| log.parent_hash.as_deref() == Some("0xparent10"))
+    );
+    assert!(rows.iter().all(|log| log.block_timestamp == Some(10)));
+    assert!(
+        response
+            .provider_diagnostics
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("reliability_receipt_fallback_calls=1"))
+    );
+    assert!(
+        response
+            .provider_diagnostics
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("reliability_receipt_recovered_blocks=1"))
+    );
+    let primary_requests = primary_requests.lock().expect("primary requests");
+    assert_eq!(primary_requests.len(), 3);
+    assert_eq!(primary_requests[2]["method"], "eth_getBlockReceipts");
+    assert_eq!(primary_requests[2]["params"][0], "0xa");
+}
+
+#[test]
+fn test_provider_filter_logs_reliability_recovers_secondary_empty_bloom_candidate_from_block_receipts()
+ {
+    let topic = transfer_topic();
+    let address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let block_hash = block_hash(10);
+    let bloom = EvmLogBloom::from_inputs([
+        EvmLogBloomInput::Address(address),
+        EvmLogBloomInput::Topic(topic),
+    ])
+    .expect("bloom")
+    .as_hex();
+    let receipt_log = provider_log_with_address(10, &block_hash, "0xtx", 0, 0, address, topic);
+    let (primary_url, primary_requests) = start_rpc_server(vec![
+        logs_response(Vec::new()),
+        json!([block_batch_response_with_bloom(
+            1,
+            10,
+            &block_hash,
+            "0xparent10",
+            10,
+            &bloom
+        )]),
+        block_receipts_response(vec![receipt(10, &block_hash, "0xtx", 0, vec![receipt_log])]),
+    ]);
+    let (secondary_url, secondary_requests) = start_rpc_server(vec![logs_response(Vec::new())]);
+    let client = EvmRpcClient::with_chain(
+        vec![primary_url, secondary_url],
+        ethereum_identity(),
+        EvmFinalityPolicy::Lag {
+            safe_lag_blocks: Some(2),
+            finalized_lag_blocks: Some(4),
+        },
+        10,
+        10,
+        3,
+        10,
+    );
+    let filter = datalens_core::EvmLogFilter::try_from(LogFilter {
+        addresses: vec![address.to_owned()],
+        topics: vec![Some(vec![topic.to_owned()])],
+    })
+    .expect("filter");
+
+    let response = client
+        .fetch(ChainFetchRequest::new(
+            ethereum_identity(),
+            DatasetKey::evm_logs(),
+            LedgerRange::from_block_range(BlockRange::expect_new(10, 10)),
+            DatasetSelector::EvmLogs(filter),
+        ))
+        .expect("logs");
+
+    let QueryRows::EvmLogs(rows) = response.rows.rows() else {
+        panic!("expected EVM logs");
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].address, address);
+    assert_eq!(rows[0].parent_hash.as_deref(), Some("0xparent10"));
+    assert_eq!(rows[0].block_timestamp, Some(10));
+    assert!(
+        response
+            .provider_diagnostics
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("reliability_receipt_recovered_blocks=1"))
+    );
+    assert_eq!(
+        secondary_requests.lock().expect("secondary requests").len(),
+        1
+    );
+    let primary_requests = primary_requests.lock().expect("primary requests");
+    assert_eq!(primary_requests.len(), 3);
+    assert_eq!(primary_requests[2]["method"], "eth_getBlockReceipts");
+}
+
+#[test]
+fn test_provider_filter_logs_reliability_falls_back_to_transaction_receipts_when_block_receipts_unsupported()
+ {
+    let topic = transfer_topic();
+    let address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let block_hash = block_hash(10);
+    let bloom = EvmLogBloom::from_inputs([
+        EvmLogBloomInput::Address(address),
+        EvmLogBloomInput::Topic(topic),
+    ])
+    .expect("bloom")
+    .as_hex();
+    let receipt_log = provider_log_with_address(10, &block_hash, "0xtx", 0, 0, address, topic);
+    let (primary_url, primary_requests) = start_rpc_server(vec![
+        logs_response(Vec::new()),
+        json!([block_batch_response_with_bloom(
+            1,
+            10,
+            &block_hash,
+            "0xparent10",
+            10,
+            &bloom
+        )]),
+        unsupported_method_response("method not found"),
+        block_with_transaction_hashes_response(10, &block_hash, "0xparent10", 10, vec!["0xtx"]),
+        receipt_response(receipt(10, &block_hash, "0xtx", 0, vec![receipt_log])),
     ]);
     let client = EvmRpcClient::with_chain(
         vec![primary_url],
@@ -598,23 +773,86 @@ fn test_provider_filter_logs_reliability_warns_on_bloom_candidate_without_second
     let QueryRows::EvmLogs(rows) = response.rows.rows() else {
         panic!("expected EVM logs");
     };
-    assert!(rows.is_empty());
-    assert_eq!(response.provider_diagnostics.calls, 1);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].transaction_hash, "0xtx");
     assert!(
         response
             .provider_diagnostics
             .warnings
             .iter()
-            .any(|warning| warning.contains("reliability_unrecovered_blocks=1"))
+            .any(|warning| warning.contains("reliability_receipt_fallback_calls=3"))
     );
-    assert!(
-        response
-            .provider_diagnostics
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("reliability_recovery_available=false"))
+    let primary_requests = primary_requests.lock().expect("primary requests");
+    assert_eq!(primary_requests[2]["method"], "eth_getBlockReceipts");
+    assert_eq!(primary_requests[3]["method"], "eth_getBlockByNumber");
+    assert_eq!(primary_requests[3]["params"][1], false);
+    assert_eq!(primary_requests[4]["method"], "eth_getTransactionReceipt");
+}
+
+#[test]
+fn test_provider_filter_logs_reliability_receipt_fallback_applies_original_filter() {
+    let topic = transfer_topic();
+    let unrelated = unrelated_topic();
+    let address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let unrelated_address = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let block_hash = block_hash(10);
+    let bloom = EvmLogBloom::from_inputs([
+        EvmLogBloomInput::Address(address),
+        EvmLogBloomInput::Topic(topic),
+    ])
+    .expect("bloom")
+    .as_hex();
+    let matched_log = provider_log_with_address(10, &block_hash, "0xtx0", 0, 0, address, topic);
+    let unrelated_log =
+        provider_log_with_address(10, &block_hash, "0xtx1", 1, 1, unrelated_address, unrelated);
+    let (primary_url, _primary_requests) = start_rpc_server(vec![
+        logs_response(Vec::new()),
+        json!([block_batch_response_with_bloom(
+            1,
+            10,
+            &block_hash,
+            "0xparent10",
+            10,
+            &bloom
+        )]),
+        block_receipts_response(vec![
+            receipt(10, &block_hash, "0xtx0", 0, vec![matched_log]),
+            receipt(10, &block_hash, "0xtx1", 1, vec![unrelated_log]),
+        ]),
+    ]);
+    let client = EvmRpcClient::with_chain(
+        vec![primary_url],
+        ethereum_identity(),
+        EvmFinalityPolicy::Lag {
+            safe_lag_blocks: Some(2),
+            finalized_lag_blocks: Some(4),
+        },
+        10,
+        10,
+        3,
+        10,
     );
-    assert_eq!(_primary_requests.lock().expect("primary requests").len(), 2);
+    let filter = datalens_core::EvmLogFilter::try_from(LogFilter {
+        addresses: vec![address.to_owned()],
+        topics: vec![Some(vec![topic.to_owned()])],
+    })
+    .expect("filter");
+
+    let response = client
+        .fetch(ChainFetchRequest::new(
+            ethereum_identity(),
+            DatasetKey::evm_logs(),
+            LedgerRange::from_block_range(BlockRange::expect_new(10, 10)),
+            DatasetSelector::EvmLogs(filter),
+        ))
+        .expect("logs");
+
+    let QueryRows::EvmLogs(rows) = response.rows.rows() else {
+        panic!("expected EVM logs");
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].address, address);
+    assert_eq!(rows[0].topics, vec![topic.to_owned()]);
 }
 
 #[test]
@@ -1706,6 +1944,17 @@ fn unsupported_tag_response() -> Value {
     })
 }
 
+fn unsupported_method_response(message: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "error": {
+            "code": -32601,
+            "message": message
+        }
+    })
+}
+
 fn transfer_topic() -> &'static str {
     "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
 }
@@ -1762,6 +2011,22 @@ fn receipt(
     })
 }
 
+fn block_receipts_response(receipts: Vec<Value>) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": receipts
+    })
+}
+
+fn receipt_response(receipt: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": receipt
+    })
+}
+
 fn block_response(number: u64, hash: &str, parent_hash: &str, timestamp: u64) -> Value {
     block_response_with_bloom(
         number,
@@ -1770,6 +2035,26 @@ fn block_response(number: u64, hash: &str, parent_hash: &str, timestamp: u64) ->
         timestamp,
         &format!("0x{}", "0".repeat(512)),
     )
+}
+
+fn block_with_transaction_hashes_response(
+    number: u64,
+    hash: &str,
+    parent_hash: &str,
+    timestamp: u64,
+    transactions: Vec<&str>,
+) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "number": format!("0x{number:x}"),
+            "hash": hash,
+            "parentHash": parent_hash,
+            "timestamp": format!("0x{timestamp:x}"),
+            "transactions": transactions
+        }
+    })
 }
 
 fn block_response_with_bloom(

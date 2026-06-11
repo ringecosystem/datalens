@@ -211,6 +211,9 @@ struct LogBlockHeaderDiagnostics {
     reliability_header_blocks: usize,
     reliability_suspicious_blocks: usize,
     reliability_secondary_calls: usize,
+    reliability_receipt_fallback_calls: usize,
+    reliability_receipt_recovered_blocks: usize,
+    reliability_receipt_unresolved_blocks: usize,
     reliability_unrecovered_blocks: usize,
     reliability_recovery_available: bool,
 }
@@ -235,10 +238,13 @@ impl LogBlockHeaderDiagnostics {
         }
         if self.reliability_checked {
             warning.push_str(&format!(
-                " reliability_header_blocks={} reliability_suspicious_blocks={} reliability_secondary_calls={} reliability_unrecovered_blocks={} reliability_recovery_available={}",
+                " reliability_header_blocks={} reliability_suspicious_blocks={} reliability_secondary_calls={} reliability_receipt_fallback_calls={} reliability_receipt_recovered_blocks={} reliability_receipt_unresolved_blocks={} reliability_unrecovered_blocks={} reliability_recovery_available={}",
                 self.reliability_header_blocks,
                 self.reliability_suspicious_blocks,
                 self.reliability_secondary_calls,
+                self.reliability_receipt_fallback_calls,
+                self.reliability_receipt_recovered_blocks,
+                self.reliability_receipt_unresolved_blocks,
                 self.reliability_unrecovered_blocks,
                 self.reliability_recovery_available
             ));
@@ -272,8 +278,17 @@ struct LogReliabilityDiagnostics {
     header_blocks: usize,
     suspicious_blocks: usize,
     secondary_provider_calls: usize,
+    receipt_fallback_calls: usize,
+    receipt_recovered_blocks: usize,
+    receipt_unresolved_blocks: usize,
     unrecovered_blocks: usize,
     recovery_available: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ReceiptFallbackFetch {
+    logs: Vec<LogRecord>,
+    provider_calls: usize,
 }
 
 #[derive(Clone)]
@@ -512,6 +527,12 @@ impl EvmRpcClient {
             diagnostics.reliability_suspicious_blocks = reliability_diagnostics.suspicious_blocks;
             diagnostics.reliability_secondary_calls =
                 reliability_diagnostics.secondary_provider_calls;
+            diagnostics.reliability_receipt_fallback_calls =
+                reliability_diagnostics.receipt_fallback_calls;
+            diagnostics.reliability_receipt_recovered_blocks =
+                reliability_diagnostics.receipt_recovered_blocks;
+            diagnostics.reliability_receipt_unresolved_blocks =
+                reliability_diagnostics.receipt_unresolved_blocks;
             diagnostics.reliability_unrecovered_blocks = reliability_diagnostics.unrecovered_blocks;
             diagnostics.reliability_recovery_available = reliability_diagnostics.recovery_available;
         }
@@ -582,58 +603,236 @@ impl EvmRpcClient {
             header_blocks: headers.len(),
             suspicious_blocks: suspicious_blocks.len(),
             secondary_provider_calls: 0,
+            receipt_fallback_calls: 0,
+            receipt_recovered_blocks: 0,
+            receipt_unresolved_blocks: 0,
             unrecovered_blocks: 0,
             recovery_available: !self.secondary_provider_urls().is_empty(),
         };
         if suspicious_blocks.is_empty() {
             return Ok((primary_logs, Some(diagnostics)));
         }
+
+        let header_by_number = headers
+            .iter()
+            .map(|header| (header.block_number, header.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let mut merged = primary_logs;
         if self.secondary_provider_urls().is_empty() {
-            diagnostics.unrecovered_blocks = suspicious_blocks.len();
             log::warn!(
-                "EVM log reliability found {} bloom-positive block(s) but no recovery provider is configured; returning primary result without authoritative recovery",
+                "EVM log reliability found {} bloom-positive block(s) but no secondary recovery provider is configured; trying receipt fallback",
                 suspicious_blocks.len()
             );
-            return Ok((primary_logs, Some(diagnostics)));
-        }
-
-        let mut merged = primary_logs;
-        for suspicious_range in adjacent_block_ranges(&suspicious_blocks) {
-            let mut last_error = None;
-            let mut range_logs = None;
-            for url in self.secondary_provider_urls() {
-                diagnostics.secondary_provider_calls += 1;
-                match self.fetch_logs_from_url(url, suspicious_range, filter) {
-                    Ok(logs) => {
-                        range_logs = Some(logs);
-                        break;
-                    }
-                    Err(error) => {
-                        last_error = Some(error);
+        } else {
+            for suspicious_range in adjacent_block_ranges(&suspicious_blocks) {
+                let mut last_error = None;
+                let mut range_logs = None;
+                for url in self.secondary_provider_urls() {
+                    diagnostics.secondary_provider_calls += 1;
+                    match self.fetch_logs_from_url(url, suspicious_range, filter) {
+                        Ok(logs) => {
+                            range_logs = Some(logs);
+                            break;
+                        }
+                        Err(error) => {
+                            last_error = Some(error);
+                        }
                     }
                 }
+                let Some(mut logs) = range_logs else {
+                    let error = last_error.unwrap_or_else(|| {
+                        DatalensError::new(
+                            DatalensErrorKind::ProviderFailure,
+                            "EVM log reliability secondary provider failed",
+                        )
+                    });
+                    return Err(DatalensError::new(
+                        error.kind,
+                        format!(
+                            "EVM log reliability secondary eth_getLogs failed for range {}-{}: {}",
+                            suspicious_range.from_block, suspicious_range.to_block, error.message
+                        ),
+                    ));
+                };
+                logs.retain(|log| suspicious_range.contains(log.block_number));
+                merged.append(&mut logs);
             }
-            let Some(mut logs) = range_logs else {
-                let error = last_error.unwrap_or_else(|| {
-                    DatalensError::new(
-                        DatalensErrorKind::ProviderFailure,
-                        "EVM log reliability secondary provider failed",
-                    )
-                });
-                return Err(DatalensError::new(
-                    error.kind,
-                    format!(
-                        "EVM log reliability secondary eth_getLogs failed for range {}-{}: {}",
-                        suspicious_range.from_block, suspicious_range.to_block, error.message
-                    ),
-                ));
-            };
-            logs.retain(|log| suspicious_range.contains(log.block_number));
-            merged.append(&mut logs);
         }
 
         dedupe_and_sort_logs(&mut merged);
+        let unresolved_blocks = suspicious_blocks
+            .iter()
+            .copied()
+            .filter(|block| {
+                !merged
+                    .iter()
+                    .any(|log| log.block_number == *block && log_matches_filter(log, filter))
+            })
+            .collect::<Vec<_>>();
+        for block_number in unresolved_blocks {
+            let Some(header) = header_by_number.get(&block_number) else {
+                diagnostics.receipt_unresolved_blocks += 1;
+                continue;
+            };
+            match self.fetch_logs_from_receipt_fallback(header, filter) {
+                Ok(mut fallback) => {
+                    diagnostics.receipt_fallback_calls += fallback.provider_calls;
+                    fallback.logs.retain(|log| log.block_number == block_number);
+                    if fallback.logs.is_empty() {
+                        diagnostics.receipt_unresolved_blocks += 1;
+                        log::warn!(
+                            "EVM log reliability receipt fallback found no matching rows block={block_number}"
+                        );
+                    } else {
+                        diagnostics.receipt_recovered_blocks += 1;
+                        log::warn!(
+                            "EVM log reliability receipt fallback recovered {} row(s) block={block_number}",
+                            fallback.logs.len()
+                        );
+                        merged.append(&mut fallback.logs);
+                    }
+                }
+                Err(error) => {
+                    diagnostics.receipt_unresolved_blocks += 1;
+                    log::warn!(
+                        "EVM log reliability receipt fallback failed block={block_number} kind={:?}: {}",
+                        error.kind,
+                        error.message
+                    );
+                }
+            }
+        }
+        diagnostics.unrecovered_blocks = diagnostics.receipt_unresolved_blocks;
+        diagnostics.recovery_available =
+            diagnostics.recovery_available || diagnostics.receipt_fallback_calls > 0;
+        dedupe_and_sort_logs(&mut merged);
         Ok((merged, Some(diagnostics)))
+    }
+
+    fn fetch_logs_from_receipt_fallback(
+        &self,
+        header: &EvmBlockHeader,
+        filter: &EvmLogFilter,
+    ) -> Result<ReceiptFallbackFetch, DatalensError> {
+        log::warn!(
+            "EVM log reliability trying receipt fallback block={}",
+            header.block_number
+        );
+        match self.call(
+            "eth_getBlockReceipts",
+            json!([format!("0x{:x}", header.block_number)]),
+        ) {
+            Ok(Some(value)) => {
+                let receipts = value.as_array().ok_or_else(|| {
+                    DatalensError::new(
+                        DatalensErrorKind::ProviderFailure,
+                        "invalid eth_getBlockReceipts result",
+                    )
+                })?;
+                Ok(ReceiptFallbackFetch {
+                    logs: receipt_logs_from_receipts(receipts, header, filter)?,
+                    provider_calls: 1,
+                })
+            }
+            Ok(None) => {
+                log::warn!(
+                    "EVM log reliability eth_getBlockReceipts returned null block={}; falling back to transaction receipts",
+                    header.block_number
+                );
+                self.fetch_logs_from_transaction_receipts(header, filter, 1)
+            }
+            Err(error) => {
+                log::warn!(
+                    "EVM log reliability eth_getBlockReceipts unavailable block={} kind={:?}: {}; falling back to transaction receipts",
+                    header.block_number,
+                    error.kind,
+                    error.message
+                );
+                self.fetch_logs_from_transaction_receipts(header, filter, 1)
+            }
+        }
+    }
+
+    fn fetch_logs_from_transaction_receipts(
+        &self,
+        header: &EvmBlockHeader,
+        filter: &EvmLogFilter,
+        provider_calls: usize,
+    ) -> Result<ReceiptFallbackFetch, DatalensError> {
+        let mut provider_calls = provider_calls;
+        let result = self.call(
+            "eth_getBlockByNumber",
+            json!([format!("0x{:x}", header.block_number), false]),
+        )?;
+        provider_calls += 1;
+        let Some(block) = result else {
+            return Err(DatalensError::new(
+                DatalensErrorKind::ProviderFailure,
+                format!("provider returned null block for {}", header.block_number),
+            ));
+        };
+        let block_number = hex_u64_field(&block, "number")?;
+        if block_number != header.block_number {
+            return Err(DatalensError::new(
+                DatalensErrorKind::ProviderFailure,
+                format!(
+                    "receipt fallback block number {} does not match requested block {}",
+                    block_number, header.block_number
+                ),
+            ));
+        }
+        let block_hash = string_field(&block, "hash")?;
+        if block_hash != header.block_hash {
+            return Err(DatalensError::new(
+                DatalensErrorKind::ProviderFailure,
+                format!(
+                    "receipt fallback block hash {} does not match header hash {}",
+                    block_hash, header.block_hash
+                ),
+            ));
+        }
+        let transactions = block
+            .get("transactions")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                DatalensError::new(
+                    DatalensErrorKind::ProviderFailure,
+                    "missing block transaction hashes",
+                )
+            })?;
+        let mut logs = Vec::new();
+        for transaction in transactions {
+            let transaction_hash = match transaction {
+                Value::String(hash) => hash.clone(),
+                Value::Object(_) => string_field(transaction, "hash")?,
+                _ => {
+                    return Err(DatalensError::new(
+                        DatalensErrorKind::ProviderFailure,
+                        "invalid block transaction hash",
+                    ));
+                }
+            };
+            let result = self.call("eth_getTransactionReceipt", json!([transaction_hash]))?;
+            provider_calls += 1;
+            let Some(receipt) = result else {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::ProviderFailure,
+                    "provider returned null receipt",
+                ));
+            };
+            let receipt_logs = receipt
+                .get("logs")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    DatalensError::new(DatalensErrorKind::ProviderFailure, "missing receipt logs")
+                })?;
+            logs.append(&mut receipt_logs_from_values(receipt_logs, header, filter)?);
+        }
+        logs.sort_by_key(|log| (log.block_number, log.transaction_index, log.log_index));
+        Ok(ReceiptFallbackFetch {
+            logs,
+            provider_calls,
+        })
     }
 
     fn fetch_evm_logs_from_receipts_with_request_id(
@@ -1141,7 +1340,8 @@ impl ChainAdapter for EvmRpcClient {
                         )?;
                         let provider_calls = 1
                             + diagnostics.provider_calls
-                            + diagnostics.reliability_secondary_calls;
+                            + diagnostics.reliability_secondary_calls
+                            + diagnostics.reliability_receipt_fallback_calls;
                         warnings.push(diagnostics.warning());
                         logs.retain(|log| range.contains(log.block_number));
                         logs.sort_by_key(|log| {
@@ -1170,7 +1370,8 @@ impl ChainAdapter for EvmRpcClient {
                         )?;
                         let provider_calls = 1
                             + diagnostics.provider_calls
-                            + diagnostics.reliability_secondary_calls;
+                            + diagnostics.reliability_secondary_calls
+                            + diagnostics.reliability_receipt_fallback_calls;
                         warnings.push(diagnostics.warning());
                         logs.retain(|log| range.contains(log.block_number));
                         logs.sort_by_key(|log| {
@@ -1268,6 +1469,45 @@ impl EvmBlockHeaderFetcher for EvmRpcClient {
             headers: self.fetch_evm_block_headers(range)?,
         })
     }
+}
+
+fn receipt_logs_from_values(
+    logs: &[Value],
+    header: &EvmBlockHeader,
+    filter: &EvmLogFilter,
+) -> Result<Vec<LogRecord>, DatalensError> {
+    let mut rows = Vec::new();
+    for log in logs {
+        let log = parse_log_record(log)?;
+        if log.block_number != header.block_number || log.block_hash != header.block_hash {
+            continue;
+        }
+        let log = log.with_block_metadata(Some(header.parent_hash.clone()), Some(header.timestamp));
+        if log_matches_filter(&log, filter) {
+            rows.push(log);
+        }
+    }
+    rows.sort_by_key(|log| (log.block_number, log.transaction_index, log.log_index));
+    Ok(rows)
+}
+
+fn receipt_logs_from_receipts(
+    receipts: &[Value],
+    header: &EvmBlockHeader,
+    filter: &EvmLogFilter,
+) -> Result<Vec<LogRecord>, DatalensError> {
+    let mut rows = Vec::new();
+    for receipt in receipts {
+        let receipt_logs = receipt
+            .get("logs")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                DatalensError::new(DatalensErrorKind::ProviderFailure, "missing receipt logs")
+            })?;
+        rows.append(&mut receipt_logs_from_values(receipt_logs, header, filter)?);
+    }
+    rows.sort_by_key(|log| (log.block_number, log.transaction_index, log.log_index));
+    Ok(rows)
 }
 
 fn log_matches_filter(log: &LogRecord, filter: &EvmLogFilter) -> bool {
