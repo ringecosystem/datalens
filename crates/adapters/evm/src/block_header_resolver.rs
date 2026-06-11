@@ -32,6 +32,7 @@ pub trait EvmBlockHeaderStore {
         &self,
         chain: &ChainIdentity,
         range: BlockRange,
+        finality_level: FinalityLevel,
     ) -> Result<Vec<EvmBlockHeader>, DatalensError>;
 
     fn persist_headers(
@@ -77,7 +78,9 @@ where
         request: EvmBlockHeaderResolveRequest,
     ) -> Result<Vec<EvmBlockHeader>, DatalensError> {
         let mut headers = match &self.store {
-            Some(store) => store.read_headers(&request.chain, request.range)?,
+            Some(store) => {
+                store.read_headers(&request.chain, request.range, request.finality_level)?
+            }
             None => Vec::new(),
         };
         retain_range(&mut headers, request.range);
@@ -125,6 +128,7 @@ impl EvmBlockHeaderStore for NoEvmBlockHeaderStore {
         &self,
         _chain: &ChainIdentity,
         _range: BlockRange,
+        _finality_level: FinalityLevel,
     ) -> Result<Vec<EvmBlockHeader>, DatalensError> {
         Ok(Vec::new())
     }
@@ -177,12 +181,14 @@ where
         &self,
         chain: &ChainIdentity,
         range: BlockRange,
+        finality_level: FinalityLevel,
     ) -> Result<Vec<EvmBlockHeader>, DatalensError> {
-        let rows = self.storage.read_rows(
+        let rows = self.storage.read_rows_for_finality(
             chain,
             &DatasetKey::evm_block_headers(),
             &DatasetSelector::All,
             LedgerRange::from_block_range(range),
+            finality_level,
         )?;
         match rows.into_rows() {
             QueryRows::EvmBlockHeaders(mut headers) => {

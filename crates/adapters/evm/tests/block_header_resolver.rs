@@ -1,14 +1,18 @@
 use std::{
     collections::BTreeMap,
+    path::PathBuf,
     sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use datalens_chain::FinalityLevel;
 use datalens_core::{BlockRange, ChainFamily, ChainIdentity, DatalensError, EvmBlockHeader};
 use datalens_evm::{
-    EvmBlockHeaderFetch, EvmBlockHeaderFetcher, EvmBlockHeaderResolveRequest,
-    EvmBlockHeaderResolver, EvmBlockHeaderStore,
+    DurableEvmBlockHeaderStore, EvmBlockHeaderFetch, EvmBlockHeaderFetcher,
+    EvmBlockHeaderResolveRequest, EvmBlockHeaderResolver, EvmBlockHeaderStore,
 };
+use datalens_storage::LocalStorage;
+use datalens_writer::DurableWriterConfig;
 
 #[test]
 fn test_block_header_resolver_reuses_stored_headers_and_fetches_only_missing_ranges() {
@@ -50,6 +54,34 @@ fn test_block_header_resolver_does_not_fetch_when_requested_range_is_durable() {
     assert!(store.persisted_numbers().is_empty());
 }
 
+#[test]
+fn test_block_header_resolver_does_not_reuse_safe_headers_for_finalized_resolve() {
+    let chain = ethereum();
+    let storage = LocalStorage::new(temp_storage_root("finality-aware-header-resolve"));
+    let store = DurableEvmBlockHeaderStore::new(storage, writer_config());
+    store
+        .persist_headers(
+            &chain,
+            BlockRange::expect_new(30, 30),
+            FinalityLevel::Safe,
+            vec![header(30)],
+        )
+        .expect("persist safe header");
+    let fetcher = MemoryHeaderFetcher::new(vec![header(30)]);
+    let resolver = EvmBlockHeaderResolver::with_store(fetcher.clone(), store);
+
+    let resolved = resolver
+        .resolve(EvmBlockHeaderResolveRequest {
+            chain,
+            range: BlockRange::expect_new(30, 30),
+            finality_level: FinalityLevel::Finalized,
+        })
+        .expect("resolve finalized header");
+
+    assert_eq!(numbers(&resolved), vec![30]);
+    assert_eq!(fetcher.requests(), vec![BlockRange::expect_new(30, 30)]);
+}
+
 #[derive(Clone, Debug)]
 struct MemoryHeaderStore {
     stored: Arc<Mutex<BTreeMap<u64, EvmBlockHeader>>>,
@@ -84,6 +116,7 @@ impl EvmBlockHeaderStore for MemoryHeaderStore {
         &self,
         _chain: &ChainIdentity,
         range: BlockRange,
+        _finality_level: FinalityLevel,
     ) -> Result<Vec<EvmBlockHeader>, DatalensError> {
         Ok(self
             .stored
@@ -167,4 +200,24 @@ fn header(block_number: u64) -> EvmBlockHeader {
 
 fn numbers(headers: &[EvmBlockHeader]) -> Vec<u64> {
     headers.iter().map(|header| header.block_number).collect()
+}
+
+fn writer_config() -> DurableWriterConfig {
+    DurableWriterConfig {
+        target_object_bytes: 1024,
+        min_object_rows: 1,
+        record_empty_coverage: true,
+        staging: Default::default(),
+    }
+}
+
+fn temp_storage_root(name: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time")
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "datalens-evm-{name}-{}-{nanos}",
+        std::process::id()
+    ))
 }

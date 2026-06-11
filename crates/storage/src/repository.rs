@@ -155,6 +155,21 @@ fn merged_selector_ranges(
     merge_ranges(ranges)
 }
 
+fn durable_finality_satisfies(
+    entry: ManifestFinalityLevel,
+    requested: ManifestFinalityLevel,
+) -> bool {
+    match requested {
+        ManifestFinalityLevel::Safe => {
+            matches!(
+                entry,
+                ManifestFinalityLevel::Safe | ManifestFinalityLevel::Finalized
+            )
+        }
+        ManifestFinalityLevel::Finalized => entry == ManifestFinalityLevel::Finalized,
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct StorageWriteLogContext {
     chain_key: String,
@@ -411,6 +426,34 @@ where
         selector: &DatasetSelector,
         range: LedgerRange,
     ) -> Result<DatasetRows, DatalensError> {
+        self.read_rows_with_finality_filter(chain, dataset_key, selector, range, None)
+    }
+
+    pub fn read_rows_for_finality(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+        finality_level: FinalityLevel,
+    ) -> Result<DatasetRows, DatalensError> {
+        self.read_rows_with_finality_filter(
+            chain,
+            dataset_key,
+            selector,
+            range,
+            Some(ManifestFinalityLevel::try_from(finality_level)?),
+        )
+    }
+
+    fn read_rows_with_finality_filter(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+        finality_level: Option<ManifestFinalityLevel>,
+    ) -> Result<DatasetRows, DatalensError> {
         log::debug!(
             "storage read dataset={} range={}-{}",
             dataset_key.as_str(),
@@ -430,6 +473,16 @@ where
         } else {
             ("coverage_index_absent", Vec::new())
         };
+        let entries = entries
+            .into_iter()
+            .filter(|entry| {
+                finality_level
+                    .map(|finality_level| {
+                        durable_finality_satisfies(entry.finality_level, finality_level)
+                    })
+                    .unwrap_or(true)
+            })
+            .collect::<Vec<_>>();
         let entries_count = entries.len();
         let covered = merged_selector_ranges(&entries, chain, dataset_key, selector, &range);
         let missing_range_count = missing_ranges(range.clone(), &covered).len();
@@ -1161,6 +1214,18 @@ pub trait StorageRepository: Send + Sync {
         range: LedgerRange,
     ) -> Result<DatasetRows, DatalensError>;
 
+    fn read_rows_for_finality(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+        finality_level: FinalityLevel,
+    ) -> Result<DatasetRows, DatalensError> {
+        let _ = finality_level;
+        self.read_rows(chain, dataset_key, selector, range)
+    }
+
     fn write_rows(
         &self,
         request: StorageWriteRequest<'_>,
@@ -1193,6 +1258,17 @@ where
         range: LedgerRange,
     ) -> Result<DatasetRows, DatalensError> {
         Self::read_rows(self, chain, dataset_key, selector, range)
+    }
+
+    fn read_rows_for_finality(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+        finality_level: FinalityLevel,
+    ) -> Result<DatasetRows, DatalensError> {
+        Self::read_rows_for_finality(self, chain, dataset_key, selector, range, finality_level)
     }
 
     fn write_rows(
@@ -1229,6 +1305,18 @@ impl StorageRepository for Box<dyn StorageRepository> {
         self.as_ref().read_rows(chain, dataset_key, selector, range)
     }
 
+    fn read_rows_for_finality(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+        finality_level: FinalityLevel,
+    ) -> Result<DatasetRows, DatalensError> {
+        self.as_ref()
+            .read_rows_for_finality(chain, dataset_key, selector, range, finality_level)
+    }
+
     fn write_rows(
         &self,
         request: StorageWriteRequest<'_>,
@@ -1261,6 +1349,18 @@ impl StorageRepository for Arc<dyn StorageRepository> {
         range: LedgerRange,
     ) -> Result<DatasetRows, DatalensError> {
         self.as_ref().read_rows(chain, dataset_key, selector, range)
+    }
+
+    fn read_rows_for_finality(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+        finality_level: FinalityLevel,
+    ) -> Result<DatasetRows, DatalensError> {
+        self.as_ref()
+            .read_rows_for_finality(chain, dataset_key, selector, range, finality_level)
     }
 
     fn write_rows(
