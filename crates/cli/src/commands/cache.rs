@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use clap::{Args, Subcommand};
-use datalens_chain::{ChainAdapter, DatasetSelector, HeightRangeKind};
+use datalens_chain::{
+    ChainAdapter, ChainFetchRequest, DatasetSelector, FetchContext, FinalityLevel, HeightRangeKind,
+    SelectorKind, validate_durable_range,
+};
 use datalens_core::{
     ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey, LedgerRange, LedgerRangeKind,
     LogFilter,
@@ -18,7 +21,7 @@ use datalens_solana::{
     SolanaAdapter, SolanaHttpRpc, solana_address_selector, solana_program_selector,
     solana_signature_selector,
 };
-use datalens_storage::StorageRepository;
+use datalens_storage::{StorageRepository, StorageWriteRequest};
 use datalens_tron::{
     TronAdapter, TronEventFilter, TronHttpProvider, tron_all_selector, tron_event_selector,
 };
@@ -76,6 +79,9 @@ pub struct CacheRepairCommand {
 
     #[arg(long)]
     pub dry_run: bool,
+
+    #[arg(long)]
+    pub force_refresh: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -254,6 +260,19 @@ where
     let dry_run = cache_dry_run(&command);
     let job = cache_job(&config, chain_name, chain, &command)?;
     let storage: Arc<dyn StorageRepository> = Arc::from(build_storage(&config)?);
+    if let CacheWorkflowCommand::Repair(repair) = &command
+        && repair.force_refresh
+    {
+        return cache_force_refresh_summary(
+            &common.config,
+            chain_name,
+            chain,
+            adapter,
+            storage,
+            &job,
+            dry_run,
+        );
+    }
     let covered_ranges = covered_ranges(storage.clone(), &job)?;
     let finality_boundary = match job.finality_requirement {
         IndexFinalityRequirement::Safe => adapter.cache_safe_height()?,
@@ -310,7 +329,140 @@ where
         &config,
         &result,
         matches!(command, CacheWorkflowCommand::Verify(_)),
-    ))
+    )
+    .as_object()
+    .map(|summary| {
+        let mut summary = summary.clone();
+        summary.insert("force_refresh".to_owned(), serde_json::json!(false));
+        serde_json::Value::Object(summary)
+    })
+    .unwrap_or_else(|| serde_json::json!({ "force_refresh": false })))
+}
+
+fn cache_force_refresh_summary<A>(
+    config_path: &str,
+    chain_name: &str,
+    chain: &ChainConfig,
+    adapter: A,
+    storage: Arc<dyn StorageRepository>,
+    job: &IndexJob,
+    dry_run: bool,
+) -> Result<serde_json::Value, DatalensError>
+where
+    A: ChainAdapter,
+{
+    if chain.kind != "evm" {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "cache repair --force-refresh is only supported for EVM logs",
+        ));
+    }
+    let datasets = selected_datasets(job)?;
+    if datasets.len() != 1 || datasets[0].dataset_key != DatasetKey::evm_logs() {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "cache repair --force-refresh requires exactly one --dataset logs selector",
+        ));
+    }
+    if job.range.kind() != LedgerRangeKind::Block {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "cache repair --force-refresh for EVM logs requires --range-kind block",
+        ));
+    }
+    let dataset = &datasets[0];
+    let finality_boundary = match job.finality_requirement {
+        IndexFinalityRequirement::Safe => adapter.cache_safe_height()?,
+        IndexFinalityRequirement::Finalized => adapter.finalized_height()?,
+    };
+    validate_durable_range(&job.range, &finality_boundary)?;
+
+    if dry_run {
+        return Ok(serde_json::json!({
+            "config": config_path,
+            "chain": chain_name,
+            "mode": "repair",
+            "status": "planned",
+            "dry_run": true,
+            "force_refresh": true,
+            "dataset": dataset.dataset_key.as_str(),
+            "selector": {
+                "kind": selector_kind_name(dataset.selector.kind()),
+                "fingerprint": dataset.selector.fingerprint(),
+                "canonical_key": dataset.selector.canonical_key(),
+            },
+            "refreshed_range": {
+                "kind": range_kind_name(job.range.kind()),
+                "start": job.range.start(),
+                "end": job.range.end(),
+            },
+            "rows_written": 0,
+            "accounting": {
+                "chunks_planned": 1,
+                "chunks_written": 0,
+                "rows_written": 0,
+            },
+            "provider_diagnostics": null,
+        }));
+    }
+
+    let request = ChainFetchRequest::new(
+        job.chain.clone(),
+        dataset.dataset_key.clone(),
+        job.range.clone(),
+        dataset.selector.clone(),
+    )
+    .with_context(FetchContext {
+        request_id: Some(job.id.as_str().to_owned()),
+        cache_write: true,
+    });
+    let response = adapter.fetch(request.clone())?;
+    response.validate_for_request(&request)?;
+    let diagnostics = response.provider_diagnostics.clone();
+    let rows = response.rows;
+    let outcome = storage.write_rows_replacing_existing(StorageWriteRequest {
+        chain: &job.chain,
+        dataset_key: dataset.dataset_key.clone(),
+        selector: &dataset.selector,
+        range: job.range.clone(),
+        rows: &rows,
+        finality_level: match job.finality_requirement {
+            IndexFinalityRequirement::Safe => FinalityLevel::Safe,
+            IndexFinalityRequirement::Finalized => FinalityLevel::Finalized,
+        },
+        record_empty_coverage: true,
+    })?;
+
+    Ok(serde_json::json!({
+        "config": config_path,
+        "chain": chain_name,
+        "mode": "repair",
+        "status": "completed",
+        "dry_run": false,
+        "force_refresh": true,
+        "dataset": dataset.dataset_key.as_str(),
+        "selector": {
+            "kind": selector_kind_name(dataset.selector.kind()),
+            "fingerprint": dataset.selector.fingerprint(),
+            "canonical_key": dataset.selector.canonical_key(),
+        },
+        "refreshed_range": {
+            "kind": range_kind_name(outcome.range.kind()),
+            "start": outcome.range.start(),
+            "end": outcome.range.end(),
+        },
+        "rows_written": outcome.row_count,
+        "accounting": {
+            "chunks_planned": 1,
+            "chunks_written": 1,
+            "rows_written": outcome.row_count,
+        },
+        "provider_diagnostics": {
+            "calls": diagnostics.calls,
+            "rows_scanned": diagnostics.rows_scanned,
+            "warnings": diagnostics.warnings,
+        },
+    }))
 }
 
 fn cache_job(
@@ -562,6 +714,23 @@ fn range_kind(value: &str) -> Result<HeightRangeKind, DatalensError> {
             DatalensErrorKind::InvalidInput,
             "range kind must not be empty",
         )),
+    }
+}
+
+fn range_kind_name(kind: HeightRangeKind) -> String {
+    match kind {
+        LedgerRangeKind::Block => "block".to_owned(),
+        LedgerRangeKind::Slot => "slot".to_owned(),
+        LedgerRangeKind::Height => "height".to_owned(),
+        LedgerRangeKind::Other(value) => value,
+    }
+}
+
+fn selector_kind_name(kind: SelectorKind) -> String {
+    match kind {
+        SelectorKind::All => "all".to_owned(),
+        SelectorKind::EvmLogs => "evm_logs".to_owned(),
+        SelectorKind::Other(value) => value.as_str().to_owned(),
     }
 }
 

@@ -650,6 +650,21 @@ where
         &self,
         request: StorageWriteRequest<'_>,
     ) -> Result<StorageWriteOutcome, DatalensError> {
+        self.write_rows_with_replacement(request, false)
+    }
+
+    pub fn write_rows_replacing_existing(
+        &self,
+        request: StorageWriteRequest<'_>,
+    ) -> Result<StorageWriteOutcome, DatalensError> {
+        self.write_rows_with_replacement(request, true)
+    }
+
+    fn write_rows_with_replacement(
+        &self,
+        request: StorageWriteRequest<'_>,
+        replace_existing: bool,
+    ) -> Result<StorageWriteOutcome, DatalensError> {
         let StorageWriteRequest {
             chain,
             dataset_key,
@@ -762,9 +777,13 @@ where
             log_context.coverage_kind
         );
         let data_object = match (data_object, data_object_bytes) {
-            (Some(data_object), Some(bytes)) => {
-                Some(self.write_data_object_manifest_entry(chain, entry, data_object, bytes)?)
-            }
+            (Some(data_object), Some(bytes)) => Some(self.write_data_object_manifest_entry(
+                chain,
+                entry,
+                data_object,
+                bytes,
+                replace_existing,
+            )?),
             _ => {
                 self.write_manifest_entry(chain, entry)?;
                 None
@@ -991,12 +1010,15 @@ where
         entry: ManifestEntry,
         mut data_object: StorageDataObject,
         bytes: Vec<u8>,
+        replace_existing: bool,
     ) -> Result<StorageDataObject, DatalensError> {
         let started = Instant::now();
         let lock = self.manifest_update_lock(chain)?;
         let _guard = self.lock_manifest_updates(&lock)?;
 
-        if let Some(existing) = self.exact_manifest_segment_entry(chain, &entry)? {
+        if !replace_existing
+            && let Some(existing) = self.exact_manifest_segment_entry(chain, &entry)?
+        {
             validate_existing_data_object(&existing, &data_object)?;
             if existing.object_size_bytes.is_some()
                 && existing.checksum.is_some()
@@ -1009,7 +1031,7 @@ where
             }
         }
 
-        if !self.existing_data_object_matches(&data_object)? {
+        if replace_existing || !self.existing_data_object_matches(&data_object)? {
             self.object_store.put(&data_object.object_key, &bytes)?;
         }
         if !self.object_store.exists(&data_object.object_key)? {
@@ -1230,6 +1252,13 @@ pub trait StorageRepository: Send + Sync {
         &self,
         request: StorageWriteRequest<'_>,
     ) -> Result<StorageWriteOutcome, DatalensError>;
+
+    fn write_rows_replacing_existing(
+        &self,
+        request: StorageWriteRequest<'_>,
+    ) -> Result<StorageWriteOutcome, DatalensError> {
+        self.write_rows(request)
+    }
 }
 
 impl<S> StorageRepository for DurableStorage<S>
@@ -1277,6 +1306,13 @@ where
     ) -> Result<StorageWriteOutcome, DatalensError> {
         Self::write_rows(self, request)
     }
+
+    fn write_rows_replacing_existing(
+        &self,
+        request: StorageWriteRequest<'_>,
+    ) -> Result<StorageWriteOutcome, DatalensError> {
+        Self::write_rows_replacing_existing(self, request)
+    }
 }
 
 impl StorageRepository for Box<dyn StorageRepository> {
@@ -1323,6 +1359,13 @@ impl StorageRepository for Box<dyn StorageRepository> {
     ) -> Result<StorageWriteOutcome, DatalensError> {
         self.as_ref().write_rows(request)
     }
+
+    fn write_rows_replacing_existing(
+        &self,
+        request: StorageWriteRequest<'_>,
+    ) -> Result<StorageWriteOutcome, DatalensError> {
+        self.as_ref().write_rows_replacing_existing(request)
+    }
 }
 
 impl StorageRepository for Arc<dyn StorageRepository> {
@@ -1368,6 +1411,13 @@ impl StorageRepository for Arc<dyn StorageRepository> {
         request: StorageWriteRequest<'_>,
     ) -> Result<StorageWriteOutcome, DatalensError> {
         self.as_ref().write_rows(request)
+    }
+
+    fn write_rows_replacing_existing(
+        &self,
+        request: StorageWriteRequest<'_>,
+    ) -> Result<StorageWriteOutcome, DatalensError> {
+        self.as_ref().write_rows_replacing_existing(request)
     }
 }
 

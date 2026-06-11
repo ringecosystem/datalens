@@ -3403,6 +3403,58 @@ fn test_write_rows_is_idempotent_for_same_logical_shard() {
 }
 
 #[test]
+fn test_replacement_write_overwrites_same_logical_data_object() {
+    let storage = LocalStorage::new(temp_storage_root("replacement-write-overwrites-object"));
+    let chain = test_chain();
+    let selector = evm_log_selector(vec![ADDRESS_A], vec![Some(vec![TOPIC_1])]);
+    let range = LedgerRange::blocks(10, 10).expect("valid range");
+    let first_rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![log_record(10, 0, ADDRESS_A, vec![TOPIC_1])]),
+    )
+    .expect("first rows");
+    let replacement_rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![log_record(10, 1, ADDRESS_A, vec![TOPIC_1])]),
+    )
+    .expect("replacement rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &selector,
+            range: range.clone(),
+            rows: &first_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write first object");
+    storage
+        .write_rows_replacing_existing(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &selector,
+            range: range.clone(),
+            rows: &replacement_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("replace object");
+
+    let rows = storage
+        .read_rows(&chain, &DatasetKey::evm_logs(), &selector, range)
+        .expect("read replacement rows");
+    match rows.into_rows() {
+        QueryRows::EvmLogs(logs) => {
+            assert_eq!(logs.len(), 1);
+            assert_eq!(logs[0].log_index, 1);
+        }
+        rows => panic!("expected log rows, got {rows:?}"),
+    }
+}
+
+#[test]
 fn test_full_manifest_shadows_stale_compacted_segments() {
     let root = temp_storage_root("full-manifest-shadows-stale-segments");
     let storage = LocalStorage::new(&root);

@@ -1,8 +1,11 @@
 use std::{
     fs,
+    io::{Read, Write},
+    net::{TcpListener, TcpStream},
     path::PathBuf,
     process::Command as ProcessCommand,
     sync::{Arc, Mutex},
+    thread,
 };
 
 use clap::Parser;
@@ -15,11 +18,13 @@ use datalens_chain::{
 use datalens_cli::*;
 use datalens_core::{
     BlockHeader, BlockRange, ChainFamily, ChainIdentity, DatalensError, DatasetKey, DatasetRows,
-    LedgerRange, NetworkId, QueryRows,
+    LedgerRange, LogFilter, LogRecord, NetworkId, QueryRows,
 };
+use datalens_evm::{EvmLogBloom, EvmLogBloomInput};
 use datalens_solana::SolanaAdapter;
 use datalens_storage::{LocalStorage, StorageWriteRequest};
 use datalens_tron::{TronAdapter, TronFixtureProviderRpc};
+use serde_json::{Value, json};
 
 #[test]
 fn test_index_plan_accepts_config_path() {
@@ -1077,6 +1082,45 @@ fn test_cache_resume_repair_and_verify_parse_required_inputs() {
 }
 
 #[test]
+fn test_cache_repair_accepts_force_refresh() {
+    let cli = Cli::parse_from([
+        "datalens",
+        "cache",
+        "repair",
+        "--config",
+        "custom.toml",
+        "--chain",
+        "ethereum",
+        "--dataset",
+        "logs",
+        "--range-kind",
+        "block",
+        "--range-start",
+        "10",
+        "--range-end",
+        "12",
+        "--application",
+        "indexer",
+        "--address",
+        ADDRESS_A,
+        "--topic",
+        VOTE_CAST_TOPIC,
+        "--force-refresh",
+    ]);
+
+    match cli.command {
+        Command::Cache(cache) => {
+            let CacheCommand { command } = *cache;
+            match command {
+                CacheWorkflowCommand::Repair(command) => assert!(command.force_refresh),
+                command => panic!("expected cache repair command, got {command:?}"),
+            }
+        }
+        command => panic!("expected cache repair command, got {command:?}"),
+    }
+}
+
+#[test]
 fn test_index_config_loads_defaults_and_limits() {
     let config: DatalensConfig = toml::from_str(
         r#"
@@ -1319,6 +1363,202 @@ fn test_cache_resume_uses_persisted_cursor_after_process_restart() {
 }
 
 #[test]
+fn test_cache_repair_without_force_refresh_skips_existing_empty_log_coverage() {
+    let root = temp_storage_root("index-repair-no-force-refresh-logs");
+    let config = write_config("index-repair-no-force-refresh-logs", &root);
+    let selector = vote_cast_selector();
+    seed_empty_log_coverage(&LocalStorage::new(&root), &selector, 50, 50);
+    let adapter = IndexFixtureAdapter::default().with_logs(vec![vote_cast_log(50)]);
+    let mut common = cache_common(config, 50, 50);
+    common.datasets = vec!["logs".to_owned()];
+    common.addresses = vec![ADDRESS_A.to_owned()];
+    common.topics = vec![VOTE_CAST_TOPIC.to_owned()];
+
+    let output = cache_summary_with_adapter(
+        CacheWorkflowCommand::Repair(CacheRepairCommand {
+            common,
+            dry_run: false,
+            force_refresh: false,
+        }),
+        adapter.clone(),
+    )
+    .expect("repair");
+
+    assert_eq!(output["force_refresh"], false);
+    assert_eq!(output["accounting"]["chunks_written"], 0);
+    assert_eq!(adapter.calls(), Vec::<IndexSourceCall>::new());
+}
+
+#[test]
+fn test_cache_repair_force_refresh_rewrites_existing_empty_log_coverage() {
+    let root = temp_storage_root("index-repair-force-refresh-logs");
+    let config = write_config("index-repair-force-refresh-logs", &root);
+    let selector = vote_cast_selector();
+    seed_empty_log_coverage(&LocalStorage::new(&root), &selector, 50, 50);
+    let adapter = IndexFixtureAdapter::default().with_logs(vec![vote_cast_log(50)]);
+    let mut common = cache_common(config, 50, 50);
+    common.datasets = vec!["logs".to_owned()];
+    common.addresses = vec![ADDRESS_A.to_owned()];
+    common.topics = vec![VOTE_CAST_TOPIC.to_owned()];
+
+    let output = cache_summary_with_adapter(
+        CacheWorkflowCommand::Repair(CacheRepairCommand {
+            common,
+            dry_run: false,
+            force_refresh: true,
+        }),
+        adapter.clone(),
+    )
+    .expect("force refresh");
+
+    assert_eq!(output["status"], "completed");
+    assert_eq!(output["force_refresh"], true);
+    assert_eq!(output["rows_written"], 1);
+    assert_eq!(output["refreshed_range"]["start"], 50);
+    assert_eq!(output["refreshed_range"]["end"], 50);
+    assert_eq!(output["provider_diagnostics"]["calls"], 2);
+    assert_eq!(
+        adapter.calls(),
+        vec![IndexSourceCall::Logs(
+            BlockRange::expect_new(50, 50),
+            selector.clone()
+        )]
+    );
+
+    let rows = LocalStorage::new(&root)
+        .read_rows(
+            &test_chain(),
+            &DatasetKey::evm_logs(),
+            &selector,
+            LedgerRange::blocks(50, 50).expect("valid range"),
+        )
+        .expect("durable read");
+    assert_eq!(rows.row_count(), 1);
+    match rows.into_rows() {
+        QueryRows::EvmLogs(logs) => {
+            assert_eq!(logs[0].topics[0], VOTE_CAST_TOPIC);
+            assert_eq!(logs[0].address, ADDRESS_A);
+        }
+        rows => panic!("expected evm logs rows, got {rows:?}"),
+    }
+}
+
+#[test]
+fn test_cache_repair_force_refresh_recovers_vote_cast_log_from_local_rpc_receipts() {
+    assert_force_refresh_recovers_log_from_local_rpc_receipts(
+        "index-repair-force-refresh-local-rpc-vote",
+        ADDRESS_A,
+        VOTE_CAST_TOPIC,
+    );
+}
+
+#[test]
+fn test_cache_repair_force_refresh_recovers_transfer_log_from_local_rpc_receipts() {
+    assert_force_refresh_recovers_log_from_local_rpc_receipts(
+        "index-repair-force-refresh-local-rpc-transfer",
+        ADDRESS_B,
+        TRANSFER_TOPIC,
+    );
+}
+
+fn assert_force_refresh_recovers_log_from_local_rpc_receipts(
+    name: &str,
+    address: &str,
+    topic: &str,
+) {
+    let root = temp_storage_root("index-repair-force-refresh-local-rpc");
+    let selector = evm_log_selector(address, topic);
+    seed_empty_log_coverage(&LocalStorage::new(&root), &selector, 50, 50);
+    let block_hash = block_hash(50);
+    let bloom = EvmLogBloom::from_inputs([
+        EvmLogBloomInput::Address(address),
+        EvmLogBloomInput::Topic(topic),
+    ])
+    .expect("bloom")
+    .as_hex();
+    let receipt_log = provider_log_with_address(
+        50,
+        &block_hash,
+        "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        0,
+        0,
+        address,
+        topic,
+    );
+    let (rpc_url, requests) = start_rpc_server(vec![
+        block_number_response(51),
+        logs_response(Vec::new()),
+        json!([block_batch_response_with_bloom(
+            1,
+            50,
+            &block_hash,
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            50,
+            &bloom,
+        )]),
+        block_receipts_response(vec![receipt(
+            50,
+            &block_hash,
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            0,
+            vec![receipt_log],
+        )]),
+    ]);
+    let config = write_config_with_rpc(name, &root, &rpc_url);
+    let mut common = cache_common(config, 50, 50);
+    common.datasets = vec!["logs".to_owned()];
+    common.addresses = vec![address.to_owned()];
+    common.topics = vec![topic.to_owned()];
+    common.finality = Some("safe".to_owned());
+
+    let output = cache_summary(CacheWorkflowCommand::Repair(CacheRepairCommand {
+        common,
+        dry_run: false,
+        force_refresh: true,
+    }))
+    .expect("force refresh");
+
+    assert_eq!(output["force_refresh"], true);
+    assert_eq!(output["rows_written"], 1);
+    assert!(
+        output["provider_diagnostics"]["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .expect("warning")
+                .contains("reliability_receipt_fallback_calls=1"))
+    );
+    let requests = requests.lock().expect("requests");
+    assert_eq!(requests.len(), 4);
+    assert_eq!(requests[1]["method"], "eth_getLogs");
+    assert_eq!(requests[3]["method"], "eth_getBlockReceipts");
+
+    let rows = LocalStorage::new(&root)
+        .read_rows(
+            &test_chain(),
+            &DatasetKey::evm_logs(),
+            &selector,
+            LedgerRange::blocks(50, 50).expect("valid range"),
+        )
+        .expect("durable read");
+    match rows.into_rows() {
+        QueryRows::EvmLogs(logs) => {
+            assert_eq!(logs.len(), 1);
+            assert_eq!(logs[0].address, address);
+            assert_eq!(logs[0].topics[0], topic);
+            assert_eq!(
+                logs[0].parent_hash.as_deref(),
+                Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+            );
+            assert_eq!(logs[0].block_timestamp, Some(50));
+        }
+        rows => panic!("expected evm logs rows, got {rows:?}"),
+    }
+}
+
+#[test]
 fn test_cache_verify_does_not_persist_cursor() {
     let root = temp_storage_root("index-verify-cursor");
     let storage = LocalStorage::new(&root);
@@ -1493,6 +1733,65 @@ fn write_config(name: &str, storage_root: &std::path::Path) -> String {
             "#,
             storage_root.display(),
             storage_root.join("cursors").display()
+        ),
+    )
+    .expect("write config");
+    config_path.to_string_lossy().into_owned()
+}
+
+fn write_config_with_rpc(name: &str, storage_root: &std::path::Path, rpc_url: &str) -> String {
+    let config_path = storage_root.with_file_name(format!("{name}.toml"));
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+            [server]
+            bind = "127.0.0.1:8080"
+
+            [storage]
+            backend = "local"
+
+            [storage.local]
+            root = "{}"
+
+            [planner]
+            max_query_range_blocks = 100
+            default_chunk_range_blocks = 10
+
+            [writer]
+            target_object_bytes = 1024
+            min_object_rows = 1
+            record_empty_coverage = true
+
+            [index]
+            default_chunk_range = 2
+            max_concurrency = 1
+            default_finality = "safe"
+            cursor_path = "{}"
+
+            [chains.ethereum]
+            kind = "evm"
+            chain_id = 1
+            rpc_urls = ["{}"]
+
+            [chains.ethereum.finality]
+            mode = "lag"
+            safe_lag_blocks = 1
+            finalized_lag_blocks = 1
+
+            [chains.ethereum.datasets.blocks]
+            enabled = true
+            max_batch_blocks = 10
+
+            [chains.ethereum.datasets.logs]
+            enabled = true
+            reliability_enabled = true
+            max_get_logs_range_blocks = 10
+            max_addresses_per_query = 2
+            "#,
+            storage_root.display(),
+            storage_root.join("cursors").display(),
+            rpc_url
         ),
     )
     .expect("write config");
@@ -1695,6 +1994,38 @@ fn block(number: u64) -> BlockHeader {
     }
 }
 
+const ADDRESS_A: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const ADDRESS_B: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const VOTE_CAST_TOPIC: &str = "0xddf252ad00000000000000000000000000000000000000000000000000000000";
+const TRANSFER_TOPIC: &str = "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
+fn vote_cast_selector() -> DatasetSelector {
+    evm_log_selector(ADDRESS_A, VOTE_CAST_TOPIC)
+}
+
+fn evm_log_selector(address: &str, topic: &str) -> DatasetSelector {
+    DatasetSelector::try_evm_logs(LogFilter {
+        addresses: vec![address.to_owned()],
+        topics: vec![Some(vec![topic.to_owned()])],
+    })
+    .expect("valid selector")
+}
+
+fn vote_cast_log(block_number: u64) -> LogRecord {
+    LogRecord::try_new(
+        block_number,
+        format!("0x{block_number:064x}"),
+        format!("0x{:064x}", block_number * 100),
+        0,
+        0,
+        ADDRESS_A,
+        vec![VOTE_CAST_TOPIC.to_owned()],
+        "0x".to_owned(),
+        false,
+    )
+    .expect("valid log")
+}
+
 fn write_block_coverage(storage: &LocalStorage, start: u64, end: u64) {
     let rows = DatasetRows::new(
         DatasetKey::evm_blocks(),
@@ -1714,15 +2045,38 @@ fn write_block_coverage(storage: &LocalStorage, start: u64, end: u64) {
         .expect("write block coverage");
 }
 
+fn seed_empty_log_coverage(
+    storage: &LocalStorage,
+    selector: &DatasetSelector,
+    start: u64,
+    end: u64,
+) {
+    let rows = DatasetRows::new(DatasetKey::evm_logs(), QueryRows::EvmLogs(Vec::new()))
+        .expect("empty log rows");
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &test_chain(),
+            dataset_key: DatasetKey::evm_logs(),
+            selector,
+            range: LedgerRange::blocks(start, end).expect("valid range"),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write empty log coverage");
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum IndexSourceCall {
     Blocks(BlockRange),
+    Logs(BlockRange, DatasetSelector),
 }
 
 #[derive(Clone)]
 struct IndexFixtureAdapter {
     chain: ChainIdentity,
     blocks: Arc<Mutex<Vec<BlockHeader>>>,
+    logs: Arc<Mutex<Vec<LogRecord>>>,
     calls: Arc<Mutex<Vec<IndexSourceCall>>>,
 }
 
@@ -1731,6 +2085,7 @@ impl Default for IndexFixtureAdapter {
         Self {
             chain: test_chain(),
             blocks: Arc::new(Mutex::new(Vec::new())),
+            logs: Arc::new(Mutex::new(Vec::new())),
             calls: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -1739,6 +2094,11 @@ impl Default for IndexFixtureAdapter {
 impl IndexFixtureAdapter {
     fn with_blocks(self, blocks: Vec<BlockHeader>) -> Self {
         *self.blocks.lock().expect("blocks") = blocks;
+        self
+    }
+
+    fn with_logs(self, logs: Vec<LogRecord>) -> Self {
+        *self.logs.lock().expect("logs") = logs;
         self
     }
 
@@ -1808,38 +2168,225 @@ impl ChainAdapter for IndexFixtureAdapter {
 
     fn fetch(&self, request: ChainFetchRequest) -> Result<ChainFetchResponse, DatalensError> {
         let range = request.range.block_range().expect("block range");
-        self.calls
-            .lock()
-            .expect("calls")
-            .push(IndexSourceCall::Blocks(range));
-        let rows = self
-            .blocks
-            .lock()
-            .expect("blocks")
-            .iter()
-            .filter(|block| request.range.contains(block.number))
-            .cloned()
-            .collect();
-        ChainFetchResponse::try_new(
-            request.chain,
-            request.dataset_key,
-            request.range,
-            request.selector,
-            if self.chain.family() == ChainFamily::Evm {
-                QueryRows::EvmBlocks(rows)
-            } else {
-                QueryRows::AdapterJson {
-                    dataset_key: DatasetKey::tron_events(),
-                    rows: Vec::new(),
-                }
-            },
-        )
-        .map(|response| {
-            response.with_provider_diagnostics(ProviderDiagnostics {
-                calls: 1,
-                rows_scanned: 0,
-                warnings: Vec::new(),
-            })
-        })
+        match &request.dataset_key {
+            dataset if *dataset == DatasetKey::evm_logs() => {
+                self.calls
+                    .lock()
+                    .expect("calls")
+                    .push(IndexSourceCall::Logs(range, request.selector.clone()));
+                let rows = self
+                    .logs
+                    .lock()
+                    .expect("logs")
+                    .iter()
+                    .filter(|log| request.range.contains(log.block_number))
+                    .cloned()
+                    .collect();
+                ChainFetchResponse::try_new(
+                    request.chain,
+                    request.dataset_key,
+                    request.range,
+                    request.selector,
+                    QueryRows::EvmLogs(rows),
+                )
+                .map(|response| {
+                    response.with_provider_diagnostics(ProviderDiagnostics {
+                        calls: 2,
+                        rows_scanned: 1,
+                        warnings: vec!["reliability_receipt_fallback_calls=1".to_owned()],
+                    })
+                })
+            }
+            _ => {
+                self.calls
+                    .lock()
+                    .expect("calls")
+                    .push(IndexSourceCall::Blocks(range));
+                let rows = self
+                    .blocks
+                    .lock()
+                    .expect("blocks")
+                    .iter()
+                    .filter(|block| request.range.contains(block.number))
+                    .cloned()
+                    .collect();
+                ChainFetchResponse::try_new(
+                    request.chain,
+                    request.dataset_key,
+                    request.range,
+                    request.selector,
+                    if self.chain.family() == ChainFamily::Evm {
+                        QueryRows::EvmBlocks(rows)
+                    } else {
+                        QueryRows::AdapterJson {
+                            dataset_key: DatasetKey::tron_events(),
+                            rows: Vec::new(),
+                        }
+                    },
+                )
+                .map(|response| {
+                    response.with_provider_diagnostics(ProviderDiagnostics {
+                        calls: 1,
+                        rows_scanned: 0,
+                        warnings: Vec::new(),
+                    })
+                })
+            }
+        }
     }
+}
+
+fn start_rpc_server(responses: Vec<Value>) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+    let address = listener.local_addr().expect("test server address");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let request_log = Arc::clone(&requests);
+    let responses = Arc::new(Mutex::new(responses));
+
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = stream.expect("test server connection");
+            let request_json = read_http_json(&mut stream);
+            request_log.lock().expect("request log").push(request_json);
+            let response = responses.lock().expect("responses").remove(0);
+            let response = response.to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                response.len(),
+                response
+            )
+            .expect("write response");
+        }
+    });
+
+    (format!("http://{address}"), requests)
+}
+
+fn read_http_json(stream: &mut TcpStream) -> Value {
+    let mut buffer = Vec::new();
+    let mut chunk = [0; 4096];
+    loop {
+        let read = stream.read(&mut chunk).expect("read request");
+        if read == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if let Some(header_end) = find_headers_end(&buffer) {
+            let headers = String::from_utf8_lossy(&buffer[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("content-length:")
+                        .or_else(|| line.strip_prefix("Content-Length:"))
+                })
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .expect("content length");
+            let body_start = header_end + 4;
+            while buffer.len() < body_start + content_length {
+                let read = stream.read(&mut chunk).expect("read body");
+                if read == 0 {
+                    break;
+                }
+                buffer.extend_from_slice(&chunk[..read]);
+            }
+            return serde_json::from_slice(&buffer[body_start..body_start + content_length])
+                .expect("json request");
+        }
+    }
+    panic!("missing HTTP request body");
+}
+
+fn find_headers_end(buffer: &[u8]) -> Option<usize> {
+    buffer.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn block_number_response(number: u64) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": format!("0x{number:x}"),
+    })
+}
+
+fn logs_response(logs: Vec<Value>) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": logs,
+    })
+}
+
+fn block_batch_response_with_bloom(
+    id: u64,
+    number: u64,
+    hash: &str,
+    parent_hash: &str,
+    timestamp: u64,
+    logs_bloom: &str,
+) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "number": format!("0x{number:x}"),
+            "hash": hash,
+            "parentHash": parent_hash,
+            "timestamp": format!("0x{timestamp:x}"),
+            "logsBloom": logs_bloom,
+        },
+    })
+}
+
+fn block_receipts_response(receipts: Vec<Value>) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": receipts,
+    })
+}
+
+fn receipt(
+    number: u64,
+    block_hash: &str,
+    transaction_hash: &str,
+    transaction_index: u64,
+    logs: Vec<Value>,
+) -> Value {
+    json!({
+        "transactionHash": transaction_hash,
+        "blockNumber": format!("0x{number:x}"),
+        "blockHash": block_hash,
+        "transactionIndex": format!("0x{transaction_index:x}"),
+        "status": "0x1",
+        "gasUsed": "0x5208",
+        "cumulativeGasUsed": "0x5208",
+        "logs": logs,
+    })
+}
+
+fn provider_log_with_address(
+    number: u64,
+    block_hash: &str,
+    transaction_hash: &str,
+    transaction_index: u64,
+    log_index: u64,
+    address: &str,
+    topic: &str,
+) -> Value {
+    json!({
+        "blockNumber": format!("0x{number:x}"),
+        "blockHash": block_hash,
+        "transactionHash": transaction_hash,
+        "transactionIndex": format!("0x{transaction_index:x}"),
+        "logIndex": format!("0x{log_index:x}"),
+        "address": address,
+        "topics": [topic],
+        "data": "0x",
+        "removed": false,
+    })
+}
+
+fn block_hash(number: u64) -> String {
+    format!("0x{number:064x}")
 }
