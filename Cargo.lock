@@ -2043,9 +2043,12 @@ dependencies = [
  "datalens-chain",
  "datalens-chain-conformance",
  "datalens-core",
+ "datalens-storage",
+ "datalens-writer",
  "log",
  "reqwest",
  "serde_json",
+ "sha3",
 ]
 
 [[package]]

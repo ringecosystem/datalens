@@ -12,8 +12,8 @@ use datalens_chain::{
 };
 use datalens_core::{
     BlockHeader, BlockRange, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, Dataset,
-    DatasetKey, EvmLogFilter, EvmReceipt, EvmTransaction, LedgerRange, LogFilter, LogRecord,
-    QueryRows, QueryStrategy, TopicFilter, redact_urls_in_text,
+    DatasetKey, EvmBlockHeader, EvmLogFilter, EvmReceipt, EvmTransaction, LedgerRange, LogFilter,
+    LogRecord, QueryRows, QueryStrategy, TopicFilter, redact_urls_in_text,
 };
 use reqwest::blocking::Client;
 use serde_json::{Value, json};
@@ -26,6 +26,7 @@ pub use crate::provider_payload::{
     classify_provider_error, height_from_latest_lag, parse_log_record, parse_receipt,
     parse_transaction,
 };
+use crate::{EvmBlockHeaderFetch, EvmBlockHeaderFetcher};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EvmAdapterMetadata {
@@ -344,6 +345,23 @@ impl EvmRpcClient {
             });
         }
         Ok(blocks)
+    }
+
+    pub fn fetch_evm_block_headers(
+        &self,
+        range: BlockRange,
+    ) -> Result<Vec<EvmBlockHeader>, DatalensError> {
+        log::info!(
+            "fetching EVM block headers range={}-{} mode={} batch_size={}",
+            range.from_block,
+            range.to_block,
+            self.block_header_metadata.fetch_mode.as_str(),
+            self.block_header_metadata.batch_size
+        );
+        match self.block_header_metadata.fetch_mode {
+            EvmBlockHeaderFetchMode::Batch => self.fetch_evm_block_headers_in_batches(range),
+            EvmBlockHeaderFetchMode::Concurrent => self.fetch_evm_block_headers_concurrently(range),
+        }
     }
 
     pub fn fetch_transactions(
@@ -1051,6 +1069,15 @@ impl ChainAdapter for EvmRpcClient {
     }
 }
 
+impl EvmBlockHeaderFetcher for EvmRpcClient {
+    fn fetch_block_headers(&self, range: BlockRange) -> Result<EvmBlockHeaderFetch, DatalensError> {
+        Ok(EvmBlockHeaderFetch {
+            range,
+            headers: self.fetch_evm_block_headers(range)?,
+        })
+    }
+}
+
 fn log_matches_filter(log: &LogRecord, filter: &EvmLogFilter) -> bool {
     if !filter.addresses().is_empty() && !filter.addresses().contains(&log.address) {
         return false;
@@ -1088,6 +1115,176 @@ impl EvmRpcClient {
             blocks.push(block);
         }
         Ok(blocks)
+    }
+
+    fn fetch_evm_block_headers_in_batches(
+        &self,
+        range: BlockRange,
+    ) -> Result<Vec<EvmBlockHeader>, DatalensError> {
+        let mut headers = Vec::new();
+        for chunk in range.split(self.block_header_metadata.batch_size as u64)? {
+            match self.fetch_evm_block_header_batch(chunk) {
+                Ok(mut chunk_headers) => headers.append(&mut chunk_headers),
+                Err(error) => {
+                    log::warn!(
+                        "falling back to single EVM block header fetch range={}-{} kind={:?}",
+                        chunk.from_block,
+                        chunk.to_block,
+                        error.kind
+                    );
+                    for number in chunk.from_block..=chunk.to_block {
+                        headers.push(self.fetch_evm_block_header(number)?);
+                    }
+                }
+            }
+        }
+        headers.sort_by_key(|header| header.block_number);
+        headers.dedup_by_key(|header| header.block_number);
+        Ok(headers)
+    }
+
+    fn fetch_evm_block_headers_concurrently(
+        &self,
+        range: BlockRange,
+    ) -> Result<Vec<EvmBlockHeader>, DatalensError> {
+        let numbers = (range.from_block..=range.to_block).collect::<VecDeque<_>>();
+        let concurrency = self
+            .block_header_metadata
+            .fetch_concurrency
+            .min(numbers.len())
+            .max(1);
+        let work = Arc::new(Mutex::new(numbers));
+        let mut handles = Vec::with_capacity(concurrency);
+        for _ in 0..concurrency {
+            let client = self.clone();
+            let work = Arc::clone(&work);
+            handles.push(thread::spawn(move || {
+                let mut headers = Vec::new();
+                loop {
+                    let number = work.lock().expect("header work").pop_front();
+                    let Some(number) = number else {
+                        break;
+                    };
+                    headers.push(client.fetch_evm_block_header(number)?);
+                }
+                Ok::<_, DatalensError>(headers)
+            }));
+        }
+
+        let mut headers = Vec::new();
+        for handle in handles {
+            let mut fetched = handle.join().map_err(|_| {
+                DatalensError::new(
+                    DatalensErrorKind::Internal,
+                    "EVM block header worker panicked",
+                )
+            })??;
+            headers.append(&mut fetched);
+        }
+        headers.sort_by_key(|header| header.block_number);
+        headers.dedup_by_key(|header| header.block_number);
+        Ok(headers)
+    }
+
+    fn fetch_evm_block_header_batch(
+        &self,
+        range: BlockRange,
+    ) -> Result<Vec<EvmBlockHeader>, DatalensError> {
+        let rpc_requests = (range.from_block..=range.to_block)
+            .enumerate()
+            .map(|(index, number)| {
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": index + 1,
+                    "method": "eth_getBlockByNumber",
+                    "params": [format!("0x{number:x}"), false],
+                })
+            })
+            .collect::<Vec<_>>();
+        let responses = self.batch_call("eth_getBlockByNumber", rpc_requests)?;
+        let request_by_id = (range.from_block..=range.to_block)
+            .enumerate()
+            .map(|(index, number)| ((index + 1) as u64, number))
+            .collect::<BTreeMap<_, _>>();
+        let mut response_by_id = BTreeMap::new();
+        for response in responses {
+            let Some(id) = response.get("id").and_then(Value::as_u64) else {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::ProviderFailure,
+                    "EVM block header batch response missing numeric id",
+                ));
+            };
+            response_by_id.insert(id, response);
+        }
+
+        let mut headers = Vec::new();
+        for (id, number) in request_by_id {
+            let response = response_by_id.get(&id).ok_or_else(|| {
+                DatalensError::new(
+                    DatalensErrorKind::ProviderFailure,
+                    format!("EVM block header batch response missing block {number}"),
+                )
+            })?;
+            if let Some(error) = response.get("error") {
+                let code = error
+                    .get("code")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default();
+                let message = error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("provider error");
+                return Err(classify_provider_error(code, message));
+            }
+            let Some(block) = response.get("result") else {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::ProviderFailure,
+                    format!("EVM block header batch response missing result for {number}"),
+                ));
+            };
+            if block.is_null() {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::ProviderFailure,
+                    format!("provider returned null block for {number}"),
+                ));
+            }
+            let header = Self::parse_evm_block_header(block)?;
+            if header.block_number != number {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::ProviderFailure,
+                    format!(
+                        "fetched block number {} does not match requested block {}",
+                        header.block_number, number
+                    ),
+                ));
+            }
+            headers.push(header);
+        }
+        Ok(headers)
+    }
+
+    fn fetch_evm_block_header(&self, number: u64) -> Result<EvmBlockHeader, DatalensError> {
+        let result = self.call(
+            "eth_getBlockByNumber",
+            json!([format!("0x{number:x}"), false]),
+        )?;
+        let Some(block) = result else {
+            return Err(DatalensError::new(
+                DatalensErrorKind::ProviderFailure,
+                format!("provider returned null block for {number}"),
+            ));
+        };
+        let header = Self::parse_evm_block_header(&block)?;
+        if header.block_number != number {
+            return Err(DatalensError::new(
+                DatalensErrorKind::ProviderFailure,
+                format!(
+                    "fetched block number {} does not match requested block {}",
+                    header.block_number, number
+                ),
+            ));
+        }
+        Ok(header)
     }
 
     fn enrich_logs_with_block_metadata(
@@ -1466,6 +1663,16 @@ impl EvmRpcClient {
             hash: string_field(block, "hash")?,
             parent_hash: string_field(block, "parentHash")?,
             timestamp: hex_u64_field(block, "timestamp")?,
+        })
+    }
+
+    fn parse_evm_block_header(block: &Value) -> Result<EvmBlockHeader, DatalensError> {
+        Ok(EvmBlockHeader {
+            block_number: hex_u64_field(block, "number")?,
+            block_hash: string_field(block, "hash")?,
+            parent_hash: string_field(block, "parentHash")?,
+            timestamp: hex_u64_field(block, "timestamp")?,
+            logs_bloom: string_field(block, "logsBloom")?,
         })
     }
 
