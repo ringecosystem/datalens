@@ -208,8 +208,11 @@ struct LogBlockHeaderDiagnostics {
     fetch_concurrency: usize,
     batch_size: usize,
     reliability_checked: bool,
+    reliability_header_blocks: usize,
     reliability_suspicious_blocks: usize,
     reliability_secondary_calls: usize,
+    reliability_unrecovered_blocks: usize,
+    reliability_recovery_available: bool,
 }
 
 impl LogBlockHeaderDiagnostics {
@@ -232,8 +235,12 @@ impl LogBlockHeaderDiagnostics {
         }
         if self.reliability_checked {
             warning.push_str(&format!(
-                " reliability_suspicious_blocks={} reliability_secondary_calls={}",
-                self.reliability_suspicious_blocks, self.reliability_secondary_calls
+                " reliability_header_blocks={} reliability_suspicious_blocks={} reliability_secondary_calls={} reliability_unrecovered_blocks={} reliability_recovery_available={}",
+                self.reliability_header_blocks,
+                self.reliability_suspicious_blocks,
+                self.reliability_secondary_calls,
+                self.reliability_unrecovered_blocks,
+                self.reliability_recovery_available
             ));
         }
         warning
@@ -262,9 +269,11 @@ struct LogBlockHeaderFetch {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct LogReliabilityDiagnostics {
-    header_provider_calls: usize,
+    header_blocks: usize,
     suspicious_blocks: usize,
     secondary_provider_calls: usize,
+    unrecovered_blocks: usize,
+    recovery_available: bool,
 }
 
 #[derive(Clone)]
@@ -498,11 +507,13 @@ impl EvmRpcClient {
             self.verify_and_merge_logs_with_secondary(range, filter, logs)?;
         let (mut logs, mut diagnostics) = self.enrich_logs_with_block_metadata(logs)?;
         if let Some(reliability_diagnostics) = reliability_diagnostics {
-            diagnostics.provider_calls += reliability_diagnostics.header_provider_calls;
             diagnostics.reliability_checked = true;
+            diagnostics.reliability_header_blocks = reliability_diagnostics.header_blocks;
             diagnostics.reliability_suspicious_blocks = reliability_diagnostics.suspicious_blocks;
             diagnostics.reliability_secondary_calls =
                 reliability_diagnostics.secondary_provider_calls;
+            diagnostics.reliability_unrecovered_blocks = reliability_diagnostics.unrecovered_blocks;
+            diagnostics.reliability_recovery_available = reliability_diagnostics.recovery_available;
         }
         log::info!("{}", diagnostics.warning());
         logs.sort_by_key(|log| (log.block_number, log.transaction_index, log.log_index));
@@ -557,15 +568,9 @@ impl EvmRpcClient {
         })?;
         self.insert_evm_block_headers_into_cache(&headers);
 
-        let primary_blocks = primary_logs
-            .iter()
-            .filter(|log| range.contains(log.block_number))
-            .map(|log| log.block_number)
-            .collect::<std::collections::BTreeSet<_>>();
         let mut suspicious_blocks = Vec::new();
         for header in &headers {
-            if !range.contains(header.block_number) || primary_blocks.contains(&header.block_number)
-            {
+            if !range.contains(header.block_number) {
                 continue;
             }
             if header_bloom_may_match_filter(header, filter)? {
@@ -574,21 +579,22 @@ impl EvmRpcClient {
         }
 
         let mut diagnostics = LogReliabilityDiagnostics {
-            header_provider_calls: self.block_header_resolve_provider_call_count(range),
+            header_blocks: headers.len(),
             suspicious_blocks: suspicious_blocks.len(),
             secondary_provider_calls: 0,
+            unrecovered_blocks: 0,
+            recovery_available: !self.secondary_provider_urls().is_empty(),
         };
         if suspicious_blocks.is_empty() {
             return Ok((primary_logs, Some(diagnostics)));
         }
         if self.secondary_provider_urls().is_empty() {
-            return Err(DatalensError::new(
-                DatalensErrorKind::ProviderFailure,
-                format!(
-                    "EVM log reliability found {} bloom-positive block(s) missing primary logs but no secondary RPC provider is configured",
-                    suspicious_blocks.len()
-                ),
-            ));
+            diagnostics.unrecovered_blocks = suspicious_blocks.len();
+            log::warn!(
+                "EVM log reliability found {} bloom-positive block(s) but no recovery provider is configured; returning primary result without authoritative recovery",
+                suspicious_blocks.len()
+            );
+            return Ok((primary_logs, Some(diagnostics)));
         }
 
         let mut merged = primary_logs;
@@ -628,16 +634,6 @@ impl EvmRpcClient {
 
         dedupe_and_sort_logs(&mut merged);
         Ok((merged, Some(diagnostics)))
-    }
-
-    fn block_header_resolve_provider_call_count(&self, range: BlockRange) -> usize {
-        match self.block_header_metadata.fetch_mode {
-            EvmBlockHeaderFetchMode::Concurrent => range.len().min(usize::MAX as u128) as usize,
-            EvmBlockHeaderFetchMode::Batch => range
-                .split(self.block_header_metadata.batch_size as u64)
-                .map(|ranges| ranges.len())
-                .unwrap_or_default(),
-        }
     }
 
     fn fetch_evm_logs_from_receipts_with_request_id(

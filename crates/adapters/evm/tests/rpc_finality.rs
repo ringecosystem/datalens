@@ -245,13 +245,20 @@ fn test_provider_filter_logs_use_eth_get_logs() {
     assert_eq!(rows[0].address, address);
     assert_eq!(rows[0].parent_hash.as_deref(), Some("0xparent"));
     assert_eq!(rows[0].block_timestamp, Some(1));
-    assert_eq!(response.provider_diagnostics.calls, 2);
+    assert_eq!(response.provider_diagnostics.calls, 1);
     assert!(
         response
             .provider_diagnostics
             .warnings
             .iter()
-            .any(|warning| warning.contains("header_provider_calls=1"))
+            .any(|warning| warning.contains("header_provider_calls=0"))
+    );
+    assert!(
+        response
+            .provider_diagnostics
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("reliability_header_blocks=1"))
     );
     let requests = requests.lock().expect("requests");
     assert_eq!(requests.len(), 2);
@@ -388,7 +395,7 @@ fn test_provider_filter_logs_reliability_recovers_primary_empty_bloom_candidate_
     assert_eq!(rows[0].log_index, 7);
     assert_eq!(rows[0].parent_hash.as_deref(), Some("0xparent10"));
     assert_eq!(rows[0].block_timestamp, Some(10));
-    assert_eq!(response.provider_diagnostics.calls, 3);
+    assert_eq!(response.provider_diagnostics.calls, 2);
     assert!(
         response
             .provider_diagnostics
@@ -474,11 +481,11 @@ fn test_provider_filter_logs_reliability_merges_dedupes_and_sorts_secondary_rows
             .collect::<Vec<_>>(),
         vec![Some("0xparent10"), Some("0xparent11"), Some("0xparent12")]
     );
-    assert_eq!(response.provider_diagnostics.calls, 3);
+    assert_eq!(response.provider_diagnostics.calls, 2);
     let secondary_requests = secondary_requests.lock().expect("secondary requests");
     assert_eq!(secondary_requests.len(), 1);
-    assert_eq!(secondary_requests[0]["params"][0]["fromBlock"], "0xb");
-    assert_eq!(secondary_requests[0]["params"][0]["toBlock"], "0xb");
+    assert_eq!(secondary_requests[0]["params"][0]["fromBlock"], "0xa");
+    assert_eq!(secondary_requests[0]["params"][0]["toBlock"], "0xc");
 }
 
 #[test]
@@ -540,7 +547,7 @@ fn test_provider_filter_logs_reliability_disabled_preserves_primary_only_empty_c
 }
 
 #[test]
-fn test_provider_filter_logs_reliability_errors_on_bloom_candidate_without_secondary_provider() {
+fn test_provider_filter_logs_reliability_warns_on_bloom_candidate_without_secondary_provider() {
     let topic = transfer_topic();
     let address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let block_hash = block_hash(10);
@@ -579,18 +586,109 @@ fn test_provider_filter_logs_reliability_errors_on_bloom_candidate_without_secon
     })
     .expect("filter");
 
-    let error = client
+    let response = client
         .fetch(ChainFetchRequest::new(
             ethereum_identity(),
             DatasetKey::evm_logs(),
             LedgerRange::from_block_range(BlockRange::expect_new(10, 10)),
             DatasetSelector::EvmLogs(filter),
         ))
-        .expect_err("missing secondary should fail closed");
+        .expect("logs");
 
-    assert_eq!(error.kind, DatalensErrorKind::ProviderFailure);
-    assert!(error.message.contains("secondary"));
-    assert!(error.message.contains("bloom"));
+    let QueryRows::EvmLogs(rows) = response.rows.rows() else {
+        panic!("expected EVM logs");
+    };
+    assert!(rows.is_empty());
+    assert_eq!(response.provider_diagnostics.calls, 1);
+    assert!(
+        response
+            .provider_diagnostics
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("reliability_unrecovered_blocks=1"))
+    );
+    assert!(
+        response
+            .provider_diagnostics
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("reliability_recovery_available=false"))
+    );
+    assert_eq!(_primary_requests.lock().expect("primary requests").len(), 2);
+}
+
+#[test]
+fn test_provider_filter_logs_reliability_recovers_partial_omission_inside_block() {
+    let topic = transfer_topic();
+    let address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let block_hash = block_hash(10);
+    let bloom = EvmLogBloom::from_inputs([
+        EvmLogBloomInput::Address(address),
+        EvmLogBloomInput::Topic(topic),
+    ])
+    .expect("bloom")
+    .as_hex();
+    let primary_log = provider_log_with_address(10, &block_hash, "0xtx0", 0, 0, address, topic);
+    let secondary_log = provider_log_with_address(10, &block_hash, "0xtx1", 1, 1, address, topic);
+    let (primary_url, _primary_requests) = start_rpc_server(vec![
+        logs_response(vec![primary_log.clone()]),
+        json!([block_batch_response_with_bloom(
+            1,
+            10,
+            &block_hash,
+            "0xparent10",
+            10,
+            &bloom
+        )]),
+    ]);
+    let (secondary_url, secondary_requests) =
+        start_rpc_server(vec![logs_response(vec![primary_log, secondary_log])]);
+    let client = EvmRpcClient::with_chain(
+        vec![primary_url, secondary_url],
+        ethereum_identity(),
+        EvmFinalityPolicy::Lag {
+            safe_lag_blocks: Some(2),
+            finalized_lag_blocks: Some(4),
+        },
+        10,
+        10,
+        3,
+        10,
+    );
+    let filter = datalens_core::EvmLogFilter::try_from(LogFilter {
+        addresses: vec![address.to_owned()],
+        topics: vec![Some(vec![topic.to_owned()])],
+    })
+    .expect("filter");
+
+    let response = client
+        .fetch(ChainFetchRequest::new(
+            ethereum_identity(),
+            DatasetKey::evm_logs(),
+            LedgerRange::from_block_range(BlockRange::expect_new(10, 10)),
+            DatasetSelector::EvmLogs(filter),
+        ))
+        .expect("logs");
+
+    let QueryRows::EvmLogs(rows) = response.rows.rows() else {
+        panic!("expected EVM logs");
+    };
+    assert_eq!(
+        rows.iter()
+            .map(|log| (log.transaction_index, log.log_index))
+            .collect::<Vec<_>>(),
+        vec![(0, 0), (1, 1)]
+    );
+    assert!(
+        rows.iter()
+            .all(|log| log.parent_hash.as_deref() == Some("0xparent10"))
+    );
+    assert!(rows.iter().all(|log| log.block_timestamp == Some(10)));
+    let secondary_requests = secondary_requests.lock().expect("secondary requests");
+    assert_eq!(secondary_requests.len(), 1);
+    assert_eq!(secondary_requests[0]["method"], "eth_getLogs");
+    assert_eq!(secondary_requests[0]["params"][0]["fromBlock"], "0xa");
+    assert_eq!(secondary_requests[0]["params"][0]["toBlock"], "0xa");
 }
 
 #[test]
