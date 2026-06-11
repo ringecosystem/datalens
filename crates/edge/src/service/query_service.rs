@@ -7,7 +7,9 @@ use datalens_chain::{
     AdapterCapabilities, ChainAdapter, ChainHeight, DatasetCapability, SelectorKind,
 };
 use datalens_core::{DatalensError, DatalensErrorKind, DatasetKey, DatasetRows, LedgerRange};
-use datalens_executor::{NativeQueryExecutionConfig, NativeQueryExecutor, generate_query_id};
+use datalens_executor::{
+    NativeQueryExecutionConfig, NativeQueryExecutor, QueryMetadataWorkerConfig, generate_query_id,
+};
 use datalens_metrics::{ApplicationIdentity, MetricsRecorder};
 use datalens_planner::{NativePlannerConfig, NativeQueryInput};
 use datalens_storage::{
@@ -22,7 +24,7 @@ use datalens_writer::{DurableWriteResult, DurableWriter, DurableWriterConfig};
 
 use crate::{
     chain_family,
-    config::{ChainConfig, MetricsConfig, PlannerConfig, WriterConfig},
+    config::{ChainConfig, MetricsConfig, PlannerConfig, QueryMetadataConfig, WriterConfig},
     contract::discovery::{ChainDiscovery, DatasetDiscovery},
 };
 
@@ -105,6 +107,34 @@ where
         chain: ChainConfig,
         metrics_config: MetricsConfig,
     ) -> Result<Self, DatalensError> {
+        Self::new_with_metadata_config(
+            storage,
+            source,
+            planner,
+            writer,
+            chain_name,
+            chain,
+            metrics_config,
+            QueryMetadataConfig::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_metadata_config(
+        storage: impl StorageRepository + 'static,
+        source: S,
+        planner: PlannerConfig,
+        writer: WriterConfig,
+        chain_name: impl Into<String>,
+        chain: ChainConfig,
+        metrics_config: MetricsConfig,
+        metadata_config: QueryMetadataConfig,
+    ) -> Result<Self, DatalensError> {
+        datalens_executor::configure_query_metadata_worker_pool(QueryMetadataWorkerConfig {
+            queue_capacity: metadata_config.queue_capacity,
+            worker_threads: metadata_config.worker_threads,
+            coalesced_capacity: metadata_config.coalesced_capacity,
+        });
         let storage: Arc<dyn StorageRepository> = Arc::new(storage);
         let recorder = if metrics_config.enabled {
             Some(MetricsRecorder::new().map_err(|error| {

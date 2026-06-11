@@ -165,6 +165,24 @@ fn validate_query_config(config: &DatalensConfig) -> Result<(), DatalensError> {
             "query.index.graphql_enabled is not a Datalens server surface; run application index GraphQL as an external application service",
         ));
     }
+    if config.query.metadata.queue_capacity == 0 {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "query.metadata.queue_capacity must be greater than zero",
+        ));
+    }
+    if config.query.metadata.worker_threads == 0 {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "query.metadata.worker_threads must be greater than zero",
+        ));
+    }
+    if config.query.metadata.coalesced_capacity == 0 {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "query.metadata.coalesced_capacity must be greater than zero",
+        ));
+    }
     let paths = [
         ("query.native.path", &config.query.native.path),
         (

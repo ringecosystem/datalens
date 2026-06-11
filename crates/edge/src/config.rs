@@ -196,6 +196,8 @@ pub struct QueryConfig {
     pub native: GraphqlSurfaceConfig,
     #[serde(default = "default_index_query_surface")]
     pub index: GraphqlSurfaceConfig,
+    #[serde(default)]
+    pub metadata: QueryMetadataConfig,
 }
 
 impl Default for QueryConfig {
@@ -203,6 +205,28 @@ impl Default for QueryConfig {
         Self {
             native: default_native_query_surface(),
             index: default_index_query_surface(),
+            metadata: QueryMetadataConfig::default(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueryMetadataConfig {
+    #[serde(default = "default_query_metadata_queue_capacity")]
+    pub queue_capacity: usize,
+    #[serde(default = "default_query_metadata_worker_threads")]
+    pub worker_threads: usize,
+    #[serde(default = "default_query_metadata_coalesced_capacity")]
+    pub coalesced_capacity: usize,
+}
+
+impl Default for QueryMetadataConfig {
+    fn default() -> Self {
+        Self {
+            queue_capacity: default_query_metadata_queue_capacity(),
+            worker_threads: default_query_metadata_worker_threads(),
+            coalesced_capacity: default_query_metadata_coalesced_capacity(),
         }
     }
 }
@@ -405,6 +429,18 @@ fn default_index_graphql_path() -> String {
 
 fn default_index_graphql_playground_path() -> String {
     "/index/graphiql".to_owned()
+}
+
+fn default_query_metadata_queue_capacity() -> usize {
+    8192
+}
+
+fn default_query_metadata_worker_threads() -> usize {
+    4
+}
+
+fn default_query_metadata_coalesced_capacity() -> usize {
+    2048
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

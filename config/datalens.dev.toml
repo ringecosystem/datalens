@@ -39,6 +39,11 @@ path = "/native/graphql"
 playground_enabled = true
 playground_path = "/native/graphiql"
 
+[query.metadata]
+queue_capacity = 8192
+worker_threads = 4
+coalesced_capacity = 2048
+
 [warmup]
 enabled = false
 registry_path = ".tmp/datalens-warmup"

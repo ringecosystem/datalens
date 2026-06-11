@@ -2,7 +2,8 @@ use datalens_core::{ChainFamily, ChainIdentity, DatalensErrorKind, DatasetKey};
 use datalens_metrics::{
     ApplicationIdentity, CacheCoverageOutcome, DurableIntentClaimOutcome, DurableIntentOutcome,
     DurableWriteOutcome, ErrorLabels, FillOutcome, HotReorgOutcome, MetricsLabels, MetricsRecorder,
-    QueryOutcome, WarmupFetchOutcome, WarmupTaskOutcome, WarmupWriteOutcome,
+    QueryMetadataEnqueueOutcome, QueryMetadataWriteOutcome, QueryOutcome, WarmupFetchOutcome,
+    WarmupTaskOutcome, WarmupWriteOutcome,
 };
 
 #[test]
@@ -119,6 +120,50 @@ fn test_warmup_metrics_have_distinct_series_and_outcomes() {
     assert!(output.contains(
         r#"datalens_warmup_current_height{application="warmup-app",chain="ethereum",chain_kind="evm",dataset="evm.logs"} 123"#
     ));
+}
+
+#[test]
+fn test_query_metadata_metrics_have_kind_and_outcome_labels() {
+    let recorder = MetricsRecorder::new().expect("metrics recorder");
+    let labels = labels(Some("query-api"));
+
+    recorder.record_query_metadata_enqueue(
+        &labels,
+        "query_watermark",
+        QueryMetadataEnqueueOutcome::Coalesced,
+    );
+    recorder.record_query_metadata_enqueue(
+        &labels,
+        "usage_ledger",
+        QueryMetadataEnqueueOutcome::Dropped,
+    );
+    recorder.record_query_metadata_enqueue(
+        &labels,
+        "query_activity",
+        QueryMetadataEnqueueOutcome::CoalesceFull,
+    );
+    recorder.record_query_metadata_write(
+        &labels,
+        "query_activity",
+        QueryMetadataWriteOutcome::Completed,
+    );
+    recorder.observe_query_metadata_write_duration(&labels, "query_activity", 0.25);
+
+    let output = recorder.encode().expect("prometheus text");
+
+    assert!(output.contains(
+        r#"datalens_query_metadata_enqueue_total{application="query-api",chain="ethereum",chain_kind="evm",dataset="evm.logs",metadata_kind="query_watermark",outcome="coalesced"} 1"#
+    ));
+    assert!(output.contains(
+        r#"datalens_query_metadata_enqueue_total{application="query-api",chain="ethereum",chain_kind="evm",dataset="evm.logs",metadata_kind="usage_ledger",outcome="dropped"} 1"#
+    ));
+    assert!(output.contains(
+        r#"datalens_query_metadata_enqueue_total{application="query-api",chain="ethereum",chain_kind="evm",dataset="evm.logs",metadata_kind="query_activity",outcome="coalesce_full"} 1"#
+    ));
+    assert!(output.contains(
+        r#"datalens_query_metadata_write_total{application="query-api",chain="ethereum",chain_kind="evm",dataset="evm.logs",metadata_kind="query_activity",outcome="completed"} 1"#
+    ));
+    assert!(output.contains("datalens_query_metadata_write_duration_seconds"));
 }
 
 #[test]
