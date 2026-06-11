@@ -692,6 +692,7 @@ fn merge_segments(
 fn estimated_object_bytes(rows: &DatasetRows) -> Result<u64, DatalensError> {
     match rows.rows() {
         QueryRows::EvmBlocks(_)
+        | QueryRows::EvmBlockHeaders(_)
         | QueryRows::EvmTransactions(_)
         | QueryRows::EvmReceipts(_)
         | QueryRows::EvmLogs(_)
@@ -724,6 +725,7 @@ fn estimated_object_bytes_after_merge(
 fn empty_query_rows(dataset_key: DatasetKey) -> QueryRows {
     match dataset_key.evm_dataset() {
         Some(Dataset::Blocks) => QueryRows::EvmBlocks(Vec::new()),
+        Some(Dataset::BlockHeaders) => QueryRows::EvmBlockHeaders(Vec::new()),
         Some(Dataset::Transactions) => QueryRows::EvmTransactions(Vec::new()),
         Some(Dataset::Receipts) => QueryRows::EvmReceipts(Vec::new()),
         Some(Dataset::Logs) => QueryRows::EvmLogs(Vec::new()),
@@ -743,6 +745,11 @@ fn filter_rows(rows: DatasetRows, range: LedgerRange) -> DatasetRows {
         QueryRows::EvmBlocks(rows) => QueryRows::EvmBlocks(
             rows.into_iter()
                 .filter(|row| block_range.contains(row.number))
+                .collect(),
+        ),
+        QueryRows::EvmBlockHeaders(rows) => QueryRows::EvmBlockHeaders(
+            rows.into_iter()
+                .filter(|row| block_range.contains(row.block_number))
                 .collect(),
         ),
         QueryRows::EvmTransactions(rows) => QueryRows::EvmTransactions(

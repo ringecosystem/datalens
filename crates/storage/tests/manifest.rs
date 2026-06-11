@@ -16,8 +16,8 @@ use datalens_chain::DatasetSelector;
 use datalens_chain::FinalityLevel;
 use datalens_core::{
     BlockHeader, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey,
-    DatasetRows, EvmReceipt, EvmTransaction, LedgerRange, LedgerRangeKind, LogFilter, LogRecord,
-    NetworkId, QueryRows, missing_ranges,
+    DatasetRows, EvmBlockHeader, EvmReceipt, EvmTransaction, LedgerRange, LedgerRangeKind,
+    LogFilter, LogRecord, NetworkId, QueryRows, missing_ranges,
 };
 
 use datalens_storage::*;
@@ -1174,6 +1174,19 @@ fn assert_parquet_compression(bytes: &[u8], expected: Compression) {
     }
 }
 
+fn assert_parquet_columns(bytes: &[u8], expected: &[&str]) {
+    let reader = SerializedFileReader::new(bytes::Bytes::copy_from_slice(bytes))
+        .expect("parquet file reader");
+    let fields = reader
+        .metadata()
+        .file_metadata()
+        .schema_descr()
+        .root_schema()
+        .get_fields();
+    let actual = fields.iter().map(|field| field.name()).collect::<Vec<_>>();
+    assert_eq!(actual, expected);
+}
+
 fn hex_sha256(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -1306,6 +1319,124 @@ fn test_evm_blocks_rows_write_zstd_parquet_and_read_back() {
         .read_rows(&chain, &DatasetKey::evm_blocks(), &selector, range)
         .expect("read rows");
     assert_eq!(read, rows);
+}
+
+#[test]
+fn test_evm_block_headers_rows_write_parquet_and_read_back_by_range() {
+    let storage = LocalStorage::new_with_config(
+        temp_storage_root("block-headers-parquet-roundtrip"),
+        DurableStorageConfig {
+            parquet_compression: ParquetCompression::Snappy,
+        },
+    );
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let range = LedgerRange::blocks(10, 12).expect("valid range");
+    let rows = DatasetRows::new(
+        DatasetKey::evm_block_headers(),
+        QueryRows::EvmBlockHeaders(vec![
+            EvmBlockHeader {
+                block_number: 10,
+                block_hash: "0xblock10".to_owned(),
+                parent_hash: "0xparent09".to_owned(),
+                timestamp: 1_700_000_010,
+                logs_bloom: "0xbloom10".to_owned(),
+            },
+            EvmBlockHeader {
+                block_number: 12,
+                block_hash: "0xblock12".to_owned(),
+                parent_hash: "0xparent11".to_owned(),
+                timestamp: 1_700_000_012,
+                logs_bloom: "0xbloom12".to_owned(),
+            },
+        ]),
+    )
+    .expect("dataset rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_block_headers(),
+            selector: &selector,
+            range: range.clone(),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write rows");
+
+    let manifest = storage.manifest().expect("manifest");
+    let entry = manifest.entries.first().expect("manifest entry");
+    assert_eq!(entry.dataset_key, DatasetKey::evm_block_headers());
+    assert_eq!(entry.object_compression, Some(ParquetCompression::Snappy));
+    let object_key = entry.object_key.as_deref().expect("object key");
+    assert!(
+        object_key
+            .starts_with("chains/evm/ethereum/1/datasets/evm.block_headers/parquet-v1/block/all/")
+    );
+    let object_bytes = std::fs::read(storage.root().join(object_key)).expect("object bytes");
+    assert_parquet_compression(&object_bytes, Compression::SNAPPY);
+    assert_parquet_columns(
+        &object_bytes,
+        &[
+            "block_number",
+            "block_hash",
+            "parent_hash",
+            "timestamp",
+            "logs_bloom",
+        ],
+    );
+
+    let read = storage
+        .read_rows(&chain, &DatasetKey::evm_block_headers(), &selector, range)
+        .expect("read rows");
+    assert_eq!(read, rows);
+}
+
+#[test]
+fn test_evm_block_headers_coverage_reports_missing_range() {
+    let storage = LocalStorage::new(temp_storage_root("block-headers-missing-range"));
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let written_range = LedgerRange::blocks(10, 11).expect("valid range");
+    let rows = DatasetRows::new(
+        DatasetKey::evm_block_headers(),
+        QueryRows::EvmBlockHeaders(vec![EvmBlockHeader {
+            block_number: 10,
+            block_hash: "0xblock10".to_owned(),
+            parent_hash: "0xparent09".to_owned(),
+            timestamp: 1_700_000_010,
+            logs_bloom: "0xbloom10".to_owned(),
+        }]),
+    )
+    .expect("dataset rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_block_headers(),
+            selector: &selector,
+            range: written_range,
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write rows");
+
+    let query_range = LedgerRange::blocks(10, 12).expect("valid range");
+    let covered = storage
+        .covered_ranges(
+            &chain,
+            &DatasetKey::evm_block_headers(),
+            &selector,
+            query_range.clone(),
+        )
+        .expect("covered ranges");
+
+    assert_eq!(
+        missing_ranges(query_range, &covered),
+        vec![LedgerRange::blocks(12, 12).expect("valid range")]
+    );
 }
 
 #[test]
