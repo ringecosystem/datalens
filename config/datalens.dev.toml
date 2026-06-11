@@ -42,6 +42,7 @@ playground_path = "/native/graphiql"
 [query.metadata]
 queue_capacity = 8192
 worker_threads = 4
+coalesced_capacity = 2048
 
 [warmup]
 enabled = false

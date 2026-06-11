@@ -133,6 +133,7 @@ where
         datalens_executor::configure_query_metadata_worker_pool(QueryMetadataWorkerConfig {
             queue_capacity: metadata_config.queue_capacity,
             worker_threads: metadata_config.worker_threads,
+            coalesced_capacity: metadata_config.coalesced_capacity,
         });
         let storage: Arc<dyn StorageRepository> = Arc::new(storage);
         let recorder = if metrics_config.enabled {

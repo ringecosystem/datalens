@@ -217,6 +217,8 @@ pub struct QueryMetadataConfig {
     pub queue_capacity: usize,
     #[serde(default = "default_query_metadata_worker_threads")]
     pub worker_threads: usize,
+    #[serde(default = "default_query_metadata_coalesced_capacity")]
+    pub coalesced_capacity: usize,
 }
 
 impl Default for QueryMetadataConfig {
@@ -224,6 +226,7 @@ impl Default for QueryMetadataConfig {
         Self {
             queue_capacity: default_query_metadata_queue_capacity(),
             worker_threads: default_query_metadata_worker_threads(),
+            coalesced_capacity: default_query_metadata_coalesced_capacity(),
         }
     }
 }
@@ -434,6 +437,10 @@ fn default_query_metadata_queue_capacity() -> usize {
 
 fn default_query_metadata_worker_threads() -> usize {
     4
+}
+
+fn default_query_metadata_coalesced_capacity() -> usize {
+    2048
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

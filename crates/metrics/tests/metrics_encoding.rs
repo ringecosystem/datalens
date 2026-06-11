@@ -137,6 +137,11 @@ fn test_query_metadata_metrics_have_kind_and_outcome_labels() {
         "usage_ledger",
         QueryMetadataEnqueueOutcome::Dropped,
     );
+    recorder.record_query_metadata_enqueue(
+        &labels,
+        "query_activity",
+        QueryMetadataEnqueueOutcome::CoalesceFull,
+    );
     recorder.record_query_metadata_write(
         &labels,
         "query_activity",
@@ -151,6 +156,9 @@ fn test_query_metadata_metrics_have_kind_and_outcome_labels() {
     ));
     assert!(output.contains(
         r#"datalens_query_metadata_enqueue_total{application="query-api",chain="ethereum",chain_kind="evm",dataset="evm.logs",metadata_kind="usage_ledger",outcome="dropped"} 1"#
+    ));
+    assert!(output.contains(
+        r#"datalens_query_metadata_enqueue_total{application="query-api",chain="ethereum",chain_kind="evm",dataset="evm.logs",metadata_kind="query_activity",outcome="coalesce_full"} 1"#
     ));
     assert!(output.contains(
         r#"datalens_query_metadata_write_total{application="query-api",chain="ethereum",chain_kind="evm",dataset="evm.logs",metadata_kind="query_activity",outcome="completed"} 1"#

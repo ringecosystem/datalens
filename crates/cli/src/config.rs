@@ -177,6 +177,12 @@ fn validate_query_config(config: &DatalensConfig) -> Result<(), DatalensError> {
             "query.metadata.worker_threads must be greater than zero",
         ));
     }
+    if config.query.metadata.coalesced_capacity == 0 {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "query.metadata.coalesced_capacity must be greater than zero",
+        ));
+    }
     let paths = [
         ("query.native.path", &config.query.native.path),
         (

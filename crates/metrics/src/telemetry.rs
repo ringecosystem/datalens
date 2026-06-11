@@ -375,6 +375,7 @@ impl WarmupWriteOutcome {
 pub enum QueryMetadataEnqueueOutcome {
     Enqueued,
     Coalesced,
+    CoalesceFull,
     Dropped,
     Closed,
 }
@@ -384,6 +385,7 @@ impl QueryMetadataEnqueueOutcome {
         match self {
             Self::Enqueued => "enqueued",
             Self::Coalesced => "coalesced",
+            Self::CoalesceFull => "coalesce_full",
             Self::Dropped => "dropped",
             Self::Closed => "closed",
         }

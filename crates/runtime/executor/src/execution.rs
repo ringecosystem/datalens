@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, VecDeque},
     sync::{
         Arc, Mutex, Once, OnceLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -72,6 +72,7 @@ pub struct NativeQueryExecutionConfig {
 pub struct QueryMetadataWorkerConfig {
     pub queue_capacity: usize,
     pub worker_threads: usize,
+    pub coalesced_capacity: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1523,19 +1524,25 @@ where
 
 const DEFAULT_QUERY_METADATA_QUEUE_CAPACITY: usize = 8192;
 const DEFAULT_QUERY_METADATA_WORKER_THREADS: usize = 4;
+const DEFAULT_QUERY_METADATA_COALESCED_CAPACITY: usize = 2048;
 
 impl Default for QueryMetadataWorkerConfig {
     fn default() -> Self {
         Self {
             queue_capacity: DEFAULT_QUERY_METADATA_QUEUE_CAPACITY,
             worker_threads: DEFAULT_QUERY_METADATA_WORKER_THREADS,
+            coalesced_capacity: DEFAULT_QUERY_METADATA_COALESCED_CAPACITY,
         }
     }
 }
 
 pub fn configure_query_metadata_worker_pool(config: QueryMetadataWorkerConfig) {
     QUERY_METADATA_WORKER_POOL.get_or_init(|| {
-        MetadataWorkerPool::new(config.queue_capacity.max(1), config.worker_threads.max(1))
+        MetadataWorkerPool::new(
+            config.queue_capacity.max(1),
+            config.worker_threads.max(1),
+            config.coalesced_capacity.max(1),
+        )
     });
 }
 
@@ -1545,6 +1552,7 @@ static QUERY_METADATA_WORKER_POOL: OnceLock<MetadataWorkerPool> = OnceLock::new(
 enum MetadataEnqueueOutcome {
     Enqueued,
     Coalesced,
+    CoalesceFull,
     Full,
     Closed,
 }
@@ -1558,6 +1566,15 @@ struct MetadataWorkerPoolInner {
     receiver: Mutex<mpsc::Receiver<MetadataJob>>,
     pending_watermarks: Mutex<BTreeMap<String, CoalescedQueryWatermark>>,
     pending_activities: Mutex<BTreeMap<String, CoalescedQueryActivity>>,
+    coalesced_capacity: usize,
+    pending_coalesced_count: AtomicUsize,
+    next_coalesced_kind: Mutex<CoalescedMetadataKind>,
+}
+
+#[derive(Clone, Copy)]
+enum CoalescedMetadataKind {
+    Watermark,
+    Activity,
 }
 
 struct CoalescedQueryWatermark {
@@ -1575,13 +1592,16 @@ struct CoalescedQueryActivity {
 }
 
 impl MetadataWorkerPool {
-    fn new(capacity: usize, worker_count: usize) -> Self {
+    fn new(capacity: usize, worker_count: usize, coalesced_capacity: usize) -> Self {
         let (sender, receiver) = mpsc::sync_channel(capacity);
         let inner = Arc::new(MetadataWorkerPoolInner {
             sender,
             receiver: Mutex::new(receiver),
             pending_watermarks: Mutex::new(BTreeMap::new()),
             pending_activities: Mutex::new(BTreeMap::new()),
+            coalesced_capacity,
+            pending_coalesced_count: AtomicUsize::new(0),
+            next_coalesced_kind: Mutex::new(CoalescedMetadataKind::Watermark),
         });
         for worker_index in 0..worker_count {
             let inner = inner.clone();
@@ -1619,7 +1639,20 @@ impl MetadataWorkerPool {
 
     #[cfg(test)]
     fn new_for_test(capacity: usize, worker_count: usize) -> Self {
-        Self::new(capacity, worker_count)
+        Self::new(
+            capacity,
+            worker_count,
+            DEFAULT_QUERY_METADATA_COALESCED_CAPACITY,
+        )
+    }
+
+    #[cfg(test)]
+    fn new_for_test_with_coalesced_capacity(
+        capacity: usize,
+        worker_count: usize,
+        coalesced_capacity: usize,
+    ) -> Self {
+        Self::new(capacity, worker_count, coalesced_capacity)
     }
 
     fn enqueue(&self, job: MetadataJob) -> MetadataEnqueueOutcome {
@@ -1674,19 +1707,13 @@ impl MetadataWorkerPoolInner {
                 watermark,
                 context,
                 metrics,
-            } => {
-                self.coalesce_watermark(repository, watermark, context, metrics);
-                MetadataEnqueueOutcome::Coalesced
-            }
+            } => self.coalesce_watermark(repository, watermark, context, metrics),
             MetadataJob::QueryActivityUpdate {
                 repository,
                 activity,
                 context,
                 metrics,
-            } => {
-                self.coalesce_activity(repository, activity, context, metrics);
-                MetadataEnqueueOutcome::Coalesced
-            }
+            } => self.coalesce_activity(repository, activity, context, metrics),
             _ => MetadataEnqueueOutcome::Full,
         }
     }
@@ -1697,7 +1724,7 @@ impl MetadataWorkerPoolInner {
         watermark: QueryWatermark,
         context: QueryWatermarkMetadataContext,
         metrics: Option<Arc<MetricsRecorder>>,
-    ) {
+    ) -> MetadataEnqueueOutcome {
         let key = query_watermark_coalesce_key(&watermark.key);
         let mut pending = match self.pending_watermarks.lock() {
             Ok(pending) => pending,
@@ -1705,7 +1732,7 @@ impl MetadataWorkerPoolInner {
                 log::warn!(
                     "query metadata coalesce lock failed metadata_kind=query_watermark message={error}"
                 );
-                return;
+                return MetadataEnqueueOutcome::CoalesceFull;
             }
         };
         let incoming = CoalescedQueryWatermark {
@@ -1715,10 +1742,18 @@ impl MetadataWorkerPoolInner {
             metrics,
         };
         match pending.get(&key) {
-            Some(existing) if !watermark_is_newer(&incoming.watermark, &existing.watermark) => {}
-            _ => {
-                pending.insert(key, incoming);
+            Some(existing) if !watermark_is_newer(&incoming.watermark, &existing.watermark) => {
+                MetadataEnqueueOutcome::Coalesced
             }
+            Some(_) => {
+                pending.insert(key, incoming);
+                MetadataEnqueueOutcome::Coalesced
+            }
+            None if self.try_reserve_coalesced_slot() => {
+                pending.insert(key, incoming);
+                MetadataEnqueueOutcome::Coalesced
+            }
+            _ => MetadataEnqueueOutcome::CoalesceFull,
         }
     }
 
@@ -1728,7 +1763,7 @@ impl MetadataWorkerPoolInner {
         activity: QueryActivity,
         context: QueryActivityMetadataContext,
         metrics: Option<Arc<MetricsRecorder>>,
-    ) {
+    ) -> MetadataEnqueueOutcome {
         let key = query_activity_coalesce_key(&activity.key);
         let mut pending = match self.pending_activities.lock() {
             Ok(pending) => pending,
@@ -1736,7 +1771,7 @@ impl MetadataWorkerPoolInner {
                 log::warn!(
                     "query metadata coalesce lock failed metadata_kind=query_activity message={error}"
                 );
-                return;
+                return MetadataEnqueueOutcome::CoalesceFull;
             }
         };
         let incoming = CoalescedQueryActivity {
@@ -1746,10 +1781,18 @@ impl MetadataWorkerPoolInner {
             metrics,
         };
         match pending.get(&key) {
-            Some(existing) if !activity_is_newer(&incoming.activity, &existing.activity) => {}
-            _ => {
-                pending.insert(key, incoming);
+            Some(existing) if !activity_is_newer(&incoming.activity, &existing.activity) => {
+                MetadataEnqueueOutcome::Coalesced
             }
+            Some(_) => {
+                pending.insert(key, incoming);
+                MetadataEnqueueOutcome::Coalesced
+            }
+            None if self.try_reserve_coalesced_slot() => {
+                pending.insert(key, incoming);
+                MetadataEnqueueOutcome::Coalesced
+            }
+            _ => MetadataEnqueueOutcome::CoalesceFull,
         }
     }
 
@@ -1759,25 +1802,59 @@ impl MetadataWorkerPoolInner {
                 return;
             };
             match self.sender.try_send(job) {
-                Ok(()) => {}
+                Ok(()) => {
+                    self.release_coalesced_slot();
+                }
                 Err(mpsc::TrySendError::Full(job)) => {
                     self.requeue_coalesced_job(job);
                     return;
                 }
-                Err(mpsc::TrySendError::Disconnected(_)) => return,
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    self.release_coalesced_slot();
+                    return;
+                }
             }
         }
     }
 
     fn pop_coalesced_job(&self) -> Option<MetadataJob> {
-        if let Some(coalesced) = pop_first(&self.pending_watermarks) {
-            return Some(MetadataJob::QueryWatermarkUpdate {
-                repository: coalesced.repository,
-                watermark: coalesced.watermark,
-                context: coalesced.context,
-                metrics: coalesced.metrics,
-            });
+        let mut next = self.next_coalesced_kind.lock().ok()?;
+        match *next {
+            CoalescedMetadataKind::Watermark => {
+                if let Some(job) = self.pop_watermark_job() {
+                    *next = CoalescedMetadataKind::Activity;
+                    Some(job)
+                } else if let Some(job) = self.pop_activity_job() {
+                    *next = CoalescedMetadataKind::Watermark;
+                    Some(job)
+                } else {
+                    None
+                }
+            }
+            CoalescedMetadataKind::Activity => {
+                if let Some(job) = self.pop_activity_job() {
+                    *next = CoalescedMetadataKind::Watermark;
+                    Some(job)
+                } else if let Some(job) = self.pop_watermark_job() {
+                    *next = CoalescedMetadataKind::Activity;
+                    Some(job)
+                } else {
+                    None
+                }
+            }
         }
+    }
+
+    fn pop_watermark_job(&self) -> Option<MetadataJob> {
+        pop_first(&self.pending_watermarks).map(|coalesced| MetadataJob::QueryWatermarkUpdate {
+            repository: coalesced.repository,
+            watermark: coalesced.watermark,
+            context: coalesced.context,
+            metrics: coalesced.metrics,
+        })
+    }
+
+    fn pop_activity_job(&self) -> Option<MetadataJob> {
         pop_first(&self.pending_activities).map(|coalesced| MetadataJob::QueryActivityUpdate {
             repository: coalesced.repository,
             activity: coalesced.activity,
@@ -1793,15 +1870,109 @@ impl MetadataWorkerPoolInner {
                 watermark,
                 context,
                 metrics,
-            } => self.coalesce_watermark(repository, watermark, context, metrics),
+            } => {
+                self.restore_watermark(repository, watermark, context, metrics);
+            }
             MetadataJob::QueryActivityUpdate {
                 repository,
                 activity,
                 context,
                 metrics,
-            } => self.coalesce_activity(repository, activity, context, metrics),
+            } => {
+                self.restore_activity(repository, activity, context, metrics);
+            }
             _ => {}
         }
+    }
+
+    fn restore_watermark(
+        &self,
+        repository: Arc<dyn QueryWatermarkRepository>,
+        watermark: QueryWatermark,
+        context: QueryWatermarkMetadataContext,
+        metrics: Option<Arc<MetricsRecorder>>,
+    ) {
+        let key = query_watermark_coalesce_key(&watermark.key);
+        let mut pending = match self.pending_watermarks.lock() {
+            Ok(pending) => pending,
+            Err(error) => {
+                log::warn!(
+                    "query metadata coalesce restore lock failed metadata_kind=query_watermark message={error}"
+                );
+                self.release_coalesced_slot();
+                return;
+            }
+        };
+        let incoming = CoalescedQueryWatermark {
+            repository,
+            watermark,
+            context,
+            metrics,
+        };
+        if let Some(existing) = pending.get(&key) {
+            if watermark_is_newer(&incoming.watermark, &existing.watermark) {
+                pending.insert(key, incoming);
+            }
+            self.release_coalesced_slot();
+        } else {
+            pending.insert(key, incoming);
+        }
+    }
+
+    fn restore_activity(
+        &self,
+        repository: Arc<dyn QueryActivityRepository>,
+        activity: QueryActivity,
+        context: QueryActivityMetadataContext,
+        metrics: Option<Arc<MetricsRecorder>>,
+    ) {
+        let key = query_activity_coalesce_key(&activity.key);
+        let mut pending = match self.pending_activities.lock() {
+            Ok(pending) => pending,
+            Err(error) => {
+                log::warn!(
+                    "query metadata coalesce restore lock failed metadata_kind=query_activity message={error}"
+                );
+                self.release_coalesced_slot();
+                return;
+            }
+        };
+        let incoming = CoalescedQueryActivity {
+            repository,
+            activity,
+            context,
+            metrics,
+        };
+        if let Some(existing) = pending.get(&key) {
+            if activity_is_newer(&incoming.activity, &existing.activity) {
+                pending.insert(key, incoming);
+            }
+            self.release_coalesced_slot();
+        } else {
+            pending.insert(key, incoming);
+        }
+    }
+
+    fn try_reserve_coalesced_slot(&self) -> bool {
+        let mut current = self.pending_coalesced_count.load(Ordering::Relaxed);
+        loop {
+            if current >= self.coalesced_capacity {
+                return false;
+            }
+            match self.pending_coalesced_count.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn release_coalesced_slot(&self) {
+        self.pending_coalesced_count.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -1860,7 +2031,11 @@ struct QueryActivityMetadataContext {
 fn metadata_worker_pool() -> &'static MetadataWorkerPool {
     QUERY_METADATA_WORKER_POOL.get_or_init(|| {
         let config = QueryMetadataWorkerConfig::default();
-        MetadataWorkerPool::new(config.queue_capacity, config.worker_threads)
+        MetadataWorkerPool::new(
+            config.queue_capacity,
+            config.worker_threads,
+            config.coalesced_capacity,
+        )
     })
 }
 
@@ -1908,6 +2083,7 @@ fn metadata_enqueue_metric_outcome(outcome: MetadataEnqueueOutcome) -> QueryMeta
     match outcome {
         MetadataEnqueueOutcome::Enqueued => QueryMetadataEnqueueOutcome::Enqueued,
         MetadataEnqueueOutcome::Coalesced => QueryMetadataEnqueueOutcome::Coalesced,
+        MetadataEnqueueOutcome::CoalesceFull => QueryMetadataEnqueueOutcome::CoalesceFull,
         MetadataEnqueueOutcome::Full => QueryMetadataEnqueueOutcome::Dropped,
         MetadataEnqueueOutcome::Closed => QueryMetadataEnqueueOutcome::Closed,
     }
@@ -1995,6 +2171,16 @@ fn enqueue_usage_ledger_append(
             context.base.range_end,
             elapsed_ms(enqueue_start)
         ),
+        MetadataEnqueueOutcome::CoalesceFull => log::warn!(
+            "query metadata enqueue dropped metadata_kind=usage_ledger query_id={} application={} chain={} dataset={} range={}-{} duration_ms={} reason=coalesce_full",
+            context.base.query_id,
+            context.base.application_id,
+            context.base.chain,
+            context.base.dataset,
+            context.base.range_start,
+            context.base.range_end,
+            elapsed_ms(enqueue_start),
+        ),
         MetadataEnqueueOutcome::Full => log::warn!(
             "query metadata enqueue dropped metadata_kind=usage_ledger query_id={} application={} chain={} dataset={} range={}-{} duration_ms={} reason=queue_full",
             context.base.query_id,
@@ -2073,6 +2259,17 @@ fn enqueue_query_watermark_update(
         ),
         MetadataEnqueueOutcome::Coalesced => log::debug!(
             "query metadata enqueue coalesced metadata_kind=query_watermark query_id={} application={} chain={} dataset={} range={}-{} latest_block={} duration_ms={} reason=queue_full",
+            context.base.query_id,
+            context.base.application_id,
+            context.base.chain,
+            context.base.dataset,
+            context.base.range_start,
+            context.base.range_end,
+            context.latest_block,
+            elapsed_ms(enqueue_start),
+        ),
+        MetadataEnqueueOutcome::CoalesceFull => log::warn!(
+            "query metadata enqueue dropped metadata_kind=query_watermark query_id={} application={} chain={} dataset={} range={}-{} latest_block={} duration_ms={} reason=coalesce_full",
             context.base.query_id,
             context.base.application_id,
             context.base.chain,
@@ -2165,6 +2362,18 @@ fn enqueue_query_activity_update(
         ),
         MetadataEnqueueOutcome::Coalesced => log::debug!(
             "query metadata enqueue coalesced metadata_kind=query_activity query_id={} application={} chain={} dataset={} range={}-{} latest_range={}-{} duration_ms={} reason=queue_full",
+            context.base.query_id,
+            context.base.application_id,
+            context.base.chain,
+            context.base.dataset,
+            context.base.range_start,
+            context.base.range_end,
+            context.latest_start,
+            context.latest_end,
+            elapsed_ms(enqueue_start),
+        ),
+        MetadataEnqueueOutcome::CoalesceFull => log::warn!(
+            "query metadata enqueue dropped metadata_kind=query_activity query_id={} application={} chain={} dataset={} range={}-{} latest_range={}-{} duration_ms={} reason=coalesce_full",
             context.base.query_id,
             context.base.application_id,
             context.base.chain,
@@ -2602,6 +2811,130 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_metadata_worker_pool_bounds_distinct_coalesced_keys() {
+        let pool = MetadataWorkerPool::new_for_test_with_coalesced_capacity(1, 0, 1);
+        let watermarks = RecordingQueryWatermarkRepository::default();
+
+        assert_eq!(
+            pool.enqueue(MetadataJob::NoopForTest),
+            MetadataEnqueueOutcome::Enqueued
+        );
+        assert_eq!(
+            pool.enqueue(MetadataJob::QueryWatermarkUpdate {
+                repository: Arc::new(watermarks.clone()),
+                watermark: test_watermark_with_selector("selector-a", 10, 100),
+                context: test_watermark_context("q-low", 10),
+                metrics: None,
+            }),
+            MetadataEnqueueOutcome::Coalesced
+        );
+        assert_eq!(
+            pool.enqueue(MetadataJob::QueryWatermarkUpdate {
+                repository: Arc::new(watermarks.clone()),
+                watermark: test_watermark_with_selector("selector-a", 20, 200),
+                context: test_watermark_context("q-high", 20),
+                metrics: None,
+            }),
+            MetadataEnqueueOutcome::Coalesced
+        );
+        assert_eq!(
+            pool.enqueue(MetadataJob::QueryWatermarkUpdate {
+                repository: Arc::new(watermarks),
+                watermark: test_watermark_with_selector("selector-b", 30, 300),
+                context: test_watermark_context("q-overflow", 30),
+                metrics: None,
+            }),
+            MetadataEnqueueOutcome::CoalesceFull
+        );
+        assert_eq!(pool.pending_latest_state_counts_for_test(), (1, 0));
+
+        assert!(matches!(
+            pool.recv_for_test(),
+            Some(MetadataJob::NoopForTest)
+        ));
+        pool.flush_coalesced();
+        match pool.recv_for_test() {
+            Some(MetadataJob::QueryWatermarkUpdate {
+                watermark, context, ..
+            }) => {
+                assert_eq!(watermark.latest_block, 20);
+                assert_eq!(context.base.query_id, "q-high");
+            }
+            _ => panic!("expected replacement watermark"),
+        }
+    }
+
+    #[test]
+    fn test_metadata_worker_pool_flushes_coalesced_kinds_fairly() {
+        let pool = MetadataWorkerPool::new_for_test_with_coalesced_capacity(4, 0, 4);
+        let watermarks = RecordingQueryWatermarkRepository::default();
+        let activities = RecordingQueryActivityRepository::default();
+
+        for _ in 0..4 {
+            assert_eq!(
+                pool.enqueue(MetadataJob::NoopForTest),
+                MetadataEnqueueOutcome::Enqueued
+            );
+        }
+        assert_eq!(
+            pool.enqueue(MetadataJob::QueryWatermarkUpdate {
+                repository: Arc::new(watermarks.clone()),
+                watermark: test_watermark_with_selector("selector-a", 10, 100),
+                context: test_watermark_context("q-watermark-a", 10),
+                metrics: None,
+            }),
+            MetadataEnqueueOutcome::Coalesced
+        );
+        assert_eq!(
+            pool.enqueue(MetadataJob::QueryWatermarkUpdate {
+                repository: Arc::new(watermarks),
+                watermark: test_watermark_with_selector("selector-b", 20, 200),
+                context: test_watermark_context("q-watermark-b", 20),
+                metrics: None,
+            }),
+            MetadataEnqueueOutcome::Coalesced
+        );
+        assert_eq!(
+            pool.enqueue(MetadataJob::QueryActivityUpdate {
+                repository: Arc::new(activities.clone()),
+                activity: test_activity_with_selector("selector-a", 10, 100),
+                context: test_activity_context("q-activity-a", 10),
+                metrics: None,
+            }),
+            MetadataEnqueueOutcome::Coalesced
+        );
+        assert_eq!(
+            pool.enqueue(MetadataJob::QueryActivityUpdate {
+                repository: Arc::new(activities),
+                activity: test_activity_with_selector("selector-b", 20, 200),
+                context: test_activity_context("q-activity-b", 20),
+                metrics: None,
+            }),
+            MetadataEnqueueOutcome::Coalesced
+        );
+
+        for _ in 0..4 {
+            assert!(matches!(
+                pool.recv_for_test(),
+                Some(MetadataJob::NoopForTest)
+            ));
+        }
+        pool.flush_coalesced();
+
+        let kinds = (0..4)
+            .map(|_| match pool.recv_for_test() {
+                Some(MetadataJob::QueryWatermarkUpdate { .. }) => "watermark",
+                Some(MetadataJob::QueryActivityUpdate { .. }) => "activity",
+                _ => panic!("expected coalesced metadata job"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec!["watermark", "activity", "watermark", "activity"]
+        );
+    }
+
     #[derive(Clone, Default)]
     struct RecordingQueryWatermarkRepository;
 
@@ -2636,6 +2969,17 @@ mod tests {
         }
     }
 
+    fn test_watermark_with_selector(
+        selector_fingerprint: &str,
+        latest_block: u64,
+        updated_at_unix_seconds: u64,
+    ) -> QueryWatermark {
+        let mut watermark = test_watermark(latest_block, updated_at_unix_seconds);
+        watermark.key.selector_fingerprint = selector_fingerprint.to_owned();
+        watermark.key.selector_canonical_key = selector_fingerprint.to_owned();
+        watermark
+    }
+
     fn test_watermark_key() -> QueryWatermarkKey {
         QueryWatermarkKey::new(
             "app",
@@ -2653,6 +2997,17 @@ mod tests {
             updated_at_unix_seconds,
             request_id: Some(format!("q-{latest_end}")),
         }
+    }
+
+    fn test_activity_with_selector(
+        selector_fingerprint: &str,
+        latest_end: u64,
+        updated_at_unix_seconds: u64,
+    ) -> QueryActivity {
+        let mut activity = test_activity(latest_end, updated_at_unix_seconds);
+        activity.key.selector_fingerprint = selector_fingerprint.to_owned();
+        activity.key.selector_canonical_key = selector_fingerprint.to_owned();
+        activity
     }
 
     fn test_activity_key() -> QueryActivityKey {
