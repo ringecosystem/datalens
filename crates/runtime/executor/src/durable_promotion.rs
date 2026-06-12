@@ -41,6 +41,21 @@ const DEFAULT_INTENT_RETRY_MAX_DELAY_SECONDS: u64 = 3600;
 const DEFAULT_INTENT_RETRY_MAX_JITTER_SECONDS: u64 = 60;
 const DEFAULT_INTENT_STALE_RUNNING_SECONDS: u64 = 300;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DurablePromotionIntentWorkerConfig {
+    pub worker_threads: usize,
+    pub claim_batch_size: usize,
+}
+
+impl Default for DurablePromotionIntentWorkerConfig {
+    fn default() -> Self {
+        Self {
+            worker_threads: DEFAULT_INTENT_WORKERS,
+            claim_batch_size: DEFAULT_INTENT_CLAIM_BATCH_SIZE,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct DurablePromotionQueue<R> {
     sender: SyncSender<DurablePromotionWork>,
@@ -66,6 +81,7 @@ where
         metrics: Option<Arc<MetricsRecorder>>,
         provider_ranges: ProviderRangeController,
         startup_maintenance_once: Arc<Once>,
+        config: DurablePromotionIntentWorkerConfig,
     ) -> Result<Self, DatalensError> {
         let claim_lock = Arc::new(Mutex::new(()));
         let shared = IntentWorkerShared {
@@ -74,8 +90,9 @@ where
             provider_ranges,
             claim_lock,
             startup_maintenance_once,
+            claim_batch_size: config.claim_batch_size,
         };
-        for worker_index in 0..DEFAULT_INTENT_WORKERS {
+        for worker_index in 0..config.worker_threads {
             spawn_intent_worker(
                 worker_index,
                 writer.clone(),
@@ -97,6 +114,7 @@ struct IntentWorkerShared {
     provider_ranges: ProviderRangeController,
     claim_lock: Arc<Mutex<()>>,
     startup_maintenance_once: Arc<Once>,
+    claim_batch_size: usize,
 }
 
 #[derive(Debug, Default)]
@@ -434,6 +452,7 @@ where
                         now,
                         worker_index,
                         record_backlog_metrics,
+                        shared.claim_batch_size,
                     )
                 };
                 if record_backlog_metrics {
@@ -1040,6 +1059,7 @@ fn claim_pending_intents(
     now: u64,
     worker_index: usize,
     record_backlog_metrics: bool,
+    claim_batch_size: usize,
 ) -> Vec<DurablePromotionIntent> {
     let Some(first) = claim_pending_intent(
         repository,
@@ -1048,6 +1068,7 @@ fn claim_pending_intents(
         now,
         worker_index,
         record_backlog_metrics,
+        claim_batch_size,
     ) else {
         return Vec::new();
     };
@@ -1055,7 +1076,7 @@ fn claim_pending_intents(
         chain,
         first.source,
         now,
-        DEFAULT_INTENT_CLAIM_BATCH_SIZE,
+        claim_batch_size,
     ) {
         Ok(pending) => pending,
         Err(error) => {
@@ -1127,6 +1148,7 @@ fn claim_pending_intent(
     now: u64,
     worker_index: usize,
     record_backlog_metrics: bool,
+    claim_batch_size: usize,
 ) -> Option<DurablePromotionIntent> {
     if record_backlog_metrics {
         match repository.pending_backlog_for_chain(chain, now) {
@@ -1148,7 +1170,7 @@ fn claim_pending_intent(
             chain,
             source,
             now,
-            DEFAULT_INTENT_CLAIM_BATCH_SIZE,
+            claim_batch_size,
         ) {
             Ok(pending) => {
                 let outcome = if pending.is_empty() {
@@ -1900,8 +1922,15 @@ mod tests {
         let metrics = Arc::new(MetricsRecorder::new().expect("metrics recorder"));
         metrics.set_durable_intent_backlog_for_scope(&ethereum_chain(), "query", 7, 30);
 
-        let claimed =
-            claim_pending_intent(&repository, &ethereum_chain(), Some(&metrics), 123, 0, true);
+        let claimed = claim_pending_intent(
+            &repository,
+            &ethereum_chain(),
+            Some(&metrics),
+            123,
+            0,
+            true,
+            DEFAULT_INTENT_CLAIM_BATCH_SIZE,
+        );
 
         assert!(claimed.is_none());
         assert_eq!(
@@ -1931,8 +1960,15 @@ mod tests {
         };
         let metrics = Arc::new(MetricsRecorder::new().expect("metrics recorder"));
 
-        let claimed =
-            claim_pending_intent(&repository, &ethereum_chain(), Some(&metrics), 130, 0, true);
+        let claimed = claim_pending_intent(
+            &repository,
+            &ethereum_chain(),
+            Some(&metrics),
+            130,
+            0,
+            true,
+            DEFAULT_INTENT_CLAIM_BATCH_SIZE,
+        );
 
         assert!(claimed.is_none());
         assert_eq!(
@@ -1947,12 +1983,33 @@ mod tests {
     }
 
     #[test]
+    fn test_claim_intent_uses_configured_claim_batch_size() {
+        let repository = PendingListIntentRepository {
+            intent: test_intent_with_created_at(100),
+            last_limit: AtomicUsize::new(0),
+        };
+
+        let claimed = claim_pending_intent(&repository, &ethereum_chain(), None, 130, 0, true, 64);
+
+        assert!(claimed.is_none());
+        assert_eq!(repository.last_limit.load(Ordering::SeqCst), 64);
+    }
+
+    #[test]
     fn test_claim_intent_skips_pending_intents_for_other_chain() {
         let ethereum = ethereum_chain();
         let lisk = lisk_chain();
         let repository = sample_repository(vec![test_intent_with_chain("intent-lisk", lisk, 100)]);
 
-        let claimed = claim_pending_intent(&repository, &ethereum, None, 130, 0, true);
+        let claimed = claim_pending_intent(
+            &repository,
+            &ethereum,
+            None,
+            130,
+            0,
+            true,
+            DEFAULT_INTENT_CLAIM_BATCH_SIZE,
+        );
 
         assert!(claimed.is_none());
         assert_eq!(
@@ -1974,7 +2031,15 @@ mod tests {
         let lisk = lisk_chain();
         let repository = sample_repository(vec![test_intent_with_chain("intent-lisk", lisk, 100)]);
 
-        let claimed = claim_pending_intent(&repository, &ethereum, None, 130, 0, true);
+        let claimed = claim_pending_intent(
+            &repository,
+            &ethereum,
+            None,
+            130,
+            0,
+            true,
+            DEFAULT_INTENT_CLAIM_BATCH_SIZE,
+        );
 
         assert!(claimed.is_none());
         assert!(
@@ -1995,7 +2060,15 @@ mod tests {
             test_intent_with_chain("intent-ethereum", ethereum.clone(), 105),
         ]);
 
-        let claimed = claim_pending_intent(&repository, &ethereum, None, 130, 0, true);
+        let claimed = claim_pending_intent(
+            &repository,
+            &ethereum,
+            None,
+            130,
+            0,
+            true,
+            DEFAULT_INTENT_CLAIM_BATCH_SIZE,
+        );
 
         assert_eq!(
             claimed.map(|intent| intent.intent_id),
@@ -2030,7 +2103,15 @@ mod tests {
         ));
         let repository = sample_repository(intents);
 
-        let claimed = claim_pending_intent(&repository, &ethereum, None, 130, 0, true);
+        let claimed = claim_pending_intent(
+            &repository,
+            &ethereum,
+            None,
+            130,
+            0,
+            true,
+            DEFAULT_INTENT_CLAIM_BATCH_SIZE,
+        );
 
         assert_eq!(
             claimed.map(|intent| intent.intent_id),
@@ -2058,7 +2139,15 @@ mod tests {
         intents.push(warmup);
         let repository = sample_repository(intents);
 
-        let claimed = claim_pending_intent(&repository, &ethereum, None, 130, 0, true);
+        let claimed = claim_pending_intent(
+            &repository,
+            &ethereum,
+            None,
+            130,
+            0,
+            true,
+            DEFAULT_INTENT_CLAIM_BATCH_SIZE,
+        );
 
         assert_eq!(
             claimed.map(|intent| intent.intent_id),
