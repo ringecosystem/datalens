@@ -219,6 +219,35 @@ fn test_tron_event_selector_filters_fallback_rows_by_contract_and_event_name() {
 }
 
 #[test]
+fn test_tron_event_selector_accepts_ormp_topics_for_fallback() {
+    let adapter = TronAdapter::with_fixture_defaults();
+    let selector = tron_event_selector(TronEventFilter {
+        contract_addresses: vec!["0xabcdefabcdefabcdefabcdefabcdefabcdefabcd".to_owned()],
+        event_names: vec![
+            "HashImported".to_owned(),
+            "MessageAccepted".to_owned(),
+            "MessageAssigned".to_owned(),
+            "MessageDispatched".to_owned(),
+            "MessageRecv".to_owned(),
+            "MessageSent".to_owned(),
+            "SignatureSubmittion".to_owned(),
+        ],
+    })
+    .expect("selector");
+
+    let response = adapter
+        .fetch(datalens_chain::ChainFetchRequest::new(
+            adapter.capabilities().chain().clone(),
+            DatasetKey::tron_events(),
+            LedgerRange::blocks(10, 12).expect("range"),
+            selector,
+        ))
+        .expect("fetch events");
+
+    assert_eq!(response.rows.row_count(), 0);
+}
+
+#[test]
 fn test_tron_event_selector_without_known_topic_mapping_does_not_write_empty_fallback_coverage() {
     let storage = LocalStorage::new(temp_storage_root("unknown-topic-filtered-events"));
     let provider = ContractEventFixtureProvider::with_error(DatalensErrorKind::RateLimited);

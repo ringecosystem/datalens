@@ -499,10 +499,40 @@ struct KnownEventTopic {
     topic0: &'static str,
 }
 
-const KNOWN_EVENT_TOPICS: &[KnownEventTopic] = &[KnownEventTopic {
-    name: "Transfer",
-    topic0: "ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
-}];
+const KNOWN_EVENT_TOPICS: &[KnownEventTopic] = &[
+    KnownEventTopic {
+        name: "Transfer",
+        topic0: "ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+    },
+    KnownEventTopic {
+        name: "HashImported",
+        topic0: "a931ec14fe958397dcb26e285e56292c13d77907712b51bbaa24cfc9349b789d",
+    },
+    KnownEventTopic {
+        name: "MessageAccepted",
+        topic0: "cfb9b3466878aff0c7df17da215fd57d59eb245a5d03f5a7b57294d54581eb18",
+    },
+    KnownEventTopic {
+        name: "MessageAssigned",
+        topic0: "3832f95736b288316c84b775a004a9d17177362548ce253cba9acb4801875f4d",
+    },
+    KnownEventTopic {
+        name: "MessageDispatched",
+        topic0: "62b1dc20fd6f1518626da5b6f9897e8cd4ebadbad071bb66dc96a37c970087a8",
+    },
+    KnownEventTopic {
+        name: "MessageRecv",
+        topic0: "ea087580bb17f433441f3b6c0c0b80cae92ee74a8d7f50050388646d9ffd1431",
+    },
+    KnownEventTopic {
+        name: "MessageSent",
+        topic0: "40195d26d027672e04e23e34282d68c3d43ea138415b24c54fcdb9c2573e5975",
+    },
+    KnownEventTopic {
+        name: "SignatureSubmittion",
+        topic0: "8b3975e4768e70d323e926e2cef0676fc9a3250437d9b8f90b52c770f0d7545f",
+    },
+];
 
 pub(crate) fn hex_prefix(bytes: &[u8], len: usize) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
