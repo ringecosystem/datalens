@@ -1144,22 +1144,7 @@ where
         entry: ManifestEntry,
         started: Instant,
     ) -> Result<(), DatalensError> {
-        let key = manifest_segment_key(chain, &entry);
-        let segment = Manifest {
-            entries: vec![entry.clone()],
-        };
-        let bytes = serde_json::to_vec_pretty(&segment).map_err(|error| {
-            DatalensError::new(
-                DatalensErrorKind::Internal,
-                format!("encode manifest segment: {error}"),
-            )
-        })?;
-        self.object_store.put(&key, &bytes).map_err(|error| {
-            DatalensError::new(
-                DatalensErrorKind::ManifestUpdateFailure,
-                format!("write manifest segment {key}: {}", error.message),
-            )
-        })?;
+        let (key, bytes_len) = self.put_manifest_segment_object(chain, &entry)?;
         self.bump_manifest_version(chain)?;
         coverage_index::write_entry(&self.object_store, &entry)?;
         log::info!(
@@ -1169,10 +1154,35 @@ where
             entry.range.end(),
             entry.selector_fingerprint,
             key,
-            bytes.len(),
+            bytes_len,
             started.elapsed().as_millis()
         );
         Ok(())
+    }
+
+    fn put_manifest_segment_object(
+        &self,
+        chain: &ChainIdentity,
+        entry: &ManifestEntry,
+    ) -> Result<(String, usize), DatalensError> {
+        let key = manifest_segment_key(chain, entry);
+        let segment = Manifest {
+            entries: vec![entry.clone()],
+        };
+        let bytes = serde_json::to_vec_pretty(&segment).map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::Internal,
+                format!("encode manifest segment: {error}"),
+            )
+        })?;
+        let bytes_len = bytes.len();
+        self.object_store.put(&key, &bytes).map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::ManifestUpdateFailure,
+                format!("write manifest segment {key}: {}", error.message),
+            )
+        })?;
+        Ok((key, bytes_len))
     }
 
     fn publish_replacement_entry_unlocked(
@@ -1181,24 +1191,49 @@ where
         entry: ManifestEntry,
         started: Instant,
     ) -> Result<(), DatalensError> {
-        let existing = self.manifest_for_chain(chain)?;
-        let mut entries = Vec::new();
-        let mut replaced_entries = 0usize;
-        for existing_entry in existing.entries {
-            if replacement_scope_matches(&existing_entry, &entry)
-                && existing_entry.range.intersection(&entry.range).is_some()
-            {
-                replaced_entries += 1;
-                entries.extend(split_entry_around_range(existing_entry, &entry.range)?);
-            } else {
-                entries.push(existing_entry);
+        let update = coverage_index::replace_entry(&self.object_store, &entry)?;
+        let mut published_segment_keys = BTreeSet::new();
+        let mut published_segment_count = 0usize;
+        let mut published_segment_bytes = 0usize;
+        for published_entry in &update.published_entries {
+            let (key, bytes_len) = self.put_manifest_segment_object(chain, published_entry)?;
+            published_segment_keys.insert(key);
+            published_segment_count += 1;
+            published_segment_bytes += bytes_len;
+        }
+        let published_update =
+            coverage_index::publish_replacement(&self.object_store, &entry, &update)?;
+        let replaced_entries_count = published_update.replaced_entries.len();
+        let mut old_segment_keys = BTreeSet::new();
+        for replaced_entry in &published_update.replaced_entries {
+            old_segment_keys.insert(manifest_segment_key(chain, replaced_entry));
+        }
+        for published_entry in &published_update.published_entries {
+            let key = manifest_segment_key(chain, published_entry);
+            if !published_segment_keys.contains(&key) {
+                let (key, bytes_len) = self.put_manifest_segment_object(chain, published_entry)?;
+                published_segment_keys.insert(key);
+                published_segment_count += 1;
+                published_segment_bytes += bytes_len;
             }
         }
-        entries.push(entry.clone());
-        let manifest = Manifest { entries };
-        self.write_manifest_unlocked(chain, &manifest, started)?;
+        let mut deleted_segment_count = 0usize;
+        for key in old_segment_keys {
+            if !published_segment_keys.contains(&key) {
+                self.object_store.delete(&key).map_err(|error| {
+                    DatalensError::new(
+                        DatalensErrorKind::ManifestUpdateFailure,
+                        format!("delete manifest segment {key}: {}", error.message),
+                    )
+                })?;
+                deleted_segment_count += 1;
+            }
+        }
+        let replaced_base_entries_count =
+            self.rewrite_base_manifest_for_replacement_unlocked(chain, &entry)?;
+        self.bump_manifest_version(chain)?;
         log::info!(
-            "storage published replacement manifest chain_key={} dataset={} selector_fingerprint={} range_kind={} range={}-{} finality={} replaced_entries_count={} duration_ms={}",
+            "storage published replacement coverage chain_key={} dataset={} selector_fingerprint={} range_kind={} range={}-{} finality={} replaced_entries_count={} replaced_base_entries_count={} deleted_manifest_segments_count={} published_manifest_segments_count={} published_manifest_segment_bytes={} duration_ms={}",
             chain.key_prefix(),
             entry.dataset_key.as_str(),
             entry.selector_fingerprint,
@@ -1206,10 +1241,61 @@ where
             entry.range.start(),
             entry.range.end(),
             entry.finality_level.as_str(),
-            replaced_entries,
+            replaced_entries_count,
+            replaced_base_entries_count,
+            deleted_segment_count,
+            published_segment_count,
+            published_segment_bytes,
             started.elapsed().as_millis()
         );
         Ok(())
+    }
+
+    fn rewrite_base_manifest_for_replacement_unlocked(
+        &self,
+        chain: &ChainIdentity,
+        entry: &ManifestEntry,
+    ) -> Result<usize, DatalensError> {
+        let key = manifest_key(chain);
+        if !self.object_store.exists(&key)? {
+            return Ok(0);
+        }
+        let bytes = self.object_store.get(&key)?;
+        let manifest: Manifest = serde_json::from_slice(&bytes).map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::StorageReadFailure,
+                format!("decode manifest {key}: {error}"),
+            )
+        })?;
+        let mut entries = Vec::new();
+        let mut replaced_entries_count = 0usize;
+        for existing_entry in manifest.entries {
+            if replacement_scope_matches(&existing_entry, entry)
+                && existing_entry.range.intersection(&entry.range).is_some()
+            {
+                replaced_entries_count += 1;
+                entries.extend(split_entry_around_range(existing_entry, &entry.range)?);
+            } else {
+                entries.push(existing_entry);
+            }
+        }
+        if replaced_entries_count == 0 {
+            return Ok(0);
+        }
+        let manifest = Manifest { entries };
+        let bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::Internal,
+                format!("encode manifest: {error}"),
+            )
+        })?;
+        self.object_store.put(&key, &bytes).map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::ManifestUpdateFailure,
+                format!("write manifest {key}: {}", error.message),
+            )
+        })?;
+        Ok(replaced_entries_count)
     }
 
     fn cached_manifest(&self, chain: &ChainIdentity) -> Result<Option<Manifest>, DatalensError> {
