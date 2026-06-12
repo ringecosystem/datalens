@@ -68,7 +68,7 @@ fn follow_query_start(input: &WarmupTargetPlanInput, query_watermark: u64) -> u6
     let safe_delta = input.safe_head.saturating_sub(query_watermark);
     let target_offset = smallest_fitting_offset(input, 0, safe_delta).unwrap_or(1);
     let Some(cursor_distance) = input.cursor_next.checked_sub(query_watermark) else {
-        return query_watermark.saturating_add(target_offset);
+        return input.cursor_next;
     };
 
     if cursor_distance < target_offset {

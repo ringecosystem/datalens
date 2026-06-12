@@ -20,11 +20,34 @@ fn test_follow_query_without_query_watermark_has_no_target() {
 }
 
 #[test]
+fn test_follow_query_cursor_behind_watermark_catches_up_from_cursor() {
+    let plan = WarmupTargetPlanner::plan(WarmupTargetPlanInput {
+        mode: WarmupTaskMode::FollowQuery,
+        fixed_end: None,
+        cursor_next: 20_248_000,
+        query_watermark: Some(20_248_609),
+        safe_head: 20_500_000,
+        lookahead_blocks: 10_000,
+        start_offset_blocks: Some(1),
+        start_offset_tiers_blocks: None,
+        catchup_threshold_blocks: 200,
+    });
+
+    assert_eq!(
+        plan,
+        PlannedWarmupTarget::Range {
+            start: 20_248_000,
+            end: 20_257_999,
+        }
+    );
+}
+
+#[test]
 fn test_follow_query_targets_query_watermark_plus_lookahead() {
     let plan = WarmupTargetPlanner::plan(WarmupTargetPlanInput {
         mode: WarmupTaskMode::FollowQuery,
         fixed_end: None,
-        cursor_next: 1,
+        cursor_next: 10,
         query_watermark: Some(10),
         safe_head: 30,
         lookahead_blocks: 5,
@@ -75,7 +98,7 @@ fn test_follow_query_caps_query_lookahead_at_safe_head() {
     let plan = WarmupTargetPlanner::plan(WarmupTargetPlanInput {
         mode: WarmupTaskMode::FollowQuery,
         fixed_end: None,
-        cursor_next: 1,
+        cursor_next: 25,
         query_watermark: Some(25),
         safe_head: 28,
         lookahead_blocks: 10,
@@ -92,7 +115,7 @@ fn test_follow_query_explicit_zero_offset_still_starts_after_watermark() {
     let plan = WarmupTargetPlanner::plan(WarmupTargetPlanInput {
         mode: WarmupTaskMode::FollowQuery,
         fixed_end: None,
-        cursor_next: 1,
+        cursor_next: 25,
         query_watermark: Some(25),
         safe_head: 28,
         lookahead_blocks: 10,
@@ -178,7 +201,7 @@ fn test_follow_query_uses_adaptive_start_offset_after_watermark() {
     let plan = WarmupTargetPlanner::plan(WarmupTargetPlanInput {
         mode: WarmupTaskMode::FollowQuery,
         fixed_end: None,
-        cursor_next: 100,
+        cursor_next: 100_000,
         query_watermark: Some(100_000),
         safe_head: 110_000,
         lookahead_blocks: 3,
@@ -201,7 +224,7 @@ fn test_follow_query_adaptive_offset_decays_near_safe_head() {
     let plan = WarmupTargetPlanner::plan(WarmupTargetPlanInput {
         mode: WarmupTaskMode::FollowQuery,
         fixed_end: None,
-        cursor_next: 1,
+        cursor_next: 100_000,
         query_watermark: Some(100_000),
         safe_head: 100_700,
         lookahead_blocks: 5,
@@ -224,7 +247,7 @@ fn test_follow_query_uses_configured_offset_tiers() {
     let plan = WarmupTargetPlanner::plan(WarmupTargetPlanInput {
         mode: WarmupTaskMode::FollowQuery,
         fixed_end: None,
-        cursor_next: 100,
+        cursor_next: 100_000,
         query_watermark: Some(100_000),
         safe_head: 110_000,
         lookahead_blocks: 3,
@@ -385,7 +408,7 @@ fn test_follow_query_adaptive_offset_decays_to_positive_offset_near_safe_head() 
     let plan = WarmupTargetPlanner::plan(WarmupTargetPlanInput {
         mode: WarmupTaskMode::FollowQuery,
         fixed_end: None,
-        cursor_next: 1,
+        cursor_next: 100_000,
         query_watermark: Some(100_000),
         safe_head: 100_005,
         lookahead_blocks: 5,
@@ -408,7 +431,7 @@ fn test_follow_query_noops_when_safe_head_equals_query_watermark() {
     let plan = WarmupTargetPlanner::plan(WarmupTargetPlanInput {
         mode: WarmupTaskMode::FollowQuery,
         fixed_end: None,
-        cursor_next: 1,
+        cursor_next: 100_000,
         query_watermark: Some(100_000),
         safe_head: 100_000,
         lookahead_blocks: 5,
@@ -425,7 +448,7 @@ fn test_follow_query_zero_lookahead_targets_safe_head_from_planned_start() {
     let plan = WarmupTargetPlanner::plan(WarmupTargetPlanInput {
         mode: WarmupTaskMode::FollowQuery,
         fixed_end: None,
-        cursor_next: 1,
+        cursor_next: 100_000,
         query_watermark: Some(100_000),
         safe_head: 100_700,
         lookahead_blocks: 0,

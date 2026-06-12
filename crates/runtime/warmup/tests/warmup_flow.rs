@@ -669,9 +669,9 @@ fn test_query_watermark_does_not_directly_update_warmup_cursor() {
     let result = runtime.run_task_once(&task_id).expect("warmup run");
 
     assert_eq!(result.status, WarmupRunStatus::Partial);
-    assert_eq!(adapter.fetches(), vec![blocks(11, 12)]);
+    assert_eq!(adapter.fetches(), vec![blocks(1, 2)]);
     let cursor = registry.load_cursor(&task_id).unwrap().expect("cursor");
-    assert_eq!(cursor.next, 13);
+    assert_eq!(cursor.next, 3);
 }
 
 #[test]
@@ -723,7 +723,7 @@ fn test_repeated_query_progress_moves_follow_query_target_forward() {
 }
 
 #[test]
-fn test_follow_query_realigns_old_cursor_to_adaptive_lookahead_frontier() {
+fn test_follow_query_at_watermark_uses_adaptive_lookahead_frontier() {
     let root = temp_root("follow-query-realigns-old-cursor");
     let storage = LocalStorage::new(&root);
     let watermarks = QueryWatermarkStore::new(LocalObjectStore::new(&root));
@@ -742,6 +742,7 @@ fn test_follow_query_realigns_old_cursor_to_adaptive_lookahead_frontier() {
         .expect("submit follow query")
         .task_id;
     save_query_watermark(&watermarks, 100_000);
+    save_warmup_cursor(&registry, &task_id, 100_000, 1);
 
     let result = runtime.run_task_once(&task_id).expect("warmup run");
 
@@ -968,6 +969,7 @@ fn test_follow_query_skips_existing_coverage_inside_lookahead_range() {
         .expect("submit follow query")
         .task_id;
     save_query_watermark(&watermarks, 100_000);
+    save_warmup_cursor(&registry, &task_id, 100_000, 1);
     seed_coverage(&storage, blocks(101_000, 101_000));
 
     let result = runtime.run_task_once(&task_id).expect("warmup run");
@@ -1003,6 +1005,7 @@ fn test_follow_query_uses_fresh_query_activity_before_monotonic_watermark() {
         .task_id;
     save_query_watermark(&watermarks, 100_000);
     save_query_activity(&activities, blocks(990, 1_000), now_unix_seconds());
+    save_warmup_cursor(&registry, &task_id, 1_000, 1);
     seed_coverage(&storage, blocks(2_000, 2_000));
 
     let result = runtime.run_task_once(&task_id).expect("warmup run");
@@ -1037,6 +1040,7 @@ fn test_follow_query_falls_back_to_watermark_when_query_activity_is_stale() {
         .task_id;
     save_query_watermark(&watermarks, 100_000);
     save_query_activity(&activities, blocks(990, 1_000), 1);
+    save_warmup_cursor(&registry, &task_id, 100_000, 1);
 
     let result = runtime.run_task_once(&task_id).expect("warmup run");
 
@@ -1106,6 +1110,7 @@ fn test_task_pool_prioritizes_active_follow_query_watermark() {
         .expect("active follow query")
         .task_id;
     save_query_watermark(&watermarks, 1_000);
+    save_warmup_cursor(&registry, &active, 1_000, 1);
     let stale = ensure_lower_task_id_without_watermark(&registry, &active);
 
     let results = pool.run_available_once().expect("run prioritized task");
@@ -1220,6 +1225,7 @@ fn test_task_pool_get_and_list_return_live_follow_query_status() {
         .task_id;
     save_query_watermark(&watermarks, 1_000);
     save_query_watermark(&watermarks, 2_000);
+    save_warmup_cursor(&registry, &task_id, 2_000, 1);
 
     let listed = pool.list(Default::default()).expect("list tasks");
     let listed_status = listed[0]
@@ -1236,10 +1242,10 @@ fn test_task_pool_get_and_list_return_live_follow_query_status() {
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].task_id, task_id);
     assert_eq!(listed_status.query_watermark, Some(2_000));
-    assert_eq!(listed_status.cursor_next, 1);
+    assert_eq!(listed_status.cursor_next, 2_000);
     assert_eq!(listed_status.planned_start, Some(3_000));
     assert_eq!(fetched.query_watermark, Some(2_000));
-    assert_eq!(fetched.cursor_next, 1);
+    assert_eq!(fetched.cursor_next, 2_000);
     assert_eq!(fetched.planned_start, Some(3_000));
 }
 
@@ -1275,6 +1281,8 @@ fn test_task_pool_rotates_between_low_lead_follow_query_tasks() {
         .task_id;
     save_query_watermark(&watermarks, 1_000);
     save_query_watermark_for(&watermarks, "app-a", &second_selector(), 1_000);
+    save_warmup_cursor(&registry, &first, 1_000, 1);
+    save_warmup_cursor(&registry, &second, 1_000, 1);
 
     pool.run_available_once().expect("first tick");
     pool.run_available_once().expect("second tick");
@@ -1426,6 +1434,25 @@ fn ensure_lower_task_id_without_watermark(
         }
     }
     panic!("could not create a lower sorted inactive follow_query task");
+}
+
+fn save_warmup_cursor(
+    registry: &LocalWarmupRegistry<LocalObjectStore>,
+    task_id: &datalens_warmup::WarmupTaskId,
+    next: u64,
+    updated_at: u64,
+) {
+    registry
+        .save_cursor(&datalens_warmup::WarmupCursor {
+            task_id: task_id.clone(),
+            next,
+            last_committed: next.checked_sub(1),
+            current_attempt: 0,
+            last_processed_range: None,
+            last_error: None,
+            updated_at,
+        })
+        .expect("save warmup cursor");
 }
 
 fn assert_existing_ensure_requeues(registry: &LocalWarmupRegistry<LocalObjectStore>) {
