@@ -259,6 +259,49 @@ fn test_executor_miss_with_durable_intent_records_staged_write_metric() {
 }
 
 #[test]
+fn test_executor_durable_intent_empty_fill_does_not_refetch_provider() {
+    let root = temp_storage_root("executor-intent-empty-no-refetch");
+    let storage = LocalStorage::new(root.join("storage"));
+    let intents = DurablePromotionIntentStore::new(LocalObjectStore::new(root.join("intents")));
+    let source = MockSource::default();
+    let executor = executor(storage.clone(), source.clone()).with_durable_intents(intents.clone());
+
+    let result = executor.execute(blocks_input(1, 1)).expect("query result");
+
+    assert_eq!(result.rows.row_count(), 0);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if source.calls().len() > 1 {
+            break;
+        }
+        let pending = intents.list_pending(u64::MAX, 10).expect("list pending");
+        if pending.is_empty() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("durable intent worker did not finish empty coverage intent");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    assert_eq!(
+        source.calls(),
+        vec![SourceCall::Blocks(BlockRange::expect_new(1, 1))]
+    );
+    assert_eq!(
+        storage
+            .covered_ranges(
+                &ethereum_identity(),
+                &DatasetKey::evm_blocks(),
+                &DatasetSelector::all(),
+                LedgerRange::blocks(1, 1).expect("range"),
+            )
+            .expect("covered ranges"),
+        vec![LedgerRange::blocks(1, 1).expect("range")]
+    );
+}
+
+#[test]
 fn test_executor_miss_returns_rows_when_durable_intent_scheduling_fails() {
     let storage = LocalStorage::new(temp_storage_root("executor-intent-fail"));
     let source = MockSource::default().with_blocks(vec![block(1, "0x01")]);
