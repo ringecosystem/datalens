@@ -1474,6 +1474,16 @@ fn test_cache_repair_force_refresh_recovers_log_when_reliability_disabled_in_con
 }
 
 #[test]
+fn test_cache_repair_force_refresh_recovers_log_when_receipt_fallback_disabled_in_config() {
+    assert_force_refresh_recovers_log_from_local_rpc_receipts(
+        "index-repair-force-refresh-local-rpc-receipt-fallback-disabled",
+        ADDRESS_A,
+        VOTE_CAST_TOPIC,
+        "receipt_fallback_enabled = false",
+    );
+}
+
+#[test]
 fn test_cache_repair_force_refresh_recovers_log_when_block_range_configured() {
     assert_force_refresh_recovers_log_from_local_rpc_receipts(
         "index-repair-force-refresh-local-rpc-block-range",

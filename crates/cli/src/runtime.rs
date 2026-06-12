@@ -962,7 +962,9 @@ pub(crate) fn evm_block_header_metadata_config(
 }
 
 pub(crate) fn evm_log_reliability_config(chain: &ChainConfig) -> EvmLogReliabilityConfig {
-    EvmLogReliabilityConfig::default().with_enabled(chain.datasets.logs.reliability_enabled)
+    EvmLogReliabilityConfig::default()
+        .with_enabled(chain.datasets.logs.reliability_enabled)
+        .with_receipt_fallback_enabled(chain.datasets.logs.receipt_fallback_enabled)
 }
 
 pub(crate) fn finality_summary(chain: &ChainConfig) -> serde_json::Value {

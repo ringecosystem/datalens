@@ -514,6 +514,7 @@ async fn test_discovery_route_lists_chain_identities_and_native_dataset_capabili
                     logs: LogsDatasetConfig {
                         enabled: false,
                         reliability_enabled: true,
+                        receipt_fallback_enabled: true,
                         query_strategy: Default::default(),
                         max_get_logs_range_blocks: 2,
                         max_block_scan_range_blocks: 2,

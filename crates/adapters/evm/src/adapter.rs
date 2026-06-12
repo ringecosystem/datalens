@@ -116,17 +116,26 @@ const DEFAULT_BLOCK_HEADER_DURABLE_CHUNK_SIZE_BLOCKS: u64 = 1_000;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EvmLogReliabilityConfig {
     pub enabled: bool,
+    pub receipt_fallback_enabled: bool,
 }
 
 impl Default for EvmLogReliabilityConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            receipt_fallback_enabled: true,
+        }
     }
 }
 
 impl EvmLogReliabilityConfig {
     pub fn with_enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
+        self
+    }
+
+    pub fn with_receipt_fallback_enabled(mut self, enabled: bool) -> Self {
+        self.receipt_fallback_enabled = enabled;
         self
     }
 }
@@ -732,6 +741,19 @@ impl EvmRpcClient {
                     .any(|log| log.block_number == *block && log_matches_filter(log, filter))
             })
             .collect::<Vec<_>>();
+        if !self.log_reliability.receipt_fallback_enabled {
+            diagnostics.receipt_unresolved_blocks = unresolved_blocks.len();
+            diagnostics.unrecovered_blocks = diagnostics.receipt_unresolved_blocks;
+            diagnostics.recovery_available =
+                diagnostics.recovery_available || diagnostics.secondary_provider_calls > 0;
+            if !unresolved_blocks.is_empty() {
+                log::warn!(
+                    "EVM log reliability left {} bloom-positive block(s) unresolved because receipt fallback is disabled",
+                    unresolved_blocks.len()
+                );
+            }
+            return Ok((merged, Some(diagnostics)));
+        }
         for block_number in unresolved_blocks {
             let Some(header) = header_by_number.get(&block_number) else {
                 diagnostics.receipt_unresolved_blocks += 1;

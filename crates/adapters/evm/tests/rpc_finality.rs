@@ -867,6 +867,85 @@ fn test_provider_filter_logs_reliability_recovers_secondary_empty_bloom_candidat
 }
 
 #[test]
+fn test_provider_filter_logs_reliability_receipt_fallback_can_be_disabled() {
+    let topic = transfer_topic();
+    let address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let block_hash = block_hash(10);
+    let bloom = EvmLogBloom::from_inputs([
+        EvmLogBloomInput::Address(address),
+        EvmLogBloomInput::Topic(topic),
+    ])
+    .expect("bloom")
+    .as_hex();
+    let (primary_url, primary_requests) = start_rpc_server(vec![
+        logs_response(Vec::new()),
+        json!([block_batch_response_with_bloom(
+            1,
+            10,
+            &block_hash,
+            "0xparent10",
+            10,
+            &bloom
+        )]),
+        block_receipts_response(Vec::new()),
+    ]);
+    let client = EvmRpcClient::with_chain(
+        vec![primary_url],
+        ethereum_identity(),
+        EvmFinalityPolicy::Lag {
+            safe_lag_blocks: Some(2),
+            finalized_lag_blocks: Some(4),
+        },
+        10,
+        10,
+        3,
+        10,
+    )
+    .with_log_reliability_config(
+        EvmLogReliabilityConfig::default().with_receipt_fallback_enabled(false),
+    );
+    let filter = datalens_core::EvmLogFilter::try_from(LogFilter {
+        addresses: vec![address.to_owned()],
+        topics: vec![Some(vec![topic.to_owned()])],
+    })
+    .expect("filter");
+
+    let response = client
+        .fetch(ChainFetchRequest::new(
+            ethereum_identity(),
+            DatasetKey::evm_logs(),
+            LedgerRange::from_block_range(BlockRange::expect_new(10, 10)),
+            DatasetSelector::EvmLogs(filter),
+        ))
+        .expect("logs");
+
+    let QueryRows::EvmLogs(rows) = response.rows.rows() else {
+        panic!("expected EVM logs");
+    };
+    assert!(rows.is_empty());
+    assert!(
+        response
+            .provider_diagnostics
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("reliability_unrecovered_blocks=1"))
+    );
+    assert!(
+        response
+            .provider_diagnostics
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("reliability_receipt_fallback_calls=0"))
+    );
+    let primary_requests = primary_requests.lock().expect("primary requests");
+    assert_eq!(primary_requests.len(), 2);
+    assert!(primary_requests.iter().all(|request| {
+        request["method"] != "eth_getBlockReceipts"
+            && request["method"] != "eth_getTransactionReceipt"
+    }));
+}
+
+#[test]
 fn test_provider_filter_logs_reliability_falls_back_to_receipts_when_secondary_fails() {
     let topic = transfer_topic();
     let address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
