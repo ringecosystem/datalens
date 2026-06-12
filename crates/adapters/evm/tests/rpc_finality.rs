@@ -547,6 +547,156 @@ fn test_provider_filter_logs_reliability_disabled_preserves_primary_only_empty_c
 }
 
 #[test]
+fn test_provider_filter_logs_reliability_header_provider_failure_returns_primary_logs() {
+    let topic = transfer_topic();
+    let address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let hash10 = block_hash(10);
+    let (primary_url, primary_requests) = start_rpc_server(vec![
+        logs_response(vec![provider_log_with_address(
+            10, &hash10, "0xtx", 0, 0, address, topic,
+        )]),
+        block_response(10, &hash10, "0xparent10", 10),
+        provider_error_response(
+            -32000,
+            "transactionsRoot is empty trie root but block contains 1 non-phantom transactions; inconsistent block data",
+        ),
+        block_response(10, &hash10, "0xparent10", 10),
+    ]);
+    let client = EvmRpcClient::with_chain(
+        vec![primary_url],
+        ethereum_identity(),
+        EvmFinalityPolicy::Lag {
+            safe_lag_blocks: Some(2),
+            finalized_lag_blocks: Some(4),
+        },
+        10,
+        10,
+        3,
+        10,
+    )
+    .with_block_header_metadata_config(
+        EvmBlockHeaderMetadataConfig::default()
+            .with_fetch_mode(EvmBlockHeaderFetchMode::Concurrent)
+            .with_fetch_concurrency(1),
+    );
+    let filter = datalens_core::EvmLogFilter::try_from(LogFilter {
+        addresses: vec![address.to_owned()],
+        topics: vec![Some(vec![topic.to_owned()])],
+    })
+    .expect("filter");
+
+    let response = client
+        .fetch(ChainFetchRequest::new(
+            ethereum_identity(),
+            DatasetKey::evm_logs(),
+            LedgerRange::from_block_range(BlockRange::expect_new(10, 11)),
+            DatasetSelector::EvmLogs(filter),
+        ))
+        .expect("logs should survive optional reliability header provider failure");
+
+    let QueryRows::EvmLogs(rows) = response.rows.rows() else {
+        panic!("expected EVM logs");
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].address, address);
+    assert_eq!(rows[0].block_hash, hash10);
+    assert_eq!(rows[0].parent_hash.as_deref(), Some("0xparent10"));
+    assert_eq!(rows[0].block_timestamp, Some(10));
+    assert_eq!(response.provider_diagnostics.calls, 2);
+    assert!(
+        response
+            .provider_diagnostics
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("reliability_header_blocks=0"))
+    );
+    assert!(
+        response
+            .provider_diagnostics
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("reliability_suspicious_blocks=0"))
+    );
+    assert!(
+        response
+            .provider_diagnostics
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("reliability_secondary_calls=0"))
+    );
+    assert!(
+        response
+            .provider_diagnostics
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("reliability_receipt_fallback_calls=0"))
+    );
+    assert!(
+        response
+            .provider_diagnostics
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("reliability_recovery_available=false"))
+    );
+    let primary_requests = primary_requests.lock().expect("primary requests");
+    assert_eq!(primary_requests.len(), 4);
+    assert_eq!(primary_requests[0]["method"], "eth_getLogs");
+    assert_eq!(primary_requests[1]["method"], "eth_getBlockByNumber");
+    assert_eq!(primary_requests[1]["params"][0], "0xa");
+    assert_eq!(primary_requests[2]["method"], "eth_getBlockByNumber");
+    assert_eq!(primary_requests[2]["params"][0], "0xb");
+    assert_eq!(primary_requests[3]["method"], "eth_getBlockByNumber");
+    assert_eq!(primary_requests[3]["params"][0], "0xa");
+}
+
+#[test]
+fn test_block_headers_all_keeps_provider_failure_strict() {
+    let hash10 = block_hash(10);
+    let (url, requests) = start_rpc_server(vec![
+        block_response(10, &hash10, "0xparent10", 10),
+        provider_error_response(
+            -32000,
+            "transactionsRoot is empty trie root but block contains 1 non-phantom transactions; inconsistent block data",
+        ),
+    ]);
+    let client = EvmRpcClient::with_chain(
+        vec![url],
+        ethereum_identity(),
+        EvmFinalityPolicy::Lag {
+            safe_lag_blocks: Some(2),
+            finalized_lag_blocks: Some(4),
+        },
+        10,
+        10,
+        3,
+        10,
+    )
+    .with_block_header_metadata_config(
+        EvmBlockHeaderMetadataConfig::default()
+            .with_fetch_mode(EvmBlockHeaderFetchMode::Concurrent)
+            .with_fetch_concurrency(1),
+    );
+
+    let error = client
+        .fetch(ChainFetchRequest::new(
+            ethereum_identity(),
+            DatasetKey::evm_block_headers(),
+            LedgerRange::from_block_range(BlockRange::expect_new(10, 11)),
+            DatasetSelector::All,
+        ))
+        .expect_err("required block header fetch should stay strict");
+
+    assert_eq!(error.kind, DatalensErrorKind::ProviderFailure);
+    assert!(error.message.contains("inconsistent block data"));
+    let requests = requests.lock().expect("requests");
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0]["method"], "eth_getBlockByNumber");
+    assert_eq!(requests[0]["params"][0], "0xa");
+    assert_eq!(requests[1]["method"], "eth_getBlockByNumber");
+    assert_eq!(requests[1]["params"][0], "0xb");
+}
+
+#[test]
 fn test_provider_filter_logs_reliability_recovers_no_secondary_bloom_candidate_from_block_receipts()
 {
     let vote_cast = topic_with_prefix("bb");

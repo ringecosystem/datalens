@@ -629,11 +629,22 @@ impl EvmRpcClient {
             return Ok((primary_logs, None));
         }
 
-        let headers = self.resolve_reliability_headers(EvmBlockHeaderResolveRequest {
+        let headers = match self.resolve_reliability_headers(EvmBlockHeaderResolveRequest {
             chain: self.chain.clone(),
             range,
             finality_level: FinalityLevel::Safe,
-        })?;
+        }) {
+            Ok(headers) => headers,
+            Err(error) if error.kind == DatalensErrorKind::ProviderFailure => {
+                log::warn!(
+                    "EVM log reliability header scan failed open kind={:?}: {}",
+                    error.kind,
+                    error.message
+                );
+                return Ok((primary_logs, Some(LogReliabilityDiagnostics::default())));
+            }
+            Err(error) => return Err(error),
+        };
         self.insert_evm_block_headers_into_cache(&headers);
 
         let mut suspicious_blocks = Vec::new();
