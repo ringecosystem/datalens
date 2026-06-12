@@ -211,6 +211,12 @@ impl TronProvider for TronHttpProvider {
                 ),
             )
         })?;
+        if is_plain_text_rate_limit(status.as_u16(), &raw_body) {
+            return Err(DatalensError::new(
+                DatalensErrorKind::RateLimited,
+                "TronGrid contract events rate limited",
+            ));
+        }
         let body: Value = serde_json::from_str(&raw_body).map_err(|error| {
             DatalensError::new(
                 DatalensErrorKind::ProviderFailure,
@@ -490,6 +496,10 @@ fn base58_encode(bytes: &[u8]) -> String {
         output.push(ALPHABET[*digit as usize] as char);
     }
     output
+}
+
+fn is_plain_text_rate_limit(status: u16, body: &str) -> bool {
+    (status == 403 || status == 429) && body.to_ascii_lowercase().contains("rate limit")
 }
 
 fn trongrid_contract_events_http_error(status: u16, body: &Value) -> DatalensError {
