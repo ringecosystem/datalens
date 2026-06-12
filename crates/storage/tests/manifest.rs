@@ -179,6 +179,22 @@ struct MissingDataObjectExistsStore {
     inner: LocalObjectStore,
 }
 
+#[derive(Clone, Debug)]
+struct FailNextManifestSegmentPutStore {
+    inner: LocalObjectStore,
+    fail_next_segment_put: Arc<AtomicUsize>,
+}
+
+type InjectedObject = (String, Vec<u8>);
+type InjectedObjects = Arc<Mutex<Vec<InjectedObject>>>;
+
+#[derive(Clone, Debug)]
+struct InjectOnManifestSegmentPutStore {
+    inner: LocalObjectStore,
+    inject_next_segment_put: Arc<AtomicUsize>,
+    injected_objects: InjectedObjects,
+}
+
 impl MissingDataObjectExistsStore {
     fn new(root: PathBuf) -> Self {
         Self {
@@ -200,6 +216,131 @@ impl ObjectStore for MissingDataObjectExistsStore {
         if key.contains("/datasets/") {
             return Ok(false);
         }
+        self.inner.exists(key)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
+        self.inner.list(prefix)
+    }
+
+    fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ObjectListPage, DatalensError> {
+        self.inner.list_page(prefix, start_after, limit)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), DatalensError> {
+        self.inner.delete(key)
+    }
+
+    fn lock_namespace(&self) -> String {
+        self.inner.lock_namespace()
+    }
+}
+
+impl FailNextManifestSegmentPutStore {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            inner: LocalObjectStore::new(root),
+            fail_next_segment_put: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn fail_next_manifest_segment_put(&self) {
+        self.fail_next_segment_put.store(1, Ordering::SeqCst);
+    }
+}
+
+impl InjectOnManifestSegmentPutStore {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            inner: LocalObjectStore::new(root),
+            inject_next_segment_put: Arc::new(AtomicUsize::new(0)),
+            injected_objects: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn inject_next_manifest_segment_put(&self, objects: Vec<(String, Vec<u8>)>) {
+        *self.injected_objects.lock().expect("lock injected objects") = objects;
+        self.inject_next_segment_put.store(1, Ordering::SeqCst);
+    }
+}
+
+impl ObjectStore for InjectOnManifestSegmentPutStore {
+    fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError> {
+        self.inner.get(key)
+    }
+
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
+        self.inner.put(key, bytes)?;
+        if key.contains("/manifest-segments/")
+            && self
+                .inject_next_segment_put
+                .compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            let objects = self
+                .injected_objects
+                .lock()
+                .expect("lock injected objects")
+                .clone();
+            for (key, bytes) in objects {
+                self.inner.put(&key, &bytes)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn exists(&self, key: &str) -> Result<bool, DatalensError> {
+        self.inner.exists(key)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
+        self.inner.list(prefix)
+    }
+
+    fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ObjectListPage, DatalensError> {
+        self.inner.list_page(prefix, start_after, limit)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), DatalensError> {
+        self.inner.delete(key)
+    }
+
+    fn lock_namespace(&self) -> String {
+        self.inner.lock_namespace()
+    }
+}
+
+impl ObjectStore for FailNextManifestSegmentPutStore {
+    fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError> {
+        self.inner.get(key)
+    }
+
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
+        if key.contains("/manifest-segments/")
+            && self
+                .fail_next_segment_put
+                .compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            return Err(DatalensError::new(
+                DatalensErrorKind::StorageWriteFailure,
+                "injected manifest segment write failure",
+            ));
+        }
+        self.inner.put(key, bytes)
+    }
+
+    fn exists(&self, key: &str) -> Result<bool, DatalensError> {
         self.inner.exists(key)
     }
 
@@ -1033,6 +1174,26 @@ fn write_coverage_index_json<S: ObjectStore>(
         .expect("write coverage index");
 }
 
+fn manifest_segment_key_for_test(
+    chain: &ChainIdentity,
+    dataset_key: &DatasetKey,
+    range_kind: &str,
+    selector: &DatasetSelector,
+    finality_level: ManifestFinalityLevel,
+    range: &LedgerRange,
+) -> String {
+    format!(
+        "chains/{}/manifest-segments/{}/{}/{}/{}/{:020}-{:020}.json",
+        chain.key_prefix(),
+        dataset_key.as_str(),
+        range_kind,
+        selector.fingerprint(),
+        finality_level.as_str(),
+        range.start(),
+        range.end()
+    )
+}
+
 fn manifest_json_path_for_test(storage: &LocalStorage, chain: &ChainIdentity) -> PathBuf {
     let manifest_path = storage.manifest_path(chain);
     if manifest_path.exists() {
@@ -1045,7 +1206,10 @@ fn manifest_json_path_for_test(storage: &LocalStorage, chain: &ChainIdentity) ->
     storage.root().join(segment_key)
 }
 
-fn manifest_segment_keys(storage: &LocalStorage, chain: &ChainIdentity) -> Vec<String> {
+fn manifest_segment_keys<S: ObjectStore>(
+    storage: &DurableStorage<S>,
+    chain: &ChainIdentity,
+) -> Vec<String> {
     storage
         .object_store()
         .list(&format!("chains/{}/manifest-segments", chain.key_prefix()))
@@ -3525,6 +3689,568 @@ fn test_replacement_write_wins_over_wider_empty_coverage() {
         ranges,
         vec![(49, 49, false), (50, 50, true), (51, 51, false)]
     );
+}
+
+#[test]
+fn test_replacement_write_updates_coverage_index_without_full_manifest_scan() {
+    let store = ManifestAccessCountingStore::new(temp_storage_root("replacement-write-bounded"));
+    let storage = DurableStorage::from_object_store(store.clone());
+    let chain = test_chain();
+    let selector = evm_log_selector(vec![ADDRESS_A], vec![Some(vec![TOPIC_1])]);
+    let empty_range = LedgerRange::blocks(49, 51).expect("valid range");
+    let replacement_range = LedgerRange::blocks(50, 50).expect("valid range");
+    let empty_rows = DatasetRows::new(DatasetKey::evm_logs(), QueryRows::EvmLogs(Vec::new()))
+        .expect("empty rows");
+    let replacement_rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![log_record(50, 7, ADDRESS_A, vec![TOPIC_1])]),
+    )
+    .expect("replacement rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &selector,
+            range: empty_range,
+            rows: &empty_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write empty coverage");
+
+    store.reset_manifest_segment_list_count();
+    store.reset_coverage_index_list_count();
+    storage
+        .write_rows_replacing_existing(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &selector,
+            range: replacement_range.clone(),
+            rows: &replacement_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write replacement rows");
+
+    assert_eq!(store.manifest_segment_list_count(), 0);
+    assert_eq!(store.coverage_index_list_count(), 0);
+
+    let rows = storage
+        .read_rows(
+            &chain,
+            &DatasetKey::evm_logs(),
+            &selector,
+            replacement_range,
+        )
+        .expect("read replacement rows");
+    match rows.into_rows() {
+        QueryRows::EvmLogs(logs) => {
+            assert_eq!(logs.len(), 1);
+            assert_eq!(logs[0].log_index, 7);
+        }
+        rows => panic!("expected log rows, got {rows:?}"),
+    }
+}
+
+#[test]
+fn test_replacement_write_updates_all_buckets_for_replaced_wide_entry() {
+    let store = ManifestAccessCountingStore::new(temp_storage_root("replacement-wide-buckets"));
+    let storage = DurableStorage::from_object_store(store.clone());
+    let chain = test_chain();
+    let selector = evm_log_selector(vec![ADDRESS_A], vec![Some(vec![TOPIC_1])]);
+    let empty_range = LedgerRange::blocks(99_999, 100_001).expect("valid range");
+    let replacement_range = LedgerRange::blocks(100_000, 100_000).expect("valid range");
+    let query_range = LedgerRange::blocks(99_999, 100_000).expect("valid range");
+    let data_rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![
+            log_record(99_999, 0, ADDRESS_A, vec![TOPIC_1]),
+            log_record(100_000, 1, ADDRESS_A, vec![TOPIC_1]),
+            log_record(100_001, 2, ADDRESS_A, vec![TOPIC_1]),
+        ]),
+    )
+    .expect("data rows");
+    let replacement_rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![log_record(100_000, 7, ADDRESS_A, vec![TOPIC_1])]),
+    )
+    .expect("replacement rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &selector,
+            range: empty_range,
+            rows: &data_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write cross-bucket data coverage");
+
+    store.reset_manifest_segment_list_count();
+    store.reset_coverage_index_list_count();
+    storage
+        .write_rows_replacing_existing(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &selector,
+            range: replacement_range,
+            rows: &replacement_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write replacement rows");
+
+    assert_eq!(store.manifest_segment_list_count(), 0);
+    assert_eq!(store.coverage_index_list_count(), 0);
+
+    let rows = storage
+        .read_rows(&chain, &DatasetKey::evm_logs(), &selector, query_range)
+        .expect("read cross-bucket replacement rows");
+    match rows.into_rows() {
+        QueryRows::EvmLogs(logs) => {
+            assert_eq!(
+                logs.into_iter()
+                    .map(|record| (record.block_number, record.log_index))
+                    .collect::<Vec<_>>(),
+                vec![(99_999, 0), (100_000, 7)]
+            );
+        }
+        rows => panic!("expected log rows, got {rows:?}"),
+    }
+}
+
+#[test]
+fn test_second_replacement_does_not_read_stale_split_from_neighbor_bucket() {
+    let storage = LocalStorage::new(temp_storage_root("replacement-stale-neighbor-fragment"));
+    let chain = test_chain();
+    let selector = evm_log_selector(vec![ADDRESS_A], vec![Some(vec![TOPIC_1])]);
+    let data_range = LedgerRange::blocks(99_999, 100_010).expect("valid range");
+    let first_replacement_range = LedgerRange::blocks(100_000, 100_000).expect("valid range");
+    let second_replacement_range = LedgerRange::blocks(100_005, 100_005).expect("valid range");
+    let query_range = LedgerRange::blocks(99_999, 100_005).expect("valid range");
+    let data_rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![
+            log_record(99_999, 0, ADDRESS_A, vec![TOPIC_1]),
+            log_record(100_000, 1, ADDRESS_A, vec![TOPIC_1]),
+            log_record(100_001, 2, ADDRESS_A, vec![TOPIC_1]),
+            log_record(100_005, 5, ADDRESS_A, vec![TOPIC_1]),
+            log_record(100_010, 10, ADDRESS_A, vec![TOPIC_1]),
+        ]),
+    )
+    .expect("data rows");
+    let first_replacement_rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![log_record(100_000, 7, ADDRESS_A, vec![TOPIC_1])]),
+    )
+    .expect("first replacement rows");
+    let second_replacement_rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![log_record(100_005, 8, ADDRESS_A, vec![TOPIC_1])]),
+    )
+    .expect("second replacement rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &selector,
+            range: data_range,
+            rows: &data_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write cross-bucket data coverage");
+    storage
+        .write_rows_replacing_existing(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &selector,
+            range: first_replacement_range,
+            rows: &first_replacement_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write first replacement");
+    storage
+        .write_rows_replacing_existing(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &selector,
+            range: second_replacement_range,
+            rows: &second_replacement_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write second replacement");
+
+    let rows = storage
+        .read_rows(&chain, &DatasetKey::evm_logs(), &selector, query_range)
+        .expect("read cross-bucket replacement rows");
+    match rows.into_rows() {
+        QueryRows::EvmLogs(logs) => {
+            assert_eq!(
+                logs.into_iter()
+                    .map(|record| (record.block_number, record.log_index))
+                    .collect::<Vec<_>>(),
+                vec![(99_999, 0), (100_000, 7), (100_001, 2), (100_005, 8)]
+            );
+        }
+        rows => panic!("expected log rows, got {rows:?}"),
+    }
+}
+
+#[test]
+fn test_replacement_write_splits_overlapping_base_manifest_entry() {
+    let storage = LocalStorage::new(temp_storage_root("replacement-base-manifest"));
+    let chain = test_chain();
+    let selector = evm_log_selector(vec![ADDRESS_A], vec![Some(vec![TOPIC_1])]);
+    let data_range = LedgerRange::blocks(70, 72).expect("valid range");
+    let replacement_range = LedgerRange::blocks(71, 71).expect("valid range");
+    let data_rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![
+            log_record(70, 0, ADDRESS_A, vec![TOPIC_1]),
+            log_record(71, 1, ADDRESS_A, vec![TOPIC_1]),
+            log_record(72, 2, ADDRESS_A, vec![TOPIC_1]),
+        ]),
+    )
+    .expect("data rows");
+    let replacement_rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![log_record(71, 7, ADDRESS_A, vec![TOPIC_1])]),
+    )
+    .expect("replacement rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &selector,
+            range: data_range.clone(),
+            rows: &data_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write data coverage");
+    let base_manifest = storage.manifest().expect("manifest");
+    storage
+        .write_manifest(&chain, &base_manifest)
+        .expect("write base manifest");
+
+    storage
+        .write_rows_replacing_existing(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &selector,
+            range: replacement_range.clone(),
+            rows: &replacement_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write replacement rows");
+
+    let manifest = storage.manifest().expect("manifest");
+    let ranges = manifest
+        .entries
+        .iter()
+        .filter(|entry| entry.dataset_key == DatasetKey::evm_logs())
+        .map(|entry| {
+            (
+                entry.range.start(),
+                entry.range.end(),
+                entry.object_key.is_some(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ranges, vec![(70, 70, true), (71, 71, true), (72, 72, true)]);
+
+    let rows = storage
+        .read_rows(&chain, &DatasetKey::evm_logs(), &selector, data_range)
+        .expect("read full rows");
+    match rows.into_rows() {
+        QueryRows::EvmLogs(logs) => {
+            assert_eq!(
+                logs.into_iter()
+                    .map(|record| (record.block_number, record.log_index))
+                    .collect::<Vec<_>>(),
+                vec![(70, 0), (71, 7), (72, 2)]
+            );
+        }
+        rows => panic!("expected log rows, got {rows:?}"),
+    }
+}
+
+#[test]
+fn test_replacement_deletes_concurrent_overlapping_manifest_segment() {
+    let store = InjectOnManifestSegmentPutStore::new(temp_storage_root(
+        "replacement-concurrent-overlapping-segment",
+    ));
+    let storage = DurableStorage::from_object_store(store.clone());
+    let chain = test_chain();
+    let selector = evm_log_selector(vec![ADDRESS_A], vec![Some(vec![TOPIC_1])]);
+    let concurrent_range = LedgerRange::blocks(99_999, 100_001).expect("valid range");
+    let replacement_range = LedgerRange::blocks(100_000, 100_000).expect("valid range");
+    let replacement_rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![log_record(100_000, 7, ADDRESS_A, vec![TOPIC_1])]),
+    )
+    .expect("replacement rows");
+    let concurrent_entry = ManifestEntry {
+        chain: chain.clone(),
+        dataset_key: DatasetKey::evm_logs(),
+        range: concurrent_range.clone(),
+        selector_fingerprint: selector.fingerprint(),
+        selector_canonical_key: selector.canonical_key(),
+        finality_level: ManifestFinalityLevel::Safe,
+        object_key: None,
+        object_encoding: None,
+        object_compression: None,
+        row_count: 0,
+        object_size_bytes: None,
+        checksum: None,
+        checksum_algorithm: None,
+        written_at_unix_seconds: None,
+    };
+    let concurrent_manifest = Manifest {
+        entries: vec![concurrent_entry],
+    };
+    let concurrent_bytes =
+        serde_json::to_vec_pretty(&concurrent_manifest).expect("concurrent manifest bytes");
+    let mut injected_objects = vec![(
+        manifest_segment_key_for_test(
+            &chain,
+            &DatasetKey::evm_logs(),
+            "block",
+            &selector,
+            ManifestFinalityLevel::Safe,
+            &concurrent_range,
+        ),
+        concurrent_bytes.clone(),
+    )];
+    for (bucket_start, bucket_end) in [(0, 99_999), (100_000, 199_999)] {
+        injected_objects.push((
+            format!(
+                "chains/{}/coverage-index/{}/{}/{}/{}/{:020}-{:020}.json",
+                chain.key_prefix(),
+                DatasetKey::evm_logs().as_str(),
+                "block",
+                selector.fingerprint(),
+                ManifestFinalityLevel::Safe.as_str(),
+                bucket_start,
+                bucket_end
+            ),
+            concurrent_bytes.clone(),
+        ));
+    }
+    store.inject_next_manifest_segment_put(injected_objects);
+
+    storage
+        .write_rows_replacing_existing(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &selector,
+            range: replacement_range.clone(),
+            rows: &replacement_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write replacement rows");
+
+    let manifest = storage.manifest().expect("manifest");
+    let ranges = manifest
+        .entries
+        .iter()
+        .filter(|entry| entry.dataset_key == DatasetKey::evm_logs())
+        .map(|entry| {
+            (
+                entry.range.start(),
+                entry.range.end(),
+                entry.object_key.is_some(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ranges,
+        vec![
+            (99_999, 99_999, false),
+            (100_000, 100_000, true),
+            (100_001, 100_001, false)
+        ]
+    );
+    assert_eq!(
+        manifest_segment_keys(&storage, &chain),
+        vec![
+            manifest_segment_key_for_test(
+                &chain,
+                &DatasetKey::evm_logs(),
+                "block",
+                &selector,
+                ManifestFinalityLevel::Safe,
+                &LedgerRange::blocks(99_999, 99_999).expect("valid range"),
+            ),
+            manifest_segment_key_for_test(
+                &chain,
+                &DatasetKey::evm_logs(),
+                "block",
+                &selector,
+                ManifestFinalityLevel::Safe,
+                &replacement_range,
+            ),
+            manifest_segment_key_for_test(
+                &chain,
+                &DatasetKey::evm_logs(),
+                "block",
+                &selector,
+                ManifestFinalityLevel::Safe,
+                &LedgerRange::blocks(100_001, 100_001).expect("valid range"),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn test_replacement_segment_failure_preserves_base_manifest_entry() {
+    let store = FailNextManifestSegmentPutStore::new(temp_storage_root(
+        "replacement-base-manifest-segment-failure",
+    ));
+    let storage = DurableStorage::from_object_store(store.clone());
+    let chain = test_chain();
+    let selector = evm_log_selector(vec![ADDRESS_A], vec![Some(vec![TOPIC_1])]);
+    let data_range = LedgerRange::blocks(70, 72).expect("valid range");
+    let replacement_range = LedgerRange::blocks(71, 71).expect("valid range");
+    let data_rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![
+            log_record(70, 0, ADDRESS_A, vec![TOPIC_1]),
+            log_record(71, 1, ADDRESS_A, vec![TOPIC_1]),
+            log_record(72, 2, ADDRESS_A, vec![TOPIC_1]),
+        ]),
+    )
+    .expect("data rows");
+    let replacement_rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![log_record(71, 7, ADDRESS_A, vec![TOPIC_1])]),
+    )
+    .expect("replacement rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &selector,
+            range: data_range.clone(),
+            rows: &data_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write data coverage");
+    let base_manifest = storage.manifest().expect("manifest");
+    storage
+        .write_manifest(&chain, &base_manifest)
+        .expect("write base manifest");
+
+    store.fail_next_manifest_segment_put();
+    let error = storage
+        .write_rows_replacing_existing(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &selector,
+            range: replacement_range,
+            rows: &replacement_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect_err("replacement should fail");
+
+    assert_eq!(error.kind, DatalensErrorKind::ManifestUpdateFailure);
+    let manifest = storage.manifest().expect("manifest");
+    let ranges = manifest
+        .entries
+        .iter()
+        .filter(|entry| entry.dataset_key == DatasetKey::evm_logs())
+        .map(|entry| (entry.range.start(), entry.range.end()))
+        .collect::<Vec<_>>();
+    assert_eq!(ranges, vec![(70, 72)]);
+}
+
+#[test]
+fn test_replacement_segment_failure_preserves_old_segment_entry() {
+    let store = FailNextManifestSegmentPutStore::new(temp_storage_root(
+        "replacement-segment-manifest-segment-failure",
+    ));
+    let storage = DurableStorage::from_object_store(store.clone());
+    let chain = test_chain();
+    let selector = evm_log_selector(vec![ADDRESS_A], vec![Some(vec![TOPIC_1])]);
+    let data_range = LedgerRange::blocks(70, 72).expect("valid range");
+    let replacement_range = LedgerRange::blocks(71, 71).expect("valid range");
+    let data_rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![
+            log_record(70, 0, ADDRESS_A, vec![TOPIC_1]),
+            log_record(71, 1, ADDRESS_A, vec![TOPIC_1]),
+            log_record(72, 2, ADDRESS_A, vec![TOPIC_1]),
+        ]),
+    )
+    .expect("data rows");
+    let replacement_rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![log_record(71, 7, ADDRESS_A, vec![TOPIC_1])]),
+    )
+    .expect("replacement rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &selector,
+            range: data_range.clone(),
+            rows: &data_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write data coverage");
+
+    store.fail_next_manifest_segment_put();
+    let error = storage
+        .write_rows_replacing_existing(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &selector,
+            range: replacement_range,
+            rows: &replacement_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect_err("replacement should fail");
+
+    assert_eq!(error.kind, DatalensErrorKind::ManifestUpdateFailure);
+    let manifest = storage.manifest().expect("manifest");
+    let ranges = manifest
+        .entries
+        .iter()
+        .filter(|entry| entry.dataset_key == DatasetKey::evm_logs())
+        .map(|entry| (entry.range.start(), entry.range.end()))
+        .collect::<Vec<_>>();
+    assert_eq!(ranges, vec![(70, 72)]);
+
+    let rows = storage
+        .read_rows(&chain, &DatasetKey::evm_logs(), &selector, data_range)
+        .expect("read old rows");
+    match rows.into_rows() {
+        QueryRows::EvmLogs(logs) => {
+            assert_eq!(
+                logs.into_iter()
+                    .map(|record| (record.block_number, record.log_index))
+                    .collect::<Vec<_>>(),
+                vec![(70, 0), (71, 1), (72, 2)]
+            );
+        }
+        rows => panic!("expected log rows, got {rows:?}"),
+    }
 }
 
 #[test]
