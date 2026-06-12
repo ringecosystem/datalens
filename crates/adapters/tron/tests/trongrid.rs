@@ -219,6 +219,34 @@ fn test_trongrid_contract_events_malformed_response_includes_status_and_body_pre
 }
 
 #[test]
+fn test_trongrid_contract_events_plain_text_rate_limit_is_retryable() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let server = TestServer::spawn(
+        seen,
+        "Too Many Requests - Rate Limit Exceeded",
+        "HTTP/1.1 403 Forbidden\r\nContent-Type: application/octet-stream",
+    );
+    let provider = TronHttpProvider::new("http://unused")
+        .with_trongrid(server.url(), Some("secret-key".to_owned()));
+
+    let error = provider
+        .get_contract_events(TronContractEventRequest {
+            contract_address: normalize_tron_contract_address(
+                "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            )
+            .expect("address"),
+            event_name: Some("Transfer".to_owned()),
+            range: LedgerRange::blocks(10, 10).expect("range"),
+            only_confirmed: true,
+            limit: 50,
+            fingerprint: None,
+        })
+        .expect_err("plain text rate-limit response should be retryable");
+
+    assert_eq!(error.kind, DatalensErrorKind::RateLimited);
+}
+
+#[test]
 fn test_trongrid_contract_events_invalid_address_response_is_invalid_input() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let server = TestServer::spawn(
