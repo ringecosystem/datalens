@@ -1,12 +1,14 @@
 //! Application-scoped durable cache repair tasks.
 
+use std::{collections::BTreeMap, sync::mpsc, thread, time::Duration};
+
 use datalens_chain::{
-    AdapterKey, ChainAdapter, ChainFetchRequest, DatasetSelector, FetchContext, FinalityLevel,
-    validate_durable_range,
+    AdapterKey, ChainAdapter, ChainFetchRequest, ChainFetchResponse, DatasetSelector, FetchContext,
+    FinalityLevel, validate_durable_range,
 };
 use datalens_core::{
-    ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey, EvmLogFilter, LedgerRange,
-    LedgerRangeKind,
+    ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey, DatasetRows, EvmLogFilter,
+    LedgerRange, LedgerRangeKind, LogRecord, QueryRows,
 };
 use datalens_storage::{ObjectStore, StorageRepository, StorageWriteRequest};
 use serde::{Deserialize, Serialize};
@@ -53,9 +55,34 @@ pub enum CacheRepairTaskState {
 }
 
 impl CacheRepairTaskState {
-    fn is_runnable(self) -> bool {
-        matches!(self, Self::Queued | Self::Running | Self::Failed)
+    fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Cancelled)
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CacheRepairRuntimeConfig {
+    #[serde(default = "default_cache_repair_fetch_timeout_ms")]
+    pub fetch_timeout_ms: u64,
+    #[serde(default = "default_cache_repair_lease_ttl_ms")]
+    pub lease_ttl_ms: u64,
+}
+
+impl Default for CacheRepairRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            fetch_timeout_ms: default_cache_repair_fetch_timeout_ms(),
+            lease_ttl_ms: default_cache_repair_lease_ttl_ms(),
+        }
+    }
+}
+
+pub fn default_cache_repair_fetch_timeout_ms() -> u64 {
+    120_000
+}
+
+pub fn default_cache_repair_lease_ttl_ms() -> u64 {
+    600_000
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -107,6 +134,7 @@ pub struct CacheRepairSubmitRequest {
     pub chain: ChainIdentity,
     pub dataset_key: DatasetKey,
     pub selector: DatasetSelector,
+    pub source_selectors: Vec<DatasetSelector>,
     pub range_kind: LedgerRangeKind,
     pub start: u64,
     pub end: u64,
@@ -122,6 +150,7 @@ pub struct CacheRepairTask {
     pub chain: ChainIdentity,
     pub dataset_key: DatasetKey,
     pub selector: DatasetSelector,
+    pub source_selectors: Vec<DatasetSelector>,
     pub range_kind: LedgerRangeKind,
     pub start: u64,
     pub end: u64,
@@ -131,6 +160,8 @@ pub struct CacheRepairTask {
     pub state: CacheRepairTaskState,
     pub created_at: u64,
     pub updated_at: u64,
+    pub lease_owner: Option<String>,
+    pub lease_expires_at: Option<u64>,
     pub last_error: Option<String>,
     pub stats: CacheRepairStats,
     dedupe_key: String,
@@ -146,6 +177,7 @@ impl CacheRepairTask {
             chain: request.chain,
             dataset_key: request.dataset_key,
             selector: request.selector,
+            source_selectors: request.source_selectors,
             range_kind: request.range_kind,
             start: request.start,
             end: request.end,
@@ -157,6 +189,8 @@ impl CacheRepairTask {
             state: CacheRepairTaskState::Queued,
             created_at: now,
             updated_at: now,
+            lease_owner: None,
+            lease_expires_at: None,
             last_error: None,
             stats: CacheRepairStats::default(),
             dedupe_key,
@@ -178,6 +212,19 @@ impl CacheRepairTask {
         self.last_error = None;
         self.touch(now);
         Ok(())
+    }
+
+    fn runnable_for_worker(&self, now_ms: u64) -> bool {
+        match self.state {
+            CacheRepairTaskState::Queued | CacheRepairTaskState::Failed => true,
+            CacheRepairTaskState::Running => self.lease_expired(now_ms),
+            CacheRepairTaskState::Completed | CacheRepairTaskState::Cancelled => false,
+        }
+    }
+
+    fn lease_expired(&self, now_ms: u64) -> bool {
+        self.lease_expires_at
+            .is_none_or(|expires_at| expires_at <= now_ms)
     }
 }
 
@@ -210,6 +257,8 @@ pub trait CacheRepairRegistry: Clone + Send + Sync + 'static {
     fn retry_failed(&self, task_id: &CacheRepairTaskId) -> Result<(), DatalensError> {
         let mut task = self.get(task_id)?.ok_or_else(|| missing_task(task_id))?;
         task.reset_for_retry(unix_seconds_now()?)?;
+        task.lease_owner = None;
+        task.lease_expires_at = None;
         self.save_task(&task)
     }
 
@@ -220,6 +269,10 @@ pub trait CacheRepairRegistry: Clone + Send + Sync + 'static {
     ) -> Result<(), DatalensError> {
         let mut task = self.get(task_id)?.ok_or_else(|| missing_task(task_id))?;
         task.state = state;
+        if state.is_terminal() {
+            task.lease_owner = None;
+            task.lease_expires_at = None;
+        }
         task.touch(unix_seconds_now()?);
         self.save_task(&task)
     }
@@ -327,6 +380,8 @@ pub struct CacheRepairRuntime<A, S, R> {
     adapter: A,
     storage: S,
     registry: R,
+    config: CacheRepairRuntimeConfig,
+    lease_owner: String,
 }
 
 #[derive(Clone)]
@@ -384,17 +439,25 @@ where
     }
 
     pub fn run_available_once(&self) -> Result<Vec<CacheRepairRunResult>, DatalensError> {
+        let now_ms = unix_milliseconds_now()?;
         let mut results = Vec::new();
         let mut tasks = self
             .list(CacheRepairTaskFilter::default())?
             .into_iter()
-            .filter(|task| task.state.is_runnable())
+            .filter(|task| task.runnable_for_worker(now_ms))
             .collect::<Vec<_>>();
         tasks.sort_by_key(|task| (task.created_at, task.task_id.as_str().to_owned()));
         for task in tasks.into_iter().take(1) {
             results.push(self.runtime.run_task_once(&task.task_id)?);
         }
         Ok(results)
+    }
+
+    pub fn run_task_once(
+        &self,
+        task_id: &CacheRepairTaskId,
+    ) -> Result<CacheRepairRunResult, DatalensError> {
+        self.runtime.run_task_once(task_id)
     }
 }
 
@@ -409,7 +472,14 @@ where
             adapter,
             storage,
             registry,
+            config: CacheRepairRuntimeConfig::default(),
+            lease_owner: default_lease_owner(),
         }
+    }
+
+    pub fn with_runtime_config(mut self, config: CacheRepairRuntimeConfig) -> Self {
+        self.config = config;
+        self
     }
 
     pub fn run_task_once(
@@ -432,6 +502,21 @@ where
                 ..CacheRepairRunResult::default()
             });
         }
+        let now_ms = unix_milliseconds_now()?;
+        if task.state == CacheRepairTaskState::Running && !task.lease_expired(now_ms) {
+            return Ok(CacheRepairRunResult {
+                status: CacheRepairRunStatus::Stopped,
+                ..CacheRepairRunResult::default()
+            });
+        }
+        if task.state == CacheRepairTaskState::Running {
+            log::warn!(
+                "cache repair stale running task recovered task_id={} lease_expires_at={} now={}",
+                task.task_id.as_str(),
+                task.lease_expires_at.unwrap_or_default(),
+                now_ms,
+            );
+        }
 
         validate_task(&task, &self.adapter)?;
         let durable_height = match task.finality {
@@ -446,9 +531,19 @@ where
             ));
         }
 
+        log::info!(
+            "cache repair task started task_id={} chain={} dataset={} range={}-{} selector_fingerprint={} source_selector_count={}",
+            task.task_id.as_str(),
+            task.chain.key_prefix(),
+            task.dataset_key.as_str(),
+            task.start,
+            task.end,
+            task.selector.fingerprint(),
+            task.source_selectors.len(),
+        );
         task.state = CacheRepairTaskState::Running;
         task.last_error = None;
-        task.touch(unix_seconds_now()?);
+        self.extend_lease(&mut task)?;
         self.registry.save_task(&task)?;
 
         let mut result = CacheRepairRunResult::default();
@@ -461,30 +556,25 @@ where
                     .min(next.saturating_add(task.chunk_policy.max_range_len.max(1) - 1)),
             )?;
             validate_durable_range(&chunk, &durable_height)?;
-            let request = ChainFetchRequest::new(
-                task.chain.clone(),
-                task.dataset_key.clone(),
-                chunk.clone(),
-                task.selector.clone(),
-            )
-            .with_context(FetchContext {
-                request_id: Some(task.task_id.as_str().to_owned()),
-                cache_write: true,
-            });
-            let response = match self.adapter.fetch(request.clone()) {
-                Ok(response) => response,
+            let fetched = match self.fetch_repair_rows(&task, chunk.clone()) {
+                Ok(fetched) => fetched,
                 Err(error) => {
                     self.mark_failed(&mut task, &error)?;
                     return Err(error);
                 }
             };
-            if let Err(error) = response.validate_for_request(&request) {
-                self.mark_failed(&mut task, &error)?;
-                return Err(error);
-            }
-            let provider_calls = response.provider_diagnostics.calls as u64;
-            let rows = response.rows;
+            let provider_calls = fetched.provider_calls;
+            let rows = fetched.rows;
             let row_count = rows.row_count();
+            let write_start = std::time::Instant::now();
+            log::info!(
+                "cache repair replacement write started task_id={} target_selector_fingerprint={} range={}-{} rows={}",
+                task.task_id.as_str(),
+                task.selector.fingerprint(),
+                chunk.start(),
+                chunk.end(),
+                row_count,
+            );
             match self
                 .storage
                 .write_rows_replacing_existing(StorageWriteRequest {
@@ -497,6 +587,15 @@ where
                     record_empty_coverage: true,
                 }) {
                 Ok(outcome) => {
+                    log::info!(
+                        "cache repair replacement write completed task_id={} range={}-{} data_object={} empty_coverage={} duration_ms={}",
+                        task.task_id.as_str(),
+                        chunk.start(),
+                        chunk.end(),
+                        outcome.data_object.is_some(),
+                        outcome.recorded_empty_coverage,
+                        write_start.elapsed().as_millis(),
+                    );
                     result.fetched_ranges += 1;
                     result.written_ranges +=
                         u64::from(outcome.data_object.is_some() || outcome.recorded_empty_coverage);
@@ -509,7 +608,7 @@ where
                     task.stats.empty_ranges += u64::from(outcome.recorded_empty_coverage);
                     task.stats.provider_calls += provider_calls;
                     task.stats.rows_fetched += row_count;
-                    task.touch(unix_seconds_now()?);
+                    self.extend_lease(&mut task)?;
                     self.registry.save_task(&task)?;
                 }
                 Err(error) => {
@@ -521,6 +620,8 @@ where
         }
 
         task.state = CacheRepairTaskState::Completed;
+        task.lease_owner = None;
+        task.lease_expires_at = None;
         task.touch(unix_seconds_now()?);
         self.registry.save_task(&task)?;
         result.status = CacheRepairRunStatus::Completed;
@@ -533,10 +634,131 @@ where
         error: &DatalensError,
     ) -> Result<(), DatalensError> {
         task.state = CacheRepairTaskState::Failed;
+        task.lease_owner = None;
+        task.lease_expires_at = None;
         task.last_error = Some(error.message.clone());
+        log::warn!(
+            "cache repair task failed task_id={} kind={:?} message={}",
+            task.task_id.as_str(),
+            error.kind,
+            error.message,
+        );
         task.touch(unix_seconds_now()?);
         self.registry.save_task(task)
     }
+
+    fn extend_lease(&self, task: &mut CacheRepairTask) -> Result<(), DatalensError> {
+        let now_ms = unix_milliseconds_now()?;
+        task.lease_owner = Some(self.lease_owner.clone());
+        task.lease_expires_at = Some(now_ms.saturating_add(self.config.lease_ttl_ms));
+        task.touch(unix_seconds_now()?);
+        Ok(())
+    }
+
+    fn fetch_repair_rows(
+        &self,
+        task: &CacheRepairTask,
+        chunk: LedgerRange,
+    ) -> Result<FetchedRepairRows, DatalensError> {
+        if task.source_selectors.is_empty() {
+            return self.fetch_one_selector(task, &task.selector, chunk, None);
+        }
+
+        let mut provider_calls = 0;
+        let mut merged = QueryRows::EvmLogs(Vec::new());
+        for (source_index, source_selector) in task.source_selectors.iter().enumerate() {
+            let fetched =
+                self.fetch_one_selector(task, source_selector, chunk.clone(), Some(source_index))?;
+            provider_calls += fetched.provider_calls;
+            merged.try_append(fetched.rows.into_rows())?;
+        }
+        let rows = DatasetRows::new(task.dataset_key.clone(), dedupe_repair_rows(merged)?)?;
+        Ok(FetchedRepairRows {
+            provider_calls,
+            rows,
+        })
+    }
+
+    fn fetch_one_selector(
+        &self,
+        task: &CacheRepairTask,
+        selector: &DatasetSelector,
+        chunk: LedgerRange,
+        source_index: Option<usize>,
+    ) -> Result<FetchedRepairRows, DatalensError> {
+        let request = ChainFetchRequest::new(
+            task.chain.clone(),
+            task.dataset_key.clone(),
+            chunk.clone(),
+            selector.clone(),
+        )
+        .with_context(FetchContext {
+            request_id: Some(task.task_id.as_str().to_owned()),
+            cache_write: true,
+        });
+        log::info!(
+            "cache repair chunk fetch started task_id={} range={}-{} source_index={}",
+            task.task_id.as_str(),
+            chunk.start(),
+            chunk.end(),
+            source_index
+                .map(|index| index.to_string())
+                .unwrap_or_else(|| "target".to_owned()),
+        );
+        let fetch_start = std::time::Instant::now();
+        let response = self.fetch_with_timeout(request.clone())?;
+        response.validate_for_request(&request)?;
+        let provider_calls = response.provider_diagnostics.calls as u64;
+        let rows = response.rows;
+        let row_count = rows.row_count();
+        log::info!(
+            "cache repair chunk fetch completed task_id={} range={}-{} rows={} provider_calls={} duration_ms={}",
+            task.task_id.as_str(),
+            chunk.start(),
+            chunk.end(),
+            row_count,
+            provider_calls,
+            fetch_start.elapsed().as_millis(),
+        );
+        Ok(FetchedRepairRows {
+            provider_calls,
+            rows,
+        })
+    }
+
+    fn fetch_with_timeout(
+        &self,
+        request: ChainFetchRequest,
+    ) -> Result<ChainFetchResponse, DatalensError> {
+        if self.config.fetch_timeout_ms == 0 {
+            return self.adapter.fetch(request);
+        }
+        let adapter = self.adapter.clone();
+        let timeout = Duration::from_millis(self.config.fetch_timeout_ms);
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send(adapter.fetch(request));
+        });
+        match receiver.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(DatalensError::new(
+                DatalensErrorKind::ProviderFailure,
+                format!(
+                    "cache repair provider fetch timed out after {}ms",
+                    self.config.fetch_timeout_ms
+                ),
+            )),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(DatalensError::new(
+                DatalensErrorKind::ProviderFailure,
+                "cache repair provider fetch worker stopped",
+            )),
+        }
+    }
+}
+
+struct FetchedRepairRows {
+    provider_calls: u64,
+    rows: DatasetRows,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -546,6 +768,8 @@ struct StoredCacheRepairTask {
     chain: ChainIdentity,
     dataset_key: DatasetKey,
     selector: StoredSelector,
+    #[serde(default)]
+    source_selectors: Vec<StoredSelector>,
     range_kind: LedgerRangeKind,
     start: u64,
     end: u64,
@@ -555,6 +779,10 @@ struct StoredCacheRepairTask {
     state: CacheRepairTaskState,
     created_at: u64,
     updated_at: u64,
+    #[serde(default)]
+    lease_owner: Option<String>,
+    #[serde(default)]
+    lease_expires_at: Option<u64>,
     last_error: Option<String>,
     stats: CacheRepairStats,
     dedupe_key: String,
@@ -590,12 +818,18 @@ impl StoredCacheRepairTask {
                 canonical_key: canonical_key.clone(),
             }),
         };
+        let source_selectors = task
+            .source_selectors
+            .iter()
+            .map(stored_selector_from_selector)
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             task_id: task.task_id.clone(),
             application_id: task.application_id.clone(),
             chain: task.chain.clone(),
             dataset_key: task.dataset_key.clone(),
             selector,
+            source_selectors,
             range_kind: task.range_kind.clone(),
             start: task.start,
             end: task.end,
@@ -605,6 +839,8 @@ impl StoredCacheRepairTask {
             state: task.state,
             created_at: task.created_at,
             updated_at: task.updated_at,
+            lease_owner: task.lease_owner.clone(),
+            lease_expires_at: task.lease_expires_at,
             last_error: task.last_error.clone(),
             stats: task.stats.clone(),
             dedupe_key: task.dedupe_key.clone(),
@@ -612,21 +848,19 @@ impl StoredCacheRepairTask {
     }
 
     fn into_task(self) -> Result<CacheRepairTask, DatalensError> {
-        let selector = match self.selector {
-            StoredSelector::All => DatasetSelector::All,
-            StoredSelector::EvmLogs(filter) => DatasetSelector::EvmLogs(filter),
-            StoredSelector::Other(stored) => DatasetSelector::try_other(
-                AdapterKey::try_new(stored.kind)?,
-                stored.fingerprint,
-                stored.canonical_key,
-            )?,
-        };
+        let selector = selector_from_stored_selector(self.selector)?;
+        let source_selectors = self
+            .source_selectors
+            .into_iter()
+            .map(selector_from_stored_selector)
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(CacheRepairTask {
             task_id: self.task_id,
             application_id: self.application_id,
             chain: self.chain,
             dataset_key: self.dataset_key,
             selector,
+            source_selectors,
             range_kind: self.range_kind,
             start: self.start,
             end: self.end,
@@ -636,6 +870,8 @@ impl StoredCacheRepairTask {
             state: self.state,
             created_at: self.created_at,
             updated_at: self.updated_at,
+            lease_owner: self.lease_owner,
+            lease_expires_at: self.lease_expires_at,
             last_error: self.last_error,
             stats: self.stats,
             dedupe_key: self.dedupe_key,
@@ -685,6 +921,7 @@ fn validate_submit(request: &CacheRepairSubmitRequest) -> Result<(), DatalensErr
             "cache repair reason must not be empty",
         ));
     }
+    validate_source_selectors(&request.selector, &request.source_selectors)?;
     Ok(())
 }
 
@@ -730,6 +967,7 @@ fn validate_task<A: ChainAdapter>(
             chain: task.chain.clone(),
             dataset_key: task.dataset_key.clone(),
             selector: task.selector.clone(),
+            source_selectors: task.source_selectors.clone(),
             range_kind: task.range_kind.clone(),
             start: task.start,
             end: task.end,
@@ -742,17 +980,105 @@ fn validate_task<A: ChainAdapter>(
 }
 
 fn task_dedupe_key(request: &CacheRepairSubmitRequest) -> String {
+    let source_selectors = request
+        .source_selectors
+        .iter()
+        .map(DatasetSelector::canonical_key)
+        .collect::<Vec<_>>()
+        .join(",");
     format!(
-        "application={};chain={};dataset={};selector={};range_kind={:?};start={};end={};finality={:?}",
+        "application={};chain={};dataset={};selector={};source_selectors={};range_kind={:?};start={};end={};finality={:?}",
         request.application_id.trim(),
         request.chain.key_prefix(),
         request.dataset_key.as_str(),
         request.selector.canonical_key(),
+        source_selectors,
         request.range_kind,
         request.start,
         request.end,
         request.finality,
     )
+}
+
+fn validate_source_selectors(
+    target: &DatasetSelector,
+    source_selectors: &[DatasetSelector],
+) -> Result<(), DatalensError> {
+    if source_selectors.is_empty() {
+        return Ok(());
+    }
+    for source in source_selectors {
+        match (target, source) {
+            (DatasetSelector::EvmLogs(_), DatasetSelector::EvmLogs(_)) => {
+                if !target.covers(source) {
+                    return Err(DatalensError::new(
+                        DatalensErrorKind::InvalidInput,
+                        "cache repair source selector must be covered by target selector",
+                    ));
+                }
+            }
+            _ => {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::InvalidInput,
+                    "cache repair source selectors are only supported for EVM log selectors",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn stored_selector_from_selector(
+    selector: &DatasetSelector,
+) -> Result<StoredSelector, DatalensError> {
+    Ok(match selector {
+        DatasetSelector::All => StoredSelector::All,
+        DatasetSelector::EvmLogs(filter) => StoredSelector::EvmLogs(filter.clone()),
+        DatasetSelector::Other {
+            kind,
+            fingerprint,
+            canonical_key,
+        } => StoredSelector::Other(StoredOtherSelector {
+            kind: kind.as_str().to_owned(),
+            fingerprint: fingerprint.clone(),
+            canonical_key: canonical_key.clone(),
+        }),
+    })
+}
+
+fn selector_from_stored_selector(
+    selector: StoredSelector,
+) -> Result<DatasetSelector, DatalensError> {
+    match selector {
+        StoredSelector::All => Ok(DatasetSelector::All),
+        StoredSelector::EvmLogs(filter) => Ok(DatasetSelector::EvmLogs(filter)),
+        StoredSelector::Other(stored) => DatasetSelector::try_other(
+            AdapterKey::try_new(stored.kind)?,
+            stored.fingerprint,
+            stored.canonical_key,
+        ),
+    }
+}
+
+fn dedupe_repair_rows(mut rows: QueryRows) -> Result<QueryRows, DatalensError> {
+    match &mut rows {
+        QueryRows::EvmLogs(logs) => {
+            logs.sort_by_key(|row| (row.block_number, row.transaction_index, row.log_index));
+            let mut unique = BTreeMap::<(String, u64), LogRecord>::new();
+            for log in logs.drain(..) {
+                unique
+                    .entry((log.transaction_hash.clone(), log.log_index))
+                    .or_insert(log);
+            }
+            *logs = unique.into_values().collect();
+            logs.sort_by_key(|row| (row.block_number, row.transaction_index, row.log_index));
+            Ok(rows)
+        }
+        _ => Err(DatalensError::new(
+            DatalensErrorKind::UnsupportedDataset,
+            "cache repair source selectors are only supported for EVM log rows",
+        )),
+    }
 }
 
 fn task_key(task_id: &CacheRepairTaskId) -> String {
@@ -776,6 +1102,22 @@ fn unix_seconds_now() -> Result<u64, DatalensError> {
                 format!("system clock before unix epoch: {error}"),
             )
         })
+}
+
+fn unix_milliseconds_now() -> Result<u64, DatalensError> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::Internal,
+                format!("system clock before unix epoch: {error}"),
+            )
+        })
+}
+
+fn default_lease_owner() -> String {
+    format!("pid-{}", std::process::id())
 }
 
 fn stable_hash(value: &str) -> u64 {

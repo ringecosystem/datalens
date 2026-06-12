@@ -12,6 +12,8 @@ pub struct CacheRepairSubmitApiRequest {
     pub chain: ChainIdentity,
     pub dataset_key: WarmupDatasetKeyApi,
     pub selector: WarmupSelectorApiRequest,
+    #[serde(default)]
+    pub source_selectors: Vec<WarmupSelectorApiRequest>,
     pub range_kind: LedgerRangeKind,
     pub start: u64,
     pub end: u64,
@@ -50,6 +52,7 @@ pub struct CacheRepairTaskView {
     pub chain: ChainIdentity,
     pub dataset_key: String,
     pub selector: WarmupSelectorView,
+    pub source_selectors: Vec<WarmupSelectorView>,
     pub range_kind: LedgerRangeKind,
     pub start: u64,
     pub end: u64,
@@ -87,6 +90,11 @@ pub(crate) fn cache_repair_task_view(
         chain: task.chain,
         dataset_key: task.dataset_key.as_str().to_owned(),
         selector: WarmupSelectorView::from(&task.selector),
+        source_selectors: task
+            .source_selectors
+            .iter()
+            .map(WarmupSelectorView::from)
+            .collect(),
         range_kind: task.range_kind,
         start: task.start,
         end: task.end,

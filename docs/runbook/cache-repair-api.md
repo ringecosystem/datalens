@@ -52,6 +52,7 @@ HTTP:
 - `POST /v1/cache/repairs/{task_id}/cancel`
 - `POST /v1/cache/repairs/{task_id}/retry`
 - `POST /v1/cache/repairs/run-once`
+- `POST /v1/cache/repairs/{task_id}/run-once`
 
 GraphQL:
 
@@ -61,6 +62,7 @@ GraphQL:
 - Mutation `cancelCacheRepairTask(id: ID!): CacheRepairTask!`
 - Mutation `retryCacheRepairTask(id: ID!): CacheRepairTask!`
 - Mutation `runCacheRepairOnce: CacheRepairRunOncePayload!`
+- Mutation `runCacheRepairTaskOnce(id: ID!): CacheRepairRunOncePayload!`
 
 Submit request:
 
@@ -79,6 +81,15 @@ Submit request:
       "topics": [["0x...", "0x..."]]
     }
   },
+  "source_selectors": [
+    {
+      "kind": "evm_logs",
+      "value": {
+        "addresses": ["0x..."],
+        "topics": [["0x..."]]
+      }
+    }
+  ],
   "range_kind": "block",
   "start": 24849000,
   "end": 24854000,
@@ -87,6 +98,12 @@ Submit request:
   "reason": "ENS broad selector durable cache missing VoteCast logs"
 }
 ```
+
+`source_selectors` is optional. When omitted or empty, repair fetches the target
+selector directly. When present, repair fetches exact source selectors, merges
+and deduplicates rows, and writes replacement coverage only for the target
+selector. In v1, source selectors are supported for EVM logs only and must be
+covered by the target EVM log selector.
 
 ## Implementation Steps
 

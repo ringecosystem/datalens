@@ -475,6 +475,10 @@ pub(crate) fn application_config(
             ApplicationOperationConfig::WarmupRead,
             ApplicationOperationConfig::WarmupMutate,
             ApplicationOperationConfig::WarmupRun,
+            ApplicationOperationConfig::CacheRepairSubmit,
+            ApplicationOperationConfig::CacheRepairRead,
+            ApplicationOperationConfig::CacheRepairMutate,
+            ApplicationOperationConfig::CacheRepairRun,
         ],
         quota: None,
     }

@@ -10,6 +10,7 @@ input CacheRepairSubmitInput {
 	chain: ChainIdentityInput!
 	datasetKey: WarmupDatasetKeyInput!
 	selector: WarmupSelectorInput!
+	sourceSelectors: [WarmupSelectorInput!]
 	rangeKind: RangeKindInput!
 	start: Int!
 	end: Int!
@@ -29,6 +30,7 @@ type CacheRepairTask {
 	chain: JSON!
 	datasetKey: String!
 	selector: WarmupTaskSelector!
+	sourceSelectors: [WarmupTaskSelector!]!
 	rangeKind: JSON!
 	start: Int!
 	end: Int!
@@ -108,6 +110,7 @@ type MutationRoot {
 	cancelCacheRepairTask(id: ID!): CacheRepairTask!
 	retryCacheRepairTask(id: ID!): CacheRepairTask!
 	runCacheRepairOnce: CacheRepairRunOncePayload!
+	runCacheRepairTaskOnce(id: ID!): CacheRepairRunOncePayload!
 }
 
 input NetworkIdInput {

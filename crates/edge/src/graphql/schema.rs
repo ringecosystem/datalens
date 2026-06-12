@@ -381,6 +381,40 @@ impl MutationRoot {
         let results = spawn_graphql_blocking(move || registry.run_cache_repair_once()).await?;
         Ok(CacheRepairRunOnceApiResponse { results }.into())
     }
+
+    async fn run_cache_repair_task_once(
+        &self,
+        ctx: &Context<'_>,
+        id: ID,
+    ) -> async_graphql::Result<CacheRepairRunOncePayload> {
+        let registry = registry(ctx)?.clone();
+        let headers = headers(ctx);
+        let task_id = CacheRepairTaskId::new(id.to_string()).map_err(graphql_error)?;
+        let application_context = registry
+            .authenticate_task_headers(&headers, ApplicationOperationConfig::CacheRepairRun)
+            .map_err(graphql_error)?;
+        let application_id = application_context
+            .as_ref()
+            .map(|application| application.id.clone())
+            .or_else(|| application_id_from_headers(&headers));
+        let current_task_id = task_id.clone();
+        let current_registry = registry.clone();
+        let current_task = spawn_graphql_blocking(move || {
+            current_registry.get_cache_repair_task(&current_task_id)
+        })
+        .await?;
+        let current_task = current_task.ok_or_else(|| {
+            graphql_error(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                format!("cache repair task {} not found", task_id.as_str()),
+            ))
+        })?;
+        authorize_cache_repair_task_application(&current_task, application_id)
+            .map_err(graphql_error)?;
+        let results =
+            spawn_graphql_blocking(move || registry.run_cache_repair_task_once(&task_id)).await?;
+        Ok(CacheRepairRunOnceApiResponse { results }.into())
+    }
 }
 
 #[derive(SimpleObject)]
@@ -565,6 +599,7 @@ pub(crate) struct CacheRepairTask {
     chain: Json<ChainIdentity>,
     dataset_key: String,
     selector: WarmupTaskSelector,
+    source_selectors: Vec<WarmupTaskSelector>,
     range_kind: Json<LedgerRangeKind>,
     start: u64,
     end: u64,
@@ -589,6 +624,15 @@ impl From<CacheRepairTaskView> for CacheRepairTask {
                 fingerprint: task.selector.fingerprint,
                 canonical_key: task.selector.canonical_key,
             },
+            source_selectors: task
+                .source_selectors
+                .into_iter()
+                .map(|selector| WarmupTaskSelector {
+                    kind: selector.kind,
+                    fingerprint: selector.fingerprint,
+                    canonical_key: selector.canonical_key,
+                })
+                .collect(),
             range_kind: Json(task.range_kind),
             start: task.start,
             end: task.end,

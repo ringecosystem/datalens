@@ -32,9 +32,9 @@ use crate::{
         head::{ChainHeadApiResponse, ChainHeadFinalityApi},
         query::{QueryApiRequest, QueryApiResponse, QueryRangeApi},
         warmup::{
-            WarmupEnsureApiResponse, WarmupRunOnceApiResponse, WarmupSubmitApiRequest,
-            WarmupSubmitApiResponse, WarmupTaskApiResponse, WarmupTaskListApiResponse,
-            WarmupTaskListQuery, warmup_task_view,
+            WarmupEnsureApiResponse, WarmupRunOnceApiResponse, WarmupSelectorApiRequest,
+            WarmupSubmitApiRequest, WarmupSubmitApiResponse, WarmupTaskApiResponse,
+            WarmupTaskListApiResponse, WarmupTaskListQuery, warmup_task_view,
         },
     },
     http::AppState,
@@ -629,6 +629,38 @@ pub(crate) async fn cache_repair_run_once(
     Ok(Json(CacheRepairRunOnceApiResponse { results }))
 }
 
+pub(crate) async fn cache_repair_run_task_once(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(task_id): AxumPath<String>,
+) -> Result<Json<CacheRepairRunOnceApiResponse>, ApiError> {
+    let task_id = CacheRepairTaskId::new(task_id).map_err(ApiError)?;
+    let task = load_authorized_cache_repair_task(state.registry.clone(), &headers, task_id.clone())
+        .await?;
+    let registry = state.registry.clone();
+    let application_context = registry
+        .authenticate_task_headers(&headers, ApplicationOperationConfig::CacheRepairRun)
+        .map_err(ApiError)?;
+    authorize_cache_repair_task_application(
+        &task,
+        application_context
+            .as_ref()
+            .map(|application| application.id.clone())
+            .or_else(|| application_id_from_headers(&headers)),
+    )?;
+    let results =
+        tokio::task::spawn_blocking(move || registry.run_cache_repair_task_once(&task_id))
+            .await
+            .map_err(|error| {
+                ApiError(DatalensError::new(
+                    DatalensErrorKind::Internal,
+                    format!("cache repair task run-once failed: {error}"),
+                ))
+            })?
+            .map_err(ApiError)?;
+    Ok(Json(CacheRepairRunOnceApiResponse { results }))
+}
+
 async fn load_authorized_warmup_task(
     registry: QueryServiceRegistry,
     headers: &HeaderMap,
@@ -733,6 +765,11 @@ pub(crate) fn cache_repair_submit_request(
         chain: request.chain,
         dataset_key: request.dataset_key.into_dataset_key()?,
         selector: request.selector.into_selector()?,
+        source_selectors: request
+            .source_selectors
+            .into_iter()
+            .map(WarmupSelectorApiRequest::into_selector)
+            .collect::<Result<Vec<_>, _>>()?,
         range_kind: request.range_kind,
         start: request.start,
         end: request.end,

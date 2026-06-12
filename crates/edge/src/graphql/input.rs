@@ -59,6 +59,7 @@ pub(crate) struct CacheRepairSubmitInput {
     chain: ChainIdentityInput,
     dataset_key: WarmupDatasetKeyInput,
     selector: WarmupSelectorInput,
+    source_selectors: Option<Vec<WarmupSelectorInput>>,
     range_kind: RangeKindInput,
     start: u64,
     end: u64,
@@ -73,6 +74,12 @@ impl CacheRepairSubmitInput {
             chain: self.chain.into_chain_identity()?,
             dataset_key: WarmupDatasetKeyApi::Structured(self.dataset_key.into_dataset_key()?),
             selector: self.selector.into_warmup_selector()?,
+            source_selectors: self
+                .source_selectors
+                .unwrap_or_default()
+                .into_iter()
+                .map(WarmupSelectorInput::into_warmup_selector)
+                .collect::<async_graphql::Result<Vec<_>>>()?,
             range_kind: self.range_kind.into_range_kind()?,
             start: self.start,
             end: self.end,
