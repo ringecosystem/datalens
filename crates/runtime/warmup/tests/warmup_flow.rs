@@ -763,6 +763,49 @@ fn test_follow_query_realigns_old_cursor_to_adaptive_lookahead_frontier() {
 }
 
 #[test]
+fn test_follow_query_large_lookahead_fetches_past_next_runner_batch() {
+    let root = temp_root("follow-query-large-lookahead-lead");
+    let storage = LocalStorage::new(&root);
+    let watermarks = QueryWatermarkStore::new(LocalObjectStore::new(&root));
+    let registry = LocalWarmupRegistry::new(object_store("follow-query-large-lookahead-lead"));
+    let adapter = FixtureAdapter::new(222_500_000)
+        .with_max_range_len(10_000)
+        .with_logs(vec![log_record(222_002_620, 0)]);
+    let runtime = runtime(adapter.clone(), storage, registry.clone())
+        .with_query_watermarks(watermarks.clone())
+        .with_follow_query_start_offset_blocks(Some(1))
+        .with_follow_query_lookahead_blocks(100_000)
+        .with_runtime_config(WarmupRuntimeConfig {
+            max_fetches_per_task_loop: 1,
+        });
+    let mut request = follow_query_request();
+    request.chunk_policy.max_range_len = 10_000;
+    let task_id = registry
+        .submit(request)
+        .expect("submit follow query")
+        .task_id;
+    registry
+        .save_cursor(&datalens_warmup::WarmupCursor {
+            task_id: task_id.clone(),
+            next: 221_992_620,
+            last_committed: None,
+            current_attempt: 0,
+            last_processed_range: None,
+            last_error: None,
+            updated_at: 1,
+        })
+        .unwrap();
+    save_query_watermark(&watermarks, 221_992_619);
+
+    let result = runtime.run_task_once(&task_id).expect("warmup run");
+
+    assert_eq!(result.status, WarmupRunStatus::Partial);
+    assert_eq!(adapter.fetches(), vec![blocks(222_002_620, 222_012_619)]);
+    let cursor = registry.load_cursor(&task_id).unwrap().expect("cursor");
+    assert_eq!(cursor.next, 222_012_620);
+}
+
+#[test]
 fn test_follow_query_jumps_forward_when_query_nears_current_cursor() {
     let root = temp_root("follow-query-jumps-near-current-cursor");
     let storage = LocalStorage::new(&root);
