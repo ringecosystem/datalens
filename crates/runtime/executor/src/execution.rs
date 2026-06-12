@@ -34,7 +34,8 @@ use datalens_storage::{
     UsageLedgerEntry, UsageLedgerRepository,
 };
 use datalens_writer::{
-    DurableWriteResult, DurableWriteSegment, DurableWriter, DurableWriterConfig,
+    DurableWriteRequest, DurableWriteResult, DurableWriteSegment, DurableWriter,
+    DurableWriterConfig,
 };
 
 use crate::helpers::*;
@@ -660,6 +661,32 @@ where
                 .map(|segment| segment.range.clone())
                 .collect::<Vec<_>>();
             if self.durable_intents.is_some() {
+                let empty_segments = fetched_segments
+                    .iter()
+                    .filter(|segment| segment.rows.row_count() == 0)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !empty_segments.is_empty()
+                    && let Err(error) = self.writer.write(DurableWriteRequest {
+                        chain: plan.chain.clone(),
+                        dataset_key: plan.dataset_key.clone(),
+                        selector: plan.selector.clone(),
+                        finality_level,
+                        segments: empty_segments,
+                    })
+                {
+                    self.record_error(&labels, &error);
+                    self.record_durable_write(&labels, MetricsDurableWriteOutcome::StorageError);
+                    durable_write_outcome = LedgerDurableWriteOutcome::StorageError;
+                    log::error!(
+                        "durable empty coverage write failed query_id={} dataset={} range={}-{} kind={:?}",
+                        query_id,
+                        plan.dataset_key.as_str(),
+                        plan.ledger_range.start(),
+                        plan.ledger_range.end(),
+                        error.kind
+                    );
+                }
                 match self.submit_durable_intent_for_plan(
                     &query_id,
                     &ledger_application,
