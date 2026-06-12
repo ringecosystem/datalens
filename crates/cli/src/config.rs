@@ -338,6 +338,18 @@ fn validate_cache_repair_config(config: &DatalensConfig) -> Result<(), DatalensE
             "cache_repair.registry_path must not be empty when cache repair is enabled",
         ));
     }
+    if config.cache_repair.fetch_timeout_ms == 0 {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "cache_repair.fetch_timeout_ms must be greater than 0 when cache repair is enabled",
+        ));
+    }
+    if config.cache_repair.lease_ttl_ms == 0 {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "cache_repair.lease_ttl_ms must be greater than 0 when cache repair is enabled",
+        ));
+    }
     Ok(())
 }
 

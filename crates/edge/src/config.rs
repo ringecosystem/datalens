@@ -1,5 +1,8 @@
 use std::{collections::BTreeMap, env, fs, path::Path};
 
+use datalens_cache_repair::{
+    default_cache_repair_fetch_timeout_ms, default_cache_repair_lease_ttl_ms,
+};
 use datalens_core::{DatalensError, DatalensErrorKind, QueryStrategy};
 use datalens_storage::{DurableStorageConfig, ParquetCompression, S3ObjectStoreConfig};
 use serde::{Deserialize, Serialize};
@@ -285,6 +288,10 @@ pub struct CacheRepairConfig {
     pub enabled: bool,
     #[serde(default = "default_cache_repair_registry_path")]
     pub registry_path: String,
+    #[serde(default = "default_cache_repair_fetch_timeout_ms")]
+    pub fetch_timeout_ms: u64,
+    #[serde(default = "default_cache_repair_lease_ttl_ms")]
+    pub lease_ttl_ms: u64,
 }
 
 impl Default for CacheRepairConfig {
@@ -292,6 +299,8 @@ impl Default for CacheRepairConfig {
         Self {
             enabled: false,
             registry_path: default_cache_repair_registry_path(),
+            fetch_timeout_ms: default_cache_repair_fetch_timeout_ms(),
+            lease_ttl_ms: default_cache_repair_lease_ttl_ms(),
         }
     }
 }

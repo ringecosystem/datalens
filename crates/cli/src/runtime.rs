@@ -7,7 +7,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use datalens_cache_repair::{CacheRepairRuntime, CacheRepairTaskPool, LocalCacheRepairRegistry};
+use datalens_cache_repair::{
+    CacheRepairRuntime, CacheRepairRuntimeConfig, CacheRepairTaskPool, LocalCacheRepairRegistry,
+};
 use datalens_core::{ChainIdentity, DatalensError, DatalensErrorKind};
 use datalens_edge::config::{ChainConfig, DatalensConfig, FinalityConfig};
 use datalens_edge::{QueryService, QueryServiceRegistry};
@@ -356,14 +358,16 @@ fn build_evm_service_with_storage(
         stores.durable_intent_startup_maintenance.clone(),
     );
     if config.cache_repair.enabled {
-        service =
-            service.with_cache_repair_pool(CacheRepairTaskPool::new(CacheRepairRuntime::new(
+        service = service.with_cache_repair_pool(CacheRepairTaskPool::new(
+            CacheRepairRuntime::new(
                 source.clone(),
                 stores.storage.clone(),
                 stores.cache_repair_registry.clone().ok_or_else(|| {
                     DatalensError::internal("cache repair registry was not initialized")
                 })?,
-            )));
+            )
+            .with_runtime_config(cache_repair_runtime_config(config)),
+        ));
     }
     if config.warmup.enabled {
         let mut runtime = WarmupRuntime::new(
@@ -468,14 +472,16 @@ fn build_solana_service_with_storage(
         stores.durable_intent_startup_maintenance,
     );
     if config.cache_repair.enabled {
-        service =
-            service.with_cache_repair_pool(CacheRepairTaskPool::new(CacheRepairRuntime::new(
+        service = service.with_cache_repair_pool(CacheRepairTaskPool::new(
+            CacheRepairRuntime::new(
                 source,
                 stores.storage,
                 stores.cache_repair_registry.ok_or_else(|| {
                     DatalensError::internal("cache repair registry was not initialized")
                 })?,
-            )));
+            )
+            .with_runtime_config(cache_repair_runtime_config(config)),
+        ));
     }
     Ok(service)
 }
@@ -530,14 +536,16 @@ fn build_tron_service_with_storage(
         stores.durable_intent_startup_maintenance,
     );
     if config.cache_repair.enabled {
-        service =
-            service.with_cache_repair_pool(CacheRepairTaskPool::new(CacheRepairRuntime::new(
+        service = service.with_cache_repair_pool(CacheRepairTaskPool::new(
+            CacheRepairRuntime::new(
                 source,
                 stores.storage,
                 stores.cache_repair_registry.ok_or_else(|| {
                     DatalensError::internal("cache repair registry was not initialized")
                 })?,
-            )));
+            )
+            .with_runtime_config(cache_repair_runtime_config(config)),
+        ));
     }
     Ok(service)
 }
@@ -879,6 +887,13 @@ fn build_cache_repair_registry(
             DatalensErrorKind::UnsupportedDataset,
             "storage.backend must be local or s3",
         )),
+    }
+}
+
+fn cache_repair_runtime_config(config: &DatalensConfig) -> CacheRepairRuntimeConfig {
+    CacheRepairRuntimeConfig {
+        fetch_timeout_ms: config.cache_repair.fetch_timeout_ms,
+        lease_ttl_ms: config.cache_repair.lease_ttl_ms,
     }
 }
 

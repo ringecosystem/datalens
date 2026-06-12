@@ -587,6 +587,10 @@ pub trait RegisteredCacheRepairService: Send + Sync {
     fn cancel(&self, task_id: &CacheRepairTaskId) -> Result<(), DatalensError>;
     fn retry_failed(&self, task_id: &CacheRepairTaskId) -> Result<(), DatalensError>;
     fn run_available_once(&self) -> Result<Vec<CacheRepairRunResult>, DatalensError>;
+    fn run_task_once(
+        &self,
+        task_id: &CacheRepairTaskId,
+    ) -> Result<CacheRepairRunResult, DatalensError>;
 }
 
 impl<A, S, R> RegisteredCacheRepairService for CacheRepairTaskPool<A, S, R>
@@ -620,6 +624,13 @@ where
 
     fn run_available_once(&self) -> Result<Vec<CacheRepairRunResult>, DatalensError> {
         CacheRepairTaskPool::run_available_once(self)
+    }
+
+    fn run_task_once(
+        &self,
+        task_id: &CacheRepairTaskId,
+    ) -> Result<CacheRepairRunResult, DatalensError> {
+        CacheRepairTaskPool::run_task_once(self, task_id)
     }
 }
 

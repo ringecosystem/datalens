@@ -352,6 +352,20 @@ impl QueryServiceRegistry {
         Ok(results)
     }
 
+    pub fn run_cache_repair_task_once(
+        &self,
+        task_id: &CacheRepairTaskId,
+    ) -> Result<Vec<CacheRepairRunResult>, DatalensError> {
+        let task = self.get_cache_repair_task(task_id)?.ok_or_else(|| {
+            DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                format!("cache repair task {} not found", task_id.as_str()),
+            )
+        })?;
+        let service = self.cache_repair_service_for_chain(task.chain.configured_name())?;
+        Ok(vec![service.run_task_once(task_id)?])
+    }
+
     pub fn start_warmup_scheduler(&self, interval: Duration) -> WarmupSchedulerHandle {
         let registry = self.clone();
         let stop = Arc::new(AtomicBool::new(false));
