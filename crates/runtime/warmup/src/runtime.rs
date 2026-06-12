@@ -135,7 +135,11 @@ where
     }
 
     pub fn get(&self, task_id: &WarmupTaskId) -> Result<Option<WarmupTask>, DatalensError> {
-        self.runtime.registry.get(task_id)
+        self.runtime
+            .registry
+            .get(task_id)?
+            .map(|task| self.runtime.task_with_follow_query_status(task))
+            .transpose()
     }
 
     pub fn list(
@@ -151,7 +155,12 @@ where
             return Ok(Vec::new());
         }
         filter.chain_key = Some(chain_key);
-        self.runtime.registry.list(filter)
+        self.runtime
+            .registry
+            .list(filter)?
+            .into_iter()
+            .map(|task| self.runtime.task_with_follow_query_status(task))
+            .collect()
     }
 
     pub fn pause(&self, task_id: &WarmupTaskId) -> Result<(), DatalensError> {
@@ -1313,6 +1322,7 @@ fn warmup_priority_key(task: &WarmupTask) -> (u8, u64, u64, u64, String, String,
     };
     (
         rank,
+        task.updated_at,
         task.follow_query_status
             .as_ref()
             .and_then(|status| status.published_query_distance)
@@ -1326,7 +1336,6 @@ fn warmup_priority_key(task: &WarmupTask) -> (u8, u64, u64, u64, String, String,
             .as_ref()
             .and_then(|status| status.cursor_query_distance)
             .unwrap_or(u64::MAX),
-        task.updated_at,
         task.chain.key_prefix(),
         task.selector.fingerprint(),
         task.task_id.as_str().to_owned(),

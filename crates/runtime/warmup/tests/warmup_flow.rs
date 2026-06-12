@@ -1117,6 +1117,133 @@ fn test_task_pool_prioritizes_active_follow_query_watermark() {
 }
 
 #[test]
+fn test_task_pool_prioritizes_old_backfill_follow_query_before_near_head() {
+    let storage = LocalStorage::new(temp_root("pool-follow-query-backfill-priority-storage"));
+    let registry =
+        LocalWarmupRegistry::new(object_store("pool-follow-query-backfill-priority-registry"));
+    let watermarks = QueryWatermarkStore::new(object_store(
+        "pool-follow-query-backfill-priority-watermarks",
+    ));
+    let adapter = FixtureAdapter::new(10_000).with_max_range_len(1);
+    let pool = WarmupTaskPool::new(
+        runtime(adapter.clone(), storage, registry.clone())
+            .with_query_watermarks(watermarks.clone())
+            .with_follow_query_lookahead_blocks(1)
+            .with_runtime_config(WarmupRuntimeConfig {
+                max_fetches_per_task_loop: 1,
+            }),
+        WarmupSchedulerConfig {
+            max_global_concurrent_tasks: 1,
+            max_concurrent_tasks_per_chain: 1,
+        },
+    );
+    let mut backfill_request = follow_query_request();
+    backfill_request.application_id = "ormp".to_owned();
+    let backfill = registry
+        .submit(backfill_request)
+        .expect("backfill follow query")
+        .task_id;
+    let mut near_head_request = follow_query_request();
+    near_head_request.application_id = "degov".to_owned();
+    near_head_request.selector = second_selector();
+    let near_head = registry
+        .submit(near_head_request)
+        .expect("near-head follow query")
+        .task_id;
+    save_query_watermark_for(&watermarks, "ormp", &selector(), 1_000);
+    save_query_watermark_for(&watermarks, "degov", &second_selector(), 1_000);
+    registry
+        .save_cursor(&datalens_warmup::WarmupCursor {
+            task_id: backfill.clone(),
+            next: 5_000,
+            last_committed: Some(4_999),
+            current_attempt: 0,
+            last_processed_range: None,
+            last_error: None,
+            updated_at: 1,
+        })
+        .expect("save backfill cursor");
+    registry
+        .save_cursor(&datalens_warmup::WarmupCursor {
+            task_id: near_head.clone(),
+            next: 1_100,
+            last_committed: Some(1_099),
+            current_attempt: 0,
+            last_processed_range: None,
+            last_error: None,
+            updated_at: 2,
+        })
+        .expect("save near-head cursor");
+    let mut backfill_task = registry.get(&backfill).unwrap().unwrap();
+    backfill_task.updated_at = 1;
+    registry
+        .save_task(&backfill_task)
+        .expect("save old backfill task");
+    let mut near_head_task = registry.get(&near_head).unwrap().unwrap();
+    near_head_task.updated_at = 2;
+    registry
+        .save_task(&near_head_task)
+        .expect("save newer near-head task");
+
+    let results = pool.run_available_once().expect("run prioritized task");
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(adapter.fetches(), vec![blocks(5_000, 5_000)]);
+    assert_eq!(
+        registry.load_cursor(&backfill).unwrap().unwrap().next,
+        5_001
+    );
+    assert_eq!(
+        registry.load_cursor(&near_head).unwrap().unwrap().next,
+        1_100
+    );
+}
+
+#[test]
+fn test_task_pool_get_and_list_return_live_follow_query_status() {
+    let storage = LocalStorage::new(temp_root("pool-follow-query-live-status-storage"));
+    let registry = LocalWarmupRegistry::new(object_store("pool-follow-query-live-status-registry"));
+    let watermarks = QueryWatermarkStore::new(object_store("pool-follow-query-live-status-marks"));
+    let adapter = FixtureAdapter::new(10_000).with_max_range_len(1);
+    let pool = WarmupTaskPool::new(
+        runtime(adapter, storage, registry.clone())
+            .with_query_watermarks(watermarks.clone())
+            .with_follow_query_lookahead_blocks(1),
+        WarmupSchedulerConfig {
+            max_global_concurrent_tasks: 1,
+            max_concurrent_tasks_per_chain: 1,
+        },
+    );
+    let task_id = registry
+        .submit(follow_query_request())
+        .expect("submit follow query")
+        .task_id;
+    save_query_watermark(&watermarks, 1_000);
+    save_query_watermark(&watermarks, 2_000);
+
+    let listed = pool.list(Default::default()).expect("list tasks");
+    let listed_status = listed[0]
+        .follow_query_status
+        .as_ref()
+        .expect("listed live follow_query status");
+    let fetched = pool
+        .get(&task_id)
+        .expect("get task")
+        .expect("task exists")
+        .follow_query_status
+        .expect("fetched live follow_query status");
+
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].task_id, task_id);
+    assert_eq!(listed_status.query_watermark, Some(2_000));
+    assert_eq!(listed_status.cursor_next, 1);
+    assert_eq!(listed_status.planned_start, Some(3_000));
+    assert_eq!(fetched.query_watermark, Some(2_000));
+    assert_eq!(fetched.cursor_next, 1);
+    assert_eq!(fetched.planned_start, Some(3_000));
+}
+
+#[test]
 fn test_task_pool_rotates_between_low_lead_follow_query_tasks() {
     let storage = LocalStorage::new(temp_root("pool-follow-query-fairness-storage"));
     let registry = LocalWarmupRegistry::new(object_store("pool-follow-query-fairness-registry"));
