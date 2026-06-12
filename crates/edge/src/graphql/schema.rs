@@ -608,6 +608,10 @@ pub(crate) struct CacheRepairTask {
     created_at: u64,
     updated_at: u64,
     last_error: Option<String>,
+    current_phase: Option<String>,
+    current_range_start: Option<u64>,
+    current_range_end: Option<u64>,
+    current_source_index: Option<usize>,
     stats: Json<datalens_cache_repair::CacheRepairStats>,
     reason: String,
 }
@@ -641,6 +645,10 @@ impl From<CacheRepairTaskView> for CacheRepairTask {
             created_at: task.created_at,
             updated_at: task.updated_at,
             last_error: task.last_error,
+            current_phase: task.current_phase,
+            current_range_start: task.current_range_start,
+            current_range_end: task.current_range_end,
+            current_source_index: task.current_source_index,
             stats: Json(task.stats),
             reason: task.reason,
         }

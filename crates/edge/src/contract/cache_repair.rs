@@ -61,6 +61,10 @@ pub struct CacheRepairTaskView {
     pub created_at: u64,
     pub updated_at: u64,
     pub last_error: Option<String>,
+    pub current_phase: Option<String>,
+    pub current_range_start: Option<u64>,
+    pub current_range_end: Option<u64>,
+    pub current_source_index: Option<usize>,
     pub stats: datalens_cache_repair::CacheRepairStats,
     pub reason: String,
 }
@@ -103,6 +107,10 @@ pub(crate) fn cache_repair_task_view(
         created_at: task.created_at,
         updated_at: task.updated_at,
         last_error: task.last_error,
+        current_phase: task.current_phase,
+        current_range_start: task.current_range_start,
+        current_range_end: task.current_range_end,
+        current_source_index: task.current_source_index,
         stats: task.stats,
         reason: task.reason,
     })

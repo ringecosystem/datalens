@@ -1,7 +1,10 @@
 use std::{
     collections::BTreeMap,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     thread,
     time::Duration,
 };
@@ -16,10 +19,13 @@ use datalens_chain::{
     DatasetCapability, DatasetSelector, FinalityLevel, ProviderDiagnostics, SelectorKind,
 };
 use datalens_core::{
-    ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey, LedgerRange,
-    LedgerRangeKind, LogFilter, LogRecord, NetworkId, QueryRows,
+    ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey, DatasetRows,
+    LedgerRange, LedgerRangeKind, LogFilter, LogRecord, NetworkId, QueryRows,
 };
-use datalens_storage::{LocalObjectStore, LocalStorage, StorageWriteRequest};
+use datalens_storage::{
+    LocalObjectStore, LocalStorage, Manifest, StorageRepository, StorageWriteOutcome,
+    StorageWriteRequest,
+};
 
 #[test]
 fn test_cache_repair_replaces_bad_empty_coverage_with_provider_rows() {
@@ -172,6 +178,154 @@ fn test_cache_repair_fetch_timeout_marks_task_failed_without_writing() {
             .covered_ranges(&chain, &DatasetKey::evm_logs(), &selector, repair_range())
             .expect("covered ranges")
             .is_empty()
+    );
+}
+
+#[test]
+fn test_cache_repair_height_timeout_marks_task_failed() {
+    let root = temp_root("repair-height-timeout");
+    let storage = LocalStorage::new(root.join("storage"));
+    let registry = LocalCacheRepairRegistry::new(LocalObjectStore::new(root.join("registry")));
+    let chain = test_chain();
+    let selector = selector();
+    let adapter = FixtureAdapter::new(chain.clone(), Ok(vec![log_record(11, 3)]))
+        .with_height_delay(Duration::from_millis(200));
+    let pool = CacheRepairTaskPool::new(
+        CacheRepairRuntime::new(adapter, storage.clone(), registry).with_runtime_config(
+            CacheRepairRuntimeConfig {
+                fetch_timeout_ms: 25,
+                ..CacheRepairRuntimeConfig::default()
+            },
+        ),
+    );
+
+    let submit = pool
+        .submit(submit_request(chain, selector))
+        .expect("submit repair");
+    let error = pool.run_available_once().expect_err("height times out");
+
+    assert_eq!(error.kind, DatalensErrorKind::ProviderFailure);
+    assert!(error.message.contains("height"));
+    assert!(error.message.contains("timed out"));
+    let task = pool
+        .get(&submit.task_id)
+        .expect("get task")
+        .expect("task exists");
+    assert_eq!(task.state, CacheRepairTaskState::Failed);
+    assert_eq!(task.lease_owner, None);
+    assert_eq!(task.lease_expires_at, None);
+    assert_eq!(task.current_phase.as_deref(), Some("height"));
+    assert!(
+        task.last_error
+            .as_deref()
+            .expect("last error")
+            .contains("height")
+    );
+}
+
+#[test]
+fn test_cache_repair_write_timeout_marks_task_uncertain_without_completed_write() {
+    let root = temp_root("repair-write-timeout");
+    let storage = BlockingReplacementStorage::new(LocalStorage::new(root.join("storage")));
+    let registry = LocalCacheRepairRegistry::new(LocalObjectStore::new(root.join("registry")));
+    let chain = test_chain();
+    let selector = selector();
+    let adapter = FixtureAdapter::new(chain.clone(), Ok(vec![log_record(11, 3)]));
+    let pool = CacheRepairTaskPool::new(
+        CacheRepairRuntime::new(adapter, storage.clone(), registry).with_runtime_config(
+            CacheRepairRuntimeConfig {
+                fetch_timeout_ms: 25,
+                ..CacheRepairRuntimeConfig::default()
+            },
+        ),
+    );
+
+    let submit = pool
+        .submit(submit_request(chain.clone(), selector.clone()))
+        .expect("submit repair");
+    let error = pool.run_available_once().expect_err("write times out");
+
+    assert_eq!(error.kind, DatalensErrorKind::Internal);
+    assert!(error.message.contains("write"));
+    assert!(error.message.contains("timed out"));
+    let task = pool
+        .get(&submit.task_id)
+        .expect("get task")
+        .expect("task exists");
+    assert_eq!(task.state, CacheRepairTaskState::WriteTimedOut);
+    assert!(task.lease_owner.is_some());
+    assert!(task.lease_expires_at.is_some());
+    assert_eq!(task.current_phase.as_deref(), Some("write"));
+    assert_eq!(task.current_range_start, Some(11));
+    assert_eq!(task.current_range_end, Some(11));
+    assert!(
+        task.last_error
+            .as_deref()
+            .expect("last error")
+            .contains("write range=11-11")
+    );
+    assert!(!storage.completed_write());
+    assert!(
+        storage
+            .covered_ranges(&chain, &DatasetKey::evm_logs(), &selector, repair_range())
+            .expect("covered ranges")
+            .is_empty()
+    );
+    storage.release_write();
+}
+
+#[test]
+fn test_cache_repair_write_timeout_is_not_retryable_while_original_write_is_uncertain() {
+    let root = temp_root("repair-write-timeout-no-retry");
+    let storage = BlockingReplacementStorage::new(LocalStorage::new(root.join("storage")));
+    let registry = LocalCacheRepairRegistry::new(LocalObjectStore::new(root.join("registry")));
+    let chain = test_chain();
+    let selector = selector();
+    let adapter = FixtureAdapter::new(chain.clone(), Ok(vec![log_record(11, 3)]));
+    let pool = CacheRepairTaskPool::new(
+        CacheRepairRuntime::new(adapter, storage.clone(), registry).with_runtime_config(
+            CacheRepairRuntimeConfig {
+                fetch_timeout_ms: 25,
+                ..CacheRepairRuntimeConfig::default()
+            },
+        ),
+    );
+
+    let submit = pool
+        .submit(submit_request(chain.clone(), selector.clone()))
+        .expect("submit repair");
+    let error = pool.run_available_once().expect_err("write times out");
+
+    assert_eq!(error.kind, DatalensErrorKind::Internal);
+    assert_eq!(storage.write_attempts(), 1);
+    let retry_error = pool
+        .retry_failed(&submit.task_id)
+        .expect_err("write timeout is not retryable");
+    assert_eq!(retry_error.kind, DatalensErrorKind::InvalidInput);
+    let results = pool
+        .run_available_once()
+        .expect("write timeout task is not runnable");
+    assert!(results.is_empty());
+    let result = pool
+        .run_task_once(&submit.task_id)
+        .expect("specific write timeout run is stopped");
+    assert_eq!(result.status, CacheRepairRunStatus::Stopped);
+    assert_eq!(storage.write_attempts(), 1);
+
+    storage.release_write();
+    storage.wait_for_completed_write(Duration::from_secs(1));
+    assert_eq!(storage.write_attempts(), 1);
+    let task = pool
+        .get(&submit.task_id)
+        .expect("get task")
+        .expect("task exists");
+    assert_eq!(task.state, CacheRepairTaskState::WriteTimedOut);
+    assert_eq!(task.current_phase.as_deref(), Some("write"));
+    assert_eq!(
+        storage
+            .covered_ranges(&chain, &DatasetKey::evm_logs(), &selector, repair_range())
+            .expect("covered ranges"),
+        vec![repair_range()]
     );
 }
 
@@ -349,6 +503,17 @@ fn test_cache_repair_source_selectors_repair_broad_target_without_fetching_targe
         }
         rows => panic!("expected evm logs, got {rows:?}"),
     }
+    assert_eq!(
+        storage
+            .covered_ranges(
+                &chain,
+                &DatasetKey::evm_logs(),
+                &target_selector,
+                repair_range()
+            )
+            .expect("covered ranges"),
+        vec![repair_range()]
+    );
 }
 
 #[test]
@@ -437,6 +602,7 @@ struct FixtureAdapter {
     selector_results: SharedSelectorResults,
     calls: Arc<Mutex<BTreeMap<String, usize>>>,
     delay: Option<Duration>,
+    height_delay: Option<Duration>,
 }
 
 type SelectorResult = Result<Vec<LogRecord>, DatalensError>;
@@ -450,6 +616,7 @@ impl FixtureAdapter {
             selector_results: Arc::new(Mutex::new(BTreeMap::new())),
             calls: Arc::new(Mutex::new(BTreeMap::new())),
             delay: None,
+            height_delay: None,
         }
     }
 
@@ -479,6 +646,11 @@ impl FixtureAdapter {
         self.delay = Some(delay);
         self
     }
+
+    fn with_height_delay(mut self, delay: Duration) -> Self {
+        self.height_delay = Some(delay);
+        self
+    }
 }
 
 impl ChainAdapter for FixtureAdapter {
@@ -497,6 +669,9 @@ impl ChainAdapter for FixtureAdapter {
     }
 
     fn cache_safe_height(&self) -> Result<ChainHeight, DatalensError> {
+        if let Some(delay) = self.height_delay {
+            thread::sleep(delay);
+        }
         Ok(ChainHeight::block(20).with_finality(FinalityLevel::Safe))
     }
 
@@ -537,6 +712,101 @@ impl ChainAdapter for FixtureAdapter {
                 warnings: Vec::new(),
             })
         })
+    }
+}
+
+#[derive(Clone)]
+struct BlockingReplacementStorage {
+    inner: LocalStorage,
+    gate: Arc<(Mutex<bool>, Condvar)>,
+    completed_write: Arc<AtomicBool>,
+    write_attempts: Arc<AtomicUsize>,
+}
+
+impl BlockingReplacementStorage {
+    fn new(inner: LocalStorage) -> Self {
+        Self {
+            inner,
+            gate: Arc::new((Mutex::new(false), Condvar::new())),
+            completed_write: Arc::new(AtomicBool::new(false)),
+            write_attempts: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn completed_write(&self) -> bool {
+        self.completed_write.load(Ordering::SeqCst)
+    }
+
+    fn write_attempts(&self) -> usize {
+        self.write_attempts.load(Ordering::SeqCst)
+    }
+
+    fn release_write(&self) {
+        let (lock, cvar) = &*self.gate;
+        let mut released = lock.lock().expect("fixture write gate lock");
+        *released = true;
+        cvar.notify_all();
+    }
+
+    fn wait_for_completed_write(&self, timeout: Duration) {
+        let started = std::time::Instant::now();
+        while !self.completed_write() && started.elapsed() < timeout {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(self.completed_write());
+    }
+}
+
+impl StorageRepository for BlockingReplacementStorage {
+    fn manifest(&self) -> Result<Manifest, DatalensError> {
+        self.inner.manifest()
+    }
+
+    fn covered_ranges(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+    ) -> Result<Vec<LedgerRange>, DatalensError> {
+        self.inner
+            .covered_ranges(chain, dataset_key, selector, range)
+    }
+
+    fn read_rows(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+    ) -> Result<DatasetRows, DatalensError> {
+        self.inner.read_rows(chain, dataset_key, selector, range)
+    }
+
+    fn write_rows(
+        &self,
+        request: StorageWriteRequest<'_>,
+    ) -> Result<StorageWriteOutcome, DatalensError> {
+        self.inner.write_rows(request)
+    }
+
+    fn write_rows_replacing_existing(
+        &self,
+        request: StorageWriteRequest<'_>,
+    ) -> Result<StorageWriteOutcome, DatalensError> {
+        self.write_attempts.fetch_add(1, Ordering::SeqCst);
+        let (lock, cvar) = &*self.gate;
+        let mut released = lock
+            .lock()
+            .map_err(|_| DatalensError::internal("fixture write gate lock poisoned"))?;
+        while !*released {
+            released = cvar
+                .wait(released)
+                .map_err(|_| DatalensError::internal("fixture write gate lock poisoned"))?;
+        }
+        let outcome = self.inner.write_rows_replacing_existing(request)?;
+        self.completed_write.store(true, Ordering::SeqCst);
+        Ok(outcome)
     }
 }
 
