@@ -20,6 +20,8 @@ pub struct DatalensConfig {
     #[serde(default)]
     pub warmup: WarmupConfig,
     #[serde(default)]
+    pub cache_repair: CacheRepairConfig,
+    #[serde(default)]
     pub edge: EdgeConfig,
     #[serde(default)]
     pub applications: ApplicationRegistryConfig,
@@ -277,6 +279,23 @@ pub struct WarmupConfig {
     pub flush_on_shutdown: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CacheRepairConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_cache_repair_registry_path")]
+    pub registry_path: String,
+}
+
+impl Default for CacheRepairConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            registry_path: default_cache_repair_registry_path(),
+        }
+    }
+}
+
 impl Default for WarmupConfig {
     fn default() -> Self {
         Self {
@@ -455,6 +474,10 @@ fn default_warmup_registry_path() -> String {
     ".datalens/warmup".to_owned()
 }
 
+fn default_cache_repair_registry_path() -> String {
+    ".datalens/cache-repair".to_owned()
+}
+
 fn default_warmup_scheduler_interval_ms() -> u64 {
     1_000
 }
@@ -551,6 +574,10 @@ pub enum ApplicationOperationConfig {
     WarmupRead,
     WarmupMutate,
     WarmupRun,
+    CacheRepairSubmit,
+    CacheRepairRead,
+    CacheRepairMutate,
+    CacheRepairRun,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

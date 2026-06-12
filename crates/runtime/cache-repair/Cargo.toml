@@ -1,0 +1,13 @@
+[package]
+name = "datalens-cache-repair"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+datalens-chain = { path = "../../chain" }
+datalens-core = { path = "../../core" }
+datalens-storage = { path = "../../storage" }
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true

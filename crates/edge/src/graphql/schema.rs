@@ -8,6 +8,7 @@ use axum::{
     http::HeaderMap,
     response::{Html, IntoResponse, Response},
 };
+use datalens_cache_repair::{CacheRepairRunResult, CacheRepairTaskFilter, CacheRepairTaskId};
 use datalens_core::{
     ChainIdentity, DatalensError, DatalensErrorKind, DatasetRows, LedgerRangeKind,
 };
@@ -18,6 +19,10 @@ use crate::{
     config::ApplicationOperationConfig,
     contract::error::{api_error_kind, api_error_status},
     contract::{
+        cache_repair::{
+            CacheRepairRunOnceApiResponse, CacheRepairSubmitApiResponse, CacheRepairTaskView,
+            cache_repair_task_view,
+        },
         discovery::{ChainDiscovery, DatasetDiscovery, DiscoveryResponse},
         query::{QueryApiResponse, QueryCacheApi, QueryRangeApi},
         warmup::{
@@ -26,12 +31,18 @@ use crate::{
     },
     http::{
         AppState,
-        handlers::{application_from_headers, application_id_from_headers, warmup_submit_request},
+        handlers::{
+            application_from_headers, application_id_from_headers, cache_repair_submit_request,
+            warmup_submit_request,
+        },
     },
     service::registry::QueryServiceRegistry,
 };
 
-use super::input::{QueryInput, WarmupSubmitInput, WarmupTaskFilterInput};
+use super::input::{
+    CacheRepairSubmitInput, CacheRepairTaskFilterInput, QueryInput, WarmupSubmitInput,
+    WarmupTaskFilterInput,
+};
 
 pub(crate) type DatalensGraphqlSchema = Schema<QueryRoot, MutationRoot, EmptySubscription>;
 
@@ -181,6 +192,60 @@ impl QueryRoot {
             .collect::<Result<Vec<_>, _>>()
             .map_err(graphql_error)
     }
+
+    async fn cache_repair_task(
+        &self,
+        ctx: &Context<'_>,
+        id: ID,
+    ) -> async_graphql::Result<Option<CacheRepairTask>> {
+        let registry = registry(ctx)?.clone();
+        let headers = headers(ctx);
+        let task_id = CacheRepairTaskId::new(id.to_string()).map_err(graphql_error)?;
+        let application_context = registry
+            .authenticate_task_headers(&headers, ApplicationOperationConfig::CacheRepairRead)
+            .map_err(graphql_error)?;
+        let application_id = application_context
+            .as_ref()
+            .map(|application| application.id.clone())
+            .or_else(|| application_id_from_headers(&headers));
+        let task = spawn_graphql_blocking(move || registry.get_cache_repair_task(&task_id)).await?;
+        task.map(|task| {
+            authorize_cache_repair_task_application(&task, application_id)?;
+            cache_repair_task_view(task).map(CacheRepairTask::from)
+        })
+        .transpose()
+        .map_err(graphql_error)
+    }
+
+    async fn cache_repair_tasks(
+        &self,
+        ctx: &Context<'_>,
+        filter: Option<CacheRepairTaskFilterInput>,
+    ) -> async_graphql::Result<Vec<CacheRepairTask>> {
+        let registry = registry(ctx)?.clone();
+        let headers = headers(ctx);
+        let application_context = registry
+            .authenticate_task_headers(&headers, ApplicationOperationConfig::CacheRepairRead)
+            .map_err(graphql_error)?;
+        let mut filter = match filter {
+            Some(filter) => filter.into_filter()?,
+            None => CacheRepairTaskFilter::default(),
+        };
+        if filter.application_id.is_none() {
+            filter.application_id = application_context
+                .as_ref()
+                .map(|application| application.id.clone())
+                .or_else(|| application_id_from_headers(&headers));
+        }
+        let tasks =
+            spawn_graphql_blocking(move || registry.list_cache_repair_tasks(filter)).await?;
+        tasks
+            .into_iter()
+            .map(cache_repair_task_view)
+            .map(|result| result.map(CacheRepairTask::from))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(graphql_error)
+    }
 }
 
 pub(crate) struct MutationRoot;
@@ -253,6 +318,68 @@ impl MutationRoot {
             .map_err(graphql_error)?;
         let results = spawn_graphql_blocking(move || registry.run_warmup_once()).await?;
         Ok(WarmupRunOnceApiResponse { results }.into())
+    }
+
+    async fn submit_cache_repair_task(
+        &self,
+        ctx: &Context<'_>,
+        input: CacheRepairSubmitInput,
+    ) -> async_graphql::Result<CacheRepairSubmitPayload> {
+        let registry = registry(ctx)?.clone();
+        let headers = headers(ctx);
+        let request = input.into_request()?;
+        let dataset = request.dataset_for_auth().map_err(graphql_error)?;
+        let application_context = registry
+            .authenticate_warmup_headers(
+                &headers,
+                request.chain().configured_name(),
+                &dataset,
+                ApplicationOperationConfig::CacheRepairSubmit,
+            )
+            .map_err(graphql_error)?;
+        let application_id = application_context
+            .as_ref()
+            .map(|application| application.id.clone())
+            .or_else(|| application_id_from_headers(&headers))
+            .unwrap_or_else(|| "unknown".to_owned());
+        let request =
+            cache_repair_submit_request(application_id, request).map_err(graphql_error)?;
+        let outcome =
+            spawn_graphql_blocking(move || registry.submit_cache_repair_task(request)).await?;
+        Ok(CacheRepairSubmitApiResponse {
+            task_id: outcome.task_id,
+            created: outcome.created,
+        }
+        .into())
+    }
+
+    async fn cancel_cache_repair_task(
+        &self,
+        ctx: &Context<'_>,
+        id: ID,
+    ) -> async_graphql::Result<CacheRepairTask> {
+        mutate_cache_repair_task(ctx, id, CacheRepairMutation::Cancel).await
+    }
+
+    async fn retry_cache_repair_task(
+        &self,
+        ctx: &Context<'_>,
+        id: ID,
+    ) -> async_graphql::Result<CacheRepairTask> {
+        mutate_cache_repair_task(ctx, id, CacheRepairMutation::Retry).await
+    }
+
+    async fn run_cache_repair_once(
+        &self,
+        ctx: &Context<'_>,
+    ) -> async_graphql::Result<CacheRepairRunOncePayload> {
+        let registry = registry(ctx)?.clone();
+        let headers = headers(ctx);
+        let _application_context = registry
+            .authenticate_task_headers(&headers, ApplicationOperationConfig::CacheRepairRun)
+            .map_err(graphql_error)?;
+        let results = spawn_graphql_blocking(move || registry.run_cache_repair_once()).await?;
+        Ok(CacheRepairRunOnceApiResponse { results }.into())
     }
 }
 
@@ -416,6 +543,79 @@ pub(crate) struct WarmupRunOncePayload {
     results: Json<Vec<WarmupRunResult>>,
 }
 
+#[derive(SimpleObject)]
+pub(crate) struct CacheRepairSubmitPayload {
+    task_id: ID,
+    created: bool,
+}
+
+impl From<CacheRepairSubmitApiResponse> for CacheRepairSubmitPayload {
+    fn from(response: CacheRepairSubmitApiResponse) -> Self {
+        Self {
+            task_id: ID::from(response.task_id.as_str().to_owned()),
+            created: response.created,
+        }
+    }
+}
+
+#[derive(SimpleObject)]
+pub(crate) struct CacheRepairTask {
+    task_id: ID,
+    application_id: String,
+    chain: Json<ChainIdentity>,
+    dataset_key: String,
+    selector: WarmupTaskSelector,
+    range_kind: Json<LedgerRangeKind>,
+    start: u64,
+    end: u64,
+    finality: String,
+    state: String,
+    created_at: u64,
+    updated_at: u64,
+    last_error: Option<String>,
+    stats: Json<datalens_cache_repair::CacheRepairStats>,
+    reason: String,
+}
+
+impl From<CacheRepairTaskView> for CacheRepairTask {
+    fn from(task: CacheRepairTaskView) -> Self {
+        Self {
+            task_id: ID::from(task.task_id.as_str().to_owned()),
+            application_id: task.application_id,
+            chain: Json(task.chain),
+            dataset_key: task.dataset_key,
+            selector: WarmupTaskSelector {
+                kind: task.selector.kind,
+                fingerprint: task.selector.fingerprint,
+                canonical_key: task.selector.canonical_key,
+            },
+            range_kind: Json(task.range_kind),
+            start: task.start,
+            end: task.end,
+            finality: serde_json_string(task.finality),
+            state: serde_json_string(task.state),
+            created_at: task.created_at,
+            updated_at: task.updated_at,
+            last_error: task.last_error,
+            stats: Json(task.stats),
+            reason: task.reason,
+        }
+    }
+}
+
+#[derive(SimpleObject)]
+pub(crate) struct CacheRepairRunOncePayload {
+    results: Json<Vec<CacheRepairRunResult>>,
+}
+
+impl From<CacheRepairRunOnceApiResponse> for CacheRepairRunOncePayload {
+    fn from(response: CacheRepairRunOnceApiResponse) -> Self {
+        Self {
+            results: Json(response.results),
+        }
+    }
+}
+
 impl From<WarmupRunOnceApiResponse> for WarmupRunOncePayload {
     fn from(response: WarmupRunOnceApiResponse) -> Self {
         Self {
@@ -427,6 +627,12 @@ impl From<WarmupRunOnceApiResponse> for WarmupRunOncePayload {
 #[derive(Clone, Copy)]
 enum WarmupMutation {
     Pause,
+    Cancel,
+    Retry,
+}
+
+#[derive(Clone, Copy)]
+enum CacheRepairMutation {
     Cancel,
     Retry,
 }
@@ -481,6 +687,60 @@ fn authorize_warmup_task_application(
         return Err(DatalensError::new(
             DatalensErrorKind::Unauthorized,
             "application is not allowed to access another application's warmup task",
+        ));
+    }
+    Ok(())
+}
+
+async fn mutate_cache_repair_task(
+    ctx: &Context<'_>,
+    id: ID,
+    mutation: CacheRepairMutation,
+) -> async_graphql::Result<CacheRepairTask> {
+    let registry = registry(ctx)?.clone();
+    let headers = headers(ctx);
+    let task_id = CacheRepairTaskId::new(id.to_string()).map_err(graphql_error)?;
+    let application_context = registry
+        .authenticate_task_headers(&headers, ApplicationOperationConfig::CacheRepairMutate)
+        .map_err(graphql_error)?;
+    let application_id = application_context
+        .as_ref()
+        .map(|application| application.id.clone())
+        .or_else(|| application_id_from_headers(&headers));
+    let current_task_id = task_id.clone();
+    let current_registry = registry.clone();
+    let current_task =
+        spawn_graphql_blocking(move || current_registry.get_cache_repair_task(&current_task_id))
+            .await?;
+    let current_task = current_task.ok_or_else(|| {
+        graphql_error(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            format!("cache repair task {} not found", task_id.as_str()),
+        ))
+    })?;
+    authorize_cache_repair_task_application(&current_task, application_id)
+        .map_err(graphql_error)?;
+    let task = spawn_graphql_blocking(move || match mutation {
+        CacheRepairMutation::Cancel => registry.cancel_cache_repair_task(&task_id),
+        CacheRepairMutation::Retry => registry.retry_cache_repair_task(&task_id),
+    })
+    .await?;
+    cache_repair_task_view(task)
+        .map(CacheRepairTask::from)
+        .map_err(graphql_error)
+}
+
+fn authorize_cache_repair_task_application(
+    task: &datalens_cache_repair::CacheRepairTask,
+    application_id: Option<String>,
+) -> Result<(), DatalensError> {
+    let Some(application_id) = application_id else {
+        return Ok(());
+    };
+    if application_id != task.application_id {
+        return Err(DatalensError::new(
+            DatalensErrorKind::Unauthorized,
+            "application is not allowed to access another application's cache repair task",
         ));
     }
     Ok(())

@@ -7,6 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use datalens_cache_repair::{CacheRepairRuntime, CacheRepairTaskPool, LocalCacheRepairRegistry};
 use datalens_core::{ChainIdentity, DatalensError, DatalensErrorKind};
 use datalens_edge::config::{ChainConfig, DatalensConfig, FinalityConfig};
 use datalens_edge::{QueryService, QueryServiceRegistry};
@@ -37,6 +38,7 @@ struct QueryRuntimeStores {
     query_activity: Arc<dyn QueryActivityRepository>,
     durable_intents: Arc<dyn DurablePromotionIntentRepository>,
     warmup_registry: Option<LocalWarmupRegistry<WarmupRegistryObjectStore>>,
+    cache_repair_registry: Option<LocalCacheRepairRegistry<WarmupRegistryObjectStore>>,
     durable_intent_startup_maintenance: Arc<Once>,
 }
 
@@ -47,6 +49,11 @@ impl QueryRuntimeStores {
         } else {
             None
         };
+        let cache_repair_registry = if config.cache_repair.enabled {
+            Some(build_cache_repair_registry(config)?)
+        } else {
+            None
+        };
         Ok(Self {
             storage: Arc::from(build_storage(config)?),
             usage_ledger: Arc::from(build_usage_ledger(config)?),
@@ -54,6 +61,7 @@ impl QueryRuntimeStores {
             query_activity: Arc::from(build_query_activity(config)?),
             durable_intents: Arc::from(build_durable_intents(config)?),
             warmup_registry,
+            cache_repair_registry,
             durable_intent_startup_maintenance: Arc::new(Once::new()),
         })
     }
@@ -347,6 +355,16 @@ fn build_evm_service_with_storage(
         stores.durable_intents.clone(),
         stores.durable_intent_startup_maintenance.clone(),
     );
+    if config.cache_repair.enabled {
+        service =
+            service.with_cache_repair_pool(CacheRepairTaskPool::new(CacheRepairRuntime::new(
+                source.clone(),
+                stores.storage.clone(),
+                stores.cache_repair_registry.clone().ok_or_else(|| {
+                    DatalensError::internal("cache repair registry was not initialized")
+                })?,
+            )));
+    }
     if config.warmup.enabled {
         let mut runtime = WarmupRuntime::new(
             source,
@@ -423,9 +441,9 @@ fn build_solana_service_with_storage(
     )
     .with_max_slot_range_len(chain.datasets.blocks.max_batch_blocks.max(1))
     .with_query_strategy(chain.datasets.logs.query_strategy);
-    Ok(datalens_edge::QueryService::new_with_metadata_config(
-        stores.storage,
-        source,
+    let mut service = datalens_edge::QueryService::new_with_metadata_config(
+        stores.storage.clone(),
+        source.clone(),
         config.planner.clone(),
         config.writer.clone(),
         chain_name.to_owned(),
@@ -448,7 +466,18 @@ fn build_solana_service_with_storage(
     .with_durable_intents_startup_maintenance_once(
         stores.durable_intents,
         stores.durable_intent_startup_maintenance,
-    ))
+    );
+    if config.cache_repair.enabled {
+        service =
+            service.with_cache_repair_pool(CacheRepairTaskPool::new(CacheRepairRuntime::new(
+                source,
+                stores.storage,
+                stores.cache_repair_registry.ok_or_else(|| {
+                    DatalensError::internal("cache repair registry was not initialized")
+                })?,
+            )));
+    }
+    Ok(service)
 }
 
 fn build_tron_service_with_storage(
@@ -474,9 +503,9 @@ fn build_tron_service_with_storage(
     )
     .with_max_block_range_len(chain.datasets.blocks.max_batch_blocks.max(1))
     .with_events_query_strategy(chain.datasets.logs.query_strategy);
-    Ok(datalens_edge::QueryService::new_with_metadata_config(
-        stores.storage,
-        source,
+    let mut service = datalens_edge::QueryService::new_with_metadata_config(
+        stores.storage.clone(),
+        source.clone(),
         config.planner.clone(),
         config.writer.clone(),
         chain_name.to_owned(),
@@ -499,7 +528,18 @@ fn build_tron_service_with_storage(
     .with_durable_intents_startup_maintenance_once(
         stores.durable_intents,
         stores.durable_intent_startup_maintenance,
-    ))
+    );
+    if config.cache_repair.enabled {
+        service =
+            service.with_cache_repair_pool(CacheRepairTaskPool::new(CacheRepairRuntime::new(
+                source,
+                stores.storage,
+                stores.cache_repair_registry.ok_or_else(|| {
+                    DatalensError::internal("cache repair registry was not initialized")
+                })?,
+            )));
+    }
+    Ok(service)
 }
 
 pub(crate) fn tron_provider(url: String, chain: &ChainConfig) -> TronHttpProvider {
@@ -797,6 +837,43 @@ fn build_warmup_registry(
             Ok(LocalWarmupRegistry::new(WarmupRegistryObjectStore::S3(
                 S3ObjectStore::from_config(s3)?,
             )))
+        }
+        _ => Err(DatalensError::new(
+            DatalensErrorKind::UnsupportedDataset,
+            "storage.backend must be local or s3",
+        )),
+    }
+}
+
+fn build_cache_repair_registry(
+    config: &DatalensConfig,
+) -> Result<LocalCacheRepairRegistry<WarmupRegistryObjectStore>, DatalensError> {
+    match config.storage.backend.as_str() {
+        "local" => Ok(LocalCacheRepairRegistry::new(
+            WarmupRegistryObjectStore::Local(LocalObjectStore::new(
+                &config.cache_repair.registry_path,
+            )),
+        )),
+        "s3" => {
+            let mut s3 = config.storage.s3.clone().ok_or_else(|| {
+                DatalensError::new(
+                    DatalensErrorKind::InvalidInput,
+                    "storage.s3 must be set when storage.backend is s3",
+                )
+            })?;
+            let registry_path = config.cache_repair.registry_path.trim().trim_matches('/');
+            s3.prefix = match (s3.prefix.as_deref(), registry_path.is_empty()) {
+                (Some(prefix), false) if !prefix.trim().is_empty() => Some(format!(
+                    "{}/{registry_path}",
+                    prefix.trim().trim_matches('/')
+                )),
+                (_, false) => Some(registry_path.to_owned()),
+                (Some(prefix), true) => Some(prefix.to_owned()),
+                (None, true) => None,
+            };
+            Ok(LocalCacheRepairRegistry::new(
+                WarmupRegistryObjectStore::S3(S3ObjectStore::from_config(s3)?),
+            ))
         }
         _ => Err(DatalensError::new(
             DatalensErrorKind::UnsupportedDataset,

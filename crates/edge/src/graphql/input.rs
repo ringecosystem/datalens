@@ -1,4 +1,5 @@
 use async_graphql::{Enum, Error, InputObject};
+use datalens_cache_repair::{CacheRepairChunkPolicy, CacheRepairTaskFilter};
 use datalens_core::{
     ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey, LedgerRangeKind,
     LogFilter, NetworkId,
@@ -7,6 +8,7 @@ use datalens_warmup::{WarmupChunkPolicy, WarmupRetryPolicy, WarmupTaskFilter};
 use serde::Deserialize;
 
 use crate::contract::{
+    cache_repair::CacheRepairSubmitApiRequest,
     query::{FieldSelectionApi, QueryApiRequest, QueryRangeApi, QuerySelectorApi},
     warmup::{WarmupDatasetKeyApi, WarmupSelectorApiRequest, WarmupSubmitApiRequest},
 };
@@ -50,6 +52,38 @@ pub(crate) struct WarmupSubmitInput {
     mode: Option<String>,
     chunk_policy: Option<WarmupChunkPolicyInput>,
     retry_policy: Option<WarmupRetryPolicyInput>,
+}
+
+#[derive(InputObject)]
+pub(crate) struct CacheRepairSubmitInput {
+    chain: ChainIdentityInput,
+    dataset_key: WarmupDatasetKeyInput,
+    selector: WarmupSelectorInput,
+    range_kind: RangeKindInput,
+    start: u64,
+    end: u64,
+    finality: Option<String>,
+    chunk_policy: Option<CacheRepairChunkPolicyInput>,
+    reason: String,
+}
+
+impl CacheRepairSubmitInput {
+    pub(crate) fn into_request(self) -> async_graphql::Result<CacheRepairSubmitApiRequest> {
+        Ok(CacheRepairSubmitApiRequest {
+            chain: self.chain.into_chain_identity()?,
+            dataset_key: WarmupDatasetKeyApi::Structured(self.dataset_key.into_dataset_key()?),
+            selector: self.selector.into_warmup_selector()?,
+            range_kind: self.range_kind.into_range_kind()?,
+            start: self.start,
+            end: self.end,
+            finality: parse_optional_json_value(self.finality, "safe")?,
+            chunk_policy: self
+                .chunk_policy
+                .map(CacheRepairChunkPolicyInput::into_chunk_policy)
+                .unwrap_or_default(),
+            reason: self.reason,
+        })
+    }
 }
 
 impl WarmupSubmitInput {
@@ -352,6 +386,19 @@ pub(crate) struct WarmupChunkPolicyInput {
     target_rows_hint: Option<usize>,
 }
 
+#[derive(InputObject)]
+pub(crate) struct CacheRepairChunkPolicyInput {
+    max_range_len: Option<u64>,
+}
+
+impl CacheRepairChunkPolicyInput {
+    fn into_chunk_policy(self) -> CacheRepairChunkPolicy {
+        CacheRepairChunkPolicy {
+            max_range_len: self.max_range_len.unwrap_or(1_000),
+        }
+    }
+}
+
 impl WarmupChunkPolicyInput {
     fn into_chunk_policy(self) -> WarmupChunkPolicy {
         WarmupChunkPolicy {
@@ -386,6 +433,23 @@ pub(crate) struct WarmupTaskFilterInput {
     application_id: Option<String>,
     chain: Option<String>,
     state: Option<String>,
+}
+
+#[derive(InputObject)]
+pub(crate) struct CacheRepairTaskFilterInput {
+    application_id: Option<String>,
+    chain: Option<String>,
+    state: Option<String>,
+}
+
+impl CacheRepairTaskFilterInput {
+    pub(crate) fn into_filter(self) -> async_graphql::Result<CacheRepairTaskFilter> {
+        Ok(CacheRepairTaskFilter {
+            application_id: self.application_id,
+            chain_key: self.chain,
+            state: self.state.map(parse_json_value).transpose()?,
+        })
+    }
 }
 
 impl WarmupTaskFilterInput {

@@ -149,6 +149,7 @@ pub fn validate_config(config: &DatalensConfig) -> Result<(), DatalensError> {
     validate_index_config(config)?;
     validate_query_config(config)?;
     validate_warmup_config(config)?;
+    validate_cache_repair_config(config)?;
     validate_applications(config)?;
     for (name, chain) in &config.chains {
         validate_chain(name, chain)?;
@@ -324,6 +325,19 @@ fn validate_warmup_config(config: &DatalensConfig) -> Result<(), DatalensError> 
             .follow_query_start_offset_tiers_blocks
             .as_deref(),
     )?;
+    Ok(())
+}
+
+fn validate_cache_repair_config(config: &DatalensConfig) -> Result<(), DatalensError> {
+    if !config.cache_repair.enabled {
+        return Ok(());
+    }
+    if config.cache_repair.registry_path.trim().is_empty() {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "cache_repair.registry_path must not be empty when cache repair is enabled",
+        ));
+    }
     Ok(())
 }
 

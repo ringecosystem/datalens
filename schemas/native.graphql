@@ -1,3 +1,52 @@
+input CacheRepairChunkPolicyInput {
+	maxRangeLen: Int
+}
+
+type CacheRepairRunOncePayload {
+	results: JSON!
+}
+
+input CacheRepairSubmitInput {
+	chain: ChainIdentityInput!
+	datasetKey: WarmupDatasetKeyInput!
+	selector: WarmupSelectorInput!
+	rangeKind: RangeKindInput!
+	start: Int!
+	end: Int!
+	finality: String
+	chunkPolicy: CacheRepairChunkPolicyInput
+	reason: String!
+}
+
+type CacheRepairSubmitPayload {
+	taskId: ID!
+	created: Boolean!
+}
+
+type CacheRepairTask {
+	taskId: ID!
+	applicationId: String!
+	chain: JSON!
+	datasetKey: String!
+	selector: WarmupTaskSelector!
+	rangeKind: JSON!
+	start: Int!
+	end: Int!
+	finality: String!
+	state: String!
+	createdAt: Int!
+	updatedAt: Int!
+	lastError: String
+	stats: JSON!
+	reason: String!
+}
+
+input CacheRepairTaskFilterInput {
+	applicationId: String
+	chain: String
+	state: String
+}
+
 type ChainDiscoveryGraphql {
 	identity: JSON!
 	datasets: [DatasetDiscoveryGraphql!]!
@@ -55,6 +104,10 @@ type MutationRoot {
 	cancelWarmupTask(id: ID!): WarmupTask!
 	retryWarmupTask(id: ID!): WarmupTask!
 	runWarmupOnce: WarmupRunOncePayload!
+	submitCacheRepairTask(input: CacheRepairSubmitInput!): CacheRepairSubmitPayload!
+	cancelCacheRepairTask(id: ID!): CacheRepairTask!
+	retryCacheRepairTask(id: ID!): CacheRepairTask!
+	runCacheRepairOnce: CacheRepairRunOncePayload!
 }
 
 input NetworkIdInput {
@@ -103,6 +156,8 @@ type QueryRoot {
 	query(input: QueryInput!): QueryResponse!
 	warmupTask(id: ID!): WarmupTask
 	warmupTasks(filter: WarmupTaskFilterInput): [WarmupTask!]!
+	cacheRepairTask(id: ID!): CacheRepairTask
+	cacheRepairTasks(filter: CacheRepairTaskFilterInput): [CacheRepairTask!]!
 }
 
 input QuerySelectorInput {
