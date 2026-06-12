@@ -42,8 +42,8 @@ use crate::helpers::*;
 pub use crate::hot_promotion::HotCachePromoter;
 use crate::{
     durable_promotion::{
-        DurablePromotionIntentWorker, DurablePromotionMetrics, DurablePromotionQueue,
-        DurablePromotionRequest, PromotionEnqueueOutcome,
+        DurablePromotionIntentWorker, DurablePromotionIntentWorkerConfig, DurablePromotionMetrics,
+        DurablePromotionQueue, DurablePromotionRequest, PromotionEnqueueOutcome,
     },
     provider_range::{ProviderRangeController, ProviderRangeKey},
     provider_singleflight::ProviderSingleflight,
@@ -119,6 +119,7 @@ pub struct NativeQueryExecutor<R, S> {
     query_activity: Option<ExecutorQueryActivity>,
     durable_intents: Option<Arc<dyn DurablePromotionIntentRepository>>,
     durable_intent_worker: Option<DurablePromotionIntentWorker<R, S>>,
+    durable_intent_worker_config: DurablePromotionIntentWorkerConfig,
 }
 
 #[derive(Clone)]
@@ -177,6 +178,7 @@ where
             query_activity: None,
             durable_intents: None,
             durable_intent_worker: None,
+            durable_intent_worker_config: DurablePromotionIntentWorkerConfig::default(),
         }
     }
 
@@ -228,6 +230,14 @@ where
         self
     }
 
+    pub fn with_durable_intent_worker_config(
+        mut self,
+        config: DurablePromotionIntentWorkerConfig,
+    ) -> Self {
+        self.durable_intent_worker_config = config;
+        self
+    }
+
     pub fn with_durable_intents(
         mut self,
         repository: impl DurablePromotionIntentRepository + 'static,
@@ -253,6 +263,7 @@ where
                     .map(|metrics| metrics.recorder.clone()),
                 self.provider_ranges.clone(),
                 startup_maintenance_once,
+                self.durable_intent_worker_config,
             )
             .expect("durable intent workers start"),
         );

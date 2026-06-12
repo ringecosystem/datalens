@@ -12,7 +12,8 @@ use datalens_chain::{
 };
 use datalens_core::{DatalensError, DatalensErrorKind, DatasetKey, DatasetRows, LedgerRange};
 use datalens_executor::{
-    NativeQueryExecutionConfig, NativeQueryExecutor, QueryMetadataWorkerConfig, generate_query_id,
+    DurablePromotionIntentWorkerConfig, NativeQueryExecutionConfig, NativeQueryExecutor,
+    QueryMetadataWorkerConfig, generate_query_id,
 };
 use datalens_metrics::{ApplicationIdentity, MetricsRecorder};
 use datalens_planner::{NativePlannerConfig, NativeQueryInput};
@@ -28,7 +29,10 @@ use datalens_writer::{DurableWriteResult, DurableWriter, DurableWriterConfig};
 
 use crate::{
     chain_family,
-    config::{ChainConfig, MetricsConfig, PlannerConfig, QueryMetadataConfig, WriterConfig},
+    config::{
+        ChainConfig, MetricsConfig, PlannerConfig, QueryDurableIntentConfig, QueryMetadataConfig,
+        WriterConfig,
+    },
     contract::discovery::{ChainDiscovery, DatasetDiscovery},
 };
 
@@ -135,6 +139,31 @@ where
         metrics_config: MetricsConfig,
         metadata_config: QueryMetadataConfig,
     ) -> Result<Self, DatalensError> {
+        Self::new_with_query_worker_config(
+            storage,
+            source,
+            planner,
+            writer,
+            chain_name,
+            chain,
+            metrics_config,
+            metadata_config,
+            QueryDurableIntentConfig::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_query_worker_config(
+        storage: impl StorageRepository + 'static,
+        source: S,
+        planner: PlannerConfig,
+        writer: WriterConfig,
+        chain_name: impl Into<String>,
+        chain: ChainConfig,
+        metrics_config: MetricsConfig,
+        metadata_config: QueryMetadataConfig,
+        durable_intents_config: QueryDurableIntentConfig,
+    ) -> Result<Self, DatalensError> {
         datalens_executor::configure_query_metadata_worker_pool(QueryMetadataWorkerConfig {
             queue_capacity: metadata_config.queue_capacity,
             worker_threads: metadata_config.worker_threads,
@@ -176,7 +205,11 @@ where
                     },
                 },
             },
-        );
+        )
+        .with_durable_intent_worker_config(DurablePromotionIntentWorkerConfig {
+            worker_threads: durable_intents_config.worker_threads,
+            claim_batch_size: durable_intents_config.claim_batch_size,
+        });
         if let Some(recorder) = recorder.clone() {
             executor = executor.with_metrics(
                 recorder,

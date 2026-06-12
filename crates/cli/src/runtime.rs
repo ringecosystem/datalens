@@ -331,7 +331,7 @@ fn build_evm_service_with_storage(
         stores.storage.clone(),
         durable_writer_config(&config.writer),
     ));
-    let mut service = datalens_edge::QueryService::new_with_metadata_config(
+    let mut service = datalens_edge::QueryService::new_with_query_worker_config(
         stores.storage.clone(),
         source.clone(),
         config.planner.clone(),
@@ -340,6 +340,7 @@ fn build_evm_service_with_storage(
         chain.clone(),
         config.metrics.clone(),
         config.query.metadata,
+        config.query.durable_intents,
     )?
     .with_usage_ledger(
         stores.usage_ledger.clone(),
@@ -445,7 +446,7 @@ fn build_solana_service_with_storage(
     )
     .with_max_slot_range_len(chain.datasets.blocks.max_batch_blocks.max(1))
     .with_query_strategy(chain.datasets.logs.query_strategy);
-    let mut service = datalens_edge::QueryService::new_with_metadata_config(
+    let mut service = datalens_edge::QueryService::new_with_query_worker_config(
         stores.storage.clone(),
         source.clone(),
         config.planner.clone(),
@@ -454,6 +455,7 @@ fn build_solana_service_with_storage(
         chain.clone(),
         config.metrics.clone(),
         config.query.metadata,
+        config.query.durable_intents,
     )?
     .with_usage_ledger(
         stores.usage_ledger,
@@ -509,7 +511,7 @@ fn build_tron_service_with_storage(
     )
     .with_max_block_range_len(chain.datasets.blocks.max_batch_blocks.max(1))
     .with_events_query_strategy(chain.datasets.logs.query_strategy);
-    let mut service = datalens_edge::QueryService::new_with_metadata_config(
+    let mut service = datalens_edge::QueryService::new_with_query_worker_config(
         stores.storage.clone(),
         source.clone(),
         config.planner.clone(),
@@ -518,6 +520,7 @@ fn build_tron_service_with_storage(
         chain.clone(),
         config.metrics.clone(),
         config.query.metadata,
+        config.query.durable_intents,
     )?
     .with_usage_ledger(
         stores.usage_ledger,

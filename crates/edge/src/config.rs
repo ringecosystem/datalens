@@ -203,6 +203,8 @@ pub struct QueryConfig {
     pub index: GraphqlSurfaceConfig,
     #[serde(default)]
     pub metadata: QueryMetadataConfig,
+    #[serde(default)]
+    pub durable_intents: QueryDurableIntentConfig,
 }
 
 impl Default for QueryConfig {
@@ -211,6 +213,7 @@ impl Default for QueryConfig {
             native: default_native_query_surface(),
             index: default_index_query_surface(),
             metadata: QueryMetadataConfig::default(),
+            durable_intents: QueryDurableIntentConfig::default(),
         }
     }
 }
@@ -232,6 +235,24 @@ impl Default for QueryMetadataConfig {
             queue_capacity: default_query_metadata_queue_capacity(),
             worker_threads: default_query_metadata_worker_threads(),
             coalesced_capacity: default_query_metadata_coalesced_capacity(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueryDurableIntentConfig {
+    #[serde(default = "default_query_durable_intent_worker_threads")]
+    pub worker_threads: usize,
+    #[serde(default = "default_query_durable_intent_claim_batch_size")]
+    pub claim_batch_size: usize,
+}
+
+impl Default for QueryDurableIntentConfig {
+    fn default() -> Self {
+        Self {
+            worker_threads: default_query_durable_intent_worker_threads(),
+            claim_batch_size: default_query_durable_intent_claim_batch_size(),
         }
     }
 }
@@ -469,6 +490,14 @@ fn default_query_metadata_worker_threads() -> usize {
 
 fn default_query_metadata_coalesced_capacity() -> usize {
     2048
+}
+
+fn default_query_durable_intent_worker_threads() -> usize {
+    2
+}
+
+fn default_query_durable_intent_claim_batch_size() -> usize {
+    16
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

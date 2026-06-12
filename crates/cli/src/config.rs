@@ -184,6 +184,18 @@ fn validate_query_config(config: &DatalensConfig) -> Result<(), DatalensError> {
             "query.metadata.coalesced_capacity must be greater than zero",
         ));
     }
+    if config.query.durable_intents.worker_threads == 0 {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "query.durable_intents.worker_threads must be greater than zero",
+        ));
+    }
+    if config.query.durable_intents.claim_batch_size == 0 {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "query.durable_intents.claim_batch_size must be greater than zero",
+        ));
+    }
     let paths = [
         ("query.native.path", &config.query.native.path),
         (
