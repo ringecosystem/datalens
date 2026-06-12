@@ -1,3 +1,9 @@
+use std::{
+    sync::{Arc, Mutex},
+    thread,
+    time::{Duration, Instant},
+};
+
 use datalens_core::{DatalensError, DatalensErrorKind, redact_url, redact_urls_in_text};
 use reqwest::blocking::Client;
 use serde_json::{Value, json};
@@ -8,11 +14,16 @@ use crate::{
     TronProvider, normalize_tron_contract_address,
 };
 
+const TRONGRID_CONTRACT_EVENTS_MAX_ATTEMPTS: usize = 3;
+const TRONGRID_CONTRACT_EVENTS_BACKOFF: Duration = Duration::from_millis(250);
+const TRONGRID_CONTRACT_EVENTS_MIN_INTERVAL: Duration = Duration::from_millis(350);
+
 #[derive(Clone, Debug)]
 pub struct TronHttpProvider {
     url: String,
     trongrid: Option<TronGridConfig>,
     client: Client,
+    next_contract_event_request_at: Arc<Mutex<Instant>>,
 }
 
 #[derive(Clone, Debug)]
@@ -27,6 +38,7 @@ impl TronHttpProvider {
             url: url.into(),
             trongrid: None,
             client: Client::new(),
+            next_contract_event_request_at: Arc::new(Mutex::new(Instant::now())),
         }
     }
 
@@ -94,6 +106,120 @@ impl TronHttpProvider {
             TronFinality::Finalized => "walletsolidity",
         };
         format!("{prefix}/{method}")
+    }
+
+    fn get_contract_events_once(
+        &self,
+        url: &str,
+        api_key: &str,
+    ) -> Result<TronContractEventPage, DatalensError> {
+        self.wait_for_contract_event_request_slot();
+        let response = self
+            .client
+            .get(url)
+            .header("TRON-PRO-API-KEY", api_key)
+            .header(reqwest::header::ACCEPT_ENCODING, "identity")
+            .send()
+            .map_err(|error| {
+                DatalensError::new(
+                    DatalensErrorKind::ProviderFailure,
+                    format!(
+                        "TronGrid contract events request failed endpoint={}: {}",
+                        redact_url(url),
+                        redact_urls_in_text(&error.to_string())
+                    ),
+                )
+            })?;
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let raw_body = response.text().map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::ProviderFailure,
+                format!(
+                    "read TronGrid contract events response failed endpoint={}: {}",
+                    redact_url(url),
+                    redact_urls_in_text(&error.to_string())
+                ),
+            )
+        })?;
+        if status.as_u16() == 429 || is_plain_text_rate_limit(status.as_u16(), &raw_body) {
+            return Err(DatalensError::new(
+                DatalensErrorKind::RateLimited,
+                "TronGrid contract events rate limited",
+            ));
+        }
+        let body: Value = serde_json::from_str(&raw_body).map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::ProviderFailure,
+                format!(
+                    "decode TronGrid contract events response failed status={} content_type={} body_prefix={}: {}",
+                    status.as_u16(),
+                    content_type.as_deref().unwrap_or("<none>"),
+                    redact_body_prefix(&raw_body),
+                    redact_urls_in_text(&error.to_string())
+                ),
+            )
+        })?;
+        if status.as_u16() == 401 || status.as_u16() == 403 {
+            return Err(DatalensError::new(
+                DatalensErrorKind::AuthenticationFailed,
+                format!("TronGrid contract events HTTP error {}", status.as_u16()),
+            ));
+        }
+        if !status.is_success() {
+            return Err(trongrid_contract_events_http_error(status.as_u16(), &body));
+        }
+        parse_contract_event_page(&body)
+    }
+
+    fn wait_for_contract_event_request_slot(&self) {
+        let sleep_for = {
+            let mut next_request_at = self
+                .next_contract_event_request_at
+                .lock()
+                .expect("contract event request limiter poisoned");
+            let now = Instant::now();
+            if now >= *next_request_at {
+                *next_request_at = now + TRONGRID_CONTRACT_EVENTS_MIN_INTERVAL;
+                None
+            } else {
+                let sleep_for = *next_request_at - now;
+                *next_request_at += TRONGRID_CONTRACT_EVENTS_MIN_INTERVAL;
+                Some(sleep_for)
+            }
+        };
+
+        if let Some(sleep_for) = sleep_for {
+            thread::sleep(sleep_for);
+        }
+    }
+
+    fn get_contract_events_with_retry(
+        &self,
+        url: &str,
+        api_key: &str,
+    ) -> Result<TronContractEventPage, DatalensError> {
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            match self.get_contract_events_once(url, api_key) {
+                Ok(mut page) => {
+                    page.provider_calls = attempts;
+                    return Ok(page);
+                }
+                Err(error)
+                    if error.kind == DatalensErrorKind::RateLimited
+                        && attempts < TRONGRID_CONTRACT_EVENTS_MAX_ATTEMPTS =>
+                {
+                    thread::sleep(TRONGRID_CONTRACT_EVENTS_BACKOFF * attempts as u32);
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 }
 
@@ -179,72 +305,7 @@ impl TronProvider for TronHttpProvider {
             self.trongrid_endpoint(&config.base_url, &path),
             encode_query(&query)
         );
-        let response = self
-            .client
-            .get(&url)
-            .header("TRON-PRO-API-KEY", api_key)
-            .header(reqwest::header::ACCEPT_ENCODING, "identity")
-            .send()
-            .map_err(|error| {
-                DatalensError::new(
-                    DatalensErrorKind::ProviderFailure,
-                    format!(
-                        "TronGrid contract events request failed endpoint={}: {}",
-                        redact_url(&url),
-                        redact_urls_in_text(&error.to_string())
-                    ),
-                )
-            })?;
-        let status = response.status();
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
-        let raw_body = response.text().map_err(|error| {
-            DatalensError::new(
-                DatalensErrorKind::ProviderFailure,
-                format!(
-                    "read TronGrid contract events response failed endpoint={}: {}",
-                    redact_url(&url),
-                    redact_urls_in_text(&error.to_string())
-                ),
-            )
-        })?;
-        if is_plain_text_rate_limit(status.as_u16(), &raw_body) {
-            return Err(DatalensError::new(
-                DatalensErrorKind::RateLimited,
-                "TronGrid contract events rate limited",
-            ));
-        }
-        let body: Value = serde_json::from_str(&raw_body).map_err(|error| {
-            DatalensError::new(
-                DatalensErrorKind::ProviderFailure,
-                format!(
-                    "decode TronGrid contract events response failed status={} content_type={} body_prefix={}: {}",
-                    status.as_u16(),
-                    content_type.as_deref().unwrap_or("<none>"),
-                    redact_body_prefix(&raw_body),
-                    redact_urls_in_text(&error.to_string())
-                ),
-            )
-        })?;
-        if status.as_u16() == 401 || status.as_u16() == 403 {
-            return Err(DatalensError::new(
-                DatalensErrorKind::AuthenticationFailed,
-                format!("TronGrid contract events HTTP error {}", status.as_u16()),
-            ));
-        }
-        if status.as_u16() == 429 {
-            return Err(DatalensError::new(
-                DatalensErrorKind::RateLimited,
-                "TronGrid contract events rate limited",
-            ));
-        }
-        if !status.is_success() {
-            return Err(trongrid_contract_events_http_error(status.as_u16(), &body));
-        }
-        parse_contract_event_page(&body)
+        self.get_contract_events_with_retry(&url, api_key)
     }
 
     fn provider_name(&self) -> &'static str {
