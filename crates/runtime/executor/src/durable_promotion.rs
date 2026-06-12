@@ -1051,19 +1051,23 @@ fn claim_pending_intents(
     ) else {
         return Vec::new();
     };
-    let pending =
-        match repository.list_pending_for_chain(chain, now, DEFAULT_INTENT_CLAIM_BATCH_SIZE) {
-            Ok(pending) => pending,
-            Err(error) => {
-                log::warn!(
-                    "durable intent batch list failed worker={} kind={:?} message={}",
-                    worker_index,
-                    error.kind,
-                    error.message
-                );
-                return vec![first];
-            }
-        };
+    let pending = match repository.list_pending_for_chain_and_source(
+        chain,
+        first.source,
+        now,
+        DEFAULT_INTENT_CLAIM_BATCH_SIZE,
+    ) {
+        Ok(pending) => pending,
+        Err(error) => {
+            log::warn!(
+                "durable intent batch list failed worker={} kind={:?} message={}",
+                worker_index,
+                error.kind,
+                error.message
+            );
+            return vec![first];
+        }
+    };
     let mut claimed = vec![first.clone()];
     for candidate in pending {
         if candidate.intent_id == first.intent_id {
@@ -1137,9 +1141,15 @@ fn claim_pending_intent(
             }
         }
     }
-    let list_started = Instant::now();
-    let pending =
-        match repository.list_pending_for_chain(chain, now, DEFAULT_INTENT_CLAIM_BATCH_SIZE) {
+    for source in intent_claim_source_order(worker_index) {
+        let source_label = intent_source_label(source);
+        let list_started = Instant::now();
+        let pending = match repository.list_pending_for_chain_and_source(
+            chain,
+            source,
+            now,
+            DEFAULT_INTENT_CLAIM_BATCH_SIZE,
+        ) {
             Ok(pending) => {
                 let outcome = if pending.is_empty() {
                     MetricsDurableIntentClaimOutcome::Empty
@@ -1147,12 +1157,12 @@ fn claim_pending_intent(
                     MetricsDurableIntentClaimOutcome::Claimed
                 };
                 if pending.is_empty() {
-                    record_intent_claim_metric(metrics, chain, "all", outcome, list_started);
+                    record_intent_claim_metric(metrics, chain, source_label, outcome, list_started);
                 } else {
                     observe_intent_claim_duration_metric(
                         metrics,
                         chain,
-                        "all",
+                        source_label,
                         outcome,
                         list_started,
                     );
@@ -1163,21 +1173,21 @@ fn claim_pending_intent(
                 record_intent_claim_metric(
                     metrics,
                     chain,
-                    "all",
+                    source_label,
                     MetricsDurableIntentClaimOutcome::ListError,
                     list_started,
                 );
                 log::error!(
-                    "durable intent list failed worker={} kind={:?} message={}",
+                    "durable intent list failed worker={} source={} kind={:?} message={}",
                     worker_index,
+                    source_label,
                     error.kind,
                     error.message
                 );
-                return None;
+                continue;
             }
         };
-    match pending.into_iter().next() {
-        Some(intent) => {
+        for intent in pending {
             let source = intent_source_label(intent.source);
             let claim_started = Instant::now();
             match repository.mark_running(&intent.intent_id, unix_seconds_now()) {
@@ -1189,7 +1199,7 @@ fn claim_pending_intent(
                         MetricsDurableIntentClaimOutcome::Claimed,
                         claim_started,
                     );
-                    Some(intent)
+                    return Some(intent);
                 }
                 Ok(None) => {
                     record_intent_claim_metric(
@@ -1199,7 +1209,6 @@ fn claim_pending_intent(
                         MetricsDurableIntentClaimOutcome::SkippedIneligible,
                         claim_started,
                     );
-                    None
                 }
                 Err(error) => {
                     record_intent_claim_metric(
@@ -1216,11 +1225,24 @@ fn claim_pending_intent(
                         error.kind,
                         error.message
                     );
-                    None
                 }
             }
         }
-        None => None,
+    }
+    None
+}
+
+fn intent_claim_source_order(worker_index: usize) -> [DurablePromotionIntentSource; 2] {
+    if worker_index.is_multiple_of(2) {
+        [
+            DurablePromotionIntentSource::Warmup,
+            DurablePromotionIntentSource::Query,
+        ]
+    } else {
+        [
+            DurablePromotionIntentSource::Query,
+            DurablePromotionIntentSource::Warmup,
+        ]
     }
 }
 
@@ -1795,6 +1817,23 @@ mod tests {
                 .collect())
         }
 
+        fn list_pending_for_chain_and_source(
+            &self,
+            chain: &ChainIdentity,
+            source: DurablePromotionIntentSource,
+            _now_unix_seconds: u64,
+            limit: usize,
+        ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+            self.last_limit.store(limit, Ordering::SeqCst);
+            let intents = self.intents.lock().expect("sample intent repository lock");
+            Ok(intents
+                .iter()
+                .filter(|intent| &intent.chain == chain && intent.source == source)
+                .take(limit)
+                .cloned()
+                .collect())
+        }
+
         fn mark_running(
             &self,
             intent_id: &str,
@@ -1877,7 +1916,10 @@ mod tests {
             r#"datalens_durable_intent_oldest_pending_age_seconds{chain="ethereum",chain_kind="evm",source="query"} 30"#
         ));
         assert!(output.contains(
-            r#"datalens_durable_intent_claim_total{chain="ethereum",chain_kind="evm",outcome="list_error",source="all"} 1"#
+            r#"datalens_durable_intent_claim_total{chain="ethereum",chain_kind="evm",outcome="list_error",source="warmup"} 1"#
+        ));
+        assert!(output.contains(
+            r#"datalens_durable_intent_claim_total{chain="ethereum",chain_kind="evm",outcome="list_error",source="query"} 1"#
         ));
     }
 
@@ -1993,6 +2035,42 @@ mod tests {
         assert_eq!(
             claimed.map(|intent| intent.intent_id),
             Some("intent-ethereum".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_claim_intent_claims_warmup_when_older_query_intents_fill_chain_batch() {
+        let ethereum = ethereum_chain();
+        let mut intents = Vec::new();
+        for index in 0..DEFAULT_INTENT_CLAIM_BATCH_SIZE {
+            intents.push(test_intent_with_chain(
+                &format!("intent-query-{index}"),
+                ethereum.clone(),
+                100 + index as u64,
+            ));
+        }
+        let mut warmup = test_intent_with_chain(
+            "intent-warmup",
+            ethereum.clone(),
+            100 + DEFAULT_INTENT_CLAIM_BATCH_SIZE as u64,
+        );
+        warmup.source = DurablePromotionIntentSource::Warmup;
+        intents.push(warmup);
+        let repository = sample_repository(intents);
+
+        let claimed = claim_pending_intent(&repository, &ethereum, None, 130, 0, true);
+
+        assert_eq!(
+            claimed.map(|intent| intent.intent_id),
+            Some("intent-warmup".to_owned())
+        );
+        assert_eq!(
+            repository
+                .marked_running
+                .lock()
+                .expect("marked running lock")
+                .as_slice(),
+            ["intent-warmup"]
         );
     }
 

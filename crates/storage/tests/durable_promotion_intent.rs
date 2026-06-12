@@ -312,6 +312,60 @@ fn test_list_pending_for_chain_filters_before_applying_limit() {
 }
 
 #[test]
+fn test_list_pending_for_chain_and_source_filters_before_applying_limit() {
+    let store = DurablePromotionIntentStore::new(LocalObjectStore::new(temp_storage_root(
+        "source-pending-limit",
+    )));
+    let ethereum = test_chain();
+    for index in 0..16 {
+        store
+            .create_or_get(datalens_storage::CreateDurablePromotionIntent {
+                source: DurablePromotionIntentSource::Query,
+                application: "analytics-api".to_owned(),
+                chain: ethereum.clone(),
+                dataset_key: DatasetKey::evm_blocks(),
+                selector: DatasetSelector::all(),
+                selector_fingerprint: "all".to_owned(),
+                selector_canonical_key: "all".to_owned(),
+                finality: "safe".to_owned(),
+                ranges: vec![LedgerRange::blocks(100 + index, 101 + index).expect("valid range")],
+                request_id: None,
+                task_id: None,
+                now_unix_seconds: 100 + index,
+            })
+            .expect("create query intent");
+    }
+    let warmup_intent = store
+        .create_or_get(datalens_storage::CreateDurablePromotionIntent {
+            source: DurablePromotionIntentSource::Warmup,
+            application: "warmup-api".to_owned(),
+            chain: ethereum.clone(),
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: DatasetSelector::all(),
+            selector_fingerprint: "all".to_owned(),
+            selector_canonical_key: "all".to_owned(),
+            finality: "safe".to_owned(),
+            ranges: vec![LedgerRange::blocks(200, 201).expect("valid range")],
+            request_id: None,
+            task_id: Some("task-1".to_owned()),
+            now_unix_seconds: 116,
+        })
+        .expect("create warmup intent");
+    let DurablePromotionIntentCreateOutcome::Created(warmup_intent) = warmup_intent else {
+        panic!("warmup intent should be created");
+    };
+
+    let scoped = store
+        .list_pending_for_chain_and_source(&ethereum, DurablePromotionIntentSource::Warmup, 200, 1)
+        .expect("list chain/source pending");
+
+    assert_eq!(
+        scoped.first().map(|intent| intent.intent_id.as_str()),
+        Some(warmup_intent.intent_id.as_str())
+    );
+}
+
+#[test]
 fn test_pending_backlog_for_chain_uses_pending_index_without_canonical_reads() {
     let root = temp_storage_root("pending-backlog-index");
     let object_store = CountingObjectStore::new(root);
