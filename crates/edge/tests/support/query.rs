@@ -209,6 +209,7 @@ pub(crate) fn service_named_with_datasets(
                     header_fetch_concurrency: 8,
                     header_fetch_batch_size: 20,
                     header_cache_max_entries: 50_000,
+                    header_durable_chunk_size_blocks: 1_000,
                 },
             },
         },
@@ -256,6 +257,7 @@ pub(crate) fn chain_config(chain_id: u64) -> ChainConfig {
                 header_fetch_concurrency: 8,
                 header_fetch_batch_size: 20,
                 header_cache_max_entries: 50_000,
+                header_durable_chunk_size_blocks: 1_000,
             },
         },
     }
@@ -317,6 +319,7 @@ pub(crate) fn solana_chain_config() -> ChainConfig {
                 header_fetch_concurrency: 8,
                 header_fetch_batch_size: 20,
                 header_cache_max_entries: 50_000,
+                header_durable_chunk_size_blocks: 1_000,
             },
         },
     }

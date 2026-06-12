@@ -862,7 +862,8 @@ pub(crate) fn evm_block_header_metadata_config(
         .with_cache_max_entries(chain.datasets.logs.header_cache_max_entries)
         .with_fetch_concurrency(chain.datasets.logs.header_fetch_concurrency)
         .with_fetch_mode(fetch_mode)
-        .with_batch_size(chain.datasets.logs.header_fetch_batch_size))
+        .with_batch_size(chain.datasets.logs.header_fetch_batch_size)
+        .with_durable_chunk_size_blocks(chain.datasets.logs.header_durable_chunk_size_blocks))
 }
 
 pub(crate) fn evm_log_reliability_config(chain: &ChainConfig) -> EvmLogReliabilityConfig {

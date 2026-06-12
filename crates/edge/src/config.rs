@@ -694,6 +694,8 @@ pub struct LogsDatasetConfig {
     pub header_fetch_batch_size: usize,
     #[serde(default = "default_evm_log_header_cache_max_entries")]
     pub header_cache_max_entries: usize,
+    #[serde(default = "default_evm_log_header_durable_chunk_size_blocks")]
+    pub header_durable_chunk_size_blocks: u64,
 }
 
 fn default_max_block_scan_range_blocks() -> u64 {
@@ -718,6 +720,10 @@ fn default_evm_log_header_fetch_batch_size() -> usize {
 
 fn default_evm_log_header_cache_max_entries() -> usize {
     50_000
+}
+
+fn default_evm_log_header_durable_chunk_size_blocks() -> u64 {
+    1_000
 }
 
 fn expand_env_vars(text: &str) -> Result<String, DatalensError> {

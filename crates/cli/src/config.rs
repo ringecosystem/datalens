@@ -460,6 +460,12 @@ fn validate_chain(name: &str, chain: &ChainConfig) -> Result<(), DatalensError> 
             format!("chain {name} logs header_cache_max_entries must be greater than zero"),
         ));
     }
+    if chain.datasets.logs.header_durable_chunk_size_blocks == 0 {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            format!("chain {name} logs header_durable_chunk_size_blocks must be greater than zero"),
+        ));
+    }
     if chain
         .warmup
         .follow_query_start_offset_blocks
@@ -659,6 +665,7 @@ pub fn doctor_chain_summary(
                 "header_fetch_concurrency": chain.datasets.logs.header_fetch_concurrency,
                 "header_fetch_batch_size": chain.datasets.logs.header_fetch_batch_size,
                 "header_cache_max_entries": chain.datasets.logs.header_cache_max_entries,
+                "header_durable_chunk_size_blocks": chain.datasets.logs.header_durable_chunk_size_blocks,
             }
         }
     }))

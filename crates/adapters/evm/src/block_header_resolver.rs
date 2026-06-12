@@ -10,6 +10,8 @@ use datalens_writer::{
     DurableWriteRequest, DurableWriteSegment, DurableWriter, DurableWriterConfig,
 };
 
+const DEFAULT_EVM_BLOCK_HEADER_CHUNK_SIZE_BLOCKS: u64 = 1_000;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EvmBlockHeaderResolveRequest {
     pub chain: ChainIdentity,
@@ -25,6 +27,45 @@ pub struct EvmBlockHeaderFetch {
 
 pub trait EvmBlockHeaderFetcher {
     fn fetch_block_headers(&self, range: BlockRange) -> Result<EvmBlockHeaderFetch, DatalensError>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EvmBlockHeaderChunkPolicy {
+    chunk_size_blocks: u64,
+}
+
+impl Default for EvmBlockHeaderChunkPolicy {
+    fn default() -> Self {
+        Self {
+            chunk_size_blocks: DEFAULT_EVM_BLOCK_HEADER_CHUNK_SIZE_BLOCKS,
+        }
+    }
+}
+
+impl EvmBlockHeaderChunkPolicy {
+    pub fn new(chunk_size_blocks: u64) -> Self {
+        Self {
+            chunk_size_blocks: chunk_size_blocks.max(1),
+        }
+    }
+
+    pub fn chunk_size_blocks(&self) -> u64 {
+        self.chunk_size_blocks
+    }
+
+    fn aligned_ranges(&self, range: BlockRange) -> Vec<BlockRange> {
+        let mut ranges = Vec::new();
+        let mut chunk_start = (range.from_block / self.chunk_size_blocks) * self.chunk_size_blocks;
+        loop {
+            let chunk_end = chunk_start.saturating_add(self.chunk_size_blocks - 1);
+            ranges.push(BlockRange::expect_new(chunk_start, chunk_end));
+            if chunk_end >= range.to_block || chunk_end == u64::MAX {
+                break;
+            }
+            chunk_start = chunk_end + 1;
+        }
+        ranges
+    }
 }
 
 pub trait EvmBlockHeaderStore {
@@ -48,6 +89,7 @@ pub trait EvmBlockHeaderStore {
 pub struct EvmBlockHeaderResolver<F, S = NoEvmBlockHeaderStore> {
     fetcher: F,
     store: Option<S>,
+    chunk_policy: EvmBlockHeaderChunkPolicy,
 }
 
 impl<F> EvmBlockHeaderResolver<F, NoEvmBlockHeaderStore> {
@@ -55,6 +97,7 @@ impl<F> EvmBlockHeaderResolver<F, NoEvmBlockHeaderStore> {
         Self {
             fetcher,
             store: None,
+            chunk_policy: EvmBlockHeaderChunkPolicy::default(),
         }
     }
 }
@@ -64,7 +107,13 @@ impl<F, S> EvmBlockHeaderResolver<F, S> {
         Self {
             fetcher,
             store: Some(store),
+            chunk_policy: EvmBlockHeaderChunkPolicy::default(),
         }
+    }
+
+    pub fn with_chunk_policy(mut self, chunk_policy: EvmBlockHeaderChunkPolicy) -> Self {
+        self.chunk_policy = chunk_policy;
+        self
     }
 }
 
@@ -85,39 +134,75 @@ where
         };
         retain_range(&mut headers, request.range);
 
-        for missing in missing_evm_block_header_ranges(request.range, &headers) {
-            let fetched = self.fetcher.fetch_block_headers(missing)?;
-            let mut fetched_headers = fetched.headers;
-            retain_range(&mut fetched_headers, missing);
-            fetched_headers.sort_by_key(|header| header.block_number);
-            fetched_headers.dedup_by_key(|header| header.block_number);
-            if let Some(store) = &self.store
-                && !fetched_headers.is_empty()
-            {
-                store.persist_headers(
-                    &request.chain,
-                    missing,
-                    request.finality_level,
-                    fetched_headers.clone(),
-                )?;
+        if self.store.is_none() || !request.finality_level.is_durable_writable() {
+            for missing in missing_evm_block_header_ranges(request.range, &headers) {
+                let fetched = self.fetcher.fetch_block_headers(missing)?;
+                let mut fetched_headers = fetched.headers;
+                retain_range(&mut fetched_headers, missing);
+                fetched_headers.sort_by_key(|header| header.block_number);
+                fetched_headers.dedup_by_key(|header| header.block_number);
+                headers.extend(fetched_headers);
             }
-            headers.extend(fetched_headers);
+            return complete_resolved_headers(request.range, headers);
         }
 
-        headers.sort_by_key(|header| header.block_number);
-        headers.dedup_by_key(|header| header.block_number);
-        let missing = missing_evm_block_header_ranges(request.range, &headers);
-        if !missing.is_empty() {
-            return Err(DatalensError::new(
-                DatalensErrorKind::ProviderFailure,
-                format!(
-                    "failed to resolve EVM block headers for {} missing ranges",
-                    missing.len()
-                ),
-            ));
+        let store = self.store.as_ref().expect("store checked");
+        for missing in missing_evm_block_header_ranges(request.range, &headers) {
+            for chunk in self.chunk_policy.aligned_ranges(missing) {
+                let mut chunk_headers =
+                    store.read_headers(&request.chain, chunk, request.finality_level)?;
+                normalize_headers(&mut chunk_headers);
+                if missing_evm_block_header_ranges(chunk, &chunk_headers).is_empty() {
+                    retain_range(&mut chunk_headers, request.range);
+                    headers.extend(chunk_headers);
+                    continue;
+                }
+
+                let fetched = self.fetcher.fetch_block_headers(chunk)?;
+                let mut fetched_headers = fetched.headers;
+                retain_range(&mut fetched_headers, chunk);
+                normalize_headers(&mut fetched_headers);
+                if !fetched_headers.is_empty()
+                    && missing_evm_block_header_ranges(chunk, &fetched_headers).is_empty()
+                {
+                    store.persist_headers(
+                        &request.chain,
+                        chunk,
+                        request.finality_level,
+                        fetched_headers.clone(),
+                    )?;
+                }
+                retain_range(&mut fetched_headers, request.range);
+                headers.extend(fetched_headers);
+            }
         }
-        Ok(headers)
+
+        complete_resolved_headers(request.range, headers)
     }
+}
+
+fn complete_resolved_headers(
+    range: BlockRange,
+    mut headers: Vec<EvmBlockHeader>,
+) -> Result<Vec<EvmBlockHeader>, DatalensError> {
+    retain_range(&mut headers, range);
+    normalize_headers(&mut headers);
+    let missing = missing_evm_block_header_ranges(range, &headers);
+    if !missing.is_empty() {
+        return Err(DatalensError::new(
+            DatalensErrorKind::ProviderFailure,
+            format!(
+                "failed to resolve EVM block headers for {} missing ranges",
+                missing.len()
+            ),
+        ));
+    }
+    Ok(headers)
+}
+
+fn normalize_headers(headers: &mut Vec<EvmBlockHeader>) {
+    headers.sort_by_key(|header| header.block_number);
+    headers.dedup_by_key(|header| header.block_number);
 }
 
 #[derive(Clone, Debug, Default)]

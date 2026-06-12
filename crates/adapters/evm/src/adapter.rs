@@ -27,7 +27,10 @@ pub use crate::provider_payload::{
     classify_provider_error, height_from_latest_lag, parse_log_record, parse_receipt,
     parse_transaction,
 };
-use crate::{DurableEvmBlockHeaderStore, EvmBlockHeaderFetch, EvmBlockHeaderFetcher};
+use crate::{
+    DurableEvmBlockHeaderStore, EvmBlockHeaderChunkPolicy, EvmBlockHeaderFetch,
+    EvmBlockHeaderFetcher,
+};
 use crate::{EvmBlockHeaderResolveRequest, EvmBlockHeaderResolver, EvmLogBloom};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -108,6 +111,7 @@ pub enum EvmFinalityPolicy {
 const DEFAULT_BLOCK_HEADER_CACHE_MAX_ENTRIES: usize = 50_000;
 const DEFAULT_BLOCK_HEADER_FETCH_CONCURRENCY: usize = 8;
 const DEFAULT_BLOCK_HEADER_BATCH_SIZE: usize = 20;
+const DEFAULT_BLOCK_HEADER_DURABLE_CHUNK_SIZE_BLOCKS: u64 = 1_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EvmLogReliabilityConfig {
@@ -149,6 +153,7 @@ pub struct EvmBlockHeaderMetadataConfig {
     pub fetch_concurrency: usize,
     pub fetch_mode: EvmBlockHeaderFetchMode,
     pub batch_size: usize,
+    pub durable_chunk_size_blocks: u64,
 }
 
 impl Default for EvmBlockHeaderMetadataConfig {
@@ -158,6 +163,7 @@ impl Default for EvmBlockHeaderMetadataConfig {
             fetch_concurrency: DEFAULT_BLOCK_HEADER_FETCH_CONCURRENCY,
             fetch_mode: EvmBlockHeaderFetchMode::Batch,
             batch_size: DEFAULT_BLOCK_HEADER_BATCH_SIZE,
+            durable_chunk_size_blocks: DEFAULT_BLOCK_HEADER_DURABLE_CHUNK_SIZE_BLOCKS,
         }
     }
 }
@@ -180,6 +186,11 @@ impl EvmBlockHeaderMetadataConfig {
 
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size.max(1);
+        self
+    }
+
+    pub fn with_durable_chunk_size_blocks(mut self, durable_chunk_size_blocks: u64) -> Self {
+        self.durable_chunk_size_blocks = durable_chunk_size_blocks.max(1);
         self
     }
 }
@@ -764,10 +775,16 @@ impl EvmRpcClient {
         &self,
         request: EvmBlockHeaderResolveRequest,
     ) -> Result<Vec<EvmBlockHeader>, DatalensError> {
+        let chunk_policy =
+            EvmBlockHeaderChunkPolicy::new(self.block_header_metadata.durable_chunk_size_blocks);
         if let Some(store) = &self.block_header_store {
-            EvmBlockHeaderResolver::with_store(self.clone(), store.clone()).resolve(request)
+            EvmBlockHeaderResolver::with_store(self.clone(), store.clone())
+                .with_chunk_policy(chunk_policy)
+                .resolve(request)
         } else {
-            EvmBlockHeaderResolver::without_store(self.clone()).resolve(request)
+            EvmBlockHeaderResolver::without_store(self.clone())
+                .with_chunk_policy(chunk_policy)
+                .resolve(request)
         }
     }
 

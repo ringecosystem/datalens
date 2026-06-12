@@ -1829,6 +1829,7 @@ fn test_validate_config_accepts_per_chain_log_query_strategy_differences() {
         header_fetch_concurrency = 3
         header_fetch_batch_size = 5
         header_cache_max_entries = 100
+        header_durable_chunk_size_blocks = 25
         "#,
     )
     .expect("config parses");
@@ -1868,6 +1869,13 @@ fn test_validate_config_accepts_per_chain_log_query_strategy_differences() {
         50_000
     );
     assert_eq!(
+        config.chains["ethereum"]
+            .datasets
+            .logs
+            .header_durable_chunk_size_blocks,
+        1_000
+    );
+    assert_eq!(
         config.chains["private"].datasets.logs.header_fetch_mode,
         "batch"
     );
@@ -1891,6 +1899,13 @@ fn test_validate_config_accepts_per_chain_log_query_strategy_differences() {
             .logs
             .header_cache_max_entries,
         100
+    );
+    assert_eq!(
+        config.chains["private"]
+            .datasets
+            .logs
+            .header_durable_chunk_size_blocks,
+        25
     );
 }
 
@@ -1947,6 +1962,7 @@ fn test_validate_config_rejects_invalid_log_header_metadata_config() {
         ("header_fetch_concurrency", "0"),
         ("header_fetch_batch_size", "0"),
         ("header_cache_max_entries", "0"),
+        ("header_durable_chunk_size_blocks", "0"),
     ] {
         let config: DatalensConfig = toml::from_str(&format!(
             r#"
@@ -2112,6 +2128,7 @@ fn test_doctor_chain_summary_rejects_unknown_auto_finality_without_profile() {
                 header_fetch_concurrency: 8,
                 header_fetch_batch_size: 20,
                 header_cache_max_entries: 50_000,
+                header_durable_chunk_size_blocks: 1_000,
             },
         },
     };
