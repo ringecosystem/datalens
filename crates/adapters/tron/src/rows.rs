@@ -339,11 +339,7 @@ pub(crate) fn should_fallback_from_contract_events(error: &DatalensError) -> boo
     // Do not fallback on arbitrary provider failures: only errors that still
     // allow an equivalent finalized block scan should leave the optimized path.
     match error.kind {
-        DatalensErrorKind::AuthenticationFailed
-        | DatalensErrorKind::Unauthorized
-        | DatalensErrorKind::RateLimited
-        | DatalensErrorKind::ProviderTimeout
-        | DatalensErrorKind::UnsupportedDataset => true,
+        DatalensErrorKind::UnsupportedDataset => true,
         DatalensErrorKind::ProviderFailure => {
             is_contract_event_provider_failure_fallback_safe(error)
         }

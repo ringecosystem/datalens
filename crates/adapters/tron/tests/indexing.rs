@@ -263,7 +263,7 @@ fn test_tron_event_selector_accepts_ormp_topics_for_fallback() {
 #[test]
 fn test_tron_event_selector_without_known_topic_mapping_does_not_write_empty_fallback_coverage() {
     let storage = LocalStorage::new(temp_storage_root("unknown-topic-filtered-events"));
-    let provider = ContractEventFixtureProvider::with_error(DatalensErrorKind::RateLimited);
+    let provider = ContractEventFixtureProvider::with_error(DatalensErrorKind::UnsupportedDataset);
     let adapter = TronAdapter::with_provider(
         TronAdapter::with_fixture_defaults()
             .capabilities()
@@ -644,7 +644,7 @@ fn test_tron_contract_event_provider_page_cap_fails_without_durable_coverage() {
 }
 
 #[test]
-fn test_tron_contract_event_provider_rate_limit_falls_back_to_block_scan() {
+fn test_tron_contract_event_provider_rate_limit_does_not_fall_back_to_block_scan() {
     let provider = ContractEventFixtureProvider::with_error(DatalensErrorKind::RateLimited);
     let adapter = TronAdapter::with_provider(
         TronAdapter::with_fixture_defaults()
@@ -659,21 +659,45 @@ fn test_tron_contract_event_provider_rate_limit_falls_back_to_block_scan() {
     })
     .expect("selector");
 
-    let response = adapter
+    let error = adapter
         .fetch(datalens_chain::ChainFetchRequest::new(
             adapter.capabilities().chain().clone(),
             DatasetKey::tron_events(),
             LedgerRange::blocks(10, 10).expect("range"),
             selector,
         ))
-        .expect("fallback fetch");
+        .expect_err("rate limit should surface");
 
-    let QueryRows::AdapterJson { rows, .. } = response.rows.rows() else {
-        panic!("expected adapter JSON rows");
-    };
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0]["transaction_id"], "tron-tx-10");
-    assert_eq!(rows[0]["source"]["provider"], "tron_block_scan");
+    assert_eq!(error.kind, DatalensErrorKind::RateLimited);
+    assert_eq!(provider.contract_event_calls(), 1);
+}
+
+#[test]
+fn test_tron_contract_event_provider_timeout_does_not_fall_back_to_block_scan() {
+    let provider = ContractEventFixtureProvider::with_error(DatalensErrorKind::ProviderTimeout);
+    let adapter = TronAdapter::with_provider(
+        TronAdapter::with_fixture_defaults()
+            .capabilities()
+            .chain()
+            .clone(),
+        provider.clone(),
+    );
+    let selector = tron_event_selector(TronEventFilter {
+        contract_addresses: vec!["0xabcdefabcdefabcdefabcdefabcdefabcdefabcd".to_owned()],
+        event_names: vec!["Transfer".to_owned()],
+    })
+    .expect("selector");
+
+    let error = adapter
+        .fetch(datalens_chain::ChainFetchRequest::new(
+            adapter.capabilities().chain().clone(),
+            DatasetKey::tron_events(),
+            LedgerRange::blocks(10, 10).expect("range"),
+            selector,
+        ))
+        .expect_err("provider timeout should surface");
+
+    assert_eq!(error.kind, DatalensErrorKind::ProviderTimeout);
     assert_eq!(provider.contract_event_calls(), 1);
 }
 
