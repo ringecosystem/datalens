@@ -165,6 +165,14 @@ where
                 if !fetched_headers.is_empty()
                     && missing_evm_block_header_ranges(chunk, &fetched_headers).is_empty()
                 {
+                    let mut refreshed_headers =
+                        store.read_headers(&request.chain, chunk, request.finality_level)?;
+                    normalize_headers(&mut refreshed_headers);
+                    if missing_evm_block_header_ranges(chunk, &refreshed_headers).is_empty() {
+                        retain_range(&mut refreshed_headers, request.range);
+                        headers.extend(refreshed_headers);
+                        continue;
+                    }
                     store.persist_headers(
                         &request.chain,
                         chunk,
