@@ -128,24 +128,32 @@ fn test_ensure_follow_query_different_selector_or_chain_creates_different_tasks(
 }
 
 #[test]
-fn test_ensure_follow_query_returns_existing_non_running_task_state() {
-    let registry = LocalWarmupRegistry::new(object_store("ensure-follow-query-states"));
+fn test_ensure_follow_query_requeues_existing_non_runnable_task() {
+    let registry = LocalWarmupRegistry::new(object_store("ensure-follow-query-requeue"));
 
     let paused = registry
         .ensure(follow_query_request())
         .expect("paused ensure")
         .task_id;
     registry.pause(&paused).expect("pause task");
-    assert_existing_ensure_state(&registry, WarmupTaskState::Paused);
+    assert_existing_ensure_requeues(&registry);
 
     let mut failed_task = registry.get(&paused).unwrap().unwrap();
     failed_task.state = WarmupTaskState::Failed;
     failed_task.last_error = Some("provider unavailable".to_owned());
     registry.save_task(&failed_task).expect("save failed task");
-    assert_existing_ensure_state(&registry, WarmupTaskState::Failed);
+    assert_existing_ensure_requeues(&registry);
+    assert_eq!(registry.get(&paused).unwrap().unwrap().last_error, None);
 
     registry.cancel(&paused).expect("cancel task");
-    assert_existing_ensure_state(&registry, WarmupTaskState::Cancelled);
+    assert_existing_ensure_requeues(&registry);
+
+    let mut completed_task = registry.get(&paused).unwrap().unwrap();
+    completed_task.state = WarmupTaskState::Completed;
+    registry
+        .save_task(&completed_task)
+        .expect("save completed task");
+    assert_existing_ensure_requeues(&registry);
 
     let tasks = registry
         .list(datalens_warmup::WarmupTaskFilter::default())
@@ -1250,17 +1258,16 @@ fn ensure_lower_task_id_without_watermark(
     panic!("could not create a lower sorted inactive follow_query task");
 }
 
-fn assert_existing_ensure_state(
-    registry: &LocalWarmupRegistry<LocalObjectStore>,
-    state: WarmupTaskState,
-) {
+fn assert_existing_ensure_requeues(registry: &LocalWarmupRegistry<LocalObjectStore>) {
     let mut request = follow_query_request();
     request.start = 100;
 
     let outcome = registry.ensure(request).expect("ensure existing task");
 
     assert!(!outcome.created);
-    assert_eq!(outcome.state, state);
+    assert_eq!(outcome.state, WarmupTaskState::Queued);
+    let task = registry.get(&outcome.task_id).unwrap().unwrap();
+    assert_eq!(task.state, WarmupTaskState::Queued);
 }
 
 fn execute_log_query<R>(executor: &NativeQueryExecutor<R, FixtureAdapter>, range: LedgerRange)

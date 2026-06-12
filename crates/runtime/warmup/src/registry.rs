@@ -178,12 +178,18 @@ where
             ));
         }
         let ensure_key = task_ensure_key(&request);
-        if let Some(existing) = self
+        if let Some(mut existing) = self
             .list(WarmupTaskFilter::default())?
             .into_iter()
             .filter(|task| task.mode == WarmupTaskMode::FollowQuery)
             .find(|task| task_ensure_key_for_task(task) == ensure_key)
         {
+            if !is_scheduler_runnable(existing.state) {
+                existing.state = WarmupTaskState::Queued;
+                existing.last_error = None;
+                existing.touch(unix_seconds_now()?);
+                self.save_task(&existing)?;
+            }
             return Ok(WarmupEnsureOutcome {
                 task_id: existing.task_id,
                 created: false,
@@ -418,6 +424,10 @@ fn matches_filter(task: &WarmupTask, filter: &WarmupTaskFilter) -> bool {
             .as_ref()
             .is_none_or(|chain_key| &task.chain.key_prefix() == chain_key)
         && filter.state.is_none_or(|state| task.state == state)
+}
+
+fn is_scheduler_runnable(state: WarmupTaskState) -> bool {
+    matches!(state, WarmupTaskState::Queued | WarmupTaskState::Running)
 }
 
 fn missing_task(task_id: &WarmupTaskId) -> DatalensError {
