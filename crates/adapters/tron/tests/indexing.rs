@@ -199,7 +199,7 @@ fn test_tron_event_selector_filters_fallback_rows_by_contract_and_event_name() {
             adapter.capabilities().chain().clone(),
             DatasetKey::tron_events(),
             LedgerRange::blocks(10, 12).expect("range"),
-            selector,
+            selector.clone(),
         ))
         .expect("fetch events");
 
@@ -240,11 +240,24 @@ fn test_tron_event_selector_accepts_ormp_topics_for_fallback() {
             adapter.capabilities().chain().clone(),
             DatasetKey::tron_events(),
             LedgerRange::blocks(10, 12).expect("range"),
-            selector,
+            selector.clone(),
         ))
         .expect("fetch events");
 
     assert_eq!(response.rows.row_count(), 0);
+    assert!(response.provider_diagnostics.calls > 0);
+
+    let cached = adapter
+        .fetch(datalens_chain::ChainFetchRequest::new(
+            adapter.capabilities().chain().clone(),
+            DatasetKey::tron_events(),
+            LedgerRange::blocks(10, 12).expect("range"),
+            selector,
+        ))
+        .expect("fetch cached empty events");
+
+    assert_eq!(cached.rows.row_count(), 0);
+    assert!(cached.provider_diagnostics.calls > 0);
 }
 
 #[test]
