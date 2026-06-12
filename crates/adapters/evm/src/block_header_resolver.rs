@@ -1,4 +1,7 @@
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    sync::{Arc, Condvar, Mutex},
+};
 
 use datalens_chain::{DatasetSelector, FinalityLevel};
 use datalens_core::{
@@ -83,6 +86,16 @@ pub trait EvmBlockHeaderStore {
         finality_level: FinalityLevel,
         headers: Vec<EvmBlockHeader>,
     ) -> Result<(), DatalensError>;
+
+    fn synchronize_chunk<T>(
+        &self,
+        _chain: &ChainIdentity,
+        _range: BlockRange,
+        _finality_level: FinalityLevel,
+        operation: impl FnOnce() -> Result<T, DatalensError>,
+    ) -> Result<T, DatalensError> {
+        operation()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -149,39 +162,46 @@ where
         let store = self.store.as_ref().expect("store checked");
         for missing in missing_evm_block_header_ranges(request.range, &headers) {
             for chunk in self.chunk_policy.aligned_ranges(missing) {
-                let mut chunk_headers =
-                    store.read_headers(&request.chain, chunk, request.finality_level)?;
-                normalize_headers(&mut chunk_headers);
-                if missing_evm_block_header_ranges(chunk, &chunk_headers).is_empty() {
-                    retain_range(&mut chunk_headers, request.range);
-                    headers.extend(chunk_headers);
-                    continue;
-                }
+                let mut chunk_headers = store.synchronize_chunk(
+                    &request.chain,
+                    chunk,
+                    request.finality_level,
+                    || {
+                        let mut chunk_headers =
+                            store.read_headers(&request.chain, chunk, request.finality_level)?;
+                        normalize_headers(&mut chunk_headers);
+                        if missing_evm_block_header_ranges(chunk, &chunk_headers).is_empty() {
+                            return Ok(chunk_headers);
+                        }
 
-                let fetched = self.fetcher.fetch_block_headers(chunk)?;
-                let mut fetched_headers = fetched.headers;
-                retain_range(&mut fetched_headers, chunk);
-                normalize_headers(&mut fetched_headers);
-                if !fetched_headers.is_empty()
-                    && missing_evm_block_header_ranges(chunk, &fetched_headers).is_empty()
-                {
-                    let mut refreshed_headers =
-                        store.read_headers(&request.chain, chunk, request.finality_level)?;
-                    normalize_headers(&mut refreshed_headers);
-                    if missing_evm_block_header_ranges(chunk, &refreshed_headers).is_empty() {
-                        retain_range(&mut refreshed_headers, request.range);
-                        headers.extend(refreshed_headers);
-                        continue;
-                    }
-                    store.persist_headers(
-                        &request.chain,
-                        chunk,
-                        request.finality_level,
-                        fetched_headers.clone(),
-                    )?;
-                }
-                retain_range(&mut fetched_headers, request.range);
-                headers.extend(fetched_headers);
+                        let fetched = self.fetcher.fetch_block_headers(chunk)?;
+                        let mut fetched_headers = fetched.headers;
+                        retain_range(&mut fetched_headers, chunk);
+                        normalize_headers(&mut fetched_headers);
+                        if fetched_headers.is_empty()
+                            || !missing_evm_block_header_ranges(chunk, &fetched_headers).is_empty()
+                        {
+                            return Ok(fetched_headers);
+                        }
+
+                        let mut refreshed_headers =
+                            store.read_headers(&request.chain, chunk, request.finality_level)?;
+                        normalize_headers(&mut refreshed_headers);
+                        if missing_evm_block_header_ranges(chunk, &refreshed_headers).is_empty() {
+                            return Ok(refreshed_headers);
+                        }
+
+                        store.persist_headers(
+                            &request.chain,
+                            chunk,
+                            request.finality_level,
+                            fetched_headers.clone(),
+                        )?;
+                        Ok(fetched_headers)
+                    },
+                )?;
+                retain_range(&mut chunk_headers, request.range);
+                headers.extend(chunk_headers);
             }
         }
 
@@ -241,6 +261,7 @@ impl EvmBlockHeaderStore for NoEvmBlockHeaderStore {
 pub struct DurableEvmBlockHeaderStore<R> {
     storage: R,
     writer: DurableWriter<R>,
+    chunk_coordinator: Arc<BlockHeaderChunkCoordinator>,
 }
 
 impl<R> DurableEvmBlockHeaderStore<R>
@@ -251,6 +272,7 @@ where
         Self {
             writer: DurableWriter::new(storage.clone(), writer_config),
             storage,
+            chunk_coordinator: Arc::default(),
         }
     }
 
@@ -258,6 +280,7 @@ where
         Self {
             storage: writer.storage(),
             writer,
+            chunk_coordinator: Arc::default(),
         }
     }
 
@@ -320,6 +343,66 @@ where
             }],
         })?;
         Ok(())
+    }
+
+    fn synchronize_chunk<T>(
+        &self,
+        chain: &ChainIdentity,
+        range: BlockRange,
+        finality_level: FinalityLevel,
+        operation: impl FnOnce() -> Result<T, DatalensError>,
+    ) -> Result<T, DatalensError> {
+        let _guard = self.chunk_coordinator.acquire(format!(
+            "{}|{:?}|{}-{}",
+            chain.key_prefix(),
+            finality_level,
+            range.from_block,
+            range.to_block
+        ));
+        operation()
+    }
+}
+
+#[derive(Debug, Default)]
+struct BlockHeaderChunkCoordinator {
+    in_flight: Mutex<BTreeSet<String>>,
+    ready: Condvar,
+}
+
+impl BlockHeaderChunkCoordinator {
+    fn acquire(&self, key: String) -> BlockHeaderChunkGuard<'_> {
+        let mut in_flight = self
+            .in_flight
+            .lock()
+            .expect("block header chunk coordinator");
+        while in_flight.contains(&key) {
+            in_flight = self
+                .ready
+                .wait(in_flight)
+                .expect("block header chunk coordinator");
+        }
+        in_flight.insert(key.clone());
+        BlockHeaderChunkGuard {
+            coordinator: self,
+            key,
+        }
+    }
+}
+
+struct BlockHeaderChunkGuard<'a> {
+    coordinator: &'a BlockHeaderChunkCoordinator,
+    key: String,
+}
+
+impl Drop for BlockHeaderChunkGuard<'_> {
+    fn drop(&mut self) {
+        let mut in_flight = self
+            .coordinator
+            .in_flight
+            .lock()
+            .expect("block header chunk coordinator");
+        in_flight.remove(&self.key);
+        self.coordinator.ready.notify_all();
     }
 }
 
