@@ -105,6 +105,29 @@ fn test_follow_query_explicit_zero_offset_still_starts_after_watermark() {
 }
 
 #[test]
+fn test_follow_query_large_lookahead_builds_lead_past_next_runner_batch() {
+    let plan = WarmupTargetPlanner::plan(WarmupTargetPlanInput {
+        mode: WarmupTaskMode::FollowQuery,
+        fixed_end: None,
+        cursor_next: 221_992_620,
+        query_watermark: Some(221_992_619),
+        safe_head: 222_500_000,
+        lookahead_blocks: 100_000,
+        start_offset_blocks: Some(1),
+        start_offset_tiers_blocks: None,
+        catchup_threshold_blocks: 200,
+    });
+
+    assert_eq!(
+        plan,
+        PlannedWarmupTarget::Range {
+            start: 222_002_620,
+            end: 222_102_619,
+        }
+    );
+}
+
+#[test]
 fn test_follow_query_uses_adaptive_start_offset_after_watermark() {
     let plan = WarmupTargetPlanner::plan(WarmupTargetPlanInput {
         mode: WarmupTaskMode::FollowQuery,

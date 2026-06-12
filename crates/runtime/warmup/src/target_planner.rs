@@ -91,6 +91,10 @@ fn smallest_fitting_offset(
     greater_than: u64,
     safe_delta: u64,
 ) -> Option<u64> {
+    let lead_floor = lookahead_lead_floor(input).filter(|offset| *offset <= safe_delta);
+    let greater_than = lead_floor
+        .map(|offset| greater_than.max(offset.saturating_sub(1)))
+        .unwrap_or(greater_than);
     let mut configured = configured_offset_tiers(input);
     configured.sort_unstable();
     configured.dedup();
@@ -98,6 +102,7 @@ fn smallest_fitting_offset(
         .into_iter()
         .find(|offset| *offset > greater_than && *offset <= safe_delta)
         .or_else(|| adaptive_fallback_offset(greater_than, safe_delta))
+        .or(lead_floor)
 }
 
 fn configured_offset_tiers(input: &WarmupTargetPlanInput) -> Vec<u64> {
@@ -116,6 +121,7 @@ fn configured_offset_tiers(input: &WarmupTargetPlanInput) -> Vec<u64> {
 fn largest_fitting_offset(input: &WarmupTargetPlanInput, safe_delta: u64) -> Option<u64> {
     configured_offset_tiers(input)
         .into_iter()
+        .chain(lookahead_lead_floor(input))
         .chain([500, 100, 50, 10, 1])
         .filter(|offset| *offset <= safe_delta)
         .max()
@@ -131,4 +137,8 @@ fn adaptive_fallback_offset(greater_than: u64, safe_delta: u64) -> Option<u64> {
         .into_iter()
         .filter(|offset| *offset > greater_than && *offset <= safe_delta)
         .max()
+}
+
+fn lookahead_lead_floor(input: &WarmupTargetPlanInput) -> Option<u64> {
+    (input.lookahead_blocks >= 10_000).then_some(input.lookahead_blocks / 10 + 1)
 }
