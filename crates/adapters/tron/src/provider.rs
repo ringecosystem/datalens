@@ -183,6 +183,7 @@ impl TronProvider for TronHttpProvider {
             .client
             .get(&url)
             .header("TRON-PRO-API-KEY", api_key)
+            .header(reqwest::header::ACCEPT_ENCODING, "identity")
             .send()
             .map_err(|error| {
                 DatalensError::new(
@@ -195,11 +196,29 @@ impl TronProvider for TronHttpProvider {
                 )
             })?;
         let status = response.status();
-        let body: Value = response.json().map_err(|error| {
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let raw_body = response.text().map_err(|error| {
             DatalensError::new(
-                DatalensErrorKind::InvalidRequest,
+                DatalensErrorKind::ProviderFailure,
                 format!(
-                    "decode TronGrid contract events response: {}",
+                    "read TronGrid contract events response failed endpoint={}: {}",
+                    redact_url(&url),
+                    redact_urls_in_text(&error.to_string())
+                ),
+            )
+        })?;
+        let body: Value = serde_json::from_str(&raw_body).map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::ProviderFailure,
+                format!(
+                    "decode TronGrid contract events response failed status={} content_type={} body_prefix={}: {}",
+                    status.as_u16(),
+                    content_type.as_deref().unwrap_or("<none>"),
+                    redact_body_prefix(&raw_body),
                     redact_urls_in_text(&error.to_string())
                 ),
             )
@@ -496,6 +515,11 @@ fn trongrid_contract_events_http_error(status: u16, body: &Value) -> DatalensErr
             redact_urls_in_text(message)
         ),
     )
+}
+
+fn redact_body_prefix(body: &str) -> String {
+    let prefix: String = body.chars().take(256).collect();
+    redact_urls_in_text(&prefix.replace(['\n', '\r'], " "))
 }
 
 fn parse_contract_event_page(value: &Value) -> Result<TronContractEventPage, DatalensError> {

@@ -232,7 +232,7 @@ fn test_tron_event_selector_without_known_topic_mapping_does_not_write_empty_fal
     let runtime = runtime(adapter.clone(), storage.clone());
     let selector = tron_event_selector(TronEventFilter {
         contract_addresses: vec!["0xabcdefabcdefabcdefabcdefabcdefabcdefabcd".to_owned()],
-        event_names: vec!["MessageAccepted".to_owned()],
+        event_names: vec!["DefinitelyUnknownEvent".to_owned()],
     })
     .expect("selector");
 
