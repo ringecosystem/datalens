@@ -180,6 +180,28 @@ fn test_block_header_resolver_bounds_persisted_ranges_by_chunk_count() {
     );
 }
 
+#[test]
+fn test_block_header_resolver_rechecks_chunk_before_persisting_after_fetch() {
+    let chain = ethereum();
+    let store = RacingHeaderStore::new((10..=19).map(header).collect());
+    let fetcher = MemoryHeaderFetcher::new((10..=19).map(header).collect());
+    let resolver = EvmBlockHeaderResolver::with_store(fetcher.clone(), store.clone())
+        .with_chunk_policy(EvmBlockHeaderChunkPolicy::new(10));
+
+    let resolved = resolver
+        .resolve(EvmBlockHeaderResolveRequest {
+            chain,
+            range: BlockRange::expect_new(12, 13),
+            finality_level: FinalityLevel::Safe,
+        })
+        .expect("resolve headers");
+
+    assert_eq!(numbers(&resolved), vec![12, 13]);
+    assert_eq!(fetcher.requests(), vec![BlockRange::expect_new(10, 19)]);
+    assert_eq!(store.read_count(), 3);
+    assert!(store.persisted_ranges().is_empty());
+}
+
 #[derive(Clone, Debug)]
 struct MemoryHeaderStore {
     stored: Arc<Mutex<BTreeMap<u64, EvmBlockHeader>>>,
@@ -252,6 +274,74 @@ impl EvmBlockHeaderStore for MemoryHeaderStore {
             stored.insert(header.block_number, header.clone());
             persisted.push(header);
         }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RacingHeaderStore {
+    headers: Arc<BTreeMap<u64, EvmBlockHeader>>,
+    read_count: Arc<Mutex<usize>>,
+    persisted_ranges: Arc<Mutex<Vec<BlockRange>>>,
+}
+
+impl RacingHeaderStore {
+    fn new(headers: Vec<EvmBlockHeader>) -> Self {
+        Self {
+            headers: Arc::new(
+                headers
+                    .into_iter()
+                    .map(|header| (header.block_number, header))
+                    .collect(),
+            ),
+            read_count: Arc::new(Mutex::new(0)),
+            persisted_ranges: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn read_count(&self) -> usize {
+        *self.read_count.lock().expect("read count")
+    }
+
+    fn persisted_ranges(&self) -> Vec<BlockRange> {
+        self.persisted_ranges
+            .lock()
+            .expect("persisted ranges")
+            .clone()
+    }
+}
+
+impl EvmBlockHeaderStore for RacingHeaderStore {
+    fn read_headers(
+        &self,
+        _chain: &ChainIdentity,
+        range: BlockRange,
+        _finality_level: FinalityLevel,
+    ) -> Result<Vec<EvmBlockHeader>, DatalensError> {
+        let mut read_count = self.read_count.lock().expect("read count");
+        *read_count += 1;
+        if *read_count < 3 {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .headers
+            .values()
+            .filter(|header| range.contains(header.block_number))
+            .cloned()
+            .collect())
+    }
+
+    fn persist_headers(
+        &self,
+        _chain: &ChainIdentity,
+        range: BlockRange,
+        _finality_level: FinalityLevel,
+        _headers: Vec<EvmBlockHeader>,
+    ) -> Result<(), DatalensError> {
+        self.persisted_ranges
+            .lock()
+            .expect("persisted ranges")
+            .push(range);
         Ok(())
     }
 }
