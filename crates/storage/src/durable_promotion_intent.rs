@@ -5,12 +5,17 @@ use datalens_core::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
+use std::{
+    collections::{BTreeMap, VecDeque},
+    sync::Arc,
+};
 
 use crate::object_store::ObjectStore;
 
 const INTENT_PREFIX: &str = "durable-promotion-intents/v1/intents";
 const PENDING_INDEX_PREFIX: &str = "durable-promotion-intents/v1/index/status=pending";
+const PENDING_APPLICATION_INDEX_PREFIX: &str =
+    "durable-promotion-intents/v1/index/status=pending-by-application";
 const QUERY_SOURCE_KEY: &str = "query";
 const WARMUP_SOURCE_KEY: &str = "warmup";
 
@@ -311,33 +316,33 @@ where
     }
 
     fn write_pending_index(&self, intent: &DurablePromotionIntent) -> Result<(), DatalensError> {
-        let Some(key) = pending_index_key(intent) else {
-            return Ok(());
-        };
-        self.object_store.put(&key, b"{}\n").map_err(|error| {
-            DatalensError::new(
-                DatalensErrorKind::StorageWriteFailure,
-                format!(
-                    "write durable promotion intent pending index {key}: {}",
-                    error.message
-                ),
-            )
-        })
+        for key in pending_index_keys_for_intent(intent) {
+            self.object_store.put(&key, b"{}\n").map_err(|error| {
+                DatalensError::new(
+                    DatalensErrorKind::StorageWriteFailure,
+                    format!(
+                        "write durable promotion intent pending index {key}: {}",
+                        error.message
+                    ),
+                )
+            })?;
+        }
+        Ok(())
     }
 
     fn delete_pending_index(&self, intent: &DurablePromotionIntent) -> Result<(), DatalensError> {
-        let Some(key) = pending_index_key(intent) else {
-            return Ok(());
-        };
-        self.object_store.delete(&key).map_err(|error| {
-            DatalensError::new(
-                DatalensErrorKind::StorageWriteFailure,
-                format!(
-                    "delete durable promotion intent pending index {key}: {}",
-                    error.message
-                ),
-            )
-        })
+        for key in pending_index_keys_for_intent(intent) {
+            self.object_store.delete(&key).map_err(|error| {
+                DatalensError::new(
+                    DatalensErrorKind::StorageWriteFailure,
+                    format!(
+                        "delete durable promotion intent pending index {key}: {}",
+                        error.message
+                    ),
+                )
+            })?;
+        }
+        Ok(())
     }
 
     fn update_intent(
@@ -419,6 +424,56 @@ where
                 entry.key.clone(),
             )
         });
+        Ok(entries)
+    }
+
+    fn pending_application_index_entries_for_chain_and_source(
+        &self,
+        chain: &ChainIdentity,
+        source: &str,
+        now_unix_seconds: u64,
+    ) -> Result<Vec<PendingIndexEntry>, DatalensError> {
+        let mut entries_by_application: BTreeMap<String, VecDeque<PendingIndexEntry>> =
+            BTreeMap::new();
+        let prefix = pending_application_index_prefix(chain, source);
+        for object in self.object_store.list(&prefix)? {
+            let Some(entry) = parse_pending_index_entry(&object.key) else {
+                continue;
+            };
+            if entry.due_at_unix_seconds > now_unix_seconds {
+                continue;
+            }
+            let Some(application_key) = entry.application_key.clone() else {
+                continue;
+            };
+            entries_by_application
+                .entry(application_key)
+                .or_default()
+                .push_back(entry);
+        }
+        for entries in entries_by_application.values_mut() {
+            let mut sorted = entries.drain(..).collect::<Vec<_>>();
+            sorted.sort_by_key(|entry| {
+                (
+                    entry.due_at_unix_seconds,
+                    entry.intent_id.clone(),
+                    entry.key.clone(),
+                )
+            });
+            entries.extend(sorted);
+        }
+
+        let mut entries = Vec::new();
+        while entries_by_application
+            .values()
+            .any(|group| !group.is_empty())
+        {
+            for group in entries_by_application.values_mut() {
+                if let Some(entry) = group.pop_front() {
+                    entries.push(entry);
+                }
+            }
+        }
         Ok(entries)
     }
 
@@ -622,11 +677,19 @@ where
             return Ok(Vec::new());
         }
         let mut pending = Vec::new();
-        for entry in self.pending_index_entries_for_chain_and_source(
+        let mut entries = self.pending_application_index_entries_for_chain_and_source(
             chain,
             source_key(source),
             now_unix_seconds,
-        )? {
+        )?;
+        if entries.is_empty() {
+            entries = self.pending_index_entries_for_chain_and_source(
+                chain,
+                source_key(source),
+                now_unix_seconds,
+            )?;
+        }
+        for entry in entries {
             let Some(intent) = self.get(&entry.intent_id)? else {
                 let _ = self.object_store.delete(&entry.key);
                 continue;
@@ -873,6 +936,7 @@ struct PendingIndexEntry {
     key: String,
     intent_id: String,
     due_at_unix_seconds: u64,
+    application_key: Option<String>,
 }
 
 fn pending_index_prefix(chain: &ChainIdentity, source: &str) -> String {
@@ -882,7 +946,14 @@ fn pending_index_prefix(chain: &ChainIdentity, source: &str) -> String {
     )
 }
 
-fn pending_index_key(intent: &DurablePromotionIntent) -> Option<String> {
+fn pending_application_index_prefix(chain: &ChainIdentity, source: &str) -> String {
+    format!(
+        "{PENDING_APPLICATION_INDEX_PREFIX}/chain={}/source={source}",
+        chain.key_prefix()
+    )
+}
+
+fn pending_index_keys_for_intent(intent: &DurablePromotionIntent) -> Vec<String> {
     let due_at_unix_seconds = match intent.status {
         DurablePromotionIntentStatus::Pending => intent.created_at_unix_seconds,
         DurablePromotionIntentStatus::FailedRetryable => intent
@@ -890,14 +961,23 @@ fn pending_index_key(intent: &DurablePromotionIntent) -> Option<String> {
             .unwrap_or(intent.created_at_unix_seconds),
         DurablePromotionIntentStatus::Running
         | DurablePromotionIntentStatus::Completed
-        | DurablePromotionIntentStatus::FailedTerminal => return None,
+        | DurablePromotionIntentStatus::FailedTerminal => return Vec::new(),
     };
-    Some(format!(
-        "{}/created={:019}/intent={}.json",
-        pending_index_prefix(&intent.chain, source_key(intent.source)),
-        due_at_unix_seconds,
-        intent.intent_id
-    ))
+    vec![
+        format!(
+            "{}/created={:019}/intent={}.json",
+            pending_index_prefix(&intent.chain, source_key(intent.source)),
+            due_at_unix_seconds,
+            intent.intent_id
+        ),
+        format!(
+            "{}/application={}/created={:019}/intent={}.json",
+            pending_application_index_prefix(&intent.chain, source_key(intent.source)),
+            application_key(&intent.application),
+            due_at_unix_seconds,
+            intent.intent_id
+        ),
+    ]
 }
 
 fn parse_pending_index_entry(key: &str) -> Option<PendingIndexEntry> {
@@ -915,7 +995,15 @@ fn parse_pending_index_entry(key: &str) -> Option<PendingIndexEntry> {
         key: key.to_owned(),
         intent_id,
         due_at_unix_seconds,
+        application_key: key
+            .split('/')
+            .find_map(|segment| segment.strip_prefix("application="))
+            .map(str::to_owned),
     })
+}
+
+fn application_key(application: &str) -> String {
+    hex_bytes(application.as_bytes())
 }
 
 fn source_key(source: DurablePromotionIntentSource) -> &'static str {

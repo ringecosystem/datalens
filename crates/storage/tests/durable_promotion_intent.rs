@@ -366,6 +366,62 @@ fn test_list_pending_for_chain_and_source_filters_before_applying_limit() {
 }
 
 #[test]
+fn test_list_pending_for_chain_and_source_is_fair_across_applications() {
+    let store = DurablePromotionIntentStore::new(LocalObjectStore::new(temp_storage_root(
+        "source-application-fairness",
+    )));
+    let ethereum = test_chain();
+    for index in 0..32 {
+        store
+            .create_or_get(datalens_storage::CreateDurablePromotionIntent {
+                source: DurablePromotionIntentSource::Warmup,
+                application: "degov-api".to_owned(),
+                chain: ethereum.clone(),
+                dataset_key: DatasetKey::evm_blocks(),
+                selector: DatasetSelector::all(),
+                selector_fingerprint: "all".to_owned(),
+                selector_canonical_key: "all".to_owned(),
+                finality: "safe".to_owned(),
+                ranges: vec![LedgerRange::blocks(100 + index, 101 + index).expect("valid range")],
+                request_id: None,
+                task_id: Some(format!("degov-task-{index}")),
+                now_unix_seconds: 100 + index,
+            })
+            .expect("create degov warmup intent");
+    }
+    let ormp_intent = store
+        .create_or_get(datalens_storage::CreateDurablePromotionIntent {
+            source: DurablePromotionIntentSource::Warmup,
+            application: "ormp-api".to_owned(),
+            chain: ethereum.clone(),
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: DatasetSelector::all(),
+            selector_fingerprint: "all".to_owned(),
+            selector_canonical_key: "all".to_owned(),
+            finality: "safe".to_owned(),
+            ranges: vec![LedgerRange::blocks(500, 501).expect("valid range")],
+            request_id: None,
+            task_id: Some("ormp-task-1".to_owned()),
+            now_unix_seconds: 200,
+        })
+        .expect("create ormp warmup intent");
+    let DurablePromotionIntentCreateOutcome::Created(ormp_intent) = ormp_intent else {
+        panic!("ormp intent should be created");
+    };
+
+    let pending = store
+        .list_pending_for_chain_and_source(&ethereum, DurablePromotionIntentSource::Warmup, 300, 16)
+        .expect("list source pending");
+
+    assert!(
+        pending
+            .iter()
+            .any(|intent| intent.intent_id == ormp_intent.intent_id),
+        "application fairness should include ORMP despite older DeGov backlog: {pending:?}"
+    );
+}
+
+#[test]
 fn test_pending_backlog_for_chain_uses_pending_index_without_canonical_reads() {
     let root = temp_storage_root("pending-backlog-index");
     let object_store = CountingObjectStore::new(root);
@@ -844,6 +900,82 @@ fn test_rebuild_pending_indexes_heals_legacy_pending_beyond_first_128_intents() 
 }
 
 #[test]
+fn test_rebuild_pending_indexes_heals_legacy_application_fairness_indexes() {
+    let root = temp_storage_root("legacy-application-index-rebuild");
+    let object_store = LocalObjectStore::new(root);
+    let store = DurablePromotionIntentStore::new(object_store.clone());
+    let chain = test_chain();
+    for index in 0..32 {
+        store
+            .create_or_get(datalens_storage::CreateDurablePromotionIntent {
+                source: DurablePromotionIntentSource::Warmup,
+                application: "degov-api".to_owned(),
+                chain: chain.clone(),
+                dataset_key: DatasetKey::evm_blocks(),
+                selector: DatasetSelector::all(),
+                selector_fingerprint: "all".to_owned(),
+                selector_canonical_key: "all".to_owned(),
+                finality: "safe".to_owned(),
+                ranges: vec![LedgerRange::blocks(100 + index, 101 + index).expect("valid range")],
+                request_id: None,
+                task_id: Some(format!("degov-task-{index}")),
+                now_unix_seconds: 100 + index,
+            })
+            .expect("create degov warmup intent");
+    }
+    let ormp = store
+        .create_or_get(datalens_storage::CreateDurablePromotionIntent {
+            source: DurablePromotionIntentSource::Warmup,
+            application: "ormp-api".to_owned(),
+            chain: chain.clone(),
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: DatasetSelector::all(),
+            selector_fingerprint: "all".to_owned(),
+            selector_canonical_key: "all".to_owned(),
+            finality: "safe".to_owned(),
+            ranges: vec![LedgerRange::blocks(500, 501).expect("valid range")],
+            request_id: None,
+            task_id: Some("ormp-task-1".to_owned()),
+            now_unix_seconds: 200,
+        })
+        .expect("create ormp warmup intent");
+    let DurablePromotionIntentCreateOutcome::Created(ormp) = ormp else {
+        panic!("ormp intent should be created");
+    };
+    for key in application_pending_index_keys(&object_store, &chain, "warmup") {
+        object_store
+            .delete(&key)
+            .expect("remove application pending index");
+    }
+    assert!(
+        !store
+            .list_pending_for_chain_and_source(
+                &chain,
+                DurablePromotionIntentSource::Warmup,
+                300,
+                16,
+            )
+            .expect("list before rebuild")
+            .iter()
+            .any(|intent| intent.intent_id == ormp.intent_id)
+    );
+
+    store
+        .rebuild_pending_indexes(300)
+        .expect("rebuild pending indexes");
+    let pending = store
+        .list_pending_for_chain_and_source(&chain, DurablePromotionIntentSource::Warmup, 300, 16)
+        .expect("list after rebuild");
+
+    assert!(
+        pending
+            .iter()
+            .any(|intent| intent.intent_id == ormp.intent_id),
+        "rebuild should restore application fairness indexes: {pending:?}"
+    );
+}
+
+#[test]
 fn test_rebuild_pending_indexes_heals_due_retryable_when_index_write_failed() {
     let root = temp_storage_root("retryable-index-write-failure");
     let object_store = FailOnceIndexPutObjectStore::new(root);
@@ -1114,6 +1246,23 @@ fn pending_index_keys(
             source
         ))
         .expect("list pending index")
+        .into_iter()
+        .map(|object| object.key)
+        .collect()
+}
+
+fn application_pending_index_keys(
+    object_store: &LocalObjectStore,
+    chain: &ChainIdentity,
+    source: &str,
+) -> Vec<String> {
+    object_store
+        .list(&format!(
+            "durable-promotion-intents/v1/index/status=pending-by-application/chain={}/source={}",
+            chain.key_prefix(),
+            source
+        ))
+        .expect("list application pending index")
         .into_iter()
         .map(|object| object.key)
         .collect()
