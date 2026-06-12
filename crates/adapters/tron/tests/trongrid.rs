@@ -30,6 +30,8 @@ fn test_trongrid_contract_events_request_uses_path_query_auth_and_pagination() {
             .expect("address"),
             event_name: Some("Transfer".to_owned()),
             range: LedgerRange::blocks(83_200_000, 83_200_000).expect("range"),
+            start_timestamp: None,
+            end_timestamp: None,
             only_confirmed: true,
             limit: 50,
             fingerprint: Some("previous-page".to_owned()),
@@ -60,7 +62,7 @@ fn test_trongrid_contract_events_request_uses_path_query_auth_and_pagination() {
 }
 
 #[test]
-fn test_trongrid_contract_events_rejects_direct_multi_block_range() {
+fn test_trongrid_contract_events_rejects_range_without_timestamps() {
     let provider = TronHttpProvider::new("http://unused")
         .with_trongrid("http://trongrid.invalid", Some("secret-key".to_owned()));
 
@@ -72,6 +74,8 @@ fn test_trongrid_contract_events_rejects_direct_multi_block_range() {
             .expect("address"),
             event_name: Some("Transfer".to_owned()),
             range: LedgerRange::blocks(83_200_000, 83_200_002).expect("range"),
+            start_timestamp: None,
+            end_timestamp: None,
             only_confirmed: true,
             limit: 50,
             fingerprint: None,
@@ -79,7 +83,37 @@ fn test_trongrid_contract_events_rejects_direct_multi_block_range() {
         .expect_err("provider should not issue unbounded TronGrid scans");
 
     assert_eq!(error.kind, DatalensErrorKind::UnsupportedDataset);
-    assert!(error.message.contains("single block_number"));
+    assert!(error.message.contains("start_timestamp"));
+}
+
+#[test]
+fn test_trongrid_contract_events_range_request_uses_timestamp_query() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let server = TestServer::spawn(seen.clone(), r#"{"data":[],"meta":{}}"#, "HTTP/1.1 200 OK");
+    let provider = TronHttpProvider::new("http://unused")
+        .with_trongrid(server.url(), Some("secret-key".to_owned()));
+
+    provider
+        .get_contract_events(TronContractEventRequest {
+            contract_address: normalize_tron_contract_address(
+                "41a614f803b6fd780986a42c78ec9c7f77e6ded13c",
+            )
+            .expect("address"),
+            event_name: Some("Transfer".to_owned()),
+            range: LedgerRange::blocks(83_200_000, 83_200_002).expect("range"),
+            start_timestamp: Some(1_700_000_000_000),
+            end_timestamp: Some(1_700_000_006_000),
+            only_confirmed: true,
+            limit: 50,
+            fingerprint: None,
+        })
+        .expect("contract events");
+
+    let request = seen.lock().expect("seen").join("\n");
+    assert!(request.contains("min_block_timestamp=1700000000000"));
+    assert!(request.contains("max_block_timestamp=1700000006000"));
+    assert!(request.contains("order_by=block_timestamp%2Casc"));
+    assert!(!request.contains("block_number="));
 }
 
 #[test]
@@ -122,6 +156,8 @@ fn test_trongrid_transport_error_redacts_rpc_url_credentials() {
             contract_address: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t".to_owned(),
             event_name: Some("MessageAccepted".to_owned()),
             range: LedgerRange::blocks(123, 123).expect("range"),
+            start_timestamp: None,
+            end_timestamp: None,
             only_confirmed: true,
             limit: 20,
             fingerprint: None,
@@ -168,6 +204,8 @@ fn test_trongrid_contract_events_response_is_normalized() {
             contract_address: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t".to_owned(),
             event_name: Some("MessageAccepted".to_owned()),
             range: LedgerRange::blocks(123, 123).expect("range"),
+            start_timestamp: None,
+            end_timestamp: None,
             only_confirmed: true,
             limit: 20,
             fingerprint: None,
@@ -207,6 +245,8 @@ fn test_trongrid_contract_events_malformed_response_includes_status_and_body_pre
             .expect("address"),
             event_name: Some("Transfer".to_owned()),
             range: LedgerRange::blocks(10, 10).expect("range"),
+            start_timestamp: None,
+            end_timestamp: None,
             only_confirmed: true,
             limit: 50,
             fingerprint: None,
@@ -244,6 +284,8 @@ fn test_trongrid_contract_events_plain_text_rate_limit_is_retryable() {
             .expect("address"),
             event_name: Some("Transfer".to_owned()),
             range: LedgerRange::blocks(10, 10).expect("range"),
+            start_timestamp: None,
+            end_timestamp: None,
             only_confirmed: true,
             limit: 50,
             fingerprint: None,
@@ -278,6 +320,8 @@ fn test_trongrid_contract_events_json_rate_limit_retries_and_eventually_succeeds
             .expect("address"),
             event_name: Some("Transfer".to_owned()),
             range: LedgerRange::blocks(10, 10).expect("range"),
+            start_timestamp: None,
+            end_timestamp: None,
             only_confirmed: true,
             limit: 50,
             fingerprint: None,
@@ -307,6 +351,8 @@ fn test_trongrid_contract_events_successive_requests_are_paced() {
         .expect("address"),
         event_name: Some("Transfer".to_owned()),
         range: LedgerRange::blocks(10, 10).expect("range"),
+        start_timestamp: None,
+        end_timestamp: None,
         only_confirmed: true,
         limit: 50,
         fingerprint: None,
@@ -363,6 +409,8 @@ fn test_trongrid_contract_events_rate_limit_stops_after_bounded_retries() {
             .expect("address"),
             event_name: Some("Transfer".to_owned()),
             range: LedgerRange::blocks(10, 10).expect("range"),
+            start_timestamp: None,
+            end_timestamp: None,
             only_confirmed: true,
             limit: 50,
             fingerprint: None,
@@ -389,6 +437,8 @@ fn test_trongrid_contract_events_invalid_address_response_is_invalid_input() {
             contract_address: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t".to_owned(),
             event_name: Some("Transfer".to_owned()),
             range: LedgerRange::blocks(123, 123).expect("range"),
+            start_timestamp: None,
+            end_timestamp: None,
             only_confirmed: true,
             limit: 20,
             fingerprint: None,
@@ -416,6 +466,8 @@ fn test_trongrid_contract_events_page_limit_response_is_provider_limit() {
             contract_address: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t".to_owned(),
             event_name: Some("Transfer".to_owned()),
             range: LedgerRange::blocks(123, 123).expect("range"),
+            start_timestamp: None,
+            end_timestamp: None,
             only_confirmed: true,
             limit: 20,
             fingerprint: None,

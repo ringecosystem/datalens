@@ -278,22 +278,37 @@ impl TronProvider for TronHttpProvider {
                 "TronGrid API key is not configured",
             )
         })?;
-        if request.range.start() != request.range.end() {
-            return Err(DatalensError::new(
-                DatalensErrorKind::UnsupportedDataset,
-                "TronGrid contract events provider requires a single block_number query",
-            ));
-        }
         let contract_address = trongrid_contract_address(&request.contract_address)?;
         let path = format!("v1/contracts/{contract_address}/events");
         let mut query = vec![
-            ("block_number".to_owned(), request.range.start().to_string()),
             (
                 "only_confirmed".to_owned(),
                 request.only_confirmed.to_string(),
             ),
             ("limit".to_owned(), request.limit.to_string()),
         ];
+        if request.range.start() == request.range.end() {
+            query.push(("block_number".to_owned(), request.range.start().to_string()));
+        } else {
+            let start_timestamp = request.start_timestamp.ok_or_else(|| {
+                DatalensError::new(
+                    DatalensErrorKind::UnsupportedDataset,
+                    "TronGrid contract events range queries require start_timestamp",
+                )
+            })?;
+            let end_timestamp = request.end_timestamp.ok_or_else(|| {
+                DatalensError::new(
+                    DatalensErrorKind::UnsupportedDataset,
+                    "TronGrid contract events range queries require end_timestamp",
+                )
+            })?;
+            query.push((
+                "min_block_timestamp".to_owned(),
+                start_timestamp.to_string(),
+            ));
+            query.push(("max_block_timestamp".to_owned(), end_timestamp.to_string()));
+            query.push(("order_by".to_owned(), "block_timestamp,asc".to_owned()));
+        }
         if let Some(event_name) = &request.event_name {
             query.push(("event_name".to_owned(), event_name.clone()));
         }
