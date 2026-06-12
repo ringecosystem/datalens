@@ -13,6 +13,12 @@ use datalens_core::{
 use datalens_storage::{ObjectStore, StorageRepository, StorageWriteRequest};
 use serde::{Deserialize, Serialize};
 
+const CACHE_REPAIR_PHASE_IDLE: &str = "idle";
+const CACHE_REPAIR_PHASE_HEIGHT: &str = "height";
+const CACHE_REPAIR_PHASE_FETCH: &str = "fetch";
+const CACHE_REPAIR_PHASE_WRITE: &str = "write";
+const CACHE_REPAIR_PHASE_COMPLETED: &str = "completed";
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct CacheRepairTaskId(String);
 
@@ -51,6 +57,7 @@ pub enum CacheRepairTaskState {
     Running,
     Completed,
     Failed,
+    WriteTimedOut,
     Cancelled,
 }
 
@@ -62,6 +69,7 @@ impl CacheRepairTaskState {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CacheRepairRuntimeConfig {
+    /// Per-operation timeout for cache repair height, fetch, and write phases.
     #[serde(default = "default_cache_repair_fetch_timeout_ms")]
     pub fetch_timeout_ms: u64,
     #[serde(default = "default_cache_repair_lease_ttl_ms")]
@@ -163,6 +171,10 @@ pub struct CacheRepairTask {
     pub lease_owner: Option<String>,
     pub lease_expires_at: Option<u64>,
     pub last_error: Option<String>,
+    pub current_phase: Option<String>,
+    pub current_range_start: Option<u64>,
+    pub current_range_end: Option<u64>,
+    pub current_source_index: Option<usize>,
     pub stats: CacheRepairStats,
     dedupe_key: String,
 }
@@ -192,6 +204,10 @@ impl CacheRepairTask {
             lease_owner: None,
             lease_expires_at: None,
             last_error: None,
+            current_phase: Some(CACHE_REPAIR_PHASE_IDLE.to_owned()),
+            current_range_start: None,
+            current_range_end: None,
+            current_source_index: None,
             stats: CacheRepairStats::default(),
             dedupe_key,
         })
@@ -210,6 +226,10 @@ impl CacheRepairTask {
         }
         self.state = CacheRepairTaskState::Queued;
         self.last_error = None;
+        self.current_phase = Some(CACHE_REPAIR_PHASE_IDLE.to_owned());
+        self.current_range_start = None;
+        self.current_range_end = None;
+        self.current_source_index = None;
         self.touch(now);
         Ok(())
     }
@@ -218,7 +238,9 @@ impl CacheRepairTask {
         match self.state {
             CacheRepairTaskState::Queued | CacheRepairTaskState::Failed => true,
             CacheRepairTaskState::Running => self.lease_expired(now_ms),
-            CacheRepairTaskState::Completed | CacheRepairTaskState::Cancelled => false,
+            CacheRepairTaskState::Completed
+            | CacheRepairTaskState::WriteTimedOut
+            | CacheRepairTaskState::Cancelled => false,
         }
     }
 
@@ -502,6 +524,12 @@ where
                 ..CacheRepairRunResult::default()
             });
         }
+        if task.state == CacheRepairTaskState::WriteTimedOut {
+            return Ok(CacheRepairRunResult {
+                status: CacheRepairRunStatus::Stopped,
+                ..CacheRepairRunResult::default()
+            });
+        }
         let now_ms = unix_milliseconds_now()?;
         if task.state == CacheRepairTaskState::Running && !task.lease_expired(now_ms) {
             return Ok(CacheRepairRunResult {
@@ -519,18 +547,6 @@ where
         }
 
         validate_task(&task, &self.adapter)?;
-        let durable_height = match task.finality {
-            CacheRepairFinality::Safe => self.adapter.cache_safe_height()?,
-            CacheRepairFinality::Finalized => self.adapter.finalized_height()?,
-        };
-        durable_height.validate_durable_writable()?;
-        if durable_height.range_kind != task.range_kind {
-            return Err(DatalensError::new(
-                DatalensErrorKind::InvalidInput,
-                "cache repair task range kind does not match adapter durable height",
-            ));
-        }
-
         log::info!(
             "cache repair task started task_id={} chain={} dataset={} range={}-{} selector_fingerprint={} source_selector_count={}",
             task.task_id.as_str(),
@@ -543,8 +559,46 @@ where
         );
         task.state = CacheRepairTaskState::Running;
         task.last_error = None;
+        self.set_phase(&mut task, CACHE_REPAIR_PHASE_HEIGHT, None, None)?;
         self.extend_lease(&mut task)?;
         self.registry.save_task(&task)?;
+
+        log::info!(
+            "cache repair height lookup started task_id={} finality={:?}",
+            task.task_id.as_str(),
+            task.finality,
+        );
+        let height_start = std::time::Instant::now();
+        let durable_height = match self.height_with_timeout(task.finality) {
+            Ok(durable_height) => {
+                log::info!(
+                    "cache repair height lookup completed task_id={} height={} duration_ms={}",
+                    task.task_id.as_str(),
+                    durable_height.value,
+                    height_start.elapsed().as_millis(),
+                );
+                durable_height
+            }
+            Err(error) => {
+                let error = error.with_cache_repair_context(&task);
+                self.mark_failed(&mut task, &error)?;
+                return Err(error);
+            }
+        };
+        if let Err(error) = durable_height.validate_durable_writable() {
+            let error = error.with_cache_repair_context(&task);
+            self.mark_failed(&mut task, &error)?;
+            return Err(error);
+        }
+        if durable_height.range_kind != task.range_kind {
+            let error = DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                "cache repair task range kind does not match adapter durable height",
+            )
+            .with_cache_repair_context(&task);
+            self.mark_failed(&mut task, &error)?;
+            return Err(error);
+        }
 
         let mut result = CacheRepairRunResult::default();
         let mut next = task.start;
@@ -555,8 +609,12 @@ where
                 task.end
                     .min(next.saturating_add(task.chunk_policy.max_range_len.max(1) - 1)),
             )?;
-            validate_durable_range(&chunk, &durable_height)?;
-            let fetched = match self.fetch_repair_rows(&task, chunk.clone()) {
+            if let Err(error) = validate_durable_range(&chunk, &durable_height) {
+                let error = error.with_cache_repair_context(&task);
+                self.mark_failed(&mut task, &error)?;
+                return Err(error);
+            }
+            let fetched = match self.fetch_repair_rows(&mut task, chunk.clone()) {
                 Ok(fetched) => fetched,
                 Err(error) => {
                     self.mark_failed(&mut task, &error)?;
@@ -567,6 +625,8 @@ where
             let rows = fetched.rows;
             let row_count = rows.row_count();
             let write_start = std::time::Instant::now();
+            self.set_phase(&mut task, CACHE_REPAIR_PHASE_WRITE, Some(&chunk), None)?;
+            self.registry.save_task(&task)?;
             log::info!(
                 "cache repair replacement write started task_id={} target_selector_fingerprint={} range={}-{} rows={}",
                 task.task_id.as_str(),
@@ -575,17 +635,7 @@ where
                 chunk.end(),
                 row_count,
             );
-            match self
-                .storage
-                .write_rows_replacing_existing(StorageWriteRequest {
-                    chain: &task.chain,
-                    dataset_key: task.dataset_key.clone(),
-                    selector: &task.selector,
-                    range: chunk.clone(),
-                    rows: &rows,
-                    finality_level: task.finality.to_finality_level(),
-                    record_empty_coverage: true,
-                }) {
+            match self.write_rows_replacing_existing_with_timeout(&task, chunk.clone(), rows) {
                 Ok(outcome) => {
                     log::info!(
                         "cache repair replacement write completed task_id={} range={}-{} data_object={} empty_coverage={} duration_ms={}",
@@ -612,7 +662,12 @@ where
                     self.registry.save_task(&task)?;
                 }
                 Err(error) => {
-                    self.mark_failed(&mut task, &error)?;
+                    let error = error.with_cache_repair_context(&task);
+                    if is_write_timeout_error(&error) {
+                        self.mark_write_timed_out(&mut task, &error)?;
+                    } else {
+                        self.mark_failed(&mut task, &error)?;
+                    }
                     return Err(error);
                 }
             }
@@ -622,6 +677,7 @@ where
         task.state = CacheRepairTaskState::Completed;
         task.lease_owner = None;
         task.lease_expires_at = None;
+        self.set_phase(&mut task, CACHE_REPAIR_PHASE_COMPLETED, None, None)?;
         task.touch(unix_seconds_now()?);
         self.registry.save_task(&task)?;
         result.status = CacheRepairRunStatus::Completed;
@@ -638,8 +694,50 @@ where
         task.lease_expires_at = None;
         task.last_error = Some(error.message.clone());
         log::warn!(
-            "cache repair task failed task_id={} kind={:?} message={}",
+            "cache repair task failed task_id={} phase={} range={}-{} source_index={} kind={:?} message={}",
             task.task_id.as_str(),
+            task.current_phase
+                .as_deref()
+                .unwrap_or(CACHE_REPAIR_PHASE_IDLE),
+            task.current_range_start
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_owned()),
+            task.current_range_end
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_owned()),
+            task.current_source_index
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_owned()),
+            error.kind,
+            error.message,
+        );
+        task.touch(unix_seconds_now()?);
+        self.registry.save_task(task)
+    }
+
+    fn mark_write_timed_out(
+        &self,
+        task: &mut CacheRepairTask,
+        error: &DatalensError,
+    ) -> Result<(), DatalensError> {
+        task.state = CacheRepairTaskState::WriteTimedOut;
+        task.last_error = Some(error.message.clone());
+        log::warn!(
+            "cache repair replacement write timed out task_id={} phase={} range={}-{} lease_owner={} lease_expires_at={} kind={:?} message={}",
+            task.task_id.as_str(),
+            task.current_phase
+                .as_deref()
+                .unwrap_or(CACHE_REPAIR_PHASE_IDLE),
+            task.current_range_start
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_owned()),
+            task.current_range_end
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_owned()),
+            task.lease_owner.as_deref().unwrap_or("none"),
+            task.lease_expires_at
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_owned()),
             error.kind,
             error.message,
         );
@@ -655,18 +753,35 @@ where
         Ok(())
     }
 
+    fn set_phase(
+        &self,
+        task: &mut CacheRepairTask,
+        phase: &str,
+        range: Option<&LedgerRange>,
+        source_index: Option<usize>,
+    ) -> Result<(), DatalensError> {
+        task.current_phase = Some(phase.to_owned());
+        task.current_range_start = range.map(LedgerRange::start);
+        task.current_range_end = range.map(LedgerRange::end);
+        task.current_source_index = source_index;
+        task.touch(unix_seconds_now()?);
+        Ok(())
+    }
+
     fn fetch_repair_rows(
         &self,
-        task: &CacheRepairTask,
+        task: &mut CacheRepairTask,
         chunk: LedgerRange,
     ) -> Result<FetchedRepairRows, DatalensError> {
         if task.source_selectors.is_empty() {
-            return self.fetch_one_selector(task, &task.selector, chunk, None);
+            let selector = task.selector.clone();
+            return self.fetch_one_selector(task, &selector, chunk, None);
         }
 
         let mut provider_calls = 0;
         let mut merged = QueryRows::EvmLogs(Vec::new());
-        for (source_index, source_selector) in task.source_selectors.iter().enumerate() {
+        let source_selectors = task.source_selectors.clone();
+        for (source_index, source_selector) in source_selectors.iter().enumerate() {
             let fetched =
                 self.fetch_one_selector(task, source_selector, chunk.clone(), Some(source_index))?;
             provider_calls += fetched.provider_calls;
@@ -681,11 +796,13 @@ where
 
     fn fetch_one_selector(
         &self,
-        task: &CacheRepairTask,
+        task: &mut CacheRepairTask,
         selector: &DatasetSelector,
         chunk: LedgerRange,
         source_index: Option<usize>,
     ) -> Result<FetchedRepairRows, DatalensError> {
+        self.set_phase(task, CACHE_REPAIR_PHASE_FETCH, Some(&chunk), source_index)?;
+        self.registry.save_task(task)?;
         let request = ChainFetchRequest::new(
             task.chain.clone(),
             task.dataset_key.clone(),
@@ -706,8 +823,12 @@ where
                 .unwrap_or_else(|| "target".to_owned()),
         );
         let fetch_start = std::time::Instant::now();
-        let response = self.fetch_with_timeout(request.clone())?;
-        response.validate_for_request(&request)?;
+        let response = self
+            .fetch_with_timeout(request.clone())
+            .map_err(|error| error.with_cache_repair_context(task))?;
+        response
+            .validate_for_request(&request)
+            .map_err(|error| error.with_cache_repair_context(task))?;
         let provider_calls = response.provider_diagnostics.calls as u64;
         let rows = response.rows;
         let row_count = rows.row_count();
@@ -730,30 +851,117 @@ where
         &self,
         request: ChainFetchRequest,
     ) -> Result<ChainFetchResponse, DatalensError> {
-        if self.config.fetch_timeout_ms == 0 {
-            return self.adapter.fetch(request);
-        }
         let adapter = self.adapter.clone();
+        self.run_with_operation_timeout(CACHE_REPAIR_PHASE_FETCH, move || adapter.fetch(request))
+    }
+
+    fn height_with_timeout(
+        &self,
+        finality: CacheRepairFinality,
+    ) -> Result<datalens_chain::ChainHeight, DatalensError> {
+        let adapter = self.adapter.clone();
+        self.run_with_operation_timeout(CACHE_REPAIR_PHASE_HEIGHT, move || match finality {
+            CacheRepairFinality::Safe => adapter.cache_safe_height(),
+            CacheRepairFinality::Finalized => adapter.finalized_height(),
+        })
+    }
+
+    fn write_rows_replacing_existing_with_timeout(
+        &self,
+        task: &CacheRepairTask,
+        range: LedgerRange,
+        rows: DatasetRows,
+    ) -> Result<datalens_storage::StorageWriteOutcome, DatalensError> {
+        let storage = self.storage.clone();
+        let chain = task.chain.clone();
+        let dataset_key = task.dataset_key.clone();
+        let selector = task.selector.clone();
+        let finality_level = task.finality.to_finality_level();
+        self.run_with_operation_timeout(CACHE_REPAIR_PHASE_WRITE, move || {
+            storage.write_rows_replacing_existing(StorageWriteRequest {
+                chain: &chain,
+                dataset_key,
+                selector: &selector,
+                range,
+                rows: &rows,
+                finality_level,
+                record_empty_coverage: true,
+            })
+        })
+    }
+
+    fn run_with_operation_timeout<T, F>(
+        &self,
+        phase: &'static str,
+        operation: F,
+    ) -> Result<T, DatalensError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, DatalensError> + Send + 'static,
+    {
+        if self.config.fetch_timeout_ms == 0 {
+            return operation();
+        }
         let timeout = Duration::from_millis(self.config.fetch_timeout_ms);
+        let timeout_ms = self.config.fetch_timeout_ms;
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
-            let _ = sender.send(adapter.fetch(request));
+            let _ = sender.send(operation());
         });
         match receiver.recv_timeout(timeout) {
             Ok(result) => result,
             Err(mpsc::RecvTimeoutError::Timeout) => Err(DatalensError::new(
-                DatalensErrorKind::ProviderFailure,
-                format!(
-                    "cache repair provider fetch timed out after {}ms",
-                    self.config.fetch_timeout_ms
-                ),
+                timeout_kind_for_phase(phase),
+                format!("cache repair {phase} operation timed out after {timeout_ms}ms"),
             )),
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(DatalensError::new(
-                DatalensErrorKind::ProviderFailure,
-                "cache repair provider fetch worker stopped",
+                timeout_kind_for_phase(phase),
+                format!("cache repair {phase} operation worker stopped"),
             )),
         }
     }
+}
+
+trait CacheRepairErrorContext {
+    fn with_cache_repair_context(self, task: &CacheRepairTask) -> Self;
+}
+
+impl CacheRepairErrorContext for DatalensError {
+    fn with_cache_repair_context(self, task: &CacheRepairTask) -> Self {
+        let phase = task
+            .current_phase
+            .as_deref()
+            .unwrap_or(CACHE_REPAIR_PHASE_IDLE);
+        let range = task
+            .current_range_start
+            .zip(task.current_range_end)
+            .map(|(start, end)| format!(" range={start}-{end}"))
+            .unwrap_or_default();
+        let source_index = task
+            .current_source_index
+            .map(|index| format!(" source_index={index}"))
+            .unwrap_or_default();
+        DatalensError::new(
+            self.kind,
+            format!(
+                "cache repair {phase}{range}{source_index} failed: {}",
+                self.message
+            ),
+        )
+    }
+}
+
+fn timeout_kind_for_phase(phase: &str) -> DatalensErrorKind {
+    match phase {
+        CACHE_REPAIR_PHASE_WRITE => DatalensErrorKind::Internal,
+        _ => DatalensErrorKind::ProviderFailure,
+    }
+}
+
+fn is_write_timeout_error(error: &DatalensError) -> bool {
+    error.kind == DatalensErrorKind::Internal
+        && error.message.contains("write")
+        && error.message.contains("timed out")
 }
 
 struct FetchedRepairRows {
@@ -784,6 +992,14 @@ struct StoredCacheRepairTask {
     #[serde(default)]
     lease_expires_at: Option<u64>,
     last_error: Option<String>,
+    #[serde(default)]
+    current_phase: Option<String>,
+    #[serde(default)]
+    current_range_start: Option<u64>,
+    #[serde(default)]
+    current_range_end: Option<u64>,
+    #[serde(default)]
+    current_source_index: Option<usize>,
     stats: CacheRepairStats,
     dedupe_key: String,
 }
@@ -842,6 +1058,10 @@ impl StoredCacheRepairTask {
             lease_owner: task.lease_owner.clone(),
             lease_expires_at: task.lease_expires_at,
             last_error: task.last_error.clone(),
+            current_phase: task.current_phase.clone(),
+            current_range_start: task.current_range_start,
+            current_range_end: task.current_range_end,
+            current_source_index: task.current_source_index,
             stats: task.stats.clone(),
             dedupe_key: task.dedupe_key.clone(),
         })
@@ -873,6 +1093,10 @@ impl StoredCacheRepairTask {
             lease_owner: self.lease_owner,
             lease_expires_at: self.lease_expires_at,
             last_error: self.last_error,
+            current_phase: self.current_phase,
+            current_range_start: self.current_range_start,
+            current_range_end: self.current_range_end,
+            current_source_index: self.current_source_index,
             stats: self.stats,
             dedupe_key: self.dedupe_key,
         })

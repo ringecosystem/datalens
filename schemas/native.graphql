@@ -39,6 +39,10 @@ type CacheRepairTask {
 	createdAt: Int!
 	updatedAt: Int!
 	lastError: String
+	currentPhase: String
+	currentRangeStart: Int
+	currentRangeEnd: Int
+	currentSourceIndex: Int
 	stats: JSON!
 	reason: String!
 }
