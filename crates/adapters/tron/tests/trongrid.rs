@@ -51,6 +51,11 @@ fn test_trongrid_contract_events_request_uses_path_query_auth_and_pagination() {
             .to_ascii_lowercase()
             .contains("tron-pro-api-key: secret-key")
     );
+    assert!(
+        request
+            .to_ascii_lowercase()
+            .contains("accept-encoding: identity")
+    );
 }
 
 #[test]
@@ -187,9 +192,9 @@ fn test_trongrid_contract_events_response_is_normalized() {
 }
 
 #[test]
-fn test_trongrid_contract_events_malformed_response_is_invalid_request() {
+fn test_trongrid_contract_events_malformed_response_includes_status_and_body_prefix() {
     let seen = Arc::new(Mutex::new(Vec::new()));
-    let server = TestServer::spawn(seen, r#"{"meta":{}}"#, "HTTP/1.1 200 OK");
+    let server = TestServer::spawn(seen, "not-json", "HTTP/1.1 200 OK");
     let provider = TronHttpProvider::new("http://unused")
         .with_trongrid(server.url(), Some("secret-key".to_owned()));
 
@@ -207,7 +212,10 @@ fn test_trongrid_contract_events_malformed_response_is_invalid_request() {
         })
         .expect_err("malformed response should stay visible");
 
-    assert_eq!(error.kind, DatalensErrorKind::InvalidRequest);
+    assert_eq!(error.kind, DatalensErrorKind::ProviderFailure);
+    assert!(error.message.contains("status=200"));
+    assert!(error.message.contains("body_prefix=not-json"));
+    assert!(!error.message.contains("secret-key"));
 }
 
 #[test]
