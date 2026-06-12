@@ -9,6 +9,10 @@ use std::{
 };
 
 use axum::http::HeaderMap;
+use datalens_cache_repair::{
+    CacheRepairRunResult, CacheRepairSubmitOutcome, CacheRepairSubmitRequest, CacheRepairTask,
+    CacheRepairTaskFilter, CacheRepairTaskId,
+};
 use datalens_chain::ChainAdapter;
 use datalens_core::{DatalensError, DatalensErrorKind, QueryFinalityRequirement};
 use datalens_executor::generate_query_id;
@@ -282,6 +286,72 @@ impl QueryServiceRegistry {
         Ok(results)
     }
 
+    pub fn submit_cache_repair_task(
+        &self,
+        request: CacheRepairSubmitRequest,
+    ) -> Result<CacheRepairSubmitOutcome, DatalensError> {
+        let service = self.cache_repair_service_for_chain(request.chain.configured_name())?;
+        service.submit(request)
+    }
+
+    pub fn get_cache_repair_task(
+        &self,
+        task_id: &CacheRepairTaskId,
+    ) -> Result<Option<CacheRepairTask>, DatalensError> {
+        for service in self.services.values() {
+            let Some(cache_repair) = service.cache_repair() else {
+                continue;
+            };
+            if let Some(task) = cache_repair.get(task_id)? {
+                return Ok(Some(task));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn list_cache_repair_tasks(
+        &self,
+        filter: CacheRepairTaskFilter,
+    ) -> Result<Vec<CacheRepairTask>, DatalensError> {
+        let mut tasks = BTreeMap::new();
+        for service in self.services.values() {
+            let Some(cache_repair) = service.cache_repair() else {
+                continue;
+            };
+            for task in cache_repair.list(filter.clone())? {
+                tasks
+                    .entry(task.task_id.as_str().to_owned())
+                    .or_insert(task);
+            }
+        }
+        Ok(tasks.into_values().collect())
+    }
+
+    pub fn cancel_cache_repair_task(
+        &self,
+        task_id: &CacheRepairTaskId,
+    ) -> Result<CacheRepairTask, DatalensError> {
+        self.mutate_cache_repair_task(task_id, CacheRepairMutation::Cancel)
+    }
+
+    pub fn retry_cache_repair_task(
+        &self,
+        task_id: &CacheRepairTaskId,
+    ) -> Result<CacheRepairTask, DatalensError> {
+        self.mutate_cache_repair_task(task_id, CacheRepairMutation::Retry)
+    }
+
+    pub fn run_cache_repair_once(&self) -> Result<Vec<CacheRepairRunResult>, DatalensError> {
+        let mut results = Vec::new();
+        for service in self.services.values() {
+            let Some(cache_repair) = service.cache_repair() else {
+                continue;
+            };
+            results.extend(cache_repair.run_available_once()?);
+        }
+        Ok(results)
+    }
+
     pub fn start_warmup_scheduler(&self, interval: Duration) -> WarmupSchedulerHandle {
         let registry = self.clone();
         let stop = Arc::new(AtomicBool::new(false));
@@ -311,6 +381,22 @@ impl QueryServiceRegistry {
                 DatalensError::new(
                     DatalensErrorKind::UnsupportedDataset,
                     format!("warmup is not configured for chain {chain_name}"),
+                )
+            })
+    }
+
+    fn cache_repair_service_for_chain(
+        &self,
+        chain_name: &str,
+    ) -> Result<Arc<dyn crate::service::query_service::RegisteredCacheRepairService>, DatalensError>
+    {
+        self.services
+            .get(chain_name)
+            .and_then(|service| service.cache_repair())
+            .ok_or_else(|| {
+                DatalensError::new(
+                    DatalensErrorKind::UnsupportedDataset,
+                    format!("cache repair is not configured for chain {chain_name}"),
                 )
             })
     }
@@ -371,6 +457,33 @@ impl QueryServiceRegistry {
         })
     }
 
+    fn mutate_cache_repair_task(
+        &self,
+        task_id: &CacheRepairTaskId,
+        mutation: CacheRepairMutation,
+    ) -> Result<CacheRepairTask, DatalensError> {
+        let task = self.get_cache_repair_task(task_id)?.ok_or_else(|| {
+            DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                format!("cache repair task {} not found", task_id.as_str()),
+            )
+        })?;
+        let service = self.cache_repair_service_for_chain(task.chain.configured_name())?;
+        match mutation {
+            CacheRepairMutation::Cancel => service.cancel(task_id)?,
+            CacheRepairMutation::Retry => service.retry_failed(task_id)?,
+        }
+        service.get(task_id)?.ok_or_else(|| {
+            DatalensError::new(
+                DatalensErrorKind::Internal,
+                format!(
+                    "cache repair task {} disappeared after mutation",
+                    task_id.as_str()
+                ),
+            )
+        })
+    }
+
     pub fn metrics_text(&self) -> Option<Result<String, DatalensError>> {
         let mut texts = Vec::new();
         for service in self.services.values() {
@@ -410,6 +523,12 @@ impl QueryServiceRegistry {
 #[derive(Clone, Copy)]
 pub(crate) enum WarmupMutation {
     Pause,
+    Cancel,
+    Retry,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum CacheRepairMutation {
     Cancel,
     Retry,
 }

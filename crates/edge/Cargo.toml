@@ -9,6 +9,7 @@ async-graphql.workspace = true
 async-graphql-axum.workspace = true
 axum.workspace = true
 datalens-chain = { path = "../chain" }
+datalens-cache-repair = { path = "../runtime/cache-repair" }
 datalens-core = { path = "../core" }
 datalens-executor = { path = "../runtime/executor" }
 datalens-metrics = { path = "../metrics" }

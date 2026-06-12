@@ -12,6 +12,7 @@ path = "src/main.rs"
 clap.workspace = true
 datalens-edge = { path = "../edge" }
 datalens-chain = { path = "../chain" }
+datalens-cache-repair = { path = "../runtime/cache-repair" }
 datalens-client = { package = "datalens-internal-client", path = "../client" }
 datalens-core = { path = "../core" }
 datalens-evm = { path = "../adapters/evm" }

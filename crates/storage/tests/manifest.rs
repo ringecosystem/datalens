@@ -3507,6 +3507,93 @@ fn test_replacement_write_wins_over_wider_empty_coverage() {
         }
         rows => panic!("expected log rows, got {rows:?}"),
     }
+
+    let manifest = storage.manifest().expect("manifest");
+    let ranges = manifest
+        .entries
+        .iter()
+        .filter(|entry| entry.dataset_key == DatasetKey::evm_logs())
+        .map(|entry| {
+            (
+                entry.range.start(),
+                entry.range.end(),
+                entry.object_key.is_some(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ranges,
+        vec![(49, 49, false), (50, 50, true), (51, 51, false)]
+    );
+}
+
+#[test]
+fn test_replacement_write_empty_wins_over_existing_data_coverage() {
+    let storage = LocalStorage::new(temp_storage_root("replacement-empty-over-data"));
+    let chain = test_chain();
+    let selector = evm_log_selector(vec![ADDRESS_A], vec![Some(vec![TOPIC_1])]);
+    let data_range = LedgerRange::blocks(70, 72).expect("valid range");
+    let replacement_range = LedgerRange::blocks(71, 71).expect("valid range");
+    let data_rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![
+            log_record(70, 0, ADDRESS_A, vec![TOPIC_1]),
+            log_record(71, 1, ADDRESS_A, vec![TOPIC_1]),
+            log_record(72, 2, ADDRESS_A, vec![TOPIC_1]),
+        ]),
+    )
+    .expect("data rows");
+    let empty_rows = DatasetRows::new(DatasetKey::evm_logs(), QueryRows::EvmLogs(Vec::new()))
+        .expect("empty rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &selector,
+            range: data_range.clone(),
+            rows: &data_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write data coverage");
+    storage
+        .write_rows_replacing_existing(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &selector,
+            range: replacement_range.clone(),
+            rows: &empty_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write empty replacement");
+
+    let rows = storage
+        .read_rows(
+            &chain,
+            &DatasetKey::evm_logs(),
+            &selector,
+            replacement_range,
+        )
+        .expect("read replacement rows");
+    assert_eq!(rows.row_count(), 0);
+
+    let rows = storage
+        .read_rows(&chain, &DatasetKey::evm_logs(), &selector, data_range)
+        .expect("read full rows");
+    match rows.into_rows() {
+        QueryRows::EvmLogs(logs) => {
+            assert_eq!(logs.len(), 2);
+            assert_eq!(
+                logs.into_iter()
+                    .map(|record| record.block_number)
+                    .collect::<Vec<_>>(),
+                vec![70, 72]
+            );
+        }
+        rows => panic!("expected log rows, got {rows:?}"),
+    }
 }
 
 #[test]

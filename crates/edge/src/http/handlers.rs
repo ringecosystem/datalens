@@ -6,6 +6,10 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
+use datalens_cache_repair::{
+    CacheRepairChunkPolicy, CacheRepairSubmitRequest, CacheRepairTask, CacheRepairTaskFilter,
+    CacheRepairTaskId,
+};
 use datalens_core::{DatalensError, DatalensErrorKind};
 use datalens_executor::generate_query_id;
 use datalens_metrics::ApplicationIdentity;
@@ -18,6 +22,11 @@ use crate::{
     APPLICATION_IDENTITY_HEADER, auth,
     config::ApplicationOperationConfig,
     contract::{
+        cache_repair::{
+            CacheRepairRunOnceApiResponse, CacheRepairSubmitApiRequest,
+            CacheRepairSubmitApiResponse, CacheRepairTaskApiResponse,
+            CacheRepairTaskListApiResponse, CacheRepairTaskListQuery, cache_repair_task_view,
+        },
         discovery::DiscoveryResponse,
         error::{api_error_body, api_error_status, api_retry_after_seconds},
         head::{ChainHeadApiResponse, ChainHeadFinalityApi},
@@ -29,7 +38,7 @@ use crate::{
         },
     },
     http::AppState,
-    service::registry::{QueryServiceRegistry, WarmupMutation},
+    service::registry::{CacheRepairMutation, QueryServiceRegistry, WarmupMutation},
 };
 
 pub(crate) async fn health() -> Json<serde_json::Value> {
@@ -481,6 +490,145 @@ pub(crate) async fn warmup_run_once(
     Ok(Json(WarmupRunOnceApiResponse { results }))
 }
 
+pub(crate) async fn cache_repair_submit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CacheRepairSubmitApiRequest>,
+) -> Result<Response, ApiError> {
+    let registry = state.registry.clone();
+    let dataset = request.dataset_for_auth().map_err(ApiError)?;
+    let application_context = registry
+        .authenticate_warmup_headers(
+            &headers,
+            request.chain().configured_name(),
+            &dataset,
+            ApplicationOperationConfig::CacheRepairSubmit,
+        )
+        .map_err(ApiError)?;
+    let application_id = application_context
+        .as_ref()
+        .map(|application| application.id.clone())
+        .or_else(|| application_id_from_headers(&headers))
+        .unwrap_or_else(|| "unknown".to_owned());
+    let request = cache_repair_submit_request(application_id, request).map_err(ApiError)?;
+    let outcome = tokio::task::spawn_blocking(move || registry.submit_cache_repair_task(request))
+        .await
+        .map_err(|error| {
+            ApiError(DatalensError::new(
+                DatalensErrorKind::Internal,
+                format!("cache repair submit task failed: {error}"),
+            ))
+        })?
+        .map_err(ApiError)?;
+    let status = if outcome.created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    Ok((
+        status,
+        Json(CacheRepairSubmitApiResponse {
+            task_id: outcome.task_id,
+            created: outcome.created,
+        }),
+    )
+        .into_response())
+}
+
+pub(crate) async fn cache_repair_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<CacheRepairTaskListQuery>,
+) -> Result<Json<CacheRepairTaskListApiResponse>, ApiError> {
+    let registry = state.registry.clone();
+    let application_context = registry
+        .authenticate_task_headers(&headers, ApplicationOperationConfig::CacheRepairRead)
+        .map_err(ApiError)?;
+    let application_id = application_context
+        .as_ref()
+        .map(|application| application.id.clone())
+        .or_else(|| application_id_from_headers(&headers));
+    let filter = CacheRepairTaskFilter {
+        application_id,
+        chain_key: query.chain,
+        state: query.state,
+    };
+    let tasks = tokio::task::spawn_blocking(move || registry.list_cache_repair_tasks(filter))
+        .await
+        .map_err(|error| {
+            ApiError(DatalensError::new(
+                DatalensErrorKind::Internal,
+                format!("cache repair list task failed: {error}"),
+            ))
+        })?
+        .map_err(ApiError)?
+        .into_iter()
+        .map(cache_repair_task_view)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(ApiError)?;
+    Ok(Json(CacheRepairTaskListApiResponse { tasks }))
+}
+
+pub(crate) async fn cache_repair_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(task_id): AxumPath<String>,
+) -> Result<Json<CacheRepairTaskApiResponse>, ApiError> {
+    let task_id = CacheRepairTaskId::new(task_id).map_err(ApiError)?;
+    let task = load_authorized_cache_repair_task(state.registry.clone(), &headers, task_id).await?;
+    Ok(Json(CacheRepairTaskApiResponse {
+        task: cache_repair_task_view(task).map_err(ApiError)?,
+    }))
+}
+
+pub(crate) async fn cache_repair_cancel(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(task_id): AxumPath<String>,
+) -> Result<Json<CacheRepairTaskApiResponse>, ApiError> {
+    mutate_authorized_cache_repair_task(
+        state.registry,
+        headers,
+        task_id,
+        CacheRepairMutation::Cancel,
+    )
+    .await
+}
+
+pub(crate) async fn cache_repair_retry(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(task_id): AxumPath<String>,
+) -> Result<Json<CacheRepairTaskApiResponse>, ApiError> {
+    mutate_authorized_cache_repair_task(
+        state.registry,
+        headers,
+        task_id,
+        CacheRepairMutation::Retry,
+    )
+    .await
+}
+
+pub(crate) async fn cache_repair_run_once(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<CacheRepairRunOnceApiResponse>, ApiError> {
+    let registry = state.registry.clone();
+    let _application_context = registry
+        .authenticate_task_headers(&headers, ApplicationOperationConfig::CacheRepairRun)
+        .map_err(ApiError)?;
+    let results = tokio::task::spawn_blocking(move || registry.run_cache_repair_once())
+        .await
+        .map_err(|error| {
+            ApiError(DatalensError::new(
+                DatalensErrorKind::Internal,
+                format!("cache repair run-once task failed: {error}"),
+            ))
+        })?
+        .map_err(ApiError)?;
+    Ok(Json(CacheRepairRunOnceApiResponse { results }))
+}
+
 async fn load_authorized_warmup_task(
     registry: QueryServiceRegistry,
     headers: &HeaderMap,
@@ -576,6 +724,26 @@ pub(crate) fn warmup_submit_request(
     })
 }
 
+pub(crate) fn cache_repair_submit_request(
+    application_id: String,
+    request: CacheRepairSubmitApiRequest,
+) -> Result<CacheRepairSubmitRequest, DatalensError> {
+    Ok(CacheRepairSubmitRequest {
+        application_id,
+        chain: request.chain,
+        dataset_key: request.dataset_key.into_dataset_key()?,
+        selector: request.selector.into_selector()?,
+        range_kind: request.range_kind,
+        start: request.start,
+        end: request.end,
+        finality: request.finality,
+        chunk_policy: CacheRepairChunkPolicy {
+            max_range_len: request.chunk_policy.max_range_len.max(1),
+        },
+        reason: request.reason,
+    })
+}
+
 fn authorize_warmup_task_application(
     task: &WarmupTask,
     application_id: Option<String>,
@@ -587,6 +755,92 @@ fn authorize_warmup_task_application(
         return Err(ApiError(DatalensError::new(
             DatalensErrorKind::Unauthorized,
             "application is not allowed to access another application's warmup task",
+        )));
+    }
+    Ok(())
+}
+
+async fn load_authorized_cache_repair_task(
+    registry: QueryServiceRegistry,
+    headers: &HeaderMap,
+    task_id: CacheRepairTaskId,
+) -> Result<CacheRepairTask, ApiError> {
+    let application_context = registry
+        .authenticate_task_headers(headers, ApplicationOperationConfig::CacheRepairRead)
+        .map_err(ApiError)?;
+    let task = tokio::task::spawn_blocking(move || {
+        registry.get_cache_repair_task(&task_id)?.ok_or_else(|| {
+            DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                format!("cache repair task {} not found", task_id.as_str()),
+            )
+        })
+    })
+    .await
+    .map_err(|error| {
+        ApiError(DatalensError::new(
+            DatalensErrorKind::Internal,
+            format!("cache repair get task failed: {error}"),
+        ))
+    })?
+    .map_err(ApiError)?;
+    authorize_cache_repair_task_application(
+        &task,
+        application_context
+            .as_ref()
+            .map(|application| application.id.clone())
+            .or_else(|| application_id_from_headers(headers)),
+    )?;
+    Ok(task)
+}
+
+async fn mutate_authorized_cache_repair_task(
+    registry: QueryServiceRegistry,
+    headers: HeaderMap,
+    task_id: String,
+    mutation: CacheRepairMutation,
+) -> Result<Json<CacheRepairTaskApiResponse>, ApiError> {
+    let task_id = CacheRepairTaskId::new(task_id).map_err(ApiError)?;
+    let task =
+        load_authorized_cache_repair_task(registry.clone(), &headers, task_id.clone()).await?;
+    let application_context = registry
+        .authenticate_task_headers(&headers, ApplicationOperationConfig::CacheRepairMutate)
+        .map_err(ApiError)?;
+    authorize_cache_repair_task_application(
+        &task,
+        application_context
+            .as_ref()
+            .map(|application| application.id.clone())
+            .or_else(|| application_id_from_headers(&headers)),
+    )?;
+    let task = tokio::task::spawn_blocking(move || match mutation {
+        CacheRepairMutation::Cancel => registry.cancel_cache_repair_task(&task_id),
+        CacheRepairMutation::Retry => registry.retry_cache_repair_task(&task_id),
+    })
+    .await
+    .map_err(|error| {
+        ApiError(DatalensError::new(
+            DatalensErrorKind::Internal,
+            format!("cache repair mutate task failed: {error}"),
+        ))
+    })?
+    .map_err(ApiError)?;
+    Ok(Json(CacheRepairTaskApiResponse {
+        task: cache_repair_task_view(task).map_err(ApiError)?,
+    }))
+}
+
+fn authorize_cache_repair_task_application(
+    task: &CacheRepairTask,
+    application_id: Option<String>,
+) -> Result<(), ApiError> {
+    let Some(application_id) = application_id else {
+        return Ok(());
+    };
+    if application_id != task.application_id {
+        return Err(ApiError(DatalensError::new(
+            DatalensErrorKind::Unauthorized,
+            "application is not allowed to access another application's cache repair task",
         )));
     }
     Ok(())

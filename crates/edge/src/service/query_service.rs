@@ -3,6 +3,10 @@ use std::{
     time::Instant,
 };
 
+use datalens_cache_repair::{
+    CacheRepairRegistry, CacheRepairRunResult, CacheRepairSubmitOutcome, CacheRepairSubmitRequest,
+    CacheRepairTask, CacheRepairTaskFilter, CacheRepairTaskId, CacheRepairTaskPool,
+};
 use datalens_chain::{
     AdapterCapabilities, ChainAdapter, ChainHeight, DatasetCapability, SelectorKind,
 };
@@ -39,6 +43,7 @@ pub struct QueryService<S> {
     capabilities: AdapterCapabilities,
     metrics: Option<MetricsRecorder>,
     warmup: Option<Arc<dyn RegisteredWarmupService>>,
+    cache_repair: Option<Arc<dyn RegisteredCacheRepairService>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -186,6 +191,7 @@ where
             capabilities,
             metrics: recorder,
             warmup: None,
+            cache_repair: None,
         })
     }
 
@@ -256,6 +262,14 @@ where
         P: RegisteredWarmupService + 'static,
     {
         self.warmup = Some(Arc::new(pool));
+        self
+    }
+
+    pub fn with_cache_repair_pool<P>(mut self, pool: P) -> Self
+    where
+        P: RegisteredCacheRepairService + 'static,
+    {
+        self.cache_repair = Some(Arc::new(pool));
         self
     }
 
@@ -509,6 +523,8 @@ pub(crate) trait RegisteredQueryService: Send + Sync {
     fn discovery(&self) -> Result<ChainDiscovery, DatalensError>;
 
     fn warmup(&self) -> Option<Arc<dyn RegisteredWarmupService>>;
+
+    fn cache_repair(&self) -> Option<Arc<dyn RegisteredCacheRepairService>>;
 }
 
 pub trait RegisteredWarmupService: Send + Sync {
@@ -558,6 +574,52 @@ where
 
     fn run_available_once(&self) -> Result<Vec<WarmupRunResult>, DatalensError> {
         WarmupTaskPool::run_available_once(self)
+    }
+}
+
+pub trait RegisteredCacheRepairService: Send + Sync {
+    fn submit(
+        &self,
+        request: CacheRepairSubmitRequest,
+    ) -> Result<CacheRepairSubmitOutcome, DatalensError>;
+    fn get(&self, task_id: &CacheRepairTaskId) -> Result<Option<CacheRepairTask>, DatalensError>;
+    fn list(&self, filter: CacheRepairTaskFilter) -> Result<Vec<CacheRepairTask>, DatalensError>;
+    fn cancel(&self, task_id: &CacheRepairTaskId) -> Result<(), DatalensError>;
+    fn retry_failed(&self, task_id: &CacheRepairTaskId) -> Result<(), DatalensError>;
+    fn run_available_once(&self) -> Result<Vec<CacheRepairRunResult>, DatalensError>;
+}
+
+impl<A, S, R> RegisteredCacheRepairService for CacheRepairTaskPool<A, S, R>
+where
+    A: ChainAdapter,
+    S: StorageRepository + Clone + 'static,
+    R: CacheRepairRegistry,
+{
+    fn submit(
+        &self,
+        request: CacheRepairSubmitRequest,
+    ) -> Result<CacheRepairSubmitOutcome, DatalensError> {
+        CacheRepairTaskPool::submit(self, request)
+    }
+
+    fn get(&self, task_id: &CacheRepairTaskId) -> Result<Option<CacheRepairTask>, DatalensError> {
+        CacheRepairTaskPool::get(self, task_id)
+    }
+
+    fn list(&self, filter: CacheRepairTaskFilter) -> Result<Vec<CacheRepairTask>, DatalensError> {
+        CacheRepairTaskPool::list(self, filter)
+    }
+
+    fn cancel(&self, task_id: &CacheRepairTaskId) -> Result<(), DatalensError> {
+        CacheRepairTaskPool::cancel(self, task_id)
+    }
+
+    fn retry_failed(&self, task_id: &CacheRepairTaskId) -> Result<(), DatalensError> {
+        CacheRepairTaskPool::retry_failed(self, task_id)
+    }
+
+    fn run_available_once(&self) -> Result<Vec<CacheRepairRunResult>, DatalensError> {
+        CacheRepairTaskPool::run_available_once(self)
     }
 }
 
@@ -625,5 +687,9 @@ where
 
     fn warmup(&self) -> Option<Arc<dyn RegisteredWarmupService>> {
         self.warmup.clone()
+    }
+
+    fn cache_repair(&self) -> Option<Arc<dyn RegisteredCacheRepairService>> {
+        self.cache_repair.clone()
     }
 }

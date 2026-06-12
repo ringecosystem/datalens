@@ -12,6 +12,7 @@ members = [
   "crates/runtime/indexer",
   "crates/metrics",
   "crates/runtime/planner",
+  "crates/runtime/cache-repair",
   "crates/adapters/solana",
   "crates/storage",
   "crates/adapters/tron",

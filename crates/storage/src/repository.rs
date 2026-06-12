@@ -170,6 +170,41 @@ fn durable_finality_satisfies(
     }
 }
 
+fn replacement_scope_matches(existing: &ManifestEntry, replacement: &ManifestEntry) -> bool {
+    existing.chain == replacement.chain
+        && existing.dataset_key == replacement.dataset_key
+        && existing.selector_fingerprint == replacement.selector_fingerprint
+        && existing.selector_canonical_key == replacement.selector_canonical_key
+        && existing.finality_level == replacement.finality_level
+        && existing.range.kind() == replacement.range.kind()
+}
+
+fn split_entry_around_range(
+    entry: ManifestEntry,
+    replacement_range: &LedgerRange,
+) -> Result<Vec<ManifestEntry>, DatalensError> {
+    let mut entries = Vec::new();
+    if entry.range.start() < replacement_range.start() {
+        let mut left = entry.clone();
+        left.range = LedgerRange::try_new(
+            entry.range.kind(),
+            entry.range.start(),
+            replacement_range.start().saturating_sub(1),
+        )?;
+        entries.push(left);
+    }
+    if entry.range.end() > replacement_range.end() {
+        let mut right = entry;
+        right.range = LedgerRange::try_new(
+            right.range.kind(),
+            replacement_range.end().saturating_add(1),
+            right.range.end(),
+        )?;
+        entries.push(right);
+    }
+    Ok(entries)
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct StorageWriteLogContext {
     chain_key: String,
@@ -787,7 +822,14 @@ where
                 replace_existing,
             )?),
             _ => {
-                self.write_manifest_entry(chain, entry)?;
+                if replace_existing {
+                    let started = Instant::now();
+                    let lock = self.manifest_update_lock(chain)?;
+                    let _guard = self.lock_manifest_updates(&lock)?;
+                    self.publish_replacement_entry_unlocked(chain, entry, started)?;
+                } else {
+                    self.write_manifest_entry(chain, entry)?;
+                }
                 None
             }
         };
@@ -1042,7 +1084,11 @@ where
                 format!("manifest entry object not found {}", data_object.object_key),
             ));
         }
-        self.publish_manifest_segment_unlocked(chain, entry, started)?;
+        if replace_existing {
+            self.publish_replacement_entry_unlocked(chain, entry, started)?;
+        } else {
+            self.publish_manifest_segment_unlocked(chain, entry, started)?;
+        }
         Ok(data_object)
     }
 
@@ -1124,6 +1170,43 @@ where
             entry.selector_fingerprint,
             key,
             bytes.len(),
+            started.elapsed().as_millis()
+        );
+        Ok(())
+    }
+
+    fn publish_replacement_entry_unlocked(
+        &self,
+        chain: &ChainIdentity,
+        entry: ManifestEntry,
+        started: Instant,
+    ) -> Result<(), DatalensError> {
+        let existing = self.manifest_for_chain(chain)?;
+        let mut entries = Vec::new();
+        let mut replaced_entries = 0usize;
+        for existing_entry in existing.entries {
+            if replacement_scope_matches(&existing_entry, &entry)
+                && existing_entry.range.intersection(&entry.range).is_some()
+            {
+                replaced_entries += 1;
+                entries.extend(split_entry_around_range(existing_entry, &entry.range)?);
+            } else {
+                entries.push(existing_entry);
+            }
+        }
+        entries.push(entry.clone());
+        let manifest = Manifest { entries };
+        self.write_manifest_unlocked(chain, &manifest, started)?;
+        log::info!(
+            "storage published replacement manifest chain_key={} dataset={} selector_fingerprint={} range_kind={} range={}-{} finality={} replaced_entries_count={} duration_ms={}",
+            chain.key_prefix(),
+            entry.dataset_key.as_str(),
+            entry.selector_fingerprint,
+            range_kind_key(entry.range.kind()),
+            entry.range.start(),
+            entry.range.end(),
+            entry.finality_level.as_str(),
+            replaced_entries,
             started.elapsed().as_millis()
         );
         Ok(())
