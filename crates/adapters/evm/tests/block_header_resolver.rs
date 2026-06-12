@@ -1,7 +1,9 @@
 use std::{
     collections::BTreeMap,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Barrier, Mutex},
+    thread,
+    time::Duration,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -202,6 +204,48 @@ fn test_block_header_resolver_rechecks_chunk_before_persisting_after_fetch() {
     assert!(store.persisted_ranges().is_empty());
 }
 
+#[test]
+fn test_block_header_resolver_singleflights_concurrent_chunk_writes() {
+    let chain = ethereum();
+    let store = SynchronizedMemoryHeaderStore::new(Vec::new());
+    let fetcher =
+        SlowMemoryHeaderFetcher::new((10..=19).map(header).collect(), Duration::from_millis(50));
+    let resolver = Arc::new(
+        EvmBlockHeaderResolver::with_store(fetcher.clone(), store.clone())
+            .with_chunk_policy(EvmBlockHeaderChunkPolicy::new(10)),
+    );
+    let start = Arc::new(Barrier::new(8));
+    let mut workers = Vec::new();
+
+    for _ in 0..8 {
+        let chain = chain.clone();
+        let resolver = resolver.clone();
+        let start = start.clone();
+        workers.push(thread::spawn(move || {
+            start.wait();
+            resolver.resolve(EvmBlockHeaderResolveRequest {
+                chain,
+                range: BlockRange::expect_new(12, 13),
+                finality_level: FinalityLevel::Safe,
+            })
+        }));
+    }
+
+    for worker in workers {
+        let resolved = worker
+            .join()
+            .expect("worker joins")
+            .expect("resolve headers");
+        assert_eq!(numbers(&resolved), vec![12, 13]);
+    }
+
+    assert_eq!(fetcher.requests(), vec![BlockRange::expect_new(10, 19)]);
+    assert_eq!(
+        store.persisted_ranges(),
+        vec![BlockRange::expect_new(10, 19)]
+    );
+}
+
 #[derive(Clone, Debug)]
 struct MemoryHeaderStore {
     stored: Arc<Mutex<BTreeMap<u64, EvmBlockHeader>>>,
@@ -275,6 +319,58 @@ impl EvmBlockHeaderStore for MemoryHeaderStore {
             persisted.push(header);
         }
         Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SynchronizedMemoryHeaderStore {
+    inner: MemoryHeaderStore,
+    lock: Arc<Mutex<()>>,
+}
+
+impl SynchronizedMemoryHeaderStore {
+    fn new(headers: Vec<EvmBlockHeader>) -> Self {
+        Self {
+            inner: MemoryHeaderStore::new(headers),
+            lock: Arc::new(Mutex::new(())),
+        }
+    }
+
+    fn persisted_ranges(&self) -> Vec<BlockRange> {
+        self.inner.persisted_ranges()
+    }
+}
+
+impl EvmBlockHeaderStore for SynchronizedMemoryHeaderStore {
+    fn read_headers(
+        &self,
+        chain: &ChainIdentity,
+        range: BlockRange,
+        finality_level: FinalityLevel,
+    ) -> Result<Vec<EvmBlockHeader>, DatalensError> {
+        self.inner.read_headers(chain, range, finality_level)
+    }
+
+    fn persist_headers(
+        &self,
+        chain: &ChainIdentity,
+        range: BlockRange,
+        finality_level: FinalityLevel,
+        headers: Vec<EvmBlockHeader>,
+    ) -> Result<(), DatalensError> {
+        self.inner
+            .persist_headers(chain, range, finality_level, headers)
+    }
+
+    fn synchronize_chunk<T>(
+        &self,
+        _chain: &ChainIdentity,
+        _range: BlockRange,
+        _finality_level: FinalityLevel,
+        operation: impl FnOnce() -> Result<T, DatalensError>,
+    ) -> Result<T, DatalensError> {
+        let _guard = self.lock.lock().expect("synchronized header store");
+        operation()
     }
 }
 
@@ -382,6 +478,32 @@ impl EvmBlockHeaderFetcher for MemoryHeaderFetcher {
                 .cloned()
                 .collect(),
         })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SlowMemoryHeaderFetcher {
+    inner: MemoryHeaderFetcher,
+    delay: Duration,
+}
+
+impl SlowMemoryHeaderFetcher {
+    fn new(headers: Vec<EvmBlockHeader>, delay: Duration) -> Self {
+        Self {
+            inner: MemoryHeaderFetcher::new(headers),
+            delay,
+        }
+    }
+
+    fn requests(&self) -> Vec<BlockRange> {
+        self.inner.requests()
+    }
+}
+
+impl EvmBlockHeaderFetcher for SlowMemoryHeaderFetcher {
+    fn fetch_block_headers(&self, range: BlockRange) -> Result<EvmBlockHeaderFetch, DatalensError> {
+        thread::sleep(self.delay);
+        self.inner.fetch_block_headers(range)
     }
 }
 
