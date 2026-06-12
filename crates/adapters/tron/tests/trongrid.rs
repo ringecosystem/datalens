@@ -1,8 +1,9 @@
 use std::{
-    io::{Read, Write},
+    io::{ErrorKind, Read, Write},
     net::{SocketAddr, TcpListener},
     sync::{Arc, Mutex},
     thread,
+    time::{Duration, Instant},
 };
 
 use datalens_core::{DatalensErrorKind, LedgerRange};
@@ -221,10 +222,127 @@ fn test_trongrid_contract_events_malformed_response_includes_status_and_body_pre
 #[test]
 fn test_trongrid_contract_events_plain_text_rate_limit_is_retryable() {
     let seen = Arc::new(Mutex::new(Vec::new()));
-    let server = TestServer::spawn(
+    let server = TestServer::spawn_sequence(
         seen,
-        "Too Many Requests - Rate Limit Exceeded",
-        "HTTP/1.1 403 Forbidden\r\nContent-Type: application/octet-stream",
+        vec![
+            TestResponse::new(
+                "Too Many Requests - Rate Limit Exceeded",
+                "HTTP/1.1 403 Forbidden\r\nContent-Type: application/octet-stream",
+            ),
+            TestResponse::new(r#"{"data":[],"meta":{}}"#, "HTTP/1.1 200 OK"),
+        ],
+    );
+    let provider = TronHttpProvider::new("http://unused")
+        .with_trongrid(server.url(), Some("secret-key".to_owned()));
+
+    let started_at = Instant::now();
+    let page = provider
+        .get_contract_events(TronContractEventRequest {
+            contract_address: normalize_tron_contract_address(
+                "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            )
+            .expect("address"),
+            event_name: Some("Transfer".to_owned()),
+            range: LedgerRange::blocks(10, 10).expect("range"),
+            only_confirmed: true,
+            limit: 50,
+            fingerprint: None,
+        })
+        .expect("plain text rate-limit response should be retried");
+
+    assert_eq!(page.provider_calls, 2);
+    assert!(started_at.elapsed() >= Duration::from_millis(200));
+}
+
+#[test]
+fn test_trongrid_contract_events_json_rate_limit_retries_and_eventually_succeeds() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let server = TestServer::spawn_sequence(
+        seen.clone(),
+        vec![
+            TestResponse::new(
+                r#"{"success":false,"error":"rate limit exceeded","statusCode":429}"#,
+                "HTTP/1.1 429 Too Many Requests",
+            ),
+            TestResponse::new(r#"{"data":[],"meta":{}}"#, "HTTP/1.1 200 OK"),
+        ],
+    );
+    let provider = TronHttpProvider::new("http://unused")
+        .with_trongrid(server.url(), Some("secret-key".to_owned()));
+
+    let page = provider
+        .get_contract_events(TronContractEventRequest {
+            contract_address: normalize_tron_contract_address(
+                "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            )
+            .expect("address"),
+            event_name: Some("Transfer".to_owned()),
+            range: LedgerRange::blocks(10, 10).expect("range"),
+            only_confirmed: true,
+            limit: 50,
+            fingerprint: None,
+        })
+        .expect("json rate-limit response should be retried");
+
+    assert_eq!(page.provider_calls, 2);
+    assert_eq!(seen.lock().expect("seen").len(), 2);
+}
+
+#[test]
+fn test_trongrid_contract_events_successive_requests_are_paced() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let server = TestServer::spawn_sequence(
+        seen.clone(),
+        vec![
+            TestResponse::new(r#"{"data":[],"meta":{}}"#, "HTTP/1.1 200 OK"),
+            TestResponse::new(r#"{"data":[],"meta":{}}"#, "HTTP/1.1 200 OK"),
+        ],
+    );
+    let provider = TronHttpProvider::new("http://unused")
+        .with_trongrid(server.url(), Some("secret-key".to_owned()));
+    let request = TronContractEventRequest {
+        contract_address: normalize_tron_contract_address(
+            "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+        )
+        .expect("address"),
+        event_name: Some("Transfer".to_owned()),
+        range: LedgerRange::blocks(10, 10).expect("range"),
+        only_confirmed: true,
+        limit: 50,
+        fingerprint: None,
+    };
+
+    provider
+        .get_contract_events(request.clone())
+        .expect("first request");
+    let started_at = Instant::now();
+    provider
+        .get_contract_events(request)
+        .expect("second request");
+
+    assert!(started_at.elapsed() >= Duration::from_millis(300));
+    assert_eq!(seen.lock().expect("seen").len(), 2);
+}
+
+#[test]
+fn test_trongrid_contract_events_rate_limit_stops_after_bounded_retries() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let server = TestServer::spawn_sequence(
+        seen.clone(),
+        vec![
+            TestResponse::new(
+                "Too Many Requests - Rate Limit Exceeded",
+                "HTTP/1.1 403 Forbidden\r\nContent-Type: application/octet-stream",
+            ),
+            TestResponse::new(
+                "Too Many Requests - Rate Limit Exceeded",
+                "HTTP/1.1 403 Forbidden\r\nContent-Type: application/octet-stream",
+            ),
+            TestResponse::new(
+                "Too Many Requests - Rate Limit Exceeded",
+                "HTTP/1.1 403 Forbidden\r\nContent-Type: application/octet-stream",
+            ),
+        ],
     );
     let provider = TronHttpProvider::new("http://unused")
         .with_trongrid(server.url(), Some("secret-key".to_owned()));
@@ -241,9 +359,10 @@ fn test_trongrid_contract_events_plain_text_rate_limit_is_retryable() {
             limit: 50,
             fingerprint: None,
         })
-        .expect_err("plain text rate-limit response should be retryable");
+        .expect_err("rate-limit responses should stop after bounded retries");
 
     assert_eq!(error.kind, DatalensErrorKind::RateLimited);
+    assert_eq!(seen.lock().expect("seen").len(), 3);
 }
 
 #[test]
@@ -305,23 +424,55 @@ struct TestServer {
     handle: Option<thread::JoinHandle<()>>,
 }
 
+struct TestResponse {
+    body: &'static str,
+    status: &'static str,
+}
+
+impl TestResponse {
+    fn new(body: &'static str, status: &'static str) -> Self {
+        Self { body, status }
+    }
+}
+
 impl TestServer {
     fn spawn(seen: Arc<Mutex<Vec<String>>>, body: &'static str, status: &'static str) -> Self {
+        Self::spawn_sequence(seen, vec![TestResponse::new(body, status)])
+    }
+
+    fn spawn_sequence(seen: Arc<Mutex<Vec<String>>>, responses: Vec<TestResponse>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind server");
+        listener.set_nonblocking(true).expect("nonblocking server");
         let address = format!("http://{}", listener.local_addr().expect("local addr"));
         let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept request");
-            let mut buffer = [0; 4096];
-            let read = stream.read(&mut buffer).expect("read request");
-            let request = String::from_utf8_lossy(&buffer[..read]).to_string();
-            seen.lock().expect("seen").push(request);
-            let response = format!(
-                "{status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-                body.len()
-            );
-            stream
-                .write_all(response.as_bytes())
-                .expect("write response");
+            for response in responses {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(accepted) => break accepted,
+                        Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                            if Instant::now() >= deadline {
+                                return;
+                            }
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("accept request: {error}"),
+                    }
+                };
+                let mut buffer = [0; 4096];
+                let read = stream.read(&mut buffer).expect("read request");
+                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                seen.lock().expect("seen").push(request);
+                let response = format!(
+                    "{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    response.status,
+                    response.body.len(),
+                    response.body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write response");
+            }
         });
         Self {
             address,
