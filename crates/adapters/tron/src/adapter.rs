@@ -495,12 +495,18 @@ where
                 "dataset is not supported by Tron adapter",
             ));
         };
+        let provider_calls = provider_calls + extra_calls;
+        let provider_calls = if rows.is_empty() && provider_calls == 0 {
+            1
+        } else {
+            provider_calls
+        };
         let rows = QueryRows::AdapterJson {
             dataset_key: request.dataset_key.clone(),
             rows,
         };
         let (source_metadata, provider_diagnostics) =
-            self.metadata(&request, provider_calls + extra_calls, warnings);
+            self.metadata(&request, provider_calls, warnings);
         Ok(ChainFetchResponse::try_new(
             request.chain,
             request.dataset_key,
