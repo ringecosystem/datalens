@@ -106,6 +106,19 @@ pub trait DurablePromotionIntentRepository: Send + Sync {
         now_unix_seconds: u64,
         limit: usize,
     ) -> Result<Vec<DurablePromotionIntent>, DatalensError>;
+    fn list_pending_for_chain_and_source(
+        &self,
+        chain: &ChainIdentity,
+        source: DurablePromotionIntentSource,
+        now_unix_seconds: u64,
+        limit: usize,
+    ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+        Ok(self
+            .list_pending_for_chain(chain, now_unix_seconds, limit)?
+            .into_iter()
+            .filter(|intent| intent.source == source)
+            .collect())
+    }
     fn rebuild_pending_indexes(&self, now_unix_seconds: u64) -> Result<usize, DatalensError> {
         let _ = now_unix_seconds;
         Ok(0)
@@ -177,6 +190,17 @@ impl DurablePromotionIntentRepository for Arc<dyn DurablePromotionIntentReposito
     ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
         self.as_ref()
             .list_pending_for_chain(chain, now_unix_seconds, limit)
+    }
+
+    fn list_pending_for_chain_and_source(
+        &self,
+        chain: &ChainIdentity,
+        source: DurablePromotionIntentSource,
+        now_unix_seconds: u64,
+        limit: usize,
+    ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+        self.as_ref()
+            .list_pending_for_chain_and_source(chain, source, now_unix_seconds, limit)
     }
 
     fn rebuild_pending_indexes(&self, now_unix_seconds: u64) -> Result<usize, DatalensError> {
@@ -356,14 +380,36 @@ where
     ) -> Result<Vec<PendingIndexEntry>, DatalensError> {
         let mut entries = Vec::new();
         for source in [QUERY_SOURCE_KEY, WARMUP_SOURCE_KEY] {
-            let prefix = pending_index_prefix(chain, source);
-            for object in self.object_store.list(&prefix)? {
-                let Some(entry) = parse_pending_index_entry(&object.key) else {
-                    continue;
-                };
-                if entry.due_at_unix_seconds <= now_unix_seconds {
-                    entries.push(entry);
-                }
+            entries.extend(self.pending_index_entries_for_chain_and_source(
+                chain,
+                source,
+                now_unix_seconds,
+            )?);
+        }
+        entries.sort_by_key(|entry| {
+            (
+                entry.due_at_unix_seconds,
+                entry.intent_id.clone(),
+                entry.key.clone(),
+            )
+        });
+        Ok(entries)
+    }
+
+    fn pending_index_entries_for_chain_and_source(
+        &self,
+        chain: &ChainIdentity,
+        source: &str,
+        now_unix_seconds: u64,
+    ) -> Result<Vec<PendingIndexEntry>, DatalensError> {
+        let mut entries = Vec::new();
+        let prefix = pending_index_prefix(chain, source);
+        for object in self.object_store.list(&prefix)? {
+            let Some(entry) = parse_pending_index_entry(&object.key) else {
+                continue;
+            };
+            if entry.due_at_unix_seconds <= now_unix_seconds {
+                entries.push(entry);
             }
         }
         entries.sort_by_key(|entry| {
@@ -554,6 +600,41 @@ where
                 continue;
             };
             if &intent.chain == chain && intent_is_eligible_for_claim(&intent, now_unix_seconds) {
+                pending.push(intent);
+                if pending.len() >= limit {
+                    break;
+                }
+            } else {
+                let _ = self.object_store.delete(&entry.key);
+            }
+        }
+        Ok(pending)
+    }
+
+    fn list_pending_for_chain_and_source(
+        &self,
+        chain: &ChainIdentity,
+        source: DurablePromotionIntentSource,
+        now_unix_seconds: u64,
+        limit: usize,
+    ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut pending = Vec::new();
+        for entry in self.pending_index_entries_for_chain_and_source(
+            chain,
+            source_key(source),
+            now_unix_seconds,
+        )? {
+            let Some(intent) = self.get(&entry.intent_id)? else {
+                let _ = self.object_store.delete(&entry.key);
+                continue;
+            };
+            if &intent.chain == chain
+                && intent.source == source
+                && intent_is_eligible_for_claim(&intent, now_unix_seconds)
+            {
                 pending.push(intent);
                 if pending.len() >= limit {
                     break;
