@@ -337,6 +337,9 @@ fn test_tron_contract_event_provider_success_uses_trongrid_rows() {
     assert_eq!(rows[0]["transaction_id"], "tron-grid-tx");
     assert_eq!(rows[0]["source"]["provider"], "trongrid_contract_events");
     assert_eq!(provider.contract_event_calls(), 1);
+    let requests = provider.contract_event_requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].event_name.as_deref(), Some("Transfer"));
 }
 
 #[test]
@@ -493,6 +496,168 @@ fn test_tron_contract_event_provider_splits_multi_block_ranges() {
         requests[2].range,
         LedgerRange::blocks(12, 12).expect("range")
     );
+}
+
+#[test]
+fn test_tron_contract_event_provider_multi_event_filter_queries_all_events_per_contract_block() {
+    let first_contract = "41abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+    let second_contract = "41bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let provider = ContractEventFixtureProvider::with_contract_event_pages(vec![
+        TronContractEventPage {
+            events: vec![
+                contract_event_for("accepted-10", first_contract, "MessageAccepted", 10),
+                contract_event_for("transfer-10", first_contract, "Transfer", 10),
+            ],
+            next_fingerprint: None,
+            provider_calls: 1,
+        },
+        TronContractEventPage {
+            events: vec![contract_event_for(
+                "dispatched-11",
+                first_contract,
+                "MessageDispatched",
+                11,
+            )],
+            next_fingerprint: None,
+            provider_calls: 1,
+        },
+        TronContractEventPage {
+            events: vec![contract_event_for(
+                "transfer-other-10",
+                second_contract,
+                "Transfer",
+                10,
+            )],
+            next_fingerprint: None,
+            provider_calls: 1,
+        },
+        TronContractEventPage {
+            events: vec![contract_event_for(
+                "accepted-other-11",
+                second_contract,
+                "MessageAccepted",
+                11,
+            )],
+            next_fingerprint: None,
+            provider_calls: 1,
+        },
+    ]);
+    let adapter = TronAdapter::with_provider(
+        TronAdapter::with_fixture_defaults()
+            .capabilities()
+            .chain()
+            .clone(),
+        provider.clone(),
+    );
+    let selector = tron_event_selector(TronEventFilter {
+        contract_addresses: vec![first_contract.to_owned(), second_contract.to_owned()],
+        event_names: vec!["MessageAccepted".to_owned(), "MessageDispatched".to_owned()],
+    })
+    .expect("selector");
+
+    let response = adapter
+        .fetch(datalens_chain::ChainFetchRequest::new(
+            adapter.capabilities().chain().clone(),
+            DatasetKey::tron_events(),
+            LedgerRange::blocks(10, 11).expect("range"),
+            selector,
+        ))
+        .expect("fetch events");
+
+    let QueryRows::AdapterJson { rows, .. } = response.rows.rows() else {
+        panic!("expected adapter JSON rows");
+    };
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0]["transaction_id"], "accepted-10");
+    assert_eq!(rows[0]["event_name"], "MessageAccepted");
+    assert_eq!(rows[1]["transaction_id"], "dispatched-11");
+    assert_eq!(rows[1]["event_name"], "MessageDispatched");
+    assert_eq!(rows[2]["transaction_id"], "accepted-other-11");
+    assert_eq!(rows[2]["event_name"], "MessageAccepted");
+    assert_eq!(provider.contract_event_calls(), 4);
+    assert_eq!(response.provider_diagnostics.calls, 6);
+
+    let requests = provider.contract_event_requests();
+    assert_eq!(requests.len(), 4);
+    assert!(requests.iter().all(|request| request.event_name.is_none()));
+    assert_eq!(requests[0].contract_address, first_contract);
+    assert_eq!(
+        requests[0].range,
+        LedgerRange::blocks(10, 10).expect("range")
+    );
+    assert_eq!(requests[1].contract_address, first_contract);
+    assert_eq!(
+        requests[1].range,
+        LedgerRange::blocks(11, 11).expect("range")
+    );
+    assert_eq!(requests[2].contract_address, second_contract);
+    assert_eq!(
+        requests[2].range,
+        LedgerRange::blocks(10, 10).expect("range")
+    );
+    assert_eq!(requests[3].contract_address, second_contract);
+    assert_eq!(
+        requests[3].range,
+        LedgerRange::blocks(11, 11).expect("range")
+    );
+}
+
+#[test]
+fn test_tron_contract_event_provider_multi_event_filter_scales_page_cap() {
+    let provider = ContractEventFixtureProvider::with_contract_event_pages(vec![
+        TronContractEventPage {
+            events: vec![contract_event_for(
+                "irrelevant-1",
+                "41abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+                "Transfer",
+                10,
+            )],
+            next_fingerprint: Some("page-2".to_owned()),
+            provider_calls: 1,
+        },
+        TronContractEventPage {
+            events: vec![contract_event_for(
+                "accepted-10",
+                "41abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+                "MessageAccepted",
+                10,
+            )],
+            next_fingerprint: None,
+            provider_calls: 1,
+        },
+    ]);
+    let adapter = TronAdapter::with_provider(
+        TronAdapter::with_fixture_defaults()
+            .capabilities()
+            .chain()
+            .clone(),
+        provider.clone(),
+    )
+    .with_max_contract_event_pages(1);
+    let selector = tron_event_selector(TronEventFilter {
+        contract_addresses: vec!["0xabcdefabcdefabcdefabcdefabcdefabcdefabcd".to_owned()],
+        event_names: vec!["MessageAccepted".to_owned(), "MessageDispatched".to_owned()],
+    })
+    .expect("selector");
+
+    let response = adapter
+        .fetch(datalens_chain::ChainFetchRequest::new(
+            adapter.capabilities().chain().clone(),
+            DatasetKey::tron_events(),
+            LedgerRange::blocks(10, 10).expect("range"),
+            selector,
+        ))
+        .expect("fetch events");
+
+    let QueryRows::AdapterJson { rows, .. } = response.rows.rows() else {
+        panic!("expected adapter JSON rows");
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["transaction_id"], "accepted-10");
+    assert_eq!(provider.contract_event_calls(), 2);
+    let requests = provider.contract_event_requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests.iter().all(|request| request.event_name.is_none()));
 }
 
 #[test]
@@ -1241,18 +1406,32 @@ impl TronProvider for ContractEventFixtureProvider {
 }
 
 fn contract_event(transaction_id: &str) -> TronContractEvent {
+    contract_event_for(
+        transaction_id,
+        "41abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+        "Transfer",
+        10,
+    )
+}
+
+fn contract_event_for(
+    transaction_id: &str,
+    contract_address: &str,
+    event_name: &str,
+    block_number: u64,
+) -> TronContractEvent {
     TronContractEvent {
-        contract_address: "41abcdefabcdefabcdefabcdefabcdefabcdefabcd".to_owned(),
-        event_name: Some("Transfer".to_owned()),
-        event_signature: Some("Transfer(address,address,uint256)".to_owned()),
+        contract_address: contract_address.to_owned(),
+        event_name: Some(event_name.to_owned()),
+        event_signature: Some(format!("{event_name}(address,address,uint256)")),
         indexed_fields: Vec::new(),
         non_indexed_fields: serde_json::json!({"value":"1"}),
         transaction_id: Some(transaction_id.to_owned()),
-        block_number: 10,
-        block_hash: Some("000000000000000a-tron-hash".to_owned()),
+        block_number,
+        block_hash: Some(format!("{block_number:016x}-tron-hash")),
         transaction_index: 4,
         event_index: 5,
         confirmed: true,
-        raw: serde_json::json!({"event_name":"Transfer"}),
+        raw: serde_json::json!({"event_name": event_name}),
     }
 }

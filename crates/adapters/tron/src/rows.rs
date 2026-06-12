@@ -215,14 +215,20 @@ where
         let mut calls = 0;
         let mut blocks = HashMap::new();
         for contract_address in &filter.contract_addresses {
-            let event_names = if filter.event_names.is_empty() {
-                vec![None]
-            } else {
-                filter.event_names.iter().cloned().map(Some).collect()
+            let event_names = match filter.event_names.as_slice() {
+                [] => vec![None],
+                [event_name] => vec![Some(event_name.clone())],
+                _ => vec![None],
             };
             for event_name in event_names {
                 for block_number in range.start()..=range.end() {
                     let block_range = LedgerRange::blocks(block_number, block_number)?;
+                    let page_cap = if event_name.is_none() && filter.event_names.len() > 1 {
+                        self.max_contract_event_pages
+                            .saturating_mul(filter.event_names.len())
+                    } else {
+                        self.max_contract_event_pages
+                    };
                     let mut fingerprint = None;
                     let mut pages = 0;
                     let mut seen_fingerprints = HashSet::new();
@@ -290,12 +296,12 @@ where
                                 ),
                             ));
                         }
-                        if pages >= self.max_contract_event_pages {
+                        if pages >= page_cap {
                             return Err(DatalensError::new(
                                 DatalensErrorKind::ProviderLimit,
                                 format!(
                                     "TronGrid contract event page limit {} reached for contract {} event {} block {}",
-                                    self.max_contract_event_pages,
+                                    page_cap,
                                     contract_address,
                                     event_name.as_deref().unwrap_or("all"),
                                     block_number
