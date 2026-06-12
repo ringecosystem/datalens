@@ -14,9 +14,9 @@ use crate::{
     TronProvider, normalize_tron_contract_address,
 };
 
-const TRONGRID_CONTRACT_EVENTS_MAX_ATTEMPTS: usize = 3;
-const TRONGRID_CONTRACT_EVENTS_BACKOFF: Duration = Duration::from_millis(250);
-const TRONGRID_CONTRACT_EVENTS_MIN_INTERVAL: Duration = Duration::from_millis(350);
+const TRONGRID_CONTRACT_EVENTS_MAX_ATTEMPTS: usize = 5;
+const TRONGRID_CONTRACT_EVENTS_BACKOFF: Duration = Duration::from_millis(1_000);
+const TRONGRID_CONTRACT_EVENTS_MIN_INTERVAL: Duration = Duration::from_millis(1_000);
 
 #[derive(Clone, Debug)]
 pub struct TronHttpProvider {

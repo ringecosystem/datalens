@@ -251,7 +251,7 @@ fn test_trongrid_contract_events_plain_text_rate_limit_is_retryable() {
         .expect("plain text rate-limit response should be retried");
 
     assert_eq!(page.provider_calls, 2);
-    assert!(started_at.elapsed() >= Duration::from_millis(200));
+    assert!(started_at.elapsed() >= Duration::from_millis(900));
 }
 
 #[test]
@@ -320,7 +320,7 @@ fn test_trongrid_contract_events_successive_requests_are_paced() {
         .get_contract_events(request)
         .expect("second request");
 
-    assert!(started_at.elapsed() >= Duration::from_millis(300));
+    assert!(started_at.elapsed() >= Duration::from_millis(900));
     assert_eq!(seen.lock().expect("seen").len(), 2);
 }
 
@@ -330,6 +330,14 @@ fn test_trongrid_contract_events_rate_limit_stops_after_bounded_retries() {
     let server = TestServer::spawn_sequence(
         seen.clone(),
         vec![
+            TestResponse::new(
+                "Too Many Requests - Rate Limit Exceeded",
+                "HTTP/1.1 403 Forbidden\r\nContent-Type: application/octet-stream",
+            ),
+            TestResponse::new(
+                "Too Many Requests - Rate Limit Exceeded",
+                "HTTP/1.1 403 Forbidden\r\nContent-Type: application/octet-stream",
+            ),
             TestResponse::new(
                 "Too Many Requests - Rate Limit Exceeded",
                 "HTTP/1.1 403 Forbidden\r\nContent-Type: application/octet-stream",
@@ -362,7 +370,7 @@ fn test_trongrid_contract_events_rate_limit_stops_after_bounded_retries() {
         .expect_err("rate-limit responses should stop after bounded retries");
 
     assert_eq!(error.kind, DatalensErrorKind::RateLimited);
-    assert_eq!(seen.lock().expect("seen").len(), 3);
+    assert_eq!(seen.lock().expect("seen").len(), 5);
 }
 
 #[test]
@@ -446,7 +454,7 @@ impl TestServer {
         let address = format!("http://{}", listener.local_addr().expect("local addr"));
         let handle = thread::spawn(move || {
             for response in responses {
-                let deadline = Instant::now() + Duration::from_secs(2);
+                let deadline = Instant::now() + Duration::from_secs(15);
                 let (mut stream, _) = loop {
                     match listener.accept() {
                         Ok(accepted) => break accepted,
