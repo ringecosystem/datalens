@@ -128,6 +128,52 @@ fn test_follow_query_large_lookahead_builds_lead_past_next_runner_batch() {
 }
 
 #[test]
+fn test_follow_query_large_lookahead_reanchors_cursor_below_lead_floor() {
+    let plan = WarmupTargetPlanner::plan(WarmupTargetPlanInput {
+        mode: WarmupTaskMode::FollowQuery,
+        fixed_end: None,
+        cursor_next: 222_272_619,
+        query_watermark: Some(222_262_619),
+        safe_head: 222_500_000,
+        lookahead_blocks: 100_000,
+        start_offset_blocks: Some(1),
+        start_offset_tiers_blocks: None,
+        catchup_threshold_blocks: 200,
+    });
+
+    assert_eq!(
+        plan,
+        PlannedWarmupTarget::Range {
+            start: 222_272_620,
+            end: 222_372_619,
+        }
+    );
+}
+
+#[test]
+fn test_follow_query_reanchors_cursor_below_configured_start_offset() {
+    let plan = WarmupTargetPlanner::plan(WarmupTargetPlanInput {
+        mode: WarmupTaskMode::FollowQuery,
+        fixed_end: None,
+        cursor_next: 222_272_620,
+        query_watermark: Some(222_262_619),
+        safe_head: 222_500_000,
+        lookahead_blocks: 100_000,
+        start_offset_blocks: Some(50_000),
+        start_offset_tiers_blocks: None,
+        catchup_threshold_blocks: 200,
+    });
+
+    assert_eq!(
+        plan,
+        PlannedWarmupTarget::Range {
+            start: 222_312_619,
+            end: 222_412_618,
+        }
+    );
+}
+
+#[test]
 fn test_follow_query_uses_adaptive_start_offset_after_watermark() {
     let plan = WarmupTargetPlanner::plan(WarmupTargetPlanInput {
         mode: WarmupTaskMode::FollowQuery,
