@@ -62,6 +62,8 @@ pub struct TronContractEventRequest {
     pub contract_address: String,
     pub event_name: Option<String>,
     pub range: LedgerRange,
+    pub start_timestamp: Option<u64>,
+    pub end_timestamp: Option<u64>,
     pub only_confirmed: bool,
     pub limit: usize,
     pub fingerprint: Option<String>,

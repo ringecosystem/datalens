@@ -483,19 +483,13 @@ fn test_tron_contract_event_provider_splits_multi_block_ranges() {
         .expect("fetch events");
 
     let requests = provider.contract_event_requests();
-    assert_eq!(requests.len(), 3);
+    assert_eq!(requests.len(), 1);
     assert_eq!(
         requests[0].range,
-        LedgerRange::blocks(10, 10).expect("range")
+        LedgerRange::blocks(10, 12).expect("range")
     );
-    assert_eq!(
-        requests[1].range,
-        LedgerRange::blocks(11, 11).expect("range")
-    );
-    assert_eq!(
-        requests[2].range,
-        LedgerRange::blocks(12, 12).expect("range")
-    );
+    assert_eq!(requests[0].start_timestamp, Some(1_700_000_010));
+    assert_eq!(requests[0].end_timestamp, Some(1_700_000_012));
 }
 
 #[test]
@@ -507,37 +501,16 @@ fn test_tron_contract_event_provider_multi_event_filter_queries_all_events_per_c
             events: vec![
                 contract_event_for("accepted-10", first_contract, "MessageAccepted", 10),
                 contract_event_for("transfer-10", first_contract, "Transfer", 10),
+                contract_event_for("dispatched-11", first_contract, "MessageDispatched", 11),
             ],
             next_fingerprint: None,
             provider_calls: 1,
         },
         TronContractEventPage {
-            events: vec![contract_event_for(
-                "dispatched-11",
-                first_contract,
-                "MessageDispatched",
-                11,
-            )],
-            next_fingerprint: None,
-            provider_calls: 1,
-        },
-        TronContractEventPage {
-            events: vec![contract_event_for(
-                "transfer-other-10",
-                second_contract,
-                "Transfer",
-                10,
-            )],
-            next_fingerprint: None,
-            provider_calls: 1,
-        },
-        TronContractEventPage {
-            events: vec![contract_event_for(
-                "accepted-other-11",
-                second_contract,
-                "MessageAccepted",
-                11,
-            )],
+            events: vec![
+                contract_event_for("transfer-other-10", second_contract, "Transfer", 10),
+                contract_event_for("accepted-other-11", second_contract, "MessageAccepted", 11),
+            ],
             next_fingerprint: None,
             provider_calls: 1,
         },
@@ -574,32 +547,26 @@ fn test_tron_contract_event_provider_multi_event_filter_queries_all_events_per_c
     assert_eq!(rows[1]["event_name"], "MessageDispatched");
     assert_eq!(rows[2]["transaction_id"], "accepted-other-11");
     assert_eq!(rows[2]["event_name"], "MessageAccepted");
-    assert_eq!(provider.contract_event_calls(), 4);
-    assert_eq!(response.provider_diagnostics.calls, 6);
+    assert_eq!(provider.contract_event_calls(), 2);
+    assert_eq!(response.provider_diagnostics.calls, 4);
 
     let requests = provider.contract_event_requests();
-    assert_eq!(requests.len(), 4);
+    assert_eq!(requests.len(), 2);
     assert!(requests.iter().all(|request| request.event_name.is_none()));
     assert_eq!(requests[0].contract_address, first_contract);
     assert_eq!(
         requests[0].range,
-        LedgerRange::blocks(10, 10).expect("range")
+        LedgerRange::blocks(10, 11).expect("range")
     );
-    assert_eq!(requests[1].contract_address, first_contract);
+    assert_eq!(requests[0].start_timestamp, Some(1_700_000_010));
+    assert_eq!(requests[0].end_timestamp, Some(1_700_000_011));
     assert_eq!(
         requests[1].range,
-        LedgerRange::blocks(11, 11).expect("range")
+        LedgerRange::blocks(10, 11).expect("range")
     );
-    assert_eq!(requests[2].contract_address, second_contract);
-    assert_eq!(
-        requests[2].range,
-        LedgerRange::blocks(10, 10).expect("range")
-    );
-    assert_eq!(requests[3].contract_address, second_contract);
-    assert_eq!(
-        requests[3].range,
-        LedgerRange::blocks(11, 11).expect("range")
-    );
+    assert_eq!(requests[1].contract_address, second_contract);
+    assert_eq!(requests[1].start_timestamp, Some(1_700_000_010));
+    assert_eq!(requests[1].end_timestamp, Some(1_700_000_011));
 }
 
 #[test]

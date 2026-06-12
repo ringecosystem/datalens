@@ -214,6 +214,41 @@ where
         let mut rows = Vec::new();
         let mut calls = 0;
         let mut blocks = HashMap::new();
+        let (start_timestamp, end_timestamp) = if range.start() == range.end() {
+            (None, None)
+        } else {
+            let start_block = self
+                .provider
+                .get_block_by_number(range.start(), TronFinality::Finalized)?
+                .ok_or_else(|| {
+                    DatalensError::new(
+                        DatalensErrorKind::ProviderFailure,
+                        format!(
+                            "provider returned no finalized Tron block metadata for range start block {}",
+                            range.start()
+                        ),
+                    )
+                })?;
+            calls += 1;
+            let end_block = self
+                .provider
+                .get_block_by_number(range.end(), TronFinality::Finalized)?
+                .ok_or_else(|| {
+                    DatalensError::new(
+                        DatalensErrorKind::ProviderFailure,
+                        format!(
+                            "provider returned no finalized Tron block metadata for range end block {}",
+                            range.end()
+                        ),
+                    )
+                })?;
+            calls += 1;
+            let start_timestamp = start_block.timestamp;
+            let end_timestamp = end_block.timestamp;
+            blocks.insert(start_block.number, start_block);
+            blocks.insert(end_block.number, end_block);
+            (Some(start_timestamp), Some(end_timestamp))
+        };
         for contract_address in &filter.contract_addresses {
             let event_names = match filter.event_names.as_slice() {
                 [] => vec![None],
@@ -221,95 +256,99 @@ where
                 _ => vec![None],
             };
             for event_name in event_names {
-                for block_number in range.start()..=range.end() {
-                    let block_range = LedgerRange::blocks(block_number, block_number)?;
-                    let page_cap = if event_name.is_none() && filter.event_names.len() > 1 {
-                        self.max_contract_event_pages
-                            .saturating_mul(filter.event_names.len())
-                    } else {
-                        self.max_contract_event_pages
-                    };
-                    let mut fingerprint = None;
-                    let mut pages = 0;
-                    let mut seen_fingerprints = HashSet::new();
-                    loop {
-                        // Pagination is capped and fingerprint loops are rejected so
-                        // a TronGrid query cannot run forever or duplicate coverage.
-                        let page = self
-                            .provider
-                            .get_contract_events(TronContractEventRequest {
-                                contract_address: contract_address.clone(),
-                                event_name: event_name.clone(),
-                                range: block_range.clone(),
-                                only_confirmed: true,
-                                limit: 200,
-                                fingerprint: fingerprint.clone(),
-                            })?;
-                        pages += 1;
-                        calls += page.provider_calls;
-                        for event in page.events.into_iter().filter(|event| {
-                            filter.matches(&event.contract_address, event.event_name.as_deref())
-                        }) {
-                            let block = if let Some(block) = blocks.get(&event.block_number) {
-                                block
-                            } else {
-                                let block = self
-                                    .provider
-                                    .get_block_by_number(event.block_number, TronFinality::Finalized)?
-                                    .ok_or_else(|| {
-                                        DatalensError::new(
-                                            DatalensErrorKind::ProviderFailure,
-                                            format!(
-                                                "provider returned no finalized Tron block metadata for block {}",
-                                                event.block_number
-                                            ),
-                                        )
-                                    })?;
-                                calls += 1;
-                                blocks.insert(event.block_number, block);
-                                blocks.get(&event.block_number).expect("inserted block")
-                            };
-                            if let Some(block_hash) = &event.block_hash
-                                && !block_hash.eq_ignore_ascii_case(&block.hash)
-                            {
-                                return Err(DatalensError::new(
-                                    DatalensErrorKind::ProviderFailure,
-                                    format!(
-                                        "TronGrid contract event block hash {} did not match finalized block hash {} for block {}",
-                                        block_hash, block.hash, event.block_number
-                                    ),
-                                ));
-                            }
-                            rows.push(contract_event_row(event, block));
-                        }
-                        let Some(next) = page.next_fingerprint else {
-                            break;
+                let page_cap = if event_name.is_none() && filter.event_names.len() > 1 {
+                    self.max_contract_event_pages
+                        .saturating_mul(filter.event_names.len())
+                        .saturating_mul(usize::try_from(range.len()).unwrap_or(usize::MAX))
+                } else {
+                    self.max_contract_event_pages
+                        .saturating_mul(usize::try_from(range.len()).unwrap_or(usize::MAX))
+                };
+                let mut fingerprint = None;
+                let mut pages = 0;
+                let mut seen_fingerprints = HashSet::new();
+                loop {
+                    // Pagination is capped and fingerprint loops are rejected so
+                    // a TronGrid query cannot run forever or duplicate coverage.
+                    let page = self
+                        .provider
+                        .get_contract_events(TronContractEventRequest {
+                            contract_address: contract_address.clone(),
+                            event_name: event_name.clone(),
+                            range: range.clone(),
+                            start_timestamp,
+                            end_timestamp,
+                            only_confirmed: true,
+                            limit: 200,
+                            fingerprint: fingerprint.clone(),
+                        })?;
+                    pages += 1;
+                    calls += page.provider_calls;
+                    for event in page.events.into_iter().filter(|event| {
+                        range.contains(event.block_number)
+                            && filter.matches(&event.contract_address, event.event_name.as_deref())
+                    }) {
+                        let block = if let Some(block) = blocks.get(&event.block_number) {
+                            block
+                        } else {
+                            let block = self
+                                .provider
+                                .get_block_by_number(event.block_number, TronFinality::Finalized)?
+                                .ok_or_else(|| {
+                                    DatalensError::new(
+                                        DatalensErrorKind::ProviderFailure,
+                                        format!(
+                                            "provider returned no finalized Tron block metadata for block {}",
+                                            event.block_number
+                                        ),
+                                    )
+                                })?;
+                            calls += 1;
+                            blocks.insert(event.block_number, block);
+                            blocks.get(&event.block_number).expect("inserted block")
                         };
-                        if !seen_fingerprints.insert(next.clone()) {
+                        if let Some(block_hash) = &event.block_hash
+                            && !block_hash.eq_ignore_ascii_case(&block.hash)
+                        {
                             return Err(DatalensError::new(
-                                DatalensErrorKind::ProviderLimit,
+                                DatalensErrorKind::ProviderFailure,
                                 format!(
-                                    "repeated TronGrid contract event fingerprint for contract {} event {} block {}",
-                                    contract_address,
-                                    event_name.as_deref().unwrap_or("all"),
-                                    block_number
+                                    "TronGrid contract event block hash {} did not match finalized block hash {} for block {}",
+                                    block_hash, block.hash, event.block_number
                                 ),
                             ));
                         }
-                        if pages >= page_cap {
-                            return Err(DatalensError::new(
-                                DatalensErrorKind::ProviderLimit,
-                                format!(
-                                    "TronGrid contract event page limit {} reached for contract {} event {} block {}",
-                                    page_cap,
-                                    contract_address,
-                                    event_name.as_deref().unwrap_or("all"),
-                                    block_number
-                                ),
-                            ));
-                        }
-                        fingerprint = Some(next);
+                        rows.push(contract_event_row(event, block));
                     }
+                    let Some(next) = page.next_fingerprint else {
+                        break;
+                    };
+                    if !seen_fingerprints.insert(next.clone()) {
+                        return Err(DatalensError::new(
+                            DatalensErrorKind::ProviderLimit,
+                            format!(
+                                "repeated TronGrid contract event fingerprint for contract {} event {} range {}-{}",
+                                contract_address,
+                                event_name.as_deref().unwrap_or("all"),
+                                range.start(),
+                                range.end()
+                            ),
+                        ));
+                    }
+                    if pages >= page_cap {
+                        return Err(DatalensError::new(
+                            DatalensErrorKind::ProviderLimit,
+                            format!(
+                                "TronGrid contract event page limit {} reached for contract {} event {} range {}-{}",
+                                page_cap,
+                                contract_address,
+                                event_name.as_deref().unwrap_or("all"),
+                                range.start(),
+                                range.end()
+                            ),
+                        ));
+                    }
+                    fingerprint = Some(next);
                 }
             }
         }
