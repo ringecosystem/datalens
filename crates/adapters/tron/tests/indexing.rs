@@ -702,6 +702,77 @@ fn test_tron_contract_event_provider_timeout_does_not_fall_back_to_block_scan() 
 }
 
 #[test]
+fn test_tron_contract_event_provider_auth_errors_do_not_fall_back_to_block_scan() {
+    for kind in [
+        DatalensErrorKind::AuthenticationFailed,
+        DatalensErrorKind::Unauthorized,
+    ] {
+        let provider = ContractEventFixtureProvider::with_error(kind.clone());
+        let adapter = TronAdapter::with_provider(
+            TronAdapter::with_fixture_defaults()
+                .capabilities()
+                .chain()
+                .clone(),
+            provider.clone(),
+        );
+        let selector = tron_event_selector(TronEventFilter {
+            contract_addresses: vec!["0xabcdefabcdefabcdefabcdefabcdefabcdefabcd".to_owned()],
+            event_names: vec!["Transfer".to_owned()],
+        })
+        .expect("selector");
+
+        let error = adapter
+            .fetch(datalens_chain::ChainFetchRequest::new(
+                adapter.capabilities().chain().clone(),
+                DatasetKey::tron_events(),
+                LedgerRange::blocks(10, 10).expect("range"),
+                selector,
+            ))
+            .expect_err("auth failure should surface");
+
+        assert_eq!(error.kind, kind);
+        assert_eq!(provider.contract_event_calls(), 1);
+    }
+}
+
+#[test]
+fn test_tron_contract_event_provider_safe_provider_failure_falls_back_to_block_scan() {
+    let provider = ContractEventFixtureProvider::with_error_message(
+        DatalensErrorKind::ProviderFailure,
+        "TronGrid contract events HTTP error 500: upstream failed",
+    );
+    let adapter = TronAdapter::with_provider(
+        TronAdapter::with_fixture_defaults()
+            .capabilities()
+            .chain()
+            .clone(),
+        provider.clone(),
+    );
+    let selector = tron_event_selector(TronEventFilter {
+        contract_addresses: vec!["0xabcdefabcdefabcdefabcdefabcdefabcdefabcd".to_owned()],
+        event_names: vec!["Transfer".to_owned()],
+    })
+    .expect("selector");
+
+    let response = adapter
+        .fetch(datalens_chain::ChainFetchRequest::new(
+            adapter.capabilities().chain().clone(),
+            DatasetKey::tron_events(),
+            LedgerRange::blocks(10, 10).expect("range"),
+            selector,
+        ))
+        .expect("fallback fetch");
+
+    let QueryRows::AdapterJson { rows, .. } = response.rows.rows() else {
+        panic!("expected adapter JSON rows");
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["transaction_id"], "tron-tx-10");
+    assert_eq!(rows[0]["source"]["provider"], "tron_block_scan");
+    assert_eq!(provider.contract_event_calls(), 1);
+}
+
+#[test]
 fn test_tron_contract_event_provider_parse_error_does_not_fall_back_to_block_scan() {
     let storage = LocalStorage::new(temp_storage_root("malformed-contract-events"));
     let provider = ContractEventFixtureProvider::with_error(DatalensErrorKind::InvalidRequest);
@@ -1043,7 +1114,7 @@ impl TronProvider for CountingTronProvider {
 #[derive(Clone, Debug)]
 struct ContractEventFixtureProvider {
     pages: Vec<TronContractEventPage>,
-    error: Option<DatalensErrorKind>,
+    error: Option<DatalensError>,
     loop_guard: Option<usize>,
     contract_event_calls: Arc<Mutex<usize>>,
     contract_event_requests: Arc<Mutex<Vec<TronContractEventRequest>>>,
@@ -1069,9 +1140,13 @@ impl ContractEventFixtureProvider {
     }
 
     fn with_error(error: DatalensErrorKind) -> Self {
+        Self::with_error_message(error, "contract event failure")
+    }
+
+    fn with_error_message(error: DatalensErrorKind, message: impl Into<String>) -> Self {
         Self {
             pages: Vec::new(),
-            error: Some(error),
+            error: Some(DatalensError::new(error, message.into())),
             loop_guard: None,
             contract_event_calls: Arc::new(Mutex::new(0)),
             contract_event_requests: Arc::new(Mutex::new(Vec::new())),
@@ -1137,7 +1212,7 @@ impl TronProvider for ContractEventFixtureProvider {
             .expect("contract event requests")
             .push(request);
         if let Some(error) = &self.error {
-            return Err(DatalensError::new(error.clone(), "contract event failure"));
+            return Err(error.clone());
         }
         if self
             .loop_guard
