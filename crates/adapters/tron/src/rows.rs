@@ -574,7 +574,7 @@ const KNOWN_EVENT_TOPICS: &[KnownEventTopic] = &[
     },
     KnownEventTopic {
         name: "HashImported",
-        topic0: "ea087580bb17f433441f3b6c0c0b80cae92ee74a8d7f50050388646d9ffd1431",
+        topic0: "a931ec14fe958397dcb26e285e56292c13d77907712b51bbaa24cfc9349b789d",
     },
     KnownEventTopic {
         name: "MessageAccepted",
@@ -590,7 +590,7 @@ const KNOWN_EVENT_TOPICS: &[KnownEventTopic] = &[
     },
     KnownEventTopic {
         name: "MessageRecv",
-        topic0: "a931ec14fe958397dcb26e285e56292c13d77907712b51bbaa24cfc9349b789d",
+        topic0: "ea087580bb17f433441f3b6c0c0b80cae92ee74a8d7f50050388646d9ffd1431",
     },
     KnownEventTopic {
         name: "MessageSent",
