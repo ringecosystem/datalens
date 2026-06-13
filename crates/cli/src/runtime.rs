@@ -528,32 +528,84 @@ fn build_tron_service_with_storage(
         config.query.durable_intents,
     )?
     .with_usage_ledger(
-        stores.usage_ledger,
+        stores.usage_ledger.clone(),
         ApplicationIdentity::named(config.metrics.default_application.clone()),
     )
     .with_query_watermarks(
-        stores.query_watermarks,
+        stores.query_watermarks.clone(),
         ApplicationIdentity::named(config.metrics.default_application.clone()),
     )
     .with_query_activity(
-        stores.query_activity,
+        stores.query_activity.clone(),
         ApplicationIdentity::named(config.metrics.default_application.clone()),
     )
     .with_durable_intents_configured(
-        stores.durable_intents,
+        stores.durable_intents.clone(),
         config.query.durable_intents,
-        stores.durable_intent_startup_maintenance,
+        stores.durable_intent_startup_maintenance.clone(),
     );
     if config.cache_repair.enabled {
         service = service.with_cache_repair_pool(CacheRepairTaskPool::new(
             CacheRepairRuntime::new(
-                source,
-                stores.storage,
-                stores.cache_repair_registry.ok_or_else(|| {
+                source.clone(),
+                stores.storage.clone(),
+                stores.cache_repair_registry.clone().ok_or_else(|| {
                     DatalensError::internal("cache repair registry was not initialized")
                 })?,
             )
             .with_runtime_config(cache_repair_runtime_config(config)),
+        ));
+    }
+    if config.warmup.enabled {
+        let mut runtime = WarmupRuntime::new(
+            source,
+            stores.storage,
+            stores
+                .warmup_registry
+                .clone()
+                .ok_or_else(|| DatalensError::internal("warmup registry was not initialized"))?,
+            durable_writer_config(&config.writer),
+        )
+        .with_durable_writer(service.durable_writer())
+        .with_runtime_config(WarmupRuntimeConfig {
+            max_fetches_per_task_loop: config.warmup.max_fetches_per_loop,
+        })
+        .with_follow_query_lookahead_blocks(config.warmup.follow_query_lookahead_blocks)
+        .with_follow_query_start_offset_blocks(
+            chain
+                .warmup
+                .follow_query_start_offset_blocks
+                .or(config.warmup.follow_query_start_offset_blocks),
+        )
+        .with_follow_query_start_offset_tiers_blocks(
+            chain
+                .warmup
+                .follow_query_start_offset_tiers_blocks
+                .clone()
+                .or(config.warmup.follow_query_start_offset_tiers_blocks.clone()),
+        )
+        .with_follow_query_catchup_threshold_blocks(
+            chain
+                .warmup
+                .follow_query_catchup_threshold_blocks
+                .unwrap_or(config.warmup.follow_query_catchup_threshold_blocks),
+        )
+        .with_usage_ledger(stores.usage_ledger)
+        .with_query_activity_ttl_seconds(config.warmup.query_activity_ttl_seconds)
+        .with_query_activity(stores.query_activity)
+        .with_query_watermarks(stores.query_watermarks);
+        if config.query.durable_intents.enabled {
+            runtime = runtime.with_durable_intents(stores.durable_intents);
+        }
+        if let Some(recorder) = service.metrics_recorder() {
+            runtime = runtime.with_metrics(recorder);
+        }
+        service = service.with_warmup_pool(WarmupTaskPool::new(
+            runtime,
+            WarmupSchedulerConfig {
+                max_global_concurrent_tasks: config.warmup.max_global_tasks,
+                max_concurrent_tasks_per_chain: config.warmup.max_per_chain_tasks,
+            },
         ));
     }
     Ok(service)
@@ -1000,5 +1052,102 @@ pub(crate) fn finality_summary(chain: &ChainConfig) -> serde_json::Value {
             "safe_tag": safe_tag,
             "finalized_tag": finalized_tag,
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use datalens_chain::{AdapterKey, DatasetSelector};
+    use datalens_core::{ChainFamily, ChainIdentity, DatasetKey, LedgerRangeKind, NetworkId};
+    use datalens_warmup::{
+        WarmupChunkPolicy, WarmupRetryPolicy, WarmupSubmitRequest, WarmupTaskMode,
+    };
+
+    use super::*;
+
+    #[test]
+    fn test_tron_service_registers_warmup_pool_when_enabled() {
+        let root =
+            std::env::temp_dir().join(format!("datalens-tron-warmup-{}", std::process::id()));
+        let storage_root = root.join("storage");
+        let warmup_root = root.join("warmup");
+        let _ = std::fs::remove_dir_all(&root);
+        let config: DatalensConfig = toml::from_str(&format!(
+            r#"
+            [server]
+            bind = "127.0.0.1:0"
+
+            [storage]
+            backend = "local"
+
+            [storage.local]
+            root = "{}"
+
+            [planner]
+            max_query_range_blocks = 1000
+            default_chunk_range_blocks = 100
+
+            [writer]
+            target_object_bytes = 1024
+            min_object_rows = 1
+            record_empty_coverage = true
+
+            [warmup]
+            enabled = true
+            registry_path = "{}"
+
+            [chains.tron-mainnet]
+            kind = "tron"
+            chain_id = 728126428
+            rpc_urls = ["http://example.invalid/tron"]
+
+            [chains.tron-mainnet.datasets.blocks]
+            enabled = true
+            max_batch_blocks = 10
+
+            [chains.tron-mainnet.datasets.logs]
+            enabled = true
+            max_get_logs_range_blocks = 10
+            max_block_scan_range_blocks = 10
+            max_addresses_per_query = 1
+            "#,
+            storage_root.display(),
+            warmup_root.display(),
+        ))
+        .expect("config parses");
+        let registry = build_service_registry(&config).expect("service registry builds");
+        let chain = ChainIdentity::try_new(
+            ChainFamily::try_other("tron").expect("family"),
+            "tron-mainnet",
+            Some(NetworkId::numeric(728126428)),
+        )
+        .expect("chain identity");
+        let request = WarmupSubmitRequest {
+            application_id: "ormp".to_owned(),
+            chain,
+            dataset_key: DatasetKey::tron_events(),
+            selector: DatasetSelector::try_other(
+                AdapterKey::try_new("tron_events").expect("selector kind"),
+                "tron-events/test",
+                "contracts/test/events/test",
+            )
+            .expect("selector"),
+            range_kind: LedgerRangeKind::Block,
+            start: 1,
+            end: None,
+            mode: WarmupTaskMode::FollowQuery,
+            chunk_policy: WarmupChunkPolicy {
+                max_range_len: 10,
+                target_rows_hint: None,
+            },
+            retry_policy: WarmupRetryPolicy::default(),
+        };
+
+        let outcome = registry
+            .ensure_warmup_task(request)
+            .expect("Tron warmup service is registered");
+
+        assert!(outcome.created);
+        let _ = std::fs::remove_dir_all(root);
     }
 }
