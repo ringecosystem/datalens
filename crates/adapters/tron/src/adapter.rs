@@ -290,21 +290,6 @@ where
         Ok((infos, provider_calls))
     }
 
-    fn fetch_block_scan_event_rows(
-        &self,
-        request: &ChainFetchRequest,
-        range: &LedgerRange,
-    ) -> Result<(Vec<Value>, usize), DatalensError> {
-        validate_block_scan_event_filter(&request.selector)?;
-        let (blocks, block_calls) = self.fetch_blocks_for_range(range)?;
-        let transactions = transaction_refs(&blocks)?;
-        let (infos, info_calls) = self.fetch_transaction_infos(&transactions)?;
-        Ok((
-            event_rows(&infos, &request.selector),
-            block_calls + info_calls,
-        ))
-    }
-
     fn fetch_block_scan_event_rows_for_transactions(
         &self,
         request: &ChainFetchRequest,
@@ -497,7 +482,9 @@ where
             match self.fetch_contract_events(&request, &range) {
                 Ok((mut rows, mut calls)) => {
                     let mut warnings = Vec::new();
-                    if let Some(filter) = missing_block_scan_event_filter(&request.selector, &rows)
+                    if !rows.is_empty()
+                        && let Some(filter) =
+                            missing_block_scan_event_filter(&request.selector, &rows)
                     {
                         let selector = tron_event_selector(filter)?;
                         let fallback_request = ChainFetchRequest::new(
@@ -506,27 +493,18 @@ where
                             request.range.clone(),
                             selector,
                         );
-                        let (fallback_rows, fallback_calls) = if rows.is_empty() {
-                            if range.start() != range.end() {
-                                return Err(DatalensError::new(
-                                    DatalensErrorKind::ProviderLimit,
-                                    "Tron block-scan merge fallback for empty contract-event rows requires a single-block range",
-                                ));
-                            }
-                            self.fetch_block_scan_event_rows(&fallback_request, &range)?
-                        } else {
-                            let candidates = candidate_transaction_refs_from_event_rows(&rows);
-                            if candidates.is_empty() {
-                                return Err(DatalensError::new(
-                                    DatalensErrorKind::ProviderLimit,
-                                    "Tron block-scan merge fallback requires contract-event transaction ids",
-                                ));
-                            }
-                            self.fetch_block_scan_event_rows_for_transactions(
+                        let candidates = candidate_transaction_refs_from_event_rows(&rows);
+                        if candidates.is_empty() {
+                            return Err(DatalensError::new(
+                                DatalensErrorKind::ProviderLimit,
+                                "Tron block-scan merge fallback requires contract-event transaction ids",
+                            ));
+                        }
+                        let (fallback_rows, fallback_calls) = self
+                            .fetch_block_scan_event_rows_for_transactions(
                                 &fallback_request,
                                 &candidates,
-                            )?
-                        };
+                            )?;
                         rows.extend(fallback_rows);
                         dedupe_event_rows(&mut rows);
                         calls += fallback_calls;
