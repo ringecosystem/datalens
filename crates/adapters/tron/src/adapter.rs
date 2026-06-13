@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     hash::Hash,
     sync::{Arc, Mutex},
 };
@@ -19,8 +19,8 @@ use sha2::{Digest, Sha256};
 pub use crate::provider::{TronFixtureProviderRpc, TronGridContractEventsConfig, TronHttpProvider};
 use crate::rows::{
     NormalizedTronEventFilter, TronTransactionInfo, TronTransactionRef, block_rows, event_rows,
-    hex_prefix, should_fallback_from_contract_events, transaction_info_rows, transaction_refs,
-    transaction_rows, validate_block_scan_event_filter,
+    hex_prefix, missing_block_scan_event_filter, should_fallback_from_contract_events,
+    transaction_info_rows, transaction_refs, transaction_rows, validate_block_scan_event_filter,
 };
 
 const TRON_ALL_KIND: &str = "tron_all";
@@ -290,6 +290,21 @@ where
         Ok((infos, provider_calls))
     }
 
+    fn fetch_block_scan_event_rows(
+        &self,
+        request: &ChainFetchRequest,
+        range: &LedgerRange,
+    ) -> Result<(Vec<Value>, usize), DatalensError> {
+        validate_block_scan_event_filter(&request.selector)?;
+        let (blocks, block_calls) = self.fetch_blocks_for_range(range)?;
+        let transactions = transaction_refs(&blocks)?;
+        let (infos, info_calls) = self.fetch_transaction_infos(&transactions)?;
+        Ok((
+            event_rows(&infos, &request.selector),
+            block_calls + info_calls,
+        ))
+    }
+
     fn metadata(
         &self,
         request: &ChainFetchRequest,
@@ -470,13 +485,32 @@ where
             // used for errors that can be safely recovered by finalized block
             // scanning without weakening authorization or rate-limit signals.
             match self.fetch_contract_events(&request, &range) {
-                Ok((rows, calls)) => {
+                Ok((mut rows, mut calls)) => {
+                    let mut warnings = Vec::new();
+                    if let Some(filter) = missing_block_scan_event_filter(&request.selector, &rows)
+                    {
+                        let selector = tron_event_selector(filter)?;
+                        let fallback_request = ChainFetchRequest::new(
+                            request.chain.clone(),
+                            request.dataset_key.clone(),
+                            request.range.clone(),
+                            selector,
+                        );
+                        let (fallback_rows, fallback_calls) =
+                            self.fetch_block_scan_event_rows(&fallback_request, &range)?;
+                        rows.extend(fallback_rows);
+                        dedupe_event_rows(&mut rows);
+                        calls += fallback_calls;
+                        warnings.push(
+                            "tron block-scan event fallback merged missing event names".to_owned(),
+                        );
+                    }
                     let rows = QueryRows::AdapterJson {
                         dataset_key: request.dataset_key.clone(),
                         rows,
                     };
                     let (source_metadata, provider_diagnostics) =
-                        self.metadata(&request, calls, Vec::new());
+                        self.metadata(&request, calls, warnings);
                     return Ok(ChainFetchResponse::try_new(
                         request.chain,
                         request.dataset_key,
@@ -546,6 +580,31 @@ where
         .with_source_metadata(source_metadata)
         .with_provider_diagnostics(provider_diagnostics))
     }
+}
+
+fn dedupe_event_rows(rows: &mut Vec<Value>) {
+    let mut seen = HashSet::new();
+    rows.retain(|row| seen.insert(event_row_key(row)));
+}
+
+fn event_row_key(row: &Value) -> String {
+    [
+        "contract_address",
+        "transaction_id",
+        "block_number",
+        "transaction_index",
+        "event_index",
+        "event_signature",
+        "event_name",
+    ]
+    .iter()
+    .map(|field| {
+        row.get(*field)
+            .map(Value::to_string)
+            .unwrap_or_else(|| "null".to_owned())
+    })
+    .collect::<Vec<_>>()
+    .join("/")
 }
 
 #[derive(Clone, Debug)]

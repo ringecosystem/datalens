@@ -201,6 +201,33 @@ pub(crate) fn validate_block_scan_event_filter(
     ))
 }
 
+pub(crate) fn missing_block_scan_event_filter(
+    selector: &DatasetSelector,
+    rows: &[Value],
+) -> Option<TronEventFilter> {
+    let filter = selector_event_filter(selector);
+    let event_names = filter
+        .event_names
+        .iter()
+        .filter(|event_name| event_topic_from_name(event_name).is_some())
+        .filter(|event_name| {
+            !rows.iter().any(|row| {
+                row.get("event_name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| name == event_name.as_str())
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if filter.contract_addresses.is_empty() || event_names.is_empty() {
+        return None;
+    }
+    Some(TronEventFilter {
+        contract_addresses: filter.contract_addresses,
+        event_names,
+    })
+}
+
 impl<P> TronAdapter<P>
 where
     P: TronProvider,
@@ -547,7 +574,7 @@ const KNOWN_EVENT_TOPICS: &[KnownEventTopic] = &[
     },
     KnownEventTopic {
         name: "HashImported",
-        topic0: "a931ec14fe958397dcb26e285e56292c13d77907712b51bbaa24cfc9349b789d",
+        topic0: "ea087580bb17f433441f3b6c0c0b80cae92ee74a8d7f50050388646d9ffd1431",
     },
     KnownEventTopic {
         name: "MessageAccepted",
@@ -563,7 +590,7 @@ const KNOWN_EVENT_TOPICS: &[KnownEventTopic] = &[
     },
     KnownEventTopic {
         name: "MessageRecv",
-        topic0: "ea087580bb17f433441f3b6c0c0b80cae92ee74a8d7f50050388646d9ffd1431",
+        topic0: "a931ec14fe958397dcb26e285e56292c13d77907712b51bbaa24cfc9349b789d",
     },
     KnownEventTopic {
         name: "MessageSent",
