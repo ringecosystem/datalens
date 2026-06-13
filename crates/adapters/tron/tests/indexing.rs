@@ -452,6 +452,72 @@ fn test_tron_contract_event_provider_empty_success_merges_known_ormp_block_scan_
 }
 
 #[test]
+fn test_tron_contract_event_provider_ormp_fallback_fetches_only_candidate_transactions() {
+    let provider = CandidateFallbackProvider::new();
+    let adapter = TronAdapter::with_provider(test_tron_chain(), provider.clone());
+    let selector = tron_event_selector(TronEventFilter {
+        contract_addresses: vec!["0xabcdefabcdefabcdefabcdefabcdefabcdefabcd".to_owned()],
+        event_names: vec![
+            "MessageAccepted".to_owned(),
+            "MessageAssigned".to_owned(),
+            "MessageSent".to_owned(),
+        ],
+    })
+    .expect("selector");
+
+    let response = adapter
+        .fetch(datalens_chain::ChainFetchRequest::new(
+            adapter.capabilities().chain().clone(),
+            DatasetKey::tron_events(),
+            LedgerRange::blocks(10, 12).expect("range"),
+            selector,
+        ))
+        .expect("fetch events");
+
+    let QueryRows::AdapterJson { rows, .. } = response.rows.rows() else {
+        panic!("expected adapter JSON rows");
+    };
+    let event_names = rows
+        .iter()
+        .map(|row| row["event_name"].as_str().expect("event name"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        event_names,
+        vec!["MessageAssigned", "MessageSent", "MessageAccepted"]
+    );
+    assert_eq!(rows[2]["transaction_id"], "candidate-11");
+    assert_eq!(rows[2]["source"]["provider"], "tron_block_scan");
+    assert_eq!(
+        provider.transaction_info_requests(),
+        vec!["candidate-11".to_owned()]
+    );
+}
+
+#[test]
+fn test_tron_contract_event_provider_empty_multi_block_ormp_fallback_requires_smaller_range() {
+    let provider = CandidateFallbackProvider::new().with_empty_contract_events();
+    let adapter = TronAdapter::with_provider(test_tron_chain(), provider.clone());
+    let selector = tron_event_selector(TronEventFilter {
+        contract_addresses: vec!["0xabcdefabcdefabcdefabcdefabcdefabcdefabcd".to_owned()],
+        event_names: vec!["MessageAccepted".to_owned()],
+    })
+    .expect("selector");
+
+    let error = adapter
+        .fetch(datalens_chain::ChainFetchRequest::new(
+            adapter.capabilities().chain().clone(),
+            DatasetKey::tron_events(),
+            LedgerRange::blocks(10, 12).expect("range"),
+            selector,
+        ))
+        .expect_err("empty multi-block fallback should require smaller range");
+
+    assert_eq!(error.kind, DatalensErrorKind::ProviderLimit);
+    assert!(error.message.contains("requires a single-block range"));
+    assert_eq!(provider.transaction_info_requests(), Vec::<String>::new());
+}
+
+#[test]
 fn test_tron_block_range_strategy_skips_trongrid_contract_events() {
     let provider =
         ContractEventFixtureProvider::with_contract_events(vec![contract_event("tron-grid-tx")]);
@@ -578,7 +644,7 @@ fn test_tron_contract_event_provider_splits_multi_block_ranges() {
     );
     let selector = tron_event_selector(TronEventFilter {
         contract_addresses: vec!["0xabcdefabcdefabcdefabcdefabcdefabcdefabcd".to_owned()],
-        event_names: vec!["Transfer".to_owned()],
+        event_names: vec!["DefinitelyUnknownEvent".to_owned()],
     })
     .expect("selector");
 
@@ -1454,7 +1520,16 @@ impl TronProvider for ContractEventFixtureProvider {
         &self,
         tx_id: &str,
     ) -> Result<Option<serde_json::Value>, DatalensError> {
-        TronFixtureProviderRpc.get_transaction_info_by_id(tx_id)
+        if let Some(info) = TronFixtureProviderRpc.get_transaction_info_by_id(tx_id)? {
+            return Ok(Some(info));
+        }
+        Ok(Some(serde_json::json!({
+            "id": tx_id,
+            "receipt": {
+                "result": "SUCCESS",
+            },
+            "log": [],
+        })))
     }
 
     fn supports_contract_event_query(&self) -> bool {
@@ -1586,6 +1661,156 @@ impl TronProvider for KnownEventBlockScanProvider {
 
     fn provider_name(&self) -> &'static str {
         "known-event-block-scan-fixture"
+    }
+}
+
+#[derive(Clone)]
+struct CandidateFallbackProvider {
+    contract_event_calls: Arc<Mutex<usize>>,
+    transaction_info_requests: Arc<Mutex<Vec<String>>>,
+    empty_contract_events: bool,
+}
+
+impl CandidateFallbackProvider {
+    fn new() -> Self {
+        Self {
+            contract_event_calls: Arc::new(Mutex::new(0)),
+            transaction_info_requests: Arc::new(Mutex::new(Vec::new())),
+            empty_contract_events: false,
+        }
+    }
+
+    fn with_empty_contract_events(mut self) -> Self {
+        self.empty_contract_events = true;
+        self
+    }
+
+    fn transaction_info_requests(&self) -> Vec<String> {
+        self.transaction_info_requests
+            .lock()
+            .expect("transaction info requests")
+            .clone()
+    }
+}
+
+impl TronProvider for CandidateFallbackProvider {
+    fn latest_block(&self, finality: TronFinality) -> Result<TronBlock, DatalensError> {
+        TronFixtureProviderRpc.latest_block(finality)
+    }
+
+    fn get_block_by_number(
+        &self,
+        number: u64,
+        _finality: TronFinality,
+    ) -> Result<Option<TronBlock>, DatalensError> {
+        let tx_ids = match number {
+            10 => vec!["unrelated-10-a", "unrelated-10-b"],
+            11 => vec!["candidate-11", "unrelated-11"],
+            12 => vec!["unrelated-12"],
+            _ => return Ok(None),
+        };
+        Ok(Some(test_block(number, tx_ids)))
+    }
+
+    fn get_transaction_info_by_id(
+        &self,
+        tx_id: &str,
+    ) -> Result<Option<serde_json::Value>, DatalensError> {
+        self.transaction_info_requests
+            .lock()
+            .expect("transaction info requests")
+            .push(tx_id.to_owned());
+        Ok(Some(serde_json::json!({
+            "id": tx_id,
+            "blockNumber": 11,
+            "blockTimeStamp": 1_700_000_011_u64,
+            "receipt": {
+                "result": "SUCCESS",
+            },
+            "log": [{
+                "address": "41abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+                "topics": [
+                    "cfb9b3466878aff0c7df17da215fd57d59eb245a5d03f5a7b57294d54581eb18"
+                ],
+                "data": "0000000000000000000000000000000000000000000000000000000000000001"
+            }],
+        })))
+    }
+
+    fn supports_contract_event_query(&self) -> bool {
+        true
+    }
+
+    fn get_contract_events(
+        &self,
+        _request: TronContractEventRequest,
+    ) -> Result<TronContractEventPage, DatalensError> {
+        *self
+            .contract_event_calls
+            .lock()
+            .expect("contract event calls") += 1;
+        if self.empty_contract_events {
+            return Ok(TronContractEventPage {
+                events: Vec::new(),
+                next_fingerprint: None,
+                provider_calls: 1,
+            });
+        }
+        Ok(TronContractEventPage {
+            events: vec![
+                contract_event_for(
+                    "candidate-11",
+                    "41abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+                    "MessageAssigned",
+                    11,
+                ),
+                contract_event_for(
+                    "candidate-11",
+                    "41abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+                    "MessageSent",
+                    11,
+                ),
+            ],
+            next_fingerprint: None,
+            provider_calls: 1,
+        })
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "candidate-fallback-fixture"
+    }
+}
+
+fn test_block(number: u64, tx_ids: Vec<&str>) -> TronBlock {
+    let transactions = tx_ids
+        .into_iter()
+        .map(|tx_id| {
+            serde_json::json!({
+                "txID": tx_id,
+                "raw_data": {
+                    "contract": []
+                },
+                "ret": []
+            })
+        })
+        .collect::<Vec<_>>();
+    TronBlock {
+        number,
+        hash: format!("{number:016x}-tron-hash"),
+        parent_hash: format!("{:016x}-tron-hash", number - 1),
+        timestamp: 1_700_000_000 + number,
+        witness_address: None,
+        transaction_count: transactions.len(),
+        raw: serde_json::json!({
+            "blockID": format!("{number:016x}-tron-hash"),
+            "block_header": {
+                "raw_data": {
+                    "number": number,
+                    "timestamp": 1_700_000_000 + number,
+                }
+            },
+            "transactions": transactions,
+        }),
     }
 }
 
