@@ -1176,6 +1176,10 @@ fn test_index_config_loads_defaults_and_limits() {
     assert_eq!(config.index.default_finality, "finalized");
     assert_eq!(config.index.cursor_path, "/tmp/datalens-cursors");
     assert_eq!(config.index.retry.max_attempts, 4);
+    let chain = config.chains.get("ethereum").expect("chain");
+    assert_eq!(chain.trongrid.contract_events_min_interval_ms, 1_000);
+    assert_eq!(chain.trongrid.contract_events_backoff_ms, 1_000);
+    assert_eq!(chain.trongrid.contract_events_max_attempts, 5);
 }
 
 #[test]
@@ -1214,6 +1218,9 @@ fn test_index_config_accepts_trongrid_without_api_key() {
         [chains.tron-mainnet.trongrid]
         enabled = true
         base_url = "https://api.trongrid.io"
+        contract_events_min_interval_ms = 2_500
+        contract_events_backoff_ms = 3_000
+        contract_events_max_attempts = 8
 
         [chains.tron-mainnet.datasets.blocks]
         enabled = true
@@ -1231,6 +1238,9 @@ fn test_index_config_accepts_trongrid_without_api_key() {
     let chain = config.chains.get("tron-mainnet").expect("chain");
     assert!(chain.trongrid.enabled);
     assert!(chain.trongrid.api_key.is_none());
+    assert_eq!(chain.trongrid.contract_events_min_interval_ms, 2_500);
+    assert_eq!(chain.trongrid.contract_events_backoff_ms, 3_000);
+    assert_eq!(chain.trongrid.contract_events_max_attempts, 8);
 }
 
 #[test]

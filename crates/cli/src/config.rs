@@ -523,6 +523,26 @@ fn validate_chain(name: &str, chain: &ChainConfig) -> Result<(), DatalensError> 
             .follow_query_start_offset_tiers_blocks
             .as_deref(),
     )?;
+    if chain.trongrid.contract_events_min_interval_ms == 0 {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            format!(
+                "chain {name} trongrid.contract_events_min_interval_ms must be greater than zero"
+            ),
+        ));
+    }
+    if chain.trongrid.contract_events_backoff_ms == 0 {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            format!("chain {name} trongrid.contract_events_backoff_ms must be greater than zero"),
+        ));
+    }
+    if chain.trongrid.contract_events_max_attempts == 0 {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            format!("chain {name} trongrid.contract_events_max_attempts must be greater than zero"),
+        ));
+    }
     if matches!(chain.kind.as_str(), "solana" | "tron") {
         return Ok(());
     }
@@ -651,6 +671,9 @@ pub fn doctor_chain_summary(
                         "enabled": chain.trongrid.enabled,
                         "base_url": chain.trongrid.base_url.as_deref().unwrap_or("https://api.trongrid.io"),
                         "api_key_configured": chain.trongrid.api_key.as_ref().is_some_and(|value| !value.trim().is_empty()),
+                        "contract_events_min_interval_ms": chain.trongrid.contract_events_min_interval_ms,
+                        "contract_events_backoff_ms": chain.trongrid.contract_events_backoff_ms,
+                        "contract_events_max_attempts": chain.trongrid.contract_events_max_attempts,
                     },
                 }
             }

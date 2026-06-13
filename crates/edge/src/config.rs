@@ -701,7 +701,7 @@ pub struct ChainWarmupConfig {
     pub follow_query_catchup_threshold_blocks: Option<u64>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TronGridConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -709,6 +709,37 @@ pub struct TronGridConfig {
     pub base_url: Option<String>,
     #[serde(default)]
     pub api_key: Option<String>,
+    #[serde(default = "default_trongrid_contract_events_min_interval_ms")]
+    pub contract_events_min_interval_ms: u64,
+    #[serde(default = "default_trongrid_contract_events_backoff_ms")]
+    pub contract_events_backoff_ms: u64,
+    #[serde(default = "default_trongrid_contract_events_max_attempts")]
+    pub contract_events_max_attempts: usize,
+}
+
+impl Default for TronGridConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: None,
+            api_key: None,
+            contract_events_min_interval_ms: default_trongrid_contract_events_min_interval_ms(),
+            contract_events_backoff_ms: default_trongrid_contract_events_backoff_ms(),
+            contract_events_max_attempts: default_trongrid_contract_events_max_attempts(),
+        }
+    }
+}
+
+fn default_trongrid_contract_events_min_interval_ms() -> u64 {
+    1_000
+}
+
+fn default_trongrid_contract_events_backoff_ms() -> u64 {
+    1_000
+}
+
+fn default_trongrid_contract_events_max_attempts() -> usize {
+    5
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

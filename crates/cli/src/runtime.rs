@@ -25,7 +25,7 @@ use datalens_storage::{
     ObjectStore, QueryActivityRepository, QueryActivityStore, QueryWatermarkRepository,
     QueryWatermarkStore, S3ObjectStore, UsageLedgerRepository, UsageLedgerStore,
 };
-use datalens_tron::{TronAdapter, TronHttpProvider};
+use datalens_tron::{TronAdapter, TronGridContractEventsConfig, TronHttpProvider};
 use datalens_warmup::{
     LocalWarmupRegistry, WarmupRuntime, WarmupRuntimeConfig, WarmupSchedulerConfig, WarmupTaskPool,
 };
@@ -556,14 +556,20 @@ fn build_tron_service_with_storage(
 pub(crate) fn tron_provider(url: String, chain: &ChainConfig) -> TronHttpProvider {
     let provider = TronHttpProvider::new(url);
     if chain.trongrid.enabled {
-        provider.with_trongrid(
-            chain
-                .trongrid
-                .base_url
-                .clone()
-                .unwrap_or_else(|| "https://api.trongrid.io".to_owned()),
-            chain.trongrid.api_key.clone(),
-        )
+        provider
+            .with_trongrid(
+                chain
+                    .trongrid
+                    .base_url
+                    .clone()
+                    .unwrap_or_else(|| "https://api.trongrid.io".to_owned()),
+                chain.trongrid.api_key.clone(),
+            )
+            .with_trongrid_contract_events_config(TronGridContractEventsConfig {
+                max_attempts: chain.trongrid.contract_events_max_attempts,
+                backoff: Duration::from_millis(chain.trongrid.contract_events_backoff_ms),
+                min_interval: Duration::from_millis(chain.trongrid.contract_events_min_interval_ms),
+            })
     } else {
         provider
     }
