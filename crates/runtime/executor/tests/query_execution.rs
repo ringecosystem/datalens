@@ -110,6 +110,50 @@ fn test_executor_miss_fetches_and_persists_through_writer() {
 }
 
 #[test]
+fn test_executor_new_without_durable_promotions_disables_legacy_promotion() {
+    let storage = LocalStorage::new(temp_storage_root("executor-explicit-no-promotion"));
+    let source = MockSource::default().with_blocks(vec![block(10, "0x10")]);
+    let executor = NativeQueryExecutor::new_without_durable_promotions(
+        storage.clone(),
+        source,
+        NativeQueryExecutionConfig {
+            planner: NativePlannerConfig {
+                max_query_range_len: 4,
+                default_chunk_range_len: 2,
+            },
+            writer: DurableWriterConfig {
+                target_object_bytes: 1024,
+                min_object_rows: 1,
+                record_empty_coverage: true,
+                staging: Default::default(),
+            },
+        },
+    );
+
+    let result = executor
+        .execute(blocks_input(10, 10))
+        .expect("query result");
+    executor
+        .wait_for_durable_promotions()
+        .expect("promotion drain");
+
+    assert_eq!(block_numbers(&result.rows), vec![10]);
+    assert_eq!(
+        result.cache.promotion_pending_ranges,
+        Vec::<LedgerRange>::new()
+    );
+    let covered = storage
+        .covered_ranges(
+            &ethereum_identity(),
+            &DatasetKey::evm_blocks(),
+            &DatasetSelector::all(),
+            LedgerRange::blocks(10, 10).expect("range"),
+        )
+        .expect("covered ranges");
+    assert!(covered.is_empty());
+}
+
+#[test]
 fn test_executor_miss_submits_durable_intent_when_configured() {
     let storage = LocalStorage::new(temp_storage_root("executor-intent-submit"));
     let source = MockSource::default().with_blocks(vec![block(1, "0x01")]);
