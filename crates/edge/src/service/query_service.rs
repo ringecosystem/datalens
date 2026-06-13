@@ -202,15 +202,11 @@ where
                 },
             },
         };
-        let mut executor = if durable_intents_config.enabled {
-            NativeQueryExecutor::new(storage, source, execution_config)
-        } else {
-            NativeQueryExecutor::new_without_durable_promotions(storage, source, execution_config)
-        }
-        .with_durable_intent_worker_config(DurablePromotionIntentWorkerConfig {
-            worker_threads: durable_intents_config.worker_threads,
-            claim_batch_size: durable_intents_config.claim_batch_size,
-        });
+        let mut executor = NativeQueryExecutor::new(storage, source, execution_config)
+            .with_durable_intent_worker_config(DurablePromotionIntentWorkerConfig {
+                worker_threads: durable_intents_config.worker_threads,
+                claim_batch_size: durable_intents_config.claim_batch_size,
+            });
         if let Some(recorder) = recorder.clone() {
             executor = executor.with_metrics(
                 recorder,
