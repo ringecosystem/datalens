@@ -884,9 +884,101 @@ fn test_config_parses_query_durable_intent_worker_settings() {
     )
     .expect("config parses");
 
+    assert!(config.query.durable_intents.enabled);
     assert_eq!(config.query.durable_intents.worker_threads, 8);
     assert_eq!(config.query.durable_intents.claim_batch_size, 64);
     validate_config(&config).expect("query durable intent worker config is valid");
+}
+
+#[test]
+fn test_config_defaults_query_durable_intents_enabled() {
+    let config = toml::from_str::<DatalensConfig>(
+        r#"
+        [server]
+        bind = "127.0.0.1:0"
+
+        [storage]
+        backend = "local"
+
+        [storage.local]
+        root = ".tmp/datalens-cli-test"
+
+        [planner]
+        max_query_range_blocks = 100
+        default_chunk_range_blocks = 10
+
+        [writer]
+        target_object_bytes = 1024
+        min_object_rows = 1
+        record_empty_coverage = true
+
+        [chains.ethereum]
+        kind = "evm"
+        chain_id = 1
+        rpc_urls = ["http://example.invalid"]
+
+        [chains.ethereum.datasets.blocks]
+        enabled = true
+        max_batch_blocks = 10
+
+        [chains.ethereum.datasets.logs]
+        enabled = true
+        max_get_logs_range_blocks = 10
+        max_addresses_per_query = 2
+        "#,
+    )
+    .expect("config parses");
+
+    assert!(config.query.durable_intents.enabled);
+    validate_config(&config).expect("default query durable intent config is valid");
+}
+
+#[test]
+fn test_config_allows_disabling_query_durable_intents() {
+    let config = toml::from_str::<DatalensConfig>(
+        r#"
+        [server]
+        bind = "127.0.0.1:0"
+
+        [storage]
+        backend = "local"
+
+        [storage.local]
+        root = ".tmp/datalens-cli-test"
+
+        [planner]
+        max_query_range_blocks = 100
+        default_chunk_range_blocks = 10
+
+        [writer]
+        target_object_bytes = 1024
+        min_object_rows = 1
+        record_empty_coverage = true
+
+        [query.durable_intents]
+        enabled = false
+        worker_threads = 0
+        claim_batch_size = 0
+
+        [chains.ethereum]
+        kind = "evm"
+        chain_id = 1
+        rpc_urls = ["http://example.invalid"]
+
+        [chains.ethereum.datasets.blocks]
+        enabled = true
+        max_batch_blocks = 10
+
+        [chains.ethereum.datasets.logs]
+        enabled = true
+        max_get_logs_range_blocks = 10
+        max_addresses_per_query = 2
+        "#,
+    )
+    .expect("config parses");
+
+    assert!(!config.query.durable_intents.enabled);
+    validate_config(&config).expect("disabled query durable intent config is valid");
 }
 
 #[test]

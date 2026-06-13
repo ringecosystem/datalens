@@ -181,31 +181,32 @@ where
             None
         };
         let capabilities = source.capabilities();
-        let mut executor = NativeQueryExecutor::new(
-            storage,
-            source,
-            NativeQueryExecutionConfig {
-                planner: NativePlannerConfig {
-                    max_query_range_len: planner.max_query_range_blocks,
-                    default_chunk_range_len: planner.default_chunk_range_blocks,
-                },
-                writer: DurableWriterConfig {
-                    target_object_bytes: writer.target_object_bytes,
-                    min_object_rows: writer.min_object_rows,
-                    record_empty_coverage: writer.record_empty_coverage,
-                    staging: datalens_writer::WriteStagingConfig {
-                        enabled: writer.staging.enabled,
-                        min_rows: writer.staging.min_rows,
-                        target_object_bytes: writer.staging.target_object_bytes,
-                        max_staged_ranges: writer.staging.max_staged_ranges,
-                        max_staged_rows: writer.staging.max_staged_rows,
-                        max_staged_age_ms: writer.staging.max_staged_age_ms,
-                        flush_on_shutdown: writer.staging.flush_on_shutdown,
-                        max_staged_bytes: writer.staging.max_staged_bytes,
-                    },
+        let execution_config = NativeQueryExecutionConfig {
+            planner: NativePlannerConfig {
+                max_query_range_len: planner.max_query_range_blocks,
+                default_chunk_range_len: planner.default_chunk_range_blocks,
+            },
+            writer: DurableWriterConfig {
+                target_object_bytes: writer.target_object_bytes,
+                min_object_rows: writer.min_object_rows,
+                record_empty_coverage: writer.record_empty_coverage,
+                staging: datalens_writer::WriteStagingConfig {
+                    enabled: writer.staging.enabled,
+                    min_rows: writer.staging.min_rows,
+                    target_object_bytes: writer.staging.target_object_bytes,
+                    max_staged_ranges: writer.staging.max_staged_ranges,
+                    max_staged_rows: writer.staging.max_staged_rows,
+                    max_staged_age_ms: writer.staging.max_staged_age_ms,
+                    flush_on_shutdown: writer.staging.flush_on_shutdown,
+                    max_staged_bytes: writer.staging.max_staged_bytes,
                 },
             },
-        )
+        };
+        let mut executor = if durable_intents_config.enabled {
+            NativeQueryExecutor::new(storage, source, execution_config)
+        } else {
+            NativeQueryExecutor::new_without_durable_promotions(storage, source, execution_config)
+        }
         .with_durable_intent_worker_config(DurablePromotionIntentWorkerConfig {
             worker_threads: durable_intents_config.worker_threads,
             claim_batch_size: durable_intents_config.claim_batch_size,
@@ -288,6 +289,20 @@ where
             .executor
             .with_durable_intents_startup_maintenance_once(repository, startup_maintenance_once);
         self
+    }
+
+    pub fn with_durable_intents_configured(
+        self,
+        repository: impl DurablePromotionIntentRepository + 'static,
+        config: QueryDurableIntentConfig,
+        startup_maintenance_once: Arc<Once>,
+    ) -> Self {
+        if config.enabled {
+            self.with_durable_intents_startup_maintenance_once(repository, startup_maintenance_once)
+        } else {
+            log::info!("query durable intents disabled");
+            self
+        }
     }
 
     pub fn with_warmup_pool<P>(mut self, pool: P) -> Self

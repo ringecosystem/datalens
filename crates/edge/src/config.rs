@@ -242,6 +242,8 @@ impl Default for QueryMetadataConfig {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QueryDurableIntentConfig {
+    #[serde(default = "default_query_durable_intent_enabled")]
+    pub enabled: bool,
     #[serde(default = "default_query_durable_intent_worker_threads")]
     pub worker_threads: usize,
     #[serde(default = "default_query_durable_intent_claim_batch_size")]
@@ -251,6 +253,7 @@ pub struct QueryDurableIntentConfig {
 impl Default for QueryDurableIntentConfig {
     fn default() -> Self {
         Self {
+            enabled: default_query_durable_intent_enabled(),
             worker_threads: default_query_durable_intent_worker_threads(),
             claim_batch_size: default_query_durable_intent_claim_batch_size(),
         }
@@ -494,6 +497,10 @@ fn default_query_metadata_coalesced_capacity() -> usize {
 
 fn default_query_durable_intent_worker_threads() -> usize {
     2
+}
+
+fn default_query_durable_intent_enabled() -> bool {
+    true
 }
 
 fn default_query_durable_intent_claim_batch_size() -> usize {

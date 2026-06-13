@@ -338,6 +338,53 @@ fn test_query_service_supports_latest_only_read_through_without_durable_cache_wr
 }
 
 #[test]
+fn test_query_service_disabled_durable_intents_returns_provider_rows_without_intent() {
+    let root = temp_storage_root("query-durable-intents-disabled");
+    let source = MockSource::default().with_blocks(vec![block(100, "0x64")]);
+    let intents = RecordingIntentRepository::default();
+    let recorded = intents.recorded();
+    let service = service_with_query_durable_intents_config(
+        LocalStorage::new(&root),
+        source.clone(),
+        datalens_edge::config::QueryDurableIntentConfig {
+            enabled: false,
+            worker_threads: 0,
+            claim_batch_size: 0,
+        },
+        intents,
+    );
+
+    let response = service
+        .query_native(blocks_request(100, 100))
+        .expect("query succeeds");
+
+    assert_eq!(block_numbers(&response), vec![100]);
+    assert_eq!(
+        response.cache.provider_fill_ranges,
+        vec![LedgerRange::blocks(100, 100).expect("range")]
+    );
+    assert_eq!(
+        source.calls(),
+        vec![SourceCall::Blocks(BlockRange::expect_new(100, 100))]
+    );
+    assert!(recorded.lock().expect("recorded intent lock").is_empty());
+    service
+        .wait_for_durable_promotions()
+        .expect("legacy promotions drain");
+    assert!(
+        LocalStorage::new(&root)
+            .covered_ranges(
+                &ethereum_identity(),
+                &DatasetKey::evm_blocks(),
+                &DatasetSelector::all(),
+                LedgerRange::blocks(100, 100).expect("range"),
+            )
+            .expect("covered ranges")
+            .is_empty()
+    );
+}
+
+#[test]
 fn test_api_error_mapping_uses_stable_response_codes() {
     let body = api_error_body(DatalensError::new(
         DatalensErrorKind::ProviderLimit,

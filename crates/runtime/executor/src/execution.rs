@@ -110,7 +110,7 @@ pub struct NativeQueryExecutor<R, S> {
     source: S,
     planner: NativePlanner,
     writer: DurableWriter<R>,
-    durable_promotions: DurablePromotionQueue<R>,
+    durable_promotions: Option<DurablePromotionQueue<R>>,
     provider_singleflight: ProviderSingleflight,
     provider_ranges: ProviderRangeController,
     metrics: Option<ExecutorMetrics>,
@@ -161,9 +161,32 @@ where
     S: ChainAdapter,
 {
     pub fn new(storage: R, source: S, config: NativeQueryExecutionConfig) -> Self {
+        Self::new_with_durable_promotions_enabled(storage, source, config, true)
+    }
+
+    pub fn new_without_durable_promotions(
+        storage: R,
+        source: S,
+        config: NativeQueryExecutionConfig,
+    ) -> Self {
+        Self::new_with_durable_promotions_enabled(storage, source, config, false)
+    }
+
+    fn new_with_durable_promotions_enabled(
+        storage: R,
+        source: S,
+        config: NativeQueryExecutionConfig,
+        durable_promotions_enabled: bool,
+    ) -> Self {
         let writer = DurableWriter::new(storage.clone(), config.writer);
-        let durable_promotions =
-            DurablePromotionQueue::new(writer.clone()).expect("durable promotion workers start");
+        let durable_promotions = if durable_promotions_enabled {
+            Some(
+                DurablePromotionQueue::new(writer.clone())
+                    .expect("durable promotion workers start"),
+            )
+        } else {
+            None
+        };
         Self {
             storage,
             source,
@@ -291,12 +314,16 @@ where
     }
 
     pub fn flush_staged_writes(&self) -> Result<DurableWriteResult, DatalensError> {
-        self.durable_promotions.wait_for_idle()?;
+        if let Some(durable_promotions) = &self.durable_promotions {
+            durable_promotions.wait_for_idle()?;
+        }
         self.writer.flush()
     }
 
     pub fn flush_staged_writes_for_shutdown(&self) -> Result<DurableWriteResult, DatalensError> {
-        self.durable_promotions.wait_for_idle()?;
+        if let Some(durable_promotions) = &self.durable_promotions {
+            durable_promotions.wait_for_idle()?;
+        }
         self.writer.flush_for_shutdown()
     }
 
@@ -305,7 +332,10 @@ where
     }
 
     pub fn wait_for_durable_promotions(&self) -> Result<(), DatalensError> {
-        self.durable_promotions.wait_for_idle()
+        if let Some(durable_promotions) = &self.durable_promotions {
+            durable_promotions.wait_for_idle()?;
+        }
+        Ok(())
     }
 
     pub fn execute_with_application(
@@ -727,9 +757,9 @@ where
                         durable_write_outcome = LedgerDurableWriteOutcome::StorageError;
                     }
                 }
-            } else {
+            } else if let Some(durable_promotions) = &self.durable_promotions {
                 let enqueue_start = Instant::now();
-                match self.durable_promotions.enqueue(DurablePromotionRequest {
+                match durable_promotions.enqueue(DurablePromotionRequest {
                     query_id: query_id.clone(),
                     chain: plan.chain.clone(),
                     dataset_key: plan.dataset_key.clone(),
@@ -798,6 +828,15 @@ where
                         durable_write_outcome = LedgerDurableWriteOutcome::StorageError;
                     }
                 };
+            } else {
+                log::info!(
+                    "durable promotion disabled query_id={} dataset={} range={}-{} pending_ranges={}",
+                    query_id,
+                    plan.dataset_key.as_str(),
+                    plan.ledger_range.start(),
+                    plan.ledger_range.end(),
+                    pending_ranges.len()
+                );
             }
         }
         if provider_fetch_attempted {
