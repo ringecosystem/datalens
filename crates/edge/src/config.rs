@@ -745,6 +745,8 @@ pub struct LogsDatasetConfig {
     pub enabled: bool,
     #[serde(default = "default_true")]
     pub reliability_enabled: bool,
+    #[serde(default = "default_true")]
+    pub receipt_fallback_enabled: bool,
     #[serde(default)]
     pub query_strategy: QueryStrategy,
     pub max_get_logs_range_blocks: u64,

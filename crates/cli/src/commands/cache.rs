@@ -255,7 +255,11 @@ fn force_refresh_evm_adapter(
         chain.datasets.logs.max_addresses_per_query,
     )
     .with_logs_query_strategy(QueryStrategy::ProviderFilter)
-    .with_log_reliability_config(EvmLogReliabilityConfig::default().with_enabled(true))
+    .with_log_reliability_config(
+        EvmLogReliabilityConfig::default()
+            .with_enabled(true)
+            .with_receipt_fallback_enabled(true),
+    )
     .with_block_header_metadata_config(evm_block_header_metadata_config(chain)?))
 }
 

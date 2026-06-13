@@ -2168,6 +2168,7 @@ fn test_doctor_chain_summary_rejects_unknown_auto_finality_without_profile() {
             logs: datalens_edge::config::LogsDatasetConfig {
                 enabled: true,
                 reliability_enabled: true,
+                receipt_fallback_enabled: true,
                 query_strategy: Default::default(),
                 max_get_logs_range_blocks: 10,
                 max_block_scan_range_blocks: 10,

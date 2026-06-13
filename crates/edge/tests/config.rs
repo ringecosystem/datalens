@@ -147,6 +147,12 @@ fn test_config_evm_log_reliability_defaults_to_enabled() {
         toml::from_str(&config_text("[query.native]")).expect("config should parse");
 
     assert!(config.chains["ethereum"].datasets.logs.reliability_enabled);
+    assert!(
+        config.chains["ethereum"]
+            .datasets
+            .logs
+            .receipt_fallback_enabled
+    );
 }
 
 #[test]
@@ -161,6 +167,26 @@ fn test_config_evm_log_reliability_can_be_disabled() {
     let config: DatalensConfig = toml::from_str(&input).expect("config should parse");
 
     assert!(!config.chains["ethereum"].datasets.logs.reliability_enabled);
+}
+
+#[test]
+fn test_config_evm_log_receipt_fallback_can_be_disabled() {
+    let input = config_text("[query.native]").replace(
+        r#"enabled = true
+        max_get_logs_range_blocks = 10"#,
+        r#"enabled = true
+        receipt_fallback_enabled = false
+        max_get_logs_range_blocks = 10"#,
+    );
+    let config: DatalensConfig = toml::from_str(&input).expect("config should parse");
+
+    assert!(config.chains["ethereum"].datasets.logs.reliability_enabled);
+    assert!(
+        !config.chains["ethereum"]
+            .datasets
+            .logs
+            .receipt_fallback_enabled
+    );
 }
 
 #[test]

@@ -144,6 +144,7 @@ pub(crate) fn chain_config(chain_id: u64) -> ChainConfig {
             logs: LogsDatasetConfig {
                 enabled: true,
                 reliability_enabled: true,
+                receipt_fallback_enabled: true,
                 query_strategy: Default::default(),
                 max_get_logs_range_blocks: 4,
                 max_block_scan_range_blocks: 4,
@@ -176,6 +177,7 @@ pub(crate) fn non_evm_chain_config(kind: &str) -> ChainConfig {
             logs: LogsDatasetConfig {
                 enabled: false,
                 reliability_enabled: true,
+                receipt_fallback_enabled: true,
                 query_strategy: Default::default(),
                 max_get_logs_range_blocks: 2,
                 max_block_scan_range_blocks: 2,

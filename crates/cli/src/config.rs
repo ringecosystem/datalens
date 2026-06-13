@@ -695,6 +695,7 @@ pub fn doctor_chain_summary(
             "logs": {
                 "enabled": chain.datasets.logs.enabled,
                 "reliability_enabled": chain.datasets.logs.reliability_enabled,
+                "receipt_fallback_enabled": chain.datasets.logs.receipt_fallback_enabled,
                 "query_strategy": chain.datasets.logs.query_strategy,
                 "max_get_logs_range_blocks": chain.datasets.logs.max_get_logs_range_blocks,
                 "max_block_scan_range_blocks": chain.datasets.logs.max_block_scan_range_blocks,
