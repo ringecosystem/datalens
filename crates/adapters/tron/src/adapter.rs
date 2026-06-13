@@ -128,6 +128,7 @@ pub struct TronAdapter<P> {
     chain: ChainIdentity,
     pub(crate) provider: P,
     max_block_range_len: u64,
+    max_event_range_len: u64,
     events_query_strategy: QueryStrategy,
     pub(crate) max_contract_event_pages: usize,
     block_cache: BlockCache,
@@ -143,6 +144,7 @@ where
             chain,
             provider,
             max_block_range_len: 64,
+            max_event_range_len: 64,
             events_query_strategy: QueryStrategy::ProviderFilter,
             max_contract_event_pages: DEFAULT_MAX_CONTRACT_EVENT_PAGES,
             block_cache: Arc::new(Mutex::new(BoundedCache::new(
@@ -156,6 +158,12 @@ where
 
     pub fn with_max_block_range_len(mut self, max_block_range_len: u64) -> Self {
         self.max_block_range_len = max_block_range_len.max(1);
+        self.max_event_range_len = self.max_block_range_len;
+        self
+    }
+
+    pub fn with_max_event_range_len(mut self, max_event_range_len: u64) -> Self {
+        self.max_event_range_len = max_event_range_len.max(1);
         self
     }
 
@@ -182,7 +190,12 @@ where
                 "Tron adapter only supports block ranges",
             ));
         }
-        if request.range.len() > u128::from(self.max_block_range_len) {
+        let max_range_len = if request.dataset_key == DatasetKey::tron_events() {
+            self.max_event_range_len
+        } else {
+            self.max_block_range_len
+        };
+        if request.range.len() > u128::from(max_range_len) {
             return Err(DatalensError::new(
                 DatalensErrorKind::ProviderLimit,
                 "request range exceeds Tron provider block range limit",
@@ -317,22 +330,31 @@ where
     P: TronProvider,
 {
     fn capabilities(&self) -> AdapterCapabilities {
-        let capability = |dataset_key| {
+        let capability = |dataset_key, max_range_len| {
             DatasetCapability::new(dataset_key)
                 .with_selector(SelectorKind::Other(adapter_key(TRON_ALL_KIND)))
                 .with_range(HeightRangeKind::Block)
-                .with_max_range_len(self.max_block_range_len)
+                .with_max_range_len(max_range_len)
                 .with_empty_coverage(true)
                 .with_finalized_height(true)
                 .with_range_split(true)
                 .with_reorg_signals(true)
         };
         AdapterCapabilities::new(self.chain.clone())
-            .with_dataset_capability(capability(DatasetKey::tron_blocks()))
-            .with_dataset_capability(capability(DatasetKey::tron_transactions()))
-            .with_dataset_capability(capability(DatasetKey::tron_transaction_infos()))
+            .with_dataset_capability(capability(
+                DatasetKey::tron_blocks(),
+                self.max_block_range_len,
+            ))
+            .with_dataset_capability(capability(
+                DatasetKey::tron_transactions(),
+                self.max_block_range_len,
+            ))
+            .with_dataset_capability(capability(
+                DatasetKey::tron_transaction_infos(),
+                self.max_block_range_len,
+            ))
             .with_dataset_capability(
-                capability(DatasetKey::tron_events())
+                capability(DatasetKey::tron_events(), self.max_event_range_len)
                     .with_selector(SelectorKind::Other(adapter_key(TRON_EVENTS_KIND))),
             )
     }

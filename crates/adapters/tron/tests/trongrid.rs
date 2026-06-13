@@ -372,6 +372,54 @@ fn test_trongrid_contract_events_successive_requests_are_paced() {
 }
 
 #[test]
+fn test_trongrid_contract_events_rate_limit_defers_future_requests() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let server = TestServer::spawn_sequence(
+        seen.clone(),
+        vec![
+            TestResponse::new(
+                r#"{"success":false,"error":"rate limit exceeded","statusCode":429}"#,
+                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1",
+            ),
+            TestResponse::new(r#"{"data":[],"meta":{}}"#, "HTTP/1.1 200 OK"),
+        ],
+    );
+    let provider = TronHttpProvider::new("http://unused")
+        .with_trongrid(server.url(), Some("secret-key".to_owned()))
+        .with_trongrid_contract_events_config(TronGridContractEventsConfig {
+            max_attempts: 1,
+            backoff: Duration::from_millis(1),
+            min_interval: Duration::from_millis(1),
+        });
+    let request = TronContractEventRequest {
+        contract_address: normalize_tron_contract_address(
+            "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+        )
+        .expect("address"),
+        event_name: Some("Transfer".to_owned()),
+        range: LedgerRange::blocks(10, 10).expect("range"),
+        start_timestamp: None,
+        end_timestamp: None,
+        only_confirmed: true,
+        limit: 50,
+        fingerprint: None,
+    };
+
+    let error = provider
+        .get_contract_events(request.clone())
+        .expect_err("first request should stop at rate limit");
+    assert_eq!(error.kind, DatalensErrorKind::RateLimited);
+
+    let started_at = Instant::now();
+    provider
+        .get_contract_events(request)
+        .expect("future request waits for rate-limit cooldown");
+
+    assert!(started_at.elapsed() >= Duration::from_millis(900));
+    assert_eq!(seen.lock().expect("seen").len(), 2);
+}
+
+#[test]
 fn test_trongrid_contract_events_rate_limit_stops_after_bounded_retries() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let server = TestServer::spawn_sequence(

@@ -1180,6 +1180,7 @@ fn test_index_config_loads_defaults_and_limits() {
     assert_eq!(chain.trongrid.contract_events_min_interval_ms, 1_000);
     assert_eq!(chain.trongrid.contract_events_backoff_ms, 1_000);
     assert_eq!(chain.trongrid.contract_events_max_attempts, 5);
+    assert_eq!(chain.trongrid.contract_events_max_range_blocks, 1_000);
 }
 
 #[test]
@@ -1221,6 +1222,7 @@ fn test_index_config_accepts_trongrid_without_api_key() {
         contract_events_min_interval_ms = 2_500
         contract_events_backoff_ms = 3_000
         contract_events_max_attempts = 8
+        contract_events_max_range_blocks = 5_000
 
         [chains.tron-mainnet.datasets.blocks]
         enabled = true
@@ -1241,6 +1243,7 @@ fn test_index_config_accepts_trongrid_without_api_key() {
     assert_eq!(chain.trongrid.contract_events_min_interval_ms, 2_500);
     assert_eq!(chain.trongrid.contract_events_backoff_ms, 3_000);
     assert_eq!(chain.trongrid.contract_events_max_attempts, 8);
+    assert_eq!(chain.trongrid.contract_events_max_range_blocks, 5_000);
 }
 
 #[test]
