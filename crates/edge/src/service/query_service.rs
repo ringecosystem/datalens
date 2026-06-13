@@ -290,6 +290,20 @@ where
         self
     }
 
+    pub fn with_durable_intents_configured(
+        self,
+        repository: impl DurablePromotionIntentRepository + 'static,
+        config: QueryDurableIntentConfig,
+        startup_maintenance_once: Arc<Once>,
+    ) -> Self {
+        if config.enabled {
+            self.with_durable_intents_startup_maintenance_once(repository, startup_maintenance_once)
+        } else {
+            log::info!("query durable intents disabled");
+            self
+        }
+    }
+
     pub fn with_warmup_pool<P>(mut self, pool: P) -> Self
     where
         P: RegisteredWarmupService + 'static,

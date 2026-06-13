@@ -15,14 +15,18 @@ pub(crate) use datalens_core::{
     QueryFinalityRequirement, QueryRows, QuerySegmentSource,
 };
 pub(crate) use datalens_edge::config::{
-    ChainConfig, DatasetsConfig, LogsDatasetConfig, PlannerConfig, WriterConfig,
+    ChainConfig, DatasetsConfig, LogsDatasetConfig, PlannerConfig, QueryDurableIntentConfig,
+    QueryMetadataConfig, WriterConfig,
 };
 pub(crate) use datalens_edge::{
     FieldSelectionApi, NativeQueryResponse, QueryApiRequest, QueryApiResponse, QueryRangeApi,
     QuerySelectorApi, QueryService, api_error_body, api_error_status,
 };
 pub(crate) use datalens_planner::{FieldSelection, NativeQueryInput};
-pub(crate) use datalens_storage::LocalStorage;
+pub(crate) use datalens_storage::{
+    CreateDurablePromotionIntent, DurablePromotionIntent, DurablePromotionIntentCreateOutcome,
+    DurablePromotionIntentRepository, LocalStorage,
+};
 
 pub(crate) fn assert_contract_violation_not_cached(name: &str, mutation: ResponseMutation) {
     let root = temp_storage_root(name);
@@ -60,6 +64,39 @@ pub(crate) fn service(storage: LocalStorage, source: MockSource) -> QueryService
             staging: Default::default(),
         },
         chain_config(2),
+    )
+}
+
+pub(crate) fn service_with_query_durable_intents_config(
+    storage: LocalStorage,
+    source: MockSource,
+    durable_intents_config: QueryDurableIntentConfig,
+    repository: impl DurablePromotionIntentRepository + 'static,
+) -> QueryService<MockSource> {
+    QueryService::new_with_query_worker_config(
+        storage,
+        source,
+        PlannerConfig {
+            max_query_range_blocks: 4,
+            default_chunk_range_blocks: 2,
+        },
+        WriterConfig {
+            target_object_bytes: 1024,
+            min_object_rows: 1,
+            record_empty_coverage: true,
+            staging: Default::default(),
+        },
+        "ethereum",
+        chain_config(2),
+        Default::default(),
+        QueryMetadataConfig::default(),
+        durable_intents_config,
+    )
+    .expect("query service")
+    .with_durable_intents_configured(
+        repository,
+        durable_intents_config,
+        Arc::new(std::sync::Once::new()),
     )
 }
 
@@ -280,6 +317,94 @@ impl MockSource {
 
     pub(crate) fn calls(&self) -> Vec<SourceCall> {
         self.calls.lock().expect("calls lock").clone()
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct RecordingIntentRepository {
+    recorded: Arc<Mutex<Vec<CreateDurablePromotionIntent>>>,
+}
+
+impl RecordingIntentRepository {
+    pub(crate) fn recorded(&self) -> Arc<Mutex<Vec<CreateDurablePromotionIntent>>> {
+        self.recorded.clone()
+    }
+}
+
+impl DurablePromotionIntentRepository for RecordingIntentRepository {
+    fn create_or_get(
+        &self,
+        request: CreateDurablePromotionIntent,
+    ) -> Result<DurablePromotionIntentCreateOutcome, DatalensError> {
+        self.recorded
+            .lock()
+            .expect("recorded intent lock")
+            .push(request);
+        panic!("durable intent should not be submitted")
+    }
+
+    fn get(&self, _intent_id: &str) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        Ok(None)
+    }
+
+    fn list_pending(
+        &self,
+        _now_unix_seconds: u64,
+        _limit: usize,
+    ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+        Ok(Vec::new())
+    }
+
+    fn list_pending_for_chain(
+        &self,
+        _chain: &ChainIdentity,
+        _now_unix_seconds: u64,
+        _limit: usize,
+    ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+        Ok(Vec::new())
+    }
+
+    fn mark_running(
+        &self,
+        _intent_id: &str,
+        _now_unix_seconds: u64,
+    ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        Ok(None)
+    }
+
+    fn mark_completed(
+        &self,
+        _intent_id: &str,
+        _now_unix_seconds: u64,
+    ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        Ok(None)
+    }
+
+    fn mark_retryable_failure(
+        &self,
+        _intent_id: &str,
+        _error: &str,
+        _now_unix_seconds: u64,
+        _next_retry_at_unix_seconds: u64,
+    ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        Ok(None)
+    }
+
+    fn mark_terminal_failure(
+        &self,
+        _intent_id: &str,
+        _error: &str,
+        _now_unix_seconds: u64,
+    ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        Ok(None)
+    }
+
+    fn reset_stale_running(
+        &self,
+        _stale_before_unix_seconds: u64,
+        _now_unix_seconds: u64,
+    ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+        Ok(Vec::new())
     }
 }
 

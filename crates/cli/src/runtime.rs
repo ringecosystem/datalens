@@ -354,8 +354,9 @@ fn build_evm_service_with_storage(
         stores.query_activity.clone(),
         ApplicationIdentity::named(config.metrics.default_application.clone()),
     )
-    .with_durable_intents_startup_maintenance_once(
+    .with_durable_intents_configured(
         stores.durable_intents.clone(),
+        config.query.durable_intents,
         stores.durable_intent_startup_maintenance.clone(),
     );
     if config.cache_repair.enabled {
@@ -407,8 +408,10 @@ fn build_evm_service_with_storage(
         .with_usage_ledger(stores.usage_ledger)
         .with_query_activity_ttl_seconds(config.warmup.query_activity_ttl_seconds)
         .with_query_activity(stores.query_activity)
-        .with_query_watermarks(stores.query_watermarks)
-        .with_durable_intents(stores.durable_intents);
+        .with_query_watermarks(stores.query_watermarks);
+        if config.query.durable_intents.enabled {
+            runtime = runtime.with_durable_intents(stores.durable_intents);
+        }
         if let Some(recorder) = service.metrics_recorder() {
             runtime = runtime.with_metrics(recorder);
         }
@@ -469,8 +472,9 @@ fn build_solana_service_with_storage(
         stores.query_activity,
         ApplicationIdentity::named(config.metrics.default_application.clone()),
     )
-    .with_durable_intents_startup_maintenance_once(
+    .with_durable_intents_configured(
         stores.durable_intents,
+        config.query.durable_intents,
         stores.durable_intent_startup_maintenance,
     );
     if config.cache_repair.enabled {
@@ -535,8 +539,9 @@ fn build_tron_service_with_storage(
         stores.query_activity,
         ApplicationIdentity::named(config.metrics.default_application.clone()),
     )
-    .with_durable_intents_startup_maintenance_once(
+    .with_durable_intents_configured(
         stores.durable_intents,
+        config.query.durable_intents,
         stores.durable_intent_startup_maintenance,
     );
     if config.cache_repair.enabled {

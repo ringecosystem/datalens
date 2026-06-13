@@ -184,13 +184,13 @@ fn validate_query_config(config: &DatalensConfig) -> Result<(), DatalensError> {
             "query.metadata.coalesced_capacity must be greater than zero",
         ));
     }
-    if config.query.durable_intents.worker_threads == 0 {
+    if config.query.durable_intents.enabled && config.query.durable_intents.worker_threads == 0 {
         return Err(DatalensError::new(
             DatalensErrorKind::InvalidInput,
             "query.durable_intents.worker_threads must be greater than zero",
         ));
     }
-    if config.query.durable_intents.claim_batch_size == 0 {
+    if config.query.durable_intents.enabled && config.query.durable_intents.claim_batch_size == 0 {
         return Err(DatalensError::new(
             DatalensErrorKind::InvalidInput,
             "query.durable_intents.claim_batch_size must be greater than zero",
