@@ -8,7 +8,8 @@ use std::{
 
 use datalens_core::{DatalensErrorKind, LedgerRange};
 use datalens_tron::{
-    TronContractEventRequest, TronHttpProvider, TronProvider, normalize_tron_contract_address,
+    TronContractEventRequest, TronGridContractEventsConfig, TronHttpProvider, TronProvider,
+    normalize_tron_contract_address,
 };
 
 #[test]
@@ -419,6 +420,51 @@ fn test_trongrid_contract_events_rate_limit_stops_after_bounded_retries() {
 
     assert_eq!(error.kind, DatalensErrorKind::RateLimited);
     assert_eq!(seen.lock().expect("seen").len(), 5);
+}
+
+#[test]
+fn test_trongrid_contract_events_uses_configured_retry_limit() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let server = TestServer::spawn_sequence(
+        seen.clone(),
+        vec![
+            TestResponse::new(
+                "Too Many Requests - Rate Limit Exceeded",
+                "HTTP/1.1 403 Forbidden\r\nContent-Type: application/octet-stream",
+            ),
+            TestResponse::new(
+                "Too Many Requests - Rate Limit Exceeded",
+                "HTTP/1.1 403 Forbidden\r\nContent-Type: application/octet-stream",
+            ),
+            TestResponse::new(r#"{"data":[],"meta":{}}"#, "HTTP/1.1 200 OK"),
+        ],
+    );
+    let provider = TronHttpProvider::new("http://unused")
+        .with_trongrid(server.url(), Some("secret-key".to_owned()))
+        .with_trongrid_contract_events_config(TronGridContractEventsConfig {
+            max_attempts: 2,
+            backoff: Duration::from_millis(1),
+            min_interval: Duration::from_millis(1),
+        });
+
+    let error = provider
+        .get_contract_events(TronContractEventRequest {
+            contract_address: normalize_tron_contract_address(
+                "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            )
+            .expect("address"),
+            event_name: Some("Transfer".to_owned()),
+            range: LedgerRange::blocks(10, 10).expect("range"),
+            start_timestamp: None,
+            end_timestamp: None,
+            only_confirmed: true,
+            limit: 50,
+            fingerprint: None,
+        })
+        .expect_err("configured retry limit should stop before success response");
+
+    assert_eq!(error.kind, DatalensErrorKind::RateLimited);
+    assert_eq!(seen.lock().expect("seen").len(), 2);
 }
 
 #[test]

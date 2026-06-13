@@ -18,6 +18,23 @@ const TRONGRID_CONTRACT_EVENTS_MAX_ATTEMPTS: usize = 5;
 const TRONGRID_CONTRACT_EVENTS_BACKOFF: Duration = Duration::from_millis(1_000);
 const TRONGRID_CONTRACT_EVENTS_MIN_INTERVAL: Duration = Duration::from_millis(1_000);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TronGridContractEventsConfig {
+    pub max_attempts: usize,
+    pub backoff: Duration,
+    pub min_interval: Duration,
+}
+
+impl Default for TronGridContractEventsConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: TRONGRID_CONTRACT_EVENTS_MAX_ATTEMPTS,
+            backoff: TRONGRID_CONTRACT_EVENTS_BACKOFF,
+            min_interval: TRONGRID_CONTRACT_EVENTS_MIN_INTERVAL,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct TronHttpProvider {
     url: String,
@@ -30,6 +47,7 @@ pub struct TronHttpProvider {
 struct TronGridConfig {
     base_url: String,
     api_key: Option<String>,
+    contract_events: TronGridContractEventsConfig,
 }
 
 impl TronHttpProvider {
@@ -46,8 +64,26 @@ impl TronHttpProvider {
         self.trongrid = Some(TronGridConfig {
             base_url: base_url.into(),
             api_key: api_key.filter(|value| !value.trim().is_empty()),
+            contract_events: TronGridContractEventsConfig::default(),
         });
         self
+    }
+
+    pub fn with_trongrid_contract_events_config(
+        mut self,
+        config: TronGridContractEventsConfig,
+    ) -> Self {
+        if let Some(trongrid) = &mut self.trongrid {
+            trongrid.contract_events = config;
+        }
+        self
+    }
+
+    fn contract_events_config(&self) -> TronGridContractEventsConfig {
+        self.trongrid
+            .as_ref()
+            .map(|config| config.contract_events)
+            .unwrap_or_default()
     }
 
     fn endpoint(&self, path: &str) -> String {
@@ -177,6 +213,7 @@ impl TronHttpProvider {
     }
 
     fn wait_for_contract_event_request_slot(&self) {
+        let min_interval = self.contract_events_config().min_interval;
         let sleep_for = {
             let mut next_request_at = self
                 .next_contract_event_request_at
@@ -184,11 +221,11 @@ impl TronHttpProvider {
                 .expect("contract event request limiter poisoned");
             let now = Instant::now();
             if now >= *next_request_at {
-                *next_request_at = now + TRONGRID_CONTRACT_EVENTS_MIN_INTERVAL;
+                *next_request_at = now + min_interval;
                 None
             } else {
                 let sleep_for = *next_request_at - now;
-                *next_request_at += TRONGRID_CONTRACT_EVENTS_MIN_INTERVAL;
+                *next_request_at += min_interval;
                 Some(sleep_for)
             }
         };
@@ -203,6 +240,7 @@ impl TronHttpProvider {
         url: &str,
         api_key: &str,
     ) -> Result<TronContractEventPage, DatalensError> {
+        let config = self.contract_events_config();
         let mut attempts = 0;
         loop {
             attempts += 1;
@@ -213,9 +251,9 @@ impl TronHttpProvider {
                 }
                 Err(error)
                     if error.kind == DatalensErrorKind::RateLimited
-                        && attempts < TRONGRID_CONTRACT_EVENTS_MAX_ATTEMPTS =>
+                        && attempts < config.max_attempts =>
                 {
-                    thread::sleep(TRONGRID_CONTRACT_EVENTS_BACKOFF * attempts as u32);
+                    thread::sleep(config.backoff * attempts as u32);
                 }
                 Err(error) => return Err(error),
             }

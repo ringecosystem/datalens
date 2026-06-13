@@ -16,7 +16,7 @@ use datalens_core::{
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-pub use crate::provider::{TronFixtureProviderRpc, TronHttpProvider};
+pub use crate::provider::{TronFixtureProviderRpc, TronGridContractEventsConfig, TronHttpProvider};
 use crate::rows::{
     NormalizedTronEventFilter, TronTransactionInfo, TronTransactionRef, block_rows, event_rows,
     hex_prefix, should_fallback_from_contract_events, transaction_info_rows, transaction_refs,
