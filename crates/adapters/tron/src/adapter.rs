@@ -1,5 +1,6 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
+    hash::Hash,
     sync::{Arc, Mutex},
 };
 
@@ -27,9 +28,11 @@ pub(crate) const TRON_EVENTS_KIND: &str = "tron_events";
 const FINALIZED: TronFinality = TronFinality::Finalized;
 const LATEST: TronFinality = TronFinality::Latest;
 const DEFAULT_MAX_CONTRACT_EVENT_PAGES: usize = 100;
+const DEFAULT_BLOCK_CACHE_MAX_ENTRIES: usize = 16;
+const DEFAULT_TRANSACTION_INFO_CACHE_MAX_ENTRIES: usize = 1024;
 
-type BlockCache = Arc<Mutex<HashMap<(u64, u64), Vec<TronBlock>>>>;
-type TransactionInfoCache = Arc<Mutex<HashMap<String, Value>>>;
+type BlockCache = Arc<Mutex<BoundedCache<(u64, u64), Vec<TronBlock>>>>;
+type TransactionInfoCache = Arc<Mutex<BoundedCache<String, Value>>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TronFinality {
@@ -142,8 +145,12 @@ where
             max_block_range_len: 64,
             events_query_strategy: QueryStrategy::ProviderFilter,
             max_contract_event_pages: DEFAULT_MAX_CONTRACT_EVENT_PAGES,
-            block_cache: Arc::new(Mutex::new(HashMap::new())),
-            transaction_info_cache: Arc::new(Mutex::new(HashMap::new())),
+            block_cache: Arc::new(Mutex::new(BoundedCache::new(
+                DEFAULT_BLOCK_CACHE_MAX_ENTRIES,
+            ))),
+            transaction_info_cache: Arc::new(Mutex::new(BoundedCache::new(
+                DEFAULT_TRANSACTION_INFO_CACHE_MAX_ENTRIES,
+            ))),
         }
     }
 
@@ -194,7 +201,6 @@ where
             .lock()
             .expect("Tron block cache")
             .get(&cache_key)
-            .cloned()
         {
             return Ok((blocks, 0));
         }
@@ -225,7 +231,7 @@ where
         self.block_cache
             .lock()
             .expect("Tron block cache")
-            .insert(cache_key, blocks.clone());
+            .put(cache_key, blocks.clone());
         Ok((blocks, provider_calls))
     }
 
@@ -241,7 +247,6 @@ where
                 .lock()
                 .expect("Tron transaction info cache")
                 .get(&transaction.tx_id)
-                .cloned()
             {
                 raw
             } else {
@@ -261,7 +266,7 @@ where
                 self.transaction_info_cache
                     .lock()
                     .expect("Tron transaction info cache")
-                    .insert(transaction.tx_id.clone(), raw.clone());
+                    .put(transaction.tx_id.clone(), raw.clone());
                 raw
             };
             infos.push(TronTransactionInfo {
@@ -521,6 +526,49 @@ where
     }
 }
 
+#[derive(Clone, Debug)]
+struct BoundedCache<K, V> {
+    max_entries: usize,
+    entries: HashMap<K, V>,
+    lru: VecDeque<K>,
+}
+
+impl<K, V> BoundedCache<K, V>
+where
+    K: Clone + Eq + Hash,
+    V: Clone,
+{
+    fn new(max_entries: usize) -> Self {
+        Self {
+            max_entries: max_entries.max(1),
+            entries: HashMap::new(),
+            lru: VecDeque::new(),
+        }
+    }
+
+    fn get(&mut self, key: &K) -> Option<V> {
+        let value = self.entries.get(key)?.clone();
+        self.touch(key);
+        Some(value)
+    }
+
+    fn put(&mut self, key: K, value: V) {
+        self.entries.insert(key.clone(), value);
+        self.touch(&key);
+        while self.entries.len() > self.max_entries {
+            let Some(evicted) = self.lru.pop_front() else {
+                break;
+            };
+            self.entries.remove(&evicted);
+        }
+    }
+
+    fn touch(&mut self, key: &K) {
+        self.lru.retain(|existing| existing != key);
+        self.lru.push_back(key.clone());
+    }
+}
+
 pub fn tron_all_selector() -> Result<DatasetSelector, DatalensError> {
     DatasetSelector::try_other(adapter_key(TRON_ALL_KIND), "tron-all/all", "all")
 }
@@ -638,4 +686,72 @@ fn default_tron_chain() -> ChainIdentity {
         Some(NetworkId::textual("mainnet").expect("valid network id")),
     )
     .expect("valid Tron chain")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_cache_evicts_least_recently_used_range() {
+        let mut cache = BoundedCache::new(2);
+        cache.put(
+            (10, 10),
+            vec![TronBlock {
+                number: 10,
+                hash: "block-10".to_owned(),
+                parent_hash: "block-9".to_owned(),
+                timestamp: 1_700_000_010,
+                witness_address: None,
+                transaction_count: 0,
+                raw: serde_json::json!({ "number": 10 }),
+            }],
+        );
+        cache.put(
+            (11, 11),
+            vec![TronBlock {
+                number: 11,
+                hash: "block-11".to_owned(),
+                parent_hash: "block-10".to_owned(),
+                timestamp: 1_700_000_011,
+                witness_address: None,
+                transaction_count: 0,
+                raw: serde_json::json!({ "number": 11 }),
+            }],
+        );
+
+        assert!(cache.get(&(10, 10)).is_some());
+
+        cache.put(
+            (12, 12),
+            vec![TronBlock {
+                number: 12,
+                hash: "block-12".to_owned(),
+                parent_hash: "block-11".to_owned(),
+                timestamp: 1_700_000_012,
+                witness_address: None,
+                transaction_count: 0,
+                raw: serde_json::json!({ "number": 12 }),
+            }],
+        );
+
+        assert!(cache.get(&(10, 10)).is_some());
+        assert!(cache.get(&(11, 11)).is_none());
+        assert!(cache.get(&(12, 12)).is_some());
+    }
+
+    #[test]
+    fn transaction_info_cache_evicts_least_recently_used_transaction() {
+        let mut cache = BoundedCache::new(2);
+        cache.put("tx-10".to_owned(), serde_json::json!({ "id": "tx-10" }));
+        cache.put("tx-11".to_owned(), serde_json::json!({ "id": "tx-11" }));
+
+        assert!(cache.get(&"tx-10".to_owned()).is_some());
+
+        cache.put("tx-12".to_owned(), serde_json::json!({ "id": "tx-12" }));
+
+        assert!(cache.get(&"tx-10".to_owned()).is_some());
+        assert!(cache.get(&"tx-11".to_owned()).is_none());
+        assert!(cache.get(&"tx-12".to_owned()).is_some());
+    }
 }

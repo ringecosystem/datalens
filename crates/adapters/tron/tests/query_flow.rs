@@ -37,6 +37,9 @@ fn test_tron_blocks_complete_fetch_query_cache_flow() {
     };
 
     let first = executor.execute(input.clone()).expect("first query");
+    executor
+        .wait_for_durable_promotions()
+        .expect("first query durable promotion");
     let second = executor.execute(input).expect("second query");
 
     assert_eq!(

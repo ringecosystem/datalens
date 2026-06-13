@@ -126,6 +126,9 @@ fn test_small_tron_json_rows_survive_query_executor_restart_with_staging_enabled
         .execute(input.clone())
         .expect("first query fills small JSON rows");
     assert_eq!(first.rows.row_count(), 1);
+    first_executor
+        .wait_for_durable_promotions()
+        .expect("first query durable promotion");
 
     let second_provider = CountingTronProvider::default();
     let second_executor = NativeQueryExecutor::new(
