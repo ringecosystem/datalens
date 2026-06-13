@@ -715,6 +715,8 @@ pub struct TronGridConfig {
     pub contract_events_backoff_ms: u64,
     #[serde(default = "default_trongrid_contract_events_max_attempts")]
     pub contract_events_max_attempts: usize,
+    #[serde(default = "default_trongrid_contract_events_max_range_blocks")]
+    pub contract_events_max_range_blocks: u64,
 }
 
 impl Default for TronGridConfig {
@@ -726,6 +728,7 @@ impl Default for TronGridConfig {
             contract_events_min_interval_ms: default_trongrid_contract_events_min_interval_ms(),
             contract_events_backoff_ms: default_trongrid_contract_events_backoff_ms(),
             contract_events_max_attempts: default_trongrid_contract_events_max_attempts(),
+            contract_events_max_range_blocks: default_trongrid_contract_events_max_range_blocks(),
         }
     }
 }
@@ -740,6 +743,10 @@ fn default_trongrid_contract_events_backoff_ms() -> u64 {
 
 fn default_trongrid_contract_events_max_attempts() -> usize {
     5
+}
+
+fn default_trongrid_contract_events_max_range_blocks() -> u64 {
+    1_000
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

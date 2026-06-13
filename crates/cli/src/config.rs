@@ -543,6 +543,14 @@ fn validate_chain(name: &str, chain: &ChainConfig) -> Result<(), DatalensError> 
             format!("chain {name} trongrid.contract_events_max_attempts must be greater than zero"),
         ));
     }
+    if chain.trongrid.contract_events_max_range_blocks == 0 {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            format!(
+                "chain {name} trongrid.contract_events_max_range_blocks must be greater than zero"
+            ),
+        ));
+    }
     if matches!(chain.kind.as_str(), "solana" | "tron") {
         return Ok(());
     }
@@ -638,6 +646,7 @@ pub fn doctor_chain_summary(
             ),
         )
         .with_max_block_range_len(chain.datasets.blocks.max_batch_blocks.max(1))
+        .with_max_event_range_len(chain.trongrid.contract_events_max_range_blocks.max(1))
         .with_events_query_strategy(chain.datasets.logs.query_strategy);
         let safe_height = source.cache_safe_height().map_err(|error| {
             DatalensError::new(
@@ -674,6 +683,7 @@ pub fn doctor_chain_summary(
                         "contract_events_min_interval_ms": chain.trongrid.contract_events_min_interval_ms,
                         "contract_events_backoff_ms": chain.trongrid.contract_events_backoff_ms,
                         "contract_events_max_attempts": chain.trongrid.contract_events_max_attempts,
+                        "contract_events_max_range_blocks": chain.trongrid.contract_events_max_range_blocks,
                     },
                 }
             }

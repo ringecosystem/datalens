@@ -6,6 +6,7 @@ use std::{
 
 use datalens_core::{DatalensError, DatalensErrorKind, redact_url, redact_urls_in_text};
 use reqwest::blocking::Client;
+use reqwest::header::HeaderMap;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -172,6 +173,7 @@ impl TronHttpProvider {
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
+        let rate_limit_cooldown = retry_after(response.headers());
         let raw_body = response.text().map_err(|error| {
             DatalensError::new(
                 DatalensErrorKind::ProviderFailure,
@@ -183,6 +185,9 @@ impl TronHttpProvider {
             )
         })?;
         if status.as_u16() == 429 || is_plain_text_rate_limit(status.as_u16(), &raw_body) {
+            self.defer_contract_event_requests(
+                rate_limit_cooldown.unwrap_or_else(|| self.contract_events_config().backoff),
+            );
             return Err(DatalensError::new(
                 DatalensErrorKind::RateLimited,
                 "TronGrid contract events rate limited",
@@ -235,6 +240,18 @@ impl TronHttpProvider {
         }
     }
 
+    fn defer_contract_event_requests(&self, cooldown: Duration) {
+        let cooldown = cooldown.max(self.contract_events_config().min_interval);
+        let mut next_request_at = self
+            .next_contract_event_request_at
+            .lock()
+            .expect("contract event request limiter poisoned");
+        let cooldown_until = Instant::now() + cooldown;
+        if *next_request_at < cooldown_until {
+            *next_request_at = cooldown_until;
+        }
+    }
+
     fn get_contract_events_with_retry(
         &self,
         url: &str,
@@ -253,7 +270,7 @@ impl TronHttpProvider {
                     if error.kind == DatalensErrorKind::RateLimited
                         && attempts < config.max_attempts =>
                 {
-                    thread::sleep(config.backoff * attempts as u32);
+                    self.defer_contract_event_requests(config.backoff * attempts as u32);
                 }
                 Err(error) => return Err(error),
             }
@@ -614,6 +631,17 @@ fn base58_encode(bytes: &[u8]) -> String {
 
 fn is_plain_text_rate_limit(status: u16, body: &str) -> bool {
     (status == 403 || status == 429) && body.to_ascii_lowercase().contains("rate limit")
+}
+
+fn retry_after(headers: &HeaderMap) -> Option<Duration> {
+    let seconds = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    Some(Duration::from_secs(seconds))
 }
 
 fn trongrid_contract_events_http_error(status: u16, body: &Value) -> DatalensError {

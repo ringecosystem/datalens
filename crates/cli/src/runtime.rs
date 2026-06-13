@@ -510,6 +510,7 @@ fn build_tron_service_with_storage(
         tron_provider(url.to_owned(), chain),
     )
     .with_max_block_range_len(chain.datasets.blocks.max_batch_blocks.max(1))
+    .with_max_event_range_len(chain.trongrid.contract_events_max_range_blocks.max(1))
     .with_events_query_strategy(chain.datasets.logs.query_strategy);
     let mut service = datalens_edge::QueryService::new_with_query_worker_config(
         stores.storage.clone(),

@@ -1032,6 +1032,29 @@ fn test_tron_indexing_chunks_according_to_provider_limit() {
 }
 
 #[test]
+fn test_tron_events_capability_uses_event_range_without_changing_blocks() {
+    let adapter = TronAdapter::with_provider(test_tron_chain(), TronFixtureProviderRpc)
+        .with_max_block_range_len(1000)
+        .with_max_event_range_len(5000);
+    let capabilities = adapter.capabilities();
+
+    assert_eq!(
+        capabilities
+            .dataset(&DatasetKey::tron_blocks())
+            .expect("blocks capability")
+            .max_range_len(),
+        Some(1000)
+    );
+    assert_eq!(
+        capabilities
+            .dataset(&DatasetKey::tron_events())
+            .expect("events capability")
+            .max_range_len(),
+        Some(5000)
+    );
+}
+
+#[test]
 fn test_tron_durable_query_reads_indexed_transactions() {
     let root = temp_storage_root("query-indexed");
     let storage = LocalStorage::new(&root);
