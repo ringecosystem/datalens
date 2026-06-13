@@ -368,6 +368,20 @@ fn test_query_service_disabled_durable_intents_returns_provider_rows_without_int
         vec![SourceCall::Blocks(BlockRange::expect_new(100, 100))]
     );
     assert!(recorded.lock().expect("recorded intent lock").is_empty());
+    service
+        .wait_for_durable_promotions()
+        .expect("legacy promotions drain");
+    assert!(
+        LocalStorage::new(&root)
+            .covered_ranges(
+                &ethereum_identity(),
+                &DatasetKey::evm_blocks(),
+                &DatasetSelector::all(),
+                LedgerRange::blocks(100, 100).expect("range"),
+            )
+            .expect("covered ranges")
+            .is_empty()
+    );
 }
 
 #[test]
