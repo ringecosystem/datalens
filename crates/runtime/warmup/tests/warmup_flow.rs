@@ -669,9 +669,9 @@ fn test_query_watermark_does_not_directly_update_warmup_cursor() {
     let result = runtime.run_task_once(&task_id).expect("warmup run");
 
     assert_eq!(result.status, WarmupRunStatus::Partial);
-    assert_eq!(adapter.fetches(), vec![blocks(1, 2)]);
+    assert_eq!(adapter.fetches(), vec![blocks(11, 12)]);
     let cursor = registry.load_cursor(&task_id).unwrap().expect("cursor");
-    assert_eq!(cursor.next, 3);
+    assert_eq!(cursor.next, 13);
 }
 
 #[test]
@@ -755,6 +755,48 @@ fn test_follow_query_at_watermark_uses_adaptive_lookahead_frontier() {
                 &DatasetKey::evm_logs(),
                 &selector(),
                 blocks(100, 100_999)
+            )
+            .unwrap()
+            .is_empty()
+    );
+    let cursor = registry.load_cursor(&task_id).unwrap().expect("cursor");
+    assert_eq!(cursor.next, 101_001);
+}
+
+#[test]
+fn test_follow_query_cursor_behind_watermark_reanchors_to_adaptive_offset() {
+    let root = temp_root("follow-query-behind-watermark-reanchors");
+    let storage = LocalStorage::new(&root);
+    let watermarks = QueryWatermarkStore::new(LocalObjectStore::new(&root));
+    let registry =
+        LocalWarmupRegistry::new(object_store("follow-query-behind-watermark-reanchors"));
+    let adapter = FixtureAdapter::new(110_000)
+        .with_max_range_len(1)
+        .with_logs(vec![log_record(101_000, 0)]);
+    let runtime = runtime(adapter.clone(), storage.clone(), registry.clone())
+        .with_query_watermarks(watermarks.clone())
+        .with_follow_query_lookahead_blocks(3)
+        .with_runtime_config(WarmupRuntimeConfig {
+            max_fetches_per_task_loop: 1,
+        });
+    let task_id = registry
+        .submit(follow_query_request())
+        .expect("submit follow query")
+        .task_id;
+    save_query_watermark(&watermarks, 100_000);
+    save_warmup_cursor(&registry, &task_id, 90_000, 1);
+
+    let result = runtime.run_task_once(&task_id).expect("warmup run");
+
+    assert_eq!(result.status, WarmupRunStatus::Partial);
+    assert_eq!(adapter.fetches(), vec![blocks(101_000, 101_000)]);
+    assert!(
+        storage
+            .covered_ranges(
+                &chain(),
+                &DatasetKey::evm_logs(),
+                &selector(),
+                blocks(90_000, 100_999)
             )
             .unwrap()
             .is_empty()
