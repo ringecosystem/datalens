@@ -268,7 +268,7 @@ fn test_tron_event_selector_maps_ormp_topics_for_block_scan() {
     for (event_name, topic0) in [
         (
             "HashImported",
-            "ea087580bb17f433441f3b6c0c0b80cae92ee74a8d7f50050388646d9ffd1431",
+            "a931ec14fe958397dcb26e285e56292c13d77907712b51bbaa24cfc9349b789d",
         ),
         (
             "MessageSent",
@@ -276,7 +276,7 @@ fn test_tron_event_selector_maps_ormp_topics_for_block_scan() {
         ),
         (
             "MessageRecv",
-            "a931ec14fe958397dcb26e285e56292c13d77907712b51bbaa24cfc9349b789d",
+            "ea087580bb17f433441f3b6c0c0b80cae92ee74a8d7f50050388646d9ffd1431",
         ),
         (
             "MessageAccepted",
