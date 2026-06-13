@@ -20,7 +20,7 @@ fn test_follow_query_without_query_watermark_has_no_target() {
 }
 
 #[test]
-fn test_follow_query_cursor_behind_watermark_catches_up_from_cursor() {
+fn test_follow_query_cursor_behind_watermark_reanchors_to_offset() {
     let plan = WarmupTargetPlanner::plan(WarmupTargetPlanInput {
         mode: WarmupTaskMode::FollowQuery,
         fixed_end: None,
@@ -36,8 +36,8 @@ fn test_follow_query_cursor_behind_watermark_catches_up_from_cursor() {
     assert_eq!(
         plan,
         PlannedWarmupTarget::Range {
-            start: 20_248_000,
-            end: 20_257_999,
+            start: 20_249_610,
+            end: 20_259_609,
         }
     );
 }
