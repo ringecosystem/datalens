@@ -3,9 +3,9 @@ use clap::{Args, Parser, Subcommand};
 pub const DEFAULT_SERVER_CONFIG: &str = "config/datalens.dev.toml";
 
 use super::{
-    BenchmarkCommand, CacheCommand, IndexCommand, InspectCommand, QueryCommand, ServeCommand,
-    benchmark_command, cache_command, doctor_command, index_command, inspect_command, plan_command,
-    query_command, serve_command,
+    BenchmarkCommand, CacheCommand, IndexCommand, InspectCommand, QueryCommand, RegistryCommand,
+    ServeCommand, benchmark_command, cache_command, doctor_command, index_command, inspect_command,
+    plan_command, query_command, registry_command, serve_command,
 };
 
 #[derive(Debug, Parser)]
@@ -24,6 +24,7 @@ pub enum Command {
     Inspect(InspectCommand),
     Index(Box<IndexCommand>),
     Cache(Box<CacheCommand>),
+    Registry(RegistryCommand),
     Benchmark(BenchmarkCommand),
 }
 
@@ -44,6 +45,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Command::Inspect(command) => inspect_command(command)?,
         Command::Index(command) => index_command(*command)?,
         Command::Cache(command) => cache_command(*command)?,
+        Command::Registry(command) => registry_command(command)?,
         Command::Benchmark(command) => benchmark_command(command)?,
     }
     Ok(())

@@ -98,6 +98,120 @@ fn test_plan_defaults_to_dev_server_config() {
 }
 
 #[test]
+fn test_registry_migrate_accepts_config_path() {
+    let cli = Cli::parse_from(["datalens", "registry", "migrate", "--config", "custom.toml"]);
+
+    match cli.command {
+        Command::Registry(RegistryCommand {
+            command: RegistrySubcommand::Migrate(command),
+        }) => assert_eq!(command.config, "custom.toml"),
+        command => panic!("expected registry migrate command, got {command:?}"),
+    }
+}
+
+#[test]
+fn test_registry_migrate_reports_per_directory_counts() {
+    let root = temp_storage_root("registry-migrate-counts");
+    let config = write_registry_config("registry-migrate-counts", &root);
+    write_test_object(
+        &root.join("warmup/warmup/tasks/warmup-task.json"),
+        b"warmup-task",
+    );
+    write_test_object(
+        &root.join("warmup/warmup/cursors/warmup-task.json"),
+        b"warmup-cursor",
+    );
+    write_test_object(
+        &root.join("cache-repair/cache-repair/tasks/repair-task.json"),
+        b"repair-task",
+    );
+
+    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_datalens"))
+        .args(["registry", "migrate", "--config", &config])
+        .current_dir(workspace_root())
+        .output()
+        .expect("run registry migrate");
+
+    assert!(
+        output.status.success(),
+        "registry migrate failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: Value = serde_json::from_slice(&output.stdout).expect("registry migrate JSON");
+    assert_eq!(summary["status"], "ok");
+    assert_eq!(summary["warmup"]["tasks"]["copied"], 1);
+    assert_eq!(summary["warmup"]["tasks"]["skipped"], 0);
+    assert_eq!(summary["warmup"]["tasks"]["conflicts"], 0);
+    assert_eq!(summary["warmup"]["tasks"]["failed"], 0);
+    assert_eq!(summary["warmup"]["cursors"]["copied"], 1);
+    assert_eq!(summary["cache_repair"]["tasks"]["copied"], 1);
+    assert_eq!(
+        std::fs::read(root.join("warmup/tasks/warmup-task.json")).expect("read clean warmup task"),
+        b"warmup-task"
+    );
+    assert_eq!(
+        std::fs::read(root.join("warmup/cursors/warmup-task.json"))
+            .expect("read clean warmup cursor"),
+        b"warmup-cursor"
+    );
+    assert_eq!(
+        std::fs::read(root.join("cache-repair/tasks/repair-task.json"))
+            .expect("read clean repair task"),
+        b"repair-task"
+    );
+}
+
+#[test]
+fn test_registry_migrate_exits_nonzero_on_conflict_without_overwriting() {
+    let root = temp_storage_root("registry-migrate-conflict");
+    let config = write_registry_config("registry-migrate-conflict", &root);
+    write_test_object(
+        &root.join("warmup/warmup/tasks/warmup-task.json"),
+        b"legacy",
+    );
+    write_test_object(&root.join("warmup/tasks/warmup-task.json"), b"clean");
+    write_test_object(
+        &root.join("warmup/warmup/cursors/warmup-task.json"),
+        b"warmup-cursor",
+    );
+    write_test_object(
+        &root.join("cache-repair/cache-repair/tasks/repair-task.json"),
+        b"repair-task",
+    );
+
+    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_datalens"))
+        .args(["registry", "migrate", "--config", &config])
+        .current_dir(workspace_root())
+        .output()
+        .expect("run registry migrate");
+
+    assert!(
+        !output.status.success(),
+        "registry migrate should fail on conflict\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: Value = serde_json::from_slice(&output.stdout).expect("registry migrate JSON");
+    assert_eq!(summary["status"], "failed");
+    assert_eq!(summary["warmup"]["tasks"]["copied"], 0);
+    assert_eq!(summary["warmup"]["tasks"]["skipped"], 0);
+    assert_eq!(summary["warmup"]["tasks"]["conflicts"], 1);
+    assert_eq!(summary["warmup"]["tasks"]["failed"], 0);
+    assert_eq!(summary["warmup"]["cursors"]["copied"], 1);
+    assert_eq!(summary["cache_repair"]["tasks"]["copied"], 1);
+    assert_eq!(
+        std::fs::read(root.join("warmup/tasks/warmup-task.json")).expect("read clean warmup task"),
+        b"clean"
+    );
+    assert_eq!(
+        std::fs::read(root.join("warmup/warmup/tasks/warmup-task.json"))
+            .expect("read legacy warmup task"),
+        b"legacy"
+    );
+}
+
+#[test]
 fn test_serve_uses_unified_query_config() {
     let config: DatalensConfig =
         toml::from_str(&minimal_config_text()).expect("minimal config should parse");
@@ -2619,6 +2733,62 @@ fn write_config(name: &str, storage_root: &std::path::Path) -> String {
     )
     .expect("write config");
     config_path.to_string_lossy().into_owned()
+}
+
+fn write_registry_config(name: &str, storage_root: &std::path::Path) -> String {
+    let config_path = storage_root.with_file_name(format!("{name}.toml"));
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+            [server]
+            bind = "127.0.0.1:8080"
+
+            [storage]
+            backend = "local"
+
+            [storage.local]
+            root = "{0}/storage"
+
+            [planner]
+            max_query_range_blocks = 100
+            default_chunk_range_blocks = 10
+
+            [writer]
+            target_object_bytes = 1024
+            min_object_rows = 1
+            record_empty_coverage = true
+
+            [warmup]
+            registry_path = "{0}/warmup"
+
+            [cache_repair]
+            registry_path = "{0}/cache-repair"
+
+            [chains.ethereum]
+            kind = "evm"
+            chain_id = 1
+            rpc_urls = ["http://example.invalid"]
+
+            [chains.ethereum.datasets.blocks]
+            enabled = true
+            max_batch_blocks = 10
+
+            [chains.ethereum.datasets.logs]
+            enabled = true
+            max_get_logs_range_blocks = 10
+            max_addresses_per_query = 2
+            "#,
+            storage_root.display()
+        ),
+    )
+    .expect("write registry config");
+    config_path.to_string_lossy().into_owned()
+}
+
+fn write_test_object(path: &std::path::Path, bytes: &[u8]) {
+    std::fs::create_dir_all(path.parent().expect("object parent")).expect("create object parent");
+    std::fs::write(path, bytes).expect("write test object");
 }
 
 fn test_chain() -> ChainIdentity {

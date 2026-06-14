@@ -31,6 +31,7 @@ use datalens_tron::{TronAdapter, TronGridContractEventsConfig, TronHttpProvider}
 use datalens_warmup::{
     LocalWarmupRegistry, WarmupRuntime, WarmupRuntimeConfig, WarmupSchedulerConfig, WarmupTaskPool,
 };
+use serde::Serialize;
 
 use crate::chain_identity;
 
@@ -979,6 +980,32 @@ fn build_cache_repair_registry(
             "storage.backend must be local or s3",
         )),
     }
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct RuntimeRegistryMigrationReport {
+    pub status: &'static str,
+    pub warmup: datalens_warmup::RegistryMigrationReport,
+    pub cache_repair: datalens_cache_repair::RegistryMigrationReport,
+}
+
+impl RuntimeRegistryMigrationReport {
+    pub(crate) fn total_problems(&self) -> u64 {
+        self.warmup.total_problems() + self.cache_repair.total_problems()
+    }
+}
+
+pub(crate) fn migrate_runtime_registry_paths(
+    config: &DatalensConfig,
+) -> Result<RuntimeRegistryMigrationReport, DatalensError> {
+    let warmup = build_warmup_registry(config)?.migrate_legacy_paths()?;
+    let cache_repair = build_cache_repair_registry(config)?.migrate_legacy_paths()?;
+    let problems = warmup.total_problems() + cache_repair.total_problems();
+    Ok(RuntimeRegistryMigrationReport {
+        status: if problems == 0 { "ok" } else { "failed" },
+        warmup,
+        cache_repair,
+    })
 }
 
 fn cache_repair_runtime_config(config: &DatalensConfig) -> CacheRepairRuntimeConfig {

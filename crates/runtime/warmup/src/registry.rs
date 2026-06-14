@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use datalens_chain::{AdapterKey, DatasetSelector};
 use datalens_core::{DatalensError, DatalensErrorKind, EvmLogFilter};
 use datalens_storage::ObjectStore;
@@ -129,6 +131,23 @@ where
     pub fn retry_failed(&self, task_id: &WarmupTaskId) -> Result<(), DatalensError> {
         <Self as WarmupRegistry>::retry_failed(self, task_id)
     }
+
+    pub fn migrate_legacy_paths(&self) -> Result<RegistryMigrationReport, DatalensError> {
+        let mut report = RegistryMigrationReport::default();
+        migrate_prefix(
+            &self.object_store,
+            LEGACY_TASK_PREFIX,
+            TASK_PREFIX,
+            &mut report.tasks,
+        )?;
+        migrate_prefix(
+            &self.object_store,
+            LEGACY_CURSOR_PREFIX,
+            CURSOR_PREFIX,
+            &mut report.cursors,
+        )?;
+        Ok(report)
+    }
 }
 
 impl<S> WarmupRegistry for LocalWarmupRegistry<S>
@@ -222,11 +241,12 @@ where
     }
 
     fn get(&self, task_id: &WarmupTaskId) -> Result<Option<WarmupTask>, DatalensError> {
-        let key = task_key(task_id);
-        if !self.object_store.exists(&key)? {
-            return Ok(None);
+        for key in [task_key(task_id), legacy_task_key(task_id)] {
+            if self.object_store.exists(&key)? {
+                return decode_task(&self.object_store.get(&key)?).map(Some);
+            }
         }
-        decode_task(&self.object_store.get(&key)?).map(Some)
+        Ok(None)
     }
 
     fn save_task(&self, task: &WarmupTask) -> Result<(), DatalensError> {
@@ -241,32 +261,50 @@ where
     }
 
     fn list(&self, filter: WarmupTaskFilter) -> Result<Vec<WarmupTask>, DatalensError> {
-        let mut tasks = Vec::new();
-        for object in self.object_store.list("warmup/tasks")? {
+        let mut tasks = BTreeMap::new();
+        for object in self.object_store.list(TASK_PREFIX)? {
             if object.key.ends_with(".json") {
+                let Some(task_id) = object_id_from_key(&object.key, TASK_PREFIX) else {
+                    continue;
+                };
                 let task = decode_task(&self.object_store.get(&object.key)?)?;
                 if matches_filter(&task, &filter) {
-                    tasks.push(task);
+                    tasks.insert(task_id, task);
                 }
             }
         }
-        tasks.sort_by(|left, right| left.task_id.as_str().cmp(right.task_id.as_str()));
+        for object in self.object_store.list(LEGACY_TASK_PREFIX)? {
+            if object.key.ends_with(".json") {
+                let Some(task_id) = object_id_from_key(&object.key, LEGACY_TASK_PREFIX) else {
+                    continue;
+                };
+                if tasks.contains_key(&task_id) {
+                    continue;
+                }
+                let task = decode_task(&self.object_store.get(&object.key)?)?;
+                if matches_filter(&task, &filter) {
+                    tasks.insert(task_id, task);
+                }
+            }
+        }
+        let tasks = tasks.into_values().collect();
         Ok(tasks)
     }
 
     fn load_cursor(&self, task_id: &WarmupTaskId) -> Result<Option<WarmupCursor>, DatalensError> {
-        let key = cursor_key(task_id);
-        if !self.object_store.exists(&key)? {
-            return Ok(None);
+        for key in [cursor_key(task_id), legacy_cursor_key(task_id)] {
+            if self.object_store.exists(&key)? {
+                return serde_json::from_slice(&self.object_store.get(&key)?)
+                    .map(Some)
+                    .map_err(|error| {
+                        DatalensError::new(
+                            DatalensErrorKind::StorageReadFailure,
+                            format!("decode warmup cursor {key}: {error}"),
+                        )
+                    });
+            }
         }
-        serde_json::from_slice(&self.object_store.get(&key)?)
-            .map(Some)
-            .map_err(|error| {
-                DatalensError::new(
-                    DatalensErrorKind::StorageReadFailure,
-                    format!("decode warmup cursor {key}: {error}"),
-                )
-            })
+        Ok(None)
     }
 
     fn save_cursor(&self, cursor: &WarmupCursor) -> Result<(), DatalensError> {
@@ -278,6 +316,34 @@ where
         })?;
         self.object_store.put(&cursor_key(&cursor.task_id), &bytes)
     }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RegistryMigrationReport {
+    pub tasks: RegistryMigrationSectionReport,
+    pub cursors: RegistryMigrationSectionReport,
+}
+
+impl RegistryMigrationReport {
+    pub fn total_problems(&self) -> u64 {
+        self.tasks.conflicts + self.tasks.failed + self.cursors.conflicts + self.cursors.failed
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RegistryMigrationSectionReport {
+    pub copied: u64,
+    pub skipped: u64,
+    pub conflicts: u64,
+    pub failed: u64,
+    pub failures: Vec<RegistryMigrationFailure>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RegistryMigrationFailure {
+    pub legacy_key: String,
+    pub clean_key: String,
+    pub message: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -397,12 +463,141 @@ pub(crate) fn unix_seconds_now() -> Result<u64, DatalensError> {
         })
 }
 
+const TASK_PREFIX: &str = "tasks";
+const CURSOR_PREFIX: &str = "cursors";
+const LEGACY_TASK_PREFIX: &str = "warmup/tasks";
+const LEGACY_CURSOR_PREFIX: &str = "warmup/cursors";
+
 fn task_key(task_id: &WarmupTaskId) -> String {
-    format!("warmup/tasks/{}.json", task_id.as_str())
+    format!("{TASK_PREFIX}/{}.json", task_id.as_str())
 }
 
 fn cursor_key(task_id: &WarmupTaskId) -> String {
-    format!("warmup/cursors/{}.json", task_id.as_str())
+    format!("{CURSOR_PREFIX}/{}.json", task_id.as_str())
+}
+
+fn legacy_task_key(task_id: &WarmupTaskId) -> String {
+    format!("{LEGACY_TASK_PREFIX}/{}.json", task_id.as_str())
+}
+
+fn legacy_cursor_key(task_id: &WarmupTaskId) -> String {
+    format!("{LEGACY_CURSOR_PREFIX}/{}.json", task_id.as_str())
+}
+
+fn object_id_from_key(key: &str, prefix: &str) -> Option<String> {
+    key.strip_prefix(&format!("{prefix}/"))?
+        .strip_suffix(".json")
+        .map(ToOwned::to_owned)
+}
+
+fn migrate_prefix<S>(
+    object_store: &S,
+    legacy_prefix: &str,
+    clean_prefix: &str,
+    report: &mut RegistryMigrationSectionReport,
+) -> Result<(), DatalensError>
+where
+    S: ObjectStore + 'static,
+{
+    for object in object_store.list(legacy_prefix)? {
+        if !object.key.ends_with(".json") {
+            continue;
+        }
+        let Some(name) = object.key.strip_prefix(&format!("{legacy_prefix}/")) else {
+            continue;
+        };
+        let clean_key = format!("{clean_prefix}/{name}");
+        migrate_object(object_store, &object.key, &clean_key, report);
+    }
+    Ok(())
+}
+
+fn migrate_object<S>(
+    object_store: &S,
+    legacy_key: &str,
+    clean_key: &str,
+    report: &mut RegistryMigrationSectionReport,
+) where
+    S: ObjectStore + 'static,
+{
+    let legacy_bytes = match object_store.get(legacy_key) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            report_failure(report, legacy_key, clean_key, error.message);
+            return;
+        }
+    };
+    match object_store.exists(clean_key) {
+        Ok(true) => match object_store.get(clean_key) {
+            Ok(clean_bytes) if clean_bytes == legacy_bytes => {
+                report.skipped += 1;
+            }
+            Ok(_) => {
+                report_conflict(
+                    report,
+                    legacy_key,
+                    clean_key,
+                    "clean object already exists with different content",
+                );
+            }
+            Err(error) => {
+                report_failure(report, legacy_key, clean_key, error.message);
+            }
+        },
+        Ok(false) => {
+            if let Err(error) = object_store.put(clean_key, &legacy_bytes) {
+                report_failure(report, legacy_key, clean_key, error.message);
+                return;
+            }
+            match object_store.get(clean_key) {
+                Ok(clean_bytes) if clean_bytes == legacy_bytes => {
+                    report.copied += 1;
+                }
+                Ok(_) => {
+                    report_failure(
+                        report,
+                        legacy_key,
+                        clean_key,
+                        "copied object content did not match legacy object",
+                    );
+                }
+                Err(error) => {
+                    report_failure(report, legacy_key, clean_key, error.message);
+                }
+            }
+        }
+        Err(error) => {
+            report_failure(report, legacy_key, clean_key, error.message);
+        }
+    }
+}
+
+fn report_failure(
+    report: &mut RegistryMigrationSectionReport,
+    legacy_key: &str,
+    clean_key: &str,
+    message: impl Into<String>,
+) {
+    report.failed += 1;
+    report.failures.push(RegistryMigrationFailure {
+        legacy_key: legacy_key.to_owned(),
+        clean_key: clean_key.to_owned(),
+        message: message.into(),
+    });
+}
+
+fn report_conflict(
+    report: &mut RegistryMigrationSectionReport,
+    legacy_key: &str,
+    clean_key: &str,
+    message: impl Into<String>,
+) {
+    report.conflicts += 1;
+    report.failures.push(RegistryMigrationFailure {
+        legacy_key: legacy_key.to_owned(),
+        clean_key: clean_key.to_owned(),
+        message: message.into(),
+    });
 }
 
 fn decode_task(bytes: &[u8]) -> Result<WarmupTask, DatalensError> {
