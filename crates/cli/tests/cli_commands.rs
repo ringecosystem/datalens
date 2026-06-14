@@ -212,6 +212,67 @@ fn test_registry_migrate_exits_nonzero_on_conflict_without_overwriting() {
 }
 
 #[test]
+fn test_registry_migrate_keeps_newer_clean_registry_objects() {
+    let root = temp_storage_root("registry-migrate-newer-clean");
+    let config = write_registry_config("registry-migrate-newer-clean", &root);
+    let legacy = json!({"id": "task", "updated_at": 10, "state": "queued"}).to_string();
+    let clean = json!({"id": "task", "updated_at": 11, "state": "queued"}).to_string();
+    write_test_object(
+        &root.join("warmup/warmup/tasks/warmup-task.json"),
+        legacy.as_bytes(),
+    );
+    write_test_object(
+        &root.join("warmup/tasks/warmup-task.json"),
+        clean.as_bytes(),
+    );
+    write_test_object(
+        &root.join("warmup/warmup/cursors/warmup-task.json"),
+        legacy.as_bytes(),
+    );
+    write_test_object(
+        &root.join("warmup/cursors/warmup-task.json"),
+        clean.as_bytes(),
+    );
+    write_test_object(
+        &root.join("cache-repair/cache-repair/tasks/repair-task.json"),
+        legacy.as_bytes(),
+    );
+    write_test_object(
+        &root.join("cache-repair/tasks/repair-task.json"),
+        clean.as_bytes(),
+    );
+
+    let output = ProcessCommand::new(env!("CARGO_BIN_EXE_datalens"))
+        .args(["registry", "migrate", "--config", &config])
+        .current_dir(workspace_root())
+        .output()
+        .expect("run registry migrate");
+
+    assert!(
+        output.status.success(),
+        "registry migrate should keep newer clean objects\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: Value = serde_json::from_slice(&output.stdout).expect("registry migrate JSON");
+    assert_eq!(summary["status"], "ok");
+    assert_eq!(summary["warmup"]["tasks"]["copied"], 0);
+    assert_eq!(summary["warmup"]["tasks"]["skipped"], 1);
+    assert_eq!(summary["warmup"]["tasks"]["conflicts"], 0);
+    assert_eq!(summary["warmup"]["cursors"]["skipped"], 1);
+    assert_eq!(summary["cache_repair"]["tasks"]["skipped"], 1);
+    assert_eq!(
+        std::fs::read(root.join("warmup/tasks/warmup-task.json")).expect("read clean warmup task"),
+        clean.as_bytes()
+    );
+    assert_eq!(
+        std::fs::read(root.join("warmup/warmup/tasks/warmup-task.json"))
+            .expect("read legacy warmup task"),
+        legacy.as_bytes()
+    );
+}
+
+#[test]
 fn test_serve_uses_unified_query_config() {
     let config: DatalensConfig =
         toml::from_str(&minimal_config_text()).expect("minimal config should parse");

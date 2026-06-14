@@ -532,13 +532,17 @@ fn migrate_object<S>(
             Ok(clean_bytes) if clean_bytes == legacy_bytes => {
                 report.skipped += 1;
             }
-            Ok(_) => {
-                report_conflict(
-                    report,
-                    legacy_key,
-                    clean_key,
-                    "clean object already exists with different content",
-                );
+            Ok(clean_bytes) => {
+                if clean_object_is_newer(&legacy_bytes, &clean_bytes) {
+                    report.skipped += 1;
+                } else {
+                    report_conflict(
+                        report,
+                        legacy_key,
+                        clean_key,
+                        "clean object already exists with different content",
+                    );
+                }
             }
             Err(error) => {
                 report_failure(report, legacy_key, clean_key, error.message);
@@ -569,6 +573,20 @@ fn migrate_object<S>(
         Err(error) => {
             report_failure(report, legacy_key, clean_key, error.message);
         }
+    }
+}
+
+fn clean_object_is_newer(legacy_bytes: &[u8], clean_bytes: &[u8]) -> bool {
+    fn updated_at(bytes: &[u8]) -> Option<u64> {
+        serde_json::from_slice::<serde_json::Value>(bytes)
+            .ok()?
+            .get("updated_at")?
+            .as_u64()
+    }
+
+    match (updated_at(legacy_bytes), updated_at(clean_bytes)) {
+        (Some(legacy), Some(clean)) => clean > legacy,
+        _ => false,
     }
 }
 
