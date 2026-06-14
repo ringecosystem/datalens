@@ -13,6 +13,8 @@ use std::{
 use crate::object_store::ObjectStore;
 
 const INTENT_PREFIX: &str = "durable-promotion-intents/v1/intents";
+const TERMINAL_CLEANUP_CURSOR_KEY: &str =
+    "durable-promotion-intents/v1/metadata/terminal-cleanup-cursor.json";
 const PENDING_INDEX_PREFIX: &str = "durable-promotion-intents/v1/index/status=pending";
 const PENDING_APPLICATION_INDEX_PREFIX: &str =
     "durable-promotion-intents/v1/index/status=pending-by-application";
@@ -94,6 +96,19 @@ pub struct DurablePromotionIntentBacklog {
     pub oldest_pending_age_seconds: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DurablePromotionIntentCleanup {
+    pub scanned: usize,
+    pub deleted: usize,
+    pub stale_pending_indexes_deleted: usize,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+struct DurablePromotionIntentCleanupCursor {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    start_after: Option<String>,
+}
+
 pub trait DurablePromotionIntentRepository: Send + Sync {
     fn create_or_get(
         &self,
@@ -136,6 +151,17 @@ pub trait DurablePromotionIntentRepository: Send + Sync {
         let _ = chain;
         let _ = now_unix_seconds;
         Ok(Vec::new())
+    }
+    fn cleanup_terminal(
+        &self,
+        retention_cutoff_unix_seconds: u64,
+        max_scan: usize,
+        max_deletes: usize,
+    ) -> Result<DurablePromotionIntentCleanup, DatalensError> {
+        let _ = retention_cutoff_unix_seconds;
+        let _ = max_scan;
+        let _ = max_deletes;
+        Ok(DurablePromotionIntentCleanup::default())
     }
     fn mark_running(
         &self,
@@ -221,6 +247,16 @@ impl DurablePromotionIntentRepository for Arc<dyn DurablePromotionIntentReposito
             .pending_backlog_for_chain(chain, now_unix_seconds)
     }
 
+    fn cleanup_terminal(
+        &self,
+        retention_cutoff_unix_seconds: u64,
+        max_scan: usize,
+        max_deletes: usize,
+    ) -> Result<DurablePromotionIntentCleanup, DatalensError> {
+        self.as_ref()
+            .cleanup_terminal(retention_cutoff_unix_seconds, max_scan, max_deletes)
+    }
+
     fn mark_running(
         &self,
         intent_id: &str,
@@ -299,6 +335,61 @@ where
         })
     }
 
+    fn read_terminal_cleanup_cursor(&self) -> Result<Option<String>, DatalensError> {
+        if !self.object_store.exists(TERMINAL_CLEANUP_CURSOR_KEY)? {
+            return Ok(None);
+        }
+        let bytes = self.object_store.get(TERMINAL_CLEANUP_CURSOR_KEY)?;
+        let cursor: DurablePromotionIntentCleanupCursor =
+            serde_json::from_slice(&bytes).map_err(|error| {
+                DatalensError::new(
+                    DatalensErrorKind::StorageReadFailure,
+                    format!("decode durable promotion intent cleanup cursor: {error}"),
+                )
+            })?;
+        Ok(cursor.start_after)
+    }
+
+    fn write_terminal_cleanup_cursor(
+        &self,
+        start_after: Option<String>,
+    ) -> Result<(), DatalensError> {
+        let Some(start_after) = start_after else {
+            return self
+                .object_store
+                .delete(TERMINAL_CLEANUP_CURSOR_KEY)
+                .map_err(|error| {
+                    DatalensError::new(
+                        DatalensErrorKind::StorageWriteFailure,
+                        format!(
+                            "delete durable promotion intent cleanup cursor: {}",
+                            error.message
+                        ),
+                    )
+                });
+        };
+        let cursor = DurablePromotionIntentCleanupCursor {
+            start_after: Some(start_after),
+        };
+        let bytes = serde_json::to_vec_pretty(&cursor).map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::Internal,
+                format!("encode durable promotion intent cleanup cursor: {error}"),
+            )
+        })?;
+        self.object_store
+            .put(TERMINAL_CLEANUP_CURSOR_KEY, &bytes)
+            .map_err(|error| {
+                DatalensError::new(
+                    DatalensErrorKind::StorageWriteFailure,
+                    format!(
+                        "write durable promotion intent cleanup cursor: {}",
+                        error.message
+                    ),
+                )
+            })
+    }
+
     fn write_intent(&self, intent: &DurablePromotionIntent) -> Result<(), DatalensError> {
         let key = intent_object_key(&intent.intent_id);
         let bytes = serde_json::to_vec_pretty(intent).map_err(|error| {
@@ -331,7 +422,31 @@ where
     }
 
     fn delete_pending_index(&self, intent: &DurablePromotionIntent) -> Result<(), DatalensError> {
-        for key in pending_index_keys_for_intent(intent) {
+        self.delete_pending_index_with_count(intent).map(|_| ())
+    }
+
+    fn delete_pending_index_with_count(
+        &self,
+        intent: &DurablePromotionIntent,
+    ) -> Result<usize, DatalensError> {
+        self.delete_pending_index_keys_with_count(pending_index_keys_for_intent(intent))
+    }
+
+    fn delete_stale_pending_index_with_count(
+        &self,
+        intent: &DurablePromotionIntent,
+    ) -> Result<usize, DatalensError> {
+        self.delete_pending_index_keys_with_count(stale_pending_index_keys_for_terminal_intent(
+            intent,
+        ))
+    }
+
+    fn delete_pending_index_keys_with_count(
+        &self,
+        keys: Vec<String>,
+    ) -> Result<usize, DatalensError> {
+        let mut deleted = 0;
+        for key in keys {
             self.object_store.delete(&key).map_err(|error| {
                 DatalensError::new(
                     DatalensErrorKind::StorageWriteFailure,
@@ -341,8 +456,9 @@ where
                     ),
                 )
             })?;
+            deleted += 1;
         }
-        Ok(())
+        Ok(deleted)
     }
 
     fn update_intent(
@@ -736,6 +852,59 @@ where
         Ok(backlog)
     }
 
+    fn cleanup_terminal(
+        &self,
+        retention_cutoff_unix_seconds: u64,
+        max_scan: usize,
+        max_deletes: usize,
+    ) -> Result<DurablePromotionIntentCleanup, DatalensError> {
+        if max_scan == 0 || max_deletes == 0 {
+            return Ok(DurablePromotionIntentCleanup::default());
+        }
+
+        let cursor = self.read_terminal_cleanup_cursor()?;
+        let page = self
+            .object_store
+            .list_page(INTENT_PREFIX, cursor.as_deref(), max_scan)?;
+        let mut cleanup = DurablePromotionIntentCleanup::default();
+        let mut last_scanned_key = None;
+        let object_count = page.objects.len();
+        let mut processed_count = 0;
+        for object in page.objects {
+            processed_count += 1;
+            last_scanned_key = Some(object.key.clone());
+            cleanup.scanned += 1;
+            if !object.key.ends_with(".json") {
+                continue;
+            }
+            let intent = self.read_intent_key(&object.key)?;
+            if !intent_is_terminal_cleanup_eligible(&intent, retention_cutoff_unix_seconds) {
+                continue;
+            }
+            cleanup.stale_pending_indexes_deleted +=
+                self.delete_stale_pending_index_with_count(&intent)?;
+            self.object_store.delete(&object.key).map_err(|error| {
+                DatalensError::new(
+                    DatalensErrorKind::StorageWriteFailure,
+                    format!(
+                        "delete durable promotion intent {}: {}",
+                        object.key, error.message
+                    ),
+                )
+            })?;
+            cleanup.deleted += 1;
+            if cleanup.deleted >= max_deletes {
+                break;
+            }
+        }
+        if page.has_more || processed_count < object_count {
+            self.write_terminal_cleanup_cursor(last_scanned_key)?;
+        } else {
+            self.write_terminal_cleanup_cursor(None)?;
+        }
+        Ok(cleanup)
+    }
+
     fn mark_running(
         &self,
         intent_id: &str,
@@ -931,6 +1100,16 @@ fn intent_object_key(intent_id: &str) -> String {
     format!("{INTENT_PREFIX}/{intent_id}.json")
 }
 
+fn intent_is_terminal_cleanup_eligible(
+    intent: &DurablePromotionIntent,
+    retention_cutoff_unix_seconds: u64,
+) -> bool {
+    matches!(
+        intent.status,
+        DurablePromotionIntentStatus::Completed | DurablePromotionIntentStatus::FailedTerminal
+    ) && intent.updated_at_unix_seconds <= retention_cutoff_unix_seconds
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PendingIndexEntry {
     key: String,
@@ -975,6 +1154,30 @@ fn pending_index_keys_for_intent(intent: &DurablePromotionIntent) -> Vec<String>
             pending_application_index_prefix(&intent.chain, source_key(intent.source)),
             application_key(&intent.application),
             due_at_unix_seconds,
+            intent.intent_id
+        ),
+    ]
+}
+
+fn stale_pending_index_keys_for_terminal_intent(intent: &DurablePromotionIntent) -> Vec<String> {
+    if !matches!(
+        intent.status,
+        DurablePromotionIntentStatus::Completed | DurablePromotionIntentStatus::FailedTerminal
+    ) {
+        return Vec::new();
+    }
+    vec![
+        format!(
+            "{}/created={:019}/intent={}.json",
+            pending_index_prefix(&intent.chain, source_key(intent.source)),
+            intent.created_at_unix_seconds,
+            intent.intent_id
+        ),
+        format!(
+            "{}/application={}/created={:019}/intent={}.json",
+            pending_application_index_prefix(&intent.chain, source_key(intent.source)),
+            application_key(&intent.application),
+            intent.created_at_unix_seconds,
             intent.intent_id
         ),
     ]

@@ -196,6 +196,48 @@ fn validate_query_config(config: &DatalensConfig) -> Result<(), DatalensError> {
             "query.durable_intents.claim_batch_size must be greater than zero",
         ));
     }
+    if config.query.durable_intents.terminal_retention_seconds == Some(0) {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "query.durable_intents.terminal_retention_seconds must be greater than zero",
+        ));
+    }
+    if config
+        .query
+        .durable_intents
+        .terminal_retention_seconds
+        .is_some()
+        && config.query.durable_intents.cleanup_max_scan == 0
+    {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "query.durable_intents.cleanup_max_scan must be greater than zero",
+        ));
+    }
+    if config
+        .query
+        .durable_intents
+        .terminal_retention_seconds
+        .is_some()
+        && config.query.durable_intents.cleanup_max_deletes == 0
+    {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "query.durable_intents.cleanup_max_deletes must be greater than zero",
+        ));
+    }
+    if config
+        .query
+        .durable_intents
+        .terminal_retention_seconds
+        .is_some()
+        && config.query.durable_intents.cleanup_interval_seconds == 0
+    {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "query.durable_intents.cleanup_interval_seconds must be greater than zero",
+        ));
+    }
     let paths = [
         ("query.native.path", &config.query.native.path),
         (

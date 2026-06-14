@@ -1059,6 +1059,322 @@ fn test_rebuild_pending_indexes_heals_future_retryable_before_it_is_due() {
 }
 
 #[test]
+fn test_cleanup_terminal_deletes_completed_older_than_cutoff() {
+    let store = DurablePromotionIntentStore::new(LocalObjectStore::new(temp_storage_root(
+        "cleanup-old-completed",
+    )));
+    let created = create_intent(
+        &store,
+        DurablePromotionIntentSource::Query,
+        "analytics-api",
+        100,
+    );
+    store
+        .mark_running(&created.intent_id, 110)
+        .expect("mark running");
+    store
+        .mark_completed(&created.intent_id, 120)
+        .expect("mark completed");
+
+    let cleanup = store
+        .cleanup_terminal(150, 100, 100)
+        .expect("cleanup terminal");
+
+    assert_eq!(cleanup.deleted, 1);
+    assert!(
+        store
+            .get(&created.intent_id)
+            .expect("read intent")
+            .is_none()
+    );
+}
+
+#[test]
+fn test_cleanup_terminal_deletes_failed_terminal_older_than_cutoff() {
+    let store = DurablePromotionIntentStore::new(LocalObjectStore::new(temp_storage_root(
+        "cleanup-old-terminal-failure",
+    )));
+    let created = create_intent(
+        &store,
+        DurablePromotionIntentSource::Warmup,
+        "warmup-api",
+        100,
+    );
+    store
+        .mark_running(&created.intent_id, 110)
+        .expect("mark running");
+    store
+        .mark_terminal_failure(&created.intent_id, "permanent error", 120)
+        .expect("mark terminal failure");
+
+    let cleanup = store
+        .cleanup_terminal(150, 100, 100)
+        .expect("cleanup terminal");
+
+    assert_eq!(cleanup.deleted, 1);
+    assert!(
+        store
+            .get(&created.intent_id)
+            .expect("read intent")
+            .is_none()
+    );
+}
+
+#[test]
+fn test_cleanup_terminal_retains_completed_newer_than_cutoff() {
+    let store = DurablePromotionIntentStore::new(LocalObjectStore::new(temp_storage_root(
+        "cleanup-new-completed",
+    )));
+    let created = create_intent(
+        &store,
+        DurablePromotionIntentSource::Query,
+        "analytics-api",
+        100,
+    );
+    store
+        .mark_running(&created.intent_id, 110)
+        .expect("mark running");
+    store
+        .mark_completed(&created.intent_id, 180)
+        .expect("mark completed");
+
+    let cleanup = store
+        .cleanup_terminal(150, 100, 100)
+        .expect("cleanup terminal");
+
+    assert_eq!(cleanup.deleted, 0);
+    assert_eq!(
+        store
+            .get(&created.intent_id)
+            .expect("read intent")
+            .expect("intent exists")
+            .status,
+        DurablePromotionIntentStatus::Completed
+    );
+}
+
+#[test]
+fn test_cleanup_terminal_retains_claimable_or_retryable_intents_even_when_old() {
+    let store = DurablePromotionIntentStore::new(LocalObjectStore::new(temp_storage_root(
+        "cleanup-retain-active",
+    )));
+    let pending = create_intent_with_range(
+        &store,
+        DurablePromotionIntentSource::Query,
+        "analytics-api",
+        LedgerRange::blocks(10, 11).expect("valid range"),
+        100,
+    );
+    let running = create_intent_with_range(
+        &store,
+        DurablePromotionIntentSource::Query,
+        "analytics-api",
+        LedgerRange::blocks(20, 21).expect("valid range"),
+        100,
+    );
+    store
+        .mark_running(&running.intent_id, 110)
+        .expect("mark running");
+    let retryable = create_intent_with_range(
+        &store,
+        DurablePromotionIntentSource::Warmup,
+        "warmup-api",
+        LedgerRange::blocks(30, 31).expect("valid range"),
+        100,
+    );
+    store
+        .mark_running(&retryable.intent_id, 110)
+        .expect("mark running");
+    store
+        .mark_retryable_failure(&retryable.intent_id, "try later", 120, 130)
+        .expect("mark retryable");
+
+    let cleanup = store
+        .cleanup_terminal(200, 100, 100)
+        .expect("cleanup terminal");
+
+    assert_eq!(cleanup.deleted, 0);
+    assert_eq!(
+        store
+            .get(&pending.intent_id)
+            .expect("read pending")
+            .expect("pending exists")
+            .status,
+        DurablePromotionIntentStatus::Pending
+    );
+    assert_eq!(
+        store
+            .get(&running.intent_id)
+            .expect("read running")
+            .expect("running exists")
+            .status,
+        DurablePromotionIntentStatus::Running
+    );
+    assert_eq!(
+        store
+            .get(&retryable.intent_id)
+            .expect("read retryable")
+            .expect("retryable exists")
+            .status,
+        DurablePromotionIntentStatus::FailedRetryable
+    );
+}
+
+#[test]
+fn test_cleanup_terminal_is_bounded_and_idempotent() {
+    let root = temp_storage_root("cleanup-bounded-idempotent");
+    let object_store = CountingObjectStore::new(root);
+    let store = DurablePromotionIntentStore::new(object_store.clone());
+    for index in 0..3 {
+        let created = create_intent_with_range(
+            &store,
+            DurablePromotionIntentSource::Query,
+            "analytics-api",
+            LedgerRange::blocks(100 + index, 101 + index).expect("valid range"),
+            100 + index,
+        );
+        store
+            .mark_running(&created.intent_id, 110 + index)
+            .expect("mark running");
+        store
+            .mark_completed(&created.intent_id, 120 + index)
+            .expect("mark completed");
+    }
+
+    let first = store
+        .cleanup_terminal(200, 1, 10)
+        .expect("cleanup terminal");
+    assert_eq!(first.scanned, 1);
+    assert_eq!(first.deleted, 1);
+    assert_eq!(
+        object_store.list_page_calls(),
+        vec![("durable-promotion-intents/v1/intents".to_owned(), None, 1,)]
+    );
+
+    let second = store
+        .cleanup_terminal(200, 100, 100)
+        .expect("cleanup terminal");
+    assert_eq!(second.deleted, 2);
+    let third = store
+        .cleanup_terminal(200, 100, 100)
+        .expect("cleanup terminal");
+    assert_eq!(third.deleted, 0);
+    assert_eq!(third.scanned, 0);
+}
+
+#[test]
+fn test_cleanup_terminal_cursor_advances_past_noneligible_objects() {
+    let root = temp_storage_root("cleanup-cursor-progress");
+    let object_store = LocalObjectStore::new(root);
+    let store = DurablePromotionIntentStore::new(object_store.clone());
+    let active = test_intent_record("active-intent", DurablePromotionIntentStatus::Pending, 100);
+    let terminal = test_intent_record(
+        "terminal-intent",
+        DurablePromotionIntentStatus::Completed,
+        100,
+    );
+    write_intent_record(&object_store, &active);
+    write_intent_record(&object_store, &terminal);
+
+    let first = store
+        .cleanup_terminal(200, 1, 10)
+        .expect("first cleanup terminal");
+    assert_eq!(first.scanned, 1);
+    assert_eq!(first.deleted, 0);
+    assert_eq!(
+        terminal_cleanup_cursor(&object_store),
+        Some("durable-promotion-intents/v1/intents/active-intent.json".to_owned())
+    );
+
+    let second = store
+        .cleanup_terminal(200, 1, 10)
+        .expect("second cleanup terminal");
+    assert_eq!(second.scanned, 1);
+    assert_eq!(second.deleted, 1);
+    assert!(
+        !object_store
+            .exists("durable-promotion-intents/v1/intents/terminal-intent.json")
+            .expect("terminal exists check")
+    );
+}
+
+#[test]
+fn test_cleanup_terminal_cursor_wraps_at_end_of_prefix() {
+    let root = temp_storage_root("cleanup-cursor-wrap");
+    let object_store = LocalObjectStore::new(root);
+    let store = DurablePromotionIntentStore::new(object_store.clone());
+    let first = test_intent_record("active-a", DurablePromotionIntentStatus::Pending, 100);
+    let second = test_intent_record("active-b", DurablePromotionIntentStatus::Running, 100);
+    write_intent_record(&object_store, &first);
+    write_intent_record(&object_store, &second);
+
+    store
+        .cleanup_terminal(200, 1, 10)
+        .expect("first cleanup terminal");
+    assert_eq!(
+        terminal_cleanup_cursor(&object_store),
+        Some("durable-promotion-intents/v1/intents/active-a.json".to_owned())
+    );
+
+    store
+        .cleanup_terminal(200, 1, 10)
+        .expect("second cleanup terminal");
+
+    assert!(
+        terminal_cleanup_cursor(&object_store).is_none(),
+        "cursor should wrap to the start after the final page"
+    );
+}
+
+#[test]
+fn test_cleanup_terminal_removes_stale_pending_indexes_for_deleted_terminal_intent() {
+    let root = temp_storage_root("cleanup-stale-terminal-index");
+    let object_store = LocalObjectStore::new(root);
+    let store = DurablePromotionIntentStore::new(object_store.clone());
+    let created = create_intent(
+        &store,
+        DurablePromotionIntentSource::Query,
+        "analytics-api",
+        100,
+    );
+    store
+        .mark_running(&created.intent_id, 110)
+        .expect("mark running");
+    let completed = store
+        .mark_completed(&created.intent_id, 120)
+        .expect("mark completed")
+        .expect("intent exists");
+    object_store
+        .put(
+            &format!(
+                "durable-promotion-intents/v1/index/status=pending/chain={}/source=query/created=0000000000000000100/intent={}.json",
+                test_chain().key_prefix(),
+                completed.intent_id
+            ),
+            b"{}\n",
+        )
+        .expect("write stale pending index");
+    object_store
+        .put(
+            &format!(
+                "durable-promotion-intents/v1/index/status=pending-by-application/chain={}/source=query/application=616e616c79746963732d617069/created=0000000000000000100/intent={}.json",
+                test_chain().key_prefix(),
+                completed.intent_id
+            ),
+            b"{}\n",
+        )
+        .expect("write stale application pending index");
+
+    let cleanup = store
+        .cleanup_terminal(150, 100, 100)
+        .expect("cleanup terminal");
+
+    assert_eq!(cleanup.deleted, 1);
+    assert!(pending_index_keys(&object_store, &test_chain(), "query").is_empty());
+    assert!(application_pending_index_keys(&object_store, &test_chain(), "query").is_empty());
+}
+
+#[test]
 fn test_submission_service_handles_query_and_warmup_sources() {
     let store =
         DurablePromotionIntentStore::new(LocalObjectStore::new(temp_storage_root("sources")));
@@ -1268,6 +1584,63 @@ fn application_pending_index_keys(
         .collect()
 }
 
+fn terminal_cleanup_cursor(object_store: &LocalObjectStore) -> Option<String> {
+    let key = "durable-promotion-intents/v1/metadata/terminal-cleanup-cursor.json";
+    if !object_store.exists(key).expect("cursor exists check") {
+        return None;
+    }
+    let bytes = object_store.get(key).expect("read cleanup cursor");
+    let value: serde_json::Value = serde_json::from_slice(&bytes).expect("decode cleanup cursor");
+    value
+        .get("start_after")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned)
+}
+
+fn write_intent_record(
+    object_store: &LocalObjectStore,
+    intent: &datalens_storage::DurablePromotionIntent,
+) {
+    let bytes = serde_json::to_vec_pretty(intent).expect("encode intent");
+    object_store
+        .put(
+            &format!(
+                "durable-promotion-intents/v1/intents/{}.json",
+                intent.intent_id
+            ),
+            &bytes,
+        )
+        .expect("write intent");
+}
+
+fn test_intent_record(
+    intent_id: &str,
+    status: DurablePromotionIntentStatus,
+    updated_at_unix_seconds: u64,
+) -> datalens_storage::DurablePromotionIntent {
+    datalens_storage::DurablePromotionIntent {
+        intent_id: intent_id.to_owned(),
+        dedupe_key: format!("dedupe-{intent_id}"),
+        source: DurablePromotionIntentSource::Query,
+        application: "analytics-api".to_owned(),
+        chain: test_chain(),
+        dataset_key: DatasetKey::evm_blocks(),
+        selector: DatasetSelector::all(),
+        selector_fingerprint: "all".to_owned(),
+        selector_canonical_key: "all".to_owned(),
+        finality: "safe".to_owned(),
+        ranges: vec![LedgerRange::blocks(10, 11).expect("valid range")],
+        status,
+        attempt_count: 0,
+        next_retry_at_unix_seconds: None,
+        created_at_unix_seconds: 100,
+        updated_at_unix_seconds,
+        last_error: None,
+        request_id: None,
+        task_id: None,
+    }
+}
+
 fn test_chain() -> ChainIdentity {
     ChainIdentity::try_new(ChainFamily::Evm, "ethereum", Some(NetworkId::numeric(1)))
         .expect("valid chain identity")
@@ -1283,7 +1656,10 @@ struct CountingObjectStore {
     inner: LocalObjectStore,
     reads: Arc<Mutex<BTreeMap<String, usize>>>,
     lists: Arc<Mutex<Vec<String>>>,
+    list_pages: Arc<Mutex<Vec<ListPageCall>>>,
 }
+
+type ListPageCall = (String, Option<String>, usize);
 
 impl CountingObjectStore {
     fn new(root: PathBuf) -> Self {
@@ -1291,6 +1667,7 @@ impl CountingObjectStore {
             inner: LocalObjectStore::new(root),
             reads: Arc::new(Mutex::new(BTreeMap::new())),
             lists: Arc::new(Mutex::new(Vec::new())),
+            list_pages: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -1317,6 +1694,10 @@ impl CountingObjectStore {
 
     fn list_prefixes(&self) -> Vec<String> {
         self.lists.lock().expect("list prefixes").clone()
+    }
+
+    fn list_page_calls(&self) -> Vec<ListPageCall> {
+        self.list_pages.lock().expect("list page calls").clone()
     }
 }
 
@@ -1353,6 +1734,11 @@ impl ObjectStore for CountingObjectStore {
         start_after: Option<&str>,
         limit: usize,
     ) -> Result<ObjectListPage, DatalensError> {
+        self.list_pages.lock().expect("list page calls").push((
+            prefix.to_owned(),
+            start_after.map(str::to_owned),
+            limit,
+        ));
         self.inner.list_page(prefix, start_after, limit)
     }
 

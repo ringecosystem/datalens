@@ -350,6 +350,7 @@ fn test_query_service_disabled_durable_intents_returns_provider_rows_without_int
             enabled: false,
             worker_threads: 0,
             claim_batch_size: 0,
+            ..Default::default()
         },
         intents,
     );
