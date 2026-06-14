@@ -281,10 +281,11 @@ fn validate_follow_query_ensure(request: &WarmupSubmitRequest) -> Result<(), Dat
 
 pub(crate) fn task_dedupe_key(request: &WarmupSubmitRequest) -> String {
     format!(
-        "application={};chain={};dataset={};selector={};range_kind={:?};start={};end={:?};mode={:?}",
+        "application={};chain={};dataset={};selector_fingerprint={};selector={};range_kind={:?};start={};end={:?};mode={:?}",
         request.application_id.trim(),
         request.chain.key_prefix(),
         request.dataset_key.as_str(),
+        request.selector.fingerprint(),
         request.selector.canonical_key(),
         request.range_kind,
         request.start,
@@ -324,10 +325,11 @@ fn task_identity_key(
     mode: WarmupTaskMode,
 ) -> String {
     format!(
-        "application={};chain={};dataset={};selector={};range_kind={:?};mode={:?}",
+        "application={};chain={};dataset={};selector_fingerprint={};selector={};range_kind={:?};mode={:?}",
         application_id,
         chain.key_prefix(),
         dataset_key.as_str(),
+        selector.fingerprint(),
         selector.canonical_key(),
         range_kind,
         mode,
