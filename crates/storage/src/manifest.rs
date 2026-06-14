@@ -49,7 +49,8 @@ impl Manifest {
         for entry in self.entries.drain(..) {
             entries.insert(entry.logical_key(), entry);
         }
-        self.entries = coalesce_empty_entries(entries.into_values().collect());
+        self.entries =
+            coalesce_empty_entries(filter_shadowed_entries(entries.into_values().collect()));
     }
 
     pub(crate) fn find_logical(
@@ -68,6 +69,21 @@ impl Manifest {
                 && existing.finality_level == finality_level
         })
     }
+}
+
+fn filter_shadowed_entries(entries: Vec<ManifestEntry>) -> Vec<ManifestEntry> {
+    let mut retained: Vec<ManifestEntry> = Vec::new();
+    for entry in entries {
+        if retained
+            .iter()
+            .any(|retained| retained.shadows_segment(&entry))
+        {
+            continue;
+        }
+        retained.retain(|retained| !entry.shadows_segment(retained));
+        retained.push(entry);
+    }
+    retained
 }
 
 fn coalesce_empty_entries(entries: Vec<ManifestEntry>) -> Vec<ManifestEntry> {

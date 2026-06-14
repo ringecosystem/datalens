@@ -320,7 +320,7 @@ fn test_compaction_merges_adjacent_small_objects_and_retains_old_objects() {
     assert_eq!(report.compacted_rows, 2);
 
     let manifest = storage.manifest().expect("manifest");
-    assert_eq!(manifest.entries.len(), 3);
+    assert_eq!(manifest.entries.len(), 1);
     let compacted_entry = manifest
         .entries
         .iter()
