@@ -34,6 +34,14 @@ use datalens_warmup::{
 use datalens_writer::DurableWriterConfig;
 
 #[test]
+fn test_warmup_idle_state_serializes_as_snake_case() {
+    assert_eq!(
+        serde_json::to_string(&WarmupTaskState::Idle).unwrap(),
+        r#""idle""#
+    );
+}
+
+#[test]
 fn test_submit_duplicate_task_returns_existing_task_id() {
     let store = object_store("dedupe");
     let registry = LocalWarmupRegistry::new(store);
@@ -1192,6 +1200,421 @@ fn test_task_pool_prioritizes_active_follow_query_watermark() {
     assert_eq!(adapter.fetches(), vec![blocks(1_001, 1_001)]);
     assert_eq!(registry.load_cursor(&active).unwrap().unwrap().next, 1_002);
     assert_eq!(registry.load_cursor(&stale).unwrap().unwrap().next, 1);
+}
+
+#[test]
+fn test_task_pool_cancels_duplicate_follow_query_tasks() {
+    let storage = LocalStorage::new(temp_root("pool-follow-query-duplicate-storage"));
+    let registry = LocalWarmupRegistry::new(object_store("pool-follow-query-duplicate-registry"));
+    let watermarks =
+        QueryWatermarkStore::new(object_store("pool-follow-query-duplicate-watermarks"));
+    let adapter = FixtureAdapter::new(2_000).with_max_range_len(1);
+    let pool = WarmupTaskPool::new(
+        runtime(adapter, storage, registry.clone())
+            .with_query_watermarks(watermarks.clone())
+            .with_follow_query_start_offset_blocks(Some(1))
+            .with_follow_query_lookahead_blocks(1)
+            .with_runtime_config(WarmupRuntimeConfig {
+                max_fetches_per_task_loop: 1,
+            }),
+        WarmupSchedulerConfig {
+            max_global_concurrent_tasks: 2,
+            max_concurrent_tasks_per_chain: 2,
+        },
+    );
+    let keeper = registry
+        .submit(follow_query_request())
+        .expect("keeper follow query")
+        .task_id;
+    let mut duplicate_task = registry.get(&keeper).unwrap().unwrap();
+    let duplicate = datalens_warmup::WarmupTaskId::new("warmup-historical-duplicate").unwrap();
+    duplicate_task.task_id = duplicate.clone();
+    duplicate_task.created_at = duplicate_task.created_at.saturating_add(1);
+    duplicate_task.updated_at = duplicate_task.updated_at.saturating_add(1);
+    registry
+        .save_task(&duplicate_task)
+        .expect("save duplicate task");
+    save_query_watermark(&watermarks, 1_000);
+    save_warmup_cursor(&registry, &keeper, 1_000, 1);
+    save_warmup_cursor(&registry, &duplicate, 1, 1);
+
+    let results = pool.run_available_once().expect("run with duplicate");
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        registry.get(&duplicate).unwrap().unwrap().state,
+        WarmupTaskState::Cancelled
+    );
+    assert!(registry.load_cursor(&keeper).unwrap().unwrap().next > 1_000);
+}
+
+#[test]
+fn test_task_pool_keeps_runnable_keeper_over_higher_cursor_paused_duplicate() {
+    let storage = LocalStorage::new(temp_root("pool-follow-query-duplicate-state-storage"));
+    let registry =
+        LocalWarmupRegistry::new(object_store("pool-follow-query-duplicate-state-registry"));
+    let watermarks =
+        QueryWatermarkStore::new(object_store("pool-follow-query-duplicate-state-watermarks"));
+    let adapter = FixtureAdapter::new(2_000).with_max_range_len(1);
+    let pool = WarmupTaskPool::new(
+        runtime(adapter, storage, registry.clone())
+            .with_query_watermarks(watermarks.clone())
+            .with_follow_query_start_offset_blocks(Some(1))
+            .with_follow_query_lookahead_blocks(1)
+            .with_runtime_config(WarmupRuntimeConfig {
+                max_fetches_per_task_loop: 1,
+            }),
+        WarmupSchedulerConfig {
+            max_global_concurrent_tasks: 2,
+            max_concurrent_tasks_per_chain: 2,
+        },
+    );
+    let keeper = registry
+        .submit(follow_query_request())
+        .expect("queued follow query")
+        .task_id;
+    let mut duplicate_task = registry.get(&keeper).unwrap().unwrap();
+    let duplicate = datalens_warmup::WarmupTaskId::new("0000-paused-high-cursor").unwrap();
+    duplicate_task.task_id = duplicate.clone();
+    duplicate_task.state = WarmupTaskState::Paused;
+    duplicate_task.created_at = duplicate_task.created_at.saturating_sub(1);
+    duplicate_task.updated_at = duplicate_task.updated_at.saturating_sub(1);
+    registry
+        .save_task(&duplicate_task)
+        .expect("save paused duplicate task");
+    save_query_watermark(&watermarks, 1_000);
+    save_warmup_cursor(&registry, &keeper, 1_000, 1);
+    save_warmup_cursor(&registry, &duplicate, 1_500, 1);
+
+    let results = pool.run_available_once().expect("run with duplicate");
+
+    assert_eq!(results.len(), 1);
+    assert_ne!(
+        registry.get(&keeper).unwrap().unwrap().state,
+        WarmupTaskState::Cancelled
+    );
+    assert_eq!(
+        registry.get(&duplicate).unwrap().unwrap().state,
+        WarmupTaskState::Cancelled
+    );
+    assert!(registry.load_cursor(&keeper).unwrap().unwrap().next > 1_000);
+}
+
+#[test]
+fn test_task_pool_does_not_reconcile_other_selectors_with_different_fingerprints() {
+    let storage = LocalStorage::new(temp_root("pool-follow-query-selector-identity-storage"));
+    let registry =
+        LocalWarmupRegistry::new(object_store("pool-follow-query-selector-identity-registry"));
+    let watermarks = QueryWatermarkStore::new(object_store(
+        "pool-follow-query-selector-identity-watermarks",
+    ));
+    let adapter = FixtureAdapter::new(2_000).with_max_range_len(1);
+    let pool = WarmupTaskPool::new(
+        runtime(adapter, storage, registry.clone())
+            .with_query_watermarks(watermarks.clone())
+            .with_follow_query_start_offset_blocks(Some(1))
+            .with_follow_query_lookahead_blocks(1)
+            .with_runtime_config(WarmupRuntimeConfig {
+                max_fetches_per_task_loop: 1,
+            }),
+        WarmupSchedulerConfig {
+            max_global_concurrent_tasks: 2,
+            max_concurrent_tasks_per_chain: 2,
+        },
+    );
+    let mut first_request = follow_query_request();
+    first_request.selector = DatasetSelector::try_other(
+        AdapterKey::try_new("fixture").expect("selector kind"),
+        "fingerprint-a".to_owned(),
+        "same-canonical-key".to_owned(),
+    )
+    .expect("first other selector");
+    let mut second_request = follow_query_request();
+    second_request.selector = DatasetSelector::try_other(
+        AdapterKey::try_new("fixture").expect("selector kind"),
+        "fingerprint-b".to_owned(),
+        "same-canonical-key".to_owned(),
+    )
+    .expect("second other selector");
+    let first = registry
+        .submit(first_request)
+        .expect("first follow query")
+        .task_id;
+    let second = registry
+        .submit(second_request)
+        .expect("second follow query")
+        .task_id;
+    registry.pause(&first).expect("pause first");
+    registry.pause(&second).expect("pause second");
+
+    let results = pool.run_available_once().expect("run distinct selectors");
+
+    assert!(results.is_empty());
+    assert_eq!(
+        registry.get(&first).unwrap().unwrap().state,
+        WarmupTaskState::Paused
+    );
+    assert_eq!(
+        registry.get(&second).unwrap().unwrap().state,
+        WarmupTaskState::Paused
+    );
+}
+
+#[test]
+fn test_ensure_keeps_cancelled_duplicate_from_replacing_keeper() {
+    let storage = LocalStorage::new(temp_root("pool-follow-query-duplicate-ensure-storage"));
+    let registry =
+        LocalWarmupRegistry::new(object_store("pool-follow-query-duplicate-ensure-registry"));
+    let watermarks = QueryWatermarkStore::new(object_store(
+        "pool-follow-query-duplicate-ensure-watermarks",
+    ));
+    let adapter = FixtureAdapter::new(2_000).with_max_range_len(1);
+    let pool = WarmupTaskPool::new(
+        runtime(adapter, storage, registry.clone())
+            .with_query_watermarks(watermarks.clone())
+            .with_follow_query_start_offset_blocks(Some(1))
+            .with_follow_query_lookahead_blocks(1)
+            .with_runtime_config(WarmupRuntimeConfig {
+                max_fetches_per_task_loop: 1,
+            }),
+        WarmupSchedulerConfig {
+            max_global_concurrent_tasks: 2,
+            max_concurrent_tasks_per_chain: 2,
+        },
+    );
+    let keeper = registry
+        .submit(follow_query_request())
+        .expect("keeper follow query")
+        .task_id;
+    let mut duplicate_task = registry.get(&keeper).unwrap().unwrap();
+    let duplicate = datalens_warmup::WarmupTaskId::new("0000-historical-duplicate").unwrap();
+    duplicate_task.task_id = duplicate.clone();
+    duplicate_task.created_at = duplicate_task.created_at.saturating_add(1);
+    duplicate_task.updated_at = duplicate_task.updated_at.saturating_add(1);
+    registry
+        .save_task(&duplicate_task)
+        .expect("save duplicate task");
+    save_query_watermark(&watermarks, 1_000);
+    save_warmup_cursor(&registry, &keeper, 1_000, 1);
+    save_warmup_cursor(&registry, &duplicate, 1, 1);
+
+    pool.run_available_once().expect("cancel duplicate");
+    let ensured = registry
+        .ensure(follow_query_request())
+        .expect("ensure existing follow query");
+
+    assert_eq!(ensured.task_id, keeper);
+    assert!(!ensured.created);
+    assert_eq!(
+        registry.get(&duplicate).unwrap().unwrap().state,
+        WarmupTaskState::Cancelled
+    );
+}
+
+#[test]
+fn test_ensure_prefers_runnable_keeper_over_paused_duplicate() {
+    let registry =
+        LocalWarmupRegistry::new(object_store("pool-follow-query-paused-duplicate-registry"));
+    let keeper = registry
+        .submit(follow_query_request())
+        .expect("keeper follow query")
+        .task_id;
+    let mut duplicate_task = registry.get(&keeper).unwrap().unwrap();
+    let duplicate = datalens_warmup::WarmupTaskId::new("0000-paused-duplicate").unwrap();
+    duplicate_task.task_id = duplicate.clone();
+    duplicate_task.state = WarmupTaskState::Paused;
+    duplicate_task.created_at = duplicate_task.created_at.saturating_sub(1);
+    duplicate_task.updated_at = duplicate_task.updated_at.saturating_sub(1);
+    registry
+        .save_task(&duplicate_task)
+        .expect("save paused duplicate task");
+
+    let ensured = registry
+        .ensure(follow_query_request())
+        .expect("ensure existing follow query");
+
+    assert_eq!(ensured.task_id, keeper);
+    assert!(!ensured.created);
+    assert_eq!(
+        registry.get(&duplicate).unwrap().unwrap().state,
+        WarmupTaskState::Paused
+    );
+}
+
+#[test]
+fn test_ensure_keeps_idle_follow_query_idle() {
+    let registry = LocalWarmupRegistry::new(object_store("ensure-follow-query-idle"));
+    let task_id = registry
+        .submit(follow_query_request())
+        .expect("follow query")
+        .task_id;
+    let mut task = registry.get(&task_id).unwrap().unwrap();
+    task.state = WarmupTaskState::Idle;
+    registry.save_task(&task).expect("save idle task");
+
+    let ensured = registry
+        .ensure(follow_query_request())
+        .expect("ensure idle follow query");
+
+    assert_eq!(ensured.task_id, task_id);
+    assert!(!ensured.created);
+    assert_eq!(ensured.state, WarmupTaskState::Idle);
+    assert_eq!(
+        registry.get(&task_id).unwrap().unwrap().state,
+        WarmupTaskState::Idle
+    );
+}
+
+#[test]
+fn test_follow_query_near_head_moves_to_idle_without_provider_fetch() {
+    let storage = LocalStorage::new(temp_root("pool-follow-query-idle-storage"));
+    let registry = LocalWarmupRegistry::new(object_store("pool-follow-query-idle-registry"));
+    let watermarks = QueryWatermarkStore::new(object_store("pool-follow-query-idle-watermarks"));
+    let adapter = FixtureAdapter::new(1_010).with_max_range_len(1);
+    let pool = WarmupTaskPool::new(
+        runtime(adapter.clone(), storage, registry.clone())
+            .with_query_watermarks(watermarks.clone())
+            .with_follow_query_idle_threshold_blocks(Some(10))
+            .with_follow_query_resume_threshold_blocks(Some(20))
+            .with_follow_query_start_offset_blocks(Some(1))
+            .with_follow_query_lookahead_blocks(1)
+            .with_runtime_config(WarmupRuntimeConfig {
+                max_fetches_per_task_loop: 1,
+            }),
+        WarmupSchedulerConfig {
+            max_global_concurrent_tasks: 1,
+            max_concurrent_tasks_per_chain: 1,
+        },
+    );
+    let task_id = registry
+        .submit(follow_query_request())
+        .expect("follow query")
+        .task_id;
+    save_query_watermark(&watermarks, 1_000);
+    save_warmup_cursor(&registry, &task_id, 1_000, 1);
+
+    let results = pool.run_available_once().expect("idle near head");
+
+    assert!(results.is_empty());
+    assert_eq!(adapter.fetches(), Vec::<LedgerRange>::new());
+    let task = registry.get(&task_id).unwrap().unwrap();
+    assert_eq!(task.state, WarmupTaskState::Idle);
+    assert_eq!(
+        task.follow_query_status.unwrap().no_op_reason.as_deref(),
+        Some("near_safe_head")
+    );
+}
+
+#[test]
+fn test_direct_idle_follow_query_below_resume_threshold_stops_without_fetch() {
+    let storage = LocalStorage::new(temp_root("direct-follow-query-idle-stopped-storage"));
+    let registry = LocalWarmupRegistry::new(object_store("direct-follow-query-idle-stopped"));
+    let watermarks =
+        QueryWatermarkStore::new(object_store("direct-follow-query-idle-stopped-marks"));
+    let adapter = FixtureAdapter::new(1_010).with_max_range_len(1);
+    let runtime = runtime(adapter.clone(), storage, registry.clone())
+        .with_query_watermarks(watermarks.clone())
+        .with_follow_query_idle_threshold_blocks(Some(10))
+        .with_follow_query_resume_threshold_blocks(Some(20))
+        .with_follow_query_start_offset_blocks(Some(1))
+        .with_follow_query_lookahead_blocks(1)
+        .with_runtime_config(WarmupRuntimeConfig {
+            max_fetches_per_task_loop: 1,
+        });
+    let task_id = registry
+        .submit(follow_query_request())
+        .expect("follow query")
+        .task_id;
+    let mut task = registry.get(&task_id).unwrap().unwrap();
+    task.state = WarmupTaskState::Idle;
+    registry.save_task(&task).expect("save idle task");
+    save_query_watermark(&watermarks, 1_000);
+    save_warmup_cursor(&registry, &task_id, 1_000, 1);
+
+    let result = runtime.run_task_once(&task_id).expect("run idle task");
+
+    assert_eq!(result.status, WarmupRunStatus::Stopped);
+    assert_eq!(adapter.fetches(), Vec::<LedgerRange>::new());
+    assert_eq!(
+        registry.get(&task_id).unwrap().unwrap().state,
+        WarmupTaskState::Idle
+    );
+}
+
+#[test]
+fn test_direct_idle_follow_query_resumes_when_query_gap_grows() {
+    let storage = LocalStorage::new(temp_root("direct-follow-query-idle-resume-storage"));
+    let registry = LocalWarmupRegistry::new(object_store("direct-follow-query-idle-resume"));
+    let watermarks =
+        QueryWatermarkStore::new(object_store("direct-follow-query-idle-resume-marks"));
+    let adapter = FixtureAdapter::new(1_100).with_max_range_len(1);
+    let runtime = runtime(adapter.clone(), storage, registry.clone())
+        .with_query_watermarks(watermarks.clone())
+        .with_follow_query_idle_threshold_blocks(Some(10))
+        .with_follow_query_resume_threshold_blocks(Some(50))
+        .with_follow_query_start_offset_blocks(Some(1))
+        .with_follow_query_lookahead_blocks(1)
+        .with_runtime_config(WarmupRuntimeConfig {
+            max_fetches_per_task_loop: 1,
+        });
+    let task_id = registry
+        .submit(follow_query_request())
+        .expect("follow query")
+        .task_id;
+    let mut task = registry.get(&task_id).unwrap().unwrap();
+    task.state = WarmupTaskState::Idle;
+    registry.save_task(&task).expect("save idle task");
+    save_query_watermark(&watermarks, 1_000);
+    save_warmup_cursor(&registry, &task_id, 1_000, 1);
+
+    let result = runtime.run_task_once(&task_id).expect("run idle task");
+
+    assert_eq!(result.status, WarmupRunStatus::Partial);
+    assert_eq!(adapter.fetches(), vec![blocks(1_001, 1_001)]);
+    assert_eq!(
+        registry.get(&task_id).unwrap().unwrap().state,
+        WarmupTaskState::Queued
+    );
+}
+
+#[test]
+fn test_idle_follow_query_resumes_when_query_gap_grows() {
+    let storage = LocalStorage::new(temp_root("pool-follow-query-resume-storage"));
+    let registry = LocalWarmupRegistry::new(object_store("pool-follow-query-resume-registry"));
+    let watermarks = QueryWatermarkStore::new(object_store("pool-follow-query-resume-watermarks"));
+    let adapter = FixtureAdapter::new(1_100).with_max_range_len(1);
+    let pool = WarmupTaskPool::new(
+        runtime(adapter, storage, registry.clone())
+            .with_query_watermarks(watermarks.clone())
+            .with_follow_query_idle_threshold_blocks(Some(10))
+            .with_follow_query_resume_threshold_blocks(Some(50))
+            .with_follow_query_start_offset_blocks(Some(1))
+            .with_follow_query_lookahead_blocks(1)
+            .with_runtime_config(WarmupRuntimeConfig {
+                max_fetches_per_task_loop: 1,
+            }),
+        WarmupSchedulerConfig {
+            max_global_concurrent_tasks: 1,
+            max_concurrent_tasks_per_chain: 1,
+        },
+    );
+    let task_id = registry
+        .submit(follow_query_request())
+        .expect("follow query")
+        .task_id;
+    let mut task = registry.get(&task_id).unwrap().unwrap();
+    task.state = WarmupTaskState::Idle;
+    registry.save_task(&task).expect("save idle task");
+    save_query_watermark(&watermarks, 1_000);
+    save_warmup_cursor(&registry, &task_id, 1_000, 1);
+
+    let results = pool.run_available_once().expect("resume idle task");
+
+    assert_eq!(
+        registry.get(&task_id).unwrap().unwrap().state,
+        WarmupTaskState::Queued
+    );
+    assert_eq!(results.len(), 1);
 }
 
 #[test]
