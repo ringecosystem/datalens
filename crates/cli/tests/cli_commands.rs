@@ -729,6 +729,8 @@ fn test_config_parses_warmup_follow_query_lookahead() {
         follow_query_start_offset_blocks = 512
         follow_query_start_offset_tiers_blocks = [5000, 3000, 1000]
         follow_query_catchup_threshold_blocks = 250
+        follow_query_idle_threshold_blocks = 10
+        follow_query_resume_threshold_blocks = 20
         query_activity_ttl_seconds = 600
 
         [chains.ethereum]
@@ -740,6 +742,8 @@ fn test_config_parses_warmup_follow_query_lookahead() {
         follow_query_start_offset_blocks = 1000
         follow_query_start_offset_tiers_blocks = [4000, 2000, 750]
         follow_query_catchup_threshold_blocks = 300
+        follow_query_idle_threshold_blocks = 30
+        follow_query_resume_threshold_blocks = 60
 
         [chains.ethereum.datasets.blocks]
         enabled = true
@@ -760,6 +764,8 @@ fn test_config_parses_warmup_follow_query_lookahead() {
         Some(vec![5000, 3000, 1000])
     );
     assert_eq!(config.warmup.follow_query_catchup_threshold_blocks, 250);
+    assert_eq!(config.warmup.follow_query_idle_threshold_blocks, Some(10));
+    assert_eq!(config.warmup.follow_query_resume_threshold_blocks, Some(20));
     assert_eq!(config.warmup.query_activity_ttl_seconds, 600);
     assert_eq!(
         config
@@ -787,6 +793,24 @@ fn test_config_parses_warmup_follow_query_lookahead() {
             .warmup
             .follow_query_catchup_threshold_blocks,
         Some(300)
+    );
+    assert_eq!(
+        config
+            .chains
+            .get("ethereum")
+            .expect("ethereum chain")
+            .warmup
+            .follow_query_idle_threshold_blocks,
+        Some(30)
+    );
+    assert_eq!(
+        config
+            .chains
+            .get("ethereum")
+            .expect("ethereum chain")
+            .warmup
+            .follow_query_resume_threshold_blocks,
+        Some(60)
     );
     validate_config(&config).expect("warmup follow-query config is valid");
 }

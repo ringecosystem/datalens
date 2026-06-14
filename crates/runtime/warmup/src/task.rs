@@ -46,6 +46,7 @@ pub enum WarmupTaskMode {
 pub enum WarmupTaskState {
     Queued,
     Running,
+    Idle,
     Paused,
     Completed,
     Failed,

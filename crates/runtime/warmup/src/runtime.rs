@@ -1,4 +1,10 @@
-use std::{collections::HashMap, sync::Arc, thread, time::Duration};
+use std::{
+    cmp::Reverse,
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    thread,
+    time::Duration,
+};
 
 use datalens_chain::{
     ChainAdapter, ChainFetchRequest, DatasetCapability, DatasetSelector, FinalityLevel,
@@ -28,6 +34,7 @@ use crate::{
     pending_commit::PendingWarmupCommit,
     registry::unix_seconds_now,
     target_planner::{PlannedWarmupTarget, WarmupTargetPlanInput, WarmupTargetPlanner},
+    task::task_ensure_key_for_task,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -92,6 +99,8 @@ pub struct WarmupRuntime<A, S, R> {
     follow_query_start_offset_blocks: Option<u64>,
     follow_query_start_offset_tiers_blocks: Option<Vec<u64>>,
     follow_query_catchup_threshold_blocks: u64,
+    follow_query_idle_threshold_blocks: Option<u64>,
+    follow_query_resume_threshold_blocks: Option<u64>,
     query_activity_ttl_seconds: u64,
     metrics: Option<MetricsRecorder>,
     usage_ledger: Option<Arc<dyn UsageLedgerRepository>>,
@@ -180,18 +189,12 @@ where
         let max_global = self.config.max_global_concurrent_tasks.max(1);
         let max_per_chain = self.config.max_concurrent_tasks_per_chain.max(1);
         let mut chain_counts: HashMap<String, usize> = HashMap::new();
-        let mut tasks = self
-            .list(crate::WarmupTaskFilter::default())?
-            .into_iter()
-            .filter(is_runnable_task)
-            .map(|task| {
-                if task.mode == WarmupTaskMode::FollowQuery {
-                    self.runtime.task_with_follow_query_status(task)
-                } else {
-                    Ok(task)
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut tasks = self.runtime.reconcile_follow_query_tasks(
+            self.list(crate::WarmupTaskFilter::default())?
+                .into_iter()
+                .collect(),
+        )?;
+        tasks.retain(is_runnable_task);
         tasks.sort_by_key(warmup_priority_key);
         for task in tasks {
             if results.len() >= max_global {
@@ -227,6 +230,8 @@ where
             follow_query_start_offset_blocks: None,
             follow_query_start_offset_tiers_blocks: None,
             follow_query_catchup_threshold_blocks: 200,
+            follow_query_idle_threshold_blocks: None,
+            follow_query_resume_threshold_blocks: None,
             query_activity_ttl_seconds: 300,
             metrics: None,
             usage_ledger: None,
@@ -275,6 +280,16 @@ where
         self
     }
 
+    pub fn with_follow_query_idle_threshold_blocks(mut self, threshold: Option<u64>) -> Self {
+        self.follow_query_idle_threshold_blocks = threshold;
+        self
+    }
+
+    pub fn with_follow_query_resume_threshold_blocks(mut self, threshold: Option<u64>) -> Self {
+        self.follow_query_resume_threshold_blocks = threshold;
+        self
+    }
+
     pub fn with_query_activity_ttl_seconds(mut self, ttl_seconds: u64) -> Self {
         self.query_activity_ttl_seconds = ttl_seconds;
         self
@@ -320,6 +335,21 @@ where
             .get(task_id)?
             .ok_or_else(|| missing_task(task_id))?;
         match task.state {
+            WarmupTaskState::Idle => {
+                let mut refreshed = self.task_with_follow_query_status(task)?;
+                if self.should_resume_follow_query(&refreshed) {
+                    refreshed.state = WarmupTaskState::Queued;
+                    refreshed.touch(unix_seconds_now()?);
+                    self.registry.save_task(&refreshed)?;
+                    task = refreshed;
+                } else {
+                    self.registry.save_task(&refreshed)?;
+                    return Ok(WarmupRunResult {
+                        status: WarmupRunStatus::Stopped,
+                        ..WarmupRunResult::default()
+                    });
+                }
+            }
             WarmupTaskState::Paused | WarmupTaskState::Cancelled => {
                 return Ok(WarmupRunResult {
                     status: WarmupRunStatus::Stopped,
@@ -860,7 +890,10 @@ where
         };
         Ok(matches!(
             task.state,
-            WarmupTaskState::Paused | WarmupTaskState::Cancelled | WarmupTaskState::Completed
+            WarmupTaskState::Paused
+                | WarmupTaskState::Cancelled
+                | WarmupTaskState::Completed
+                | WarmupTaskState::Idle
         ))
     }
 
@@ -988,7 +1021,110 @@ where
             safe_height.value,
             &target_plan,
         )?;
+        if task.state == WarmupTaskState::Idle
+            && !self.should_resume_follow_query(&task)
+            && let Some(status) = task.follow_query_status.as_mut()
+        {
+            status.no_op_reason = Some("near_safe_head".to_owned());
+        }
         Ok(task)
+    }
+
+    fn reconcile_follow_query_tasks(
+        &self,
+        tasks: Vec<WarmupTask>,
+    ) -> Result<Vec<WarmupTask>, DatalensError> {
+        let mut groups: HashMap<String, Vec<WarmupTask>> = HashMap::new();
+        for task in tasks
+            .iter()
+            .filter(|task| task.mode == WarmupTaskMode::FollowQuery)
+            .filter(|task| {
+                !matches!(
+                    task.state,
+                    WarmupTaskState::Completed | WarmupTaskState::Cancelled
+                )
+            })
+        {
+            if let Some(identity_key) = follow_query_identity_key(task) {
+                groups.entry(identity_key).or_default().push(task.clone());
+            }
+        }
+
+        let mut cancelled = HashSet::new();
+        for group in groups.into_values().filter(|group| group.len() > 1) {
+            let keeper = group
+                .iter()
+                .min_by_key(|task| duplicate_keeper_key(task))
+                .expect("non-empty duplicate group");
+            for duplicate in group
+                .iter()
+                .filter(|task| task.task_id != keeper.task_id)
+                .filter(|task| {
+                    !matches!(
+                        task.state,
+                        WarmupTaskState::Completed | WarmupTaskState::Cancelled
+                    )
+                })
+            {
+                self.registry.cancel(&duplicate.task_id)?;
+                cancelled.insert(duplicate.task_id.clone());
+                log::info!(
+                    "warmup follow_query duplicate cancelled task_id={} keeper_task_id={} chain_key={} dataset={} selector_fingerprint={}",
+                    duplicate.task_id.as_str(),
+                    keeper.task_id.as_str(),
+                    duplicate.chain.key_prefix(),
+                    duplicate.dataset_key.as_str(),
+                    duplicate.selector.fingerprint(),
+                );
+            }
+        }
+
+        let mut reconciled = Vec::new();
+        for mut task in tasks {
+            if cancelled.contains(&task.task_id) {
+                continue;
+            }
+            if task.mode != WarmupTaskMode::FollowQuery
+                || matches!(
+                    task.state,
+                    WarmupTaskState::Completed | WarmupTaskState::Cancelled
+                )
+            {
+                reconciled.push(task);
+                continue;
+            }
+            if matches!(
+                task.state,
+                WarmupTaskState::Queued | WarmupTaskState::Running
+            ) && self.should_idle_follow_query(&task)
+            {
+                if let Some(status) = task.follow_query_status.as_mut() {
+                    status.no_op_reason = Some("near_safe_head".to_owned());
+                }
+                task.state = WarmupTaskState::Idle;
+                task.touch(unix_seconds_now()?);
+                self.registry.save_task(&task)?;
+            } else if task.state == WarmupTaskState::Idle && self.should_resume_follow_query(&task)
+            {
+                task.state = WarmupTaskState::Queued;
+                task.touch(unix_seconds_now()?);
+                self.registry.save_task(&task)?;
+            }
+            reconciled.push(task);
+        }
+        Ok(reconciled)
+    }
+
+    fn should_idle_follow_query(&self, task: &WarmupTask) -> bool {
+        self.follow_query_idle_threshold_blocks
+            .zip(follow_query_gap(task))
+            .is_some_and(|(threshold, gap)| gap <= threshold)
+    }
+
+    fn should_resume_follow_query(&self, task: &WarmupTask) -> bool {
+        self.follow_query_resume_threshold_blocks
+            .zip(follow_query_gap(task))
+            .is_some_and(|(threshold, gap)| gap >= threshold)
     }
 
     fn apply_follow_query_status(
@@ -1299,6 +1435,42 @@ fn is_runnable_task(task: &WarmupTask) -> bool {
         task.state,
         WarmupTaskState::Queued | WarmupTaskState::Running
     )
+}
+
+fn follow_query_identity_key(task: &WarmupTask) -> Option<String> {
+    if task.mode != WarmupTaskMode::FollowQuery {
+        return None;
+    }
+    Some(task_ensure_key_for_task(task))
+}
+
+fn duplicate_keeper_key(task: &WarmupTask) -> (u8, Reverse<u64>, u64, String) {
+    let cursor_next = task
+        .follow_query_status
+        .as_ref()
+        .map(|status| status.cursor_next)
+        .unwrap_or(task.start);
+    (
+        duplicate_keeper_state_rank(task.state),
+        Reverse(cursor_next),
+        task.created_at,
+        task.task_id.as_str().to_owned(),
+    )
+}
+
+fn duplicate_keeper_state_rank(state: WarmupTaskState) -> u8 {
+    match state {
+        WarmupTaskState::Queued | WarmupTaskState::Running => 0,
+        WarmupTaskState::Idle => 1,
+        WarmupTaskState::Paused | WarmupTaskState::Failed => 2,
+        WarmupTaskState::Completed | WarmupTaskState::Cancelled => 3,
+    }
+}
+
+fn follow_query_gap(task: &WarmupTask) -> Option<u64> {
+    let status = task.follow_query_status.as_ref()?;
+    let query_watermark = status.query_watermark?;
+    Some(status.safe_head.saturating_sub(query_watermark))
 }
 
 fn warmup_priority_key(task: &WarmupTask) -> (u8, u64, u64, u64, String, String, String) {

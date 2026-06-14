@@ -1,5 +1,9 @@
 mod support;
 
+use datalens_storage::{
+    QueryWatermark, QueryWatermarkKey, QueryWatermarkRepository, QueryWatermarkStore,
+};
+use datalens_warmup::WarmupTaskFilter;
 use support::graphql::*;
 
 #[tokio::test]
@@ -182,4 +186,131 @@ async fn test_graphql_warmup_follow_query_submit_reuses_identity_without_start()
     assert_eq!(tasks[0]["taskId"], task_id);
     assert_eq!(tasks[0]["start"], 20);
     assert_eq!(tasks[0]["end"], serde_json::Value::Null);
+}
+
+#[tokio::test]
+async fn test_graphql_warmup_task_exposes_idle_follow_query_reason() {
+    let root = temp_storage_root("gql-warmup-follow-query-idle");
+    let watermarks = QueryWatermarkStore::new(LocalObjectStore::new(root.join("watermarks")));
+    let source = MockSource::default();
+    let warmup_registry =
+        LocalWarmupRegistry::new(LocalObjectStore::new(root.join("warmup-registry")));
+    let service =
+        service(LocalStorage::new(&root), source.clone()).with_warmup_pool(WarmupTaskPool::new(
+            WarmupRuntime::new(
+                source,
+                LocalStorage::new(&root),
+                warmup_registry.clone(),
+                datalens_writer::DurableWriterConfig {
+                    target_object_bytes: 1024,
+                    min_object_rows: 1,
+                    record_empty_coverage: true,
+                    staging: Default::default(),
+                },
+            )
+            .with_query_watermarks(watermarks.clone())
+            .with_follow_query_idle_threshold_blocks(Some(10))
+            .with_follow_query_resume_threshold_blocks(Some(20))
+            .with_follow_query_start_offset_blocks(Some(1))
+            .with_follow_query_lookahead_blocks(3)
+            .with_runtime_config(WarmupRuntimeConfig {
+                max_fetches_per_task_loop: 1,
+            }),
+            WarmupSchedulerConfig {
+                max_global_concurrent_tasks: 1,
+                max_concurrent_tasks_per_chain: 1,
+            },
+        ));
+    let registry = QueryServiceRegistry::new()
+        .with_service(service)
+        .expect("register service");
+    let app = graphql_router(registry);
+
+    let submit = graphql_json(
+        app.clone(),
+        r#"
+        mutation($input: WarmupSubmitInput!) {
+          submitWarmupTask(input: $input) {
+            taskId
+            created
+          }
+        }
+        "#,
+        serde_json::json!({
+            "input": {
+                "chain": ethereum_chain_input(),
+                "datasetKey": dataset_key_input("evm", "logs"),
+                "selector": {
+                    "kind": "evm_logs",
+                    "evmLogs": {
+                        "addresses": ["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+                        "topics": []
+                    }
+                },
+                "rangeKind": { "kind": "block" },
+                "start": 1,
+                "end": null,
+                "mode": "follow_query"
+            }
+        }),
+    )
+    .await;
+    assert_eq!(submit["errors"], serde_json::Value::Null);
+    let task = warmup_registry
+        .list(WarmupTaskFilter::default())
+        .expect("list warmup tasks")
+        .into_iter()
+        .next()
+        .expect("warmup task");
+    watermarks
+        .update(&QueryWatermark {
+            key: QueryWatermarkKey::new(
+                task.application_id,
+                task.chain,
+                task.dataset_key,
+                &task.selector,
+                task.range_kind,
+            ),
+            latest_block: 990,
+            updated_at_unix_seconds: 1,
+        })
+        .expect("save watermark");
+
+    let run = graphql_json(
+        app.clone(),
+        r#"
+        mutation {
+          runWarmupOnce {
+            results
+          }
+        }
+        "#,
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(run["errors"], serde_json::Value::Null);
+    assert!(
+        run["data"]["runWarmupOnce"]["results"]
+            .as_array()
+            .expect("results")
+            .is_empty()
+    );
+
+    let listed = graphql_json(
+        app,
+        r#"
+        query {
+          warmupTasks {
+            state
+            noOpReason
+          }
+        }
+        "#,
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(listed["errors"], serde_json::Value::Null);
+    let task = &listed["data"]["warmupTasks"].as_array().expect("tasks")[0];
+    assert_eq!(task["state"], "idle");
+    assert_eq!(task["noOpReason"], "near_safe_head");
 }

@@ -131,6 +131,15 @@ fn test_config_storage_parquet_compression_defaults_to_disabled() {
 }
 
 #[test]
+fn test_config_warmup_follow_query_lifecycle_thresholds_default_to_unset() {
+    let config: DatalensConfig =
+        toml::from_str(&config_text("[query.native]")).expect("config should parse");
+
+    assert_eq!(config.warmup.follow_query_idle_threshold_blocks, None);
+    assert_eq!(config.warmup.follow_query_resume_threshold_blocks, None);
+}
+
+#[test]
 fn test_config_evm_log_header_fetch_mode_defaults_to_batch() {
     let config: DatalensConfig =
         toml::from_str(&config_text("[query.native]")).expect("config should parse");

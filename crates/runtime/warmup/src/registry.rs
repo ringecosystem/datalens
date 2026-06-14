@@ -178,13 +178,21 @@ where
             ));
         }
         let ensure_key = task_ensure_key(&request);
-        if let Some(mut existing) = self
+        let mut matches = self
             .list(WarmupTaskFilter::default())?
             .into_iter()
             .filter(|task| task.mode == WarmupTaskMode::FollowQuery)
-            .find(|task| task_ensure_key_for_task(task) == ensure_key)
-        {
-            if !is_scheduler_runnable(existing.state) {
+            .filter(|task| task_ensure_key_for_task(task) == ensure_key)
+            .collect::<Vec<_>>();
+        matches.sort_by_key(|task| {
+            (
+                follow_query_ensure_state_rank(task.state),
+                task.created_at,
+                task.task_id.as_str().to_owned(),
+            )
+        });
+        if let Some(mut existing) = matches.into_iter().next() {
+            if !is_scheduler_runnable(existing.state) && existing.state != WarmupTaskState::Idle {
                 existing.state = WarmupTaskState::Queued;
                 existing.last_error = None;
                 existing.touch(unix_seconds_now()?);
@@ -428,6 +436,15 @@ fn matches_filter(task: &WarmupTask, filter: &WarmupTaskFilter) -> bool {
 
 fn is_scheduler_runnable(state: WarmupTaskState) -> bool {
     matches!(state, WarmupTaskState::Queued | WarmupTaskState::Running)
+}
+
+fn follow_query_ensure_state_rank(state: WarmupTaskState) -> u8 {
+    match state {
+        WarmupTaskState::Queued | WarmupTaskState::Running => 0,
+        WarmupTaskState::Idle => 1,
+        WarmupTaskState::Paused | WarmupTaskState::Failed => 2,
+        WarmupTaskState::Completed | WarmupTaskState::Cancelled => 3,
+    }
 }
 
 fn missing_task(task_id: &WarmupTaskId) -> DatalensError {

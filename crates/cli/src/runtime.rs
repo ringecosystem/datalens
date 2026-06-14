@@ -405,6 +405,10 @@ fn build_evm_service_with_storage(
                 .follow_query_catchup_threshold_blocks
                 .unwrap_or(config.warmup.follow_query_catchup_threshold_blocks),
         )
+        .with_follow_query_idle_threshold_blocks(follow_query_idle_threshold_blocks(config, chain))
+        .with_follow_query_resume_threshold_blocks(follow_query_resume_threshold_blocks(
+            config, chain,
+        ))
         .with_usage_ledger(stores.usage_ledger)
         .with_query_activity_ttl_seconds(config.warmup.query_activity_ttl_seconds)
         .with_query_activity(stores.query_activity)
@@ -590,6 +594,10 @@ fn build_tron_service_with_storage(
                 .follow_query_catchup_threshold_blocks
                 .unwrap_or(config.warmup.follow_query_catchup_threshold_blocks),
         )
+        .with_follow_query_idle_threshold_blocks(follow_query_idle_threshold_blocks(config, chain))
+        .with_follow_query_resume_threshold_blocks(follow_query_resume_threshold_blocks(
+            config, chain,
+        ))
         .with_usage_ledger(stores.usage_ledger)
         .with_query_activity_ttl_seconds(config.warmup.query_activity_ttl_seconds)
         .with_query_activity(stores.query_activity)
@@ -962,6 +970,27 @@ fn cache_repair_runtime_config(config: &DatalensConfig) -> CacheRepairRuntimeCon
         fetch_timeout_ms: config.cache_repair.fetch_timeout_ms,
         lease_ttl_ms: config.cache_repair.lease_ttl_ms,
     }
+}
+
+fn follow_query_idle_threshold_blocks(config: &DatalensConfig, chain: &ChainConfig) -> Option<u64> {
+    chain
+        .warmup
+        .follow_query_idle_threshold_blocks
+        .or(config.warmup.follow_query_idle_threshold_blocks)
+}
+
+fn follow_query_resume_threshold_blocks(
+    config: &DatalensConfig,
+    chain: &ChainConfig,
+) -> Option<u64> {
+    chain
+        .warmup
+        .follow_query_resume_threshold_blocks
+        .or(config.warmup.follow_query_resume_threshold_blocks)
+        .or_else(|| {
+            follow_query_idle_threshold_blocks(config, chain)
+                .map(|threshold| threshold.saturating_mul(2))
+        })
 }
 
 fn durable_writer_config(
