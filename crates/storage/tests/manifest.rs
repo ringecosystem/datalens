@@ -3567,6 +3567,86 @@ fn test_write_rows_is_idempotent_for_same_logical_shard() {
 }
 
 #[test]
+fn test_broader_replacement_segment_shadows_old_small_entries_on_read() {
+    let store = ManifestAccessCountingStore::new(temp_storage_root("replacement-shadows-small"));
+    let storage = DurableStorage::from_object_store(store.clone());
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let replacement_rows = DatasetRows::new(
+        DatasetKey::evm_blocks(),
+        QueryRows::EvmBlocks(vec![
+            BlockHeader {
+                number: 90,
+                hash: "0xblock90".to_owned(),
+                parent_hash: "0xparent".to_owned(),
+                timestamp: 90,
+            },
+            BlockHeader {
+                number: 91,
+                hash: "0xblock91".to_owned(),
+                parent_hash: "0xblock90".to_owned(),
+                timestamp: 91,
+            },
+        ]),
+    )
+    .expect("replacement rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &selector,
+            range: LedgerRange::blocks(90, 90).expect("valid range"),
+            rows: &single_block_rows(90),
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write first small entry");
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &selector,
+            range: LedgerRange::blocks(91, 91).expect("valid range"),
+            rows: &single_block_rows(91),
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write second small entry");
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &selector,
+            range: LedgerRange::blocks(90, 91).expect("valid range"),
+            rows: &replacement_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write broader replacement entry");
+
+    assert_eq!(manifest_segment_keys(&storage, &chain).len(), 3);
+    assert_eq!(storage.manifest().expect("manifest").entries.len(), 1);
+
+    store.reset_data_object_get_count();
+    let read = storage
+        .read_rows(
+            &chain,
+            &DatasetKey::evm_blocks(),
+            &selector,
+            LedgerRange::blocks(90, 91).expect("valid range"),
+        )
+        .expect("read replacement rows");
+
+    assert_eq!(read, replacement_rows);
+    assert_eq!(
+        store.data_object_get_count(),
+        1,
+        "same-range read should fetch only the replacement object"
+    );
+}
+
+#[test]
 fn test_replacement_write_overwrites_same_logical_data_object() {
     let storage = LocalStorage::new(temp_storage_root("replacement-write-overwrites-object"));
     let chain = test_chain();
