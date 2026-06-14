@@ -12,7 +12,9 @@ use datalens_cache_repair::{
 };
 use datalens_core::{ChainIdentity, DatalensError, DatalensErrorKind};
 use datalens_edge::config::{ChainConfig, DatalensConfig, FinalityConfig};
-use datalens_edge::{QueryService, QueryServiceRegistry};
+use datalens_edge::{
+    QueryService, QueryServiceRegistry, spawn_durable_intent_terminal_cleanup_once,
+};
 use datalens_evm::{
     DurableEvmBlockHeaderStore, EvmBlockHeaderFetchMode, EvmBlockHeaderMetadataConfig,
     EvmFinalityPolicy, EvmLogReliabilityConfig, EvmRpcClient,
@@ -56,15 +58,29 @@ impl QueryRuntimeStores {
         } else {
             None
         };
+        let storage = Arc::from(build_storage(config)?);
+        let usage_ledger = Arc::from(build_usage_ledger(config)?);
+        let query_watermarks = Arc::from(build_query_watermarks(config)?);
+        let query_activity = Arc::from(build_query_activity(config)?);
+        let durable_intents: Arc<dyn DurablePromotionIntentRepository> =
+            Arc::from(build_durable_intents(config)?);
+        let durable_intent_startup_maintenance = Arc::new(Once::new());
+        if !config.query.durable_intents.enabled {
+            spawn_durable_intent_terminal_cleanup_once(
+                durable_intents.clone(),
+                durable_intent_startup_maintenance.clone(),
+                config.query.durable_intents,
+            );
+        }
         Ok(Self {
-            storage: Arc::from(build_storage(config)?),
-            usage_ledger: Arc::from(build_usage_ledger(config)?),
-            query_watermarks: Arc::from(build_query_watermarks(config)?),
-            query_activity: Arc::from(build_query_activity(config)?),
-            durable_intents: Arc::from(build_durable_intents(config)?),
+            storage,
+            usage_ledger,
+            query_watermarks,
+            query_activity,
+            durable_intents,
             warmup_registry,
             cache_repair_registry,
-            durable_intent_startup_maintenance: Arc::new(Once::new()),
+            durable_intent_startup_maintenance,
         })
     }
 }

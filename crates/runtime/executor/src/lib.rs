@@ -7,5 +7,5 @@ mod hot_promotion;
 mod provider_range;
 mod provider_singleflight;
 
-pub use durable_promotion::DurablePromotionIntentWorkerConfig;
+pub use durable_promotion::{DurablePromotionIntentWorkerConfig, spawn_terminal_cleanup_once};
 pub use execution::*;

@@ -1006,6 +1006,167 @@ fn test_config_allows_disabling_query_durable_intents() {
 }
 
 #[test]
+fn test_config_accepts_query_durable_intent_cleanup_when_workers_disabled() {
+    let config = toml::from_str::<DatalensConfig>(
+        r#"
+        [server]
+        bind = "127.0.0.1:0"
+
+        [storage]
+        backend = "local"
+
+        [storage.local]
+        root = ".tmp/datalens-cli-test"
+
+        [planner]
+        max_query_range_blocks = 100
+        default_chunk_range_blocks = 10
+
+        [writer]
+        target_object_bytes = 1024
+        min_object_rows = 1
+        record_empty_coverage = true
+
+        [query.durable_intents]
+        enabled = false
+        worker_threads = 0
+        claim_batch_size = 0
+        terminal_retention_seconds = 604800
+        cleanup_max_scan = 2048
+        cleanup_max_deletes = 512
+
+        [chains.ethereum]
+        kind = "evm"
+        chain_id = 1
+        rpc_urls = ["http://example.invalid"]
+
+        [chains.ethereum.datasets.blocks]
+        enabled = true
+        max_batch_blocks = 10
+
+        [chains.ethereum.datasets.logs]
+        enabled = true
+        max_get_logs_range_blocks = 10
+        max_addresses_per_query = 2
+        "#,
+    )
+    .expect("config parses");
+
+    assert!(!config.query.durable_intents.enabled);
+    assert_eq!(
+        config.query.durable_intents.terminal_retention_seconds,
+        Some(604800)
+    );
+    assert_eq!(config.query.durable_intents.cleanup_max_scan, 2048);
+    assert_eq!(config.query.durable_intents.cleanup_max_deletes, 512);
+    validate_config(&config).expect("cleanup config is valid");
+}
+
+#[test]
+fn test_config_defaults_query_durable_intent_cleanup_disabled() {
+    let config = toml::from_str::<DatalensConfig>(
+        r#"
+        [server]
+        bind = "127.0.0.1:0"
+
+        [storage]
+        backend = "local"
+
+        [storage.local]
+        root = ".tmp/datalens-cli-test"
+
+        [planner]
+        max_query_range_blocks = 100
+        default_chunk_range_blocks = 10
+
+        [writer]
+        target_object_bytes = 1024
+        min_object_rows = 1
+        record_empty_coverage = true
+
+        [query.durable_intents]
+        enabled = false
+
+        [chains.ethereum]
+        kind = "evm"
+        chain_id = 1
+        rpc_urls = ["http://example.invalid"]
+
+        [chains.ethereum.datasets.blocks]
+        enabled = true
+        max_batch_blocks = 10
+
+        [chains.ethereum.datasets.logs]
+        enabled = true
+        max_get_logs_range_blocks = 10
+        max_addresses_per_query = 2
+        "#,
+    )
+    .expect("config parses");
+
+    assert_eq!(
+        config.query.durable_intents.terminal_retention_seconds,
+        None
+    );
+    assert!(config.query.durable_intents.cleanup_max_scan > 0);
+    assert!(config.query.durable_intents.cleanup_max_deletes > 0);
+    validate_config(&config).expect("default cleanup config is valid");
+}
+
+#[test]
+fn test_validate_config_rejects_zero_query_durable_intent_cleanup_bounds() {
+    for field in ["cleanup_max_scan", "cleanup_max_deletes"] {
+        let config = toml::from_str::<DatalensConfig>(&format!(
+            r#"
+            [server]
+            bind = "127.0.0.1:0"
+
+            [storage]
+            backend = "local"
+
+            [storage.local]
+            root = ".tmp/datalens-cli-test"
+
+            [planner]
+            max_query_range_blocks = 100
+            default_chunk_range_blocks = 10
+
+            [writer]
+            target_object_bytes = 1024
+            min_object_rows = 1
+            record_empty_coverage = true
+
+            [query.durable_intents]
+            enabled = false
+            terminal_retention_seconds = 604800
+            {field} = 0
+
+            [chains.ethereum]
+            kind = "evm"
+            chain_id = 1
+            rpc_urls = ["http://example.invalid"]
+
+            [chains.ethereum.datasets.blocks]
+            enabled = true
+            max_batch_blocks = 10
+
+            [chains.ethereum.datasets.logs]
+            enabled = true
+            max_get_logs_range_blocks = 10
+            max_addresses_per_query = 2
+            "#
+        ))
+        .expect("config parses");
+
+        let error = validate_config(&config).expect_err("zero cleanup bound rejected");
+        assert!(
+            error.message.contains(field),
+            "expected {field} validation error, got {error:?}"
+        );
+    }
+}
+
+#[test]
 fn test_validate_config_rejects_zero_query_metadata_worker_threads() {
     let config = toml::from_str::<DatalensConfig>(
         r#"

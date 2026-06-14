@@ -45,6 +45,9 @@ const DEFAULT_INTENT_STALE_RUNNING_SECONDS: u64 = 300;
 pub struct DurablePromotionIntentWorkerConfig {
     pub worker_threads: usize,
     pub claim_batch_size: usize,
+    pub terminal_retention_seconds: Option<u64>,
+    pub cleanup_max_scan: usize,
+    pub cleanup_max_deletes: usize,
 }
 
 impl Default for DurablePromotionIntentWorkerConfig {
@@ -52,6 +55,9 @@ impl Default for DurablePromotionIntentWorkerConfig {
         Self {
             worker_threads: DEFAULT_INTENT_WORKERS,
             claim_batch_size: DEFAULT_INTENT_CLAIM_BATCH_SIZE,
+            terminal_retention_seconds: None,
+            cleanup_max_scan: 1024,
+            cleanup_max_deletes: 256,
         }
     }
 }
@@ -91,6 +97,9 @@ where
             claim_lock,
             startup_maintenance_once,
             claim_batch_size: config.claim_batch_size,
+            terminal_retention_seconds: config.terminal_retention_seconds,
+            cleanup_max_scan: config.cleanup_max_scan,
+            cleanup_max_deletes: config.cleanup_max_deletes,
         };
         for worker_index in 0..config.worker_threads {
             spawn_intent_worker(
@@ -115,6 +124,9 @@ struct IntentWorkerShared {
     claim_lock: Arc<Mutex<()>>,
     startup_maintenance_once: Arc<Once>,
     claim_batch_size: usize,
+    terminal_retention_seconds: Option<u64>,
+    cleanup_max_scan: usize,
+    cleanup_max_deletes: usize,
 }
 
 #[derive(Debug, Default)]
@@ -433,6 +445,9 @@ where
             spawn_startup_maintenance_once(
                 shared.repository.clone(),
                 shared.startup_maintenance_once.as_ref(),
+                shared.terminal_retention_seconds,
+                shared.cleanup_max_scan,
+                shared.cleanup_max_deletes,
             );
             let mut last_backlog_metric_sample: Option<Instant> = None;
             loop {
@@ -580,11 +595,21 @@ fn run_intent_batch_work<R, A>(
 fn spawn_startup_maintenance_once(
     repository: Arc<dyn DurablePromotionIntentRepository>,
     startup_maintenance_once: &Once,
+    terminal_retention_seconds: Option<u64>,
+    cleanup_max_scan: usize,
+    cleanup_max_deletes: usize,
 ) {
     startup_maintenance_once.call_once(|| {
         if let Err(error) = thread::Builder::new()
             .name("datalens-durable-intent-maintenance".to_owned())
-            .spawn(move || run_startup_maintenance(repository.as_ref()))
+            .spawn(move || {
+                run_startup_maintenance(
+                    repository.as_ref(),
+                    terminal_retention_seconds,
+                    cleanup_max_scan,
+                    cleanup_max_deletes,
+                )
+            })
         {
             log::error!("durable intent startup maintenance spawn failed error={error}");
         }
@@ -1494,7 +1519,12 @@ fn reset_stale_intents(
     Ok(())
 }
 
-fn run_startup_maintenance(repository: &dyn DurablePromotionIntentRepository) {
+fn run_startup_maintenance(
+    repository: &dyn DurablePromotionIntentRepository,
+    terminal_retention_seconds: Option<u64>,
+    cleanup_max_scan: usize,
+    cleanup_max_deletes: usize,
+) {
     let started = Instant::now();
     log::info!("durable intent startup maintenance started");
     match reset_stale_intents(repository) {
@@ -1526,10 +1556,77 @@ fn run_startup_maintenance(repository: &dyn DurablePromotionIntentRepository) {
             );
         }
     }
+    run_terminal_cleanup(
+        repository,
+        terminal_retention_seconds,
+        cleanup_max_scan,
+        cleanup_max_deletes,
+    );
     log::info!(
         "durable intent startup maintenance finished duration_ms={}",
         started.elapsed().as_millis()
     );
+}
+
+pub fn spawn_terminal_cleanup_once(
+    repository: Arc<dyn DurablePromotionIntentRepository>,
+    startup_maintenance_once: Arc<Once>,
+    terminal_retention_seconds: Option<u64>,
+    cleanup_max_scan: usize,
+    cleanup_max_deletes: usize,
+) {
+    if terminal_retention_seconds.is_none() {
+        return;
+    }
+    startup_maintenance_once.call_once(|| {
+        if let Err(error) = thread::Builder::new()
+            .name("datalens-durable-intent-cleanup".to_owned())
+            .spawn(move || {
+                run_terminal_cleanup(
+                    repository.as_ref(),
+                    terminal_retention_seconds,
+                    cleanup_max_scan,
+                    cleanup_max_deletes,
+                )
+            })
+        {
+            log::error!("durable intent terminal cleanup spawn failed error={error}");
+        }
+    });
+}
+
+fn run_terminal_cleanup(
+    repository: &dyn DurablePromotionIntentRepository,
+    terminal_retention_seconds: Option<u64>,
+    cleanup_max_scan: usize,
+    cleanup_max_deletes: usize,
+) {
+    let Some(retention_seconds) = terminal_retention_seconds else {
+        return;
+    };
+    let started = Instant::now();
+    let cutoff = unix_seconds_now().saturating_sub(retention_seconds);
+    match repository.cleanup_terminal(cutoff, cleanup_max_scan, cleanup_max_deletes) {
+        Ok(cleanup) => {
+            log::info!(
+                "durable intent terminal cleanup completed scanned={} deleted={} stale_pending_indexes_deleted={} cutoff_unix_seconds={} duration_ms={}",
+                cleanup.scanned,
+                cleanup.deleted,
+                cleanup.stale_pending_indexes_deleted,
+                cutoff,
+                started.elapsed().as_millis()
+            );
+        }
+        Err(error) => {
+            log::error!(
+                "durable intent terminal cleanup failed kind={:?} message={} cutoff_unix_seconds={} duration_ms={}",
+                error.kind,
+                error.message,
+                cutoff,
+                started.elapsed().as_millis()
+            );
+        }
+    }
 }
 
 fn unix_seconds_now() -> u64 {
@@ -1573,6 +1670,7 @@ mod tests {
         intents: Mutex<Vec<DurablePromotionIntent>>,
         marked_running: Mutex<Vec<String>>,
         marked_terminal: Mutex<Vec<String>>,
+        cleanup_calls: Mutex<Vec<(u64, usize, usize)>>,
         last_limit: AtomicUsize,
     }
 
@@ -1914,6 +2012,51 @@ mod tests {
         ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
             Ok(Vec::new())
         }
+
+        fn cleanup_terminal(
+            &self,
+            retention_cutoff_unix_seconds: u64,
+            max_scan: usize,
+            max_deletes: usize,
+        ) -> Result<datalens_storage::DurablePromotionIntentCleanup, DatalensError> {
+            self.cleanup_calls
+                .lock()
+                .expect("cleanup calls lock")
+                .push((retention_cutoff_unix_seconds, max_scan, max_deletes));
+            Ok(datalens_storage::DurablePromotionIntentCleanup::default())
+        }
+    }
+
+    #[test]
+    fn test_terminal_cleanup_skips_when_retention_disabled() {
+        let repository = sample_repository(Vec::new());
+
+        run_terminal_cleanup(&repository, None, 17, 5);
+
+        assert!(
+            repository
+                .cleanup_calls
+                .lock()
+                .expect("cleanup calls lock")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_terminal_cleanup_uses_retention_cutoff_and_bounds() {
+        let repository = sample_repository(Vec::new());
+        let before = unix_seconds_now();
+
+        run_terminal_cleanup(&repository, Some(60), 17, 5);
+
+        let after = unix_seconds_now();
+        let cleanup_calls = repository.cleanup_calls.lock().expect("cleanup calls lock");
+        assert_eq!(cleanup_calls.len(), 1);
+        let (cutoff, max_scan, max_deletes) = cleanup_calls[0];
+        assert!(cutoff >= before.saturating_sub(60));
+        assert!(cutoff <= after.saturating_sub(60));
+        assert_eq!(max_scan, 17);
+        assert_eq!(max_deletes, 5);
     }
 
     #[test]
@@ -2294,6 +2437,7 @@ mod tests {
             intents: Mutex::new(intents),
             marked_running: Mutex::new(Vec::new()),
             marked_terminal: Mutex::new(Vec::new()),
+            cleanup_calls: Mutex::new(Vec::new()),
             last_limit: AtomicUsize::new(0),
         }
     }

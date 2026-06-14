@@ -31,6 +31,7 @@ pub use service::{
     },
     query_service::{
         NativeCacheSummary, NativeQueryResponse, QueryService, RegisteredWarmupService,
+        spawn_durable_intent_terminal_cleanup_once,
     },
     registry::QueryServiceRegistry,
 };

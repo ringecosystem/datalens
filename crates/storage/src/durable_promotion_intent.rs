@@ -94,6 +94,13 @@ pub struct DurablePromotionIntentBacklog {
     pub oldest_pending_age_seconds: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DurablePromotionIntentCleanup {
+    pub scanned: usize,
+    pub deleted: usize,
+    pub stale_pending_indexes_deleted: usize,
+}
+
 pub trait DurablePromotionIntentRepository: Send + Sync {
     fn create_or_get(
         &self,
@@ -136,6 +143,17 @@ pub trait DurablePromotionIntentRepository: Send + Sync {
         let _ = chain;
         let _ = now_unix_seconds;
         Ok(Vec::new())
+    }
+    fn cleanup_terminal(
+        &self,
+        retention_cutoff_unix_seconds: u64,
+        max_scan: usize,
+        max_deletes: usize,
+    ) -> Result<DurablePromotionIntentCleanup, DatalensError> {
+        let _ = retention_cutoff_unix_seconds;
+        let _ = max_scan;
+        let _ = max_deletes;
+        Ok(DurablePromotionIntentCleanup::default())
     }
     fn mark_running(
         &self,
@@ -219,6 +237,16 @@ impl DurablePromotionIntentRepository for Arc<dyn DurablePromotionIntentReposito
     ) -> Result<Vec<DurablePromotionIntentBacklog>, DatalensError> {
         self.as_ref()
             .pending_backlog_for_chain(chain, now_unix_seconds)
+    }
+
+    fn cleanup_terminal(
+        &self,
+        retention_cutoff_unix_seconds: u64,
+        max_scan: usize,
+        max_deletes: usize,
+    ) -> Result<DurablePromotionIntentCleanup, DatalensError> {
+        self.as_ref()
+            .cleanup_terminal(retention_cutoff_unix_seconds, max_scan, max_deletes)
     }
 
     fn mark_running(
@@ -331,7 +359,31 @@ where
     }
 
     fn delete_pending_index(&self, intent: &DurablePromotionIntent) -> Result<(), DatalensError> {
-        for key in pending_index_keys_for_intent(intent) {
+        self.delete_pending_index_with_count(intent).map(|_| ())
+    }
+
+    fn delete_pending_index_with_count(
+        &self,
+        intent: &DurablePromotionIntent,
+    ) -> Result<usize, DatalensError> {
+        self.delete_pending_index_keys_with_count(pending_index_keys_for_intent(intent))
+    }
+
+    fn delete_stale_pending_index_with_count(
+        &self,
+        intent: &DurablePromotionIntent,
+    ) -> Result<usize, DatalensError> {
+        self.delete_pending_index_keys_with_count(stale_pending_index_keys_for_terminal_intent(
+            intent,
+        ))
+    }
+
+    fn delete_pending_index_keys_with_count(
+        &self,
+        keys: Vec<String>,
+    ) -> Result<usize, DatalensError> {
+        let mut deleted = 0;
+        for key in keys {
             self.object_store.delete(&key).map_err(|error| {
                 DatalensError::new(
                     DatalensErrorKind::StorageWriteFailure,
@@ -341,8 +393,9 @@ where
                     ),
                 )
             })?;
+            deleted += 1;
         }
-        Ok(())
+        Ok(deleted)
     }
 
     fn update_intent(
@@ -736,6 +789,46 @@ where
         Ok(backlog)
     }
 
+    fn cleanup_terminal(
+        &self,
+        retention_cutoff_unix_seconds: u64,
+        max_scan: usize,
+        max_deletes: usize,
+    ) -> Result<DurablePromotionIntentCleanup, DatalensError> {
+        if max_scan == 0 || max_deletes == 0 {
+            return Ok(DurablePromotionIntentCleanup::default());
+        }
+
+        let page = self.object_store.list_page(INTENT_PREFIX, None, max_scan)?;
+        let mut cleanup = DurablePromotionIntentCleanup::default();
+        for object in page.objects {
+            if !object.key.ends_with(".json") {
+                continue;
+            }
+            cleanup.scanned += 1;
+            let intent = self.read_intent_key(&object.key)?;
+            if !intent_is_terminal_cleanup_eligible(&intent, retention_cutoff_unix_seconds) {
+                continue;
+            }
+            cleanup.stale_pending_indexes_deleted +=
+                self.delete_stale_pending_index_with_count(&intent)?;
+            self.object_store.delete(&object.key).map_err(|error| {
+                DatalensError::new(
+                    DatalensErrorKind::StorageWriteFailure,
+                    format!(
+                        "delete durable promotion intent {}: {}",
+                        object.key, error.message
+                    ),
+                )
+            })?;
+            cleanup.deleted += 1;
+            if cleanup.deleted >= max_deletes {
+                break;
+            }
+        }
+        Ok(cleanup)
+    }
+
     fn mark_running(
         &self,
         intent_id: &str,
@@ -931,6 +1024,16 @@ fn intent_object_key(intent_id: &str) -> String {
     format!("{INTENT_PREFIX}/{intent_id}.json")
 }
 
+fn intent_is_terminal_cleanup_eligible(
+    intent: &DurablePromotionIntent,
+    retention_cutoff_unix_seconds: u64,
+) -> bool {
+    matches!(
+        intent.status,
+        DurablePromotionIntentStatus::Completed | DurablePromotionIntentStatus::FailedTerminal
+    ) && intent.updated_at_unix_seconds <= retention_cutoff_unix_seconds
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PendingIndexEntry {
     key: String,
@@ -975,6 +1078,30 @@ fn pending_index_keys_for_intent(intent: &DurablePromotionIntent) -> Vec<String>
             pending_application_index_prefix(&intent.chain, source_key(intent.source)),
             application_key(&intent.application),
             due_at_unix_seconds,
+            intent.intent_id
+        ),
+    ]
+}
+
+fn stale_pending_index_keys_for_terminal_intent(intent: &DurablePromotionIntent) -> Vec<String> {
+    if !matches!(
+        intent.status,
+        DurablePromotionIntentStatus::Completed | DurablePromotionIntentStatus::FailedTerminal
+    ) {
+        return Vec::new();
+    }
+    vec![
+        format!(
+            "{}/created={:019}/intent={}.json",
+            pending_index_prefix(&intent.chain, source_key(intent.source)),
+            intent.created_at_unix_seconds,
+            intent.intent_id
+        ),
+        format!(
+            "{}/application={}/created={:019}/intent={}.json",
+            pending_application_index_prefix(&intent.chain, source_key(intent.source)),
+            application_key(&intent.application),
+            intent.created_at_unix_seconds,
             intent.intent_id
         ),
     ]

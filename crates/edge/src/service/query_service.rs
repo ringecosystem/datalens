@@ -13,7 +13,7 @@ use datalens_chain::{
 use datalens_core::{DatalensError, DatalensErrorKind, DatasetKey, DatasetRows, LedgerRange};
 use datalens_executor::{
     DurablePromotionIntentWorkerConfig, NativeQueryExecutionConfig, NativeQueryExecutor,
-    QueryMetadataWorkerConfig, generate_query_id,
+    QueryMetadataWorkerConfig, generate_query_id, spawn_terminal_cleanup_once,
 };
 use datalens_metrics::{ApplicationIdentity, MetricsRecorder};
 use datalens_planner::{NativePlannerConfig, NativeQueryInput};
@@ -206,6 +206,9 @@ where
             .with_durable_intent_worker_config(DurablePromotionIntentWorkerConfig {
                 worker_threads: durable_intents_config.worker_threads,
                 claim_batch_size: durable_intents_config.claim_batch_size,
+                terminal_retention_seconds: durable_intents_config.terminal_retention_seconds,
+                cleanup_max_scan: durable_intents_config.cleanup_max_scan,
+                cleanup_max_deletes: durable_intents_config.cleanup_max_deletes,
             });
         if let Some(recorder) = recorder.clone() {
             executor = executor.with_metrics(
@@ -513,6 +516,20 @@ where
         }
         Ok(())
     }
+}
+
+pub fn spawn_durable_intent_terminal_cleanup_once(
+    repository: Arc<dyn DurablePromotionIntentRepository>,
+    startup_maintenance_once: Arc<Once>,
+    config: QueryDurableIntentConfig,
+) {
+    spawn_terminal_cleanup_once(
+        repository,
+        startup_maintenance_once,
+        config.terminal_retention_seconds,
+        config.cleanup_max_scan,
+        config.cleanup_max_deletes,
+    );
 }
 
 fn dataset_discovery(capability: &DatasetCapability) -> DatasetDiscovery {
