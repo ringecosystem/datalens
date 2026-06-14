@@ -22,8 +22,8 @@ use datalens_solana::{SolanaAdapter, solana_all_selector};
 use datalens_storage::{
     CreateDurablePromotionIntent, DurablePromotionIntent, DurablePromotionIntentCreateOutcome,
     DurablePromotionIntentRepository, DurablePromotionIntentStatus, LocalObjectStore, LocalStorage,
-    QueryActivity, QueryActivityKey, QueryActivityRepository, QueryActivityStore, QueryWatermark,
-    QueryWatermarkKey, QueryWatermarkRepository, QueryWatermarkStore,
+    ObjectStore, QueryActivity, QueryActivityKey, QueryActivityRepository, QueryActivityStore,
+    QueryWatermark, QueryWatermarkKey, QueryWatermarkRepository, QueryWatermarkStore,
 };
 use datalens_tron::{TronAdapter, tron_all_selector};
 use datalens_warmup::{
@@ -57,6 +57,203 @@ fn test_submit_duplicate_task_returns_existing_task_id() {
         .list(datalens_warmup::WarmupTaskFilter::default())
         .unwrap();
     assert_eq!(tasks.len(), 1);
+}
+
+#[test]
+fn test_warmup_registry_writes_clean_task_and_cursor_paths() {
+    let store = object_store("registry-writes-clean-paths");
+    let registry = LocalWarmupRegistry::new(store.clone());
+
+    let task_id = registry
+        .submit(submit_request(Some(10), WarmupTaskMode::FixedRange))
+        .expect("submit")
+        .task_id;
+
+    assert!(
+        store
+            .exists(&warmup_clean_task_key(&task_id))
+            .expect("clean task exists")
+    );
+    assert!(
+        store
+            .exists(&warmup_clean_cursor_key(&task_id))
+            .expect("clean cursor exists")
+    );
+    assert!(
+        !store
+            .exists(&warmup_legacy_task_key(&task_id))
+            .expect("legacy task missing")
+    );
+    assert!(
+        !store
+            .exists(&warmup_legacy_cursor_key(&task_id))
+            .expect("legacy cursor missing")
+    );
+}
+
+#[test]
+fn test_warmup_registry_reads_and_lists_legacy_task_and_cursor() {
+    let store = object_store("registry-reads-legacy-paths");
+    let registry = LocalWarmupRegistry::new(store.clone());
+    let task_id = move_warmup_task_to_legacy(&store, &registry);
+
+    let task = registry
+        .get(&task_id)
+        .expect("get legacy task")
+        .expect("legacy task");
+    let cursor = registry
+        .load_cursor(&task_id)
+        .expect("load legacy cursor")
+        .expect("legacy cursor");
+    let listed = registry.list(Default::default()).expect("list tasks");
+
+    assert_eq!(task.task_id, task_id);
+    assert_eq!(cursor.task_id, task_id);
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].task_id, task_id);
+}
+
+#[test]
+fn test_warmup_registry_prefers_clean_task_and_cursor_when_legacy_duplicate_exists() {
+    let store = object_store("registry-prefers-clean-paths");
+    let registry = LocalWarmupRegistry::new(store.clone());
+    let task_id = registry
+        .submit(submit_request(Some(10), WarmupTaskMode::FixedRange))
+        .expect("submit")
+        .task_id;
+    copy_warmup_clean_to_legacy(&store, &task_id);
+    mutate_json_object(&store, &warmup_clean_task_key(&task_id), |value| {
+        value["state"] = serde_json::json!("paused");
+    });
+    mutate_json_object(&store, &warmup_clean_cursor_key(&task_id), |value| {
+        value["next"] = serde_json::json!(99);
+    });
+
+    let task = registry
+        .get(&task_id)
+        .expect("get task")
+        .expect("task exists");
+    let cursor = registry
+        .load_cursor(&task_id)
+        .expect("load cursor")
+        .expect("cursor exists");
+    let listed = registry.list(Default::default()).expect("list tasks");
+
+    assert_eq!(task.state, WarmupTaskState::Paused);
+    assert_eq!(cursor.next, 99);
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].state, WarmupTaskState::Paused);
+}
+
+#[test]
+fn test_warmup_registry_mutating_legacy_task_writes_clean_path_without_deleting_legacy() {
+    let store = object_store("registry-mutates-legacy-to-clean");
+    let registry = LocalWarmupRegistry::new(store.clone());
+    let task_id = move_warmup_task_to_legacy(&store, &registry);
+
+    registry.cancel(&task_id).expect("cancel legacy task");
+
+    assert!(
+        store
+            .exists(&warmup_clean_task_key(&task_id))
+            .expect("clean task exists")
+    );
+    assert!(
+        store
+            .exists(&warmup_legacy_task_key(&task_id))
+            .expect("legacy task preserved")
+    );
+    assert_eq!(
+        registry
+            .get(&task_id)
+            .expect("get task")
+            .expect("task exists")
+            .state,
+        WarmupTaskState::Cancelled
+    );
+}
+
+#[test]
+fn test_warmup_registry_migration_copies_legacy_paths_idempotently() {
+    let store = object_store("registry-migrates-legacy-paths");
+    let registry = LocalWarmupRegistry::new(store.clone());
+    let task_id = move_warmup_task_to_legacy(&store, &registry);
+
+    let first = registry
+        .migrate_legacy_paths()
+        .expect("first migration succeeds");
+    let second = registry
+        .migrate_legacy_paths()
+        .expect("second migration succeeds");
+
+    assert_eq!(first.tasks.copied, 1);
+    assert_eq!(first.tasks.skipped, 0);
+    assert_eq!(first.tasks.conflicts, 0);
+    assert_eq!(first.tasks.failed, 0);
+    assert_eq!(first.cursors.copied, 1);
+    assert_eq!(first.cursors.skipped, 0);
+    assert_eq!(first.cursors.conflicts, 0);
+    assert_eq!(first.cursors.failed, 0);
+    assert_eq!(second.tasks.copied, 0);
+    assert_eq!(second.tasks.skipped, 1);
+    assert_eq!(second.tasks.conflicts, 0);
+    assert_eq!(second.tasks.failed, 0);
+    assert_eq!(second.cursors.copied, 0);
+    assert_eq!(second.cursors.skipped, 1);
+    assert_eq!(second.cursors.conflicts, 0);
+    assert_eq!(second.cursors.failed, 0);
+    assert!(
+        store
+            .exists(&warmup_clean_task_key(&task_id))
+            .expect("clean task exists")
+    );
+    assert!(
+        store
+            .exists(&warmup_clean_cursor_key(&task_id))
+            .expect("clean cursor exists")
+    );
+    assert!(
+        store
+            .exists(&warmup_legacy_task_key(&task_id))
+            .expect("legacy task preserved")
+    );
+    assert!(
+        store
+            .exists(&warmup_legacy_cursor_key(&task_id))
+            .expect("legacy cursor preserved")
+    );
+}
+
+#[test]
+fn test_warmup_registry_migration_reports_conflict_without_overwriting_clean_object() {
+    let store = object_store("registry-migration-conflict");
+    let registry = LocalWarmupRegistry::new(store.clone());
+    let task_id = move_warmup_task_to_legacy(&store, &registry);
+    let clean_key = warmup_clean_task_key(&task_id);
+    let clean_bytes = br#"{"existing":"clean"}"#;
+    store
+        .put(&clean_key, clean_bytes)
+        .expect("write clean object");
+
+    let report = registry
+        .migrate_legacy_paths()
+        .expect("migration reports conflict");
+
+    assert_eq!(report.tasks.copied, 0);
+    assert_eq!(report.tasks.skipped, 0);
+    assert_eq!(report.tasks.conflicts, 1);
+    assert_eq!(report.tasks.failed, 0);
+    assert_eq!(report.cursors.copied, 1);
+    assert_eq!(report.cursors.conflicts, 0);
+    assert_eq!(
+        store.get(&clean_key).expect("read clean object"),
+        clean_bytes
+    );
+    assert!(
+        store
+            .exists(&warmup_legacy_task_key(&task_id))
+            .expect("legacy task preserved")
+    );
 }
 
 #[test]
@@ -2069,6 +2266,84 @@ fn now_unix_seconds() -> u64 {
 
 fn object_store(name: &str) -> LocalObjectStore {
     LocalObjectStore::new(temp_root(name))
+}
+
+fn move_warmup_task_to_legacy(
+    store: &LocalObjectStore,
+    registry: &LocalWarmupRegistry<LocalObjectStore>,
+) -> datalens_warmup::WarmupTaskId {
+    let task_id = registry
+        .submit(submit_request(Some(10), WarmupTaskMode::FixedRange))
+        .expect("submit")
+        .task_id;
+    copy_warmup_clean_to_legacy(store, &task_id);
+    delete_if_distinct(
+        store,
+        &warmup_clean_task_key(&task_id),
+        &warmup_legacy_task_key(&task_id),
+    );
+    delete_if_distinct(
+        store,
+        &warmup_clean_cursor_key(&task_id),
+        &warmup_legacy_cursor_key(&task_id),
+    );
+    task_id
+}
+
+fn copy_warmup_clean_to_legacy(store: &LocalObjectStore, task_id: &datalens_warmup::WarmupTaskId) {
+    copy_existing_object(
+        store,
+        &warmup_clean_task_key(task_id),
+        &warmup_legacy_task_key(task_id),
+    );
+    copy_existing_object(
+        store,
+        &warmup_clean_cursor_key(task_id),
+        &warmup_legacy_cursor_key(task_id),
+    );
+}
+
+fn copy_existing_object(store: &LocalObjectStore, clean_key: &str, legacy_key: &str) {
+    let source_key = if store.exists(clean_key).expect("check clean source") {
+        clean_key
+    } else {
+        legacy_key
+    };
+    let bytes = store.get(source_key).expect("read object source");
+    store.put(legacy_key, &bytes).expect("write legacy object");
+}
+
+fn delete_if_distinct(store: &LocalObjectStore, key: &str, other_key: &str) {
+    if key != other_key {
+        store.delete(key).expect("delete object");
+    }
+}
+
+fn mutate_json_object<F>(store: &LocalObjectStore, key: &str, mutate: F)
+where
+    F: FnOnce(&mut serde_json::Value),
+{
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&store.get(key).expect("read json object")).expect("decode json");
+    mutate(&mut value);
+    let bytes = serde_json::to_vec_pretty(&value).expect("encode json");
+    store.put(key, &bytes).expect("write json object");
+}
+
+fn warmup_clean_task_key(task_id: &datalens_warmup::WarmupTaskId) -> String {
+    format!("tasks/{}.json", task_id.as_str())
+}
+
+fn warmup_legacy_task_key(task_id: &datalens_warmup::WarmupTaskId) -> String {
+    format!("warmup/tasks/{}.json", task_id.as_str())
+}
+
+fn warmup_clean_cursor_key(task_id: &datalens_warmup::WarmupTaskId) -> String {
+    format!("cursors/{}.json", task_id.as_str())
+}
+
+fn warmup_legacy_cursor_key(task_id: &datalens_warmup::WarmupTaskId) -> String {
+    format!("warmup/cursors/{}.json", task_id.as_str())
 }
 
 fn temp_root(name: &str) -> PathBuf {

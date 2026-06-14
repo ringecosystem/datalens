@@ -9,7 +9,9 @@ mod task;
 
 pub use cursor::{WarmupCheckpoint, WarmupCursor};
 pub use registry::{
-    LocalWarmupRegistry, WarmupEnsureOutcome, WarmupRegistry, WarmupSubmitOutcome, WarmupTaskFilter,
+    LocalWarmupRegistry, RegistryMigrationFailure, RegistryMigrationReport,
+    RegistryMigrationSectionReport, WarmupEnsureOutcome, WarmupRegistry, WarmupSubmitOutcome,
+    WarmupTaskFilter,
 };
 pub use runtime::{
     WarmupRunResult, WarmupRunStatus, WarmupRuntime, WarmupRuntimeConfig, WarmupSchedulerConfig,

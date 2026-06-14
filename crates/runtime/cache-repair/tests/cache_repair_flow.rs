@@ -23,7 +23,7 @@ use datalens_core::{
     LedgerRange, LedgerRangeKind, LogFilter, LogRecord, NetworkId, QueryRows,
 };
 use datalens_storage::{
-    LocalObjectStore, LocalStorage, Manifest, StorageRepository, StorageWriteOutcome,
+    LocalObjectStore, LocalStorage, Manifest, ObjectStore, StorageRepository, StorageWriteOutcome,
     StorageWriteRequest,
 };
 
@@ -83,6 +83,160 @@ fn test_cache_repair_replaces_bad_empty_coverage_with_provider_rows() {
             .covered_ranges(&chain, &DatasetKey::evm_logs(), &selector, bad_range)
             .expect("covered ranges"),
         vec![LedgerRange::blocks(10, 12).expect("valid range")]
+    );
+}
+
+#[test]
+fn test_cache_repair_registry_writes_clean_task_path() {
+    let store = LocalObjectStore::new(temp_root("registry-writes-clean-path"));
+    let registry = LocalCacheRepairRegistry::new(store.clone());
+
+    let task_id = registry
+        .submit(submit_request(test_chain(), selector()))
+        .expect("submit")
+        .task_id;
+
+    assert!(
+        store
+            .exists(&cache_repair_clean_task_key(&task_id))
+            .expect("clean task exists")
+    );
+    assert!(
+        !store
+            .exists(&cache_repair_legacy_task_key(&task_id))
+            .expect("legacy task missing")
+    );
+}
+
+#[test]
+fn test_cache_repair_registry_reads_and_lists_legacy_task() {
+    let store = LocalObjectStore::new(temp_root("registry-reads-legacy-path"));
+    let registry = LocalCacheRepairRegistry::new(store.clone());
+    let task_id = move_cache_repair_task_to_legacy(&store, &registry);
+
+    let task = registry
+        .get(&task_id)
+        .expect("get legacy task")
+        .expect("legacy task");
+    let listed = registry.list(Default::default()).expect("list tasks");
+
+    assert_eq!(task.task_id, task_id);
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].task_id, task_id);
+}
+
+#[test]
+fn test_cache_repair_registry_prefers_clean_task_when_legacy_duplicate_exists() {
+    let store = LocalObjectStore::new(temp_root("registry-prefers-clean-path"));
+    let registry = LocalCacheRepairRegistry::new(store.clone());
+    let task_id = registry
+        .submit(submit_request(test_chain(), selector()))
+        .expect("submit")
+        .task_id;
+    copy_cache_repair_clean_to_legacy(&store, &task_id);
+    mutate_json_object(&store, &cache_repair_clean_task_key(&task_id), |value| {
+        value["state"] = serde_json::json!("cancelled");
+    });
+
+    let task = registry
+        .get(&task_id)
+        .expect("get task")
+        .expect("task exists");
+    let listed = registry.list(Default::default()).expect("list tasks");
+
+    assert_eq!(task.state, CacheRepairTaskState::Cancelled);
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].state, CacheRepairTaskState::Cancelled);
+}
+
+#[test]
+fn test_cache_repair_registry_mutating_legacy_task_writes_clean_path_without_deleting_legacy() {
+    let store = LocalObjectStore::new(temp_root("registry-mutates-legacy-to-clean"));
+    let registry = LocalCacheRepairRegistry::new(store.clone());
+    let task_id = move_cache_repair_task_to_legacy(&store, &registry);
+
+    registry.cancel(&task_id).expect("cancel legacy task");
+
+    assert!(
+        store
+            .exists(&cache_repair_clean_task_key(&task_id))
+            .expect("clean task exists")
+    );
+    assert!(
+        store
+            .exists(&cache_repair_legacy_task_key(&task_id))
+            .expect("legacy task preserved")
+    );
+    assert_eq!(
+        registry
+            .get(&task_id)
+            .expect("get task")
+            .expect("task exists")
+            .state,
+        CacheRepairTaskState::Cancelled
+    );
+}
+
+#[test]
+fn test_cache_repair_registry_migration_copies_legacy_paths_idempotently() {
+    let store = LocalObjectStore::new(temp_root("registry-migrates-legacy-path"));
+    let registry = LocalCacheRepairRegistry::new(store.clone());
+    let task_id = move_cache_repair_task_to_legacy(&store, &registry);
+
+    let first = registry
+        .migrate_legacy_paths()
+        .expect("first migration succeeds");
+    let second = registry
+        .migrate_legacy_paths()
+        .expect("second migration succeeds");
+
+    assert_eq!(first.tasks.copied, 1);
+    assert_eq!(first.tasks.skipped, 0);
+    assert_eq!(first.tasks.conflicts, 0);
+    assert_eq!(first.tasks.failed, 0);
+    assert_eq!(second.tasks.copied, 0);
+    assert_eq!(second.tasks.skipped, 1);
+    assert_eq!(second.tasks.conflicts, 0);
+    assert_eq!(second.tasks.failed, 0);
+    assert!(
+        store
+            .exists(&cache_repair_clean_task_key(&task_id))
+            .expect("clean task exists")
+    );
+    assert!(
+        store
+            .exists(&cache_repair_legacy_task_key(&task_id))
+            .expect("legacy task preserved")
+    );
+}
+
+#[test]
+fn test_cache_repair_registry_migration_reports_conflict_without_overwriting_clean_object() {
+    let store = LocalObjectStore::new(temp_root("registry-migration-conflict"));
+    let registry = LocalCacheRepairRegistry::new(store.clone());
+    let task_id = move_cache_repair_task_to_legacy(&store, &registry);
+    let clean_key = cache_repair_clean_task_key(&task_id);
+    let clean_bytes = br#"{"existing":"clean"}"#;
+    store
+        .put(&clean_key, clean_bytes)
+        .expect("write clean object");
+
+    let report = registry
+        .migrate_legacy_paths()
+        .expect("migration reports conflict");
+
+    assert_eq!(report.tasks.copied, 0);
+    assert_eq!(report.tasks.skipped, 0);
+    assert_eq!(report.tasks.conflicts, 1);
+    assert_eq!(report.tasks.failed, 0);
+    assert_eq!(
+        store.get(&clean_key).expect("read clean object"),
+        clean_bytes
+    );
+    assert!(
+        store
+            .exists(&cache_repair_legacy_task_key(&task_id))
+            .expect("legacy task preserved")
     );
 }
 
@@ -928,4 +1082,67 @@ fn temp_root(name: &str) -> PathBuf {
     ));
     let _ = std::fs::remove_dir_all(&root);
     root
+}
+
+fn move_cache_repair_task_to_legacy(
+    store: &LocalObjectStore,
+    registry: &LocalCacheRepairRegistry<LocalObjectStore>,
+) -> datalens_cache_repair::CacheRepairTaskId {
+    let task_id = registry
+        .submit(submit_request(test_chain(), selector()))
+        .expect("submit")
+        .task_id;
+    copy_cache_repair_clean_to_legacy(store, &task_id);
+    delete_if_distinct(
+        store,
+        &cache_repair_clean_task_key(&task_id),
+        &cache_repair_legacy_task_key(&task_id),
+    );
+    task_id
+}
+
+fn copy_cache_repair_clean_to_legacy(
+    store: &LocalObjectStore,
+    task_id: &datalens_cache_repair::CacheRepairTaskId,
+) {
+    copy_existing_object(
+        store,
+        &cache_repair_clean_task_key(task_id),
+        &cache_repair_legacy_task_key(task_id),
+    );
+}
+
+fn copy_existing_object(store: &LocalObjectStore, clean_key: &str, legacy_key: &str) {
+    let source_key = if store.exists(clean_key).expect("check clean source") {
+        clean_key
+    } else {
+        legacy_key
+    };
+    let bytes = store.get(source_key).expect("read object source");
+    store.put(legacy_key, &bytes).expect("write legacy object");
+}
+
+fn delete_if_distinct(store: &LocalObjectStore, key: &str, other_key: &str) {
+    if key != other_key {
+        store.delete(key).expect("delete object");
+    }
+}
+
+fn mutate_json_object<F>(store: &LocalObjectStore, key: &str, mutate: F)
+where
+    F: FnOnce(&mut serde_json::Value),
+{
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&store.get(key).expect("read json object")).expect("decode json");
+    mutate(&mut value);
+    let bytes = serde_json::to_vec_pretty(&value).expect("encode json");
+    store.put(key, &bytes).expect("write json object");
+}
+
+fn cache_repair_clean_task_key(task_id: &datalens_cache_repair::CacheRepairTaskId) -> String {
+    format!("tasks/{}.json", task_id.as_str())
+}
+
+fn cache_repair_legacy_task_key(task_id: &datalens_cache_repair::CacheRepairTaskId) -> String {
+    format!("cache-repair/tasks/{}.json", task_id.as_str())
 }
