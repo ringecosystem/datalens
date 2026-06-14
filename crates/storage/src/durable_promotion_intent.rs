@@ -13,6 +13,8 @@ use std::{
 use crate::object_store::ObjectStore;
 
 const INTENT_PREFIX: &str = "durable-promotion-intents/v1/intents";
+const TERMINAL_CLEANUP_CURSOR_KEY: &str =
+    "durable-promotion-intents/v1/metadata/terminal-cleanup-cursor.json";
 const PENDING_INDEX_PREFIX: &str = "durable-promotion-intents/v1/index/status=pending";
 const PENDING_APPLICATION_INDEX_PREFIX: &str =
     "durable-promotion-intents/v1/index/status=pending-by-application";
@@ -99,6 +101,12 @@ pub struct DurablePromotionIntentCleanup {
     pub scanned: usize,
     pub deleted: usize,
     pub stale_pending_indexes_deleted: usize,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+struct DurablePromotionIntentCleanupCursor {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    start_after: Option<String>,
 }
 
 pub trait DurablePromotionIntentRepository: Send + Sync {
@@ -325,6 +333,61 @@ where
                 format!("decode durable promotion intent {key}: {error}"),
             )
         })
+    }
+
+    fn read_terminal_cleanup_cursor(&self) -> Result<Option<String>, DatalensError> {
+        if !self.object_store.exists(TERMINAL_CLEANUP_CURSOR_KEY)? {
+            return Ok(None);
+        }
+        let bytes = self.object_store.get(TERMINAL_CLEANUP_CURSOR_KEY)?;
+        let cursor: DurablePromotionIntentCleanupCursor =
+            serde_json::from_slice(&bytes).map_err(|error| {
+                DatalensError::new(
+                    DatalensErrorKind::StorageReadFailure,
+                    format!("decode durable promotion intent cleanup cursor: {error}"),
+                )
+            })?;
+        Ok(cursor.start_after)
+    }
+
+    fn write_terminal_cleanup_cursor(
+        &self,
+        start_after: Option<String>,
+    ) -> Result<(), DatalensError> {
+        let Some(start_after) = start_after else {
+            return self
+                .object_store
+                .delete(TERMINAL_CLEANUP_CURSOR_KEY)
+                .map_err(|error| {
+                    DatalensError::new(
+                        DatalensErrorKind::StorageWriteFailure,
+                        format!(
+                            "delete durable promotion intent cleanup cursor: {}",
+                            error.message
+                        ),
+                    )
+                });
+        };
+        let cursor = DurablePromotionIntentCleanupCursor {
+            start_after: Some(start_after),
+        };
+        let bytes = serde_json::to_vec_pretty(&cursor).map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::Internal,
+                format!("encode durable promotion intent cleanup cursor: {error}"),
+            )
+        })?;
+        self.object_store
+            .put(TERMINAL_CLEANUP_CURSOR_KEY, &bytes)
+            .map_err(|error| {
+                DatalensError::new(
+                    DatalensErrorKind::StorageWriteFailure,
+                    format!(
+                        "write durable promotion intent cleanup cursor: {}",
+                        error.message
+                    ),
+                )
+            })
     }
 
     fn write_intent(&self, intent: &DurablePromotionIntent) -> Result<(), DatalensError> {
@@ -799,13 +862,21 @@ where
             return Ok(DurablePromotionIntentCleanup::default());
         }
 
-        let page = self.object_store.list_page(INTENT_PREFIX, None, max_scan)?;
+        let cursor = self.read_terminal_cleanup_cursor()?;
+        let page = self
+            .object_store
+            .list_page(INTENT_PREFIX, cursor.as_deref(), max_scan)?;
         let mut cleanup = DurablePromotionIntentCleanup::default();
+        let mut last_scanned_key = None;
+        let object_count = page.objects.len();
+        let mut processed_count = 0;
         for object in page.objects {
+            processed_count += 1;
+            last_scanned_key = Some(object.key.clone());
+            cleanup.scanned += 1;
             if !object.key.ends_with(".json") {
                 continue;
             }
-            cleanup.scanned += 1;
             let intent = self.read_intent_key(&object.key)?;
             if !intent_is_terminal_cleanup_eligible(&intent, retention_cutoff_unix_seconds) {
                 continue;
@@ -825,6 +896,11 @@ where
             if cleanup.deleted >= max_deletes {
                 break;
             }
+        }
+        if page.has_more || processed_count < object_count {
+            self.write_terminal_cleanup_cursor(last_scanned_key)?;
+        } else {
+            self.write_terminal_cleanup_cursor(None)?;
         }
         Ok(cleanup)
     }

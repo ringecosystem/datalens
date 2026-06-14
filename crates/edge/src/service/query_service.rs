@@ -1,6 +1,6 @@
 use std::{
     sync::{Arc, Once},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use datalens_cache_repair::{
@@ -209,6 +209,9 @@ where
                 terminal_retention_seconds: durable_intents_config.terminal_retention_seconds,
                 cleanup_max_scan: durable_intents_config.cleanup_max_scan,
                 cleanup_max_deletes: durable_intents_config.cleanup_max_deletes,
+                cleanup_interval: Duration::from_secs(
+                    durable_intents_config.cleanup_interval_seconds,
+                ),
             });
         if let Some(recorder) = recorder.clone() {
             executor = executor.with_metrics(
@@ -529,6 +532,7 @@ pub fn spawn_durable_intent_terminal_cleanup_once(
         config.terminal_retention_seconds,
         config.cleanup_max_scan,
         config.cleanup_max_deletes,
+        Duration::from_secs(config.cleanup_interval_seconds),
     );
 }
 

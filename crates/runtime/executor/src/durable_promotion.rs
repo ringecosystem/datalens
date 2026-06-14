@@ -40,6 +40,7 @@ const DEFAULT_INTENT_RETRY_BASE_DELAY_SECONDS: u64 = 60;
 const DEFAULT_INTENT_RETRY_MAX_DELAY_SECONDS: u64 = 3600;
 const DEFAULT_INTENT_RETRY_MAX_JITTER_SECONDS: u64 = 60;
 const DEFAULT_INTENT_STALE_RUNNING_SECONDS: u64 = 300;
+const DEFAULT_INTENT_CLEANUP_INTERVAL: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DurablePromotionIntentWorkerConfig {
@@ -48,6 +49,7 @@ pub struct DurablePromotionIntentWorkerConfig {
     pub terminal_retention_seconds: Option<u64>,
     pub cleanup_max_scan: usize,
     pub cleanup_max_deletes: usize,
+    pub cleanup_interval: Duration,
 }
 
 impl Default for DurablePromotionIntentWorkerConfig {
@@ -58,6 +60,7 @@ impl Default for DurablePromotionIntentWorkerConfig {
             terminal_retention_seconds: None,
             cleanup_max_scan: 1024,
             cleanup_max_deletes: 256,
+            cleanup_interval: DEFAULT_INTENT_CLEANUP_INTERVAL,
         }
     }
 }
@@ -100,6 +103,7 @@ where
             terminal_retention_seconds: config.terminal_retention_seconds,
             cleanup_max_scan: config.cleanup_max_scan,
             cleanup_max_deletes: config.cleanup_max_deletes,
+            cleanup_interval: config.cleanup_interval,
         };
         for worker_index in 0..config.worker_threads {
             spawn_intent_worker(
@@ -127,6 +131,7 @@ struct IntentWorkerShared {
     terminal_retention_seconds: Option<u64>,
     cleanup_max_scan: usize,
     cleanup_max_deletes: usize,
+    cleanup_interval: Duration,
 }
 
 #[derive(Debug, Default)]
@@ -448,6 +453,7 @@ where
                 shared.terminal_retention_seconds,
                 shared.cleanup_max_scan,
                 shared.cleanup_max_deletes,
+                shared.cleanup_interval,
             );
             let mut last_backlog_metric_sample: Option<Instant> = None;
             loop {
@@ -598,6 +604,7 @@ fn spawn_startup_maintenance_once(
     terminal_retention_seconds: Option<u64>,
     cleanup_max_scan: usize,
     cleanup_max_deletes: usize,
+    cleanup_interval: Duration,
 ) {
     startup_maintenance_once.call_once(|| {
         if let Err(error) = thread::Builder::new()
@@ -608,7 +615,14 @@ fn spawn_startup_maintenance_once(
                     terminal_retention_seconds,
                     cleanup_max_scan,
                     cleanup_max_deletes,
-                )
+                );
+                run_terminal_cleanup_periodically(
+                    repository.as_ref(),
+                    terminal_retention_seconds,
+                    cleanup_max_scan,
+                    cleanup_max_deletes,
+                    cleanup_interval,
+                );
             })
         {
             log::error!("durable intent startup maintenance spawn failed error={error}");
@@ -1574,6 +1588,7 @@ pub fn spawn_terminal_cleanup_once(
     terminal_retention_seconds: Option<u64>,
     cleanup_max_scan: usize,
     cleanup_max_deletes: usize,
+    cleanup_interval: Duration,
 ) {
     if terminal_retention_seconds.is_none() {
         return;
@@ -1587,12 +1602,45 @@ pub fn spawn_terminal_cleanup_once(
                     terminal_retention_seconds,
                     cleanup_max_scan,
                     cleanup_max_deletes,
-                )
+                );
+                run_terminal_cleanup_periodically(
+                    repository.as_ref(),
+                    terminal_retention_seconds,
+                    cleanup_max_scan,
+                    cleanup_max_deletes,
+                    cleanup_interval,
+                );
             })
         {
             log::error!("durable intent terminal cleanup spawn failed error={error}");
         }
     });
+}
+
+fn run_terminal_cleanup_periodically(
+    repository: &dyn DurablePromotionIntentRepository,
+    terminal_retention_seconds: Option<u64>,
+    cleanup_max_scan: usize,
+    cleanup_max_deletes: usize,
+    cleanup_interval: Duration,
+) {
+    if terminal_retention_seconds.is_none() {
+        return;
+    }
+    let cleanup_interval = if cleanup_interval.is_zero() {
+        DEFAULT_INTENT_CLEANUP_INTERVAL
+    } else {
+        cleanup_interval
+    };
+    loop {
+        thread::sleep(cleanup_interval);
+        run_terminal_cleanup(
+            repository,
+            terminal_retention_seconds,
+            cleanup_max_scan,
+            cleanup_max_deletes,
+        );
+    }
 }
 
 fn run_terminal_cleanup(
@@ -2057,6 +2105,38 @@ mod tests {
         assert!(cutoff <= after.saturating_sub(60));
         assert_eq!(max_scan, 17);
         assert_eq!(max_deletes, 5);
+    }
+
+    #[test]
+    fn test_terminal_cleanup_once_runs_periodically() {
+        let repository = Arc::new(sample_repository(Vec::new()));
+        let worker_repository: Arc<dyn DurablePromotionIntentRepository> = repository.clone();
+        spawn_terminal_cleanup_once(
+            worker_repository,
+            Arc::new(Once::new()),
+            Some(60),
+            17,
+            5,
+            Duration::from_millis(50),
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if repository
+                .cleanup_calls
+                .lock()
+                .expect("cleanup calls lock")
+                .len()
+                >= 2
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "periodic terminal cleanup did not run twice"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]

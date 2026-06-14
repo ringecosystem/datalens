@@ -1034,6 +1034,7 @@ fn test_config_accepts_query_durable_intent_cleanup_when_workers_disabled() {
         terminal_retention_seconds = 604800
         cleanup_max_scan = 2048
         cleanup_max_deletes = 512
+        cleanup_interval_seconds = 60
 
         [chains.ethereum]
         kind = "evm"
@@ -1059,6 +1060,7 @@ fn test_config_accepts_query_durable_intent_cleanup_when_workers_disabled() {
     );
     assert_eq!(config.query.durable_intents.cleanup_max_scan, 2048);
     assert_eq!(config.query.durable_intents.cleanup_max_deletes, 512);
+    assert_eq!(config.query.durable_intents.cleanup_interval_seconds, 60);
     validate_config(&config).expect("cleanup config is valid");
 }
 
@@ -1110,12 +1112,17 @@ fn test_config_defaults_query_durable_intent_cleanup_disabled() {
     );
     assert!(config.query.durable_intents.cleanup_max_scan > 0);
     assert!(config.query.durable_intents.cleanup_max_deletes > 0);
+    assert!(config.query.durable_intents.cleanup_interval_seconds > 0);
     validate_config(&config).expect("default cleanup config is valid");
 }
 
 #[test]
 fn test_validate_config_rejects_zero_query_durable_intent_cleanup_bounds() {
-    for field in ["cleanup_max_scan", "cleanup_max_deletes"] {
+    for field in [
+        "cleanup_max_scan",
+        "cleanup_max_deletes",
+        "cleanup_interval_seconds",
+    ] {
         let config = toml::from_str::<DatalensConfig>(&format!(
             r#"
             [server]

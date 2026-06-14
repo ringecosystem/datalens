@@ -1263,6 +1263,70 @@ fn test_cleanup_terminal_is_bounded_and_idempotent() {
 }
 
 #[test]
+fn test_cleanup_terminal_cursor_advances_past_noneligible_objects() {
+    let root = temp_storage_root("cleanup-cursor-progress");
+    let object_store = LocalObjectStore::new(root);
+    let store = DurablePromotionIntentStore::new(object_store.clone());
+    let active = test_intent_record("active-intent", DurablePromotionIntentStatus::Pending, 100);
+    let terminal = test_intent_record(
+        "terminal-intent",
+        DurablePromotionIntentStatus::Completed,
+        100,
+    );
+    write_intent_record(&object_store, &active);
+    write_intent_record(&object_store, &terminal);
+
+    let first = store
+        .cleanup_terminal(200, 1, 10)
+        .expect("first cleanup terminal");
+    assert_eq!(first.scanned, 1);
+    assert_eq!(first.deleted, 0);
+    assert_eq!(
+        terminal_cleanup_cursor(&object_store),
+        Some("durable-promotion-intents/v1/intents/active-intent.json".to_owned())
+    );
+
+    let second = store
+        .cleanup_terminal(200, 1, 10)
+        .expect("second cleanup terminal");
+    assert_eq!(second.scanned, 1);
+    assert_eq!(second.deleted, 1);
+    assert!(
+        !object_store
+            .exists("durable-promotion-intents/v1/intents/terminal-intent.json")
+            .expect("terminal exists check")
+    );
+}
+
+#[test]
+fn test_cleanup_terminal_cursor_wraps_at_end_of_prefix() {
+    let root = temp_storage_root("cleanup-cursor-wrap");
+    let object_store = LocalObjectStore::new(root);
+    let store = DurablePromotionIntentStore::new(object_store.clone());
+    let first = test_intent_record("active-a", DurablePromotionIntentStatus::Pending, 100);
+    let second = test_intent_record("active-b", DurablePromotionIntentStatus::Running, 100);
+    write_intent_record(&object_store, &first);
+    write_intent_record(&object_store, &second);
+
+    store
+        .cleanup_terminal(200, 1, 10)
+        .expect("first cleanup terminal");
+    assert_eq!(
+        terminal_cleanup_cursor(&object_store),
+        Some("durable-promotion-intents/v1/intents/active-a.json".to_owned())
+    );
+
+    store
+        .cleanup_terminal(200, 1, 10)
+        .expect("second cleanup terminal");
+
+    assert!(
+        terminal_cleanup_cursor(&object_store).is_none(),
+        "cursor should wrap to the start after the final page"
+    );
+}
+
+#[test]
 fn test_cleanup_terminal_removes_stale_pending_indexes_for_deleted_terminal_intent() {
     let root = temp_storage_root("cleanup-stale-terminal-index");
     let object_store = LocalObjectStore::new(root);
@@ -1518,6 +1582,63 @@ fn application_pending_index_keys(
         .into_iter()
         .map(|object| object.key)
         .collect()
+}
+
+fn terminal_cleanup_cursor(object_store: &LocalObjectStore) -> Option<String> {
+    let key = "durable-promotion-intents/v1/metadata/terminal-cleanup-cursor.json";
+    if !object_store.exists(key).expect("cursor exists check") {
+        return None;
+    }
+    let bytes = object_store.get(key).expect("read cleanup cursor");
+    let value: serde_json::Value = serde_json::from_slice(&bytes).expect("decode cleanup cursor");
+    value
+        .get("start_after")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned)
+}
+
+fn write_intent_record(
+    object_store: &LocalObjectStore,
+    intent: &datalens_storage::DurablePromotionIntent,
+) {
+    let bytes = serde_json::to_vec_pretty(intent).expect("encode intent");
+    object_store
+        .put(
+            &format!(
+                "durable-promotion-intents/v1/intents/{}.json",
+                intent.intent_id
+            ),
+            &bytes,
+        )
+        .expect("write intent");
+}
+
+fn test_intent_record(
+    intent_id: &str,
+    status: DurablePromotionIntentStatus,
+    updated_at_unix_seconds: u64,
+) -> datalens_storage::DurablePromotionIntent {
+    datalens_storage::DurablePromotionIntent {
+        intent_id: intent_id.to_owned(),
+        dedupe_key: format!("dedupe-{intent_id}"),
+        source: DurablePromotionIntentSource::Query,
+        application: "analytics-api".to_owned(),
+        chain: test_chain(),
+        dataset_key: DatasetKey::evm_blocks(),
+        selector: DatasetSelector::all(),
+        selector_fingerprint: "all".to_owned(),
+        selector_canonical_key: "all".to_owned(),
+        finality: "safe".to_owned(),
+        ranges: vec![LedgerRange::blocks(10, 11).expect("valid range")],
+        status,
+        attempt_count: 0,
+        next_retry_at_unix_seconds: None,
+        created_at_unix_seconds: 100,
+        updated_at_unix_seconds,
+        last_error: None,
+        request_id: None,
+        task_id: None,
+    }
 }
 
 fn test_chain() -> ChainIdentity {

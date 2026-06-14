@@ -254,6 +254,8 @@ pub struct QueryDurableIntentConfig {
     pub cleanup_max_scan: usize,
     #[serde(default = "default_query_durable_intent_cleanup_max_deletes")]
     pub cleanup_max_deletes: usize,
+    #[serde(default = "default_query_durable_intent_cleanup_interval_seconds")]
+    pub cleanup_interval_seconds: u64,
 }
 
 impl Default for QueryDurableIntentConfig {
@@ -265,6 +267,7 @@ impl Default for QueryDurableIntentConfig {
             terminal_retention_seconds: None,
             cleanup_max_scan: default_query_durable_intent_cleanup_max_scan(),
             cleanup_max_deletes: default_query_durable_intent_cleanup_max_deletes(),
+            cleanup_interval_seconds: default_query_durable_intent_cleanup_interval_seconds(),
         }
     }
 }
@@ -528,6 +531,10 @@ fn default_query_durable_intent_cleanup_max_scan() -> usize {
 
 fn default_query_durable_intent_cleanup_max_deletes() -> usize {
     256
+}
+
+fn default_query_durable_intent_cleanup_interval_seconds() -> u64 {
+    300
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
