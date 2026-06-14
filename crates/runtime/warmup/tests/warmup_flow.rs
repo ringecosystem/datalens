@@ -6,8 +6,9 @@ use std::{
 };
 
 use datalens_chain::{
-    AdapterCapabilities, ChainAdapter, ChainFetchRequest, ChainFetchResponse, ChainHeight,
-    DatasetCapability, DatasetSelector, FinalityLevel, ProviderDiagnostics, SelectorKind,
+    AdapterCapabilities, AdapterKey, ChainAdapter, ChainFetchRequest, ChainFetchResponse,
+    ChainHeight, DatasetCapability, DatasetSelector, FinalityLevel, ProviderDiagnostics,
+    SelectorKind,
 };
 use datalens_core::{
     ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey, DatasetRows,
@@ -125,6 +126,36 @@ fn test_ensure_follow_query_different_selector_or_chain_creates_different_tasks(
         .list(datalens_warmup::WarmupTaskFilter::default())
         .unwrap();
     assert_eq!(tasks.len(), 3);
+}
+
+#[test]
+fn test_ensure_follow_query_different_selector_fingerprint_creates_different_task() {
+    let registry = LocalWarmupRegistry::new(object_store("ensure-follow-query-fingerprint"));
+    let mut first_request = follow_query_request();
+    first_request.selector = DatasetSelector::try_other(
+        AdapterKey::try_new("tron_events").expect("adapter key"),
+        "tron-events/legacy".to_owned(),
+        "contracts/41aaaa/events/MessageSent".to_owned(),
+    )
+    .expect("legacy selector");
+    let mut second_request = follow_query_request();
+    second_request.selector = DatasetSelector::try_other(
+        AdapterKey::try_new("tron_events").expect("adapter key"),
+        "tron-events/ormp-v3/legacy".to_owned(),
+        "contracts/41aaaa/events/MessageSent".to_owned(),
+    )
+    .expect("versioned selector");
+
+    let first = registry.ensure(first_request).expect("first ensure");
+    let second = registry.ensure(second_request).expect("second ensure");
+
+    assert!(first.created);
+    assert!(second.created);
+    assert_ne!(first.task_id, second.task_id);
+    let tasks = registry
+        .list(datalens_warmup::WarmupTaskFilter::default())
+        .unwrap();
+    assert_eq!(tasks.len(), 2);
 }
 
 #[test]
