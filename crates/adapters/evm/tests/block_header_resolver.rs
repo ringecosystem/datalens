@@ -8,7 +8,9 @@ use std::{
 };
 
 use datalens_chain::FinalityLevel;
-use datalens_core::{BlockRange, ChainFamily, ChainIdentity, DatalensError, EvmBlockHeader};
+use datalens_core::{
+    BlockRange, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, EvmBlockHeader,
+};
 use datalens_evm::{
     DurableEvmBlockHeaderStore, EvmBlockHeaderChunkPolicy, EvmBlockHeaderFetch,
     EvmBlockHeaderFetcher, EvmBlockHeaderResolveRequest, EvmBlockHeaderResolver,
@@ -111,6 +113,38 @@ fn test_block_header_resolver_fetches_and_persists_aligned_chunks() {
         vec![BlockRange::expect_new(10, 19)]
     );
     assert_eq!(store.persisted_numbers(), (10..=19).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_block_header_resolver_falls_back_to_requested_range_when_aligned_chunk_is_near_head() {
+    let chain = ethereum();
+    let store = MemoryHeaderStore::new(Vec::new());
+    let fetcher = FailingRangeHeaderFetcher::new(
+        (12..=13).map(header).collect(),
+        BlockRange::expect_new(10, 19),
+        DatalensErrorKind::ProviderFailure,
+    );
+    let resolver = EvmBlockHeaderResolver::with_store(fetcher.clone(), store.clone())
+        .with_chunk_policy(EvmBlockHeaderChunkPolicy::new(10));
+
+    let resolved = resolver
+        .resolve(EvmBlockHeaderResolveRequest {
+            chain,
+            range: BlockRange::expect_new(12, 13),
+            finality_level: FinalityLevel::Safe,
+        })
+        .expect("resolve headers");
+
+    assert_eq!(numbers(&resolved), vec![12, 13]);
+    assert_eq!(
+        fetcher.requests(),
+        vec![
+            BlockRange::expect_new(10, 19),
+            BlockRange::expect_new(12, 13)
+        ]
+    );
+    assert!(store.persisted_ranges().is_empty());
+    assert!(store.persisted_numbers().is_empty());
 }
 
 #[test]
@@ -463,6 +497,48 @@ impl MemoryHeaderFetcher {
 
     fn requests(&self) -> Vec<BlockRange> {
         self.requests.lock().expect("fetch requests").clone()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FailingRangeHeaderFetcher {
+    inner: MemoryHeaderFetcher,
+    failing_range: BlockRange,
+    failing_kind: DatalensErrorKind,
+}
+
+impl FailingRangeHeaderFetcher {
+    fn new(
+        headers: Vec<EvmBlockHeader>,
+        failing_range: BlockRange,
+        failing_kind: DatalensErrorKind,
+    ) -> Self {
+        Self {
+            inner: MemoryHeaderFetcher::new(headers),
+            failing_range,
+            failing_kind,
+        }
+    }
+
+    fn requests(&self) -> Vec<BlockRange> {
+        self.inner.requests()
+    }
+}
+
+impl EvmBlockHeaderFetcher for FailingRangeHeaderFetcher {
+    fn fetch_block_headers(&self, range: BlockRange) -> Result<EvmBlockHeaderFetch, DatalensError> {
+        if range == self.failing_range {
+            self.inner
+                .requests
+                .lock()
+                .expect("fetch requests")
+                .push(range);
+            return Err(DatalensError::new(
+                self.failing_kind.clone(),
+                "near-head chunk tail is unavailable",
+            ));
+        }
+        self.inner.fetch_block_headers(range)
     }
 }
 

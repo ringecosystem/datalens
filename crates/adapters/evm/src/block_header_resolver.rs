@@ -174,7 +174,32 @@ where
                             return Ok(chunk_headers);
                         }
 
-                        let fetched = self.fetcher.fetch_block_headers(chunk)?;
+                        let fetched = match self.fetcher.fetch_block_headers(chunk) {
+                            Ok(fetched) => fetched,
+                            Err(error) if error.kind == DatalensErrorKind::ProviderFailure => {
+                                let fallback_range =
+                                    intersect_block_ranges(chunk, missing).expect("chunk overlaps missing range");
+                                log::warn!(
+                                    "EVM block header aligned chunk fetch failed; falling back to requested range chain_key={} requested_range={}-{} chunk_range={}-{} fallback_range={}-{} kind={:?} message={}",
+                                    request.chain.key_prefix(),
+                                    request.range.from_block,
+                                    request.range.to_block,
+                                    chunk.from_block,
+                                    chunk.to_block,
+                                    fallback_range.from_block,
+                                    fallback_range.to_block,
+                                    error.kind,
+                                    error.message
+                                );
+                                return self.fetcher.fetch_block_headers(fallback_range).map(|fetched| {
+                                    let mut fetched_headers = fetched.headers;
+                                    retain_range(&mut fetched_headers, fallback_range);
+                                    normalize_headers(&mut fetched_headers);
+                                    fetched_headers
+                                });
+                            }
+                            Err(error) => return Err(error),
+                        };
                         let mut fetched_headers = fetched.headers;
                         retain_range(&mut fetched_headers, chunk);
                         normalize_headers(&mut fetched_headers);
@@ -231,6 +256,12 @@ fn complete_resolved_headers(
 fn normalize_headers(headers: &mut Vec<EvmBlockHeader>) {
     headers.sort_by_key(|header| header.block_number);
     headers.dedup_by_key(|header| header.block_number);
+}
+
+fn intersect_block_ranges(left: BlockRange, right: BlockRange) -> Option<BlockRange> {
+    let from_block = left.from_block.max(right.from_block);
+    let to_block = left.to_block.min(right.to_block);
+    (from_block <= to_block).then(|| BlockRange::expect_new(from_block, to_block))
 }
 
 #[derive(Clone, Debug, Default)]
