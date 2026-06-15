@@ -1574,7 +1574,7 @@ where
                 return;
             }
         };
-        let activity = QueryActivity {
+        let mut activity = QueryActivity {
             key: QueryActivityKey::new(
                 application.as_str(),
                 plan.chain.clone(),
@@ -1582,16 +1582,39 @@ where
                 &plan.selector,
                 plan.ledger_range.kind(),
             ),
-            latest_range,
+            latest_range: latest_range.clone(),
+            follow_query_range: Some(latest_range.clone()),
+            follow_query_updated_at_unix_seconds: Some(updated_at_unix_seconds),
             updated_at_unix_seconds,
             request_id: Some(query_id.to_owned()),
         };
+        if let Some(safe_head) = durable_activity_safe_head(plan) {
+            match activities.repository.read(&activity.key) {
+                Ok(Some(existing)) => {
+                    retain_follow_query_activity_range(&mut activity, &existing, safe_head);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    log::warn!(
+                        "query metadata read failed metadata_kind=query_activity query_id={} chain={} dataset={} range={}-{} kind={:?} message={}",
+                        query_id,
+                        plan.chain.configured_name(),
+                        plan.dataset_key.as_str(),
+                        plan.ledger_range.start(),
+                        plan.ledger_range.end(),
+                        error.kind,
+                        error.message
+                    );
+                }
+            }
+        }
         enqueue_query_activity_update(
             activities.repository.clone(),
             query_id.to_owned(),
             activity,
             plan.ledger_range.start(),
             plan.ledger_range.end(),
+            durable_activity_safe_head(plan),
             self.metrics
                 .as_ref()
                 .map(|metrics| metrics.recorder.clone()),
@@ -1602,6 +1625,8 @@ where
 const DEFAULT_QUERY_METADATA_QUEUE_CAPACITY: usize = 8192;
 const DEFAULT_QUERY_METADATA_WORKER_THREADS: usize = 4;
 const DEFAULT_QUERY_METADATA_COALESCED_CAPACITY: usize = 2048;
+const FOLLOW_QUERY_NEAR_HEAD_PROBE_BLOCKS: u64 = 1_000;
+const FOLLOW_QUERY_RETAINED_BACKFILL_GAP_BLOCKS: u64 = 10_000;
 
 impl Default for QueryMetadataWorkerConfig {
     fn default() -> Self {
@@ -1837,7 +1862,7 @@ impl MetadataWorkerPoolInner {
     fn coalesce_activity(
         &self,
         repository: Arc<dyn QueryActivityRepository>,
-        activity: QueryActivity,
+        mut activity: QueryActivity,
         context: QueryActivityMetadataContext,
         metrics: Option<Arc<MetricsRecorder>>,
     ) -> MetadataEnqueueOutcome {
@@ -1851,6 +1876,11 @@ impl MetadataWorkerPoolInner {
                 return MetadataEnqueueOutcome::CoalesceFull;
             }
         };
+        if let Some(existing) = pending.get(&key)
+            && let Some(safe_head) = context.safe_head
+        {
+            retain_follow_query_activity_range(&mut activity, &existing.activity, safe_head);
+        }
         let incoming = CoalescedQueryActivity {
             repository,
             activity,
@@ -1999,7 +2029,7 @@ impl MetadataWorkerPoolInner {
     fn restore_activity(
         &self,
         repository: Arc<dyn QueryActivityRepository>,
-        activity: QueryActivity,
+        mut activity: QueryActivity,
         context: QueryActivityMetadataContext,
         metrics: Option<Arc<MetricsRecorder>>,
     ) {
@@ -2014,6 +2044,11 @@ impl MetadataWorkerPoolInner {
                 return;
             }
         };
+        if let Some(existing) = pending.get(&key)
+            && let Some(safe_head) = context.safe_head
+        {
+            retain_follow_query_activity_range(&mut activity, &existing.activity, safe_head);
+        }
         let incoming = CoalescedQueryActivity {
             repository,
             activity,
@@ -2103,6 +2138,7 @@ struct QueryActivityMetadataContext {
     base: QueryMetadataContext,
     latest_start: u64,
     latest_end: u64,
+    safe_head: Option<u64>,
 }
 
 fn metadata_worker_pool() -> &'static MetadataWorkerPool {
@@ -2151,9 +2187,14 @@ fn watermark_is_newer(incoming: &QueryWatermark, existing: &QueryWatermark) -> b
 }
 
 fn activity_is_newer(incoming: &QueryActivity, existing: &QueryActivity) -> bool {
-    incoming.latest_range.end() > existing.latest_range.end()
-        || (incoming.latest_range.end() == existing.latest_range.end()
-            && incoming.updated_at_unix_seconds >= existing.updated_at_unix_seconds)
+    match incoming
+        .updated_at_unix_seconds
+        .cmp(&existing.updated_at_unix_seconds)
+    {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => incoming.request_id > existing.request_id,
+    }
 }
 
 fn metadata_enqueue_metric_outcome(outcome: MetadataEnqueueOutcome) -> QueryMetadataEnqueueOutcome {
@@ -2387,6 +2428,7 @@ fn enqueue_query_activity_update(
     activity: QueryActivity,
     range_start: u64,
     range_end: u64,
+    safe_head: Option<u64>,
     metrics: Option<Arc<MetricsRecorder>>,
 ) {
     let enqueue_start = Instant::now();
@@ -2411,6 +2453,7 @@ fn enqueue_query_activity_update(
         },
         latest_start,
         latest_end,
+        safe_head,
     };
     let outcome = metadata_worker_pool().enqueue(MetadataJob::QueryActivityUpdate {
         repository,
@@ -2700,6 +2743,56 @@ fn durable_activity_range(plan: &datalens_planner::NativeQueryPlan) -> Option<Le
     .ok()
 }
 
+fn durable_activity_safe_head(plan: &datalens_planner::NativeQueryPlan) -> Option<u64> {
+    match &plan.finality_policy {
+        FinalityPolicy::DurableCache { boundary }
+            if boundary.range_kind == plan.ledger_range.kind() =>
+        {
+            Some(boundary.value)
+        }
+        FinalityPolicy::MixedReadThrough {
+            durable_boundary, ..
+        } if durable_boundary.range_kind == plan.ledger_range.kind() => {
+            Some(durable_boundary.value)
+        }
+        _ => None,
+    }
+}
+
+fn retain_follow_query_activity_range(
+    incoming: &mut QueryActivity,
+    existing: &QueryActivity,
+    safe_head: u64,
+) {
+    let (existing_range, existing_updated_at) = query_activity_follow_query_range(existing);
+    if should_retain_follow_query_range(
+        incoming.latest_range.end(),
+        existing_range.end(),
+        safe_head,
+    ) {
+        incoming.follow_query_range = Some(existing_range.clone());
+        incoming.follow_query_updated_at_unix_seconds = Some(existing_updated_at);
+    }
+}
+
+fn query_activity_follow_query_range(activity: &QueryActivity) -> (&LedgerRange, u64) {
+    match (
+        activity.follow_query_range.as_ref(),
+        activity.follow_query_updated_at_unix_seconds,
+    ) {
+        (Some(range), Some(updated_at_unix_seconds)) => (range, updated_at_unix_seconds),
+        (Some(range), None) => (range, activity.updated_at_unix_seconds),
+        (None, _) => (&activity.latest_range, activity.updated_at_unix_seconds),
+    }
+}
+
+fn should_retain_follow_query_range(incoming_end: u64, retained_end: u64, safe_head: u64) -> bool {
+    incoming_end > retained_end
+        && incoming_end.saturating_sub(retained_end) > FOLLOW_QUERY_RETAINED_BACKFILL_GAP_BLOCKS
+        && safe_head.saturating_sub(incoming_end) <= FOLLOW_QUERY_NEAR_HEAD_PROBE_BLOCKS
+        && safe_head.saturating_sub(retained_end) > FOLLOW_QUERY_RETAINED_BACKFILL_GAP_BLOCKS
+}
+
 fn unix_seconds_now() -> Result<u64, DatalensError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2889,6 +2982,62 @@ mod tests {
     }
 
     #[test]
+    fn test_metadata_worker_pool_retains_low_follow_query_activity_for_near_head_probe() {
+        let pool = MetadataWorkerPool::new_for_test(1, 0);
+        let activities = RecordingQueryActivityRepository;
+
+        assert_eq!(
+            pool.enqueue(MetadataJob::NoopForTest),
+            MetadataEnqueueOutcome::Enqueued
+        );
+        assert_eq!(
+            pool.enqueue(MetadataJob::QueryActivityUpdate {
+                repository: Arc::new(activities.clone()),
+                activity: test_activity(5_855_859, 100),
+                context: test_activity_context("q-backfill", 5_855_859),
+                metrics: None,
+            }),
+            MetadataEnqueueOutcome::Coalesced
+        );
+        assert_eq!(
+            pool.enqueue(MetadataJob::QueryActivityUpdate {
+                repository: Arc::new(activities),
+                activity: test_activity(83_612_407, 200),
+                context: test_activity_context_with_safe_head(
+                    "q-near-head",
+                    83_612_407,
+                    83_612_498,
+                ),
+                metrics: None,
+            }),
+            MetadataEnqueueOutcome::Coalesced
+        );
+
+        assert!(matches!(
+            pool.recv_for_test(),
+            Some(MetadataJob::NoopForTest)
+        ));
+        pool.flush_coalesced();
+        match pool.recv_for_test() {
+            Some(MetadataJob::QueryActivityUpdate {
+                activity, context, ..
+            }) => {
+                assert_eq!(activity.latest_range.end(), 83_612_407);
+                assert_eq!(
+                    activity
+                        .follow_query_range
+                        .as_ref()
+                        .map(|range| range.end()),
+                    Some(5_855_859)
+                );
+                assert_eq!(activity.follow_query_updated_at_unix_seconds, Some(100));
+                assert_eq!(context.base.query_id, "q-near-head");
+            }
+            _ => panic!("expected coalesced activity"),
+        }
+    }
+
+    #[test]
     fn test_metadata_worker_pool_bounds_distinct_coalesced_keys() {
         let pool = MetadataWorkerPool::new_for_test_with_coalesced_capacity(1, 0, 1);
         let watermarks = RecordingQueryWatermarkRepository;
@@ -3071,6 +3220,8 @@ mod tests {
         QueryActivity {
             key: test_activity_key(),
             latest_range: LedgerRange::blocks(1, latest_end).expect("range"),
+            follow_query_range: Some(LedgerRange::blocks(1, latest_end).expect("range")),
+            follow_query_updated_at_unix_seconds: Some(updated_at_unix_seconds),
             updated_at_unix_seconds,
             request_id: Some(format!("q-{latest_end}")),
         }
@@ -3109,6 +3260,20 @@ mod tests {
             base: test_metadata_context(query_id),
             latest_start: 1,
             latest_end,
+            safe_head: None,
+        }
+    }
+
+    fn test_activity_context_with_safe_head(
+        query_id: &str,
+        latest_end: u64,
+        safe_head: u64,
+    ) -> QueryActivityMetadataContext {
+        QueryActivityMetadataContext {
+            base: test_metadata_context(query_id),
+            latest_start: 1,
+            latest_end,
+            safe_head: Some(safe_head),
         }
     }
 

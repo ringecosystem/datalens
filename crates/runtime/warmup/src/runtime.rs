@@ -20,8 +20,9 @@ use datalens_metrics::{
 use datalens_storage::{
     CacheOutcome, DurableIntentSubmissionOutcome, DurableIntentSubmissionRequest,
     DurableIntentSubmissionService, DurablePromotionIntentRepository, DurablePromotionIntentSource,
-    FillOutcome, QueryActivityKey, QueryActivityRepository, QueryOutcome, QueryWatermarkKey,
-    QueryWatermarkRepository, StorageRepository, UsageLedgerEntry, UsageLedgerRepository,
+    FillOutcome, QueryActivity, QueryActivityKey, QueryActivityRepository, QueryOutcome,
+    QueryWatermarkKey, QueryWatermarkRepository, StorageRepository, UsageLedgerEntry,
+    UsageLedgerRepository,
 };
 use datalens_writer::{
     DurableWriteRequest, DurableWriteSegment, DurableWriter, DurableWriterConfig,
@@ -382,12 +383,7 @@ where
                 unix_seconds_now().unwrap_or_default(),
             )
         });
-        let query_watermark = self.query_watermark(
-            &task,
-            cursor.next,
-            cursor.last_committed.is_some(),
-            safe_height.value,
-        )?;
+        let query_watermark = self.query_watermark(&task)?;
         let target_plan = WarmupTargetPlanner::plan(WarmupTargetPlanInput {
             mode: task.mode,
             fixed_end: task.end,
@@ -957,13 +953,7 @@ where
         )
     }
 
-    fn query_watermark(
-        &self,
-        task: &WarmupTask,
-        cursor_next: u64,
-        has_committed_cursor: bool,
-        safe_head: u64,
-    ) -> Result<Option<u64>, DatalensError> {
+    fn query_watermark(&self, task: &WarmupTask) -> Result<Option<u64>, DatalensError> {
         if task.mode != WarmupTaskMode::FollowQuery {
             return Ok(None);
         }
@@ -975,18 +965,14 @@ where
                 &task.selector,
                 task.range_kind.clone(),
             );
-            if let Some(activity) = repository.read(&key)?
-                && query_activity_is_fresh(
-                    activity.updated_at_unix_seconds,
+            if let Some(activity) = repository.read(&key)? {
+                let (range, updated_at_unix_seconds) = follow_query_activity_range(&activity);
+                if query_activity_is_fresh(
+                    updated_at_unix_seconds,
                     self.query_activity_ttl_seconds,
-                )?
-            {
-                return Ok(Some(self.effective_follow_query_watermark(
-                    activity.latest_range.end(),
-                    cursor_next,
-                    has_committed_cursor,
-                    safe_head,
-                )));
+                )? {
+                    return Ok(Some(range.end()));
+                }
             }
         }
         let Some(repository) = &self.query_watermarks else {
@@ -999,43 +985,9 @@ where
             &task.selector,
             task.range_kind.clone(),
         );
-        Ok(repository.read(&key)?.map(|watermark| {
-            self.effective_follow_query_watermark(
-                watermark.latest_block,
-                cursor_next,
-                has_committed_cursor,
-                safe_head,
-            )
-        }))
-    }
-
-    fn effective_follow_query_watermark(
-        &self,
-        candidate: u64,
-        cursor_next: u64,
-        has_committed_cursor: bool,
-        safe_head: u64,
-    ) -> u64 {
-        if has_committed_cursor
-            && candidate > cursor_next
-            && candidate.saturating_sub(cursor_next)
-                > self
-                    .follow_query_catchup_threshold_blocks
-                    .max(self.follow_query_lookahead_blocks)
-            && is_near_safe_head(
-                candidate,
-                safe_head,
-                self.follow_query_near_head_threshold(),
-            )
-        {
-            return cursor_next;
-        }
-        candidate
-    }
-
-    fn follow_query_near_head_threshold(&self) -> u64 {
-        self.follow_query_idle_threshold_blocks
-            .unwrap_or(self.follow_query_catchup_threshold_blocks)
+        Ok(repository
+            .read(&key)?
+            .map(|watermark| watermark.latest_block))
     }
 
     fn task_with_follow_query_status(
@@ -1047,14 +999,12 @@ where
             return Ok(task);
         }
         let safe_height = self.adapter.cache_safe_height()?;
-        let cursor = self.registry.load_cursor(&task.task_id)?;
-        let has_committed_cursor = cursor
-            .as_ref()
-            .and_then(|cursor| cursor.last_committed)
-            .is_some();
-        let cursor_next = cursor.map(|cursor| cursor.next).unwrap_or(task.start);
-        let query_watermark =
-            self.query_watermark(&task, cursor_next, has_committed_cursor, safe_height.value)?;
+        let cursor_next = self
+            .registry
+            .load_cursor(&task.task_id)?
+            .map(|cursor| cursor.next)
+            .unwrap_or(task.start);
+        let query_watermark = self.query_watermark(&task)?;
         let target_plan = WarmupTargetPlanner::plan(WarmupTargetPlanInput {
             mode: task.mode,
             fixed_end: task.end,
@@ -1412,11 +1362,14 @@ fn query_activity_is_fresh(
     )
 }
 
-fn is_near_safe_head(candidate: u64, safe_head: u64, threshold: u64) -> bool {
-    if candidate <= safe_head {
-        safe_head.saturating_sub(candidate) <= threshold
-    } else {
-        candidate.saturating_sub(safe_head) <= threshold
+fn follow_query_activity_range(activity: &QueryActivity) -> (&LedgerRange, u64) {
+    match (
+        activity.follow_query_range.as_ref(),
+        activity.follow_query_updated_at_unix_seconds,
+    ) {
+        (Some(range), Some(updated_at_unix_seconds)) => (range, updated_at_unix_seconds),
+        (Some(range), None) => (range, activity.updated_at_unix_seconds),
+        (None, _) => (&activity.latest_range, activity.updated_at_unix_seconds),
     }
 }
 

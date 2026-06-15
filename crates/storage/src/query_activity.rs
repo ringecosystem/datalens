@@ -39,6 +39,10 @@ impl QueryActivityKey {
 pub struct QueryActivity {
     pub key: QueryActivityKey,
     pub latest_range: LedgerRange,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_query_range: Option<LedgerRange>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_query_updated_at_unix_seconds: Option<u64>,
     pub updated_at_unix_seconds: u64,
     pub request_id: Option<String>,
 }
