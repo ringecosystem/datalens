@@ -286,6 +286,20 @@ impl QueryServiceRegistry {
         Ok(results)
     }
 
+    pub fn run_warmup_task_once(
+        &self,
+        task_id: &WarmupTaskId,
+    ) -> Result<Vec<WarmupRunResult>, DatalensError> {
+        let task = self.get_warmup_task(task_id)?.ok_or_else(|| {
+            DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                format!("warmup task {} not found", task_id.as_str()),
+            )
+        })?;
+        let service = self.warmup_service_for_chain(task.chain.configured_name())?;
+        Ok(vec![service.run_task_once(task_id)?])
+    }
+
     pub fn submit_cache_repair_task(
         &self,
         request: CacheRepairSubmitRequest,

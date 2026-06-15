@@ -479,6 +479,207 @@ async fn test_api_warmup_run_once_requires_warmup_run_operation() {
 }
 
 #[tokio::test]
+async fn test_api_warmup_run_task_once_runs_only_requested_task() {
+    let root = temp_storage_root("api-warmup-run-task-once");
+    let source = MockSource::default();
+    let service = service(LocalStorage::new(&root), source.clone())
+        .with_warmup_pool(warmup_pool_with_max_fetches(&root, 1));
+    let registry = QueryServiceRegistry::new()
+        .with_service(service)
+        .expect("registry");
+    let app = router(registry);
+
+    let first = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/warmup/tasks")
+                .header("content-type", "application/json")
+                .header("x-datalens-application", "app-a")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "chain": ethereum_identity(),
+                        "dataset_key": "evm.logs",
+                        "selector": {
+                            "kind": "evm_logs",
+                            "value": evm_logs_selector_value(&logs_request(20, 21))
+                        },
+                        "range_kind": { "kind": "block" },
+                        "start": 20,
+                        "end": 21,
+                        "mode": "fixed_range"
+                    }))
+                    .expect("request json"),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("first submit response");
+    assert_eq!(first.status(), StatusCode::CREATED);
+
+    let second = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/warmup/tasks")
+                .header("content-type", "application/json")
+                .header("x-datalens-application", "app-a")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "chain": ethereum_identity(),
+                        "dataset_key": "evm.logs",
+                        "selector": {
+                            "kind": "evm_logs",
+                            "value": evm_logs_selector_value(&logs_request(30, 31))
+                        },
+                        "range_kind": { "kind": "block" },
+                        "start": 30,
+                        "end": 31,
+                        "mode": "fixed_range"
+                    }))
+                    .expect("request json"),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("second submit response");
+    assert_eq!(second.status(), StatusCode::CREATED);
+    let second_body = body_json(second.into_body()).await;
+    let second_task_id = second_body["task_id"]
+        .as_str()
+        .expect("second task id")
+        .to_owned();
+
+    let run_once = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/v1/warmup/tasks/{second_task_id}/run-once"))
+                .header("x-datalens-application", "app-a")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("run task once response");
+    assert_eq!(run_once.status(), StatusCode::OK);
+    let run_body = body_json(run_once.into_body()).await;
+    let results = run_body["results"].as_array().expect("results");
+    assert_eq!(results.len(), 1);
+
+    source.clear_calls();
+    let first_query = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/query")
+                .header("content-type", "application/json")
+                .body(Body::from(query_body(logs_request(20, 21))))
+                .expect("request"),
+        )
+        .await
+        .expect("first query response");
+    assert_eq!(first_query.status(), StatusCode::OK);
+    assert!(
+        !source.calls().is_empty(),
+        "untargeted task should not have produced durable coverage"
+    );
+
+    source.clear_calls();
+    let second_query = app
+        .oneshot(
+            Request::post("/v1/query")
+                .header("content-type", "application/json")
+                .body(Body::from(query_body(logs_request(30, 31))))
+                .expect("request"),
+        )
+        .await
+        .expect("second query response");
+    assert_eq!(second_query.status(), StatusCode::OK);
+    assert_eq!(
+        source.calls(),
+        Vec::<SourceCall>::new(),
+        "targeted task should produce durable coverage"
+    );
+}
+
+#[tokio::test]
+async fn test_api_warmup_run_task_once_enforces_owner_and_reports_missing_task() {
+    let root = temp_storage_root("api-warmup-run-task-once-auth");
+    let source = MockSource::default();
+    let service = service(LocalStorage::new(&root), source).with_warmup_pool(warmup_pool(&root));
+    let application_registry = datalens_edge::config::ApplicationRegistryConfig {
+        required: true,
+        applications: vec![
+            application_config("app-a", "token-a"),
+            application_config("app-b", "token-b"),
+        ],
+    };
+    let registry = QueryServiceRegistry::new()
+        .with_application_registry(application_registry)
+        .expect("application registry")
+        .with_service(service)
+        .expect("registry");
+    let app = router(registry);
+
+    let submit = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/warmup/tasks")
+                .header("content-type", "application/json")
+                .header("x-datalens-application", "app-a")
+                .header("authorization", "Bearer token-a")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "chain": ethereum_identity(),
+                        "dataset_key": "evm.logs",
+                        "selector": {
+                            "kind": "evm_logs",
+                            "value": evm_logs_selector_value(&logs_request(20, 21))
+                        },
+                        "range_kind": { "kind": "block" },
+                        "start": 20,
+                        "end": 21,
+                        "mode": "fixed_range"
+                    }))
+                    .expect("request json"),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("submit response");
+    assert_eq!(submit.status(), StatusCode::CREATED);
+    let submit_body = body_json(submit.into_body()).await;
+    let task_id = submit_body["task_id"].as_str().expect("task id").to_owned();
+
+    let forbidden = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/v1/warmup/tasks/{task_id}/run-once"))
+                .header("x-datalens-application", "app-b")
+                .header("authorization", "Bearer token-b")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("forbidden response");
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+    let missing = app
+        .oneshot(
+            Request::post("/v1/warmup/tasks/warmup-missing/run-once")
+                .header("x-datalens-application", "app-a")
+                .header("authorization", "Bearer token-a")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("missing response");
+    assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+    let missing_body = body_json(missing.into_body()).await;
+    assert_eq!(missing_body["error"]["kind"], "invalid_input");
+    assert_eq!(
+        missing_body["error"]["message"],
+        "warmup task warmup-missing not found"
+    );
+}
+
+#[tokio::test]
 async fn test_api_warmup_rejects_old_evm_logs_submit_shape() {
     let root = temp_storage_root("api-warmup-rejects-old-submit");
     let source = MockSource::default();

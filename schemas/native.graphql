@@ -110,6 +110,7 @@ type MutationRoot {
 	cancelWarmupTask(id: ID!): WarmupTask!
 	retryWarmupTask(id: ID!): WarmupTask!
 	runWarmupOnce: WarmupRunOncePayload!
+	runWarmupTaskOnce(id: ID!): WarmupRunOncePayload!
 	submitCacheRepairTask(input: CacheRepairSubmitInput!): CacheRepairSubmitPayload!
 	cancelCacheRepairTask(id: ID!): CacheRepairTask!
 	retryCacheRepairTask(id: ID!): CacheRepairTask!

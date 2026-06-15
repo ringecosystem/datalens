@@ -189,6 +189,95 @@ async fn test_graphql_warmup_follow_query_submit_reuses_identity_without_start()
 }
 
 #[tokio::test]
+async fn test_graphql_run_warmup_task_once_runs_only_requested_task() {
+    let root = temp_storage_root("gql-warmup-run-task-once");
+    let source = MockSource::default();
+    let service = service(LocalStorage::new(&root), source.clone())
+        .with_warmup_pool(warmup_pool_with_max_fetches(&root, 1));
+    let registry = QueryServiceRegistry::new()
+        .with_service(service)
+        .expect("register service");
+    let app = graphql_router(registry);
+
+    let mutation = r#"
+        mutation($input: WarmupSubmitInput!) {
+          submitWarmupTask(input: $input) {
+            taskId
+          }
+        }
+        "#;
+    let first = graphql_json(
+        app.clone(),
+        mutation,
+        serde_json::json!({
+            "input": {
+                "chain": ethereum_chain_input(),
+                "datasetKey": dataset_key_input("evm", "logs"),
+                "selector": {
+                    "kind": "evm_logs",
+                    "evmLogs": {
+                        "addresses": ["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+                        "topics": []
+                    }
+                },
+                "rangeKind": { "kind": "block" },
+                "start": 20,
+                "end": 21,
+                "mode": "fixed_range"
+            }
+        }),
+    )
+    .await;
+    assert_eq!(first["errors"], serde_json::Value::Null);
+
+    let second = graphql_json(
+        app.clone(),
+        mutation,
+        serde_json::json!({
+            "input": {
+                "chain": ethereum_chain_input(),
+                "datasetKey": dataset_key_input("evm", "logs"),
+                "selector": {
+                    "kind": "evm_logs",
+                    "evmLogs": {
+                        "addresses": ["0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+                        "topics": []
+                    }
+                },
+                "rangeKind": { "kind": "block" },
+                "start": 30,
+                "end": 31,
+                "mode": "fixed_range"
+            }
+        }),
+    )
+    .await;
+    assert_eq!(second["errors"], serde_json::Value::Null);
+    let second_task_id = second["data"]["submitWarmupTask"]["taskId"]
+        .as_str()
+        .expect("second task id")
+        .to_owned();
+
+    let run = graphql_json(
+        app,
+        r#"
+        mutation($id: ID!) {
+          runWarmupTaskOnce(id: $id) {
+            results
+          }
+        }
+        "#,
+        serde_json::json!({ "id": second_task_id }),
+    )
+    .await;
+    assert_eq!(run["errors"], serde_json::Value::Null);
+    let results = run["data"]["runWarmupTaskOnce"]["results"]
+        .as_array()
+        .expect("results");
+    assert_eq!(results.len(), 1);
+}
+
+#[tokio::test]
 async fn test_graphql_warmup_task_exposes_idle_follow_query_reason() {
     let root = temp_storage_root("gql-warmup-follow-query-idle");
     let watermarks = QueryWatermarkStore::new(LocalObjectStore::new(root.join("watermarks")));

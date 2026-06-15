@@ -11,7 +11,8 @@ use crate::{
             cache_repair_cancel, cache_repair_get, cache_repair_list, cache_repair_retry,
             cache_repair_run_once, cache_repair_run_task_once, cache_repair_submit, chain_head,
             chains, discovery, health, metrics, query, warmup_cancel, warmup_ensure, warmup_get,
-            warmup_list, warmup_pause, warmup_retry, warmup_run_once, warmup_submit,
+            warmup_list, warmup_pause, warmup_retry, warmup_run_once, warmup_run_task_once,
+            warmup_submit,
         },
     },
     service::registry::QueryServiceRegistry,
@@ -41,6 +42,10 @@ pub fn router_with_edge_config(registry: QueryServiceRegistry, edge: config::Edg
         .route("/v1/warmup/tasks/{task_id}/pause", post(warmup_pause))
         .route("/v1/warmup/tasks/{task_id}/cancel", post(warmup_cancel))
         .route("/v1/warmup/tasks/{task_id}/retry", post(warmup_retry))
+        .route(
+            "/v1/warmup/tasks/{task_id}/run-once",
+            post(warmup_run_task_once),
+        )
         .route("/v1/warmup/run-once", post(warmup_run_once))
         .route(
             "/v1/cache/repairs",

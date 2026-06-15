@@ -490,6 +490,37 @@ pub(crate) async fn warmup_run_once(
     Ok(Json(WarmupRunOnceApiResponse { results }))
 }
 
+pub(crate) async fn warmup_run_task_once(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(task_id): AxumPath<String>,
+) -> Result<Json<WarmupRunOnceApiResponse>, ApiError> {
+    let task_id = WarmupTaskId::new(task_id).map_err(ApiError)?;
+    let task =
+        load_authorized_warmup_task(state.registry.clone(), &headers, task_id.clone()).await?;
+    let registry = state.registry.clone();
+    let application_context = registry
+        .authenticate_task_headers(&headers, ApplicationOperationConfig::WarmupRun)
+        .map_err(ApiError)?;
+    authorize_warmup_task_application(
+        &task,
+        application_context
+            .as_ref()
+            .map(|application| application.id.clone())
+            .or_else(|| application_id_from_headers(&headers)),
+    )?;
+    let results = tokio::task::spawn_blocking(move || registry.run_warmup_task_once(&task_id))
+        .await
+        .map_err(|error| {
+            ApiError(DatalensError::new(
+                DatalensErrorKind::Internal,
+                format!("warmup task run-once failed: {error}"),
+            ))
+        })?
+        .map_err(ApiError)?;
+    Ok(Json(WarmupRunOnceApiResponse { results }))
+}
+
 pub(crate) async fn cache_repair_submit(
     State(state): State<AppState>,
     headers: HeaderMap,

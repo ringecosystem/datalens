@@ -601,6 +601,7 @@ pub trait RegisteredWarmupService: Send + Sync {
     fn cancel(&self, task_id: &WarmupTaskId) -> Result<(), DatalensError>;
     fn retry_failed(&self, task_id: &WarmupTaskId) -> Result<(), DatalensError>;
     fn run_available_once(&self) -> Result<Vec<WarmupRunResult>, DatalensError>;
+    fn run_task_once(&self, task_id: &WarmupTaskId) -> Result<WarmupRunResult, DatalensError>;
 }
 
 impl<A, S, R> RegisteredWarmupService for WarmupTaskPool<A, S, R>
@@ -639,6 +640,10 @@ where
 
     fn run_available_once(&self) -> Result<Vec<WarmupRunResult>, DatalensError> {
         WarmupTaskPool::run_available_once(self)
+    }
+
+    fn run_task_once(&self, task_id: &WarmupTaskId) -> Result<WarmupRunResult, DatalensError> {
+        WarmupTaskPool::run_task_once(self, task_id)
     }
 }
 
