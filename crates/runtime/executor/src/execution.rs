@@ -1574,7 +1574,7 @@ where
                 return;
             }
         };
-        let mut activity = QueryActivity {
+        let activity = QueryActivity {
             key: QueryActivityKey::new(
                 application.as_str(),
                 plan.chain.clone(),
@@ -1588,26 +1588,6 @@ where
             updated_at_unix_seconds,
             request_id: Some(query_id.to_owned()),
         };
-        if let Some(safe_head) = durable_activity_safe_head(plan) {
-            match activities.repository.read(&activity.key) {
-                Ok(Some(existing)) => {
-                    retain_follow_query_activity_range(&mut activity, &existing, safe_head);
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    log::warn!(
-                        "query metadata read failed metadata_kind=query_activity query_id={} chain={} dataset={} range={}-{} kind={:?} message={}",
-                        query_id,
-                        plan.chain.configured_name(),
-                        plan.dataset_key.as_str(),
-                        plan.ledger_range.start(),
-                        plan.ledger_range.end(),
-                        error.kind,
-                        error.message
-                    );
-                }
-            }
-        }
         enqueue_query_activity_update(
             activities.repository.clone(),
             query_id.to_owned(),
@@ -2653,7 +2633,7 @@ fn process_metadata_job(job: MetadataJob) {
         }
         MetadataJob::QueryActivityUpdate {
             repository,
-            activity,
+            mut activity,
             context,
             metrics,
         } => {
@@ -2663,6 +2643,30 @@ fn process_metadata_job(job: MetadataJob) {
                 activity.key.chain.clone(),
                 activity.key.dataset_key.clone(),
             );
+            if let Some(safe_head) = context.safe_head {
+                match repository.read(&activity.key) {
+                    Ok(Some(existing)) => {
+                        retain_follow_query_activity_range(&mut activity, &existing, safe_head);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        log::warn!(
+                            "query metadata background read failed metadata_kind=query_activity query_id={} application={} chain={} dataset={} range={}-{} latest_range={}-{} duration_ms={} kind={:?} message={}",
+                            context.base.query_id,
+                            context.base.application_id,
+                            context.base.chain,
+                            context.base.dataset,
+                            context.base.range_start,
+                            context.base.range_end,
+                            context.latest_start,
+                            context.latest_end,
+                            start.elapsed().as_millis(),
+                            error.kind,
+                            error.message
+                        );
+                    }
+                }
+            }
             match repository.update(&activity) {
                 Ok(()) => {
                     let duration = start.elapsed();

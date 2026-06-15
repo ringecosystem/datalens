@@ -1410,6 +1410,28 @@ fn test_executor_slow_usage_ledger_write_does_not_delay_successful_query() {
 }
 
 #[test]
+fn test_executor_slow_query_activity_read_does_not_delay_successful_query() {
+    let storage = LocalStorage::new(temp_storage_root("executor-slow-activity-read"));
+    let source = MockSource::default().with_blocks(vec![block(30, "0x30")]);
+    let activities = SlowReadQueryActivityRepository::new(Duration::from_millis(500));
+    let attempts = activities.read_attempts();
+    let executor = executor(storage, source)
+        .with_query_activity(activities, ApplicationIdentity::named("api"));
+
+    let start = Instant::now();
+    let result = executor
+        .execute(blocks_input(30, 32))
+        .expect("slow activity read does not block query");
+
+    assert_eq!(block_numbers(&result.rows), vec![30]);
+    assert!(
+        start.elapsed() < Duration::from_millis(250),
+        "query response waited for query activity read"
+    );
+    wait_for_attempt(&attempts);
+}
+
+#[test]
 fn test_executor_miss_requires_provider_safe_height_before_fetch_or_write() {
     let root = temp_storage_root("executor-miss-provider-down");
     let storage = LocalStorage::new(&root);
@@ -2481,6 +2503,40 @@ impl QueryActivityRepository for FailingQueryActivityRepository {
         &self,
         _key: &QueryActivityKey,
     ) -> Result<Option<datalens_storage::QueryActivity>, DatalensError> {
+        Ok(None)
+    }
+}
+
+#[derive(Clone)]
+struct SlowReadQueryActivityRepository {
+    read_attempts: Arc<AtomicUsize>,
+    delay: Duration,
+}
+
+impl SlowReadQueryActivityRepository {
+    fn new(delay: Duration) -> Self {
+        Self {
+            read_attempts: Arc::new(AtomicUsize::new(0)),
+            delay,
+        }
+    }
+
+    fn read_attempts(&self) -> Arc<AtomicUsize> {
+        self.read_attempts.clone()
+    }
+}
+
+impl QueryActivityRepository for SlowReadQueryActivityRepository {
+    fn update(&self, _activity: &datalens_storage::QueryActivity) -> Result<(), DatalensError> {
+        Ok(())
+    }
+
+    fn read(
+        &self,
+        _key: &QueryActivityKey,
+    ) -> Result<Option<datalens_storage::QueryActivity>, DatalensError> {
+        self.read_attempts.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(self.delay);
         Ok(None)
     }
 }
