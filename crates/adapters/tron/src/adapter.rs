@@ -300,6 +300,26 @@ where
         Ok((event_rows(&infos, &request.selector), info_calls))
     }
 
+    fn fetch_block_scan_event_rows_for_range(
+        &self,
+        request: &ChainFetchRequest,
+        range: &LedgerRange,
+    ) -> Result<(Vec<Value>, usize), DatalensError> {
+        validate_block_scan_event_filter(&request.selector)?;
+        let mut rows = Vec::new();
+        let mut provider_calls = 0;
+        for block_number in range.start()..=range.end() {
+            let block_range = LedgerRange::try_new(range.kind(), block_number, block_number)?;
+            let (blocks, block_calls) = self.fetch_blocks_for_range(&block_range)?;
+            provider_calls += block_calls;
+            let transactions = transaction_refs(&blocks)?;
+            let (infos, info_calls) = self.fetch_transaction_infos(&transactions)?;
+            provider_calls += info_calls;
+            rows.extend(event_rows(&infos, &request.selector));
+        }
+        Ok((rows, provider_calls))
+    }
+
     fn metadata(
         &self,
         request: &ChainFetchRequest,
@@ -494,17 +514,18 @@ where
                             selector,
                         );
                         let candidates = candidate_transaction_refs_from_event_rows(&rows);
-                        if candidates.is_empty() {
-                            return Err(DatalensError::new(
-                                DatalensErrorKind::ProviderLimit,
-                                "Tron block-scan merge fallback requires contract-event transaction ids",
-                            ));
-                        }
-                        let (fallback_rows, fallback_calls) = self
-                            .fetch_block_scan_event_rows_for_transactions(
-                                &fallback_request,
-                                &candidates,
-                            )?;
+                        let (fallback_rows, fallback_calls) =
+                            if event_rows_missing_transaction_refs(&rows) {
+                                self.fetch_block_scan_event_rows_for_range(
+                                    &fallback_request,
+                                    &range,
+                                )?
+                            } else {
+                                self.fetch_block_scan_event_rows_for_transactions(
+                                    &fallback_request,
+                                    &candidates,
+                                )?
+                            };
                         rows.extend(fallback_rows);
                         dedupe_event_rows(&mut rows);
                         calls += fallback_calls;
@@ -634,6 +655,14 @@ fn candidate_transaction_refs_from_event_rows(rows: &[Value]) -> Vec<TronTransac
         });
     }
     transactions
+}
+
+fn event_rows_missing_transaction_refs(rows: &[Value]) -> bool {
+    rows.iter().any(|row| {
+        row.get("transaction_id")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+    })
 }
 
 fn event_row_key(row: &Value) -> String {

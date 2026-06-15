@@ -461,6 +461,44 @@ fn test_warmup_with_durable_intents_schedules_without_fetching_or_advancing_curs
 }
 
 #[test]
+fn test_warmup_requeues_retryable_durable_intent_failure() {
+    let adapter = FixtureAdapter::new(10).with_logs(vec![log_record(1, 0)]);
+    let storage = LocalStorage::new(temp_root("intent-failure-storage"));
+    let registry = LocalWarmupRegistry::new(object_store("intent-failure-registry"));
+    let runtime = WarmupRuntime::new(adapter.clone(), storage, registry.clone(), writer_config())
+        .with_durable_intents(FailingIntentRepository {
+            error: DatalensError::storage_write("fixture durable intent write failure"),
+        });
+    let task_id = registry
+        .submit(submit_request(Some(3), WarmupTaskMode::FixedRange))
+        .expect("submit")
+        .task_id;
+
+    let error = runtime
+        .run_task_once(&task_id)
+        .expect_err("durable intent write should fail");
+
+    assert_eq!(error.kind, DatalensErrorKind::StorageWriteFailure);
+    assert!(adapter.fetches().is_empty());
+    let cursor = registry
+        .load_cursor(&task_id)
+        .expect("load cursor")
+        .expect("cursor exists");
+    assert_eq!(cursor.next, 1);
+    assert_eq!(cursor.current_attempt, 1);
+    assert_eq!(
+        cursor.last_error.as_deref(),
+        Some("fixture durable intent write failure")
+    );
+    let task = registry.get(&task_id).expect("load task").expect("task");
+    assert_eq!(task.state, WarmupTaskState::Queued);
+    assert_eq!(
+        task.last_error.as_deref(),
+        Some("fixture durable intent write failure")
+    );
+}
+
+#[test]
 fn test_warmup_fetches_solana_slots_and_writes_durable_cache() {
     let storage = LocalStorage::new(temp_root("solana-storage"));
     let registry = LocalWarmupRegistry::new(object_store("solana-registry"));
@@ -767,7 +805,7 @@ fn test_warmup_skips_provider_for_mixed_empty_and_data_coverage_and_checkpoints(
 }
 
 #[test]
-fn test_provider_failure_does_not_advance_cursor_and_marks_task_failed() {
+fn test_provider_failure_does_not_advance_cursor_and_requeues_task() {
     let storage = LocalStorage::new(temp_root("failure-storage"));
     let registry = LocalWarmupRegistry::new(object_store("failure-registry"));
     let adapter = FixtureAdapter::new(3).with_failure(blocks(1, 3));
@@ -785,8 +823,13 @@ fn test_provider_failure_does_not_advance_cursor_and_marks_task_failed() {
     let cursor = registry.load_cursor(&task_id).unwrap().expect("cursor");
     assert_eq!(cursor.next, 1);
     assert_eq!(cursor.current_attempt, 1);
+    assert_eq!(
+        cursor.last_error.as_deref(),
+        Some("fixture provider failure")
+    );
     let task = registry.get(&task_id).unwrap().expect("task");
-    assert_eq!(task.state, WarmupTaskState::Failed);
+    assert_eq!(task.state, WarmupTaskState::Queued);
+    assert_eq!(task.last_error.as_deref(), Some("fixture provider failure"));
 }
 
 #[test]
@@ -1329,6 +1372,89 @@ fn test_follow_query_falls_back_to_watermark_when_query_activity_is_stale() {
 }
 
 #[test]
+fn test_warmup_splits_provider_limit_ranges_from_hint() {
+    let storage = LocalStorage::new(temp_root("provider-limit-hint-split-storage"));
+    let registry = LocalWarmupRegistry::new(object_store("provider-limit-hint-split-registry"));
+    let adapter = FixtureAdapter::new(5_000)
+        .with_max_range_len(5_000)
+        .with_provider_limit(
+            1_000,
+            "query block range exceeds server limit, narrow your filter: 1000",
+        )
+        .with_logs(vec![log_record(1_250, 0), log_record(2_250, 1)]);
+    let runtime = runtime(adapter.clone(), storage, registry.clone());
+    let mut request = submit_request(Some(2_500), WarmupTaskMode::FixedRange);
+    request.chunk_policy.max_range_len = 5_000;
+    let task_id = registry.submit(request).expect("submit warmup").task_id;
+
+    let result = runtime.run_task_once(&task_id).expect("warmup run");
+
+    assert_eq!(result.status, WarmupRunStatus::Completed);
+    assert_eq!(
+        adapter.fetches(),
+        vec![
+            blocks(1, 2_500),
+            blocks(1, 1_000),
+            blocks(1_001, 2_000),
+            blocks(2_001, 2_500),
+        ]
+    );
+    assert_eq!(
+        registry.get(&task_id).unwrap().unwrap().state,
+        WarmupTaskState::Completed
+    );
+    assert_eq!(registry.load_cursor(&task_id).unwrap().unwrap().next, 2_501);
+}
+
+#[test]
+fn test_warmup_requeues_retryable_fetch_failure_for_later_success() {
+    let storage = LocalStorage::new(temp_root("retryable-fetch-requeue-storage"));
+    let registry = LocalWarmupRegistry::new(object_store("retryable-fetch-requeue-registry"));
+    let adapter = FixtureAdapter::new(10)
+        .with_max_range_len(1)
+        .with_once_failure(
+            blocks(1, 1),
+            DatalensError::new(
+                DatalensErrorKind::StorageReadFailure,
+                "fixture storage read",
+            ),
+        )
+        .with_logs(vec![log_record(1, 0)]);
+    let runtime = runtime(adapter.clone(), storage, registry.clone());
+    let mut request = submit_request(Some(1), WarmupTaskMode::FixedRange);
+    request.retry_policy.max_attempts = 1;
+    let task_id = registry.submit(request).expect("submit warmup").task_id;
+
+    let error = runtime
+        .run_task_once(&task_id)
+        .expect_err("first run records retryable failure");
+
+    assert_eq!(error.kind, DatalensErrorKind::StorageReadFailure);
+    let task = registry.get(&task_id).unwrap().unwrap();
+    assert_eq!(task.state, WarmupTaskState::Queued);
+    assert_eq!(task.last_error.as_deref(), Some("fixture storage read"));
+    assert_eq!(
+        registry
+            .load_cursor(&task_id)
+            .unwrap()
+            .unwrap()
+            .last_error
+            .as_deref(),
+        Some("fixture storage read")
+    );
+
+    let result = runtime
+        .run_task_once(&task_id)
+        .expect("second run retries warmup");
+
+    assert_eq!(result.status, WarmupRunStatus::Completed);
+    assert_eq!(
+        registry.get(&task_id).unwrap().unwrap().state,
+        WarmupTaskState::Completed
+    );
+}
+
+#[test]
 fn test_task_pool_runs_available_tasks_with_global_bound() {
     let storage = LocalStorage::new(temp_root("pool-storage"));
     let registry = LocalWarmupRegistry::new(object_store("pool-registry"));
@@ -1397,6 +1523,105 @@ fn test_task_pool_prioritizes_active_follow_query_watermark() {
     assert_eq!(adapter.fetches(), vec![blocks(1_001, 1_001)]);
     assert_eq!(registry.load_cursor(&active).unwrap().unwrap().next, 1_002);
     assert_eq!(registry.load_cursor(&stale).unwrap().unwrap().next, 1);
+}
+
+#[test]
+fn test_task_pool_cancels_failed_duplicate_when_healthy_follow_query_exists() {
+    let storage = LocalStorage::new(temp_root("pool-follow-query-failed-duplicate-storage"));
+    let registry =
+        LocalWarmupRegistry::new(object_store("pool-follow-query-failed-duplicate-registry"));
+    let watermarks = QueryWatermarkStore::new(object_store(
+        "pool-follow-query-failed-duplicate-watermarks",
+    ));
+    let adapter = FixtureAdapter::new(2_000).with_max_range_len(1);
+    let pool = WarmupTaskPool::new(
+        runtime(adapter, storage, registry.clone())
+            .with_query_watermarks(watermarks.clone())
+            .with_follow_query_start_offset_blocks(Some(1))
+            .with_follow_query_lookahead_blocks(1)
+            .with_runtime_config(WarmupRuntimeConfig {
+                max_fetches_per_task_loop: 1,
+            }),
+        WarmupSchedulerConfig {
+            max_global_concurrent_tasks: 2,
+            max_concurrent_tasks_per_chain: 2,
+        },
+    );
+    let keeper = registry
+        .submit(follow_query_request())
+        .expect("queued follow query")
+        .task_id;
+    let mut duplicate_task = registry.get(&keeper).unwrap().unwrap();
+    let duplicate = datalens_warmup::WarmupTaskId::new("0000-failed-duplicate").unwrap();
+    duplicate_task.task_id = duplicate.clone();
+    duplicate_task.state = WarmupTaskState::Failed;
+    duplicate_task.last_error = Some("historical provider failure".to_owned());
+    duplicate_task.created_at = duplicate_task.created_at.saturating_sub(1);
+    duplicate_task.updated_at = duplicate_task.updated_at.saturating_sub(1);
+    registry
+        .save_task(&duplicate_task)
+        .expect("save failed duplicate task");
+    save_query_watermark(&watermarks, 1_000);
+    save_warmup_cursor(&registry, &keeper, 1_000, 1);
+    save_warmup_cursor(&registry, &duplicate, 1, 1);
+
+    let results = pool.run_available_once().expect("run with duplicate");
+
+    assert_eq!(results.len(), 1);
+    assert_ne!(
+        registry.get(&keeper).unwrap().unwrap().state,
+        WarmupTaskState::Cancelled
+    );
+    assert_eq!(
+        registry.get(&duplicate).unwrap().unwrap().state,
+        WarmupTaskState::Cancelled
+    );
+    assert!(registry.load_cursor(&keeper).unwrap().unwrap().next > 1_000);
+}
+
+#[test]
+fn test_task_pool_failed_list_excludes_failed_duplicate_when_healthy_follow_query_exists() {
+    let storage = LocalStorage::new(temp_root("pool-follow-query-failed-list-storage"));
+    let registry = LocalWarmupRegistry::new(object_store("pool-follow-query-failed-list-registry"));
+    let watermarks = QueryWatermarkStore::new(object_store("pool-follow-query-failed-list-marks"));
+    let adapter = FixtureAdapter::new(2_000).with_max_range_len(1);
+    let pool = WarmupTaskPool::new(
+        runtime(adapter, storage, registry.clone())
+            .with_query_watermarks(watermarks.clone())
+            .with_follow_query_start_offset_blocks(Some(1))
+            .with_follow_query_lookahead_blocks(1),
+        WarmupSchedulerConfig::default(),
+    );
+    let keeper = registry
+        .submit(follow_query_request())
+        .expect("queued follow query")
+        .task_id;
+    let mut duplicate_task = registry.get(&keeper).unwrap().unwrap();
+    let duplicate = datalens_warmup::WarmupTaskId::new("0000-failed-list-duplicate").unwrap();
+    duplicate_task.task_id = duplicate.clone();
+    duplicate_task.state = WarmupTaskState::Failed;
+    duplicate_task.last_error = Some("historical provider failure".to_owned());
+    duplicate_task.created_at = duplicate_task.created_at.saturating_sub(1);
+    duplicate_task.updated_at = duplicate_task.updated_at.saturating_sub(1);
+    registry
+        .save_task(&duplicate_task)
+        .expect("save failed duplicate task");
+    save_query_watermark(&watermarks, 1_000);
+    save_warmup_cursor(&registry, &keeper, 1_000, 1);
+    save_warmup_cursor(&registry, &duplicate, 1, 1);
+
+    let failed = pool
+        .list(datalens_warmup::WarmupTaskFilter {
+            state: Some(WarmupTaskState::Failed),
+            ..Default::default()
+        })
+        .expect("list failed tasks");
+
+    assert!(failed.is_empty());
+    assert_eq!(
+        registry.get(&duplicate).unwrap().unwrap().state,
+        WarmupTaskState::Cancelled
+    );
 }
 
 #[test]
@@ -2571,12 +2796,19 @@ struct FixtureState {
     max_range_len: u64,
     logs: Vec<LogRecord>,
     failures: Vec<(LedgerRange, DatalensError)>,
+    once_failures: Vec<(LedgerRange, DatalensError)>,
+    provider_limit: Option<(u64, String)>,
     fetches: Vec<LedgerRange>,
 }
 
 #[derive(Clone, Default)]
 struct RecordingIntentRepository {
     recorded: Arc<Mutex<Vec<CreateDurablePromotionIntent>>>,
+}
+
+#[derive(Clone)]
+struct FailingIntentRepository {
+    error: DatalensError,
 }
 
 impl DurablePromotionIntentRepository for RecordingIntentRepository {
@@ -2591,6 +2823,79 @@ impl DurablePromotionIntentRepository for RecordingIntentRepository {
         Ok(DurablePromotionIntentCreateOutcome::Created(
             intent_from_request(request),
         ))
+    }
+
+    fn get(&self, _intent_id: &str) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        Ok(None)
+    }
+
+    fn list_pending(
+        &self,
+        _now_unix_seconds: u64,
+        _limit: usize,
+    ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+        Ok(Vec::new())
+    }
+
+    fn list_pending_for_chain(
+        &self,
+        _chain: &ChainIdentity,
+        _now_unix_seconds: u64,
+        _limit: usize,
+    ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+        Ok(Vec::new())
+    }
+
+    fn mark_running(
+        &self,
+        _intent_id: &str,
+        _now_unix_seconds: u64,
+    ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        Ok(None)
+    }
+
+    fn mark_completed(
+        &self,
+        _intent_id: &str,
+        _now_unix_seconds: u64,
+    ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        Ok(None)
+    }
+
+    fn mark_retryable_failure(
+        &self,
+        _intent_id: &str,
+        _error: &str,
+        _now_unix_seconds: u64,
+        _next_retry_at_unix_seconds: u64,
+    ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        Ok(None)
+    }
+
+    fn mark_terminal_failure(
+        &self,
+        _intent_id: &str,
+        _error: &str,
+        _now_unix_seconds: u64,
+    ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        Ok(None)
+    }
+
+    fn reset_stale_running(
+        &self,
+        _stale_before_unix_seconds: u64,
+        _now_unix_seconds: u64,
+    ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+        Ok(Vec::new())
+    }
+}
+
+impl DurablePromotionIntentRepository for FailingIntentRepository {
+    fn create_or_get(
+        &self,
+        _request: CreateDurablePromotionIntent,
+    ) -> Result<DurablePromotionIntentCreateOutcome, DatalensError> {
+        Err(self.error.clone())
     }
 
     fn get(&self, _intent_id: &str) -> Result<Option<DurablePromotionIntent>, DatalensError> {
@@ -2714,6 +3019,20 @@ impl FixtureAdapter {
         self
     }
 
+    fn with_once_failure(self, range: LedgerRange, error: DatalensError) -> Self {
+        self.inner
+            .lock()
+            .unwrap()
+            .once_failures
+            .push((range, error));
+        self
+    }
+
+    fn with_provider_limit(self, max_len: u64, message: impl Into<String>) -> Self {
+        self.inner.lock().unwrap().provider_limit = Some((max_len, message.into()));
+        self
+    }
+
     fn fetches(&self) -> Vec<LedgerRange> {
         self.inner.lock().unwrap().fetches.clone()
     }
@@ -2748,12 +3067,28 @@ impl ChainAdapter for FixtureAdapter {
     fn fetch(&self, request: ChainFetchRequest) -> Result<ChainFetchResponse, DatalensError> {
         let mut state = self.inner.lock().unwrap();
         state.fetches.push(request.range.clone());
+        if let Some((max_len, message)) = &state.provider_limit
+            && request.range.len() > u128::from(*max_len)
+        {
+            return Err(DatalensError::new(
+                DatalensErrorKind::ProviderLimit,
+                message.clone(),
+            ));
+        }
         if let Some((_, error)) = state
             .failures
             .iter()
             .find(|(range, _)| range == &request.range)
         {
             return Err(error.clone());
+        }
+        if let Some(index) = state
+            .once_failures
+            .iter()
+            .position(|(range, _)| range == &request.range)
+        {
+            let (_, error) = state.once_failures.remove(index);
+            return Err(error);
         }
         let logs = state
             .logs
