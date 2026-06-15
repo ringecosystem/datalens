@@ -362,6 +362,12 @@ fn validate_warmup_config(config: &DatalensConfig) -> Result<(), DatalensError> 
             "warmup.query_activity_ttl_seconds must be greater than zero",
         ));
     }
+    if config.warmup.stale_running_ttl_ms == 0 {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "warmup.stale_running_ttl_ms must be greater than zero",
+        ));
+    }
     if config
         .warmup
         .follow_query_start_offset_blocks

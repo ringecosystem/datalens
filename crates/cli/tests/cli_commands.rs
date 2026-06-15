@@ -907,6 +907,7 @@ fn test_config_parses_warmup_follow_query_lookahead() {
         follow_query_idle_threshold_blocks = 10
         follow_query_resume_threshold_blocks = 20
         query_activity_ttl_seconds = 600
+        stale_running_ttl_ms = 120000
 
         [chains.ethereum]
         kind = "evm"
@@ -942,6 +943,7 @@ fn test_config_parses_warmup_follow_query_lookahead() {
     assert_eq!(config.warmup.follow_query_idle_threshold_blocks, Some(10));
     assert_eq!(config.warmup.follow_query_resume_threshold_blocks, Some(20));
     assert_eq!(config.warmup.query_activity_ttl_seconds, 600);
+    assert_eq!(config.warmup.stale_running_ttl_ms, 120_000);
     assert_eq!(
         config
             .chains
@@ -1730,6 +1732,63 @@ fn test_validate_config_allows_zero_warmup_follow_query_lookahead() {
     .expect("config parses");
 
     validate_config(&config).expect("zero lookahead means warm to safe head");
+}
+
+#[test]
+fn test_validate_config_rejects_zero_warmup_stale_running_ttl() {
+    let config = toml::from_str::<DatalensConfig>(
+        r#"
+        [server]
+        bind = "127.0.0.1:0"
+
+        [storage]
+        backend = "local"
+
+        [storage.local]
+        root = ".tmp/datalens-cli-test"
+
+        [planner]
+        max_query_range_blocks = 100
+        default_chunk_range_blocks = 10
+
+        [writer]
+        target_object_bytes = 1024
+        min_object_rows = 1
+        record_empty_coverage = true
+
+        [warmup]
+        enabled = true
+        registry_path = ".tmp/datalens-warmup"
+        scheduler_interval_ms = 1000
+        max_global_tasks = 1
+        max_per_chain_tasks = 1
+        max_fetches_per_loop = 1
+        stale_running_ttl_ms = 0
+
+        [chains.ethereum]
+        kind = "evm"
+        chain_id = 1
+        rpc_urls = ["http://example.invalid"]
+
+        [chains.ethereum.datasets.blocks]
+        enabled = true
+        max_batch_blocks = 10
+
+        [chains.ethereum.datasets.logs]
+        enabled = true
+        max_get_logs_range_blocks = 10
+        max_addresses_per_query = 2
+        "#,
+    )
+    .expect("config parses");
+
+    let error = validate_config(&config).expect_err("zero stale running ttl is invalid");
+
+    assert!(
+        error
+            .message
+            .contains("warmup.stale_running_ttl_ms must be greater than zero")
+    );
 }
 
 #[test]
