@@ -151,7 +151,11 @@ where
         self.runtime
             .registry
             .get(task_id)?
-            .map(|task| self.runtime.task_with_follow_query_status(task))
+            .map(|task| {
+                self.runtime
+                    .recover_stale_running_task(task)
+                    .and_then(|task| self.runtime.task_with_follow_query_status(task))
+            })
             .transpose()
     }
 
