@@ -211,6 +211,10 @@ where
         }
         Ok(results)
     }
+
+    pub fn run_task_once(&self, task_id: &WarmupTaskId) -> Result<WarmupRunResult, DatalensError> {
+        self.runtime.run_task_once(task_id)
+    }
 }
 
 impl<A, S, R> WarmupRuntime<A, S, R>

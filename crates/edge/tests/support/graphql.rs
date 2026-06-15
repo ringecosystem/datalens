@@ -195,6 +195,13 @@ pub(crate) fn non_evm_chain_config(kind: &str) -> ChainConfig {
 pub(crate) fn warmup_pool(
     root: &std::path::Path,
 ) -> WarmupTaskPool<MockSource, LocalStorage, LocalWarmupRegistry<LocalObjectStore>> {
+    warmup_pool_with_max_fetches(root, 4)
+}
+
+pub(crate) fn warmup_pool_with_max_fetches(
+    root: &std::path::Path,
+    max_fetches_per_task_loop: u64,
+) -> WarmupTaskPool<MockSource, LocalStorage, LocalWarmupRegistry<LocalObjectStore>> {
     let storage = LocalStorage::new(root);
     let registry = LocalWarmupRegistry::new(LocalObjectStore::new(root.join("warmup-registry")));
     let runtime = WarmupRuntime::new(
@@ -209,7 +216,7 @@ pub(crate) fn warmup_pool(
         },
     )
     .with_runtime_config(WarmupRuntimeConfig {
-        max_fetches_per_task_loop: 4,
+        max_fetches_per_task_loop,
     });
     WarmupTaskPool::new(
         runtime,

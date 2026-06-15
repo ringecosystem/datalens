@@ -320,6 +320,38 @@ impl MutationRoot {
         Ok(WarmupRunOnceApiResponse { results }.into())
     }
 
+    async fn run_warmup_task_once(
+        &self,
+        ctx: &Context<'_>,
+        id: ID,
+    ) -> async_graphql::Result<WarmupRunOncePayload> {
+        let registry = registry(ctx)?.clone();
+        let headers = headers(ctx);
+        let task_id = WarmupTaskId::new(id.to_string()).map_err(graphql_error)?;
+        let application_context = registry
+            .authenticate_task_headers(&headers, ApplicationOperationConfig::WarmupRun)
+            .map_err(graphql_error)?;
+        let application_id = application_context
+            .as_ref()
+            .map(|application| application.id.clone())
+            .or_else(|| application_id_from_headers(&headers));
+        let current_task_id = task_id.clone();
+        let current_registry = registry.clone();
+        let current_task =
+            spawn_graphql_blocking(move || current_registry.get_warmup_task(&current_task_id))
+                .await?;
+        let current_task = current_task.ok_or_else(|| {
+            graphql_error(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                format!("warmup task {} not found", task_id.as_str()),
+            ))
+        })?;
+        authorize_warmup_task_application(&current_task, application_id).map_err(graphql_error)?;
+        let results =
+            spawn_graphql_blocking(move || registry.run_warmup_task_once(&task_id)).await?;
+        Ok(WarmupRunOnceApiResponse { results }.into())
+    }
+
     async fn submit_cache_repair_task(
         &self,
         ctx: &Context<'_>,

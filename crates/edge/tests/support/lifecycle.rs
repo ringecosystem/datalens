@@ -384,19 +384,27 @@ pub(crate) fn evm_log_filter_value(filter: &datalens_core::EvmLogFilter) -> serd
 pub(crate) fn warmup_pool(
     root: &std::path::Path,
 ) -> WarmupTaskPool<MockSource, LocalStorage, LocalWarmupRegistry<LocalObjectStore>> {
-    warmup_pool_inner(root, None)
+    warmup_pool_inner(root, None, 4)
 }
 
 pub(crate) fn warmup_pool_with_metrics(
     root: &std::path::Path,
     recorder: MetricsRecorder,
 ) -> WarmupTaskPool<MockSource, LocalStorage, LocalWarmupRegistry<LocalObjectStore>> {
-    warmup_pool_inner(root, Some(recorder))
+    warmup_pool_inner(root, Some(recorder), 4)
+}
+
+pub(crate) fn warmup_pool_with_max_fetches(
+    root: &std::path::Path,
+    max_fetches_per_task_loop: u64,
+) -> WarmupTaskPool<MockSource, LocalStorage, LocalWarmupRegistry<LocalObjectStore>> {
+    warmup_pool_inner(root, None, max_fetches_per_task_loop)
 }
 
 fn warmup_pool_inner(
     root: &std::path::Path,
     recorder: Option<MetricsRecorder>,
+    max_fetches_per_task_loop: u64,
 ) -> WarmupTaskPool<MockSource, LocalStorage, LocalWarmupRegistry<LocalObjectStore>> {
     let storage = LocalStorage::new(root);
     let registry = LocalWarmupRegistry::new(LocalObjectStore::new(root.join("warmup-registry")));
@@ -412,7 +420,7 @@ fn warmup_pool_inner(
         },
     )
     .with_runtime_config(WarmupRuntimeConfig {
-        max_fetches_per_task_loop: 4,
+        max_fetches_per_task_loop,
     });
     if let Some(recorder) = recorder {
         runtime = runtime.with_metrics(recorder);
