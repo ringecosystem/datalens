@@ -1703,6 +1703,122 @@ fn test_follow_query_near_head_moves_to_idle_without_provider_fetch() {
 }
 
 #[test]
+fn test_follow_query_near_head_activity_does_not_idle_historical_backfill() {
+    let root = temp_root("follow-query-near-head-activity-keeps-backfill");
+    let storage = LocalStorage::new(&root);
+    let watermarks = QueryWatermarkStore::new(LocalObjectStore::new(&root));
+    let activities = QueryActivityStore::new(LocalObjectStore::new(&root));
+    let registry = LocalWarmupRegistry::new(object_store(
+        "follow-query-near-head-activity-keeps-backfill-registry",
+    ));
+    let adapter = FixtureAdapter::new(83_612_498)
+        .with_max_range_len(1)
+        .with_logs(vec![log_record(5_855_860, 0)]);
+    let pool = WarmupTaskPool::new(
+        runtime(adapter.clone(), storage, registry.clone())
+            .with_query_watermarks(watermarks.clone())
+            .with_query_activity(activities.clone())
+            .with_follow_query_idle_threshold_blocks(Some(100))
+            .with_follow_query_resume_threshold_blocks(Some(200))
+            .with_follow_query_start_offset_blocks(Some(1))
+            .with_follow_query_lookahead_blocks(1)
+            .with_runtime_config(WarmupRuntimeConfig {
+                max_fetches_per_task_loop: 1,
+            }),
+        WarmupSchedulerConfig {
+            max_global_concurrent_tasks: 1,
+            max_concurrent_tasks_per_chain: 1,
+        },
+    );
+    let task_id = registry
+        .submit(WarmupSubmitRequest {
+            start: 83_577_136,
+            ..follow_query_request()
+        })
+        .expect("follow query")
+        .task_id;
+    save_query_watermark(&watermarks, 83_612_407);
+    let now = now_unix_seconds();
+    let backfill_query_range = blocks(5_855_850, 5_855_859);
+    let backfill_query_updated_at = now.saturating_sub(1);
+    save_query_activity(
+        &activities,
+        backfill_query_range.clone(),
+        backfill_query_updated_at,
+    );
+    save_query_activity_with_follow_query_range(
+        &activities,
+        blocks(83_612_400, 83_612_407),
+        backfill_query_range,
+        backfill_query_updated_at,
+        now,
+    );
+    save_warmup_cursor(&registry, &task_id, 83_585_885, 1);
+
+    let results = pool.run_available_once().expect("keep warming backfill");
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].status, WarmupRunStatus::Partial);
+    assert_eq!(adapter.fetches(), vec![blocks(5_855_860, 5_855_860)]);
+    let task = registry.get(&task_id).unwrap().unwrap();
+    assert_eq!(task.state, WarmupTaskState::Queued);
+    assert_eq!(
+        task.follow_query_status
+            .as_ref()
+            .and_then(|status| status.query_watermark),
+        Some(5_855_859)
+    );
+    assert_ne!(
+        task.follow_query_status
+            .as_ref()
+            .and_then(|status| status.no_op_reason.as_deref()),
+        Some("near_safe_head")
+    );
+}
+
+#[test]
+fn test_follow_query_near_head_activity_without_backfill_cursor_can_idle() {
+    let root = temp_root("follow-query-near-head-activity-without-cursor-idles");
+    let storage = LocalStorage::new(&root);
+    let activities = QueryActivityStore::new(LocalObjectStore::new(&root));
+    let registry = LocalWarmupRegistry::new(object_store(
+        "follow-query-near-head-activity-without-cursor-idles-registry",
+    ));
+    let adapter = FixtureAdapter::new(1_010).with_max_range_len(1);
+    let pool = WarmupTaskPool::new(
+        runtime(adapter.clone(), storage, registry.clone())
+            .with_query_activity(activities.clone())
+            .with_follow_query_idle_threshold_blocks(Some(10))
+            .with_follow_query_resume_threshold_blocks(Some(20))
+            .with_follow_query_start_offset_blocks(Some(1))
+            .with_follow_query_lookahead_blocks(1)
+            .with_runtime_config(WarmupRuntimeConfig {
+                max_fetches_per_task_loop: 1,
+            }),
+        WarmupSchedulerConfig {
+            max_global_concurrent_tasks: 1,
+            max_concurrent_tasks_per_chain: 1,
+        },
+    );
+    let task_id = registry
+        .submit(follow_query_request())
+        .expect("follow query")
+        .task_id;
+    save_query_activity(&activities, blocks(990, 1_000), now_unix_seconds());
+
+    let results = pool.run_available_once().expect("idle near head");
+
+    assert!(results.is_empty());
+    assert_eq!(adapter.fetches(), Vec::<LedgerRange>::new());
+    let task = registry.get(&task_id).unwrap().unwrap();
+    assert_eq!(task.state, WarmupTaskState::Idle);
+    assert_eq!(
+        task.follow_query_status.unwrap().no_op_reason.as_deref(),
+        Some("near_safe_head")
+    );
+}
+
+#[test]
 fn test_direct_idle_follow_query_below_resume_threshold_stops_without_fetch() {
     let storage = LocalStorage::new(temp_root("direct-follow-query-idle-stopped-storage"));
     let registry = LocalWarmupRegistry::new(object_store("direct-follow-query-idle-stopped"));
@@ -2225,7 +2341,36 @@ fn save_query_activity<S>(
                 &selector(),
                 LedgerRangeKind::Block,
             ),
+            latest_range: latest_range.clone(),
+            follow_query_range: Some(latest_range),
+            follow_query_updated_at_unix_seconds: Some(updated_at),
+            updated_at_unix_seconds: updated_at,
+            request_id: Some("query-activity-test".to_owned()),
+        })
+        .expect("save query activity");
+}
+
+fn save_query_activity_with_follow_query_range<S>(
+    activities: &QueryActivityStore<S>,
+    latest_range: LedgerRange,
+    follow_query_range: LedgerRange,
+    follow_query_updated_at: u64,
+    updated_at: u64,
+) where
+    S: datalens_storage::ObjectStore + 'static,
+{
+    activities
+        .update(&QueryActivity {
+            key: QueryActivityKey::new(
+                "app-a",
+                chain(),
+                DatasetKey::evm_logs(),
+                &selector(),
+                LedgerRangeKind::Block,
+            ),
             latest_range,
+            follow_query_range: Some(follow_query_range),
+            follow_query_updated_at_unix_seconds: Some(follow_query_updated_at),
             updated_at_unix_seconds: updated_at,
             request_id: Some("query-activity-test".to_owned()),
         })

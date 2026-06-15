@@ -273,6 +273,8 @@ fn test_query_activity_can_rewind_without_rewinding_query_watermark() {
         .update(&QueryActivity {
             key: activity_key.clone(),
             latest_range: LedgerRange::blocks(90, 100).unwrap(),
+            follow_query_range: Some(LedgerRange::blocks(90, 100).unwrap()),
+            follow_query_updated_at_unix_seconds: Some(10),
             updated_at_unix_seconds: 10,
             request_id: Some("query-high".to_owned()),
         })
@@ -289,6 +291,8 @@ fn test_query_activity_can_rewind_without_rewinding_query_watermark() {
         .update(&QueryActivity {
             key: activity_key.clone(),
             latest_range: LedgerRange::blocks(10, 20).unwrap(),
+            follow_query_range: Some(LedgerRange::blocks(10, 20).unwrap()),
+            follow_query_updated_at_unix_seconds: Some(20),
             updated_at_unix_seconds: 20,
             request_id: Some("query-low".to_owned()),
         })
@@ -331,6 +335,8 @@ fn test_query_activity_skips_older_out_of_order_update() {
         .update(&QueryActivity {
             key: key.clone(),
             latest_range: LedgerRange::blocks(90, 100).unwrap(),
+            follow_query_range: Some(LedgerRange::blocks(90, 100).unwrap()),
+            follow_query_updated_at_unix_seconds: Some(200),
             updated_at_unix_seconds: 200,
             request_id: Some("q-newer".to_owned()),
         })
@@ -339,6 +345,8 @@ fn test_query_activity_skips_older_out_of_order_update() {
         .update(&QueryActivity {
             key: key.clone(),
             latest_range: LedgerRange::blocks(10, 20).unwrap(),
+            follow_query_range: Some(LedgerRange::blocks(10, 20).unwrap()),
+            follow_query_updated_at_unix_seconds: Some(100),
             updated_at_unix_seconds: 100,
             request_id: Some("q-older".to_owned()),
         })
@@ -368,6 +376,8 @@ fn test_query_activity_allows_newer_lower_block_update() {
         .update(&QueryActivity {
             key: key.clone(),
             latest_range: LedgerRange::blocks(90, 100).unwrap(),
+            follow_query_range: Some(LedgerRange::blocks(90, 100).unwrap()),
+            follow_query_updated_at_unix_seconds: Some(100),
             updated_at_unix_seconds: 100,
             request_id: Some("q-high".to_owned()),
         })
@@ -376,6 +386,8 @@ fn test_query_activity_allows_newer_lower_block_update() {
         .update(&QueryActivity {
             key: key.clone(),
             latest_range: LedgerRange::blocks(10, 20).unwrap(),
+            follow_query_range: Some(LedgerRange::blocks(10, 20).unwrap()),
+            follow_query_updated_at_unix_seconds: Some(200),
             updated_at_unix_seconds: 200,
             request_id: Some("q-low".to_owned()),
         })
@@ -405,6 +417,8 @@ fn test_query_activity_uses_request_id_tie_breaker_for_equal_timestamps() {
         .update(&QueryActivity {
             key: key.clone(),
             latest_range: LedgerRange::blocks(90, 100).unwrap(),
+            follow_query_range: Some(LedgerRange::blocks(90, 100).unwrap()),
+            follow_query_updated_at_unix_seconds: Some(200),
             updated_at_unix_seconds: 200,
             request_id: Some("q002".to_owned()),
         })
@@ -413,6 +427,8 @@ fn test_query_activity_uses_request_id_tie_breaker_for_equal_timestamps() {
         .update(&QueryActivity {
             key: key.clone(),
             latest_range: LedgerRange::blocks(10, 20).unwrap(),
+            follow_query_range: Some(LedgerRange::blocks(10, 20).unwrap()),
+            follow_query_updated_at_unix_seconds: Some(200),
             updated_at_unix_seconds: 200,
             request_id: Some("q001".to_owned()),
         })

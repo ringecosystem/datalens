@@ -20,8 +20,9 @@ use datalens_metrics::{
 use datalens_storage::{
     CacheOutcome, DurableIntentSubmissionOutcome, DurableIntentSubmissionRequest,
     DurableIntentSubmissionService, DurablePromotionIntentRepository, DurablePromotionIntentSource,
-    FillOutcome, QueryActivityKey, QueryActivityRepository, QueryOutcome, QueryWatermarkKey,
-    QueryWatermarkRepository, StorageRepository, UsageLedgerEntry, UsageLedgerRepository,
+    FillOutcome, QueryActivity, QueryActivityKey, QueryActivityRepository, QueryOutcome,
+    QueryWatermarkKey, QueryWatermarkRepository, StorageRepository, UsageLedgerEntry,
+    UsageLedgerRepository,
 };
 use datalens_writer::{
     DurableWriteRequest, DurableWriteSegment, DurableWriter, DurableWriterConfig,
@@ -964,13 +965,14 @@ where
                 &task.selector,
                 task.range_kind.clone(),
             );
-            if let Some(activity) = repository.read(&key)?
-                && query_activity_is_fresh(
-                    activity.updated_at_unix_seconds,
+            if let Some(activity) = repository.read(&key)? {
+                let (range, updated_at_unix_seconds) = follow_query_activity_range(&activity);
+                if query_activity_is_fresh(
+                    updated_at_unix_seconds,
                     self.query_activity_ttl_seconds,
-                )?
-            {
-                return Ok(Some(activity.latest_range.end()));
+                )? {
+                    return Ok(Some(range.end()));
+                }
             }
         }
         let Some(repository) = &self.query_watermarks else {
@@ -1358,6 +1360,17 @@ fn query_activity_is_fresh(
         updated_at_unix_seconds >= now
             || now.saturating_sub(updated_at_unix_seconds) <= ttl_seconds,
     )
+}
+
+fn follow_query_activity_range(activity: &QueryActivity) -> (&LedgerRange, u64) {
+    match (
+        activity.follow_query_range.as_ref(),
+        activity.follow_query_updated_at_unix_seconds,
+    ) {
+        (Some(range), Some(updated_at_unix_seconds)) => (range, updated_at_unix_seconds),
+        (Some(range), None) => (range, activity.updated_at_unix_seconds),
+        (None, _) => (&activity.latest_range, activity.updated_at_unix_seconds),
+    }
 }
 
 fn sleep_backoff(policy: &crate::WarmupRetryPolicy, attempts: u32) {

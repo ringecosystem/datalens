@@ -1080,10 +1080,66 @@ fn test_executor_records_query_activity_after_successful_durable_query() {
     );
     let activity = wait_for_query_activity(&activities, &key);
     assert_eq!(activity.latest_range, LedgerRange::blocks(30, 32).unwrap());
+    assert_eq!(
+        activity.follow_query_range,
+        Some(LedgerRange::blocks(30, 32).unwrap())
+    );
+    assert!(activity.follow_query_updated_at_unix_seconds.is_some());
     assert!(activity.request_id.is_some());
     assert_eq!(
         activity.key.selector_canonical_key,
         DatasetSelector::all().canonical_key()
+    );
+}
+
+#[test]
+fn test_executor_retains_low_follow_query_activity_after_near_head_probe() {
+    let root = temp_storage_root("executor-query-activity-retains-low-follow");
+    let storage = LocalStorage::new(&root);
+    let activities = QueryActivityStore::new(LocalObjectStore::new(&root));
+    let source = MockSource::default()
+        .with_safe_height(83_612_498)
+        .with_capability_max_range_len(100)
+        .with_blocks(vec![
+            block(5_855_859, "0x5961f3"),
+            block(83_612_407, "0x4fc1977"),
+        ]);
+    let executor = executor(storage, source).with_query_activity(
+        activities.clone(),
+        ApplicationIdentity::named("analytics-api"),
+    );
+    let key = QueryActivityKey::new(
+        "analytics-api",
+        ethereum_identity(),
+        DatasetKey::evm_blocks(),
+        &DatasetSelector::all(),
+        datalens_core::LedgerRangeKind::Block,
+    );
+
+    executor
+        .execute(blocks_input(5_855_859, 5_855_859))
+        .expect("backfill durable query succeeds");
+    let low_activity = wait_for_query_activity_end(&activities, &key, 5_855_859);
+    let low_follow_updated_at = low_activity
+        .follow_query_updated_at_unix_seconds
+        .expect("low follow timestamp");
+
+    executor
+        .execute(blocks_input(83_612_407, 83_612_407))
+        .expect("near-head durable query succeeds");
+
+    let activity = wait_for_query_activity_end(&activities, &key, 83_612_407);
+    assert_eq!(
+        activity.latest_range,
+        LedgerRange::blocks(83_612_407, 83_612_407).unwrap()
+    );
+    assert_eq!(
+        activity.follow_query_range,
+        Some(LedgerRange::blocks(5_855_859, 5_855_859).unwrap())
+    );
+    assert_eq!(
+        activity.follow_query_updated_at_unix_seconds,
+        Some(low_follow_updated_at)
     );
 }
 
@@ -1349,6 +1405,28 @@ fn test_executor_slow_usage_ledger_write_does_not_delay_successful_query() {
     assert!(
         start.elapsed() < Duration::from_millis(250),
         "query response waited for slow metadata write"
+    );
+    wait_for_attempt(&attempts);
+}
+
+#[test]
+fn test_executor_slow_query_activity_read_does_not_delay_successful_query() {
+    let storage = LocalStorage::new(temp_storage_root("executor-slow-activity-read"));
+    let source = MockSource::default().with_blocks(vec![block(30, "0x30")]);
+    let activities = SlowReadQueryActivityRepository::new(Duration::from_millis(500));
+    let attempts = activities.read_attempts();
+    let executor = executor(storage, source)
+        .with_query_activity(activities, ApplicationIdentity::named("api"));
+
+    let start = Instant::now();
+    let result = executor
+        .execute(blocks_input(30, 32))
+        .expect("slow activity read does not block query");
+
+    assert_eq!(block_numbers(&result.rows), vec![30]);
+    assert!(
+        start.elapsed() < Duration::from_millis(250),
+        "query response waited for query activity read"
     );
     wait_for_attempt(&attempts);
 }
@@ -2430,6 +2508,40 @@ impl QueryActivityRepository for FailingQueryActivityRepository {
 }
 
 #[derive(Clone)]
+struct SlowReadQueryActivityRepository {
+    read_attempts: Arc<AtomicUsize>,
+    delay: Duration,
+}
+
+impl SlowReadQueryActivityRepository {
+    fn new(delay: Duration) -> Self {
+        Self {
+            read_attempts: Arc::new(AtomicUsize::new(0)),
+            delay,
+        }
+    }
+
+    fn read_attempts(&self) -> Arc<AtomicUsize> {
+        self.read_attempts.clone()
+    }
+}
+
+impl QueryActivityRepository for SlowReadQueryActivityRepository {
+    fn update(&self, _activity: &datalens_storage::QueryActivity) -> Result<(), DatalensError> {
+        Ok(())
+    }
+
+    fn read(
+        &self,
+        _key: &QueryActivityKey,
+    ) -> Result<Option<datalens_storage::QueryActivity>, DatalensError> {
+        self.read_attempts.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(self.delay);
+        Ok(None)
+    }
+}
+
+#[derive(Clone)]
 struct SlowUsageLedgerRepository {
     attempts: Arc<AtomicUsize>,
     delay: Duration,
@@ -2491,6 +2603,28 @@ where
         }
         if Instant::now() >= deadline {
             panic!("query activity was not recorded");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_query_activity_end<S>(
+    activities: &QueryActivityStore<S>,
+    key: &QueryActivityKey,
+    latest_end: u64,
+) -> datalens_storage::QueryActivity
+where
+    S: datalens_storage::ObjectStore + 'static,
+{
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(activity) = activities.read(key).expect("read activity")
+            && activity.latest_range.end() == latest_end
+        {
+            return activity;
+        }
+        if Instant::now() >= deadline {
+            panic!("query activity ending at {latest_end} was not recorded");
         }
         std::thread::sleep(Duration::from_millis(10));
     }
