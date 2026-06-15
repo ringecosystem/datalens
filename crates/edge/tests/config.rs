@@ -128,6 +128,23 @@ fn test_config_storage_parquet_compression_defaults_to_disabled() {
         toml::from_str(&config_text("[query.native]")).expect("config should parse");
 
     assert_eq!(config.storage.parquet.compression, ParquetCompression::None);
+    assert!(!config.storage.compaction.delete_source_objects);
+}
+
+#[test]
+fn test_config_storage_compaction_accepts_source_object_cleanup() {
+    let input = config_text("[query.native]").replace(
+        r#"
+        [planner]"#,
+        r#"
+        [storage.compaction]
+        delete_source_objects = true
+
+        [planner]"#,
+    );
+    let config: DatalensConfig = toml::from_str(&input).expect("config should parse");
+
+    assert!(config.storage.compaction.delete_source_objects);
 }
 
 #[test]

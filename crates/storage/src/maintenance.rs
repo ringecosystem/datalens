@@ -89,6 +89,8 @@ pub struct MaintenanceCompactionReport {
     pub tick_status: MaintenanceCompactionTickStatus,
     pub compacted_objects: usize,
     pub compacted_rows: usize,
+    pub deleted_source_objects: usize,
+    pub source_delete_failures: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -116,6 +118,7 @@ pub struct MaintenanceCompactionConfig {
     pub max_tick_duration_ms: u64,
     pub max_candidates_per_tick: usize,
     pub max_manifest_entries_per_tick: usize,
+    pub delete_source_objects: bool,
 }
 
 impl Default for MaintenanceCompactionConfig {
@@ -126,6 +129,7 @@ impl Default for MaintenanceCompactionConfig {
             max_tick_duration_ms: 30_000,
             max_candidates_per_tick: 8,
             max_manifest_entries_per_tick: 20_000,
+            delete_source_objects: false,
         }
     }
 }
@@ -234,6 +238,8 @@ where
                 tick_status: MaintenanceCompactionTickStatus::Completed,
                 compacted_objects: 0,
                 compacted_rows: 0,
+                deleted_source_objects: 0,
+                source_delete_failures: 0,
             },
             retention: MaintenanceRetentionReport {
                 mode: MaintenanceOperationMode::DryRun,
@@ -320,6 +326,8 @@ where
         let mut compacted_objects = 0usize;
         let mut compacted_rows = 0usize;
         let mut processed_candidates = 0usize;
+        let mut deleted_source_objects = 0usize;
+        let mut source_delete_failures = 0usize;
         let mut cursor_advance_key = None;
         let max_candidates = config.max_candidates_per_tick.max(1);
         let max_duration = Duration::from_millis(config.max_tick_duration_ms.max(1));
@@ -355,6 +363,11 @@ where
                 candidate.chain.key_prefix(),
                 publish_started.elapsed().as_millis()
             );
+            if config.delete_source_objects {
+                let cleanup = self.delete_compacted_source_objects(candidate);
+                deleted_source_objects += cleanup.deleted_objects;
+                source_delete_failures += cleanup.delete_failures;
+            }
             log::info!(
                 "storage compaction candidate compacted chain_key={} range_kind={} range={}-{} processed_candidates={} duration_ms={}",
                 candidate.chain.key_prefix(),
@@ -393,6 +406,8 @@ where
             tick_status,
             compacted_objects,
             compacted_rows,
+            deleted_source_objects,
+            source_delete_failures,
         })
     }
 
@@ -406,6 +421,9 @@ where
                 continue;
             };
             if !self.object_store().exists(object_key)? {
+                if entry_shadowed_by_live_data_object(entry, entries, self.object_store())? {
+                    continue;
+                }
                 issues.push(entry_issue(
                     entry,
                     MaintenanceIssueKind::MissingObject,
@@ -432,6 +450,40 @@ where
             }
         }
         Ok(issues)
+    }
+
+    fn delete_compacted_source_objects(
+        &self,
+        candidate: &CompactionCandidate,
+    ) -> CompactionSourceCleanup {
+        let mut deleted_objects = 0usize;
+        let mut delete_failures = 0usize;
+        for object_key in &candidate.object_keys {
+            match self.object_store().delete(object_key) {
+                Ok(()) => {
+                    deleted_objects += 1;
+                    log::info!(
+                        "storage compaction source object deleted chain_key={} object_key={}",
+                        candidate.chain.key_prefix(),
+                        object_key
+                    );
+                }
+                Err(error) => {
+                    delete_failures += 1;
+                    log::warn!(
+                        "storage compaction source object delete failed chain_key={} object_key={} kind={:?} message={}",
+                        candidate.chain.key_prefix(),
+                        object_key,
+                        error.kind,
+                        error.message
+                    );
+                }
+            }
+        }
+        CompactionSourceCleanup {
+            deleted_objects,
+            delete_failures,
+        }
     }
 
     fn retention_delete_candidates(
@@ -932,6 +984,12 @@ struct CompactedObject {
     entry: ManifestEntry,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CompactionSourceCleanup {
+    deleted_objects: usize,
+    delete_failures: usize,
+}
+
 fn candidate_selected_entries(
     entries: &[SelectedManifestEntry],
     candidate: &CompactionCandidate,
@@ -1046,6 +1104,28 @@ fn current_object_keys(entries: &[ManifestEntry]) -> Vec<String> {
     keys.sort();
     keys.dedup();
     keys
+}
+
+fn entry_shadowed_by_live_data_object<S>(
+    entry: &ManifestEntry,
+    entries: &[ManifestEntry],
+    object_store: &S,
+) -> Result<bool, DatalensError>
+where
+    S: ObjectStore,
+{
+    for candidate in entries {
+        if candidate.object_key == entry.object_key {
+            continue;
+        }
+        let Some(object_key) = candidate.object_key.as_deref() else {
+            continue;
+        };
+        if candidate.shadows_segment(entry) && object_store.exists(object_key)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn is_data_object(object_key: &str) -> bool {

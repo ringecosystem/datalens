@@ -14,6 +14,9 @@ force_path_style = true
 [storage.parquet]
 compression = "zstd"
 
+[storage.compaction]
+delete_source_objects = true
+
 [planner]
 max_query_range_blocks = 100000
 default_chunk_range_blocks = 10000
