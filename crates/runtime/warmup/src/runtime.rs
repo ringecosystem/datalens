@@ -38,6 +38,8 @@ use crate::{
     task::task_ensure_key_for_task,
 };
 
+pub const DEFAULT_WARMUP_STALE_RUNNING_TTL_MS: u64 = 30 * 60 * 1_000;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WarmupRuntimeConfig {
     pub max_fetches_per_task_loop: u64,
@@ -103,6 +105,7 @@ pub struct WarmupRuntime<A, S, R> {
     follow_query_idle_threshold_blocks: Option<u64>,
     follow_query_resume_threshold_blocks: Option<u64>,
     query_activity_ttl_seconds: u64,
+    stale_running_ttl_ms: u64,
     metrics: Option<MetricsRecorder>,
     usage_ledger: Option<Arc<dyn UsageLedgerRepository>>,
     query_activity: Option<Arc<dyn QueryActivityRepository>>,
@@ -171,6 +174,7 @@ where
             .into_iter()
             .map(|task| self.runtime.task_with_follow_query_status(task))
             .collect::<Result<Vec<_>, _>>()?;
+        let listed = self.runtime.recover_stale_running_tasks(listed)?;
         Ok(self
             .runtime
             .reconcile_follow_query_tasks(listed)?
@@ -244,6 +248,7 @@ where
             follow_query_idle_threshold_blocks: None,
             follow_query_resume_threshold_blocks: None,
             query_activity_ttl_seconds: 300,
+            stale_running_ttl_ms: DEFAULT_WARMUP_STALE_RUNNING_TTL_MS,
             metrics: None,
             usage_ledger: None,
             query_activity: None,
@@ -306,6 +311,11 @@ where
         self
     }
 
+    pub fn with_stale_running_ttl_ms(mut self, ttl_ms: u64) -> Self {
+        self.stale_running_ttl_ms = ttl_ms.max(1);
+        self
+    }
+
     pub fn with_metrics(mut self, recorder: MetricsRecorder) -> Self {
         self.metrics = Some(recorder);
         self
@@ -345,6 +355,7 @@ where
             .registry
             .get(task_id)?
             .ok_or_else(|| missing_task(task_id))?;
+        task = self.recover_stale_running_task(task)?;
         match task.state {
             WarmupTaskState::Idle => {
                 let mut refreshed = self.task_with_follow_query_status(task)?;
@@ -373,7 +384,13 @@ where
                     ..WarmupRunResult::default()
                 });
             }
-            WarmupTaskState::Queued | WarmupTaskState::Running | WarmupTaskState::Failed => {}
+            WarmupTaskState::Running => {
+                return Ok(WarmupRunResult {
+                    status: WarmupRunStatus::Stopped,
+                    ..WarmupRunResult::default()
+                });
+            }
+            WarmupTaskState::Queued | WarmupTaskState::Failed => {}
         }
 
         validate_task(&task, &self.adapter)?;
@@ -1146,6 +1163,49 @@ where
         Ok(task)
     }
 
+    fn recover_stale_running_tasks(
+        &self,
+        tasks: Vec<WarmupTask>,
+    ) -> Result<Vec<WarmupTask>, DatalensError> {
+        tasks
+            .into_iter()
+            .map(|task| self.recover_stale_running_task(task))
+            .collect()
+    }
+
+    fn recover_stale_running_task(
+        &self,
+        mut task: WarmupTask,
+    ) -> Result<WarmupTask, DatalensError> {
+        if task.state != WarmupTaskState::Running {
+            return Ok(task);
+        }
+        let now = unix_seconds_now()?;
+        let ttl_seconds = self.stale_running_ttl_seconds();
+        if task.updated_at > now.saturating_sub(ttl_seconds) {
+            return Ok(task);
+        }
+        let previous_updated_at = task.updated_at;
+        task.state = WarmupTaskState::Queued;
+        task.last_error = Some(format!(
+            "stale running task recovered after {ttl_seconds}s lease ttl"
+        ));
+        task.touch(now);
+        self.registry.save_task(&task)?;
+        log::warn!(
+            "warmup stale running task recovered task_id={} updated_at={} now={} ttl_seconds={}",
+            task.task_id.as_str(),
+            previous_updated_at,
+            now,
+            ttl_seconds,
+        );
+        Ok(task)
+    }
+
+    fn stale_running_ttl_seconds(&self) -> u64 {
+        self.stale_running_ttl_ms.div_ceil(1_000).max(1)
+    }
+
     fn reconcile_follow_query_tasks(
         &self,
         tasks: Vec<WarmupTask>,
@@ -1558,10 +1618,7 @@ fn format_ranges(ranges: &[LedgerRange]) -> String {
 }
 
 fn is_runnable_task(task: &WarmupTask) -> bool {
-    matches!(
-        task.state,
-        WarmupTaskState::Queued | WarmupTaskState::Running
-    )
+    task.state == WarmupTaskState::Queued
 }
 
 fn matches_task_filter(task: &WarmupTask, filter: &crate::WarmupTaskFilter) -> bool {

@@ -432,6 +432,7 @@ fn build_evm_service_with_storage(
         ))
         .with_usage_ledger(stores.usage_ledger)
         .with_query_activity_ttl_seconds(config.warmup.query_activity_ttl_seconds)
+        .with_stale_running_ttl_ms(config.warmup.stale_running_ttl_ms)
         .with_query_activity(stores.query_activity)
         .with_query_watermarks(stores.query_watermarks);
         if config.query.durable_intents.enabled {
@@ -621,6 +622,7 @@ fn build_tron_service_with_storage(
         ))
         .with_usage_ledger(stores.usage_ledger)
         .with_query_activity_ttl_seconds(config.warmup.query_activity_ttl_seconds)
+        .with_stale_running_ttl_ms(config.warmup.stale_running_ttl_ms)
         .with_query_activity(stores.query_activity)
         .with_query_watermarks(stores.query_watermarks);
         if config.query.durable_intents.enabled {

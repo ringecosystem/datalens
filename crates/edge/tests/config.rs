@@ -1,5 +1,6 @@
 use datalens_edge::config::DatalensConfig;
 use datalens_storage::ParquetCompression;
+use datalens_warmup::DEFAULT_WARMUP_STALE_RUNNING_TTL_MS;
 
 #[test]
 fn test_config_production_ethereum_rpc_pool_and_log_reliability() {
@@ -154,6 +155,29 @@ fn test_config_warmup_follow_query_lifecycle_thresholds_default_to_unset() {
 
     assert_eq!(config.warmup.follow_query_idle_threshold_blocks, None);
     assert_eq!(config.warmup.follow_query_resume_threshold_blocks, None);
+}
+
+#[test]
+fn test_config_warmup_stale_running_ttl_defaults_and_parses() {
+    let default_config: DatalensConfig =
+        toml::from_str(&config_text("[query.native]")).expect("config should parse");
+    assert_eq!(
+        default_config.warmup.stale_running_ttl_ms,
+        DEFAULT_WARMUP_STALE_RUNNING_TTL_MS
+    );
+
+    let input = config_text("[query.native]").replace(
+        r#"
+        [planner]"#,
+        r#"
+        [warmup]
+        stale_running_ttl_ms = 120000
+
+        [planner]"#,
+    );
+    let config: DatalensConfig = toml::from_str(&input).expect("config should parse");
+
+    assert_eq!(config.warmup.stale_running_ttl_ms, 120_000);
 }
 
 #[test]

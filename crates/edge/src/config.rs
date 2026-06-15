@@ -5,6 +5,7 @@ use datalens_cache_repair::{
 };
 use datalens_core::{DatalensError, DatalensErrorKind, QueryStrategy};
 use datalens_storage::{DurableStorageConfig, ParquetCompression, S3ObjectStoreConfig};
+use datalens_warmup::DEFAULT_WARMUP_STALE_RUNNING_TTL_MS;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -321,6 +322,8 @@ pub struct WarmupConfig {
     pub follow_query_resume_threshold_blocks: Option<u64>,
     #[serde(default = "default_warmup_query_activity_ttl_seconds")]
     pub query_activity_ttl_seconds: u64,
+    #[serde(default = "default_warmup_stale_running_ttl_ms")]
+    pub stale_running_ttl_ms: u64,
     #[serde(default = "default_warmup_flush_on_shutdown")]
     pub flush_on_shutdown: bool,
 }
@@ -365,6 +368,7 @@ impl Default for WarmupConfig {
             follow_query_idle_threshold_blocks: None,
             follow_query_resume_threshold_blocks: None,
             query_activity_ttl_seconds: default_warmup_query_activity_ttl_seconds(),
+            stale_running_ttl_ms: default_warmup_stale_running_ttl_ms(),
             flush_on_shutdown: default_warmup_flush_on_shutdown(),
         }
     }
@@ -582,6 +586,10 @@ fn default_warmup_follow_query_catchup_threshold_blocks() -> u64 {
 
 fn default_warmup_query_activity_ttl_seconds() -> u64 {
     300
+}
+
+fn default_warmup_stale_running_ttl_ms() -> u64 {
+    DEFAULT_WARMUP_STALE_RUNNING_TTL_MS
 }
 
 fn default_warmup_flush_on_shutdown() -> bool {

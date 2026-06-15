@@ -14,8 +14,8 @@ pub use registry::{
     WarmupTaskFilter,
 };
 pub use runtime::{
-    WarmupRunResult, WarmupRunStatus, WarmupRuntime, WarmupRuntimeConfig, WarmupSchedulerConfig,
-    WarmupTaskPool,
+    DEFAULT_WARMUP_STALE_RUNNING_TTL_MS, WarmupRunResult, WarmupRunStatus, WarmupRuntime,
+    WarmupRuntimeConfig, WarmupSchedulerConfig, WarmupTaskPool,
 };
 pub use target_planner::{PlannedWarmupTarget, WarmupTargetPlanInput, WarmupTargetPlanner};
 pub use task::{
