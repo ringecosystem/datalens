@@ -23,6 +23,11 @@ struct FailingDataObjectPutStore {
 }
 
 #[derive(Clone, Debug)]
+struct FailingDataObjectDeleteStore {
+    inner: LocalObjectStore,
+}
+
+#[derive(Clone, Debug)]
 struct CountingListStore {
     inner: LocalObjectStore,
     list_prefixes: Arc<Mutex<Vec<String>>>,
@@ -30,6 +35,14 @@ struct CountingListStore {
 }
 
 impl FailingDataObjectPutStore {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            inner: LocalObjectStore::new(root),
+        }
+    }
+}
+
+impl FailingDataObjectDeleteStore {
     fn new(root: PathBuf) -> Self {
         Self {
             inner: LocalObjectStore::new(root),
@@ -103,6 +116,43 @@ impl ObjectStore for FailingDataObjectPutStore {
 
     fn lock_namespace(&self) -> String {
         self.inner.lock_namespace()
+    }
+}
+
+impl ObjectStore for FailingDataObjectDeleteStore {
+    fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError> {
+        self.inner.get(key)
+    }
+
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
+        self.inner.put(key, bytes)
+    }
+
+    fn exists(&self, key: &str) -> Result<bool, DatalensError> {
+        self.inner.exists(key)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
+        self.inner.list(prefix)
+    }
+
+    fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ObjectListPage, DatalensError> {
+        self.inner.list_page(prefix, start_after, limit)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), DatalensError> {
+        if key.contains("/datasets/") && (key.ends_with(".json") || key.ends_with(".parquet")) {
+            return Err(DatalensError::new(
+                DatalensErrorKind::StorageWriteFailure,
+                "injected data object delete failure",
+            ));
+        }
+        self.inner.delete(key)
     }
 }
 
@@ -305,6 +355,7 @@ fn test_compaction_merges_adjacent_small_objects_and_retains_old_objects() {
             max_tick_duration_ms: 30_000,
             max_candidates_per_tick: 8,
             max_manifest_entries_per_tick: 20_000,
+            delete_source_objects: false,
         })
         .expect("compact small objects");
 
@@ -401,6 +452,7 @@ fn test_compaction_uses_configured_parquet_compression() {
             max_tick_duration_ms: 30_000,
             max_candidates_per_tick: 8,
             max_manifest_entries_per_tick: 20_000,
+            delete_source_objects: false,
         })
         .expect("compact small objects");
 
@@ -426,6 +478,77 @@ fn test_compaction_uses_configured_parquet_compression() {
 }
 
 #[test]
+fn test_compaction_deletes_source_objects_when_enabled() {
+    let storage = LocalStorage::new(temp_storage_root("execute-compaction-delete-sources"));
+    let chain = test_chain();
+    let first_object = write_block_object(&storage, &chain, 52, FinalityLevel::Safe);
+    let second_object = write_block_object(&storage, &chain, 53, FinalityLevel::Safe);
+
+    let report = storage
+        .compact_small_objects(MaintenanceCompactionConfig {
+            min_object_bytes: u64::MAX,
+            max_merge_ranges: 8,
+            max_tick_duration_ms: 30_000,
+            max_candidates_per_tick: 8,
+            max_manifest_entries_per_tick: 20_000,
+            delete_source_objects: true,
+        })
+        .expect("compact small objects");
+
+    assert_eq!(report.processed_candidates, 1);
+    assert_eq!(report.compacted_objects, 1);
+    assert_eq!(report.deleted_source_objects, 2);
+    assert_eq!(report.source_delete_failures, 0);
+    assert!(
+        !storage
+            .object_store()
+            .exists(&first_object)
+            .expect("first exists")
+    );
+    assert!(
+        !storage
+            .object_store()
+            .exists(&second_object)
+            .expect("second exists")
+    );
+
+    let manifest = storage.manifest().expect("manifest");
+    let compacted_entry = manifest
+        .entries
+        .iter()
+        .find(|entry| entry.range == LedgerRange::blocks(52, 53).expect("range"))
+        .expect("compacted entry");
+    let compacted_object = compacted_entry
+        .object_key
+        .as_ref()
+        .expect("compacted object key");
+    assert!(
+        storage
+            .object_store()
+            .exists(compacted_object)
+            .expect("compacted exists")
+    );
+
+    let rows = storage
+        .read_rows(
+            &chain,
+            &DatasetKey::evm_blocks(),
+            &DatasetSelector::all(),
+            LedgerRange::blocks(52, 53).expect("range"),
+        )
+        .expect("read compacted rows");
+    assert_eq!(rows.row_count(), 2);
+    assert!(
+        storage
+            .maintenance_report()
+            .expect("maintenance")
+            .check
+            .issues
+            .is_empty()
+    );
+}
+
+#[test]
 fn test_compaction_replacement_write_failure_leaves_old_manifest_readable() {
     let storage = LocalStorage::new(temp_storage_root("failed-compaction-write"));
     let chain = test_chain();
@@ -441,6 +564,7 @@ fn test_compaction_replacement_write_failure_leaves_old_manifest_readable() {
             max_tick_duration_ms: 30_000,
             max_candidates_per_tick: 8,
             max_manifest_entries_per_tick: 20_000,
+            delete_source_objects: true,
         })
         .expect_err("compaction replacement write failure");
 
@@ -455,6 +579,43 @@ fn test_compaction_replacement_write_failure_leaves_old_manifest_readable() {
             LedgerRange::blocks(70, 71).expect("range"),
         )
         .expect("old manifest entries remain readable");
+    assert_eq!(rows.row_count(), 2);
+}
+
+#[test]
+fn test_compaction_source_delete_failure_leaves_reads_working() {
+    let storage = LocalStorage::new(temp_storage_root("failed-compaction-delete"));
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 72, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 73, FinalityLevel::Safe);
+    let failing_storage =
+        DurableStorage::from_object_store(FailingDataObjectDeleteStore::new(storage.root().into()));
+
+    let report = failing_storage
+        .compact_small_objects(MaintenanceCompactionConfig {
+            min_object_bytes: u64::MAX,
+            max_merge_ranges: 8,
+            max_tick_duration_ms: 30_000,
+            max_candidates_per_tick: 8,
+            max_manifest_entries_per_tick: 20_000,
+            delete_source_objects: true,
+        })
+        .expect("compaction reports source delete failure");
+
+    assert_eq!(report.processed_candidates, 1);
+    assert_eq!(report.compacted_objects, 1);
+    assert_eq!(report.deleted_source_objects, 0);
+    assert_eq!(report.source_delete_failures, 2);
+    let manifest = storage.manifest().expect("manifest");
+    assert_eq!(manifest.entries.len(), 1);
+    let rows = storage
+        .read_rows(
+            &chain,
+            &DatasetKey::evm_blocks(),
+            &DatasetSelector::all(),
+            LedgerRange::blocks(72, 73).expect("range"),
+        )
+        .expect("compacted manifest remains readable");
     assert_eq!(rows.row_count(), 2);
 }
 
@@ -476,6 +637,7 @@ fn test_compaction_tick_stops_after_candidate_budget_and_reports_partial() {
                 max_tick_duration_ms: 30_000,
                 max_candidates_per_tick: 1,
                 max_manifest_entries_per_tick: 20_000,
+                delete_source_objects: false,
             },
         )
         .expect("bounded compaction");
@@ -507,6 +669,7 @@ fn test_compaction_tick_does_not_reload_manifest_per_candidate() {
                 max_tick_duration_ms: 30_000,
                 max_candidates_per_tick: 8,
                 max_manifest_entries_per_tick: 20_000,
+                delete_source_objects: false,
             },
         )
         .expect("bounded compaction");
@@ -544,6 +707,7 @@ fn test_compaction_tick_scans_one_manifest_segment_prefix_per_tick() {
                 max_tick_duration_ms: 30_000,
                 max_candidates_per_tick: 8,
                 max_manifest_entries_per_tick: 20_000,
+                delete_source_objects: false,
             },
         )
         .expect("prefix-scoped compaction");
@@ -568,6 +732,7 @@ fn test_compaction_cursor_resumes_and_loss_recovers_without_affecting_reads() {
         max_tick_duration_ms: 30_000,
         max_candidates_per_tick: 8,
         max_manifest_entries_per_tick: 2,
+        delete_source_objects: false,
     };
 
     let first = storage
@@ -640,6 +805,7 @@ fn test_compaction_legacy_full_manifest_partial_tick_persists_offset_cursor() {
         max_tick_duration_ms: 30_000,
         max_candidates_per_tick: 8,
         max_manifest_entries_per_tick: 1,
+        delete_source_objects: false,
     };
 
     let first = storage
@@ -704,6 +870,7 @@ fn test_compaction_legacy_cursor_continues_after_partial_tick_writes_segment() {
         max_tick_duration_ms: 30_000,
         max_candidates_per_tick: 8,
         max_manifest_entries_per_tick: 2,
+        delete_source_objects: false,
     };
 
     let first = storage
@@ -777,6 +944,7 @@ fn test_compaction_legacy_cursor_survives_candidate_budget_partial() {
         max_tick_duration_ms: 30_000,
         max_candidates_per_tick: 1,
         max_manifest_entries_per_tick: 4,
+        delete_source_objects: false,
     };
 
     let first = storage
@@ -873,6 +1041,7 @@ fn test_compaction_ignores_segments_shadowed_by_full_manifest() {
                 max_tick_duration_ms: 30_000,
                 max_candidates_per_tick: 8,
                 max_manifest_entries_per_tick: 20_000,
+                delete_source_objects: false,
             },
         )
         .expect("compaction");

@@ -161,6 +161,7 @@ pub(crate) fn start_storage_compaction_worker(
         max_tick_duration_ms: config.storage.compaction.max_tick_duration_ms,
         max_candidates_per_tick: config.storage.compaction.max_candidates_per_tick,
         max_manifest_entries_per_tick: config.storage.compaction.max_manifest_entries_per_tick,
+        delete_source_objects: config.storage.compaction.delete_source_objects,
     };
     let storage = match config.storage.backend.as_str() {
         "local" => {
@@ -223,13 +224,14 @@ impl StorageCompactionWorker {
             .name("datalens-storage-compaction".to_owned())
             .spawn(move || {
                 log::info!(
-                    "storage compaction worker started interval_ms={} min_object_bytes={} max_merge_ranges={} max_tick_duration_ms={} max_candidates_per_tick={} max_manifest_entries_per_tick={} chain_count={}",
+                    "storage compaction worker started interval_ms={} min_object_bytes={} max_merge_ranges={} max_tick_duration_ms={} max_candidates_per_tick={} max_manifest_entries_per_tick={} delete_source_objects={} chain_count={}",
                     interval.as_millis(),
                     config.min_object_bytes,
                     config.max_merge_ranges,
                     config.max_tick_duration_ms,
                     config.max_candidates_per_tick,
                     config.max_manifest_entries_per_tick,
+                    config.delete_source_objects,
                     chains.len()
                 );
                 let mut consecutive_failures = 0u32;
@@ -254,12 +256,14 @@ impl StorageCompactionWorker {
                         Ok(report) => {
                             consecutive_failures = 0;
                             log::info!(
-                                "storage compaction tick completed chain_key={} candidate_count={} processed_candidates={} compacted_objects={} compacted_rows={} tick_status={} duration_ms={}",
+                                "storage compaction tick completed chain_key={} candidate_count={} processed_candidates={} compacted_objects={} compacted_rows={} deleted_source_objects={} source_delete_failures={} tick_status={} duration_ms={}",
                                 chain.key_prefix(),
                                 report.candidate_count,
                                 report.processed_candidates,
                                 report.compacted_objects,
                                 report.compacted_rows,
+                                report.deleted_source_objects,
+                                report.source_delete_failures,
                                 report.tick_status.as_str(),
                                 started.elapsed().as_millis()
                             );

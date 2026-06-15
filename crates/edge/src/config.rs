@@ -106,6 +106,8 @@ pub struct StorageCompactionConfig {
     pub max_candidates_per_tick: usize,
     #[serde(default = "default_storage_compaction_max_manifest_entries_per_tick")]
     pub max_manifest_entries_per_tick: usize,
+    #[serde(default)]
+    pub delete_source_objects: bool,
 }
 
 impl Default for StorageCompactionConfig {
@@ -120,6 +122,7 @@ impl Default for StorageCompactionConfig {
             max_tick_duration_ms: default_storage_compaction_max_tick_duration_ms(),
             max_candidates_per_tick: default_storage_compaction_max_candidates_per_tick(),
             max_manifest_entries_per_tick,
+            delete_source_objects: false,
         }
     }
 }

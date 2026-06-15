@@ -21,6 +21,7 @@ pub(crate) fn selector_coverage_candidates<'a>(
     let selector_fingerprint = selector.fingerprint();
     let mut candidates =
         exact_selector_candidates(entries, chain, dataset_key, &selector_fingerprint, range);
+    sort_coverage_candidates(&mut candidates);
     let exact_ranges = merge_ranges(
         candidates
             .iter()
@@ -36,7 +37,17 @@ pub(crate) fn selector_coverage_candidates<'a>(
         range,
         &exact_ranges,
     ));
+    sort_coverage_candidates(&mut candidates);
     candidates
+}
+
+fn sort_coverage_candidates(candidates: &mut [SelectorCoverageCandidate<'_>]) {
+    candidates.sort_by_key(|candidate| {
+        (
+            candidate.entry.range.start(),
+            std::cmp::Reverse(candidate.entry.range.end()),
+        )
+    });
 }
 
 fn exact_selector_candidates<'a>(
