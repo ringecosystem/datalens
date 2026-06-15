@@ -487,6 +487,92 @@ fn test_tron_contract_event_provider_ormp_fallback_fetches_only_candidate_transa
 }
 
 #[test]
+fn test_tron_contract_event_provider_ormp_fallback_scans_single_blocks_without_candidates() {
+    let provider = CandidateFallbackProvider::new().with_contract_events_without_transaction_ids();
+    let adapter = TronAdapter::with_provider(test_tron_chain(), provider.clone());
+    let selector = tron_event_selector(TronEventFilter {
+        contract_addresses: vec!["0xabcdefabcdefabcdefabcdefabcdefabcdefabcd".to_owned()],
+        event_names: vec![
+            "MessageAccepted".to_owned(),
+            "MessageAssigned".to_owned(),
+            "MessageSent".to_owned(),
+        ],
+    })
+    .expect("selector");
+
+    let response = adapter
+        .fetch(datalens_chain::ChainFetchRequest::new(
+            adapter.capabilities().chain().clone(),
+            DatasetKey::tron_events(),
+            LedgerRange::blocks(10, 12).expect("range"),
+            selector,
+        ))
+        .expect("fetch events");
+
+    let QueryRows::AdapterJson { rows, .. } = response.rows.rows() else {
+        panic!("expected adapter JSON rows");
+    };
+    let event_names = rows
+        .iter()
+        .map(|row| row["event_name"].as_str().expect("event name"))
+        .collect::<Vec<_>>();
+    assert_eq!(event_names, vec!["MessageAssigned", "MessageAccepted"]);
+    assert_eq!(rows[1]["transaction_id"], "candidate-11");
+    assert_eq!(rows[1]["source"]["provider"], "tron_block_scan");
+    let block_requests = provider.block_requests();
+    assert_eq!(
+        &block_requests[block_requests.len().saturating_sub(3)..],
+        &[10, 11, 12]
+    );
+    assert!(
+        provider
+            .transaction_info_requests()
+            .contains(&"candidate-11".to_owned())
+    );
+}
+
+#[test]
+fn test_tron_contract_event_provider_ormp_fallback_scans_single_blocks_for_mixed_candidates() {
+    let provider = CandidateFallbackProvider::new().with_mixed_contract_event_transaction_ids();
+    let adapter = TronAdapter::with_provider(test_tron_chain(), provider.clone());
+    let selector = tron_event_selector(TronEventFilter {
+        contract_addresses: vec!["0xabcdefabcdefabcdefabcdefabcdefabcdefabcd".to_owned()],
+        event_names: vec![
+            "MessageAccepted".to_owned(),
+            "MessageAssigned".to_owned(),
+            "MessageSent".to_owned(),
+        ],
+    })
+    .expect("selector");
+
+    let response = adapter
+        .fetch(datalens_chain::ChainFetchRequest::new(
+            adapter.capabilities().chain().clone(),
+            DatasetKey::tron_events(),
+            LedgerRange::blocks(10, 12).expect("range"),
+            selector,
+        ))
+        .expect("fetch events");
+
+    let QueryRows::AdapterJson { rows, .. } = response.rows.rows() else {
+        panic!("expected adapter JSON rows");
+    };
+    let event_names = rows
+        .iter()
+        .map(|row| row["event_name"].as_str().expect("event name"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        event_names,
+        vec!["MessageAssigned", "MessageSent", "MessageAccepted"]
+    );
+    let block_requests = provider.block_requests();
+    assert_eq!(
+        &block_requests[block_requests.len().saturating_sub(3)..],
+        &[10, 11, 12]
+    );
+}
+
+#[test]
 fn test_tron_contract_event_provider_empty_multi_block_ormp_returns_empty_without_block_scan() {
     let provider = CandidateFallbackProvider::new().with_empty_contract_events();
     let adapter = TronAdapter::with_provider(test_tron_chain(), provider.clone());
@@ -1667,6 +1753,8 @@ struct CandidateFallbackProvider {
     block_requests: Arc<Mutex<Vec<u64>>>,
     transaction_info_requests: Arc<Mutex<Vec<String>>>,
     empty_contract_events: bool,
+    contract_events_without_transaction_ids: bool,
+    mixed_contract_event_transaction_ids: bool,
 }
 
 impl CandidateFallbackProvider {
@@ -1676,11 +1764,23 @@ impl CandidateFallbackProvider {
             block_requests: Arc::new(Mutex::new(Vec::new())),
             transaction_info_requests: Arc::new(Mutex::new(Vec::new())),
             empty_contract_events: false,
+            contract_events_without_transaction_ids: false,
+            mixed_contract_event_transaction_ids: false,
         }
     }
 
     fn with_empty_contract_events(mut self) -> Self {
         self.empty_contract_events = true;
+        self
+    }
+
+    fn with_contract_events_without_transaction_ids(mut self) -> Self {
+        self.contract_events_without_transaction_ids = true;
+        self
+    }
+
+    fn with_mixed_contract_event_transaction_ids(mut self) -> Self {
+        self.mixed_contract_event_transaction_ids = true;
         self
     }
 
@@ -1727,6 +1827,17 @@ impl TronProvider for CandidateFallbackProvider {
             .lock()
             .expect("transaction info requests")
             .push(tx_id.to_owned());
+        if tx_id.starts_with("unrelated") {
+            return Ok(Some(serde_json::json!({
+                "id": tx_id,
+                "blockNumber": 11,
+                "blockTimeStamp": 1_700_000_011_u64,
+                "receipt": {
+                    "result": "SUCCESS",
+                },
+                "log": [],
+            })));
+        }
         Ok(Some(serde_json::json!({
             "id": tx_id,
             "blockNumber": 11,
@@ -1759,6 +1870,42 @@ impl TronProvider for CandidateFallbackProvider {
         if self.empty_contract_events {
             return Ok(TronContractEventPage {
                 events: Vec::new(),
+                next_fingerprint: None,
+                provider_calls: 1,
+            });
+        }
+        if self.contract_events_without_transaction_ids {
+            let mut event = contract_event_for(
+                "candidate-11",
+                "41abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+                "MessageAssigned",
+                11,
+            );
+            event.transaction_id = None;
+            return Ok(TronContractEventPage {
+                events: vec![event],
+                next_fingerprint: None,
+                provider_calls: 1,
+            });
+        }
+        if self.mixed_contract_event_transaction_ids {
+            let mut assigned = contract_event_for(
+                "candidate-11",
+                "41abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+                "MessageAssigned",
+                11,
+            );
+            assigned.transaction_id = None;
+            return Ok(TronContractEventPage {
+                events: vec![
+                    assigned,
+                    contract_event_for(
+                        "candidate-11",
+                        "41abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+                        "MessageSent",
+                        11,
+                    ),
+                ],
                 next_fingerprint: None,
                 provider_calls: 1,
             });

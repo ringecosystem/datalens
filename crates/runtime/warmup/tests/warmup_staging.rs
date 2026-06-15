@@ -77,8 +77,16 @@ fn test_staged_warmup_shutdown_flush_failure_does_not_advance_cursor() {
     let cursor = registry.load_cursor(&task_id).unwrap().expect("cursor");
     assert_eq!(cursor.next, 1);
     assert_eq!(cursor.current_attempt, 1);
+    assert_eq!(
+        cursor.last_error.as_deref(),
+        Some("injected durable write failure")
+    );
     let task = registry.get(&task_id).unwrap().expect("task");
-    assert_eq!(task.state, WarmupTaskState::Failed);
+    assert_eq!(task.state, WarmupTaskState::Queued);
+    assert_eq!(
+        task.last_error.as_deref(),
+        Some("injected durable write failure")
+    );
 }
 
 #[test]

@@ -152,10 +152,7 @@ where
             .transpose()
     }
 
-    pub fn list(
-        &self,
-        mut filter: crate::WarmupTaskFilter,
-    ) -> Result<Vec<WarmupTask>, DatalensError> {
+    pub fn list(&self, filter: crate::WarmupTaskFilter) -> Result<Vec<WarmupTask>, DatalensError> {
         let chain_key = self.runtime.adapter.capabilities().chain().key_prefix();
         if filter
             .chain_key
@@ -164,13 +161,22 @@ where
         {
             return Ok(Vec::new());
         }
-        filter.chain_key = Some(chain_key);
-        self.runtime
+        let listed = self
+            .runtime
             .registry
-            .list(filter)?
+            .list(crate::WarmupTaskFilter {
+                chain_key: Some(chain_key),
+                ..Default::default()
+            })?
             .into_iter()
             .map(|task| self.runtime.task_with_follow_query_status(task))
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(self
+            .runtime
+            .reconcile_follow_query_tasks(listed)?
+            .into_iter()
+            .filter(|task| matches_task_filter(task, &filter))
+            .collect())
     }
 
     pub fn pause(&self, task_id: &WarmupTaskId) -> Result<(), DatalensError> {
@@ -469,20 +475,41 @@ where
                 target_end.min(next.saturating_add(max_chunk_len(&task, &self.adapter)? - 1)),
             )?;
             validate_durable_range(&chunk, &safe_height)?;
-            let durable_covered = self.storage.covered_ranges(
+            let durable_covered = match self.storage.covered_ranges(
                 &task.chain,
                 &task.dataset_key,
                 &task.selector,
                 chunk.clone(),
-            )?;
+            ) {
+                Ok(covered) => covered,
+                Err(error) if error.is_retryable() => {
+                    self.mark_retryable_failure(&mut task, &mut cursor, chunk, &error)?;
+                    return Err(error);
+                }
+                Err(error) => {
+                    self.mark_failed(&mut task, &mut cursor, chunk, &error)?;
+                    return Err(error);
+                }
+            };
             let durable_missing = missing_ranges(chunk.clone(), &durable_covered);
             let mut covered = durable_covered.clone();
-            covered.extend(writer.staged_covered_ranges(
+            let staged_covered = match writer.staged_covered_ranges(
                 &task.chain,
                 &task.dataset_key,
                 &task.selector,
                 chunk.clone(),
-            )?);
+            ) {
+                Ok(covered) => covered,
+                Err(error) if error.is_retryable() => {
+                    self.mark_retryable_failure(&mut task, &mut cursor, chunk, &error)?;
+                    return Err(error);
+                }
+                Err(error) => {
+                    self.mark_failed(&mut task, &mut cursor, chunk, &error)?;
+                    return Err(error);
+                }
+            };
+            covered.extend(staged_covered);
             let missing = missing_ranges(chunk.clone(), &covered);
             if missing.is_empty() {
                 if durable_missing.is_empty()
@@ -511,7 +538,16 @@ where
             }
 
             if self.durable_intents.is_some() {
-                self.submit_durable_intent(&task, &missing, safe_height.finality)?;
+                if let Err(error) =
+                    self.submit_durable_intent(&task, &missing, safe_height.finality)
+                {
+                    if error.is_retryable() {
+                        self.mark_retryable_failure(&mut task, &mut cursor, chunk, &error)?;
+                    } else {
+                        self.mark_failed(&mut task, &mut cursor, chunk, &error)?;
+                    }
+                    return Err(error);
+                }
                 result.status = WarmupRunStatus::Partial;
                 self.registry.save_task(&task)?;
                 self.registry.save_cursor(&cursor)?;
@@ -522,7 +558,11 @@ where
                 Ok(fetched) => fetched,
                 Err(error) => {
                     self.record_provider_error_metric(&task, &error);
-                    self.mark_failed(&mut task, &mut cursor, chunk, &error)?;
+                    if error.is_retryable() {
+                        self.mark_retryable_failure(&mut task, &mut cursor, chunk, &error)?;
+                    } else {
+                        self.mark_failed(&mut task, &mut cursor, chunk, &error)?;
+                    }
                     return Err(error);
                 }
             };
@@ -541,7 +581,11 @@ where
                 Ok(write_result) => write_result,
                 Err(error) => {
                     self.record_write_metric(&task, WarmupWriteOutcome::Error);
-                    self.mark_failed(&mut task, &mut cursor, chunk, &error)?;
+                    if error.is_retryable() {
+                        self.mark_retryable_failure(&mut task, &mut cursor, chunk, &error)?;
+                    } else {
+                        self.mark_failed(&mut task, &mut cursor, chunk, &error)?;
+                    }
                     return Err(error);
                 }
             };
@@ -568,7 +612,17 @@ where
             if write_result.staged_ranges.is_empty() {
                 if !uncommitted_staged_coverage_seen
                     && chunk.start() == cursor.next
-                    && self.is_durable_covered(&task, chunk.clone())?
+                    && match self.is_durable_covered(&task, chunk.clone()) {
+                        Ok(covered) => covered,
+                        Err(error) if error.is_retryable() => {
+                            self.mark_retryable_failure(&mut task, &mut cursor, chunk, &error)?;
+                            return Err(error);
+                        }
+                        Err(error) => {
+                            self.mark_failed(&mut task, &mut cursor, chunk, &error)?;
+                            return Err(error);
+                        }
+                    }
                 {
                     self.commit_visible_range(
                         &task,
@@ -706,7 +760,8 @@ where
     ) -> Result<FetchedSegments, DatalensError> {
         let mut segments = Vec::new();
         let mut provider_calls = 0u64;
-        for range in missing {
+        let mut queue = missing.iter().rev().cloned().collect::<Vec<_>>();
+        'queue: while let Some(range) = queue.pop() {
             let mut attempts = 0;
             let response = loop {
                 attempts += 1;
@@ -725,6 +780,31 @@ where
                         if error.is_retryable() && attempts < task.retry_policy.max_attempts =>
                     {
                         sleep_backoff(&task.retry_policy, attempts);
+                    }
+                    Err(error)
+                        if error.kind == DatalensErrorKind::ProviderLimit
+                            && request.range.len() > 1 =>
+                    {
+                        let hint_max_len = parse_provider_limit_hint(&error.message);
+                        let split_ranges =
+                            split_provider_limit_range(&request.range, hint_max_len)?;
+                        log::warn!(
+                            "warmup provider limit split task_id={} application={} chain_key={} dataset={} selector_fingerprint={} range={}-{} hint_max_len={:?} chunks={}",
+                            task.task_id.as_str(),
+                            task.application_id,
+                            task.chain.key_prefix(),
+                            task.dataset_key.as_str(),
+                            task.selector.fingerprint(),
+                            request.range.start(),
+                            request.range.end(),
+                            hint_max_len,
+                            split_ranges.len(),
+                        );
+                        provider_calls += u64::from(attempts);
+                        for split in split_ranges.into_iter().rev() {
+                            queue.push(split);
+                        }
+                        continue 'queue;
                     }
                     Err(error) => return Err(error),
                 }
@@ -811,7 +891,16 @@ where
             Err(error) => {
                 self.record_write_metric(task, WarmupWriteOutcome::Error);
                 if let Some(first_pending) = pending_commits.first() {
-                    self.mark_failed(task, cursor, first_pending.range.clone(), &error)?;
+                    if error.is_retryable() {
+                        self.mark_retryable_failure(
+                            task,
+                            cursor,
+                            first_pending.range.clone(),
+                            &error,
+                        )?;
+                    } else {
+                        self.mark_failed(task, cursor, first_pending.range.clone(), &error)?;
+                    }
                 }
                 return Err(error);
             }
@@ -923,6 +1012,27 @@ where
         task.last_error = Some(error.message.clone());
         task.touch(now);
         self.record_task_metric(task, WarmupTaskOutcome::Failed);
+        self.registry.save_task(task)
+    }
+
+    fn mark_retryable_failure(
+        &self,
+        task: &mut WarmupTask,
+        cursor: &mut WarmupCursor,
+        range: LedgerRange,
+        error: &DatalensError,
+    ) -> Result<(), DatalensError> {
+        let now = unix_seconds_now()?;
+        cursor.mark_failure(
+            range,
+            cursor.current_attempt.saturating_add(1),
+            error.message.clone(),
+            now,
+        );
+        self.registry.save_cursor(cursor)?;
+        task.state = WarmupTaskState::Queued;
+        task.last_error = Some(error.message.clone());
+        task.touch(now);
         self.registry.save_task(task)
     }
 
@@ -1452,6 +1562,106 @@ fn is_runnable_task(task: &WarmupTask) -> bool {
         task.state,
         WarmupTaskState::Queued | WarmupTaskState::Running
     )
+}
+
+fn matches_task_filter(task: &WarmupTask, filter: &crate::WarmupTaskFilter) -> bool {
+    filter
+        .application_id
+        .as_ref()
+        .is_none_or(|application_id| &task.application_id == application_id)
+        && filter
+            .chain_key
+            .as_ref()
+            .is_none_or(|chain_key| &task.chain.key_prefix() == chain_key)
+        && filter.state.is_none_or(|state| task.state == state)
+}
+
+fn parse_provider_limit_hint(message: &str) -> Option<u64> {
+    let normalized = message.to_ascii_lowercase();
+    parse_number_after_marker(&normalized, "filter:")
+        .or_else(|| parse_number_after_marker(&normalized, "limit:"))
+        .or_else(|| parse_number_after_limit_word(&normalized))
+}
+
+fn parse_number_after_marker(message: &str, marker: &str) -> Option<u64> {
+    let start = message.find(marker)? + marker.len();
+    parse_positive_u64_at(message, start)
+}
+
+fn parse_number_after_limit_word(message: &str) -> Option<u64> {
+    let mut search_start = 0;
+    while let Some(relative) = message[search_start..].find("limit") {
+        let start = search_start + relative;
+        let end = start + "limit".len();
+        if is_word_boundary(message, start, end)
+            && message[end..]
+                .chars()
+                .next()
+                .is_none_or(|ch| ch.is_ascii_whitespace() || ch == ':' || ch == ',')
+        {
+            let scan_end = message.len().min(end + 48);
+            if let Some(offset) = message[end..scan_end]
+                .char_indices()
+                .find_map(|(index, ch)| ch.is_ascii_digit().then_some(end + index))
+                && let Some(value) = parse_positive_u64_at(message, offset)
+            {
+                return Some(value);
+            }
+        }
+        search_start = end;
+    }
+    None
+}
+
+fn parse_positive_u64_at(message: &str, mut start: usize) -> Option<u64> {
+    while let Some(ch) = message[start..].chars().next() {
+        if !ch.is_ascii_whitespace() {
+            break;
+        }
+        start += ch.len_utf8();
+    }
+    let mut end = start;
+    while let Some(ch) = message[end..].chars().next() {
+        if !ch.is_ascii_digit() {
+            break;
+        }
+        end += ch.len_utf8();
+    }
+    if end == start {
+        return None;
+    }
+    message[start..end]
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0)
+}
+
+fn is_word_boundary(message: &str, start: usize, end: usize) -> bool {
+    let before = message[..start].chars().next_back();
+    let after = message[end..].chars().next();
+    !before.is_some_and(is_word_char) && !after.is_some_and(is_word_char)
+}
+
+fn is_word_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
+}
+
+fn split_provider_limit_range(
+    range: &LedgerRange,
+    hint_max_len: Option<u64>,
+) -> Result<Vec<LedgerRange>, DatalensError> {
+    if let Some(max_len) = hint_max_len
+        && max_len > 0
+        && range.len() > u128::from(max_len)
+    {
+        return range.split(max_len);
+    }
+    let first_len = u64::try_from(range.len() / 2).unwrap_or(u64::MAX).max(1);
+    let first_end = range.start().saturating_add(first_len - 1);
+    Ok(vec![
+        LedgerRange::try_new(range.kind(), range.start(), first_end)?,
+        LedgerRange::try_new(range.kind(), first_end.saturating_add(1), range.end())?,
+    ])
 }
 
 fn follow_query_identity_key(task: &WarmupTask) -> Option<String> {
