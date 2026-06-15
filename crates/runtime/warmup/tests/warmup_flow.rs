@@ -1547,6 +1547,36 @@ fn test_task_pool_list_recovers_stale_running_task_for_scheduler() {
 }
 
 #[test]
+fn test_task_pool_get_recovers_stale_running_task_for_observation() {
+    let storage = LocalStorage::new(temp_root("pool-get-stale-running-storage"));
+    let registry = LocalWarmupRegistry::new(object_store("pool-get-stale-running-registry"));
+    let adapter = FixtureAdapter::new(10).with_max_range_len(1);
+    let pool = WarmupTaskPool::new(
+        runtime(adapter.clone(), storage, registry.clone()).with_stale_running_ttl_ms(60_000),
+        WarmupSchedulerConfig::default(),
+    );
+    let task_id = registry
+        .submit(submit_request(Some(1), WarmupTaskMode::FixedRange))
+        .expect("submit warmup")
+        .task_id;
+    let mut task = registry.get(&task_id).unwrap().unwrap();
+    task.state = WarmupTaskState::Running;
+    task.updated_at = now_unix_seconds().saturating_sub(120);
+    registry.save_task(&task).expect("save stale running task");
+    save_warmup_cursor(&registry, &task_id, 1, 7);
+
+    let observed = pool.get(&task_id).expect("get task").expect("task exists");
+
+    assert_eq!(observed.state, WarmupTaskState::Queued);
+    assert_eq!(adapter.fetches(), Vec::<LedgerRange>::new());
+    assert_eq!(
+        registry.get(&task_id).unwrap().unwrap().state,
+        WarmupTaskState::Queued
+    );
+    assert_eq!(registry.load_cursor(&task_id).unwrap().unwrap().next, 1);
+}
+
+#[test]
 fn test_task_pool_runs_available_tasks_with_global_bound() {
     let storage = LocalStorage::new(temp_root("pool-storage"));
     let registry = LocalWarmupRegistry::new(object_store("pool-registry"));
