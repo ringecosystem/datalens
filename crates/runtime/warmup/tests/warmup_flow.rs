@@ -281,6 +281,97 @@ fn test_ensure_follow_query_with_different_start_returns_existing_task_id() {
 }
 
 #[test]
+fn test_ensure_follow_query_does_not_scan_unrelated_tasks() {
+    let store = object_store("ensure-follow-query-direct-lookup");
+    let registry = LocalWarmupRegistry::new(store.clone());
+
+    let first = registry
+        .ensure(follow_query_request())
+        .expect("first ensure");
+    store
+        .put("tasks/unrelated-broken-task.json", b"{")
+        .expect("write unrelated broken task");
+    let second = registry
+        .ensure(follow_query_request())
+        .expect("second ensure");
+
+    assert!(first.created);
+    assert!(!second.created);
+    assert_eq!(first.task_id, second.task_id);
+}
+
+#[test]
+fn test_ensure_follow_query_indexes_legacy_identity_task() {
+    let store = object_store("ensure-follow-query-legacy-identity");
+    let registry = LocalWarmupRegistry::new(store.clone());
+    let original = registry
+        .ensure(follow_query_request())
+        .expect("original ensure")
+        .task_id;
+    let mut legacy_task = registry
+        .get(&original)
+        .expect("read original")
+        .expect("original task");
+    let legacy_task_id =
+        datalens_warmup::WarmupTaskId::new("legacy-follow-query-task").expect("legacy task id");
+    legacy_task.task_id = legacy_task_id.clone();
+    registry.save_task(&legacy_task).expect("save legacy task");
+    store
+        .delete(&format!("tasks/{}.json", original.as_str()))
+        .expect("delete deterministic task");
+    store
+        .delete(&format!("ensure-index/{}.json", original.as_str()))
+        .expect("delete deterministic index");
+
+    let found = registry
+        .ensure(follow_query_request())
+        .expect("ensure finds legacy task");
+    store
+        .put("tasks/unrelated-broken-task.json", b"{")
+        .expect("write unrelated broken task");
+    let indexed = registry
+        .ensure(follow_query_request())
+        .expect("ensure uses index");
+
+    assert!(!found.created);
+    assert_eq!(found.task_id, legacy_task_id);
+    assert!(!indexed.created);
+    assert_eq!(indexed.task_id, legacy_task_id);
+}
+
+#[test]
+fn test_ensure_follow_query_missing_index_prefers_better_legacy_task() {
+    let store = object_store("ensure-follow-query-missing-index-legacy-keeper");
+    let registry = LocalWarmupRegistry::new(store.clone());
+    let deterministic = registry
+        .ensure(follow_query_request())
+        .expect("deterministic ensure")
+        .task_id;
+    let mut legacy_task = registry
+        .get(&deterministic)
+        .expect("read deterministic")
+        .expect("deterministic task");
+    let legacy_task_id =
+        datalens_warmup::WarmupTaskId::new("legacy-follow-query-keeper").expect("legacy task id");
+    legacy_task.task_id = legacy_task_id.clone();
+    legacy_task.created_at = legacy_task.created_at.saturating_sub(1);
+    legacy_task.updated_at = legacy_task.updated_at.saturating_sub(1);
+    registry
+        .save_task(&legacy_task)
+        .expect("save legacy keeper task");
+    store
+        .delete(&format!("ensure-index/{}.json", deterministic.as_str()))
+        .expect("delete ensure index");
+
+    let found = registry
+        .ensure(follow_query_request())
+        .expect("ensure finds better legacy task");
+
+    assert!(!found.created);
+    assert_eq!(found.task_id, legacy_task_id);
+}
+
+#[test]
 fn test_submit_follow_query_with_different_start_uses_ensure_identity() {
     let registry = LocalWarmupRegistry::new(object_store("submit-follow-query-ensure-identity"));
     let first_request = follow_query_request();
@@ -1983,6 +2074,30 @@ fn test_ensure_prefers_runnable_keeper_over_paused_duplicate() {
         registry.get(&duplicate).unwrap().unwrap().state,
         WarmupTaskState::Paused
     );
+}
+
+#[test]
+fn test_ensure_index_keeps_better_runnable_keeper() {
+    let registry = LocalWarmupRegistry::new(object_store("ensure-index-runnable-keeper"));
+    let keeper = registry
+        .submit(follow_query_request())
+        .expect("keeper follow query")
+        .task_id;
+    let mut duplicate_task = registry.get(&keeper).unwrap().unwrap();
+    let duplicate = datalens_warmup::WarmupTaskId::new("zzzz-runnable-duplicate").unwrap();
+    duplicate_task.task_id = duplicate;
+    duplicate_task.created_at = duplicate_task.created_at.saturating_add(1);
+    duplicate_task.updated_at = duplicate_task.updated_at.saturating_add(1);
+    registry
+        .save_task(&duplicate_task)
+        .expect("save runnable duplicate task");
+
+    let ensured = registry
+        .ensure(follow_query_request())
+        .expect("ensure existing follow query");
+
+    assert_eq!(ensured.task_id, keeper);
+    assert!(!ensured.created);
 }
 
 #[test]
