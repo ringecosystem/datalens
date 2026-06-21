@@ -426,6 +426,8 @@ where
             start_offset_tiers_blocks: self.follow_query_start_offset_tiers_blocks.clone(),
             catchup_threshold_blocks: self.follow_query_catchup_threshold_blocks,
         });
+        let target_plan =
+            self.follow_query_exact_tail_target(&task, cursor.next, query_watermark, target_plan)?;
         log_target_plan(
             &task,
             cursor.next,
@@ -1092,23 +1094,8 @@ where
         if task.mode != WarmupTaskMode::FollowQuery {
             return Ok(None);
         }
-        if let Some(repository) = &self.query_activity {
-            let key = QueryActivityKey::new(
-                task.application_id.clone(),
-                task.chain.clone(),
-                task.dataset_key.clone(),
-                &task.selector,
-                task.range_kind.clone(),
-            );
-            if let Some(activity) = repository.read(&key)? {
-                let (range, updated_at_unix_seconds) = follow_query_activity_range(&activity);
-                if query_activity_is_fresh(
-                    updated_at_unix_seconds,
-                    self.query_activity_ttl_seconds,
-                )? {
-                    return Ok(Some(range.end()));
-                }
-            }
+        if let Some(range) = self.fresh_follow_query_activity_range(task)? {
+            return Ok(Some(range.end()));
         }
         let Some(repository) = &self.query_watermarks else {
             return Ok(None);
@@ -1123,6 +1110,97 @@ where
         Ok(repository
             .read(&key)?
             .map(|watermark| watermark.latest_block))
+    }
+
+    fn fresh_follow_query_activity_range(
+        &self,
+        task: &WarmupTask,
+    ) -> Result<Option<LedgerRange>, DatalensError> {
+        if task.mode != WarmupTaskMode::FollowQuery {
+            return Ok(None);
+        }
+        let Some(repository) = &self.query_activity else {
+            return Ok(None);
+        };
+        let key = QueryActivityKey::new(
+            task.application_id.clone(),
+            task.chain.clone(),
+            task.dataset_key.clone(),
+            &task.selector,
+            task.range_kind.clone(),
+        );
+        let Some(activity) = repository.read(&key)? else {
+            return Ok(None);
+        };
+        let (range, updated_at_unix_seconds) = follow_query_activity_range(&activity);
+        if query_activity_is_fresh(updated_at_unix_seconds, self.query_activity_ttl_seconds)? {
+            Ok(Some(range.clone()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn follow_query_exact_tail_target(
+        &self,
+        task: &WarmupTask,
+        cursor_next: u64,
+        query_watermark: Option<u64>,
+        target_plan: PlannedWarmupTarget,
+    ) -> Result<PlannedWarmupTarget, DatalensError> {
+        if task.mode != WarmupTaskMode::FollowQuery {
+            return Ok(target_plan);
+        }
+        if !matches!(
+            target_plan,
+            PlannedWarmupTarget::Range { start, .. }
+                if query_watermark.is_some_and(|watermark| start > watermark)
+        ) {
+            return Ok(target_plan);
+        }
+        let Some(query_range) = self.fresh_follow_query_activity_range(task)? else {
+            return Ok(target_plan);
+        };
+        if query_range.kind() != task.range_kind
+            || cursor_next <= query_range.start()
+            || cursor_next > query_range.end()
+        {
+            return Ok(target_plan);
+        }
+
+        let prefix = LedgerRange::try_new(
+            task.range_kind.clone(),
+            query_range.start(),
+            cursor_next.saturating_sub(1),
+        )?;
+        let prefix_covered = self.storage.covered_ranges(
+            &task.chain,
+            &task.dataset_key,
+            &task.selector,
+            prefix.clone(),
+        )?;
+        if !missing_ranges(prefix, &prefix_covered).is_empty() {
+            return Ok(target_plan);
+        }
+
+        let tail = LedgerRange::try_new(task.range_kind.clone(), cursor_next, query_range.end())?;
+        let tail_covered = self.storage.covered_ranges(
+            &task.chain,
+            &task.dataset_key,
+            &task.selector,
+            tail.clone(),
+        )?;
+        let tail_missing = missing_ranges(tail, &tail_covered);
+        if tail_missing
+            .first()
+            .is_some_and(|range| range.start() == cursor_next)
+        {
+            Ok(PlannedWarmupTarget::Range {
+                start: cursor_next,
+                end: query_range.end(),
+            })
+        } else {
+            Ok(target_plan)
+        }
     }
 
     fn task_with_follow_query_status(

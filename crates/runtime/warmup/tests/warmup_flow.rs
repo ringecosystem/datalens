@@ -1393,6 +1393,61 @@ fn test_follow_query_skips_existing_coverage_inside_lookahead_range() {
 }
 
 #[test]
+fn test_follow_query_fills_exact_missing_tail_before_watermark() {
+    let root = temp_root("follow-query-fills-exact-missing-tail");
+    let storage = LocalStorage::new(&root);
+    let watermarks = QueryWatermarkStore::new(LocalObjectStore::new(&root));
+    let activities = QueryActivityStore::new(LocalObjectStore::new(&root));
+    let registry = LocalWarmupRegistry::new(object_store(
+        "follow-query-fills-exact-missing-tail-registry",
+    ));
+    let adapter = FixtureAdapter::new(11_124_762)
+        .with_max_range_len(1_000)
+        .with_logs(vec![log_record(11_124_700, 0)]);
+    let runtime = runtime(adapter.clone(), storage.clone(), registry.clone())
+        .with_query_watermarks(watermarks.clone())
+        .with_query_activity(activities.clone())
+        .with_follow_query_start_offset_blocks(Some(1))
+        .with_follow_query_lookahead_blocks(1)
+        .with_runtime_config(WarmupRuntimeConfig {
+            max_fetches_per_task_loop: 1,
+        });
+    let mut request = follow_query_request();
+    request.start = 11_123_762;
+    request.chunk_policy.max_range_len = 1_000;
+    let task_id = registry
+        .submit(request)
+        .expect("submit follow query")
+        .task_id;
+    seed_coverage(&storage, blocks(11_123_762, 11_124_415));
+    save_warmup_cursor(&registry, &task_id, 11_124_416, 1);
+    save_query_watermark(&watermarks, 11_124_761);
+    save_query_activity(
+        &activities,
+        blocks(11_123_762, 11_124_761),
+        now_unix_seconds(),
+    );
+
+    let result = runtime.run_task_once(&task_id).expect("warmup run");
+
+    assert_eq!(result.status, WarmupRunStatus::Partial);
+    assert_eq!(adapter.fetches(), vec![blocks(11_124_416, 11_124_761)]);
+    assert_eq!(
+        storage
+            .covered_ranges(
+                &chain(),
+                &DatasetKey::evm_logs(),
+                &selector(),
+                blocks(11_123_762, 11_124_761)
+            )
+            .unwrap(),
+        vec![blocks(11_123_762, 11_124_761)]
+    );
+    let cursor = registry.load_cursor(&task_id).unwrap().expect("cursor");
+    assert_eq!(cursor.next, 11_124_762);
+}
+
+#[test]
 fn test_follow_query_uses_fresh_query_activity_before_monotonic_watermark() {
     let root = temp_root("follow-query-fresh-activity-before-watermark");
     let storage = LocalStorage::new(&root);
