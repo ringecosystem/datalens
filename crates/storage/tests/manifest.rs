@@ -1244,15 +1244,20 @@ fn coverage_index_keys<S: ObjectStore>(
 }
 
 fn clear_coverage_index<S: ObjectStore>(storage: &DurableStorage<S>, chain: &ChainIdentity) {
-    for object in storage
-        .object_store()
-        .list(&format!("chains/{}/coverage-index", chain.key_prefix()))
-        .expect("coverage index list")
-    {
-        storage
+    for prefix in [
+        format!("chains/{}/coverage-index", chain.key_prefix()),
+        format!("chains/{}/coverage-index-semantic", chain.key_prefix()),
+    ] {
+        for object in storage
             .object_store()
-            .delete(&object.key)
-            .expect("delete coverage index object");
+            .list(&prefix)
+            .expect("coverage index list")
+        {
+            storage
+                .object_store()
+                .delete(&object.key)
+                .expect("delete coverage index object");
+        }
     }
 }
 
@@ -2172,7 +2177,7 @@ fn test_evm_logs_rows_write_parquet_and_read_back() {
 }
 
 #[test]
-fn test_broad_evm_log_address_wildcard_topics_index_does_not_serve_narrow_query() {
+fn test_broad_evm_log_address_wildcard_topics_index_serves_compatible_narrow_query() {
     let storage = LocalStorage::new(temp_storage_root("semantic-address-wildcard-topics"));
     let chain = test_chain();
     let stored_selector = evm_log_selector(vec![ADDRESS_A, ADDRESS_B, ADDRESS_C], vec![]);
@@ -2207,7 +2212,10 @@ fn test_broad_evm_log_address_wildcard_topics_index_does_not_serve_narrow_query(
             LedgerRange::blocks(10, 11).expect("valid range"),
         )
         .expect("covered ranges");
-    assert!(covered.is_empty());
+    assert_eq!(
+        covered,
+        vec![LedgerRange::blocks(10, 11).expect("valid range")]
+    );
 
     let read = storage
         .read_rows(
@@ -2217,11 +2225,16 @@ fn test_broad_evm_log_address_wildcard_topics_index_does_not_serve_narrow_query(
             LedgerRange::blocks(10, 11).expect("valid range"),
         )
         .expect("read rows");
-    assert_eq!(read.row_count(), 0);
+    let QueryRows::EvmLogs(logs) = read.rows() else {
+        panic!("expected evm logs");
+    };
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].address, ADDRESS_A);
+    assert_eq!(logs[0].topics, vec![TOPIC_1.to_owned()]);
 }
 
 #[test]
-fn test_broad_evm_log_topic_values_index_does_not_serve_narrow_query() {
+fn test_broad_evm_log_topic_values_index_serves_compatible_narrow_query() {
     let storage = LocalStorage::new(temp_storage_root("semantic-topic-values"));
     let chain = test_chain();
     let stored_selector = evm_log_selector(
@@ -2259,7 +2272,12 @@ fn test_broad_evm_log_topic_values_index_does_not_serve_narrow_query() {
             LedgerRange::blocks(10, 10).expect("valid range"),
         )
         .expect("read rows");
-    assert_eq!(read.row_count(), 0);
+    let QueryRows::EvmLogs(logs) = read.rows() else {
+        panic!("expected evm logs");
+    };
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].address, ADDRESS_B);
+    assert_eq!(logs[0].topics, vec![TOPIC_2.to_owned()]);
 }
 
 #[test]
@@ -2318,7 +2336,7 @@ fn test_exact_evm_log_coverage_prevents_overlapping_semantic_read() {
 }
 
 #[test]
-fn test_partial_exact_coverage_does_not_use_semantic_fallback_for_missing_ranges() {
+fn test_partial_exact_coverage_uses_semantic_fallback_for_missing_ranges() {
     let storage = LocalStorage::new(temp_storage_root("semantic-partial-exact-fallback"));
     let chain = test_chain();
     let query_selector = evm_log_selector(vec![ADDRESS_A], vec![Some(vec![TOPIC_1])]);
@@ -2369,7 +2387,7 @@ fn test_partial_exact_coverage_does_not_use_semantic_fallback_for_missing_ranges
                 LedgerRange::blocks(12, 13).expect("valid range"),
             )
             .expect("covered ranges"),
-        vec![LedgerRange::blocks(12, 12).expect("valid range")]
+        vec![LedgerRange::blocks(12, 13).expect("valid range")]
     );
 
     let read = storage
@@ -2385,14 +2403,17 @@ fn test_partial_exact_coverage_does_not_use_semantic_fallback_for_missing_ranges
         read,
         DatasetRows::new(
             DatasetKey::evm_logs(),
-            QueryRows::EvmLogs(vec![log_record(12, 0, ADDRESS_A, vec![TOPIC_1]),])
+            QueryRows::EvmLogs(vec![
+                log_record(12, 0, ADDRESS_A, vec![TOPIC_1]),
+                log_record(13, 0, ADDRESS_A, vec![TOPIC_1]),
+            ])
         )
         .expect("dataset rows")
     );
 }
 
 #[test]
-fn test_broad_evm_log_empty_coverage_index_does_not_satisfy_narrow_query() {
+fn test_broad_evm_log_empty_coverage_index_satisfies_compatible_narrow_query() {
     let storage = LocalStorage::new(temp_storage_root("semantic-empty-coverage"));
     let chain = test_chain();
     let stored_selector = evm_log_selector(vec![ADDRESS_A, ADDRESS_B, ADDRESS_C], vec![]);
@@ -2420,7 +2441,10 @@ fn test_broad_evm_log_empty_coverage_index_does_not_satisfy_narrow_query() {
             LedgerRange::blocks(19, 23).expect("valid range"),
         )
         .expect("covered ranges");
-    assert!(covered.is_empty());
+    assert_eq!(
+        covered,
+        vec![LedgerRange::blocks(20, 22).expect("valid range")]
+    );
     let read = storage
         .read_rows(
             &chain,
@@ -2663,6 +2687,156 @@ fn test_evm_logs_legacy_parquet_without_block_metadata_reads_null_metadata() {
     assert_eq!(logs.len(), 1);
     assert_eq!(logs[0].parent_hash, None);
     assert_eq!(logs[0].block_timestamp, None);
+}
+
+#[test]
+fn test_semantic_evm_log_coverage_reuses_broad_cache_without_hiding_incomplete_topics() {
+    let storage = LocalStorage::new(temp_storage_root("semantic-log-coverage-reuse"));
+    let chain = test_chain();
+    let broad_selector = evm_log_selector(vec![], vec![Some(vec![TOPIC_1, TOPIC_2])]);
+    let topic_one_selector = evm_log_selector(vec![], vec![Some(vec![TOPIC_1])]);
+    let missing_broad_selector = evm_log_selector(vec![], vec![Some(vec![TOPIC_1, TOPIC_3])]);
+    let range = LedgerRange::blocks(10, 10).expect("valid range");
+    let broad_rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![
+            log_record(10, 1, ADDRESS_A, vec![TOPIC_1]),
+            log_record(10, 2, ADDRESS_A, vec![TOPIC_2]),
+        ]),
+    )
+    .expect("broad rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &broad_selector,
+            range: range.clone(),
+            rows: &broad_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write broad logs coverage");
+
+    assert_eq!(
+        storage
+            .covered_ranges(
+                &chain,
+                &DatasetKey::evm_logs(),
+                &topic_one_selector,
+                range.clone(),
+            )
+            .expect("covered ranges"),
+        vec![range.clone()]
+    );
+    let read = storage
+        .read_rows(
+            &chain,
+            &DatasetKey::evm_logs(),
+            &topic_one_selector,
+            range.clone(),
+        )
+        .expect("read topic one rows");
+    let QueryRows::EvmLogs(logs) = read.rows() else {
+        panic!("expected evm logs");
+    };
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].topics, vec![TOPIC_1.to_owned()]);
+
+    assert!(
+        storage
+            .covered_ranges(
+                &chain,
+                &DatasetKey::evm_logs(),
+                &missing_broad_selector,
+                range,
+            )
+            .expect("covered ranges")
+            .is_empty()
+    );
+}
+
+#[test]
+fn test_wildcard_evm_log_coverage_serves_fully_specific_queries() {
+    let storage = LocalStorage::new(temp_storage_root("wildcard-log-coverage-specific-query"));
+    let chain = test_chain();
+    let all_logs_selector = evm_log_selector(vec![], vec![]);
+    let specific_query = evm_log_selector(vec![ADDRESS_A], vec![Some(vec![TOPIC_1])]);
+    let all_logs_rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![
+            log_record(10, 1, ADDRESS_A, vec![TOPIC_1]),
+            log_record(10, 2, ADDRESS_B, vec![TOPIC_2]),
+        ]),
+    )
+    .expect("all logs rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &all_logs_selector,
+            range: LedgerRange::blocks(10, 10).expect("valid range"),
+            rows: &all_logs_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write all logs coverage");
+
+    let read = storage
+        .read_rows(
+            &chain,
+            &DatasetKey::evm_logs(),
+            &specific_query,
+            LedgerRange::blocks(10, 10).expect("valid range"),
+        )
+        .expect("read specific query rows");
+    let QueryRows::EvmLogs(logs) = read.rows() else {
+        panic!("expected evm logs");
+    };
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].address, ADDRESS_A);
+    assert_eq!(logs[0].topics, vec![TOPIC_1.to_owned()]);
+
+    let slot_wildcard_selector = evm_log_selector(vec![ADDRESS_A], vec![None, Some(vec![TOPIC_2])]);
+    let slot_specific_query = evm_log_selector(
+        vec![ADDRESS_A],
+        vec![Some(vec![TOPIC_1]), Some(vec![TOPIC_2])],
+    );
+    let slot_rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![
+            log_record(30, 1, ADDRESS_A, vec![TOPIC_1, TOPIC_2]),
+            log_record(30, 2, ADDRESS_A, vec![TOPIC_3, TOPIC_2]),
+        ]),
+    )
+    .expect("slot wildcard rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &slot_wildcard_selector,
+            range: LedgerRange::blocks(30, 30).expect("valid range"),
+            rows: &slot_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write slot wildcard coverage");
+
+    let read = storage
+        .read_rows(
+            &chain,
+            &DatasetKey::evm_logs(),
+            &slot_specific_query,
+            LedgerRange::blocks(30, 30).expect("valid range"),
+        )
+        .expect("read slot specific query rows");
+    let QueryRows::EvmLogs(logs) = read.rows() else {
+        panic!("expected evm logs");
+    };
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].topics, vec![TOPIC_1.to_owned(), TOPIC_2.to_owned()]);
 }
 
 #[test]

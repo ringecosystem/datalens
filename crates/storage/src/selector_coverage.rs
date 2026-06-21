@@ -146,7 +146,7 @@ pub(crate) fn filter_evm_log_rows_for_selector(
     }
 }
 
-fn parse_evm_log_canonical_key(canonical_key: &str) -> Option<EvmLogFilter> {
+pub(crate) fn parse_evm_log_canonical_key(canonical_key: &str) -> Option<EvmLogFilter> {
     let rest = canonical_key.strip_prefix("evm-logs/")?;
     let mut parts = rest.split('/');
     let addresses = parts.next()?.strip_prefix("addr=")?;

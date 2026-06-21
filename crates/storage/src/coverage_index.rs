@@ -1,5 +1,8 @@
 use datalens_chain::DatasetSelector;
-use datalens_core::{ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey, LedgerRange};
+use datalens_core::{
+    ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey, EvmLogFilter, LedgerRange,
+    TopicFilter,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -7,9 +10,13 @@ use std::{
     time::Instant,
 };
 
+use crate::selector_coverage::{parse_evm_log_canonical_key, selector_coverage_candidates};
 use crate::{Manifest, ManifestEntry, ManifestFinalityLevel, ObjectStore, range_kind_key};
 
 pub(crate) const DEFAULT_COVERAGE_INDEX_BUCKET_SIZE: u64 = 100_000;
+const EVM_LOG_SEMANTIC_INDEX_VERSION: &str = "evm-logs-v1";
+const MAX_EVM_LOG_TOPIC_VALUE_SEMANTIC_KEYS: usize = 128;
+const EVM_LOG_LARGE_TOPIC_VALUE_SCOPE: &str = "_large-any-of";
 
 static COVERAGE_INDEX_UPDATE_LOCKS: OnceLock<Mutex<BTreeMap<String, Weak<Mutex<()>>>>> =
     OnceLock::new();
@@ -34,7 +41,7 @@ pub(crate) struct CoverageIndexReplacementPublish {
     pub(crate) published_entries: Vec<ManifestEntry>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct CoverageIndexReplacementBucket {
     key: String,
     bucket_start: u64,
@@ -66,7 +73,6 @@ pub(crate) fn read_entries_for_query<S>(
 where
     S: ObjectStore,
 {
-    let selector_fingerprint = selector.fingerprint();
     let mut entries = Vec::new();
     let mut any_bucket_has_index = false;
     for (bucket_start, bucket_end) in bucket_ranges(range, DEFAULT_COVERAGE_INDEX_BUCKET_SIZE) {
@@ -75,27 +81,28 @@ where
             ManifestFinalityLevel::Safe,
             ManifestFinalityLevel::Finalized,
         ] {
-            let key = coverage_index_key(
+            for key in coverage_index_query_keys(
                 chain,
                 dataset_key,
                 range,
-                &selector_fingerprint,
+                selector,
                 finality_level,
                 bucket_start,
                 bucket_end,
-            );
-            if !object_store.exists(&key)? {
-                continue;
+            ) {
+                if !object_store.exists(&key)? {
+                    continue;
+                }
+                let bytes = object_store.get(&key)?;
+                let mut index: CoverageIndex = serde_json::from_slice(&bytes).map_err(|error| {
+                    DatalensError::new(
+                        DatalensErrorKind::StorageReadFailure,
+                        format!("decode coverage index {key}: {error}"),
+                    )
+                })?;
+                bucket_has_index = true;
+                entries.append(&mut index.entries);
             }
-            let bytes = object_store.get(&key)?;
-            let mut index: CoverageIndex = serde_json::from_slice(&bytes).map_err(|error| {
-                DatalensError::new(
-                    DatalensErrorKind::StorageReadFailure,
-                    format!("decode coverage index {key}: {error}"),
-                )
-            })?;
-            bucket_has_index = true;
-            entries.append(&mut index.entries);
         }
         if bucket_has_index {
             any_bucket_has_index = true;
@@ -107,7 +114,12 @@ where
 
     let mut index = CoverageIndex { entries };
     index.normalize();
-    Ok(Some(index.entries))
+    Ok(Some(
+        selector_coverage_candidates(&index.entries, chain, dataset_key, selector, range)
+            .into_iter()
+            .map(|candidate| candidate.entry.clone())
+            .collect(),
+    ))
 }
 
 pub(crate) fn write_entry<S>(object_store: &S, entry: &ManifestEntry) -> Result<(), DatalensError>
@@ -118,52 +130,45 @@ where
         bucket_ranges(&entry.range, DEFAULT_COVERAGE_INDEX_BUCKET_SIZE)
     {
         let started = Instant::now();
-        let key = coverage_index_key(
-            &entry.chain,
-            &entry.dataset_key,
-            &entry.range,
-            &entry.selector_fingerprint,
-            entry.finality_level,
-            bucket_start,
-            bucket_end,
-        );
-        let lock = coverage_index_update_lock(object_store, &key)?;
-        let _guard = lock_coverage_index_update(&lock)?;
-        let mut index = if object_store.exists(&key)? {
-            let bytes = object_store.get(&key)?;
-            serde_json::from_slice(&bytes).map_err(|error| {
+        for key in coverage_index_entry_keys(entry, bucket_start, bucket_end) {
+            let lock = coverage_index_update_lock(object_store, &key)?;
+            let _guard = lock_coverage_index_update(&lock)?;
+            let mut index = if object_store.exists(&key)? {
+                let bytes = object_store.get(&key)?;
+                serde_json::from_slice(&bytes).map_err(|error| {
+                    DatalensError::new(
+                        DatalensErrorKind::StorageReadFailure,
+                        format!("decode coverage index {key}: {error}"),
+                    )
+                })?
+            } else {
+                CoverageIndex::default()
+            };
+            index.upsert(entry.clone());
+            let bytes = serde_json::to_vec_pretty(&index).map_err(|error| {
                 DatalensError::new(
-                    DatalensErrorKind::StorageReadFailure,
-                    format!("decode coverage index {key}: {error}"),
+                    DatalensErrorKind::Internal,
+                    format!("encode coverage index: {error}"),
                 )
-            })?
-        } else {
-            CoverageIndex::default()
-        };
-        index.upsert(entry.clone());
-        let bytes = serde_json::to_vec_pretty(&index).map_err(|error| {
-            DatalensError::new(
-                DatalensErrorKind::Internal,
-                format!("encode coverage index: {error}"),
-            )
-        })?;
-        object_store.put(&key, &bytes).map_err(|error| {
-            DatalensError::new(
-                DatalensErrorKind::ManifestUpdateFailure,
-                format!("write coverage index {key}: {}", error.message),
-            )
-        })?;
-        log::info!(
-            "storage wrote coverage index chain_key={} dataset={} selector_fingerprint={} range_kind={} bucket={}-{} entries_count={} duration_ms={}",
-            entry.chain.key_prefix(),
-            entry.dataset_key.as_str(),
-            entry.selector_fingerprint,
-            range_kind_key(entry.range.kind()),
-            bucket_start,
-            bucket_end,
-            index.entries.len(),
-            started.elapsed().as_millis()
-        );
+            })?;
+            object_store.put(&key, &bytes).map_err(|error| {
+                DatalensError::new(
+                    DatalensErrorKind::ManifestUpdateFailure,
+                    format!("write coverage index {key}: {}", error.message),
+                )
+            })?;
+            log::info!(
+                "storage wrote coverage index chain_key={} dataset={} selector_fingerprint={} range_kind={} bucket={}-{} entries_count={} duration_ms={}",
+                entry.chain.key_prefix(),
+                entry.dataset_key.as_str(),
+                entry.selector_fingerprint,
+                range_kind_key(entry.range.kind()),
+                bucket_start,
+                bucket_end,
+                index.entries.len(),
+                started.elapsed().as_millis()
+            );
+        }
     }
     Ok(())
 }
@@ -201,32 +206,34 @@ where
     };
     replaced_manifest.normalize();
 
-    let mut buckets = BTreeSet::new();
-    for replaced_entry in &replaced_manifest.entries {
-        buckets.extend(bucket_ranges(
-            &replaced_entry.range,
-            DEFAULT_COVERAGE_INDEX_BUCKET_SIZE,
-        ));
-    }
-    let replacement_buckets = bucket_ranges(&entry.range, DEFAULT_COVERAGE_INDEX_BUCKET_SIZE);
-    buckets.extend(replacement_buckets.iter().copied());
-
-    let mut bucket_updates = Vec::new();
-    for (bucket_start, bucket_end) in buckets {
-        let key = coverage_index_key(
-            &entry.chain,
-            &entry.dataset_key,
-            &entry.range,
-            &entry.selector_fingerprint,
-            entry.finality_level,
-            bucket_start,
-            bucket_end,
+    let mut bucket_updates = BTreeSet::new();
+    for (bucket_start, bucket_end) in
+        bucket_ranges(&entry.range, DEFAULT_COVERAGE_INDEX_BUCKET_SIZE)
+    {
+        bucket_updates.extend(
+            coverage_index_entry_keys(entry, bucket_start, bucket_end)
+                .into_iter()
+                .map(|key| CoverageIndexReplacementBucket {
+                    key,
+                    bucket_start,
+                    bucket_end,
+                }),
         );
-        bucket_updates.push(CoverageIndexReplacementBucket {
-            key,
-            bucket_start,
-            bucket_end,
-        });
+    }
+    for replaced_entry in &replaced_manifest.entries {
+        for (bucket_start, bucket_end) in
+            bucket_ranges(&replaced_entry.range, DEFAULT_COVERAGE_INDEX_BUCKET_SIZE)
+        {
+            bucket_updates.extend(
+                coverage_index_entry_keys(replaced_entry, bucket_start, bucket_end)
+                    .into_iter()
+                    .map(|key| CoverageIndexReplacementBucket {
+                        key,
+                        bucket_start,
+                        bucket_end,
+                    }),
+            );
+        }
     }
 
     let mut published_manifest = Manifest {
@@ -236,7 +243,7 @@ where
     Ok(CoverageIndexReplacement {
         replaced_entries: replaced_manifest.entries,
         published_entries: published_manifest.entries,
-        bucket_updates,
+        bucket_updates: bucket_updates.into_iter().collect(),
     })
 }
 
@@ -263,29 +270,33 @@ pub(crate) fn publish_replacement<S>(
 where
     S: ObjectStore,
 {
-    let replacement_buckets = bucket_ranges(&entry.range, DEFAULT_COVERAGE_INDEX_BUCKET_SIZE);
+    let replacement_buckets = bucket_ranges(&entry.range, DEFAULT_COVERAGE_INDEX_BUCKET_SIZE)
+        .into_iter()
+        .flat_map(|(bucket_start, bucket_end)| {
+            coverage_index_entry_keys(entry, bucket_start, bucket_end)
+                .into_iter()
+                .map(move |key| CoverageIndexReplacementBucket {
+                    key,
+                    bucket_start,
+                    bucket_end,
+                })
+        })
+        .collect::<BTreeSet<_>>();
     let mut pending_buckets = replacement
         .bucket_updates
         .iter()
-        .map(|bucket| (bucket.bucket_start, bucket.bucket_end))
+        .cloned()
         .collect::<BTreeSet<_>>();
     let mut processed_buckets = BTreeSet::new();
     let mut actual_replaced_entries = Vec::new();
-    while let Some((bucket_start, bucket_end)) = pending_buckets.pop_first() {
-        if !processed_buckets.insert((bucket_start, bucket_end)) {
+    while let Some(bucket) = pending_buckets.pop_first() {
+        if !processed_buckets.insert(bucket.clone()) {
             continue;
         }
         let started = Instant::now();
-        let key = coverage_index_key(
-            &entry.chain,
-            &entry.dataset_key,
-            &entry.range,
-            &entry.selector_fingerprint,
-            entry.finality_level,
-            bucket_start,
-            bucket_end,
-        );
-        let bucket_range = LedgerRange::try_new(entry.range.kind(), bucket_start, bucket_end)?;
+        let key = bucket.key.clone();
+        let bucket_range =
+            LedgerRange::try_new(entry.range.kind(), bucket.bucket_start, bucket.bucket_end)?;
         let lock = coverage_index_update_lock(object_store, &key)?;
         let _guard = lock_coverage_index_update(&lock)?;
         let index = read_index(object_store, &key)?;
@@ -300,8 +311,17 @@ where
                 for discovered_bucket in
                     bucket_ranges(&existing_entry.range, DEFAULT_COVERAGE_INDEX_BUCKET_SIZE)
                 {
-                    if !processed_buckets.contains(&discovered_bucket) {
-                        pending_buckets.insert(discovered_bucket);
+                    let (bucket_start, bucket_end) = discovered_bucket;
+                    for key in coverage_index_entry_keys(&existing_entry, bucket_start, bucket_end)
+                    {
+                        let discovered = CoverageIndexReplacementBucket {
+                            key,
+                            bucket_start,
+                            bucket_end,
+                        };
+                        if !processed_buckets.contains(&discovered) {
+                            pending_buckets.insert(discovered);
+                        }
                     }
                 }
                 entries.extend(
@@ -315,7 +335,7 @@ where
                 entries.push(existing_entry);
             }
         }
-        if replacement_buckets.contains(&(bucket_start, bucket_end)) {
+        if replacement_buckets.contains(&bucket) {
             entries.push(entry.clone());
         }
         let mut index = CoverageIndex { entries };
@@ -340,8 +360,8 @@ where
             range_kind_key(entry.range.kind()),
             entry.range.start(),
             entry.range.end(),
-            bucket_start,
-            bucket_end,
+            bucket.bucket_start,
+            bucket.bucket_end,
             bucket_replaced_entries_count,
             index.entries.len(),
             started.elapsed().as_millis()
@@ -428,13 +448,18 @@ pub(crate) fn delete_chain<S>(object_store: &S, chain: &ChainIdentity) -> Result
 where
     S: ObjectStore,
 {
-    for object in object_store.list(&coverage_index_prefix(chain))? {
-        object_store.delete(&object.key).map_err(|error| {
-            DatalensError::new(
-                DatalensErrorKind::ManifestUpdateFailure,
-                format!("delete coverage index {}: {}", object.key, error.message),
-            )
-        })?;
+    for prefix in [
+        coverage_index_prefix(chain),
+        semantic_coverage_index_prefix(chain),
+    ] {
+        for object in object_store.list(&prefix)? {
+            object_store.delete(&object.key).map_err(|error| {
+                DatalensError::new(
+                    DatalensErrorKind::ManifestUpdateFailure,
+                    format!("delete coverage index {}: {}", object.key, error.message),
+                )
+            })?;
+        }
     }
     Ok(())
 }
@@ -442,6 +467,11 @@ where
 #[allow(dead_code)]
 fn coverage_index_prefix(chain: &ChainIdentity) -> String {
     format!("chains/{}/coverage-index", chain.key_prefix())
+}
+
+#[allow(dead_code)]
+fn semantic_coverage_index_prefix(chain: &ChainIdentity) -> String {
+    format!("chains/{}/coverage-index-semantic", chain.key_prefix())
 }
 
 fn coverage_index_key(
@@ -463,6 +493,180 @@ fn coverage_index_key(
         bucket_start,
         bucket_end,
     )
+}
+
+fn semantic_coverage_index_key(
+    chain: &ChainIdentity,
+    dataset_key: &DatasetKey,
+    range: &LedgerRange,
+    finality_level: ManifestFinalityLevel,
+    scope: &str,
+    bucket_start: u64,
+    bucket_end: u64,
+) -> String {
+    format!(
+        "chains/{}/coverage-index-semantic/{}/{}/{}/{}/{}/{:020}-{:020}.json",
+        chain.key_prefix(),
+        dataset_key.as_str(),
+        range_kind_key(range.kind()),
+        finality_level.as_str(),
+        EVM_LOG_SEMANTIC_INDEX_VERSION,
+        scope,
+        bucket_start,
+        bucket_end,
+    )
+}
+
+fn coverage_index_query_keys(
+    chain: &ChainIdentity,
+    dataset_key: &DatasetKey,
+    range: &LedgerRange,
+    selector: &DatasetSelector,
+    finality_level: ManifestFinalityLevel,
+    bucket_start: u64,
+    bucket_end: u64,
+) -> Vec<String> {
+    let mut keys = BTreeSet::from([coverage_index_key(
+        chain,
+        dataset_key,
+        range,
+        &selector.fingerprint(),
+        finality_level,
+        bucket_start,
+        bucket_end,
+    )]);
+    if *dataset_key == DatasetKey::evm_logs()
+        && let DatasetSelector::EvmLogs(filter) = selector
+    {
+        keys.extend(
+            evm_log_query_semantic_scopes(filter)
+                .into_iter()
+                .map(|scope| {
+                    semantic_coverage_index_key(
+                        chain,
+                        dataset_key,
+                        range,
+                        finality_level,
+                        &scope,
+                        bucket_start,
+                        bucket_end,
+                    )
+                }),
+        );
+    }
+    keys.into_iter().collect()
+}
+
+fn coverage_index_entry_keys(
+    entry: &ManifestEntry,
+    bucket_start: u64,
+    bucket_end: u64,
+) -> Vec<String> {
+    let mut keys = BTreeSet::from([coverage_index_key(
+        &entry.chain,
+        &entry.dataset_key,
+        &entry.range,
+        &entry.selector_fingerprint,
+        entry.finality_level,
+        bucket_start,
+        bucket_end,
+    )]);
+    if entry.dataset_key == DatasetKey::evm_logs()
+        && let Some(filter) = parse_evm_log_canonical_key(&entry.selector_canonical_key)
+    {
+        keys.extend(
+            evm_log_entry_semantic_scopes(&filter)
+                .into_iter()
+                .map(|scope| {
+                    semantic_coverage_index_key(
+                        &entry.chain,
+                        &entry.dataset_key,
+                        &entry.range,
+                        entry.finality_level,
+                        &scope,
+                        bucket_start,
+                        bucket_end,
+                    )
+                }),
+        );
+    }
+    keys.into_iter().collect()
+}
+
+fn evm_log_entry_semantic_scopes(filter: &EvmLogFilter) -> BTreeSet<String> {
+    let mut scopes = BTreeSet::new();
+    if filter.addresses().is_empty() {
+        scopes.insert("addr/*".to_owned());
+    } else {
+        scopes.extend(
+            filter
+                .addresses()
+                .iter()
+                .map(|address| format!("addr/{address}")),
+        );
+    }
+
+    if filter.topics().is_empty()
+        || filter
+            .topics()
+            .iter()
+            .all(|topic| matches!(topic, TopicFilter::Wildcard))
+    {
+        scopes.insert("topic/*".to_owned());
+    } else {
+        for (index, topic) in filter.topics().iter().enumerate() {
+            match topic {
+                TopicFilter::Wildcard => {
+                    scopes.insert(format!("topic/{index}/*"));
+                }
+                TopicFilter::AnyOf(values) if values.is_empty() => {
+                    scopes.insert(format!("topic/{index}/[]"));
+                }
+                TopicFilter::AnyOf(values)
+                    if values.len() > MAX_EVM_LOG_TOPIC_VALUE_SEMANTIC_KEYS =>
+                {
+                    scopes.insert(format!("topic/{index}/{EVM_LOG_LARGE_TOPIC_VALUE_SCOPE}"));
+                }
+                TopicFilter::AnyOf(values) => {
+                    scopes.extend(values.iter().map(|value| format!("topic/{index}/{value}")));
+                }
+            }
+        }
+    }
+    scopes
+}
+
+fn evm_log_query_semantic_scopes(filter: &EvmLogFilter) -> BTreeSet<String> {
+    let mut scopes = BTreeSet::new();
+    if filter.addresses().is_empty() {
+        scopes.insert("addr/*".to_owned());
+    } else {
+        scopes.insert("addr/*".to_owned());
+        scopes.extend(
+            filter
+                .addresses()
+                .iter()
+                .map(|address| format!("addr/{address}")),
+        );
+    }
+
+    scopes.insert("topic/*".to_owned());
+    for (index, topic) in filter.topics().iter().enumerate() {
+        scopes.insert(format!("topic/{index}/*"));
+        match topic {
+            TopicFilter::Wildcard => {}
+            TopicFilter::AnyOf(values) if values.is_empty() => {
+                scopes.insert(format!("topic/{index}/[]"));
+            }
+            TopicFilter::AnyOf(values) => {
+                scopes.insert(format!("topic/{index}/{EVM_LOG_LARGE_TOPIC_VALUE_SCOPE}"));
+                if values.len() <= MAX_EVM_LOG_TOPIC_VALUE_SEMANTIC_KEYS {
+                    scopes.extend(values.iter().map(|value| format!("topic/{index}/{value}")));
+                }
+            }
+        }
+    }
+    scopes
 }
 
 fn replacement_scope_matches(existing: &ManifestEntry, replacement: &ManifestEntry) -> bool {
@@ -572,7 +776,7 @@ fn can_merge_empty(left: &ManifestEntry, right: &ManifestEntry) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datalens_core::{ChainFamily, NetworkId};
+    use datalens_core::{ChainFamily, LogFilter, NetworkId};
 
     fn temp_storage_root(name: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -607,6 +811,81 @@ mod tests {
             checksum_algorithm: None,
             written_at_unix_seconds: None,
         }
+    }
+
+    fn evm_logs_selector(topics: Vec<Option<Vec<String>>>) -> DatasetSelector {
+        DatasetSelector::try_evm_logs(LogFilter {
+            addresses: Vec::new(),
+            topics,
+        })
+        .expect("valid evm logs selector")
+    }
+
+    fn evm_logs_selector_with_addresses(
+        addresses: Vec<String>,
+        topics: Vec<Option<Vec<String>>>,
+    ) -> DatasetSelector {
+        DatasetSelector::try_evm_logs(LogFilter { addresses, topics })
+            .expect("valid evm logs selector")
+    }
+
+    fn evm_logs_entry(
+        chain: &ChainIdentity,
+        selector: &DatasetSelector,
+        start: u64,
+        end: u64,
+        rows: usize,
+    ) -> ManifestEntry {
+        let range = LedgerRange::blocks(start, end).expect("valid range");
+        ManifestEntry {
+            chain: chain.clone(),
+            dataset_key: DatasetKey::evm_logs(),
+            range: range.clone(),
+            selector_fingerprint: selector.fingerprint(),
+            selector_canonical_key: selector.canonical_key(),
+            finality_level: ManifestFinalityLevel::Safe,
+            object_key: (rows > 0).then(|| {
+                crate::helpers::object_key(
+                    chain,
+                    &DatasetKey::evm_logs(),
+                    range,
+                    &selector.fingerprint(),
+                    crate::ObjectEncoding::ParquetV1,
+                )
+            }),
+            object_encoding: (rows > 0).then_some(crate::ObjectEncoding::ParquetV1),
+            object_compression: None,
+            row_count: rows,
+            object_size_bytes: (rows > 0).then_some(1),
+            checksum: (rows > 0).then(|| format!("{start:064x}")),
+            checksum_algorithm: (rows > 0).then(|| "sha256".to_owned()),
+            written_at_unix_seconds: Some(1),
+        }
+    }
+
+    fn topic(value: u16) -> String {
+        format!("0x{value:064x}")
+    }
+
+    fn address(value: u16) -> String {
+        format!("0x{value:040x}")
+    }
+
+    fn delete_semantic_bucket(
+        object_store: &crate::LocalObjectStore,
+        chain: &ChainIdentity,
+        scope: &str,
+    ) {
+        let key = semantic_coverage_index_key(
+            chain,
+            &DatasetKey::evm_logs(),
+            &LedgerRange::blocks(10, 10).expect("valid range"),
+            ManifestFinalityLevel::Safe,
+            scope,
+            0,
+            99_999,
+        );
+        object_store.delete(&key).expect("delete semantic bucket");
     }
 
     fn data_entry(chain: &ChainIdentity, start: u64, end: u64) -> ManifestEntry {
@@ -745,6 +1024,157 @@ mod tests {
         assert_eq!(
             index_bucket_ranges(&object_store, &chain, 100_000, 199_999),
             vec![(100_000, 100_000), (100_001, 100_001)]
+        );
+    }
+
+    #[test]
+    fn test_read_entries_for_query_finds_semantic_evm_log_bucket_candidates() {
+        let object_store =
+            crate::LocalObjectStore::new(temp_storage_root("semantic-evm-log-bucket-candidates"));
+        let chain = test_chain();
+        let broad = evm_logs_selector(vec![Some(vec![topic(1), topic(2)])]);
+        let query = evm_logs_selector(vec![Some(vec![topic(1)])]);
+        let entry = evm_logs_entry(&chain, &broad, 10, 20, 1);
+
+        write_entry(&object_store, &entry).expect("write broad evm logs coverage");
+
+        let entries = read_entries_for_query(
+            &object_store,
+            &chain,
+            &DatasetKey::evm_logs(),
+            &query,
+            &LedgerRange::blocks(10, 20).expect("valid range"),
+        )
+        .expect("read coverage index")
+        .expect("coverage index entries");
+
+        assert_eq!(entries, vec![entry]);
+    }
+
+    #[test]
+    fn test_read_entries_for_query_finds_all_wildcard_evm_log_coverage_for_specific_query() {
+        let object_store =
+            crate::LocalObjectStore::new(temp_storage_root("wildcard-evm-log-specific-query"));
+        let chain = test_chain();
+        let all_logs = evm_logs_selector(Vec::new());
+        let query = evm_logs_selector_with_addresses(
+            vec![address(1)],
+            vec![Some(vec![topic(1)]), Some(vec![topic(2)])],
+        );
+        let entry = evm_logs_entry(&chain, &all_logs, 10, 20, 1);
+
+        write_entry(&object_store, &entry).expect("write all logs coverage");
+
+        let entries = read_entries_for_query(
+            &object_store,
+            &chain,
+            &DatasetKey::evm_logs(),
+            &query,
+            &LedgerRange::blocks(10, 20).expect("valid range"),
+        )
+        .expect("read coverage index")
+        .expect("coverage index entries");
+
+        assert_eq!(entries, vec![entry]);
+    }
+
+    #[test]
+    fn test_read_entries_for_query_finds_topic_slot_wildcard_evm_log_coverage() {
+        let object_store =
+            crate::LocalObjectStore::new(temp_storage_root("topic-slot-wildcard-query"));
+        let chain = test_chain();
+        let stored =
+            evm_logs_selector_with_addresses(vec![address(1)], vec![None, Some(vec![topic(2)])]);
+        let query = evm_logs_selector_with_addresses(
+            vec![address(1)],
+            vec![Some(vec![topic(1)]), Some(vec![topic(2)])],
+        );
+        let entry = evm_logs_entry(&chain, &stored, 10, 20, 1);
+
+        write_entry(&object_store, &entry).expect("write wildcard topic slot coverage");
+        delete_semantic_bucket(&object_store, &chain, &format!("addr/{}", address(1)));
+        delete_semantic_bucket(&object_store, &chain, &format!("topic/1/{}", topic(2)));
+
+        let entries = read_entries_for_query(
+            &object_store,
+            &chain,
+            &DatasetKey::evm_logs(),
+            &query,
+            &LedgerRange::blocks(10, 20).expect("valid range"),
+        )
+        .expect("read coverage index")
+        .expect("coverage index entries");
+
+        assert_eq!(entries, vec![entry]);
+    }
+
+    #[test]
+    fn test_read_entries_for_query_does_not_use_narrow_evm_logs_for_broad_query() {
+        let object_store =
+            crate::LocalObjectStore::new(temp_storage_root("narrow-evm-log-does-not-cover-broad"));
+        let chain = test_chain();
+        let narrow = evm_logs_selector(vec![Some(vec![topic(1)])]);
+        let broad_query = evm_logs_selector(vec![Some(vec![topic(1), topic(2)])]);
+        let entry = evm_logs_entry(&chain, &narrow, 10, 20, 1);
+
+        write_entry(&object_store, &entry).expect("write narrow evm logs coverage");
+
+        let entries = read_entries_for_query(
+            &object_store,
+            &chain,
+            &DatasetKey::evm_logs(),
+            &broad_query,
+            &LedgerRange::blocks(10, 20).expect("valid range"),
+        )
+        .expect("read coverage index");
+
+        assert!(entries.unwrap_or_default().is_empty());
+    }
+
+    #[test]
+    fn test_read_entries_for_query_ignores_semantically_invalid_empty_evm_log_coverage() {
+        let object_store =
+            crate::LocalObjectStore::new(temp_storage_root("invalid-empty-evm-log-coverage"));
+        let chain = test_chain();
+        let empty_narrow = evm_logs_selector(vec![Some(vec![topic(1)])]);
+        let broad_query = evm_logs_selector(vec![Some(vec![topic(1), topic(2)])]);
+        let entry = evm_logs_entry(&chain, &empty_narrow, 10, 20, 0);
+
+        write_entry(&object_store, &entry).expect("write empty narrow evm logs coverage");
+
+        let entries = read_entries_for_query(
+            &object_store,
+            &chain,
+            &DatasetKey::evm_logs(),
+            &broad_query,
+            &LedgerRange::blocks(10, 20).expect("valid range"),
+        )
+        .expect("read coverage index");
+
+        assert!(entries.unwrap_or_default().is_empty());
+    }
+
+    #[test]
+    fn test_evm_log_semantic_key_generation_bounds_large_topic_value_sets() {
+        let chain = test_chain();
+        let topics = (0..512).map(topic).collect::<Vec<_>>();
+        let selector = evm_logs_selector(vec![Some(topics)]);
+        let entry = evm_logs_entry(&chain, &selector, 10, 20, 1);
+        let range = LedgerRange::blocks(10, 20).expect("valid range");
+
+        assert!(coverage_index_entry_keys(&entry, 0, 99_999).len() <= 16);
+        assert!(
+            coverage_index_query_keys(
+                &chain,
+                &DatasetKey::evm_logs(),
+                &range,
+                &selector,
+                ManifestFinalityLevel::Safe,
+                0,
+                99_999,
+            )
+            .len()
+                <= 16
         );
     }
 }
