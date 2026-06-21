@@ -241,6 +241,83 @@ impl StorageWriteLogContext {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StorageCoveragePlan {
+    chain: ChainIdentity,
+    dataset_key: DatasetKey,
+    selector_fingerprint: String,
+    selector_canonical_key: String,
+    range: LedgerRange,
+    covered_ranges: Vec<LedgerRange>,
+    index_entries: Option<Vec<ManifestEntry>>,
+}
+
+impl StorageCoveragePlan {
+    fn from_covered_ranges(
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+        covered_ranges: Vec<LedgerRange>,
+    ) -> Self {
+        Self {
+            chain: chain.clone(),
+            dataset_key: dataset_key.clone(),
+            selector_fingerprint: selector.fingerprint(),
+            selector_canonical_key: selector.canonical_key(),
+            range,
+            covered_ranges,
+            index_entries: None,
+        }
+    }
+
+    fn from_index_entries(
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+        covered_ranges: Vec<LedgerRange>,
+        index_entries: Vec<ManifestEntry>,
+    ) -> Self {
+        Self {
+            chain: chain.clone(),
+            dataset_key: dataset_key.clone(),
+            selector_fingerprint: selector.fingerprint(),
+            selector_canonical_key: selector.canonical_key(),
+            range,
+            covered_ranges,
+            index_entries: Some(index_entries),
+        }
+    }
+
+    pub fn covered_ranges(&self) -> &[LedgerRange] {
+        &self.covered_ranges
+    }
+
+    fn validate_read(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: &LedgerRange,
+    ) -> Result<(), DatalensError> {
+        if self.chain != *chain
+            || self.dataset_key != *dataset_key
+            || self.selector_fingerprint != selector.fingerprint()
+            || self.selector_canonical_key != selector.canonical_key()
+            || self.range.kind() != range.kind()
+            || self.range.start() > range.start()
+            || self.range.end() < range.end()
+        {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                "storage coverage plan does not match read request",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug)]
 struct StorageReadPlan {
     coverage_entries_count: usize,
@@ -248,6 +325,17 @@ struct StorageReadPlan {
     empty_coverage_count: usize,
     objects: Vec<StorageReadPlanObject>,
     reads: Vec<StorageReadPlanRead>,
+}
+
+struct StorageReadEntriesRequest<'a> {
+    chain: &'a ChainIdentity,
+    dataset_key: &'a DatasetKey,
+    selector: &'a DatasetSelector,
+    range: LedgerRange,
+    finality_level: Option<ManifestFinalityLevel>,
+    coverage_source: &'static str,
+    entries: Vec<ManifestEntry>,
+    coverage_started: Instant,
 }
 
 #[derive(Clone, Debug)]
@@ -416,6 +504,19 @@ where
         selector: &DatasetSelector,
         range: LedgerRange,
     ) -> Result<Vec<LedgerRange>, DatalensError> {
+        Ok(self
+            .coverage_plan(chain, dataset_key, selector, range)?
+            .covered_ranges()
+            .to_vec())
+    }
+
+    pub fn coverage_plan(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+    ) -> Result<StorageCoveragePlan, DatalensError> {
         let started = Instant::now();
         if let Some(index_entries) = coverage_index::read_entries_for_query(
             &self.object_store,
@@ -440,7 +541,14 @@ where
                 missing.len(),
                 started.elapsed().as_millis()
             );
-            return Ok(covered);
+            return Ok(StorageCoveragePlan::from_index_entries(
+                chain,
+                dataset_key,
+                selector,
+                range,
+                covered,
+                index_entries,
+            ));
         }
 
         log::info!(
@@ -453,7 +561,13 @@ where
             range.end(),
             started.elapsed().as_millis()
         );
-        Ok(Vec::new())
+        Ok(StorageCoveragePlan::from_covered_ranges(
+            chain,
+            dataset_key,
+            selector,
+            range,
+            Vec::new(),
+        ))
     }
 
     pub fn read_rows(
@@ -464,6 +578,31 @@ where
         range: LedgerRange,
     ) -> Result<DatasetRows, DatalensError> {
         self.read_rows_with_finality_filter(chain, dataset_key, selector, range, None)
+    }
+
+    pub fn read_rows_with_coverage_plan(
+        &self,
+        coverage_plan: &StorageCoveragePlan,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+    ) -> Result<DatasetRows, DatalensError> {
+        coverage_plan.validate_read(chain, dataset_key, selector, &range)?;
+        if let Some(entries) = coverage_plan.index_entries.clone() {
+            self.read_rows_with_entries(StorageReadEntriesRequest {
+                chain,
+                dataset_key,
+                selector,
+                range,
+                finality_level: None,
+                coverage_source: "coverage_plan",
+                entries,
+                coverage_started: Instant::now(),
+            })
+        } else {
+            self.read_rows(chain, dataset_key, selector, range)
+        }
     }
 
     pub fn read_rows_for_finality(
@@ -510,6 +649,32 @@ where
         } else {
             ("coverage_index_absent", Vec::new())
         };
+        self.read_rows_with_entries(StorageReadEntriesRequest {
+            chain,
+            dataset_key,
+            selector,
+            range,
+            finality_level,
+            coverage_source,
+            entries,
+            coverage_started,
+        })
+    }
+
+    fn read_rows_with_entries(
+        &self,
+        request: StorageReadEntriesRequest<'_>,
+    ) -> Result<DatasetRows, DatalensError> {
+        let StorageReadEntriesRequest {
+            chain,
+            dataset_key,
+            selector,
+            range,
+            finality_level,
+            coverage_source,
+            entries,
+            coverage_started,
+        } = request;
         let entries = entries
             .into_iter()
             .filter(|entry| {
@@ -1399,6 +1564,23 @@ pub trait StorageRepository: Send + Sync {
         range: LedgerRange,
     ) -> Result<Vec<LedgerRange>, DatalensError>;
 
+    fn coverage_plan(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+    ) -> Result<StorageCoveragePlan, DatalensError> {
+        let covered_ranges = self.covered_ranges(chain, dataset_key, selector, range.clone())?;
+        Ok(StorageCoveragePlan::from_covered_ranges(
+            chain,
+            dataset_key,
+            selector,
+            range,
+            covered_ranges,
+        ))
+    }
+
     fn read_rows(
         &self,
         chain: &ChainIdentity,
@@ -1406,6 +1588,18 @@ pub trait StorageRepository: Send + Sync {
         selector: &DatasetSelector,
         range: LedgerRange,
     ) -> Result<DatasetRows, DatalensError>;
+
+    fn read_rows_with_coverage_plan(
+        &self,
+        coverage_plan: &StorageCoveragePlan,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+    ) -> Result<DatasetRows, DatalensError> {
+        let _ = coverage_plan;
+        self.read_rows(chain, dataset_key, selector, range)
+    }
 
     fn read_rows_for_finality(
         &self,
@@ -1454,6 +1648,16 @@ where
         Self::covered_ranges(self, chain, dataset_key, selector, range)
     }
 
+    fn coverage_plan(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+    ) -> Result<StorageCoveragePlan, DatalensError> {
+        Self::coverage_plan(self, chain, dataset_key, selector, range)
+    }
+
     fn read_rows(
         &self,
         chain: &ChainIdentity,
@@ -1462,6 +1666,17 @@ where
         range: LedgerRange,
     ) -> Result<DatasetRows, DatalensError> {
         Self::read_rows(self, chain, dataset_key, selector, range)
+    }
+
+    fn read_rows_with_coverage_plan(
+        &self,
+        coverage_plan: &StorageCoveragePlan,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+    ) -> Result<DatasetRows, DatalensError> {
+        Self::read_rows_with_coverage_plan(self, coverage_plan, chain, dataset_key, selector, range)
     }
 
     fn read_rows_for_finality(
@@ -1506,6 +1721,17 @@ impl StorageRepository for Box<dyn StorageRepository> {
             .covered_ranges(chain, dataset_key, selector, range)
     }
 
+    fn coverage_plan(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+    ) -> Result<StorageCoveragePlan, DatalensError> {
+        self.as_ref()
+            .coverage_plan(chain, dataset_key, selector, range)
+    }
+
     fn read_rows(
         &self,
         chain: &ChainIdentity,
@@ -1514,6 +1740,23 @@ impl StorageRepository for Box<dyn StorageRepository> {
         range: LedgerRange,
     ) -> Result<DatasetRows, DatalensError> {
         self.as_ref().read_rows(chain, dataset_key, selector, range)
+    }
+
+    fn read_rows_with_coverage_plan(
+        &self,
+        coverage_plan: &StorageCoveragePlan,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+    ) -> Result<DatasetRows, DatalensError> {
+        self.as_ref().read_rows_with_coverage_plan(
+            coverage_plan,
+            chain,
+            dataset_key,
+            selector,
+            range,
+        )
     }
 
     fn read_rows_for_finality(
@@ -1559,6 +1802,17 @@ impl StorageRepository for Arc<dyn StorageRepository> {
             .covered_ranges(chain, dataset_key, selector, range)
     }
 
+    fn coverage_plan(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+    ) -> Result<StorageCoveragePlan, DatalensError> {
+        self.as_ref()
+            .coverage_plan(chain, dataset_key, selector, range)
+    }
+
     fn read_rows(
         &self,
         chain: &ChainIdentity,
@@ -1567,6 +1821,23 @@ impl StorageRepository for Arc<dyn StorageRepository> {
         range: LedgerRange,
     ) -> Result<DatasetRows, DatalensError> {
         self.as_ref().read_rows(chain, dataset_key, selector, range)
+    }
+
+    fn read_rows_with_coverage_plan(
+        &self,
+        coverage_plan: &StorageCoveragePlan,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+    ) -> Result<DatasetRows, DatalensError> {
+        self.as_ref().read_rows_with_coverage_plan(
+            coverage_plan,
+            chain,
+            dataset_key,
+            selector,
+            range,
+        )
     }
 
     fn read_rows_for_finality(

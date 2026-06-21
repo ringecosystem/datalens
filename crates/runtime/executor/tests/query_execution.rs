@@ -15,7 +15,7 @@ use datalens_chain::{
 };
 use datalens_core::{
     BlockHeader, BlockRange, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, Dataset,
-    DatasetKey, DatasetRows, LedgerRange, LogFilter, NetworkId, QueryDataFinality,
+    DatasetKey, DatasetRows, LedgerRange, LogFilter, LogRecord, NetworkId, QueryDataFinality,
     QueryFinalityRequirement, QueryRows, QuerySegmentSource,
 };
 use datalens_executor::{NativeQueryExecutionConfig, NativeQueryExecutor};
@@ -26,9 +26,10 @@ use datalens_storage::{
     DurablePromotionIntentBacklog, DurablePromotionIntentCreateOutcome,
     DurablePromotionIntentRepository, DurablePromotionIntentSource, DurablePromotionIntentStatus,
     DurablePromotionIntentStore, FillOutcome, LocalObjectStore, LocalStorage, Manifest,
-    QueryActivityKey, QueryActivityRepository, QueryActivityStore, QueryOutcome, QueryWatermarkKey,
-    QueryWatermarkRepository, QueryWatermarkStore, StorageRepository, StorageWriteOutcome,
-    StorageWriteRequest, UsageLedgerRepository, UsageLedgerStore,
+    ObjectListPage, ObjectMetadata, ObjectStore, QueryActivityKey, QueryActivityRepository,
+    QueryActivityStore, QueryOutcome, QueryWatermarkKey, QueryWatermarkRepository,
+    QueryWatermarkStore, StorageRepository, StorageWriteOutcome, StorageWriteRequest,
+    UsageLedgerRepository, UsageLedgerStore,
 };
 use datalens_writer::{
     DurableWriteRequest, DurableWriteSegment, DurableWriterConfig, WriteStagingConfig,
@@ -72,6 +73,68 @@ fn test_executor_full_cache_hit_does_not_require_provider_safe_height() {
     assert_eq!(result.cache.missing_ranges, Vec::<LedgerRange>::new());
     assert_eq!(source.calls(), Vec::<SourceCall>::new());
     assert_eq!(block_numbers(&result.rows), vec![1, 2]);
+}
+
+#[test]
+fn test_executor_full_cache_hit_reuses_coverage_lookup_for_durable_read() {
+    let object_store = CountingObjectStore::new(LocalObjectStore::new(temp_storage_root(
+        "executor-hit-coverage-reuse",
+    )));
+    let storage = datalens_storage::DurableStorage::from_object_store(object_store.clone());
+    seed_blocks_in_storage(&storage, 1, 2, vec![block(1, "0x01"), block(2, "0x02")]);
+    object_store.reset_counts();
+    let source = MockSource::default().with_safe_height_error(DatalensErrorKind::ProviderFailure);
+    let executor = executor(storage, source.clone());
+
+    let result = executor
+        .execute(blocks_input(1, 2))
+        .expect("full cache hit succeeds");
+
+    assert_eq!(source.calls(), Vec::<SourceCall>::new());
+    assert_eq!(block_numbers(&result.rows), vec![1, 2]);
+    assert_eq!(object_store.coverage_index_get_count(), 1);
+}
+
+#[test]
+fn test_executor_full_cache_hit_reuses_mixed_exact_and_semantic_coverage_plan() {
+    let storage = datalens_storage::DurableStorage::from_object_store(LocalObjectStore::new(
+        temp_storage_root("executor-hit-mixed-coverage-plan"),
+    ));
+    let query_selector = evm_log_selector(vec![ADDRESS_A], vec![Some(vec![TOPIC_1])]);
+    let broad_selector = evm_log_selector(vec![ADDRESS_A, ADDRESS_B], vec![]);
+    seed_logs_in_storage(
+        &storage,
+        &query_selector,
+        12,
+        12,
+        vec![log_record(12, 0, ADDRESS_A, vec![TOPIC_1])],
+    );
+    seed_logs_in_storage(
+        &storage,
+        &broad_selector,
+        13,
+        13,
+        vec![
+            log_record(13, 0, ADDRESS_A, vec![TOPIC_1]),
+            log_record(13, 1, ADDRESS_B, vec![TOPIC_2]),
+        ],
+    );
+    let source = MockSource::default().with_safe_height_error(DatalensErrorKind::ProviderFailure);
+    let executor = executor(storage, source.clone());
+
+    let result = executor
+        .execute(logs_input(query_selector, 12, 13))
+        .expect("mixed exact and semantic durable hit succeeds");
+
+    assert_eq!(source.calls(), Vec::<SourceCall>::new());
+    let logs = log_rows(&result.rows);
+    assert_eq!(logs.len(), 2);
+    assert_eq!(logs[0].block_number, 12);
+    assert_eq!(logs[0].address, ADDRESS_A);
+    assert_eq!(logs[0].topics, vec![TOPIC_1.to_owned()]);
+    assert_eq!(logs[1].block_number, 13);
+    assert_eq!(logs[1].address, ADDRESS_A);
+    assert_eq!(logs[1].topics, vec![TOPIC_1.to_owned()]);
 }
 
 #[test]
@@ -1735,6 +1798,67 @@ struct CountingStorage {
     read_ranges: Arc<Mutex<Vec<LedgerRange>>>,
 }
 
+#[derive(Clone)]
+struct CountingObjectStore {
+    inner: LocalObjectStore,
+    coverage_index_gets: Arc<AtomicUsize>,
+}
+
+impl CountingObjectStore {
+    fn new(inner: LocalObjectStore) -> Self {
+        Self {
+            inner,
+            coverage_index_gets: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn reset_counts(&self) {
+        self.coverage_index_gets.store(0, Ordering::SeqCst);
+    }
+
+    fn coverage_index_get_count(&self) -> usize {
+        self.coverage_index_gets.load(Ordering::SeqCst)
+    }
+}
+
+impl ObjectStore for CountingObjectStore {
+    fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError> {
+        if key.contains("/coverage-index/") || key.contains("/coverage-index-semantic/") {
+            self.coverage_index_gets.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.get(key)
+    }
+
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
+        self.inner.put(key, bytes)
+    }
+
+    fn exists(&self, key: &str) -> Result<bool, DatalensError> {
+        self.inner.exists(key)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
+        self.inner.list(prefix)
+    }
+
+    fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ObjectListPage, DatalensError> {
+        self.inner.list_page(prefix, start_after, limit)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), DatalensError> {
+        self.inner.delete(key)
+    }
+
+    fn lock_namespace(&self) -> String {
+        format!("counting:{}", self.inner.lock_namespace())
+    }
+}
+
 #[derive(Clone, Default)]
 struct RecordingIntentRepository {
     recorded: Arc<Mutex<Vec<CreateDurablePromotionIntent>>>,
@@ -2721,6 +2845,13 @@ impl StorageRepository for FailingStorage {
 }
 
 fn seed_blocks(storage: &LocalStorage, start: u64, end: u64, blocks: Vec<BlockHeader>) {
+    seed_blocks_in_storage(storage, start, end, blocks);
+}
+
+fn seed_blocks_in_storage<R>(storage: &R, start: u64, end: u64, blocks: Vec<BlockHeader>)
+where
+    R: StorageRepository + Clone + 'static,
+{
     datalens_writer::DurableWriter::new(
         storage.clone(),
         DurableWriterConfig {
@@ -2768,6 +2899,38 @@ fn seed_empty_blocks(storage: &LocalStorage, start: u64, end: u64) {
     .expect("seed empty coverage");
 }
 
+fn seed_logs_in_storage<R>(
+    storage: &R,
+    selector: &DatasetSelector,
+    start: u64,
+    end: u64,
+    logs: Vec<LogRecord>,
+) where
+    R: StorageRepository + Clone + 'static,
+{
+    datalens_writer::DurableWriter::new(
+        storage.clone(),
+        DurableWriterConfig {
+            target_object_bytes: 1024,
+            min_object_rows: 1,
+            record_empty_coverage: true,
+            staging: Default::default(),
+        },
+    )
+    .write(DurableWriteRequest {
+        chain: ethereum_identity(),
+        dataset_key: DatasetKey::evm_logs(),
+        selector: selector.clone(),
+        finality_level: FinalityKind::Safe,
+        segments: vec![DurableWriteSegment {
+            range: LedgerRange::blocks(start, end).expect("valid range"),
+            rows: DatasetRows::new(DatasetKey::evm_logs(), QueryRows::EvmLogs(logs))
+                .expect("dataset rows"),
+        }],
+    })
+    .expect("seed log cache");
+}
+
 fn blocks_input(start: u64, end: u64) -> NativeQueryInput {
     NativeQueryInput {
         chain: ethereum_identity(),
@@ -2779,10 +2942,28 @@ fn blocks_input(start: u64, end: u64) -> NativeQueryInput {
     }
 }
 
+fn logs_input(selector: DatasetSelector, start: u64, end: u64) -> NativeQueryInput {
+    NativeQueryInput {
+        chain: ethereum_identity(),
+        dataset_key: DatasetKey::evm_logs(),
+        ledger_range: LedgerRange::blocks(start, end).expect("valid range"),
+        selector,
+        field_selection: FieldSelection::All,
+        finality: QueryFinalityRequirement::DurableOnly,
+    }
+}
+
 fn block_numbers(rows: &DatasetRows) -> Vec<u64> {
     match rows.rows() {
         QueryRows::EvmBlocks(rows) => rows.iter().map(|row| row.number).collect(),
         _ => panic!("expected blocks"),
+    }
+}
+
+fn log_rows(rows: &DatasetRows) -> &[LogRecord] {
+    match rows.rows() {
+        QueryRows::EvmLogs(rows) => rows,
+        _ => panic!("expected logs"),
     }
 }
 
@@ -2810,6 +2991,37 @@ fn block(number: u64, hash: &str) -> BlockHeader {
         parent_hash: format!("{hash}-parent"),
         timestamp: number * 10,
     }
+}
+
+const ADDRESS_A: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const ADDRESS_B: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const TOPIC_1: &str = "0x1111111111111111111111111111111111111111111111111111111111111111";
+const TOPIC_2: &str = "0x2222222222222222222222222222222222222222222222222222222222222222";
+
+fn evm_log_selector(addresses: Vec<&str>, topics: Vec<Option<Vec<&str>>>) -> DatasetSelector {
+    DatasetSelector::try_evm_logs(LogFilter {
+        addresses: addresses.into_iter().map(str::to_owned).collect(),
+        topics: topics
+            .into_iter()
+            .map(|slot| slot.map(|values| values.into_iter().map(str::to_owned).collect()))
+            .collect(),
+    })
+    .expect("valid selector")
+}
+
+fn log_record(block_number: u64, log_index: u64, address: &str, topics: Vec<&str>) -> LogRecord {
+    LogRecord::try_new(
+        block_number,
+        format!("0xblock{block_number}"),
+        format!("0xtx{block_number}{log_index}"),
+        0,
+        log_index,
+        address,
+        topics.into_iter().map(str::to_owned).collect(),
+        "0x".to_owned(),
+        false,
+    )
+    .expect("valid log record")
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2943,21 +3155,32 @@ enum ResponseMutation {
 
 impl ChainAdapter for MockSource {
     fn capabilities(&self) -> AdapterCapabilities {
-        AdapterCapabilities::new(ethereum_identity()).with_dataset_capability(
-            DatasetCapability::new(Dataset::Blocks)
-                .with_selector(SelectorKind::All)
-                .with_range(HeightRangeKind::Block)
-                .with_max_range_len(
-                    *self
-                        .capability_max_range_len
-                        .lock()
-                        .expect("capability max range len lock"),
-                )
-                .with_empty_coverage(true)
-                .with_safe_height(true)
-                .with_finalized_height(true)
-                .with_range_split(true),
-        )
+        let max_range_len = *self
+            .capability_max_range_len
+            .lock()
+            .expect("capability max range len lock");
+        AdapterCapabilities::new(ethereum_identity())
+            .with_dataset_capability(
+                DatasetCapability::new(Dataset::Blocks)
+                    .with_selector(SelectorKind::All)
+                    .with_range(HeightRangeKind::Block)
+                    .with_max_range_len(max_range_len)
+                    .with_empty_coverage(true)
+                    .with_safe_height(true)
+                    .with_finalized_height(true)
+                    .with_range_split(true),
+            )
+            .with_dataset_capability(
+                DatasetCapability::new(Dataset::Logs)
+                    .with_selector(SelectorKind::All)
+                    .with_selector(SelectorKind::EvmLogs)
+                    .with_range(HeightRangeKind::Block)
+                    .with_max_range_len(max_range_len)
+                    .with_empty_coverage(true)
+                    .with_safe_height(true)
+                    .with_finalized_height(true)
+                    .with_range_split(true),
+            )
     }
 
     fn latest_height(&self) -> Result<ChainHeight, DatalensError> {

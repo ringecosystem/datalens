@@ -175,6 +175,67 @@ impl ObjectStore for CountingDataObjectExistsStore {
 }
 
 #[derive(Clone, Debug)]
+struct CountingCoverageIndexExistsStore {
+    inner: LocalObjectStore,
+    semantic_exists_count: Arc<AtomicUsize>,
+}
+
+impl CountingCoverageIndexExistsStore {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            inner: LocalObjectStore::new(root),
+            semantic_exists_count: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn reset_counts(&self) {
+        self.semantic_exists_count.store(0, Ordering::SeqCst);
+    }
+
+    fn semantic_exists_count(&self) -> usize {
+        self.semantic_exists_count.load(Ordering::SeqCst)
+    }
+}
+
+impl ObjectStore for CountingCoverageIndexExistsStore {
+    fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError> {
+        self.inner.get(key)
+    }
+
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
+        self.inner.put(key, bytes)
+    }
+
+    fn exists(&self, key: &str) -> Result<bool, DatalensError> {
+        if key.contains("/coverage-index-semantic/") {
+            self.semantic_exists_count.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.exists(key)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
+        self.inner.list(prefix)
+    }
+
+    fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ObjectListPage, DatalensError> {
+        self.inner.list_page(prefix, start_after, limit)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), DatalensError> {
+        self.inner.delete(key)
+    }
+
+    fn lock_namespace(&self) -> String {
+        format!("counting-coverage:{}", self.inner.lock_namespace())
+    }
+}
+
+#[derive(Clone, Debug)]
 struct MissingDataObjectExistsStore {
     inner: LocalObjectStore,
 }
@@ -2333,6 +2394,42 @@ fn test_exact_evm_log_coverage_prevents_overlapping_semantic_read() {
         .expect("read rows");
 
     assert_eq!(read, exact_rows);
+}
+
+#[test]
+fn test_exact_evm_log_coverage_full_hit_skips_semantic_index_probes() {
+    let object_store = CountingCoverageIndexExistsStore::new(temp_storage_root(
+        "semantic-exact-full-hit-no-probes",
+    ));
+    let storage = DurableStorage::from_object_store(object_store.clone());
+    let chain = test_chain();
+    let selector = evm_log_selector(vec![ADDRESS_A], vec![Some(vec![TOPIC_1])]);
+    let range = LedgerRange::blocks(12, 12).expect("valid range");
+    let rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![log_record(12, 0, ADDRESS_A, vec![TOPIC_1])]),
+    )
+    .expect("rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &selector,
+            range: range.clone(),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write exact rows");
+    object_store.reset_counts();
+
+    let covered = storage
+        .covered_ranges(&chain, &DatasetKey::evm_logs(), &selector, range.clone())
+        .expect("covered ranges");
+
+    assert_eq!(covered, vec![range]);
+    assert_eq!(object_store.semantic_exists_count(), 0);
 }
 
 #[test]

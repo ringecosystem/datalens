@@ -365,13 +365,13 @@ where
         // Coverage is read before asking the adapter for finality so full
         // durable hits avoid unnecessary provider calls; misses still require a
         // safe/finalized boundary before they can be filled and written.
-        let mut covered_ranges = match self.storage.covered_ranges(
+        let coverage_plan = match self.storage.coverage_plan(
             &input.chain,
             &input.dataset_key,
             &input.selector,
             input.ledger_range.clone(),
         ) {
-            Ok(covered_ranges) => covered_ranges,
+            Ok(coverage_plan) => coverage_plan,
             Err(error) => {
                 self.record_error(&labels, &error);
                 self.record_cache_coverage(&labels, CacheCoverageOutcome::Error);
@@ -390,6 +390,7 @@ where
                 return Err(error);
             }
         };
+        let mut covered_ranges = coverage_plan.covered_ranges().to_vec();
         covered_ranges.extend(self.writer.staged_covered_ranges(
             &input.chain,
             &input.dataset_key,
@@ -534,7 +535,8 @@ where
                 segment.range.clone(),
             ) {
                 Ok(Some(cached)) => cached,
-                Ok(None) => match self.storage.read_rows(
+                Ok(None) => match self.storage.read_rows_with_coverage_plan(
+                    &coverage_plan,
                     &plan.chain,
                     &plan.dataset_key,
                     &plan.selector,
