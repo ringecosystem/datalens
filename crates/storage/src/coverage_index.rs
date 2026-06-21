@@ -1,7 +1,7 @@
 use datalens_chain::DatasetSelector;
 use datalens_core::{
     ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey, EvmLogFilter, LedgerRange,
-    TopicFilter,
+    TopicFilter, missing_ranges,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -73,53 +73,94 @@ pub(crate) fn read_entries_for_query<S>(
 where
     S: ObjectStore,
 {
-    let mut entries = Vec::new();
-    let mut any_bucket_has_index = false;
-    for (bucket_start, bucket_end) in bucket_ranges(range, DEFAULT_COVERAGE_INDEX_BUCKET_SIZE) {
-        let mut bucket_has_index = false;
-        for finality_level in [
-            ManifestFinalityLevel::Safe,
-            ManifestFinalityLevel::Finalized,
-        ] {
-            for key in coverage_index_query_keys(
-                chain,
-                dataset_key,
-                range,
-                selector,
-                finality_level,
-                bucket_start,
-                bucket_end,
-            ) {
-                if !object_store.exists(&key)? {
-                    continue;
-                }
-                let bytes = object_store.get(&key)?;
-                let mut index: CoverageIndex = serde_json::from_slice(&bytes).map_err(|error| {
-                    DatalensError::new(
-                        DatalensErrorKind::StorageReadFailure,
-                        format!("decode coverage index {key}: {error}"),
-                    )
-                })?;
-                bucket_has_index = true;
-                entries.append(&mut index.entries);
-            }
-        }
-        if bucket_has_index {
-            any_bucket_has_index = true;
-        }
+    let mut exact_entries = Vec::new();
+    let exact_keys = exact_coverage_index_query_keys_for_ranges(
+        chain,
+        dataset_key,
+        selector,
+        std::slice::from_ref(range),
+    );
+    let exact_has_index = read_entries_for_keys(object_store, exact_keys, &mut exact_entries)?;
+    let exact_entries =
+        normalized_query_entries(exact_entries, chain, dataset_key, selector, range);
+    let exact_covered =
+        covered_ranges_from_entries(&exact_entries, chain, dataset_key, selector, range);
+    let exact_missing = missing_ranges(range.clone(), &exact_covered);
+    if exact_missing.is_empty() {
+        return Ok(Some(exact_entries));
     }
-    if !any_bucket_has_index {
+
+    let mut entries = exact_entries;
+    let semantic_keys =
+        semantic_coverage_index_query_keys_for_ranges(chain, dataset_key, selector, &exact_missing);
+    let semantic_has_index = read_entries_for_keys(object_store, semantic_keys, &mut entries)?;
+    if !exact_has_index && !semantic_has_index {
         return Ok(None);
     }
 
+    Ok(Some(normalized_query_entries(
+        entries,
+        chain,
+        dataset_key,
+        selector,
+        range,
+    )))
+}
+
+fn read_entries_for_keys<S>(
+    object_store: &S,
+    keys: BTreeSet<String>,
+    entries: &mut Vec<ManifestEntry>,
+) -> Result<bool, DatalensError>
+where
+    S: ObjectStore,
+{
+    let mut any_key_has_index = false;
+    for key in keys {
+        if !object_store.exists(&key)? {
+            continue;
+        }
+        let bytes = object_store.get(&key)?;
+        let mut index: CoverageIndex = serde_json::from_slice(&bytes).map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::StorageReadFailure,
+                format!("decode coverage index {key}: {error}"),
+            )
+        })?;
+        any_key_has_index = true;
+        entries.append(&mut index.entries);
+    }
+    Ok(any_key_has_index)
+}
+
+fn normalized_query_entries(
+    entries: Vec<ManifestEntry>,
+    chain: &ChainIdentity,
+    dataset_key: &DatasetKey,
+    selector: &DatasetSelector,
+    range: &LedgerRange,
+) -> Vec<ManifestEntry> {
     let mut index = CoverageIndex { entries };
     index.normalize();
-    Ok(Some(
-        selector_coverage_candidates(&index.entries, chain, dataset_key, selector, range)
-            .into_iter()
-            .map(|candidate| candidate.entry.clone())
-            .collect(),
-    ))
+    selector_coverage_candidates(&index.entries, chain, dataset_key, selector, range)
+        .into_iter()
+        .map(|candidate| candidate.entry.clone())
+        .collect()
+}
+
+fn covered_ranges_from_entries(
+    entries: &[ManifestEntry],
+    chain: &ChainIdentity,
+    dataset_key: &DatasetKey,
+    selector: &DatasetSelector,
+    range: &LedgerRange,
+) -> Vec<LedgerRange> {
+    let mut ranges = selector_coverage_candidates(entries, chain, dataset_key, selector, range)
+        .into_iter()
+        .flat_map(|candidate| candidate.ranges)
+        .collect::<Vec<_>>();
+    ranges.sort_by_key(|range| range.start());
+    crate::merge_ranges(ranges)
 }
 
 pub(crate) fn write_entry<S>(object_store: &S, entry: &ManifestEntry) -> Result<(), DatalensError>
@@ -517,44 +558,69 @@ fn semantic_coverage_index_key(
     )
 }
 
-fn coverage_index_query_keys(
+fn exact_coverage_index_query_keys_for_ranges(
     chain: &ChainIdentity,
     dataset_key: &DatasetKey,
-    range: &LedgerRange,
     selector: &DatasetSelector,
-    finality_level: ManifestFinalityLevel,
-    bucket_start: u64,
-    bucket_end: u64,
-) -> Vec<String> {
-    let mut keys = BTreeSet::from([coverage_index_key(
-        chain,
-        dataset_key,
-        range,
-        &selector.fingerprint(),
-        finality_level,
-        bucket_start,
-        bucket_end,
-    )]);
-    if *dataset_key == DatasetKey::evm_logs()
-        && let DatasetSelector::EvmLogs(filter) = selector
-    {
-        keys.extend(
-            evm_log_query_semantic_scopes(filter)
-                .into_iter()
-                .map(|scope| {
+    ranges: &[LedgerRange],
+) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    for range in ranges {
+        for (bucket_start, bucket_end) in bucket_ranges(range, DEFAULT_COVERAGE_INDEX_BUCKET_SIZE) {
+            for finality_level in [
+                ManifestFinalityLevel::Safe,
+                ManifestFinalityLevel::Finalized,
+            ] {
+                keys.insert(coverage_index_key(
+                    chain,
+                    dataset_key,
+                    range,
+                    &selector.fingerprint(),
+                    finality_level,
+                    bucket_start,
+                    bucket_end,
+                ));
+            }
+        }
+    }
+    keys
+}
+
+fn semantic_coverage_index_query_keys_for_ranges(
+    chain: &ChainIdentity,
+    dataset_key: &DatasetKey,
+    selector: &DatasetSelector,
+    ranges: &[LedgerRange],
+) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    if *dataset_key != DatasetKey::evm_logs() {
+        return keys;
+    }
+    let DatasetSelector::EvmLogs(filter) = selector else {
+        return keys;
+    };
+    let scopes = evm_log_query_semantic_scopes(filter);
+    for range in ranges {
+        for (bucket_start, bucket_end) in bucket_ranges(range, DEFAULT_COVERAGE_INDEX_BUCKET_SIZE) {
+            for finality_level in [
+                ManifestFinalityLevel::Safe,
+                ManifestFinalityLevel::Finalized,
+            ] {
+                keys.extend(scopes.iter().map(|scope| {
                     semantic_coverage_index_key(
                         chain,
                         dataset_key,
                         range,
                         finality_level,
-                        &scope,
+                        scope,
                         bucket_start,
                         bucket_end,
                     )
-                }),
-        );
+                }));
+            }
+        }
     }
-    keys.into_iter().collect()
+    keys
 }
 
 fn coverage_index_entry_keys(
@@ -1163,18 +1229,25 @@ mod tests {
         let range = LedgerRange::blocks(10, 20).expect("valid range");
 
         assert!(coverage_index_entry_keys(&entry, 0, 99_999).len() <= 16);
-        assert!(
-            coverage_index_query_keys(
+        assert_eq!(
+            exact_coverage_index_query_keys_for_ranges(
                 &chain,
                 &DatasetKey::evm_logs(),
-                &range,
                 &selector,
-                ManifestFinalityLevel::Safe,
-                0,
-                99_999,
+                std::slice::from_ref(&range),
+            )
+            .len(),
+            2
+        );
+        assert!(
+            semantic_coverage_index_query_keys_for_ranges(
+                &chain,
+                &DatasetKey::evm_logs(),
+                &selector,
+                std::slice::from_ref(&range),
             )
             .len()
-                <= 16
+                <= 32
         );
     }
 }
