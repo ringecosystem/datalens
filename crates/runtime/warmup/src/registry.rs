@@ -132,6 +132,77 @@ where
         <Self as WarmupRegistry>::retry_failed(self, task_id)
     }
 
+    fn find_follow_query_ensure_task(
+        &self,
+        ensure_key: &str,
+        deterministic_task_id: &WarmupTaskId,
+    ) -> Result<Option<WarmupTask>, DatalensError> {
+        if let Some(indexed_task_id) = self.load_ensure_index(deterministic_task_id)?
+            && let Some(task) = self.get(&indexed_task_id)?
+            && task.mode == WarmupTaskMode::FollowQuery
+            && task_ensure_key_for_task(&task) == ensure_key
+            && follow_query_ensure_state_rank(task.state) == 0
+        {
+            return Ok(Some(task));
+        }
+
+        let mut matches = self
+            .list(WarmupTaskFilter::default())?
+            .into_iter()
+            .filter(|task| task.mode == WarmupTaskMode::FollowQuery)
+            .filter(|task| task_ensure_key_for_task(task) == ensure_key)
+            .collect::<Vec<_>>();
+        matches.sort_by_key(follow_query_ensure_order_key);
+        if let Some(task) = matches.into_iter().next() {
+            self.save_ensure_index(&task)?;
+            return Ok(Some(task));
+        }
+
+        Ok(None)
+    }
+
+    fn load_ensure_index(
+        &self,
+        deterministic_task_id: &WarmupTaskId,
+    ) -> Result<Option<WarmupTaskId>, DatalensError> {
+        let key = ensure_index_key(deterministic_task_id);
+        if !self.object_store.exists(&key)? {
+            return Ok(None);
+        }
+        serde_json::from_slice::<StoredWarmupEnsureIndex>(&self.object_store.get(&key)?)
+            .map(|index| Some(index.task_id))
+            .map_err(|error| {
+                DatalensError::new(
+                    DatalensErrorKind::StorageReadFailure,
+                    format!("decode warmup ensure index {key}: {error}"),
+                )
+            })
+    }
+
+    fn save_ensure_index(&self, task: &WarmupTask) -> Result<(), DatalensError> {
+        let ensure_key = task_ensure_key_for_task(task);
+        let deterministic_task_id = WarmupTaskId::from_dedupe_key(&ensure_key);
+        if let Some(indexed_task_id) = self.load_ensure_index(&deterministic_task_id)?
+            && let Some(indexed_task) = self.get(&indexed_task_id)?
+            && indexed_task.mode == WarmupTaskMode::FollowQuery
+            && task_ensure_key_for_task(&indexed_task) == ensure_key
+            && follow_query_ensure_order_key(&indexed_task) <= follow_query_ensure_order_key(task)
+        {
+            return Ok(());
+        }
+        let index = StoredWarmupEnsureIndex {
+            task_id: task.task_id.clone(),
+        };
+        let bytes = serde_json::to_vec_pretty(&index).map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::Internal,
+                format!("encode warmup ensure index: {error}"),
+            )
+        })?;
+        self.object_store
+            .put(&ensure_index_key(&deterministic_task_id), &bytes)
+    }
+
     pub fn migrate_legacy_paths(&self) -> Result<RegistryMigrationReport, DatalensError> {
         let mut report = RegistryMigrationReport::default();
         migrate_prefix(
@@ -197,20 +268,8 @@ where
             ));
         }
         let ensure_key = task_ensure_key(&request);
-        let mut matches = self
-            .list(WarmupTaskFilter::default())?
-            .into_iter()
-            .filter(|task| task.mode == WarmupTaskMode::FollowQuery)
-            .filter(|task| task_ensure_key_for_task(task) == ensure_key)
-            .collect::<Vec<_>>();
-        matches.sort_by_key(|task| {
-            (
-                follow_query_ensure_state_rank(task.state),
-                task.created_at,
-                task.task_id.as_str().to_owned(),
-            )
-        });
-        if let Some(mut existing) = matches.into_iter().next() {
+        let task_id = WarmupTaskId::from_dedupe_key(&ensure_key);
+        if let Some(mut existing) = self.find_follow_query_ensure_task(&ensure_key, &task_id)? {
             if !is_scheduler_runnable(existing.state) && existing.state != WarmupTaskState::Idle {
                 existing.state = WarmupTaskState::Queued;
                 existing.last_error = None;
@@ -257,7 +316,11 @@ where
                     format!("encode warmup task: {error}"),
                 )
             })?;
-        self.object_store.put(&task_key(&task.task_id), &bytes)
+        self.object_store.put(&task_key(&task.task_id), &bytes)?;
+        if task.mode == WarmupTaskMode::FollowQuery {
+            self.save_ensure_index(task)?;
+        }
+        Ok(())
     }
 
     fn list(&self, filter: WarmupTaskFilter) -> Result<Vec<WarmupTask>, DatalensError> {
@@ -370,6 +433,11 @@ struct StoredWarmupTask {
 }
 
 #[derive(Serialize, Deserialize)]
+struct StoredWarmupEnsureIndex {
+    task_id: WarmupTaskId,
+}
+
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
 enum StoredSelector {
     All,
@@ -465,6 +533,7 @@ pub(crate) fn unix_seconds_now() -> Result<u64, DatalensError> {
 
 const TASK_PREFIX: &str = "tasks";
 const CURSOR_PREFIX: &str = "cursors";
+const ENSURE_INDEX_PREFIX: &str = "ensure-index";
 const LEGACY_TASK_PREFIX: &str = "warmup/tasks";
 const LEGACY_CURSOR_PREFIX: &str = "warmup/cursors";
 
@@ -474,6 +543,13 @@ fn task_key(task_id: &WarmupTaskId) -> String {
 
 fn cursor_key(task_id: &WarmupTaskId) -> String {
     format!("{CURSOR_PREFIX}/{}.json", task_id.as_str())
+}
+
+fn ensure_index_key(deterministic_task_id: &WarmupTaskId) -> String {
+    format!(
+        "{ENSURE_INDEX_PREFIX}/{}.json",
+        deterministic_task_id.as_str()
+    )
 }
 
 fn legacy_task_key(task_id: &WarmupTaskId) -> String {
@@ -658,6 +734,14 @@ fn follow_query_ensure_state_rank(state: WarmupTaskState) -> u8 {
         WarmupTaskState::Paused | WarmupTaskState::Failed => 2,
         WarmupTaskState::Completed | WarmupTaskState::Cancelled => 3,
     }
+}
+
+fn follow_query_ensure_order_key(task: &WarmupTask) -> (u8, u64, String) {
+    (
+        follow_query_ensure_state_rank(task.state),
+        task.created_at,
+        task.task_id.as_str().to_owned(),
+    )
 }
 
 fn missing_task(task_id: &WarmupTaskId) -> DatalensError {
