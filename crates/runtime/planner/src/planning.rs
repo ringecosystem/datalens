@@ -588,3 +588,77 @@ fn validate_selector_limits(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datalens_chain::{DatasetCapability, FinalityLevel};
+    use datalens_core::{ChainFamily, LogFilter, NetworkId};
+
+    fn test_chain() -> ChainIdentity {
+        ChainIdentity::expect_with_network_id(ChainFamily::Evm, "ethereum", NetworkId::numeric(1))
+    }
+
+    fn evm_logs_capabilities(chain: &ChainIdentity) -> AdapterCapabilities {
+        AdapterCapabilities::new(chain.clone()).with_dataset_capability(
+            DatasetCapability::new(DatasetKey::evm_logs())
+                .with_selector(SelectorKind::EvmLogs)
+                .with_range(HeightRangeKind::Block)
+                .with_safe_height(true)
+                .with_max_range_len(100),
+        )
+    }
+
+    fn evm_logs_input(chain: &ChainIdentity, range: LedgerRange) -> NativeQueryInput {
+        NativeQueryInput {
+            chain: chain.clone(),
+            dataset_key: DatasetKey::evm_logs(),
+            ledger_range: range,
+            selector: DatasetSelector::try_evm_logs(LogFilter {
+                addresses: Vec::new(),
+                topics: Vec::new(),
+            })
+            .expect("valid selector"),
+            field_selection: FieldSelection::All,
+            finality: QueryFinalityRequirement::DurableOnly,
+        }
+    }
+
+    #[test]
+    fn test_plan_with_coverage_reports_full_hit_only_when_coverage_spans_query() {
+        let chain = test_chain();
+        let planner = NativePlanner::new(NativePlannerConfig {
+            max_query_range_len: 100,
+            default_chunk_range_len: 10,
+        });
+        let capabilities = evm_logs_capabilities(&chain);
+        let boundary = ChainHeight::block(20).with_finality(FinalityLevel::Safe);
+        let query_range = LedgerRange::blocks(10, 12).expect("valid range");
+
+        let full_hit = planner
+            .plan_with_coverage(
+                evm_logs_input(&chain, query_range.clone()),
+                &capabilities,
+                boundary.clone(),
+                vec![query_range.clone()],
+            )
+            .expect("full hit plan");
+        assert_eq!(full_hit.coverage.status, QueryPlanStatus::FullHit);
+        assert_eq!(full_hit.read_segments.len(), 1);
+        assert!(full_hit.fetch_tasks.is_empty());
+
+        let partial_hit = planner
+            .plan_with_coverage(
+                evm_logs_input(&chain, query_range),
+                &capabilities,
+                boundary,
+                vec![LedgerRange::blocks(10, 11).expect("valid range")],
+            )
+            .expect("partial hit plan");
+        assert_eq!(partial_hit.coverage.status, QueryPlanStatus::PartialHit);
+        assert_eq!(
+            partial_hit.coverage.missing_ranges,
+            vec![LedgerRange::blocks(12, 12).expect("valid range")]
+        );
+    }
+}
