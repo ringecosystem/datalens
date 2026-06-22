@@ -11,7 +11,9 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use crate::selector_coverage::{filter_evm_log_rows_for_selector, selector_coverage_candidates};
+use crate::selector_coverage::{
+    filter_evm_log_rows_for_selector, parse_evm_log_canonical_key, selector_coverage_candidates,
+};
 use crate::{coverage_index, read_through_cache};
 
 const STORAGE_READ_GET_PARALLELISM: usize = 8;
@@ -203,6 +205,20 @@ fn split_entry_around_range(
         entries.push(right);
     }
     Ok(entries)
+}
+
+fn manifest_entry_read_key(
+    entry: &ManifestEntry,
+) -> (String, String, String, String, u64, u64, &'static str) {
+    (
+        entry.chain.key_prefix(),
+        entry.dataset_key.as_str().to_owned(),
+        entry.selector_fingerprint.clone(),
+        range_kind_key(entry.range.kind()),
+        entry.range.start(),
+        entry.range.end(),
+        entry.finality_level.as_str(),
+    )
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -675,7 +691,7 @@ where
             entries,
             coverage_started,
         } = request;
-        let entries = entries
+        let mut entries = entries
             .into_iter()
             .filter(|entry| {
                 finality_level
@@ -685,6 +701,14 @@ where
                     .unwrap_or(true)
             })
             .collect::<Vec<_>>();
+        self.augment_evm_log_read_entries_for_polluted_empty_coverage(
+            chain,
+            dataset_key,
+            selector,
+            &range,
+            finality_level,
+            &mut entries,
+        )?;
         let entries_count = entries.len();
         let covered = merged_selector_ranges(&entries, chain, dataset_key, selector, &range);
         let missing_range_count = missing_ranges(range.clone(), &covered).len();
@@ -846,6 +870,84 @@ where
             fetched.append(&mut chunk_results);
         }
         Ok(fetched)
+    }
+
+    fn augment_evm_log_read_entries_for_polluted_empty_coverage(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: &LedgerRange,
+        finality_level: Option<ManifestFinalityLevel>,
+        entries: &mut Vec<ManifestEntry>,
+    ) -> Result<(), DatalensError> {
+        if *dataset_key != DatasetKey::evm_logs()
+            || !matches!(selector, DatasetSelector::EvmLogs(_))
+        {
+            return Ok(());
+        }
+
+        let candidates = selector_coverage_candidates(entries, chain, dataset_key, selector, range);
+        if !candidates
+            .iter()
+            .any(|candidate| candidate.entry.object_key.is_none())
+        {
+            return Ok(());
+        }
+
+        let Some(query_filter) = parse_evm_log_canonical_key(&selector.canonical_key()) else {
+            return Ok(());
+        };
+        let existing_keys = entries
+            .iter()
+            .map(manifest_entry_read_key)
+            .collect::<BTreeSet<_>>();
+        let manifest = self.manifest_for_chain(chain)?;
+        let selector_fingerprint = selector.fingerprint();
+        let selector_canonical_key = selector.canonical_key();
+        let mut repaired_entries = manifest
+            .entries
+            .into_iter()
+            .filter(|entry| entry.chain == *chain)
+            .filter(|entry| entry.dataset_key == *dataset_key)
+            .filter(|entry| entry.object_key.is_some())
+            .filter(|entry| entry.range.kind() == range.kind())
+            .filter(|entry| entry.range.intersection(range).is_some())
+            .filter(|entry| {
+                finality_level
+                    .map(|finality_level| {
+                        durable_finality_satisfies(entry.finality_level, finality_level)
+                    })
+                    .unwrap_or(true)
+            })
+            .filter(|entry| !existing_keys.contains(&manifest_entry_read_key(entry)))
+            .filter(|entry| {
+                parse_evm_log_canonical_key(&entry.selector_canonical_key)
+                    .map(|stored_filter| query_filter.covers(&stored_filter))
+                    .unwrap_or(false)
+            })
+            .map(|mut entry| {
+                entry.selector_fingerprint = selector_fingerprint.clone();
+                entry.selector_canonical_key = selector_canonical_key.clone();
+                entry
+            })
+            .collect::<Vec<_>>();
+
+        if repaired_entries.is_empty() {
+            return Ok(());
+        }
+        log::warn!(
+            "storage read augmented polluted empty evm log coverage chain_key={} dataset={} selector_fingerprint={} range_kind={} range={}-{} repaired_entries_count={}",
+            chain.key_prefix(),
+            dataset_key.as_str(),
+            selector.fingerprint(),
+            range_kind_key(range.kind()),
+            range.start(),
+            range.end(),
+            repaired_entries.len()
+        );
+        entries.append(&mut repaired_entries);
+        Ok(())
     }
 
     pub fn write_rows(
