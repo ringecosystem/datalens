@@ -107,6 +107,48 @@ where
     )))
 }
 
+pub(crate) fn read_compatible_evm_log_data_entries_for_query<S>(
+    object_store: &S,
+    chain: &ChainIdentity,
+    dataset_key: &DatasetKey,
+    selector: &DatasetSelector,
+    range: &LedgerRange,
+) -> Result<Vec<ManifestEntry>, DatalensError>
+where
+    S: ObjectStore,
+{
+    if *dataset_key != DatasetKey::evm_logs() || !matches!(selector, DatasetSelector::EvmLogs(_)) {
+        return Ok(Vec::new());
+    }
+    let Some(query_filter) = parse_evm_log_canonical_key(&selector.canonical_key()) else {
+        return Ok(Vec::new());
+    };
+    let mut entries = Vec::new();
+    let keys = semantic_coverage_index_query_keys_for_ranges(
+        chain,
+        dataset_key,
+        selector,
+        std::slice::from_ref(range),
+    );
+    read_entries_for_keys(object_store, keys, &mut entries)?;
+    let mut index = CoverageIndex { entries };
+    index.normalize();
+    Ok(index
+        .entries
+        .into_iter()
+        .filter(|entry| entry.chain == *chain)
+        .filter(|entry| entry.dataset_key == *dataset_key)
+        .filter(|entry| entry.object_key.is_some())
+        .filter(|entry| entry.range.kind() == range.kind())
+        .filter(|entry| entry.range.intersection(range).is_some())
+        .filter(|entry| {
+            parse_evm_log_canonical_key(&entry.selector_canonical_key)
+                .map(|stored_filter| query_filter.covers(&stored_filter))
+                .unwrap_or(false)
+        })
+        .collect())
+}
+
 fn read_entries_for_keys<S>(
     object_store: &S,
     keys: BTreeSet<String>,
