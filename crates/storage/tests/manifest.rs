@@ -2603,6 +2603,149 @@ fn test_broad_evm_log_empty_coverage_index_satisfies_compatible_narrow_query() {
 }
 
 #[test]
+fn test_narrow_evm_log_data_read_pierces_polluted_broad_empty_coverage() {
+    let storage = LocalStorage::new(temp_storage_root("semantic-narrow-data-over-broad-empty"));
+    let chain = test_chain();
+    let broad_selector = evm_log_selector(vec![ADDRESS_A], vec![]);
+    let narrow_selector = evm_log_selector(vec![ADDRESS_A], vec![Some(vec![TOPIC_1])]);
+    let range = LedgerRange::blocks(20, 22).expect("valid range");
+    let empty_rows = DatasetRows::new(DatasetKey::evm_logs(), QueryRows::EvmLogs(Vec::new()))
+        .expect("empty rows");
+    let narrow_rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![log_record(21, 3, ADDRESS_A, vec![TOPIC_1])]),
+    )
+    .expect("narrow rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &broad_selector,
+            range: range.clone(),
+            rows: &empty_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write polluted broad empty coverage");
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &narrow_selector,
+            range: range.clone(),
+            rows: &narrow_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write narrow repaired data");
+
+    assert_eq!(
+        storage
+            .covered_ranges(
+                &chain,
+                &DatasetKey::evm_logs(),
+                &broad_selector,
+                range.clone(),
+            )
+            .expect("covered ranges"),
+        vec![range.clone()]
+    );
+
+    let read = storage
+        .read_rows(&chain, &DatasetKey::evm_logs(), &broad_selector, range)
+        .expect("read broad rows");
+
+    assert_eq!(read, narrow_rows);
+}
+
+#[test]
+fn test_narrow_evm_log_data_repairs_mixed_broad_data_and_empty_coverage() {
+    let storage = LocalStorage::new(temp_storage_root("semantic-narrow-data-over-mixed-broad"));
+    let chain = test_chain();
+    let broad_selector = evm_log_selector(vec![ADDRESS_A], vec![]);
+    let narrow_selector = evm_log_selector(vec![ADDRESS_A], vec![Some(vec![TOPIC_1])]);
+    let query_range = LedgerRange::blocks(20, 22).expect("valid query range");
+    let broad_rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![log_record(20, 1, ADDRESS_A, vec![TOPIC_2])]),
+    )
+    .expect("broad rows");
+    let empty_rows = DatasetRows::new(DatasetKey::evm_logs(), QueryRows::EvmLogs(Vec::new()))
+        .expect("empty rows");
+    let narrow_rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![log_record(21, 3, ADDRESS_A, vec![TOPIC_1])]),
+    )
+    .expect("narrow rows");
+    let expected_rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![
+            log_record(20, 1, ADDRESS_A, vec![TOPIC_2]),
+            log_record(21, 3, ADDRESS_A, vec![TOPIC_1]),
+        ]),
+    )
+    .expect("expected rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &broad_selector,
+            range: LedgerRange::blocks(20, 20).expect("valid broad range"),
+            rows: &broad_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write broad data coverage");
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &broad_selector,
+            range: LedgerRange::blocks(21, 22).expect("valid empty range"),
+            rows: &empty_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write polluted broad empty coverage");
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &narrow_selector,
+            range: LedgerRange::blocks(21, 21).expect("valid narrow range"),
+            rows: &narrow_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write narrow repaired data");
+
+    assert_eq!(
+        storage
+            .covered_ranges(
+                &chain,
+                &DatasetKey::evm_logs(),
+                &broad_selector,
+                query_range.clone(),
+            )
+            .expect("covered ranges"),
+        vec![query_range.clone()]
+    );
+
+    let read = storage
+        .read_rows(
+            &chain,
+            &DatasetKey::evm_logs(),
+            &broad_selector,
+            query_range,
+        )
+        .expect("read broad rows");
+
+    assert_eq!(read, expected_rows);
+}
+
+#[test]
 fn test_narrow_evm_log_address_coverage_does_not_cover_broader_query() {
     let storage = LocalStorage::new(temp_storage_root("semantic-narrow-address"));
     let chain = test_chain();
