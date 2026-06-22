@@ -2652,11 +2652,15 @@ fn test_narrow_evm_log_data_read_pierces_polluted_broad_empty_coverage() {
         vec![range.clone()]
     );
 
-    let read = storage
+    let store = ManifestAccessCountingStore::new(storage.root().to_path_buf());
+    let read_storage = DurableStorage::from_object_store(store.clone());
+    store.reset_manifest_access_count();
+    let read = read_storage
         .read_rows(&chain, &DatasetKey::evm_logs(), &broad_selector, range)
         .expect("read broad rows");
 
     assert_eq!(read, narrow_rows);
+    assert_eq!(store.manifest_access_count(), 0);
 }
 
 #[test]
@@ -2733,7 +2737,10 @@ fn test_narrow_evm_log_data_repairs_mixed_broad_data_and_empty_coverage() {
         vec![query_range.clone()]
     );
 
-    let read = storage
+    let store = ManifestAccessCountingStore::new(storage.root().to_path_buf());
+    let read_storage = DurableStorage::from_object_store(store.clone());
+    store.reset_manifest_access_count();
+    let read = read_storage
         .read_rows(
             &chain,
             &DatasetKey::evm_logs(),
@@ -2743,6 +2750,7 @@ fn test_narrow_evm_log_data_repairs_mixed_broad_data_and_empty_coverage() {
         .expect("read broad rows");
 
     assert_eq!(read, expected_rows);
+    assert_eq!(store.manifest_access_count(), 0);
 }
 
 #[test]

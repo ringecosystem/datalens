@@ -11,9 +11,7 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use crate::selector_coverage::{
-    filter_evm_log_rows_for_selector, parse_evm_log_canonical_key, selector_coverage_candidates,
-};
+use crate::selector_coverage::{filter_evm_log_rows_for_selector, selector_coverage_candidates};
 use crate::{coverage_index, read_through_cache};
 
 const STORAGE_READ_GET_PARALLELISM: usize = 8;
@@ -895,43 +893,34 @@ where
             return Ok(());
         }
 
-        let Some(query_filter) = parse_evm_log_canonical_key(&selector.canonical_key()) else {
-            return Ok(());
-        };
         let existing_keys = entries
             .iter()
             .map(manifest_entry_read_key)
             .collect::<BTreeSet<_>>();
-        let manifest = self.manifest_for_chain(chain)?;
         let selector_fingerprint = selector.fingerprint();
         let selector_canonical_key = selector.canonical_key();
-        let mut repaired_entries = manifest
-            .entries
-            .into_iter()
-            .filter(|entry| entry.chain == *chain)
-            .filter(|entry| entry.dataset_key == *dataset_key)
-            .filter(|entry| entry.object_key.is_some())
-            .filter(|entry| entry.range.kind() == range.kind())
-            .filter(|entry| entry.range.intersection(range).is_some())
-            .filter(|entry| {
-                finality_level
-                    .map(|finality_level| {
-                        durable_finality_satisfies(entry.finality_level, finality_level)
-                    })
-                    .unwrap_or(true)
-            })
-            .filter(|entry| !existing_keys.contains(&manifest_entry_read_key(entry)))
-            .filter(|entry| {
-                parse_evm_log_canonical_key(&entry.selector_canonical_key)
-                    .map(|stored_filter| query_filter.covers(&stored_filter))
-                    .unwrap_or(false)
-            })
-            .map(|mut entry| {
-                entry.selector_fingerprint = selector_fingerprint.clone();
-                entry.selector_canonical_key = selector_canonical_key.clone();
-                entry
-            })
-            .collect::<Vec<_>>();
+        let mut repaired_entries = coverage_index::read_compatible_evm_log_data_entries_for_query(
+            &self.object_store,
+            chain,
+            dataset_key,
+            selector,
+            range,
+        )?
+        .into_iter()
+        .filter(|entry| {
+            finality_level
+                .map(|finality_level| {
+                    durable_finality_satisfies(entry.finality_level, finality_level)
+                })
+                .unwrap_or(true)
+        })
+        .filter(|entry| !existing_keys.contains(&manifest_entry_read_key(entry)))
+        .map(|mut entry| {
+            entry.selector_fingerprint = selector_fingerprint.clone();
+            entry.selector_canonical_key = selector_canonical_key.clone();
+            entry
+        })
+        .collect::<Vec<_>>();
 
         if repaired_entries.is_empty() {
             return Ok(());
