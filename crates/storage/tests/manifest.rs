@@ -2433,6 +2433,55 @@ fn test_exact_evm_log_coverage_full_hit_skips_semantic_index_probes() {
 }
 
 #[test]
+fn test_exact_evm_log_coverage_uses_deterministic_index_without_listing() {
+    let store =
+        ManifestAccessCountingStore::new(temp_storage_root("evm-log-exact-deterministic-no-list"));
+    let storage = DurableStorage::from_object_store(store.clone());
+    let chain = test_chain();
+    let selector = evm_log_selector(vec![ADDRESS_A], vec![Some(vec![TOPIC_1])]);
+    let range = LedgerRange::blocks(12, 12).expect("valid range");
+    let rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![log_record(12, 0, ADDRESS_A, vec![TOPIC_1])]),
+    )
+    .expect("rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &selector,
+            range: range.clone(),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write exact rows");
+
+    store.reset_manifest_access_count();
+    store.reset_coverage_index_list_count();
+    assert_eq!(
+        storage
+            .covered_ranges(&chain, &DatasetKey::evm_logs(), &selector, range.clone())
+            .expect("covered ranges"),
+        vec![range.clone()]
+    );
+    assert_eq!(store.manifest_access_count(), 0);
+    assert_eq!(store.coverage_index_list_count(), 0);
+
+    store.reset_manifest_access_count();
+    store.reset_coverage_index_list_count();
+    assert_eq!(
+        storage
+            .read_rows(&chain, &DatasetKey::evm_logs(), &selector, range)
+            .expect("read rows"),
+        rows
+    );
+    assert_eq!(store.manifest_access_count(), 0);
+    assert_eq!(store.coverage_index_list_count(), 0);
+}
+
+#[test]
 fn test_partial_exact_coverage_uses_semantic_fallback_for_missing_ranges() {
     let storage = LocalStorage::new(temp_storage_root("semantic-partial-exact-fallback"));
     let chain = test_chain();
@@ -2851,6 +2900,66 @@ fn test_semantic_evm_log_coverage_reuses_broad_cache_without_hiding_incomplete_t
             .expect("covered ranges")
             .is_empty()
     );
+}
+
+#[test]
+fn test_broad_evm_log_index_serves_narrow_query_without_manifest_or_listing() {
+    let store =
+        ManifestAccessCountingStore::new(temp_storage_root("broad-evm-log-index-narrow-no-list"));
+    let storage = DurableStorage::from_object_store(store.clone());
+    let chain = test_chain();
+    let broad_selector = evm_log_selector(vec![], vec![Some(vec![TOPIC_1, TOPIC_2])]);
+    let narrow_selector = evm_log_selector(vec![], vec![Some(vec![TOPIC_1])]);
+    let range = LedgerRange::blocks(10, 10).expect("valid range");
+    let broad_rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![
+            log_record(10, 1, ADDRESS_A, vec![TOPIC_1]),
+            log_record(10, 2, ADDRESS_A, vec![TOPIC_2]),
+        ]),
+    )
+    .expect("broad rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &broad_selector,
+            range: range.clone(),
+            rows: &broad_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write broad logs coverage");
+
+    store.reset_manifest_access_count();
+    store.reset_coverage_index_list_count();
+    assert_eq!(
+        storage
+            .covered_ranges(
+                &chain,
+                &DatasetKey::evm_logs(),
+                &narrow_selector,
+                range.clone(),
+            )
+            .expect("covered ranges"),
+        vec![range.clone()]
+    );
+    assert_eq!(store.manifest_access_count(), 0);
+    assert_eq!(store.coverage_index_list_count(), 0);
+
+    store.reset_manifest_access_count();
+    store.reset_coverage_index_list_count();
+    let read = storage
+        .read_rows(&chain, &DatasetKey::evm_logs(), &narrow_selector, range)
+        .expect("read rows");
+    let QueryRows::EvmLogs(logs) = read.rows() else {
+        panic!("expected evm logs");
+    };
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].topics, vec![TOPIC_1.to_owned()]);
+    assert_eq!(store.manifest_access_count(), 0);
+    assert_eq!(store.coverage_index_list_count(), 0);
 }
 
 #[test]

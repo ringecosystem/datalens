@@ -9,7 +9,7 @@ use std::{
 use datalens_chain::{DatasetSelector, FinalityLevel};
 use datalens_core::{
     BlockHeader, ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey,
-    DatasetRows, LedgerRange, LogRecord, NetworkId, QueryRows,
+    DatasetRows, LedgerRange, LogFilter, LogRecord, NetworkId, QueryRows,
 };
 use datalens_storage::{
     LocalStorage, Manifest, ManifestFinalityLevel, ObjectEncoding, StorageRepository,
@@ -482,6 +482,66 @@ fn test_writer_exposes_staged_rows_for_matching_coverage_identity_only() {
 }
 
 #[test]
+fn test_writer_staged_evm_logs_cover_and_filter_narrow_query() {
+    let storage = LocalStorage::new(temp_storage_root("staged-evm-log-semantic-readable"));
+    let writer = DurableWriter::new(
+        storage.clone(),
+        DurableWriterConfig {
+            target_object_bytes: 1024 * 1024,
+            min_object_rows: 3,
+            record_empty_coverage: true,
+            staging: WriteStagingConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        },
+    );
+    let chain = test_chain();
+    let range = LedgerRange::blocks(10, 10).expect("valid range");
+    let broad_selector = evm_log_selector(vec![Some(vec![TOPIC_1, TOPIC_2])]);
+    let narrow_selector = evm_log_selector(vec![Some(vec![TOPIC_1])]);
+
+    writer
+        .write(DurableWriteRequest {
+            chain: chain.clone(),
+            dataset_key: DatasetKey::evm_logs(),
+            selector: broad_selector,
+            finality_level: FinalityLevel::Safe,
+            segments: vec![DurableWriteSegment {
+                range: range.clone(),
+                rows: log_rows(vec![
+                    log_record(10, 1, vec![TOPIC_1]),
+                    log_record(10, 2, vec![TOPIC_2]),
+                ]),
+            }],
+        })
+        .expect("stage broad evm log write");
+
+    assert_eq!(
+        writer
+            .staged_covered_ranges(
+                &chain,
+                &DatasetKey::evm_logs(),
+                &narrow_selector,
+                range.clone(),
+            )
+            .expect("staged coverage"),
+        vec![range.clone()]
+    );
+
+    let staged = writer
+        .read_staged_rows(&chain, &DatasetKey::evm_logs(), &narrow_selector, range)
+        .expect("read staged rows")
+        .expect("matching staged rows");
+    let QueryRows::EvmLogs(logs) = staged.rows() else {
+        panic!("expected evm logs");
+    };
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].topics, vec![TOPIC_1.to_owned()]);
+    assert!(storage.manifest().expect("manifest").entries.is_empty());
+}
+
+#[test]
 fn test_writer_flush_persists_staged_segments_as_durable_coverage() {
     let storage = LocalStorage::new(temp_storage_root("flush-staged"));
     let writer = DurableWriter::new(
@@ -779,6 +839,36 @@ fn block_rows(rows: Vec<BlockHeader>) -> DatasetRows {
 
 fn log_rows(rows: Vec<LogRecord>) -> DatasetRows {
     DatasetRows::new(DatasetKey::evm_logs(), QueryRows::EvmLogs(rows)).expect("dataset rows")
+}
+
+const ADDRESS_A: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const TOPIC_1: &str = "0x1111111111111111111111111111111111111111111111111111111111111111";
+const TOPIC_2: &str = "0x2222222222222222222222222222222222222222222222222222222222222222";
+
+fn evm_log_selector(topics: Vec<Option<Vec<&str>>>) -> DatasetSelector {
+    DatasetSelector::try_evm_logs(LogFilter {
+        addresses: Vec::new(),
+        topics: topics
+            .into_iter()
+            .map(|slot| slot.map(|values| values.into_iter().map(str::to_owned).collect()))
+            .collect(),
+    })
+    .expect("valid selector")
+}
+
+fn log_record(block_number: u64, log_index: u64, topics: Vec<&str>) -> LogRecord {
+    LogRecord::try_new(
+        block_number,
+        format!("0xblock{block_number}"),
+        format!("0xtx{block_number}{log_index}"),
+        0,
+        log_index,
+        ADDRESS_A,
+        topics.into_iter().map(str::to_owned).collect(),
+        "0x".to_owned(),
+        false,
+    )
+    .expect("valid log record")
 }
 
 #[derive(Clone)]
