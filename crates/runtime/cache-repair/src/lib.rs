@@ -843,7 +843,10 @@ where
             provider_calls += fetched.provider_calls;
             merged.try_append(fetched.rows.into_rows())?;
         }
-        let rows = DatasetRows::new(task.dataset_key.clone(), dedupe_repair_rows(merged)?)?;
+        let rows = filter_repair_rows_for_target(
+            DatasetRows::new(task.dataset_key.clone(), dedupe_repair_rows(merged)?)?,
+            &task.selector,
+        )?;
         Ok(FetchedRepairRows {
             provider_calls,
             rows,
@@ -1290,10 +1293,10 @@ fn validate_source_selectors(
     for source in source_selectors {
         match (target, source) {
             (DatasetSelector::EvmLogs(_), DatasetSelector::EvmLogs(_)) => {
-                if !target.covers(source) {
+                if !target.covers(source) && !source.covers(target) {
                     return Err(DatalensError::new(
                         DatalensErrorKind::InvalidInput,
-                        "cache repair source selector must be covered by target selector",
+                        "cache repair source selector must be compatible with target selector",
                     ));
                 }
             }
@@ -1306,6 +1309,32 @@ fn validate_source_selectors(
         }
     }
     Ok(())
+}
+
+fn filter_repair_rows_for_target(
+    rows: DatasetRows,
+    target: &DatasetSelector,
+) -> Result<DatasetRows, DatalensError> {
+    let DatasetSelector::EvmLogs(filter) = target else {
+        return Ok(rows);
+    };
+    if rows.dataset_key() != &DatasetKey::evm_logs() {
+        return Ok(rows);
+    }
+    let QueryRows::EvmLogs(logs) = rows.into_rows() else {
+        return Err(DatalensError::new(
+            DatalensErrorKind::UnsupportedDataset,
+            "cache repair source selectors are only supported for EVM log rows",
+        ));
+    };
+    DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(
+            logs.into_iter()
+                .filter(|row| filter.matches_log(row))
+                .collect(),
+        ),
+    )
 }
 
 fn stored_selector_from_selector(
