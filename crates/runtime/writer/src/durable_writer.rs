@@ -244,7 +244,10 @@ where
             .filter(|write| write.finality_level.is_durable_writable())
             .filter(|write| write.matches_coverage(chain, dataset_key, selector, &range))
         {
-            let filtered = filter_rows(write.segment.rows.clone(), range.clone());
+            let filtered = filter_rows_for_selector(
+                filter_rows(write.segment.rows.clone(), range.clone()),
+                selector,
+            )?;
             rows.try_append(filtered.into_rows())?;
         }
         rows.sort();
@@ -515,8 +518,41 @@ impl StagedWrite {
     ) -> bool {
         self.chain == *chain
             && self.dataset_key == *dataset_key
-            && self.selector == *selector
+            && selector_covers_query(&self.selector, selector)
             && self.segment.range.kind() == range.kind()
+    }
+}
+
+fn selector_covers_query(stored: &DatasetSelector, query: &DatasetSelector) -> bool {
+    if stored == query {
+        return true;
+    }
+    matches!(
+        (stored, query),
+        (DatasetSelector::EvmLogs(_), DatasetSelector::EvmLogs(_))
+    ) && stored.covers(query)
+}
+
+fn filter_rows_for_selector(
+    rows: DatasetRows,
+    selector: &DatasetSelector,
+) -> Result<DatasetRows, DatalensError> {
+    let DatasetSelector::EvmLogs(filter) = selector else {
+        return Ok(rows);
+    };
+    if rows.dataset_key() != &DatasetKey::evm_logs() {
+        return Ok(rows);
+    }
+    match rows.into_rows() {
+        QueryRows::EvmLogs(rows) => DatasetRows::new(
+            DatasetKey::evm_logs(),
+            QueryRows::EvmLogs(
+                rows.into_iter()
+                    .filter(|row| filter.matches_log(row))
+                    .collect(),
+            ),
+        ),
+        rows => DatasetRows::new(DatasetKey::evm_logs(), rows),
     }
 }
 
