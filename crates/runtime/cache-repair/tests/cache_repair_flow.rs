@@ -671,6 +671,64 @@ fn test_cache_repair_source_selectors_repair_broad_target_without_fetching_targe
 }
 
 #[test]
+fn test_cache_repair_broad_source_selector_is_filtered_before_target_write() {
+    let root = temp_root("repair-broad-source-filtered");
+    let storage = LocalStorage::new(root.join("storage"));
+    let registry = LocalCacheRepairRegistry::new(LocalObjectStore::new(root.join("registry")));
+    let chain = test_chain();
+    let target_selector = exact_selector(topic());
+    let source_selector = address_only_selector();
+    let adapter = FixtureAdapter::target_fetch_fails(chain.clone(), target_selector.clone())
+        .with_selector_result(
+            source_selector.clone(),
+            Ok(vec![
+                log_record_with_topic(11, 3, topic()),
+                log_record_with_topic(11, 4, other_topic()),
+            ]),
+        );
+    let calls = adapter.calls.clone();
+    let pool =
+        CacheRepairTaskPool::new(CacheRepairRuntime::new(adapter, storage.clone(), registry));
+    let mut request = submit_request(chain.clone(), target_selector.clone());
+    request.source_selectors = vec![source_selector.clone()];
+    let submit = pool.submit(request).expect("submit repair");
+
+    let result = pool
+        .run_task_once(&submit.task_id)
+        .expect("run source selector repair");
+
+    assert_eq!(result.status, CacheRepairRunStatus::Completed);
+    assert_eq!(calls_for(&calls, &target_selector), 0);
+    assert_eq!(calls_for(&calls, &source_selector), 1);
+    let rows = storage
+        .read_rows(
+            &chain,
+            &DatasetKey::evm_logs(),
+            &target_selector,
+            repair_range(),
+        )
+        .expect("read repaired target rows");
+    match rows.into_rows() {
+        QueryRows::EvmLogs(logs) => {
+            assert_eq!(logs.len(), 1);
+            assert_eq!(logs[0].topics[0], topic());
+        }
+        rows => panic!("expected evm logs, got {rows:?}"),
+    }
+    assert_eq!(
+        storage
+            .covered_ranges(
+                &chain,
+                &DatasetKey::evm_logs(),
+                &target_selector,
+                repair_range()
+            )
+            .expect("covered ranges"),
+        vec![repair_range()]
+    );
+}
+
+#[test]
 fn test_cache_repair_source_selector_failure_preserves_target_coverage() {
     let root = temp_root("repair-source-selector-failure");
     let storage = LocalStorage::new(root.join("storage"));
@@ -998,6 +1056,14 @@ fn broad_selector() -> DatasetSelector {
         topics: vec![Some(vec![topic(), other_topic()])],
     })
     .expect("broad selector")
+}
+
+fn address_only_selector() -> DatasetSelector {
+    DatasetSelector::try_evm_logs(LogFilter {
+        addresses: vec![address()],
+        topics: Vec::new(),
+    })
+    .expect("address-only selector")
 }
 
 fn log_record(block_number: u64, log_index: u64) -> LogRecord {
