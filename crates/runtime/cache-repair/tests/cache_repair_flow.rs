@@ -729,6 +729,58 @@ fn test_cache_repair_broad_source_selector_is_filtered_before_target_write() {
 }
 
 #[test]
+fn test_cache_repair_safe_task_replaces_finalized_coverage_when_range_is_finalized() {
+    let root = temp_root("repair-safe-task-replaces-finalized");
+    let storage = LocalStorage::new(root.join("storage"));
+    let registry = LocalCacheRepairRegistry::new(LocalObjectStore::new(root.join("registry")));
+    let chain = test_chain();
+    let target_selector = broad_selector();
+    let source_selector = exact_selector(topic());
+    write_empty_coverage_with_finality(
+        &storage,
+        &chain,
+        &target_selector,
+        FinalityLevel::Finalized,
+    );
+    let adapter = FixtureAdapter::target_fetch_fails(chain.clone(), target_selector.clone())
+        .with_finalized_height(ChainHeight::block(20).with_finality(FinalityLevel::Finalized))
+        .with_selector_result(
+            source_selector.clone(),
+            Ok(vec![log_record_with_topic(11, 3, topic())]),
+        );
+    let calls = adapter.calls.clone();
+    let pool =
+        CacheRepairTaskPool::new(CacheRepairRuntime::new(adapter, storage.clone(), registry));
+    let mut request = submit_request(chain.clone(), target_selector.clone());
+    request.source_selectors = vec![source_selector.clone()];
+    let submit = pool.submit(request).expect("submit repair");
+
+    let result = pool
+        .run_task_once(&submit.task_id)
+        .expect("run source selector repair");
+
+    assert_eq!(result.status, CacheRepairRunStatus::Completed);
+    assert_eq!(calls_for(&calls, &target_selector), 0);
+    assert_eq!(calls_for(&calls, &source_selector), 1);
+    let finalized_rows = storage
+        .read_rows_for_finality(
+            &chain,
+            &DatasetKey::evm_logs(),
+            &target_selector,
+            repair_range(),
+            FinalityLevel::Finalized,
+        )
+        .expect("read finalized repaired target rows");
+    match finalized_rows.into_rows() {
+        QueryRows::EvmLogs(logs) => {
+            assert_eq!(logs.len(), 1);
+            assert_eq!(logs[0].topics[0], topic());
+        }
+        rows => panic!("expected evm logs, got {rows:?}"),
+    }
+}
+
+#[test]
 fn test_cache_repair_source_selector_failure_preserves_target_coverage() {
     let root = temp_root("repair-source-selector-failure");
     let storage = LocalStorage::new(root.join("storage"));
@@ -815,6 +867,7 @@ struct FixtureAdapter {
     calls: Arc<Mutex<BTreeMap<String, usize>>>,
     delay: Option<Duration>,
     height_delay: Option<Duration>,
+    finalized_height: Option<ChainHeight>,
 }
 
 type SelectorResult = Result<Vec<LogRecord>, DatalensError>;
@@ -829,6 +882,7 @@ impl FixtureAdapter {
             calls: Arc::new(Mutex::new(BTreeMap::new())),
             delay: None,
             height_delay: None,
+            finalized_height: None,
         }
     }
 
@@ -863,6 +917,11 @@ impl FixtureAdapter {
         self.height_delay = Some(delay);
         self
     }
+
+    fn with_finalized_height(mut self, finalized_height: ChainHeight) -> Self {
+        self.finalized_height = Some(finalized_height);
+        self
+    }
 }
 
 impl ChainAdapter for FixtureAdapter {
@@ -885,6 +944,15 @@ impl ChainAdapter for FixtureAdapter {
             thread::sleep(delay);
         }
         Ok(ChainHeight::block(20).with_finality(FinalityLevel::Safe))
+    }
+
+    fn finalized_height(&self) -> Result<ChainHeight, DatalensError> {
+        self.finalized_height.clone().ok_or_else(|| {
+            DatalensError::new(
+                DatalensErrorKind::UnsupportedDataset,
+                "fixture does not expose finalized height",
+            )
+        })
     }
 
     fn fetch(&self, request: ChainFetchRequest) -> Result<ChainFetchResponse, DatalensError> {
@@ -1102,6 +1170,15 @@ fn repair_range() -> LedgerRange {
 }
 
 fn write_empty_coverage(storage: &LocalStorage, chain: &ChainIdentity, selector: &DatasetSelector) {
+    write_empty_coverage_with_finality(storage, chain, selector, FinalityLevel::Safe);
+}
+
+fn write_empty_coverage_with_finality(
+    storage: &LocalStorage,
+    chain: &ChainIdentity,
+    selector: &DatasetSelector,
+    finality_level: FinalityLevel,
+) {
     let empty_rows =
         datalens_core::DatasetRows::new(DatasetKey::evm_logs(), QueryRows::EvmLogs(Vec::new()))
             .expect("empty rows");
@@ -1112,7 +1189,7 @@ fn write_empty_coverage(storage: &LocalStorage, chain: &ChainIdentity, selector:
             selector,
             range: repair_range(),
             rows: &empty_rows,
-            finality_level: FinalityLevel::Safe,
+            finality_level,
             record_empty_coverage: true,
         })
         .expect("write empty coverage");

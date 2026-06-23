@@ -655,6 +655,42 @@ where
             self.mark_failed(&mut task, &error)?;
             return Err(error);
         }
+        let finalized_height = if task.finality == CacheRepairFinality::Safe {
+            match self.height_with_timeout(CacheRepairFinality::Finalized) {
+                Ok(finalized_height) => {
+                    if let Err(error) = finalized_height.validate_durable_writable() {
+                        log::debug!(
+                            "cache repair finalized height skipped task_id={} kind={:?} message={}",
+                            task.task_id.as_str(),
+                            error.kind,
+                            error.message,
+                        );
+                        None
+                    } else if finalized_height.range_kind != task.range_kind {
+                        log::debug!(
+                            "cache repair finalized height skipped task_id={} task_range_kind={:?} finalized_range_kind={:?}",
+                            task.task_id.as_str(),
+                            task.range_kind,
+                            finalized_height.range_kind,
+                        );
+                        None
+                    } else {
+                        Some(finalized_height)
+                    }
+                }
+                Err(error) => {
+                    log::debug!(
+                        "cache repair finalized height unavailable task_id={} kind={:?} message={}",
+                        task.task_id.as_str(),
+                        error.kind,
+                        error.message,
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         let mut result = CacheRepairRunResult::default();
         let mut next = task.start;
@@ -683,15 +719,23 @@ where
             let write_start = std::time::Instant::now();
             self.set_phase(&mut task, CACHE_REPAIR_PHASE_WRITE, Some(&chunk), None)?;
             self.registry.save_task(&task)?;
+            let write_finalities =
+                repair_write_finalities(&task, &chunk, finalized_height.as_ref());
             log::info!(
-                "cache repair replacement write started task_id={} target_selector_fingerprint={} range={}-{} rows={}",
+                "cache repair replacement write started task_id={} target_selector_fingerprint={} range={}-{} rows={} finalities={:?}",
                 task.task_id.as_str(),
                 task.selector.fingerprint(),
                 chunk.start(),
                 chunk.end(),
                 row_count,
+                write_finalities,
             );
-            match self.write_rows_replacing_existing_with_timeout(&task, chunk.clone(), rows) {
+            match self.write_rows_replacing_existing_with_timeout(
+                &task,
+                chunk.clone(),
+                rows,
+                write_finalities,
+            ) {
                 Ok(outcome) => {
                     log::info!(
                         "cache repair replacement write completed task_id={} range={}-{} data_object={} empty_coverage={} duration_ms={}",
@@ -930,22 +974,26 @@ where
         task: &CacheRepairTask,
         range: LedgerRange,
         rows: DatasetRows,
+        finality_levels: Vec<FinalityLevel>,
     ) -> Result<datalens_storage::StorageWriteOutcome, DatalensError> {
         let storage = self.storage.clone();
         let chain = task.chain.clone();
         let dataset_key = task.dataset_key.clone();
         let selector = task.selector.clone();
-        let finality_level = task.finality.to_finality_level();
         self.run_with_operation_timeout(CACHE_REPAIR_PHASE_WRITE, move || {
-            storage.write_rows_replacing_existing(StorageWriteRequest {
-                chain: &chain,
-                dataset_key,
-                selector: &selector,
-                range,
-                rows: &rows,
-                finality_level,
-                record_empty_coverage: true,
-            })
+            let mut outcome = None;
+            for finality_level in finality_levels {
+                outcome = Some(storage.write_rows_replacing_existing(StorageWriteRequest {
+                    chain: &chain,
+                    dataset_key: dataset_key.clone(),
+                    selector: &selector,
+                    range: range.clone(),
+                    rows: &rows,
+                    finality_level,
+                    record_empty_coverage: true,
+                })?);
+            }
+            outcome.ok_or_else(|| DatalensError::internal("cache repair has no write finalities"))
         })
     }
 
@@ -979,6 +1027,22 @@ where
             )),
         }
     }
+}
+
+fn repair_write_finalities(
+    task: &CacheRepairTask,
+    range: &LedgerRange,
+    finalized_height: Option<&datalens_chain::ChainHeight>,
+) -> Vec<FinalityLevel> {
+    let mut finalities = vec![task.finality.to_finality_level()];
+    if task.finality == CacheRepairFinality::Safe
+        && finalized_height
+            .and_then(|height| validate_durable_range(range, height).ok())
+            .is_some()
+    {
+        finalities.push(FinalityLevel::Finalized);
+    }
+    finalities
 }
 
 trait CacheRepairErrorContext {
