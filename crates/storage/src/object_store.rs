@@ -5,7 +5,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use aws_sdk_s3::{
@@ -374,6 +374,8 @@ pub struct S3ObjectStore {
 
 const DEFAULT_S3_RUNTIME_WORKER_THREADS: usize = 4;
 const DEFAULT_S3_MAX_CONCURRENT_OPERATIONS: usize = 16;
+const DEFAULT_S3_GET_MAX_ATTEMPTS: usize = 3;
+const DEFAULT_S3_GET_RETRY_BACKOFF_MS: u64 = 100;
 
 #[derive(Clone)]
 struct S3Runtime {
@@ -571,27 +573,58 @@ impl ObjectStore for S3ObjectStore {
         let client = self.client.clone();
         let bucket = self.bucket.clone();
         self.runtime.block_on_operation("get", log_key, async move {
-            let object = client
-                .get_object()
-                .bucket(&bucket)
-                .key(&key)
-                .send()
-                .await
-                .map_err(|error| {
-                    let message = if service_error_code(&error).is_some_and(is_not_found_code) {
-                        format!("object not found {key}")
-                    } else {
-                        format!("S3 get object {key}: {error}")
-                    };
-                    DatalensError::new(DatalensErrorKind::StorageReadFailure, message)
-                })?;
-            let bytes = object.body.collect().await.map_err(|error| {
-                DatalensError::new(
-                    DatalensErrorKind::StorageReadFailure,
-                    format!("S3 read object body {key}: {error}"),
-                )
-            })?;
-            Ok(bytes.into_bytes().to_vec())
+            for attempt in 1..=DEFAULT_S3_GET_MAX_ATTEMPTS {
+                let object = match client.get_object().bucket(&bucket).key(&key).send().await {
+                    Ok(object) => object,
+                    Err(error) if service_error_code(&error).is_some_and(is_not_found_code) => {
+                        return Err(DatalensError::new(
+                            DatalensErrorKind::StorageReadFailure,
+                            format!("object not found {key}"),
+                        ));
+                    }
+                    Err(error) if should_retry_s3_get(attempt) => {
+                        log::warn!(
+                            "s3 get retry scheduled key={} attempt={} max_attempts={} error={}",
+                            key,
+                            attempt + 1,
+                            DEFAULT_S3_GET_MAX_ATTEMPTS,
+                            error
+                        );
+                        tokio::time::sleep(s3_get_retry_delay(attempt)).await;
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(DatalensError::new(
+                            DatalensErrorKind::StorageReadFailure,
+                            format!("S3 get object {key}: {error}"),
+                        ));
+                    }
+                };
+
+                match object.body.collect().await {
+                    Ok(bytes) => return Ok(bytes.into_bytes().to_vec()),
+                    Err(error) if should_retry_s3_get(attempt) => {
+                        log::warn!(
+                            "s3 get body retry scheduled key={} attempt={} max_attempts={} error={}",
+                            key,
+                            attempt + 1,
+                            DEFAULT_S3_GET_MAX_ATTEMPTS,
+                            error
+                        );
+                        tokio::time::sleep(s3_get_retry_delay(attempt)).await;
+                    }
+                    Err(error) => {
+                        return Err(DatalensError::new(
+                            DatalensErrorKind::StorageReadFailure,
+                            format!("S3 read object body {key}: {error}"),
+                        ));
+                    }
+                }
+            }
+            Err(DatalensError::new(
+                DatalensErrorKind::StorageReadFailure,
+                format!("S3 get object {key}: retry attempts exhausted"),
+            ))
         })
     }
 
@@ -785,6 +818,14 @@ fn is_not_found_code(code: &str) -> bool {
     matches!(code, "NoSuchKey" | "NotFound" | "404")
 }
 
+fn should_retry_s3_get(attempt: usize) -> bool {
+    attempt < DEFAULT_S3_GET_MAX_ATTEMPTS
+}
+
+fn s3_get_retry_delay(attempt: usize) -> Duration {
+    Duration::from_millis(DEFAULT_S3_GET_RETRY_BACKOFF_MS.saturating_mul(attempt as u64))
+}
+
 fn normalize_prefix(prefix: Option<&str>) -> Result<Option<String>, DatalensError> {
     let Some(prefix) = prefix else {
         return Ok(None);
@@ -806,7 +847,7 @@ mod tests {
 
     use datalens_core::DatalensError;
 
-    use super::S3Runtime;
+    use super::{DEFAULT_S3_GET_MAX_ATTEMPTS, S3Runtime, s3_get_retry_delay, should_retry_s3_get};
 
     #[test]
     fn test_s3_runtime_runs_independent_operations_concurrently() {
@@ -832,5 +873,18 @@ mod tests {
             start.elapsed() < Duration::from_millis(650),
             "S3 runtime serialized independent operations"
         );
+    }
+
+    #[test]
+    fn test_s3_get_retry_stops_after_max_attempts() {
+        assert!(should_retry_s3_get(1));
+        assert!(should_retry_s3_get(DEFAULT_S3_GET_MAX_ATTEMPTS - 1));
+        assert!(!should_retry_s3_get(DEFAULT_S3_GET_MAX_ATTEMPTS));
+    }
+
+    #[test]
+    fn test_s3_get_retry_delay_increases_by_attempt() {
+        assert_eq!(s3_get_retry_delay(1), Duration::from_millis(100));
+        assert_eq!(s3_get_retry_delay(2), Duration::from_millis(200));
     }
 }
