@@ -88,20 +88,24 @@ pub(crate) fn evm_log_filter(range: BlockRange, filter: &EvmLogFilter) -> Value 
     if !filter.addresses().is_empty() {
         value.insert("address".to_owned(), json!(filter.addresses()));
     }
-    if !filter.topics().is_empty() {
-        value.insert(
-            "topics".to_owned(),
-            Value::Array(
-                filter
-                    .topics()
-                    .iter()
-                    .map(|topic| match topic {
-                        TopicFilter::Wildcard => Value::Null,
-                        TopicFilter::AnyOf(values) => json!(values),
-                    })
-                    .collect(),
-            ),
-        );
+    let topics = filter
+        .topics()
+        .iter()
+        .map(|topic| match topic {
+            TopicFilter::Wildcard => Value::Null,
+            TopicFilter::AnyOf(values) => json!(values),
+        })
+        .collect::<Vec<_>>();
+    let topics = topics
+        .into_iter()
+        .rev()
+        .skip_while(Value::is_null)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>();
+    if !topics.is_empty() {
+        value.insert("topics".to_owned(), Value::Array(topics));
     }
     Value::Object(value)
 }
@@ -247,4 +251,60 @@ pub(crate) fn optional_hex_u64_field(
             })
         })
         .transpose()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datalens_core::LogFilter;
+
+    fn topic(value: &str) -> String {
+        format!("0x{value:0>64}")
+    }
+
+    #[test]
+    fn evm_log_filter_trims_trailing_wildcard_topics() {
+        let first_topic = topic("1");
+        let filter = EvmLogFilter::try_from(LogFilter {
+            addresses: vec!["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()],
+            topics: vec![Some(vec![first_topic.clone()]), None, None, None],
+        })
+        .expect("filter");
+
+        let value = evm_log_filter(BlockRange::expect_new(10, 10), &filter);
+
+        assert_eq!(value["topics"], json!([[first_topic]]));
+    }
+
+    #[test]
+    fn evm_log_filter_preserves_inner_wildcard_topics() {
+        let first_topic = topic("1");
+        let third_topic = topic("3");
+        let filter = EvmLogFilter::try_from(LogFilter {
+            addresses: vec!["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()],
+            topics: vec![
+                Some(vec![first_topic.clone()]),
+                None,
+                Some(vec![third_topic.clone()]),
+            ],
+        })
+        .expect("filter");
+
+        let value = evm_log_filter(BlockRange::expect_new(10, 10), &filter);
+
+        assert_eq!(value["topics"], json!([[first_topic], null, [third_topic]]));
+    }
+
+    #[test]
+    fn evm_log_filter_omits_all_wildcard_topics() {
+        let filter = EvmLogFilter::try_from(LogFilter {
+            addresses: vec!["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()],
+            topics: vec![None, None],
+        })
+        .expect("filter");
+
+        let value = evm_log_filter(BlockRange::expect_new(10, 10), &filter);
+
+        assert!(value.get("topics").is_none());
+    }
 }
