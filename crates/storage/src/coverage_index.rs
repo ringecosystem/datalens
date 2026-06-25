@@ -159,10 +159,8 @@ where
 {
     let mut any_key_has_index = false;
     for key in keys {
-        let bytes = match object_store.get(&key) {
-            Ok(bytes) => bytes,
-            Err(error) if is_object_not_found(&error) => continue,
-            Err(error) => return Err(error),
+        let Some(bytes) = object_store.get_optional(&key)? else {
+            continue;
         };
         let mut index: CoverageIndex = serde_json::from_slice(&bytes).map_err(|error| {
             DatalensError::new(
@@ -174,11 +172,6 @@ where
         entries.append(&mut index.entries);
     }
     Ok(any_key_has_index)
-}
-
-fn is_object_not_found(error: &DatalensError) -> bool {
-    error.kind == DatalensErrorKind::StorageReadFailure
-        && error.message.starts_with("object not found ")
 }
 
 fn normalized_query_entries(

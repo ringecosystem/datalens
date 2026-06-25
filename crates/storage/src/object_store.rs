@@ -32,6 +32,13 @@ pub struct ObjectListPage {
 
 pub trait ObjectStore: Clone + Send + Sync {
     fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError>;
+    fn get_optional(&self, key: &str) -> Result<Option<Vec<u8>>, DatalensError> {
+        match self.get(key) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if is_object_not_found(&error) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
     fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError>;
     fn exists(&self, key: &str) -> Result<bool, DatalensError>;
     fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError>;
@@ -46,6 +53,11 @@ pub trait ObjectStore: Clone + Send + Sync {
     fn lock_namespace(&self) -> String {
         std::any::type_name::<Self>().to_owned()
     }
+}
+
+fn is_object_not_found(error: &DatalensError) -> bool {
+    error.kind == DatalensErrorKind::StorageReadFailure
+        && error.message.starts_with("object not found ")
 }
 
 pub fn validate_object_key(key: &str) -> Result<(), DatalensError> {
@@ -95,6 +107,18 @@ impl ObjectStore for LocalObjectStore {
             };
             DatalensError::new(DatalensErrorKind::StorageReadFailure, message)
         })
+    }
+
+    fn get_optional(&self, key: &str) -> Result<Option<Vec<u8>>, DatalensError> {
+        let path = self.path(key)?;
+        match fs::read(&path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(DatalensError::new(
+                DatalensErrorKind::StorageReadFailure,
+                format!("read object {}: {error}", path.display()),
+            )),
+        }
     }
 
     fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
@@ -626,6 +650,65 @@ impl ObjectStore for S3ObjectStore {
                 format!("S3 get object {key}: retry attempts exhausted"),
             ))
         })
+    }
+
+    fn get_optional(&self, key: &str) -> Result<Option<Vec<u8>>, DatalensError> {
+        let key = self.key(key)?;
+        let log_key = key.clone();
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        self.runtime
+            .block_on_operation("get_optional", log_key, async move {
+                for attempt in 1..=DEFAULT_S3_GET_MAX_ATTEMPTS {
+                    let object = match client.get_object().bucket(&bucket).key(&key).send().await {
+                        Ok(object) => object,
+                        Err(error) if service_error_code(&error).is_some_and(is_not_found_code) => {
+                            return Ok(None);
+                        }
+                        Err(error) if should_retry_s3_get(attempt) => {
+                            log::warn!(
+                                "s3 get retry scheduled key={} attempt={} max_attempts={} error={}",
+                                key,
+                                attempt + 1,
+                                DEFAULT_S3_GET_MAX_ATTEMPTS,
+                                error
+                            );
+                            tokio::time::sleep(s3_get_retry_delay(attempt)).await;
+                            continue;
+                        }
+                        Err(error) => {
+                            return Err(DatalensError::new(
+                                DatalensErrorKind::StorageReadFailure,
+                                format!("S3 get object {key}: {error}"),
+                            ));
+                        }
+                    };
+
+                    match object.body.collect().await {
+                        Ok(bytes) => return Ok(Some(bytes.into_bytes().to_vec())),
+                        Err(error) if should_retry_s3_get(attempt) => {
+                            log::warn!(
+                                "s3 get body retry scheduled key={} attempt={} max_attempts={} error={}",
+                                key,
+                                attempt + 1,
+                                DEFAULT_S3_GET_MAX_ATTEMPTS,
+                                error
+                            );
+                            tokio::time::sleep(s3_get_retry_delay(attempt)).await;
+                        }
+                        Err(error) => {
+                            return Err(DatalensError::new(
+                                DatalensErrorKind::StorageReadFailure,
+                                format!("S3 read object body {key}: {error}"),
+                            ));
+                        }
+                    }
+                }
+                Err(DatalensError::new(
+                    DatalensErrorKind::StorageReadFailure,
+                    format!("S3 get object {key}: retry attempts exhausted"),
+                ))
+            })
     }
 
     fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
