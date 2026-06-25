@@ -159,10 +159,11 @@ where
 {
     let mut any_key_has_index = false;
     for key in keys {
-        if !object_store.exists(&key)? {
-            continue;
-        }
-        let bytes = object_store.get(&key)?;
+        let bytes = match object_store.get(&key) {
+            Ok(bytes) => bytes,
+            Err(error) if is_object_not_found(&error) => continue,
+            Err(error) => return Err(error),
+        };
         let mut index: CoverageIndex = serde_json::from_slice(&bytes).map_err(|error| {
             DatalensError::new(
                 DatalensErrorKind::StorageReadFailure,
@@ -173,6 +174,11 @@ where
         entries.append(&mut index.entries);
     }
     Ok(any_key_has_index)
+}
+
+fn is_object_not_found(error: &DatalensError) -> bool {
+    error.kind == DatalensErrorKind::StorageReadFailure
+        && error.message.starts_with("object not found ")
 }
 
 fn normalized_query_entries(
@@ -902,6 +908,50 @@ mod tests {
         ChainIdentity::expect_with_network_id(ChainFamily::Evm, "ethereum", NetworkId::numeric(1))
     }
 
+    #[derive(Clone, Debug)]
+    struct NoExistsObjectStore {
+        inner: crate::LocalObjectStore,
+    }
+
+    impl NoExistsObjectStore {
+        fn new(root: std::path::PathBuf) -> Self {
+            Self {
+                inner: crate::LocalObjectStore::new(root),
+            }
+        }
+    }
+
+    impl ObjectStore for NoExistsObjectStore {
+        fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError> {
+            self.inner.get(key)
+        }
+
+        fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
+            self.inner.put(key, bytes)
+        }
+
+        fn exists(&self, _key: &str) -> Result<bool, DatalensError> {
+            panic!("coverage index reads should use get and handle missing keys")
+        }
+
+        fn list(&self, prefix: &str) -> Result<Vec<crate::ObjectMetadata>, DatalensError> {
+            self.inner.list(prefix)
+        }
+
+        fn list_page(
+            &self,
+            prefix: &str,
+            start_after: Option<&str>,
+            limit: usize,
+        ) -> Result<crate::ObjectListPage, DatalensError> {
+            self.inner.list_page(prefix, start_after, limit)
+        }
+
+        fn delete(&self, key: &str) -> Result<(), DatalensError> {
+            self.inner.delete(key)
+        }
+    }
+
     fn empty_entry(chain: &ChainIdentity, start: u64, end: u64) -> ManifestEntry {
         ManifestEntry {
             chain: chain.clone(),
@@ -1059,6 +1109,21 @@ mod tests {
 
         assert!(locks.contains_key("live"));
         assert!(!locks.contains_key("stale"));
+    }
+
+    #[test]
+    fn test_read_entries_for_query_skips_missing_keys_without_exists_probe() {
+        let object_store = NoExistsObjectStore::new(temp_storage_root("direct-get-missing-index"));
+        let entries = read_entries_for_query(
+            &object_store,
+            &test_chain(),
+            &DatasetKey::evm_blocks(),
+            &DatasetSelector::all(),
+            &LedgerRange::blocks(1, 10).expect("valid range"),
+        )
+        .expect("missing coverage index should not fail");
+
+        assert_eq!(entries, None);
     }
 
     #[test]
