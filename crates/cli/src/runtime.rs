@@ -232,13 +232,14 @@ impl StorageCompactionWorker {
             .name("datalens-storage-compaction".to_owned())
             .spawn(move || {
                 log::info!(
-                    "storage compaction worker started interval_ms={} min_object_bytes={} max_merge_ranges={} max_tick_duration_ms={} max_candidates_per_tick={} max_manifest_entries_per_tick={} delete_source_objects={} chain_count={}",
+                    "storage compaction worker started interval_ms={} min_object_bytes={} max_merge_ranges={} max_tick_duration_ms={} max_candidates_per_tick={} max_manifest_entries_per_tick={} cleanup_enabled={} delete_source_objects={} chain_count={}",
                     interval.as_millis(),
                     config.min_object_bytes,
                     config.max_merge_ranges,
                     config.max_tick_duration_ms,
                     config.max_candidates_per_tick,
                     config.max_manifest_entries_per_tick,
+                    config.cleanup_enabled,
                     config.delete_source_objects,
                     chains.len()
                 );
@@ -408,7 +409,8 @@ fn maintenance_compaction_config(
         query_latency_pause_threshold_ms: config.query_latency_pause_threshold_ms,
         write_latency_pause_threshold_ms: config.write_latency_pause_threshold_ms,
         pressure_pause_ms: config.pressure_pause_ms,
-        delete_source_objects: config.cleanup_enabled && config.delete_source_objects,
+        cleanup_enabled: config.cleanup_enabled,
+        delete_source_objects: config.delete_source_objects,
         ..MaintenanceCompactionConfig::default()
     }
 }
@@ -1259,9 +1261,38 @@ mod tests {
 
         let compaction = maintenance_compaction_config(config);
 
-        assert!(!compaction.delete_source_objects);
+        assert!(!compaction.cleanup_enabled);
+        assert!(compaction.delete_source_objects);
         assert_eq!(compaction.max_candidates_per_tick, 1);
         assert_eq!(compaction.max_tick_duration_ms, 2_000);
+    }
+
+    #[test]
+    fn storage_compaction_cleanup_flag_preserves_source_cleanup_intent() {
+        let config = StorageCompactionConfig {
+            enabled: true,
+            interval_ms: 10_000,
+            min_object_bytes: 1_048_576,
+            max_merge_ranges: 4,
+            max_tick_duration_ms: 2_000,
+            max_candidates_per_tick: 1,
+            max_concurrent_candidates: 1,
+            max_manifest_entries_per_tick: 2_000,
+            max_gets_per_tick: 64,
+            max_puts_per_tick: 8,
+            max_deletes_per_tick: 64,
+            object_store_error_pause_ms: 60_000,
+            query_latency_pause_threshold_ms: 0,
+            write_latency_pause_threshold_ms: 0,
+            pressure_pause_ms: 60_000,
+            cleanup_enabled: true,
+            delete_source_objects: true,
+        };
+
+        let compaction = maintenance_compaction_config(config);
+
+        assert!(compaction.cleanup_enabled);
+        assert!(compaction.delete_source_objects);
     }
 
     #[test]

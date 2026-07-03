@@ -70,8 +70,8 @@ runtime settings, and detected safe/finalized height for every configured chain.
 background compaction. Keep the first production rollout conservative:
 
 - `storage.compaction.enabled = true` starts the controller.
-- `storage.compaction.cleanup_enabled = false` keeps deletion cleanup off during the
-  first rollout.
+- `storage.compaction.cleanup_enabled = false` keeps reconciliation cleanup deletes
+  off during the first rollout.
 - `storage.compaction.delete_source_objects = false` preserves source objects even
   after a compacted replacement is published.
 - `storage.compaction.max_candidates_per_tick = 1`,
@@ -88,8 +88,9 @@ in any of those signals as a rollout stop.
 Automatic retreat is built into the compaction worker: failed ticks back off from one
 interval to two, four, eight, then sixteen intervals before retrying. For an immediate
 manual rollback, set `storage.compaction.enabled = false` to stop the controller. To keep
-compaction running but stop deletion cleanup, set `storage.compaction.cleanup_enabled = false`
-and `storage.compaction.delete_source_objects = false`.
+compaction running but stop reconciliation/source-object cleanup, set
+`storage.compaction.cleanup_enabled = false` and
+`storage.compaction.delete_source_objects = false`.
 
 ## Local Development Profile
 
