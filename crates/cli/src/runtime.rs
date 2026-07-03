@@ -19,14 +19,17 @@ use datalens_evm::{
     DurableEvmBlockHeaderStore, EvmBlockHeaderFetchMode, EvmBlockHeaderMetadataConfig,
     EvmFinalityPolicy, EvmLogReliabilityConfig, EvmRpcClient,
 };
-use datalens_metrics::ApplicationIdentity;
+use datalens_metrics::{
+    ApplicationIdentity, CompactionBacklogLabels, CompactionTickMetrics, MetricsRecorder,
+};
 use datalens_solana::{SolanaAdapter, SolanaHttpRpc};
 use datalens_storage::{
     DurablePromotionIntentRepository, DurablePromotionIntentStore, DurableStorage,
     LocalObjectStore, LocalStorage, MaintenanceCompactionConfig,
-    MaintenanceCompactionPressureMonitor, ObjectListPage, ObjectMetadata, ObjectStore,
-    QueryActivityRepository, QueryActivityStore, QueryWatermarkRepository, QueryWatermarkStore,
-    S3ObjectStore, UsageLedgerRepository, UsageLedgerStore,
+    MaintenanceCompactionPressureMonitor, MaintenanceCompactionReport, ObjectListPage,
+    ObjectMetadata, ObjectStore, QueryActivityRepository, QueryActivityStore,
+    QueryWatermarkRepository, QueryWatermarkStore, S3ObjectStore, UsageLedgerRepository,
+    UsageLedgerStore,
 };
 use datalens_tron::{TronAdapter, TronGridContractEventsConfig, TronHttpProvider};
 use datalens_warmup::{
@@ -150,6 +153,7 @@ pub(crate) fn build_service_registry_with_compaction_pressure(
 pub(crate) fn start_storage_compaction_worker(
     config: &DatalensConfig,
     compaction_pressure: MaintenanceCompactionPressureMonitor,
+    metrics_recorders: Vec<MetricsRecorder>,
 ) -> Result<Option<StorageCompactionWorker>, DatalensError> {
     if !config.storage.compaction.enabled {
         log::info!("storage compaction worker disabled");
@@ -224,6 +228,7 @@ pub(crate) fn start_storage_compaction_worker(
         interval,
         object_store_error_pause,
         compaction_pressure,
+        metrics_recorders,
     )?))
 }
 
@@ -246,6 +251,7 @@ impl StorageCompactionWorker {
         interval: Duration,
         object_store_error_pause: Duration,
         compaction_pressure: MaintenanceCompactionPressureMonitor,
+        metrics_recorders: Vec<MetricsRecorder>,
     ) -> Result<Self, DatalensError> {
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
@@ -318,26 +324,37 @@ impl StorageCompactionWorker {
                     match result {
                         Ok(report) => {
                             consecutive_failures = 0;
+                            record_compaction_metrics(&metrics_recorders, &chain, &report);
                             log::info!(
-                                "storage compaction tick completed chain_key={} candidate_count={} processed_candidates={} compacted_objects={} compacted_rows={} deleted_source_objects={} source_delete_failures={} tick_status={} duration_ms={}",
+                                "storage compaction tick completed chain_key={} candidate_count={} candidate_backlog={} processed_candidates={} input_objects={} output_objects={} compacted_objects={} compacted_rows={} deleted_source_objects={} deleted_manifest_segments={} source_delete_failures={} pause_reason={} tick_status={} duration_ms={}",
                                 chain.key_prefix(),
                                 report.candidate_count,
+                                report.candidate_backlog,
                                 report.processed_candidates,
+                                report.tick_summary.input_objects,
+                                report.tick_summary.output_objects,
                                 report.compacted_objects,
                                 report.compacted_rows,
                                 report.deleted_source_objects,
+                                report.tick_summary.deleted_manifest_segments,
                                 report.source_delete_failures,
+                                report.pause_reason.as_deref().unwrap_or("none"),
                                 report.tick_status.as_str(),
                                 started.elapsed().as_millis()
                             );
                         }
                         Err(error) => {
                             consecutive_failures = consecutive_failures.saturating_add(1);
-                            if is_object_store_backpressure_error(&error)
-                                && !object_store_error_pause.is_zero()
-                            {
+                            let backpressure_error = is_object_store_backpressure_error(&error);
+                            if backpressure_error && !object_store_error_pause.is_zero() {
                                 pause_until = Some(Instant::now() + object_store_error_pause);
                             }
+                            record_compaction_failure_metrics(
+                                &metrics_recorders,
+                                &chain,
+                                backpressure_error.then_some("object_store_error"),
+                                started.elapsed(),
+                            );
                             log::warn!(
                                 "storage compaction tick failed chain_key={} tick_status=failed kind={:?} message={} consecutive_failures={} duration_ms={}",
                                 chain.key_prefix(),
@@ -391,6 +408,66 @@ fn configured_compaction_chains(
 fn compaction_sleep_duration(interval: Duration, consecutive_failures: u32) -> Duration {
     let multiplier = 1_u32 << consecutive_failures.min(4);
     interval.saturating_mul(multiplier)
+}
+
+fn record_compaction_metrics(
+    recorders: &[MetricsRecorder],
+    chain: &ChainIdentity,
+    report: &MaintenanceCompactionReport,
+) {
+    if recorders.is_empty() {
+        return;
+    }
+    let pause_reason = report.pause_reason.as_deref().unwrap_or("none");
+    for recorder in recorders {
+        for scope in &report.backlog {
+            recorder.set_compaction_backlog(
+                &CompactionBacklogLabels::new(
+                    scope.chain.clone(),
+                    scope.dataset_key.clone(),
+                    &scope.selector_kind,
+                    &scope.selector_fingerprint,
+                ),
+                scope.small_objects,
+                scope.manifest_segments,
+                scope.candidate_backlog,
+            );
+        }
+        recorder.record_compaction_tick(
+            chain,
+            CompactionTickMetrics {
+                status: report.tick_status.as_str(),
+                pause_reason,
+                input_objects: report.tick_summary.input_objects,
+                output_objects: report.tick_summary.output_objects,
+                deleted_source_objects: report.tick_summary.deleted_source_objects,
+                deleted_manifest_segments: report.tick_summary.deleted_manifest_segments,
+                duration_seconds: report.tick_summary.duration_ms as f64 / 1_000.0,
+            },
+        );
+    }
+}
+
+fn record_compaction_failure_metrics(
+    recorders: &[MetricsRecorder],
+    chain: &ChainIdentity,
+    pause_reason: Option<&str>,
+    duration: Duration,
+) {
+    for recorder in recorders {
+        recorder.record_compaction_tick(
+            chain,
+            CompactionTickMetrics {
+                status: "failed",
+                pause_reason: pause_reason.unwrap_or("none"),
+                input_objects: 0,
+                output_objects: 0,
+                deleted_source_objects: 0,
+                deleted_manifest_segments: 0,
+                duration_seconds: duration.as_secs_f64(),
+            },
+        );
+    }
 }
 
 fn is_object_store_backpressure_error(error: &DatalensError) -> bool {

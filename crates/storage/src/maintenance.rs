@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -89,9 +89,14 @@ pub struct MaintenanceCompactionReport {
     pub read_only: bool,
     pub candidates: Vec<CompactionCandidate>,
     pub candidate_count: usize,
+    pub candidate_backlog: usize,
+    pub backlog: Vec<CompactionBacklogScope>,
     pub processed_candidates: usize,
     pub duration_ms: u64,
     pub tick_status: MaintenanceCompactionTickStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_reason: Option<String>,
+    pub tick_summary: MaintenanceCompactionTickSummary,
     pub compacted_objects: usize,
     pub compacted_rows: usize,
     pub deleted_source_objects: usize,
@@ -99,6 +104,27 @@ pub struct MaintenanceCompactionReport {
     pub get_operations: usize,
     pub put_operations: usize,
     pub delete_operations: usize,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MaintenanceCompactionTickSummary {
+    pub input_objects: usize,
+    pub output_objects: usize,
+    pub deleted_source_objects: usize,
+    pub deleted_manifest_segments: usize,
+    pub duration_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CompactionBacklogScope {
+    pub chain: ChainIdentity,
+    pub dataset_key: DatasetKey,
+    pub selector_fingerprint: String,
+    pub selector_canonical_key: String,
+    pub selector_kind: String,
+    pub small_objects: usize,
+    pub manifest_segments: usize,
+    pub candidate_backlog: usize,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -325,10 +351,14 @@ where
             compaction: MaintenanceCompactionReport {
                 read_only: true,
                 candidate_count: candidates.len(),
+                candidate_backlog: candidates.len(),
+                backlog: compaction_backlog_scopes(&candidates),
                 candidates,
                 processed_candidates: 0,
                 duration_ms: 0,
                 tick_status: MaintenanceCompactionTickStatus::Completed,
+                pause_reason: None,
+                tick_summary: MaintenanceCompactionTickSummary::default(),
                 compacted_objects: 0,
                 compacted_rows: 0,
                 deleted_source_objects: 0,
@@ -478,14 +508,40 @@ where
         cursor: Option<(&ChainIdentity, Option<CompactionCursor>)>,
         scan_partial: bool,
     ) -> Result<MaintenanceCompactionReport, DatalensError> {
-        if compaction_pressure_pause_reason(config).is_some() {
+        let build_started = Instant::now();
+        let manifest_entries = entries
+            .iter()
+            .map(|entry| entry.entry.clone())
+            .collect::<Vec<_>>();
+        let candidates = compaction_candidates(&manifest_entries, config);
+        let pause_reason = compaction_pressure_pause_reason(config);
+        log::info!(
+            "storage compaction candidate build candidate_count={} entry_count={} duration_ms={}",
+            candidates.len(),
+            manifest_entries.len(),
+            build_started.elapsed().as_millis()
+        );
+        if let Some(reason) = pause_reason {
+            let duration_ms = duration_millis(started);
+            log::info!(
+                "storage compaction tick summary status=paused pause_reason={} input_objects=0 output_objects=0 deleted_source_objects=0 deleted_manifest_segments=0 duration_ms={}",
+                reason,
+                duration_ms
+            );
             return Ok(MaintenanceCompactionReport {
                 read_only: false,
-                candidate_count: 0,
-                candidates: Vec::new(),
+                candidate_count: candidates.len(),
+                candidate_backlog: candidates.len(),
+                backlog: compaction_backlog_scopes(&candidates),
+                candidates,
                 processed_candidates: 0,
-                duration_ms: duration_millis(started),
+                duration_ms,
                 tick_status: MaintenanceCompactionTickStatus::Paused,
+                pause_reason: Some(reason.to_owned()),
+                tick_summary: MaintenanceCompactionTickSummary {
+                    duration_ms,
+                    ..MaintenanceCompactionTickSummary::default()
+                },
                 compacted_objects: 0,
                 compacted_rows: 0,
                 deleted_source_objects: 0,
@@ -495,21 +551,11 @@ where
                 delete_operations: 0,
             });
         }
-        let build_started = Instant::now();
-        let manifest_entries = entries
-            .iter()
-            .map(|entry| entry.entry.clone())
-            .collect::<Vec<_>>();
-        let candidates = compaction_candidates(&manifest_entries, config);
-        log::info!(
-            "storage compaction candidate build candidate_count={} entry_count={} duration_ms={}",
-            candidates.len(),
-            manifest_entries.len(),
-            build_started.elapsed().as_millis()
-        );
         let mut compacted_objects = 0usize;
         let mut compacted_rows = 0usize;
         let mut processed_candidates = 0usize;
+        let mut input_objects = 0usize;
+        let mut deleted_manifest_segments = BTreeSet::new();
         let mut deleted_source_objects = 0usize;
         let mut source_delete_failures = 0usize;
         let mut cursor_advance_key = None;
@@ -554,6 +600,12 @@ where
             compacted_rows += compacted.row_count;
             compacted_objects += 1;
             processed_candidates += 1;
+            input_objects += candidate_entries.len();
+            deleted_manifest_segments.extend(
+                selected_entries
+                    .iter()
+                    .filter_map(|entry| entry.segment_key.clone()),
+            );
             cursor_advance_key = selected_entries
                 .iter()
                 .filter_map(|entry| entry.segment_key.clone())
@@ -600,14 +652,40 @@ where
         } else {
             MaintenanceCompactionTickStatus::Completed
         };
+        let duration_ms = duration_millis(started);
+        let remaining_candidates = candidates
+            .iter()
+            .skip(processed_candidates)
+            .cloned()
+            .collect::<Vec<_>>();
+        let tick_summary = MaintenanceCompactionTickSummary {
+            input_objects,
+            output_objects: compacted_objects,
+            deleted_source_objects,
+            deleted_manifest_segments: deleted_manifest_segments.len(),
+            duration_ms,
+        };
+        log::info!(
+            "storage compaction tick summary status={} pause_reason=none input_objects={} output_objects={} deleted_source_objects={} deleted_manifest_segments={} duration_ms={}",
+            tick_status.as_str(),
+            tick_summary.input_objects,
+            tick_summary.output_objects,
+            tick_summary.deleted_source_objects,
+            tick_summary.deleted_manifest_segments,
+            tick_summary.duration_ms
+        );
 
         Ok(MaintenanceCompactionReport {
             read_only: false,
             candidate_count: candidates.len(),
+            candidate_backlog: remaining_candidates.len(),
+            backlog: compaction_backlog_scopes(&remaining_candidates),
             candidates,
             processed_candidates,
-            duration_ms: duration_millis(started),
+            duration_ms,
             tick_status,
+            pause_reason: None,
+            tick_summary,
             compacted_objects,
             compacted_rows,
             deleted_source_objects,
@@ -1378,6 +1456,50 @@ fn compaction_candidates(
         push_candidate(&mut candidates, &key, &run);
     }
     candidates
+}
+
+fn compaction_backlog_scopes(candidates: &[CompactionCandidate]) -> Vec<CompactionBacklogScope> {
+    let mut scopes =
+        BTreeMap::<(String, String, String, String, String), CompactionBacklogScope>::new();
+    for candidate in candidates {
+        let selector_kind = compaction_selector_kind(candidate);
+        let key = (
+            candidate.chain.key_prefix(),
+            candidate.dataset_key.as_str().to_owned(),
+            candidate.selector_fingerprint.clone(),
+            candidate.selector_canonical_key.clone(),
+            selector_kind.clone(),
+        );
+        let scope = scopes.entry(key).or_insert_with(|| CompactionBacklogScope {
+            chain: candidate.chain.clone(),
+            dataset_key: candidate.dataset_key.clone(),
+            selector_fingerprint: candidate.selector_fingerprint.clone(),
+            selector_canonical_key: candidate.selector_canonical_key.clone(),
+            selector_kind,
+            small_objects: 0,
+            manifest_segments: 0,
+            candidate_backlog: 0,
+        });
+        scope.small_objects = scope.small_objects.saturating_add(candidate.entry_count);
+        scope.manifest_segments = scope
+            .manifest_segments
+            .saturating_add(candidate.entry_count);
+        scope.candidate_backlog = scope.candidate_backlog.saturating_add(1);
+    }
+    scopes.into_values().collect()
+}
+
+fn compaction_selector_kind(candidate: &CompactionCandidate) -> String {
+    if candidate.selector_fingerprint == "all" || candidate.selector_canonical_key == "all" {
+        return "all".to_owned();
+    }
+    candidate
+        .selector_canonical_key
+        .split(':')
+        .next()
+        .filter(|kind| !kind.is_empty())
+        .unwrap_or("unknown")
+        .to_owned()
 }
 
 #[derive(Clone, Debug)]

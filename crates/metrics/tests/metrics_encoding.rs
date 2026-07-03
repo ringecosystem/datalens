@@ -1,9 +1,10 @@
 use datalens_core::{ChainFamily, ChainIdentity, DatalensErrorKind, DatasetKey};
 use datalens_metrics::{
-    ApplicationIdentity, CacheCoverageOutcome, DurableIntentClaimOutcome, DurableIntentOutcome,
-    DurableWriteOutcome, ErrorLabels, FillOutcome, HotReorgOutcome, MetricsLabels, MetricsRecorder,
-    QueryMetadataEnqueueOutcome, QueryMetadataWriteOutcome, QueryOutcome, WarmupFetchOutcome,
-    WarmupTaskOutcome, WarmupWriteOutcome,
+    ApplicationIdentity, CacheCoverageOutcome, CompactionBacklogLabels, CompactionTickMetrics,
+    DurableIntentClaimOutcome, DurableIntentOutcome, DurableWriteOutcome, ErrorLabels, FillOutcome,
+    HotReorgOutcome, MetricsLabels, MetricsRecorder, QueryMetadataEnqueueOutcome,
+    QueryMetadataWriteOutcome, QueryOutcome, WarmupFetchOutcome, WarmupTaskOutcome,
+    WarmupWriteOutcome,
 };
 
 #[test]
@@ -164,6 +165,66 @@ fn test_query_metadata_metrics_have_kind_and_outcome_labels() {
         r#"datalens_query_metadata_write_total{application="query-api",chain="ethereum",chain_kind="evm",dataset="evm.logs",metadata_kind="query_activity",outcome="completed"} 1"#
     ));
     assert!(output.contains("datalens_query_metadata_write_duration_seconds"));
+}
+
+#[test]
+fn test_compaction_metrics_expose_backlog_progress_and_backpressure() {
+    let recorder = MetricsRecorder::new().expect("metrics recorder");
+    let labels = CompactionBacklogLabels::new(chain(), DatasetKey::evm_logs(), "evm_logs", "0xabc");
+
+    recorder.set_compaction_backlog(&labels, 6, 3, 2);
+    recorder.record_compaction_tick(
+        &chain(),
+        CompactionTickMetrics {
+            status: "partial",
+            pause_reason: "none",
+            input_objects: 4,
+            output_objects: 1,
+            deleted_source_objects: 3,
+            deleted_manifest_segments: 2,
+            duration_seconds: 0.75,
+        },
+    );
+    recorder.record_compaction_tick(
+        &chain(),
+        CompactionTickMetrics {
+            status: "paused",
+            pause_reason: "query_latency",
+            input_objects: 0,
+            output_objects: 0,
+            deleted_source_objects: 0,
+            deleted_manifest_segments: 0,
+            duration_seconds: 0.01,
+        },
+    );
+
+    let output = recorder.encode().expect("prometheus text");
+
+    assert!(output.contains(
+        r#"datalens_compaction_small_objects{chain="ethereum",chain_kind="evm",dataset="evm.logs",selector="0xabc",selector_kind="evm_logs"} 6"#
+    ));
+    assert!(output.contains(
+        r#"datalens_compaction_manifest_segments{chain="ethereum",chain_kind="evm",dataset="evm.logs",selector="0xabc",selector_kind="evm_logs"} 3"#
+    ));
+    assert!(output.contains(
+        r#"datalens_compaction_candidate_backlog{chain="ethereum",chain_kind="evm",dataset="evm.logs",selector="0xabc",selector_kind="evm_logs"} 2"#
+    ));
+    assert!(output.contains(
+        r#"datalens_compaction_input_objects_total{chain="ethereum",chain_kind="evm",pause_reason="none",status="partial"} 4"#
+    ));
+    assert!(output.contains(
+        r#"datalens_compaction_output_objects_total{chain="ethereum",chain_kind="evm",pause_reason="none",status="partial"} 1"#
+    ));
+    assert!(output.contains(
+        r#"datalens_compaction_deleted_source_objects_total{chain="ethereum",chain_kind="evm",pause_reason="none",status="partial"} 3"#
+    ));
+    assert!(output.contains(
+        r#"datalens_compaction_deleted_manifest_segments_total{chain="ethereum",chain_kind="evm",pause_reason="none",status="partial"} 2"#
+    ));
+    assert!(output.contains(
+        r#"datalens_compaction_paused{chain="ethereum",chain_kind="evm",reason="query_latency"} 1"#
+    ));
+    assert!(output.contains("datalens_compaction_tick_duration_seconds"));
 }
 
 #[test]
