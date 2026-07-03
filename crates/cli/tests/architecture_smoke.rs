@@ -79,7 +79,10 @@ fn edge_public_contract_omits_placeholder_modules_and_block_only_query_dtos() {
 fn serve_path_builds_registry_without_first_chain_selection() {
     let source = include_str!("../src/commands/serve.rs");
 
-    assert!(source.contains("build_service_registry(&config)?"));
+    assert!(source.contains(
+        "build_service_registry_with_compaction_pressure(&config, compaction_pressure.clone())?"
+    ));
+    assert!(source.contains("start_storage_compaction_worker(&config, compaction_pressure)?"));
     assert!(!source.contains("fn first_chain("));
     assert!(!source.contains("application_index_config"));
     assert!(!source.contains("IndexDaemon"));

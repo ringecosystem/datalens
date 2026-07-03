@@ -1,10 +1,13 @@
 use datalens_chain::ChainAdapter;
 use datalens_edge::config::{DatalensConfig, EdgeConfig};
 use datalens_evm::{EvmAdapter, EvmAdapterMetadata};
+use datalens_storage::MaintenanceCompactionPressureMonitor;
 use tracing_subscriber::EnvFilter;
 
 use crate::config::{load_config, validate_config};
-use crate::runtime::{build_service_registry, start_storage_compaction_worker};
+use crate::runtime::{
+    build_service_registry_with_compaction_pressure, start_storage_compaction_worker,
+};
 
 use super::{DEFAULT_SERVER_CONFIG, parse_bind};
 
@@ -24,8 +27,10 @@ pub fn serve_command(
     let config = load_config(&command.config)?;
     validate_config(&config)?;
     let bind = parse_bind(command.bind.as_deref().unwrap_or(&config.server.bind))?;
-    let registry = build_service_registry(&config)?;
-    let _compaction_worker = start_storage_compaction_worker(&config)?;
+    let compaction_pressure = MaintenanceCompactionPressureMonitor::default();
+    let registry =
+        build_service_registry_with_compaction_pressure(&config, compaction_pressure.clone())?;
+    let _compaction_worker = start_storage_compaction_worker(&config, compaction_pressure)?;
     let warmup_scheduler = if config.warmup.enabled {
         Some(
             registry.start_warmup_scheduler(std::time::Duration::from_millis(

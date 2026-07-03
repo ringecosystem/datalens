@@ -23,9 +23,10 @@ use datalens_metrics::ApplicationIdentity;
 use datalens_solana::{SolanaAdapter, SolanaHttpRpc};
 use datalens_storage::{
     DurablePromotionIntentRepository, DurablePromotionIntentStore, DurableStorage,
-    LocalObjectStore, LocalStorage, MaintenanceCompactionConfig, ObjectListPage, ObjectMetadata,
-    ObjectStore, QueryActivityRepository, QueryActivityStore, QueryWatermarkRepository,
-    QueryWatermarkStore, S3ObjectStore, UsageLedgerRepository, UsageLedgerStore,
+    LocalObjectStore, LocalStorage, MaintenanceCompactionConfig,
+    MaintenanceCompactionPressureMonitor, ObjectListPage, ObjectMetadata, ObjectStore,
+    QueryActivityRepository, QueryActivityStore, QueryWatermarkRepository, QueryWatermarkStore,
+    S3ObjectStore, UsageLedgerRepository, UsageLedgerStore,
 };
 use datalens_tron::{TronAdapter, TronGridContractEventsConfig, TronHttpProvider};
 use datalens_warmup::{
@@ -45,6 +46,7 @@ struct QueryRuntimeStores {
     warmup_registry: Option<LocalWarmupRegistry<WarmupRegistryObjectStore>>,
     cache_repair_registry: Option<LocalCacheRepairRegistry<WarmupRegistryObjectStore>>,
     durable_intent_startup_maintenance: Arc<Once>,
+    compaction_pressure: MaintenanceCompactionPressureMonitor,
 }
 
 impl QueryRuntimeStores {
@@ -82,6 +84,7 @@ impl QueryRuntimeStores {
             warmup_registry,
             cache_repair_registry,
             durable_intent_startup_maintenance,
+            compaction_pressure: MaintenanceCompactionPressureMonitor::default(),
         })
     }
 }
@@ -101,10 +104,12 @@ pub(crate) fn build_service(
     build_evm_service_with_storage(stores, config, chain_name, chain)
 }
 
-pub(crate) fn build_service_registry(
+pub(crate) fn build_service_registry_with_compaction_pressure(
     config: &DatalensConfig,
+    compaction_pressure: MaintenanceCompactionPressureMonitor,
 ) -> Result<QueryServiceRegistry, DatalensError> {
-    let stores = QueryRuntimeStores::build(config)?;
+    let mut stores = QueryRuntimeStores::build(config)?;
+    stores.compaction_pressure = compaction_pressure;
     let mut registry =
         QueryServiceRegistry::new().with_application_registry(config.applications.clone())?;
     for (chain_name, chain) in &config.chains {
@@ -144,6 +149,7 @@ pub(crate) fn build_service_registry(
 
 pub(crate) fn start_storage_compaction_worker(
     config: &DatalensConfig,
+    compaction_pressure: MaintenanceCompactionPressureMonitor,
 ) -> Result<Option<StorageCompactionWorker>, DatalensError> {
     if !config.storage.compaction.enabled {
         log::info!("storage compaction worker disabled");
@@ -160,9 +166,25 @@ pub(crate) fn start_storage_compaction_worker(
         max_merge_ranges: config.storage.compaction.max_merge_ranges.max(2),
         max_tick_duration_ms: config.storage.compaction.max_tick_duration_ms,
         max_candidates_per_tick: config.storage.compaction.max_candidates_per_tick,
+        max_concurrent_candidates: config.storage.compaction.max_concurrent_candidates,
         max_manifest_entries_per_tick: config.storage.compaction.max_manifest_entries_per_tick,
+        max_gets_per_tick: config.storage.compaction.max_gets_per_tick,
+        max_puts_per_tick: config.storage.compaction.max_puts_per_tick,
+        max_deletes_per_tick: config.storage.compaction.max_deletes_per_tick,
+        query_latency_pause_threshold_ms: config
+            .storage
+            .compaction
+            .query_latency_pause_threshold_ms,
+        write_latency_pause_threshold_ms: config
+            .storage
+            .compaction
+            .write_latency_pause_threshold_ms,
+        pressure_pause_ms: config.storage.compaction.pressure_pause_ms,
         delete_source_objects: config.storage.compaction.delete_source_objects,
+        ..MaintenanceCompactionConfig::default()
     };
+    let object_store_error_pause =
+        Duration::from_millis(config.storage.compaction.object_store_error_pause_ms);
     let storage = match config.storage.backend.as_str() {
         "local" => {
             let local = config.storage.local.as_ref().ok_or_else(|| {
@@ -196,7 +218,12 @@ pub(crate) fn start_storage_compaction_worker(
         }
     };
     Ok(Some(StorageCompactionWorker::start(
-        storage, chains, compaction, interval,
+        storage,
+        chains,
+        compaction,
+        interval,
+        object_store_error_pause,
+        compaction_pressure,
     )?))
 }
 
@@ -217,6 +244,8 @@ impl StorageCompactionWorker {
         chains: Vec<ChainIdentity>,
         config: MaintenanceCompactionConfig,
         interval: Duration,
+        object_store_error_pause: Duration,
+        compaction_pressure: MaintenanceCompactionPressureMonitor,
     ) -> Result<Self, DatalensError> {
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
@@ -236,20 +265,33 @@ impl StorageCompactionWorker {
                 );
                 let mut consecutive_failures = 0u32;
                 let mut next_chain_index = 0usize;
+                let mut pause_until: Option<Instant> = None;
                 while !worker_stop.load(Ordering::Relaxed) {
                     thread::park_timeout(compaction_sleep_duration(interval, consecutive_failures));
                     if worker_stop.load(Ordering::Relaxed) {
                         break;
                     }
+                    if let Some(deadline) = pause_until {
+                        let now = Instant::now();
+                        if now < deadline {
+                            thread::park_timeout(deadline.saturating_duration_since(now));
+                            continue;
+                        }
+                        pause_until = None;
+                    }
                     let chain = chains[next_chain_index % chains.len()].clone();
                     next_chain_index = next_chain_index.saturating_add(1);
                     let started = Instant::now();
+                    let tick_config = MaintenanceCompactionConfig {
+                        pressure: compaction_pressure.snapshot(),
+                        ..config
+                    };
                     let reconciliation = match &storage {
                         CompactionStorage::Local(storage) => {
-                            storage.reconcile_compaction_for_chain(&chain, config)
+                            storage.reconcile_compaction_for_chain(&chain, tick_config)
                         }
                         CompactionStorage::S3(storage) => {
-                            storage.reconcile_compaction_for_chain(&chain, config)
+                            storage.reconcile_compaction_for_chain(&chain, tick_config)
                         }
                     };
                     let result = reconciliation.and_then(|reconciliation| {
@@ -266,10 +308,10 @@ impl StorageCompactionWorker {
                         );
                         match &storage {
                             CompactionStorage::Local(storage) => {
-                                storage.compact_small_objects_for_chain(&chain, config)
+                                storage.compact_small_objects_for_chain(&chain, tick_config)
                             }
                             CompactionStorage::S3(storage) => {
-                                storage.compact_small_objects_for_chain(&chain, config)
+                                storage.compact_small_objects_for_chain(&chain, tick_config)
                             }
                         }
                     });
@@ -291,6 +333,11 @@ impl StorageCompactionWorker {
                         }
                         Err(error) => {
                             consecutive_failures = consecutive_failures.saturating_add(1);
+                            if is_object_store_backpressure_error(&error)
+                                && !object_store_error_pause.is_zero()
+                            {
+                                pause_until = Some(Instant::now() + object_store_error_pause);
+                            }
                             log::warn!(
                                 "storage compaction tick failed chain_key={} tick_status=failed kind={:?} message={} consecutive_failures={} duration_ms={}",
                                 chain.key_prefix(),
@@ -344,6 +391,26 @@ fn configured_compaction_chains(
 fn compaction_sleep_duration(interval: Duration, consecutive_failures: u32) -> Duration {
     let multiplier = 1_u32 << consecutive_failures.min(4);
     interval.saturating_mul(multiplier)
+}
+
+fn is_object_store_backpressure_error(error: &DatalensError) -> bool {
+    if !matches!(
+        error.kind,
+        DatalensErrorKind::StorageReadFailure
+            | DatalensErrorKind::StorageWriteFailure
+            | DatalensErrorKind::ManifestUpdateFailure
+    ) {
+        return false;
+    }
+    let message = error.message.to_ascii_lowercase();
+    message.contains("timeout")
+        || message.contains("timed out")
+        || message.contains("http 5")
+        || message.contains("status 5")
+        || message.contains("500")
+        || message.contains("502")
+        || message.contains("503")
+        || message.contains("504")
 }
 
 fn build_evm_service_with_storage(
@@ -400,7 +467,8 @@ fn build_evm_service_with_storage(
         stores.durable_intents.clone(),
         config.query.durable_intents,
         stores.durable_intent_startup_maintenance.clone(),
-    );
+    )
+    .with_compaction_pressure_monitor(stores.compaction_pressure.clone());
     if config.cache_repair.enabled {
         service = service.with_cache_repair_pool(CacheRepairTaskPool::new(
             CacheRepairRuntime::new(
@@ -523,7 +591,8 @@ fn build_solana_service_with_storage(
         stores.durable_intents,
         config.query.durable_intents,
         stores.durable_intent_startup_maintenance,
-    );
+    )
+    .with_compaction_pressure_monitor(stores.compaction_pressure.clone());
     if config.cache_repair.enabled {
         service = service.with_cache_repair_pool(CacheRepairTaskPool::new(
             CacheRepairRuntime::new(
@@ -590,7 +659,8 @@ fn build_tron_service_with_storage(
         stores.durable_intents.clone(),
         config.query.durable_intents,
         stores.durable_intent_startup_maintenance.clone(),
-    );
+    )
+    .with_compaction_pressure_monitor(stores.compaction_pressure.clone());
     if config.cache_repair.enabled {
         service = service.with_cache_repair_pool(CacheRepairTaskPool::new(
             CacheRepairRuntime::new(
@@ -1214,7 +1284,7 @@ mod tests {
             warmup_root.display(),
         ))
         .expect("config parses");
-        let registry = build_service_registry(&config).expect("service registry builds");
+        let registry = build_warmup_registry(&config).expect("service registry builds");
         let chain = ChainIdentity::try_new(
             ChainFamily::try_other("tron").expect("family"),
             "tron-mainnet",
@@ -1243,7 +1313,7 @@ mod tests {
         };
 
         let outcome = registry
-            .ensure_warmup_task(request)
+            .ensure(request)
             .expect("Tron warmup service is registered");
 
         assert!(outcome.created);

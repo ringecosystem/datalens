@@ -1,5 +1,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -127,6 +131,9 @@ pub struct MaintenanceCompactionReport {
     pub compacted_rows: usize,
     pub deleted_source_objects: usize,
     pub source_delete_failures: usize,
+    pub get_operations: usize,
+    pub put_operations: usize,
+    pub delete_operations: usize,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -146,6 +153,7 @@ pub struct MaintenanceCompactionReconciliationReport {
 pub enum MaintenanceCompactionTickStatus {
     Completed,
     Partial,
+    Paused,
     Failed,
 }
 
@@ -154,6 +162,7 @@ impl MaintenanceCompactionTickStatus {
         match self {
             Self::Completed => "completed",
             Self::Partial => "partial",
+            Self::Paused => "paused",
             Self::Failed => "failed",
         }
     }
@@ -165,7 +174,15 @@ pub struct MaintenanceCompactionConfig {
     pub max_merge_ranges: usize,
     pub max_tick_duration_ms: u64,
     pub max_candidates_per_tick: usize,
+    pub max_concurrent_candidates: usize,
     pub max_manifest_entries_per_tick: usize,
+    pub max_gets_per_tick: usize,
+    pub max_puts_per_tick: usize,
+    pub max_deletes_per_tick: usize,
+    pub query_latency_pause_threshold_ms: u64,
+    pub write_latency_pause_threshold_ms: u64,
+    pub pressure_pause_ms: u64,
+    pub pressure: MaintenanceCompactionPressure,
     pub delete_source_objects: bool,
 }
 
@@ -175,9 +192,66 @@ impl Default for MaintenanceCompactionConfig {
             min_object_bytes: u64::MAX,
             max_merge_ranges: 32,
             max_tick_duration_ms: 30_000,
-            max_candidates_per_tick: 8,
+            max_candidates_per_tick: 1,
+            max_concurrent_candidates: 1,
             max_manifest_entries_per_tick: 20_000,
+            max_gets_per_tick: 64,
+            max_puts_per_tick: 8,
+            max_deletes_per_tick: 64,
+            query_latency_pause_threshold_ms: 0,
+            write_latency_pause_threshold_ms: 0,
+            pressure_pause_ms: 60_000,
+            pressure: MaintenanceCompactionPressure::default(),
             delete_source_objects: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MaintenanceCompactionPressure {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_latency_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_latency_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct MaintenanceCompactionPressureMonitor {
+    inner: Arc<MaintenanceCompactionPressureMonitorInner>,
+}
+
+#[derive(Debug)]
+struct MaintenanceCompactionPressureMonitorInner {
+    query_latency_ms: AtomicU64,
+    write_latency_ms: AtomicU64,
+}
+
+impl Default for MaintenanceCompactionPressureMonitorInner {
+    fn default() -> Self {
+        Self {
+            query_latency_ms: AtomicU64::new(u64::MAX),
+            write_latency_ms: AtomicU64::new(u64::MAX),
+        }
+    }
+}
+
+impl MaintenanceCompactionPressureMonitor {
+    pub fn record_query_latency(&self, duration: Duration) {
+        self.inner
+            .query_latency_ms
+            .store(duration_millis_value(duration), Ordering::Relaxed);
+    }
+
+    pub fn record_write_latency(&self, duration: Duration) {
+        self.inner
+            .write_latency_ms
+            .store(duration_millis_value(duration), Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> MaintenanceCompactionPressure {
+        MaintenanceCompactionPressure {
+            query_latency_ms: optional_latency(self.inner.query_latency_ms.load(Ordering::Relaxed)),
+            write_latency_ms: optional_latency(self.inner.write_latency_ms.load(Ordering::Relaxed)),
         }
     }
 }
@@ -298,6 +372,9 @@ where
                 compacted_rows: 0,
                 deleted_source_objects: 0,
                 source_delete_failures: 0,
+                get_operations: 0,
+                put_operations: 0,
+                delete_operations: 0,
             },
             compaction_reconciliation,
             retention: MaintenanceRetentionReport {
@@ -440,6 +517,23 @@ where
         cursor: Option<(&ChainIdentity, Option<CompactionCursor>)>,
         scan_partial: bool,
     ) -> Result<MaintenanceCompactionReport, DatalensError> {
+        if compaction_pressure_pause_reason(config).is_some() {
+            return Ok(MaintenanceCompactionReport {
+                read_only: false,
+                candidate_count: 0,
+                candidates: Vec::new(),
+                processed_candidates: 0,
+                duration_ms: duration_millis(started),
+                tick_status: MaintenanceCompactionTickStatus::Paused,
+                compacted_objects: 0,
+                compacted_rows: 0,
+                deleted_source_objects: 0,
+                source_delete_failures: 0,
+                get_operations: 0,
+                put_operations: 0,
+                delete_operations: 0,
+            });
+        }
         let build_started = Instant::now();
         let manifest_entries = entries
             .iter()
@@ -458,9 +552,13 @@ where
         let mut deleted_source_objects = 0usize;
         let mut source_delete_failures = 0usize;
         let mut cursor_advance_key = None;
-        let max_candidates = config.max_candidates_per_tick.max(1);
+        let max_candidates = config
+            .max_candidates_per_tick
+            .max(1)
+            .min(config.max_concurrent_candidates.max(1));
         let max_duration = Duration::from_millis(config.max_tick_duration_ms.max(1));
         let mut partial = scan_partial;
+        let mut operation_budget = CompactionOperationBudget::new(config);
 
         for candidate in &candidates {
             if processed_candidates >= max_candidates || started.elapsed() >= max_duration {
@@ -472,11 +570,17 @@ where
             if selected_entries.len() != candidate.entry_count {
                 continue;
             }
+            if !operation_budget.can_process_candidate(candidate, selected_entries.len()) {
+                partial = true;
+                break;
+            }
             let candidate_entries = selected_entries
                 .iter()
                 .map(|entry| entry.entry.clone())
                 .collect::<Vec<_>>();
             let compacted = self.write_compacted_object(candidate, &candidate_entries)?;
+            operation_budget.record_gets(candidate_entries.len());
+            operation_budget.record_puts(1);
             let publish_started = Instant::now();
             if !self.try_write_compaction_manifest_entry(
                 &candidate.chain,
@@ -485,6 +589,7 @@ where
             )? {
                 continue;
             }
+            operation_budget.record_puts(1);
             compacted_rows += compacted.row_count;
             compacted_objects += 1;
             processed_candidates += 1;
@@ -498,8 +603,11 @@ where
                 candidate.chain.key_prefix(),
                 publish_started.elapsed().as_millis()
             );
-            if config.delete_source_objects {
+            if config.delete_source_objects
+                && operation_budget.can_delete_sources(candidate.object_keys.len())
+            {
                 let cleanup = self.delete_compacted_source_objects(candidate);
+                operation_budget.record_deletes(candidate.object_keys.len());
                 deleted_source_objects += cleanup.deleted_objects;
                 source_delete_failures += cleanup.delete_failures;
             }
@@ -543,6 +651,9 @@ where
             compacted_rows,
             deleted_source_objects,
             source_delete_failures,
+            get_operations: operation_budget.used_gets,
+            put_operations: operation_budget.used_puts,
+            delete_operations: operation_budget.used_deletes,
         })
     }
 
@@ -1057,6 +1168,67 @@ struct CompactionManifestScan {
     cursor_advance: Option<CompactionCursor>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct CompactionOperationBudget {
+    max_gets: usize,
+    max_puts: usize,
+    max_deletes: usize,
+    used_gets: usize,
+    used_puts: usize,
+    used_deletes: usize,
+    delete_source_objects: bool,
+}
+
+impl CompactionOperationBudget {
+    fn new(config: MaintenanceCompactionConfig) -> Self {
+        Self {
+            max_gets: config.max_gets_per_tick,
+            max_puts: config.max_puts_per_tick,
+            max_deletes: config.max_deletes_per_tick,
+            used_gets: 0,
+            used_puts: 0,
+            used_deletes: 0,
+            delete_source_objects: config.delete_source_objects,
+        }
+    }
+
+    fn can_process_candidate(&self, candidate: &CompactionCandidate, source_gets: usize) -> bool {
+        self.remaining_gets() >= source_gets
+            && self.remaining_puts() >= 2
+            && (!self.delete_source_objects
+                || self.max_deletes == 0
+                || self.remaining_deletes() >= candidate.object_keys.len())
+    }
+
+    fn can_delete_sources(&self, source_deletes: usize) -> bool {
+        self.remaining_deletes() >= source_deletes
+    }
+
+    fn record_gets(&mut self, count: usize) {
+        self.used_gets = self.used_gets.saturating_add(count);
+    }
+
+    fn record_puts(&mut self, count: usize) {
+        self.used_puts = self.used_puts.saturating_add(count);
+    }
+
+    fn record_deletes(&mut self, count: usize) {
+        self.used_deletes = self.used_deletes.saturating_add(count);
+    }
+
+    fn remaining_gets(&self) -> usize {
+        self.max_gets.saturating_sub(self.used_gets)
+    }
+
+    fn remaining_puts(&self) -> usize {
+        self.max_puts.saturating_sub(self.used_puts)
+    }
+
+    fn remaining_deletes(&self) -> usize {
+        self.max_deletes.saturating_sub(self.used_deletes)
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 struct CompactionCursor {
     #[serde(default)]
@@ -1097,6 +1269,34 @@ fn manifest_segment_scope_prefix(key: &str) -> Option<String> {
 
 fn duration_millis(started: Instant) -> u64 {
     started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+fn duration_millis_value(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX - 1)
+}
+
+fn optional_latency(value: u64) -> Option<u64> {
+    (value != u64::MAX).then_some(value)
+}
+
+fn compaction_pressure_pause_reason(config: MaintenanceCompactionConfig) -> Option<&'static str> {
+    if config.query_latency_pause_threshold_ms > 0
+        && config
+            .pressure
+            .query_latency_ms
+            .is_some_and(|latency| latency >= config.query_latency_pause_threshold_ms)
+    {
+        return Some("query_latency");
+    }
+    if config.write_latency_pause_threshold_ms > 0
+        && config
+            .pressure
+            .write_latency_ms
+            .is_some_and(|latency| latency >= config.write_latency_pause_threshold_ms)
+    {
+        return Some("write_latency");
+    }
+    None
 }
 
 fn metadata_issues(entry: &ManifestEntry, object_key: &str, bytes: &[u8]) -> Vec<MaintenanceIssue> {

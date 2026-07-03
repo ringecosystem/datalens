@@ -7,9 +7,9 @@ use datalens_core::{
 };
 use datalens_storage::{
     DurableStorage, DurableStorageConfig, LocalObjectStore, LocalStorage,
-    MaintenanceCompactionConfig, MaintenanceCompactionTickStatus, MaintenanceIssueKind,
-    MaintenanceOperationMode, Manifest, ObjectListPage, ObjectMetadata, ObjectStore,
-    ParquetCompression, StorageWriteRequest,
+    MaintenanceCompactionConfig, MaintenanceCompactionPressure, MaintenanceCompactionTickStatus,
+    MaintenanceIssueKind, MaintenanceOperationMode, Manifest, ObjectListPage, ObjectMetadata,
+    ObjectStore, ParquetCompression, StorageWriteRequest,
 };
 use parquet::{
     basic::Compression,
@@ -40,6 +40,14 @@ struct CountingListStore {
     inner: LocalObjectStore,
     list_prefixes: Arc<Mutex<Vec<String>>>,
     list_page_prefixes: Arc<Mutex<Vec<String>>>,
+}
+
+#[derive(Clone, Debug)]
+struct CountingOperationStore {
+    inner: LocalObjectStore,
+    gets: Arc<Mutex<Vec<String>>>,
+    puts: Arc<Mutex<Vec<String>>>,
+    deletes: Arc<Mutex<Vec<String>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -98,6 +106,29 @@ impl CountingListStore {
             .iter()
             .filter(|listed_prefix| listed_prefix.as_str() == prefix)
             .count()
+    }
+}
+
+impl CountingOperationStore {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            inner: LocalObjectStore::new(root),
+            gets: Arc::new(Mutex::new(Vec::new())),
+            puts: Arc::new(Mutex::new(Vec::new())),
+            deletes: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn get_count(&self) -> usize {
+        self.gets.lock().expect("gets").len()
+    }
+
+    fn put_count(&self) -> usize {
+        self.puts.lock().expect("puts").len()
+    }
+
+    fn delete_count(&self) -> usize {
+        self.deletes.lock().expect("deletes").len()
     }
 }
 
@@ -269,6 +300,44 @@ impl ObjectStore for CountingListStore {
     }
 
     fn delete(&self, key: &str) -> Result<(), DatalensError> {
+        self.inner.delete(key)
+    }
+
+    fn lock_namespace(&self) -> String {
+        self.inner.lock_namespace()
+    }
+}
+
+impl ObjectStore for CountingOperationStore {
+    fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError> {
+        self.gets.lock().expect("gets").push(key.to_owned());
+        self.inner.get(key)
+    }
+
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
+        self.puts.lock().expect("puts").push(key.to_owned());
+        self.inner.put(key, bytes)
+    }
+
+    fn exists(&self, key: &str) -> Result<bool, DatalensError> {
+        self.inner.exists(key)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
+        self.inner.list(prefix)
+    }
+
+    fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ObjectListPage, DatalensError> {
+        self.inner.list_page(prefix, start_after, limit)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), DatalensError> {
+        self.deletes.lock().expect("deletes").push(key.to_owned());
         self.inner.delete(key)
     }
 
@@ -498,6 +567,7 @@ fn test_compaction_merges_adjacent_small_objects_and_retains_old_objects() {
             max_candidates_per_tick: 8,
             max_manifest_entries_per_tick: 20_000,
             delete_source_objects: false,
+            ..MaintenanceCompactionConfig::default()
         })
         .expect("compact small objects");
 
@@ -593,6 +663,7 @@ fn test_compaction_skips_candidate_when_overlapping_write_publishes_before_manif
             max_candidates_per_tick: 8,
             max_manifest_entries_per_tick: 20_000,
             delete_source_objects: false,
+            ..MaintenanceCompactionConfig::default()
         })
         .expect("compact small objects");
 
@@ -692,6 +763,7 @@ fn test_compaction_uses_configured_parquet_compression() {
             max_candidates_per_tick: 8,
             max_manifest_entries_per_tick: 20_000,
             delete_source_objects: false,
+            ..MaintenanceCompactionConfig::default()
         })
         .expect("compact small objects");
 
@@ -731,6 +803,7 @@ fn test_compaction_deletes_source_objects_when_enabled() {
             max_candidates_per_tick: 8,
             max_manifest_entries_per_tick: 20_000,
             delete_source_objects: true,
+            ..MaintenanceCompactionConfig::default()
         })
         .expect("compact small objects");
 
@@ -804,6 +877,7 @@ fn test_compaction_replacement_write_failure_leaves_old_manifest_readable() {
             max_candidates_per_tick: 8,
             max_manifest_entries_per_tick: 20_000,
             delete_source_objects: true,
+            ..MaintenanceCompactionConfig::default()
         })
         .expect_err("compaction replacement write failure");
 
@@ -838,6 +912,7 @@ fn test_compaction_source_delete_failure_leaves_reads_working() {
             max_candidates_per_tick: 8,
             max_manifest_entries_per_tick: 20_000,
             delete_source_objects: true,
+            ..MaintenanceCompactionConfig::default()
         })
         .expect("compaction reports source delete failure");
 
@@ -876,6 +951,7 @@ fn test_compaction_reconciliation_deletes_unpublished_compacted_orphan() {
             max_candidates_per_tick: 8,
             max_manifest_entries_per_tick: 20_000,
             delete_source_objects: true,
+            ..MaintenanceCompactionConfig::default()
         })
         .expect_err("manifest publish crash leaves compacted object");
 
@@ -929,6 +1005,7 @@ fn test_compaction_reconciliation_retries_stale_source_cleanup_after_restart() {
             max_candidates_per_tick: 8,
             max_manifest_entries_per_tick: 20_000,
             delete_source_objects: true,
+            ..MaintenanceCompactionConfig::default()
         })
         .expect("compaction with cleanup failures");
 
@@ -986,6 +1063,7 @@ fn test_compaction_reconciliation_never_deletes_current_manifest_objects() {
             max_candidates_per_tick: 8,
             max_manifest_entries_per_tick: 20_000,
             delete_source_objects: true,
+            ..MaintenanceCompactionConfig::default()
         })
         .expect("compact small objects");
     let current_object = storage.manifest().expect("manifest").entries[0]
@@ -1032,6 +1110,7 @@ fn test_compaction_tick_stops_after_candidate_budget_and_reports_partial() {
                 max_candidates_per_tick: 1,
                 max_manifest_entries_per_tick: 20_000,
                 delete_source_objects: false,
+                ..MaintenanceCompactionConfig::default()
             },
         )
         .expect("bounded compaction");
@@ -1040,6 +1119,85 @@ fn test_compaction_tick_stops_after_candidate_budget_and_reports_partial() {
     assert_eq!(report.candidate_count, 2);
     assert_eq!(report.processed_candidates, 1);
     assert_eq!(report.compacted_objects, 1);
+}
+
+#[test]
+fn test_compaction_tick_stops_before_exceeding_object_store_operation_budgets() {
+    let storage = LocalStorage::new(temp_storage_root("operation-budgets"));
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 82, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 83, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 92, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 93, FinalityLevel::Safe);
+    let counting_store = CountingOperationStore::new(storage.root().into());
+    let counting_storage = DurableStorage::from_object_store(counting_store.clone());
+
+    let report = counting_storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                min_object_bytes: u64::MAX,
+                max_merge_ranges: 2,
+                max_tick_duration_ms: 30_000,
+                max_candidates_per_tick: 8,
+                max_concurrent_candidates: 1,
+                max_manifest_entries_per_tick: 20_000,
+                max_gets_per_tick: 4,
+                max_puts_per_tick: 2,
+                max_deletes_per_tick: 0,
+                delete_source_objects: true,
+                ..MaintenanceCompactionConfig::default()
+            },
+        )
+        .expect("budgeted compaction");
+
+    assert_eq!(report.tick_status, MaintenanceCompactionTickStatus::Partial);
+    assert_eq!(report.candidate_count, 2);
+    assert_eq!(report.processed_candidates, 1);
+    assert_eq!(report.compacted_objects, 1);
+    assert_eq!(report.deleted_source_objects, 0);
+    assert_eq!(report.get_operations, 2);
+    assert_eq!(report.put_operations, 2);
+    assert_eq!(report.delete_operations, 0);
+    assert!(counting_store.get_count() > 0);
+    assert!(counting_store.put_count() > 0);
+    assert_eq!(counting_store.delete_count(), 0);
+}
+
+#[test]
+fn test_compaction_pauses_when_query_latency_exceeds_threshold_and_reads_still_work() {
+    let storage = LocalStorage::new(temp_storage_root("query-pressure-pause"));
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 84, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 85, FinalityLevel::Safe);
+
+    let report = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                min_object_bytes: u64::MAX,
+                query_latency_pause_threshold_ms: 100,
+                pressure: MaintenanceCompactionPressure {
+                    query_latency_ms: Some(250),
+                    write_latency_ms: None,
+                },
+                ..MaintenanceCompactionConfig::default()
+            },
+        )
+        .expect("pressure-paused compaction");
+
+    assert_eq!(report.tick_status, MaintenanceCompactionTickStatus::Paused);
+    assert_eq!(report.processed_candidates, 0);
+    assert_eq!(report.compacted_objects, 0);
+    let rows = storage
+        .read_rows(
+            &chain,
+            &DatasetKey::evm_blocks(),
+            &DatasetSelector::all(),
+            LedgerRange::blocks(84, 85).expect("range"),
+        )
+        .expect("query path still works");
+    assert_eq!(rows.row_count(), 2);
 }
 
 #[test]
@@ -1062,8 +1220,10 @@ fn test_compaction_tick_does_not_reload_manifest_per_candidate() {
                 max_merge_ranges: 2,
                 max_tick_duration_ms: 30_000,
                 max_candidates_per_tick: 8,
+                max_concurrent_candidates: 8,
                 max_manifest_entries_per_tick: 20_000,
                 delete_source_objects: false,
+                ..MaintenanceCompactionConfig::default()
             },
         )
         .expect("bounded compaction");
@@ -1102,6 +1262,7 @@ fn test_compaction_tick_scans_one_manifest_segment_prefix_per_tick() {
                 max_candidates_per_tick: 8,
                 max_manifest_entries_per_tick: 20_000,
                 delete_source_objects: false,
+                ..MaintenanceCompactionConfig::default()
             },
         )
         .expect("prefix-scoped compaction");
@@ -1127,6 +1288,7 @@ fn test_compaction_cursor_resumes_and_loss_recovers_without_affecting_reads() {
         max_candidates_per_tick: 8,
         max_manifest_entries_per_tick: 2,
         delete_source_objects: false,
+        ..MaintenanceCompactionConfig::default()
     };
 
     let first = storage
@@ -1200,6 +1362,7 @@ fn test_compaction_legacy_full_manifest_partial_tick_persists_offset_cursor() {
         max_candidates_per_tick: 8,
         max_manifest_entries_per_tick: 1,
         delete_source_objects: false,
+        ..MaintenanceCompactionConfig::default()
     };
 
     let first = storage
@@ -1265,6 +1428,7 @@ fn test_compaction_legacy_cursor_continues_after_partial_tick_writes_segment() {
         max_candidates_per_tick: 8,
         max_manifest_entries_per_tick: 2,
         delete_source_objects: false,
+        ..MaintenanceCompactionConfig::default()
     };
 
     let first = storage
@@ -1339,6 +1503,7 @@ fn test_compaction_legacy_cursor_survives_candidate_budget_partial() {
         max_candidates_per_tick: 1,
         max_manifest_entries_per_tick: 4,
         delete_source_objects: false,
+        ..MaintenanceCompactionConfig::default()
     };
 
     let first = storage
@@ -1436,6 +1601,7 @@ fn test_compaction_ignores_segments_shadowed_by_full_manifest() {
                 max_candidates_per_tick: 8,
                 max_manifest_entries_per_tick: 20_000,
                 delete_source_objects: false,
+                ..MaintenanceCompactionConfig::default()
             },
         )
         .expect("compaction");
