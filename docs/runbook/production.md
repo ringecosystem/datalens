@@ -142,3 +142,7 @@ Run the production config doctor smoke:
 ```bash
 just config-doctor-smoke
 ```
+
+For production prefixes that already contain a large compaction backlog, use
+`docs/runbook/compaction-production-backlog-drain.md` after release validation and
+before increasing compaction above the checked-in low-rate production profile.

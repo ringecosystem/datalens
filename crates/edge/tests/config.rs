@@ -25,6 +25,28 @@ fn test_config_production_ethereum_rpc_pool_and_log_reliability() {
 }
 
 #[test]
+fn test_config_production_compaction_starts_with_controlled_backlog_drain_limits() {
+    set_production_config_env();
+
+    let config_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../config/datalens.production.toml")
+        .canonicalize()
+        .expect("production config path");
+    let config = DatalensConfig::from_file(&config_path).expect("production config should parse");
+
+    assert!(config.storage.compaction.enabled);
+    assert_eq!(config.storage.compaction.interval_ms, 300_000);
+    assert_eq!(config.storage.compaction.max_tick_duration_ms, 5_000);
+    assert_eq!(config.storage.compaction.max_candidates_per_tick, 1);
+    assert_eq!(
+        config.storage.compaction.max_manifest_entries_per_tick,
+        1_000
+    );
+    assert_eq!(config.storage.compaction.max_merge_ranges, 8);
+    assert!(config.storage.compaction.delete_source_objects);
+}
+
+#[test]
 fn test_config_query_native_namespace_controls_native_graphql_settings() {
     let config: DatalensConfig =
         toml::from_str(&config_text("[query.native]")).expect("query native config should parse");

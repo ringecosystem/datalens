@@ -15,6 +15,13 @@ force_path_style = true
 compression = "zstd"
 
 [storage.compaction]
+enabled = true
+interval_ms = 300000
+min_object_bytes = 1048576
+max_merge_ranges = 8
+max_tick_duration_ms = 5000
+max_candidates_per_tick = 1
+max_manifest_entries_per_tick = 1000
 delete_source_objects = true
 
 [planner]
