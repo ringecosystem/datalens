@@ -1,12 +1,14 @@
 use datalens_chain::ChainAdapter;
 use datalens_edge::config::{DatalensConfig, EdgeConfig};
+use datalens_edge::{LifecycleShutdown, WarmupSchedulerHandle};
 use datalens_evm::{EvmAdapter, EvmAdapterMetadata};
 use datalens_storage::MaintenanceCompactionPressureMonitor;
 use tracing_subscriber::EnvFilter;
 
 use crate::config::{load_config, validate_config};
 use crate::runtime::{
-    build_service_registry_with_compaction_pressure, start_storage_compaction_worker,
+    StorageCompactionWorker, build_service_registry_with_compaction_pressure,
+    start_storage_compaction_worker,
 };
 
 use super::{DEFAULT_SERVER_CONFIG, parse_bind};
@@ -30,7 +32,7 @@ pub fn serve_command(
     let compaction_pressure = MaintenanceCompactionPressureMonitor::default();
     let registry =
         build_service_registry_with_compaction_pressure(&config, compaction_pressure.clone())?;
-    let _compaction_worker = start_storage_compaction_worker(
+    let compaction_worker = start_storage_compaction_worker(
         &config,
         compaction_pressure,
         registry.metrics_recorders(),
@@ -52,15 +54,31 @@ pub fn serve_command(
     let edge = serve_edge_config(&config, &command);
     let lifecycle = datalens_edge::ServiceLifecycle::new_with_edge_config(registry, edge);
     let runtime = tokio::runtime::Runtime::new()?;
-    if let Some(scheduler) = warmup_scheduler {
-        runtime.block_on(datalens_edge::serve_lifecycle(
-            bind,
-            lifecycle.with_warmup_scheduler(scheduler),
-        ))?;
-    } else {
-        runtime.block_on(datalens_edge::serve_lifecycle(bind, lifecycle))?;
-    }
+    let controllers = ServeMaintenanceControllers {
+        warmup_scheduler,
+        compaction_worker,
+    };
+    runtime.block_on(datalens_edge::serve_lifecycle(
+        bind,
+        lifecycle.with_warmup_scheduler(controllers),
+    ))?;
     Ok(())
+}
+
+struct ServeMaintenanceControllers {
+    warmup_scheduler: Option<WarmupSchedulerHandle>,
+    compaction_worker: Option<StorageCompactionWorker>,
+}
+
+impl LifecycleShutdown for ServeMaintenanceControllers {
+    fn shutdown(self) {
+        if let Some(compaction_worker) = self.compaction_worker {
+            drop(compaction_worker);
+        }
+        if let Some(warmup_scheduler) = self.warmup_scheduler {
+            warmup_scheduler.shutdown();
+        }
+    }
 }
 
 pub fn serve_edge_config(config: &DatalensConfig, command: &ServeCommand) -> EdgeConfig {

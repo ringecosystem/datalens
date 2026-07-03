@@ -123,6 +123,8 @@ pub struct StorageCompactionConfig {
     pub write_latency_pause_threshold_ms: u64,
     #[serde(default = "default_storage_compaction_pressure_pause_ms")]
     pub pressure_pause_ms: u64,
+    #[serde(default = "default_storage_compaction_leader_lock_ttl_ms")]
+    pub leader_lock_ttl_ms: u64,
     #[serde(default)]
     pub cleanup_enabled: bool,
     #[serde(default)]
@@ -151,6 +153,7 @@ impl Default for StorageCompactionConfig {
             write_latency_pause_threshold_ms:
                 default_storage_compaction_write_latency_pause_threshold_ms(),
             pressure_pause_ms: default_storage_compaction_pressure_pause_ms(),
+            leader_lock_ttl_ms: default_storage_compaction_leader_lock_ttl_ms(),
             cleanup_enabled: false,
             delete_source_objects: false,
         }
@@ -532,6 +535,10 @@ fn default_storage_compaction_write_latency_pause_threshold_ms() -> u64 {
 }
 
 fn default_storage_compaction_pressure_pause_ms() -> u64 {
+    60_000
+}
+
+fn default_storage_compaction_leader_lock_ttl_ms() -> u64 {
     60_000
 }
 

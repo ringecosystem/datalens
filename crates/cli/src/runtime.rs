@@ -27,9 +27,9 @@ use datalens_storage::{
     DurablePromotionIntentRepository, DurablePromotionIntentStore, DurableStorage,
     LocalObjectStore, LocalStorage, MaintenanceCompactionConfig,
     MaintenanceCompactionPressureMonitor, MaintenanceCompactionReport, ObjectListPage,
-    ObjectMetadata, ObjectStore, QueryActivityRepository, QueryActivityStore,
+    ObjectLockLease, ObjectMetadata, ObjectStore, QueryActivityRepository, QueryActivityStore,
     QueryWatermarkRepository, QueryWatermarkStore, S3ObjectStore, UsageLedgerRepository,
-    UsageLedgerStore,
+    UsageLedgerStore, encode_object_lock_owner,
 };
 use datalens_tron::{TronAdapter, TronGridContractEventsConfig, TronHttpProvider};
 use datalens_warmup::{
@@ -168,6 +168,7 @@ pub(crate) fn start_storage_compaction_worker(
     let compaction = maintenance_compaction_config(config.storage.compaction);
     let object_store_error_pause =
         Duration::from_millis(config.storage.compaction.object_store_error_pause_ms);
+    let leader_lock_ttl = Duration::from_millis(config.storage.compaction.leader_lock_ttl_ms);
     let storage = match config.storage.backend.as_str() {
         "local" => {
             let local = config.storage.local.as_ref().ok_or_else(|| {
@@ -206,6 +207,7 @@ pub(crate) fn start_storage_compaction_worker(
         compaction,
         interval,
         object_store_error_pause,
+        leader_lock_ttl,
         compaction_pressure,
         metrics_recorders,
     )?))
@@ -222,6 +224,68 @@ enum CompactionStorage {
     S3(DurableStorage<S3ObjectStore>),
 }
 
+struct CompactionLeaderLock {
+    storage: CompactionStorage,
+    lease: Option<ObjectLockLease>,
+}
+
+impl CompactionStorage {
+    fn try_acquire_compaction_leader_lock(
+        &self,
+        chain: &ChainIdentity,
+        ttl: Duration,
+    ) -> Result<Option<CompactionLeaderLock>, DatalensError> {
+        let key = compaction_leader_lock_key(chain);
+        let owner = encode_object_lock_owner(&format!(
+            "{}:{}:{}",
+            self.lock_namespace(),
+            std::process::id(),
+            chain.key_prefix()
+        ))?;
+        let lease = match self {
+            CompactionStorage::Local(storage) => storage
+                .object_store()
+                .try_acquire_lock_with_ttl(&key, &owner, ttl)?,
+            CompactionStorage::S3(storage) => storage
+                .object_store()
+                .try_acquire_lock_with_ttl(&key, &owner, ttl)?,
+        };
+        Ok(lease.map(|lease| CompactionLeaderLock {
+            storage: self.clone(),
+            lease: Some(lease),
+        }))
+    }
+
+    fn release_compaction_leader_lock(&self, lease: ObjectLockLease) -> Result<(), DatalensError> {
+        match self {
+            CompactionStorage::Local(storage) => storage.object_store().release_lock(lease),
+            CompactionStorage::S3(storage) => storage.object_store().release_lock(lease),
+        }
+    }
+
+    fn lock_namespace(&self) -> String {
+        match self {
+            CompactionStorage::Local(storage) => storage.object_store().lock_namespace(),
+            CompactionStorage::S3(storage) => storage.object_store().lock_namespace(),
+        }
+    }
+}
+
+impl Drop for CompactionLeaderLock {
+    fn drop(&mut self) {
+        let Some(lease) = self.lease.take() else {
+            return;
+        };
+        if let Err(error) = self.storage.release_compaction_leader_lock(lease) {
+            log::warn!(
+                "storage compaction leader lock release failed kind={:?} message={}",
+                error.kind,
+                error.message
+            );
+        }
+    }
+}
+
 impl StorageCompactionWorker {
     fn start(
         storage: CompactionStorage,
@@ -229,6 +293,7 @@ impl StorageCompactionWorker {
         config: MaintenanceCompactionConfig,
         interval: Duration,
         object_store_error_pause: Duration,
+        leader_lock_ttl: Duration,
         compaction_pressure: MaintenanceCompactionPressureMonitor,
         metrics_recorders: Vec<MetricsRecorder>,
     ) -> Result<Self, DatalensError> {
@@ -272,6 +337,35 @@ impl StorageCompactionWorker {
                         pressure: compaction_pressure.snapshot(),
                         ..config
                     };
+                    let leader_lock =
+                        match storage.try_acquire_compaction_leader_lock(&chain, leader_lock_ttl) {
+                            Ok(Some(leader_lock)) => leader_lock,
+                            Ok(None) => {
+                                log::info!(
+                                    "storage compaction tick skipped reason=leader_lock_busy chain_key={}",
+                                    chain.key_prefix()
+                                );
+                                continue;
+                            }
+                            Err(error) => {
+                                consecutive_failures = consecutive_failures.saturating_add(1);
+                                record_compaction_failure_metrics(
+                                    &metrics_recorders,
+                                    &chain,
+                                    Some("leader_lock_error"),
+                                    started.elapsed(),
+                                );
+                                log::warn!(
+                                    "storage compaction leader lock failed chain_key={} kind={:?} message={} consecutive_failures={} duration_ms={}",
+                                    chain.key_prefix(),
+                                    error.kind,
+                                    error.message,
+                                    consecutive_failures,
+                                    started.elapsed().as_millis()
+                                );
+                                continue;
+                            }
+                        };
                     let reconciliation = match &storage {
                         CompactionStorage::Local(storage) => {
                             storage.reconcile_compaction_for_chain(&chain, tick_config)
@@ -301,6 +395,7 @@ impl StorageCompactionWorker {
                             }
                         }
                     });
+                    drop(leader_lock);
                     match result {
                         Ok(report) => {
                             consecutive_failures = 0;
@@ -388,6 +483,13 @@ fn configured_compaction_chains(
 fn compaction_sleep_duration(interval: Duration, consecutive_failures: u32) -> Duration {
     let multiplier = 1_u32 << consecutive_failures.min(4);
     interval.saturating_mul(multiplier)
+}
+
+fn compaction_leader_lock_key(chain: &ChainIdentity) -> String {
+    format!(
+        "chains/{}/metadata/storage-compaction-leader.json",
+        chain.key_prefix()
+    )
 }
 
 fn record_compaction_metrics(
