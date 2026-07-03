@@ -4,7 +4,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use datalens_core::{
@@ -139,6 +139,14 @@ pub struct MaintenanceCompactionReconciliationReport {
     pub delete_failures: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct SupersededCompactionSource {
+    schema_version: u32,
+    object_key: String,
+    superseded_at_unix_ms: u64,
+    delete_after_unix_ms: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MaintenanceCompactionTickStatus {
@@ -176,6 +184,7 @@ pub struct MaintenanceCompactionConfig {
     pub pressure: MaintenanceCompactionPressure,
     pub cleanup_enabled: bool,
     pub delete_source_objects: bool,
+    pub source_delete_grace_ms: u64,
 }
 
 impl Default for MaintenanceCompactionConfig {
@@ -196,6 +205,7 @@ impl Default for MaintenanceCompactionConfig {
             pressure: MaintenanceCompactionPressure::default(),
             cleanup_enabled: false,
             delete_source_objects: false,
+            source_delete_grace_ms: 300_000,
         }
     }
 }
@@ -331,8 +341,12 @@ where
         issues.extend(contradictory_coverage_issues(&entries));
 
         let candidates = compaction_candidates(&entries, MaintenanceCompactionConfig::default());
-        let compaction_reconciliation =
-            self.compaction_reconciliation_report(&entries, &raw_entries, true)?;
+        let compaction_reconciliation = self.compaction_reconciliation_report(
+            &entries,
+            &raw_entries,
+            MaintenanceCompactionConfig::default(),
+            true,
+        )?;
         let protected_current_objects = current_object_keys(&entries);
         let delete_candidates = self.retention_delete_candidates(&protected_current_objects)?;
 
@@ -440,7 +454,7 @@ where
         let current_entries = self.manifest_for_chain(chain)?.entries;
         let raw_entries = self.raw_manifest_entries_for_chain(chain)?;
         let mut report =
-            self.compaction_reconciliation_report(&current_entries, &raw_entries, false)?;
+            self.compaction_reconciliation_report(&current_entries, &raw_entries, config, false)?;
         let chain_prefix = format!("chains/{}/", chain.key_prefix());
         report
             .orphan_compacted_objects
@@ -469,15 +483,35 @@ where
                 }
             }
             if config.delete_source_objects {
-                for object_key in report.stale_source_objects.clone() {
-                    match self.object_store().delete(&object_key) {
+                let eligible_records =
+                    self.superseded_source_records_for_chain(chain, config.source_delete_grace_ms)?;
+                for (record_key, record) in eligible_records
+                    .into_iter()
+                    .take(config.max_deletes_per_tick)
+                {
+                    match self.object_store().delete(&record.object_key) {
                         Ok(()) => report.deleted_stale_source_objects += 1,
                         Err(error) => {
                             report.delete_failures += 1;
                             log::warn!(
                                 "storage compaction reconciliation source delete failed chain_key={} object_key={} kind={:?} message={}",
                                 chain.key_prefix(),
-                                object_key,
+                                record.object_key,
+                                error.kind,
+                                error.message
+                            );
+                            continue;
+                        }
+                    }
+                    match self.object_store().delete(&record_key) {
+                        Ok(()) => report.deleted_stale_cleanup_records += 1,
+                        Err(error) => {
+                            report.delete_failures += 1;
+                            log::warn!(
+                                "storage compaction reconciliation source cleanup record delete failed chain_key={} object_key={} record_key={} kind={:?} message={}",
+                                chain.key_prefix(),
+                                record.object_key,
+                                record_key,
                                 error.kind,
                                 error.message
                             );
@@ -560,8 +594,8 @@ where
         let mut processed_candidates = 0usize;
         let mut input_objects = 0usize;
         let mut deleted_manifest_segments = BTreeSet::new();
-        let mut deleted_source_objects = 0usize;
-        let mut source_delete_failures = 0usize;
+        let deleted_source_objects = 0usize;
+        let source_delete_failures = 0usize;
         let mut cursor_advance_key = None;
         let max_candidates = config
             .max_candidates_per_tick
@@ -620,14 +654,8 @@ where
                 candidate.chain.key_prefix(),
                 publish_started.elapsed().as_millis()
             );
-            if config.cleanup_enabled
-                && config.delete_source_objects
-                && operation_budget.can_delete_sources(candidate.object_keys.len())
-            {
-                let cleanup = self.delete_compacted_source_objects(candidate);
-                operation_budget.record_deletes(candidate.object_keys.len());
-                deleted_source_objects += cleanup.deleted_objects;
-                source_delete_failures += cleanup.delete_failures;
+            if config.delete_source_objects {
+                self.record_superseded_compaction_sources(candidate, config)?;
             }
             log::info!(
                 "storage compaction candidate compacted chain_key={} range_kind={} range={}-{} processed_candidates={} duration_ms={}",
@@ -766,6 +794,7 @@ where
         &self,
         current_entries: &[ManifestEntry],
         raw_entries: &[ManifestEntry],
+        config: MaintenanceCompactionConfig,
         read_only: bool,
     ) -> Result<MaintenanceCompactionReconciliationReport, DatalensError> {
         let current_objects = current_object_keys(current_entries)
@@ -783,18 +812,12 @@ where
         orphan_compacted_objects.sort();
         orphan_compacted_objects.dedup();
 
-        let mut stale_source_objects = Vec::new();
-        for entry in raw_entries {
-            let Some(object_key) = entry.object_key.as_ref() else {
-                continue;
-            };
-            if object_key.contains("/compacted/") || current_objects.contains(object_key) {
-                continue;
-            }
-            if stale_source_object_is_safe(entry, current_entries, self.object_store())? {
-                stale_source_objects.push(object_key.clone());
-            }
-        }
+        let mut stale_source_objects = self
+            .superseded_source_records(config.source_delete_grace_ms, false)?
+            .into_iter()
+            .filter(|(_, record)| !current_objects.contains(&record.object_key))
+            .map(|(_, record)| record.object_key)
+            .collect::<Vec<_>>();
         stale_source_objects.sort();
         stale_source_objects.dedup();
 
@@ -848,38 +871,90 @@ where
         Ok(records)
     }
 
-    fn delete_compacted_source_objects(
+    fn record_superseded_compaction_sources(
         &self,
         candidate: &CompactionCandidate,
-    ) -> CompactionSourceCleanup {
-        let mut deleted_objects = 0usize;
-        let mut delete_failures = 0usize;
+        config: MaintenanceCompactionConfig,
+    ) -> Result<(), DatalensError> {
+        let now_ms = unix_millis_now()?;
         for object_key in &candidate.object_keys {
-            match self.object_store().delete(object_key) {
-                Ok(()) => {
-                    deleted_objects += 1;
-                    log::info!(
-                        "storage compaction source object deleted chain_key={} object_key={}",
-                        candidate.chain.key_prefix(),
-                        object_key
-                    );
-                }
-                Err(error) => {
-                    delete_failures += 1;
-                    log::warn!(
-                        "storage compaction source object delete failed chain_key={} object_key={} kind={:?} message={}",
-                        candidate.chain.key_prefix(),
-                        object_key,
-                        error.kind,
-                        error.message
-                    );
-                }
+            let record = SupersededCompactionSource {
+                schema_version: 1,
+                object_key: object_key.clone(),
+                superseded_at_unix_ms: now_ms,
+                delete_after_unix_ms: now_ms.saturating_add(config.source_delete_grace_ms),
+            };
+            let record_key = superseded_source_record_key(&candidate.chain, object_key);
+            let bytes = serde_json::to_vec_pretty(&record).map_err(|error| {
+                DatalensError::new(
+                    DatalensErrorKind::Internal,
+                    format!("encode compaction superseded source record: {error}"),
+                )
+            })?;
+            self.object_store().put(&record_key, &bytes)?;
+            log::info!(
+                "storage compaction source object superseded chain_key={} object_key={} delete_after_unix_ms={}",
+                candidate.chain.key_prefix(),
+                object_key,
+                record.delete_after_unix_ms
+            );
+        }
+        Ok(())
+    }
+
+    fn superseded_source_records_for_chain(
+        &self,
+        chain: &ChainIdentity,
+        grace_ms: u64,
+    ) -> Result<Vec<(String, SupersededCompactionSource)>, DatalensError> {
+        let prefix = superseded_source_record_prefix(chain);
+        Ok(self
+            .superseded_source_records(grace_ms, true)?
+            .into_iter()
+            .filter(|(key, _)| key.starts_with(&prefix))
+            .collect())
+    }
+
+    fn superseded_source_records(
+        &self,
+        grace_ms: u64,
+        eligible_only: bool,
+    ) -> Result<Vec<(String, SupersededCompactionSource)>, DatalensError> {
+        let now_ms = unix_millis_now()?;
+        let mut records = Vec::new();
+        for object in self.object_store().list("chains")? {
+            if !object
+                .key
+                .contains("/metadata/compaction-superseded-sources/")
+                || !object.key.ends_with(".json")
+            {
+                continue;
+            }
+            let bytes = self.object_store().get(&object.key)?;
+            let mut record =
+                serde_json::from_slice::<SupersededCompactionSource>(&bytes).map_err(|error| {
+                    DatalensError::new(
+                        DatalensErrorKind::StorageReadFailure,
+                        format!(
+                            "decode compaction superseded source record {}: {error}",
+                            object.key
+                        ),
+                    )
+                })?;
+            record.delete_after_unix_ms = record
+                .delete_after_unix_ms
+                .max(record.superseded_at_unix_ms.saturating_add(grace_ms));
+            if !eligible_only || record.delete_after_unix_ms <= now_ms {
+                records.push((object.key, record));
             }
         }
-        CompactionSourceCleanup {
-            deleted_objects,
-            delete_failures,
-        }
+        records.sort_by(|left, right| {
+            left.1
+                .delete_after_unix_ms
+                .cmp(&right.1.delete_after_unix_ms)
+                .then_with(|| left.1.object_key.cmp(&right.1.object_key))
+        });
+        Ok(records)
     }
 
     fn retention_delete_candidates(
@@ -1216,11 +1291,9 @@ struct CompactionManifestScan {
 struct CompactionOperationBudget {
     max_gets: usize,
     max_puts: usize,
-    max_deletes: usize,
     used_gets: usize,
     used_puts: usize,
     used_deletes: usize,
-    delete_source_objects: bool,
 }
 
 impl CompactionOperationBudget {
@@ -1228,24 +1301,15 @@ impl CompactionOperationBudget {
         Self {
             max_gets: config.max_gets_per_tick,
             max_puts: config.max_puts_per_tick,
-            max_deletes: config.max_deletes_per_tick,
             used_gets: 0,
             used_puts: 0,
             used_deletes: 0,
-            delete_source_objects: config.delete_source_objects,
         }
     }
 
     fn can_process_candidate(&self, candidate: &CompactionCandidate, source_gets: usize) -> bool {
-        self.remaining_gets() >= source_gets
-            && self.remaining_puts() >= 2
-            && (!self.delete_source_objects
-                || self.max_deletes == 0
-                || self.remaining_deletes() >= candidate.object_keys.len())
-    }
-
-    fn can_delete_sources(&self, source_deletes: usize) -> bool {
-        self.remaining_deletes() >= source_deletes
+        let _ = candidate;
+        self.remaining_gets() >= source_gets && self.remaining_puts() >= 2
     }
 
     fn record_gets(&mut self, count: usize) {
@@ -1256,20 +1320,12 @@ impl CompactionOperationBudget {
         self.used_puts = self.used_puts.saturating_add(count);
     }
 
-    fn record_deletes(&mut self, count: usize) {
-        self.used_deletes = self.used_deletes.saturating_add(count);
-    }
-
     fn remaining_gets(&self) -> usize {
         self.max_gets.saturating_sub(self.used_gets)
     }
 
     fn remaining_puts(&self) -> usize {
         self.max_puts.saturating_sub(self.used_puts)
-    }
-
-    fn remaining_deletes(&self) -> usize {
-        self.max_deletes.saturating_sub(self.used_deletes)
     }
 }
 
@@ -1287,6 +1343,21 @@ fn compaction_cursor_key(chain: &ChainIdentity) -> String {
     format!(
         "chains/{}/metadata/compaction-cursor.json",
         chain.key_prefix()
+    )
+}
+
+fn superseded_source_record_prefix(chain: &ChainIdentity) -> String {
+    format!(
+        "chains/{}/metadata/compaction-superseded-sources",
+        chain.key_prefix()
+    )
+}
+
+fn superseded_source_record_key(chain: &ChainIdentity, object_key: &str) -> String {
+    format!(
+        "{}/{}.json",
+        superseded_source_record_prefix(chain),
+        checksum_hex(object_key.as_bytes())
     )
 }
 
@@ -1317,6 +1388,18 @@ fn duration_millis(started: Instant) -> u64 {
 
 fn duration_millis_value(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX - 1)
+}
+
+fn unix_millis_now() -> Result<u64, DatalensError> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::Internal,
+                format!("system clock before unix epoch: {error}"),
+            )
+        })?;
+    Ok(duration.as_millis().try_into().unwrap_or(u64::MAX))
 }
 
 fn optional_latency(value: u64) -> Option<u64> {
@@ -1513,12 +1596,6 @@ struct CompactedObject {
     entry: ManifestEntry,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct CompactionSourceCleanup {
-    deleted_objects: usize,
-    delete_failures: usize,
-}
-
 fn candidate_selected_entries(
     entries: &[SelectedManifestEntry],
     candidate: &CompactionCandidate,
@@ -1651,34 +1728,6 @@ where
             continue;
         };
         if candidate.shadows_segment(entry) && object_store.exists(object_key)? {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn stale_source_object_is_safe<S>(
-    entry: &ManifestEntry,
-    current_entries: &[ManifestEntry],
-    object_store: &S,
-) -> Result<bool, DatalensError>
-where
-    S: ObjectStore,
-{
-    let Some(source_object_key) = entry.object_key.as_deref() else {
-        return Ok(false);
-    };
-    if !object_store.exists(source_object_key)? {
-        return Ok(false);
-    }
-    for current_entry in current_entries {
-        let Some(current_object_key) = current_entry.object_key.as_deref() else {
-            continue;
-        };
-        if current_object_key == source_object_key {
-            return Ok(false);
-        }
-        if current_entry.shadows_segment(entry) && object_store.exists(current_object_key)? {
             return Ok(true);
         }
     }
