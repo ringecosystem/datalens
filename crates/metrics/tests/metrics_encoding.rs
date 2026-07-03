@@ -1,9 +1,10 @@
 use datalens_core::{ChainFamily, ChainIdentity, DatalensErrorKind, DatasetKey};
 use datalens_metrics::{
-    ApplicationIdentity, CacheCoverageOutcome, CompactionBacklogLabels, DurableIntentClaimOutcome,
-    DurableIntentOutcome, DurableWriteOutcome, ErrorLabels, FillOutcome, HotReorgOutcome,
-    MetricsLabels, MetricsRecorder, QueryMetadataEnqueueOutcome, QueryMetadataWriteOutcome,
-    QueryOutcome, WarmupFetchOutcome, WarmupTaskOutcome, WarmupWriteOutcome,
+    ApplicationIdentity, CacheCoverageOutcome, CompactionBacklogLabels, CompactionTickMetrics,
+    DurableIntentClaimOutcome, DurableIntentOutcome, DurableWriteOutcome, ErrorLabels, FillOutcome,
+    HotReorgOutcome, MetricsLabels, MetricsRecorder, QueryMetadataEnqueueOutcome,
+    QueryMetadataWriteOutcome, QueryOutcome, WarmupFetchOutcome, WarmupTaskOutcome,
+    WarmupWriteOutcome,
 };
 
 #[test]
@@ -172,8 +173,30 @@ fn test_compaction_metrics_expose_backlog_progress_and_backpressure() {
     let labels = CompactionBacklogLabels::new(chain(), DatasetKey::evm_logs(), "evm_logs", "0xabc");
 
     recorder.set_compaction_backlog(&labels, 6, 3, 2);
-    recorder.record_compaction_tick(&chain(), "partial", "none", 4, 1, 3, 2, 0.75);
-    recorder.record_compaction_tick(&chain(), "paused", "query_latency", 0, 0, 0, 0, 0.01);
+    recorder.record_compaction_tick(
+        &chain(),
+        CompactionTickMetrics {
+            status: "partial",
+            pause_reason: "none",
+            input_objects: 4,
+            output_objects: 1,
+            deleted_source_objects: 3,
+            deleted_manifest_segments: 2,
+            duration_seconds: 0.75,
+        },
+    );
+    recorder.record_compaction_tick(
+        &chain(),
+        CompactionTickMetrics {
+            status: "paused",
+            pause_reason: "query_latency",
+            input_objects: 0,
+            output_objects: 0,
+            deleted_source_objects: 0,
+            deleted_manifest_segments: 0,
+            duration_seconds: 0.01,
+        },
+    );
 
     let output = recorder.encode().expect("prometheus text");
 

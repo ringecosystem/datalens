@@ -53,6 +53,17 @@ pub struct CompactionBacklogLabels {
     selector: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CompactionTickMetrics<'a> {
+    pub status: &'a str,
+    pub pause_reason: &'a str,
+    pub input_objects: usize,
+    pub output_objects: usize,
+    pub deleted_source_objects: usize,
+    pub deleted_manifest_segments: usize,
+    pub duration_seconds: f64,
+}
+
 impl CompactionBacklogLabels {
     pub fn new(
         chain: ChainIdentity,
@@ -1256,43 +1267,33 @@ impl MetricsRecorder {
             .set(candidate_backlog as f64);
     }
 
-    pub fn record_compaction_tick(
-        &self,
-        chain: &ChainIdentity,
-        status: &str,
-        pause_reason: &str,
-        input_objects: usize,
-        output_objects: usize,
-        deleted_source_objects: usize,
-        deleted_manifest_segments: usize,
-        duration_seconds: f64,
-    ) {
-        let labels = compaction_tick_label_values(chain, status, pause_reason);
+    pub fn record_compaction_tick(&self, chain: &ChainIdentity, tick: CompactionTickMetrics<'_>) {
+        let labels = compaction_tick_label_values(chain, tick.status, tick.pause_reason);
         self.compaction_input_objects_total
             .with_label_values(&labels)
-            .inc_by(input_objects as f64);
+            .inc_by(tick.input_objects as f64);
         self.compaction_output_objects_total
             .with_label_values(&labels)
-            .inc_by(output_objects as f64);
+            .inc_by(tick.output_objects as f64);
         self.compaction_deleted_source_objects_total
             .with_label_values(&labels)
-            .inc_by(deleted_source_objects as f64);
+            .inc_by(tick.deleted_source_objects as f64);
         self.compaction_deleted_manifest_segments_total
             .with_label_values(&labels)
-            .inc_by(deleted_manifest_segments as f64);
+            .inc_by(tick.deleted_manifest_segments as f64);
         self.compaction_tick_duration_seconds
             .with_label_values(&labels)
-            .observe(duration_seconds);
+            .observe(tick.duration_seconds);
         for reason in COMPACTION_PAUSE_REASONS {
-            if reason != pause_reason {
+            if reason != tick.pause_reason {
                 self.compaction_paused
                     .with_label_values(&compaction_paused_label_values(chain, reason))
                     .set(0.0);
             }
         }
         self.compaction_paused
-            .with_label_values(&compaction_paused_label_values(chain, pause_reason))
-            .set((pause_reason != "none") as u8 as f64);
+            .with_label_values(&compaction_paused_label_values(chain, tick.pause_reason))
+            .set((tick.pause_reason != "none") as u8 as f64);
     }
 
     pub fn encode(&self) -> Result<String, prometheus::Error> {

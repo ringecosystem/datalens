@@ -19,7 +19,9 @@ use datalens_evm::{
     DurableEvmBlockHeaderStore, EvmBlockHeaderFetchMode, EvmBlockHeaderMetadataConfig,
     EvmFinalityPolicy, EvmLogReliabilityConfig, EvmRpcClient,
 };
-use datalens_metrics::{ApplicationIdentity, CompactionBacklogLabels, MetricsRecorder};
+use datalens_metrics::{
+    ApplicationIdentity, CompactionBacklogLabels, CompactionTickMetrics, MetricsRecorder,
+};
 use datalens_solana::{SolanaAdapter, SolanaHttpRpc};
 use datalens_storage::{
     DurablePromotionIntentRepository, DurablePromotionIntentStore, DurableStorage,
@@ -433,13 +435,15 @@ fn record_compaction_metrics(
         }
         recorder.record_compaction_tick(
             chain,
-            report.tick_status.as_str(),
-            pause_reason,
-            report.tick_summary.input_objects,
-            report.tick_summary.output_objects,
-            report.tick_summary.deleted_source_objects,
-            report.tick_summary.deleted_manifest_segments,
-            report.tick_summary.duration_ms as f64 / 1_000.0,
+            CompactionTickMetrics {
+                status: report.tick_status.as_str(),
+                pause_reason,
+                input_objects: report.tick_summary.input_objects,
+                output_objects: report.tick_summary.output_objects,
+                deleted_source_objects: report.tick_summary.deleted_source_objects,
+                deleted_manifest_segments: report.tick_summary.deleted_manifest_segments,
+                duration_seconds: report.tick_summary.duration_ms as f64 / 1_000.0,
+            },
         );
     }
 }
@@ -453,13 +457,15 @@ fn record_compaction_failure_metrics(
     for recorder in recorders {
         recorder.record_compaction_tick(
             chain,
-            "failed",
-            pause_reason.unwrap_or("none"),
-            0,
-            0,
-            0,
-            0,
-            duration.as_secs_f64(),
+            CompactionTickMetrics {
+                status: "failed",
+                pause_reason: pause_reason.unwrap_or("none"),
+                input_objects: 0,
+                output_objects: 0,
+                deleted_source_objects: 0,
+                deleted_manifest_segments: 0,
+                duration_seconds: duration.as_secs_f64(),
+            },
         );
     }
 }
