@@ -66,6 +66,7 @@ pub use crate::hot_cache::{
 };
 pub use crate::maintenance::{
     CompactionCandidate, MaintenanceCheckReport, MaintenanceCompactionConfig,
+    MaintenanceCompactionPressure, MaintenanceCompactionPressureMonitor,
     MaintenanceCompactionReport, MaintenanceCompactionTickStatus, MaintenanceIssue,
     MaintenanceIssueKind, MaintenanceOperation, MaintenanceOperationMode, MaintenanceReport,
     MaintenanceRetentionReport, MaintenanceUsageLedgerReport, RetentionPolicy,

@@ -118,10 +118,28 @@ pub fn validate_config(config: &DatalensConfig) -> Result<(), DatalensError> {
                 "storage.compaction.max_candidates_per_tick must be greater than zero when compaction is enabled",
             ));
         }
+        if config.storage.compaction.max_concurrent_candidates == 0 {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                "storage.compaction.max_concurrent_candidates must be greater than zero when compaction is enabled",
+            ));
+        }
         if config.storage.compaction.max_manifest_entries_per_tick == 0 {
             return Err(DatalensError::new(
                 DatalensErrorKind::InvalidInput,
                 "storage.compaction.max_manifest_entries_per_tick must be greater than zero when compaction is enabled",
+            ));
+        }
+        if config.storage.compaction.max_gets_per_tick == 0 {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                "storage.compaction.max_gets_per_tick must be greater than zero when compaction is enabled",
+            ));
+        }
+        if config.storage.compaction.max_puts_per_tick < 2 {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                "storage.compaction.max_puts_per_tick must be at least two when compaction is enabled",
             ));
         }
     }

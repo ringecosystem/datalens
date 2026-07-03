@@ -18,8 +18,8 @@ use datalens_executor::{
 use datalens_metrics::{ApplicationIdentity, MetricsRecorder};
 use datalens_planner::{NativePlannerConfig, NativeQueryInput};
 use datalens_storage::{
-    DurablePromotionIntentRepository, QueryActivityRepository, QueryWatermarkRepository,
-    StorageRepository, UsageLedgerRepository,
+    DurablePromotionIntentRepository, MaintenanceCompactionPressureMonitor,
+    QueryActivityRepository, QueryWatermarkRepository, StorageRepository, UsageLedgerRepository,
 };
 use datalens_warmup::{
     WarmupEnsureOutcome, WarmupRegistry, WarmupRunResult, WarmupSubmitOutcome, WarmupSubmitRequest,
@@ -46,6 +46,7 @@ pub struct QueryService<S> {
     chain: ChainConfig,
     capabilities: AdapterCapabilities,
     metrics: Option<MetricsRecorder>,
+    compaction_pressure: Option<MaintenanceCompactionPressureMonitor>,
     warmup: Option<Arc<dyn RegisteredWarmupService>>,
     cache_repair: Option<Arc<dyn RegisteredCacheRepairService>>,
 }
@@ -226,6 +227,7 @@ where
             chain,
             capabilities,
             metrics: recorder,
+            compaction_pressure: None,
             warmup: None,
             cache_repair: None,
         })
@@ -236,6 +238,14 @@ where
             .executor
             .with_metrics(metrics.clone(), ApplicationIdentity::unknown());
         self.metrics = Some(metrics);
+        self
+    }
+
+    pub fn with_compaction_pressure_monitor(
+        mut self,
+        monitor: MaintenanceCompactionPressureMonitor,
+    ) -> Self {
+        self.compaction_pressure = Some(monitor);
         self
     }
 
@@ -403,6 +413,11 @@ where
         let result = match result {
             Ok(result) => result,
             Err(error) => {
+                if let Some(monitor) = &self.compaction_pressure {
+                    let elapsed = start.elapsed();
+                    monitor.record_query_latency(elapsed);
+                    monitor.record_write_latency(elapsed);
+                }
                 log::warn!(
                     "native query failed query_id={} kind={:?} message={} duration_ms={}",
                     query_id,
@@ -413,6 +428,11 @@ where
                 return Err(error);
             }
         };
+        if let Some(monitor) = &self.compaction_pressure {
+            let elapsed = start.elapsed();
+            monitor.record_query_latency(elapsed);
+            monitor.record_write_latency(elapsed);
+        }
         log::info!(
             "native query completed query_id={} chain={} dataset={} range={}-{} rows={} duration_ms={}",
             query_id,
