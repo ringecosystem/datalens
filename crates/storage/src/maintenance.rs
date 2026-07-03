@@ -332,21 +332,16 @@ where
         let raw_entries = self.raw_manifest_entries_for_chain(chain)?;
         let mut report =
             self.compaction_reconciliation_report(&current_entries, &raw_entries, false)?;
-        report.orphan_compacted_objects = report
+        let chain_prefix = format!("chains/{}/", chain.key_prefix());
+        report
             .orphan_compacted_objects
-            .into_iter()
-            .filter(|object_key| object_key.starts_with(&format!("chains/{}/", chain.key_prefix())))
-            .collect();
-        report.stale_source_objects = report
+            .retain(|object_key| object_key.starts_with(&chain_prefix));
+        report
             .stale_source_objects
-            .into_iter()
-            .filter(|object_key| object_key.starts_with(&format!("chains/{}/", chain.key_prefix())))
-            .collect();
-        report.stale_cleanup_records = report
+            .retain(|object_key| object_key.starts_with(&chain_prefix));
+        report
             .stale_cleanup_records
-            .into_iter()
-            .filter(|object_key| object_key.starts_with(&format!("chains/{}/", chain.key_prefix())))
-            .collect();
+            .retain(|object_key| object_key.starts_with(&chain_prefix));
 
         for object_key in report.orphan_compacted_objects.clone() {
             match self.object_store().delete(&object_key) {
