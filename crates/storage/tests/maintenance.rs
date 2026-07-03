@@ -1075,6 +1075,74 @@ fn test_compaction_tick_stops_after_candidate_budget_and_reports_partial() {
 }
 
 #[test]
+fn test_compaction_report_exposes_backlog_estimates_and_tick_summary() {
+    let storage = LocalStorage::new(temp_storage_root("compaction-observability"));
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 180, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 181, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 190, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 191, FinalityLevel::Safe);
+
+    let report = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                min_object_bytes: u64::MAX,
+                max_merge_ranges: 2,
+                max_tick_duration_ms: 30_000,
+                max_candidates_per_tick: 1,
+                max_manifest_entries_per_tick: 20_000,
+                delete_source_objects: true,
+                ..MaintenanceCompactionConfig::default()
+            },
+        )
+        .expect("observable compaction");
+
+    assert_eq!(report.tick_summary.input_objects, 2);
+    assert_eq!(report.tick_summary.output_objects, 1);
+    assert_eq!(report.tick_summary.deleted_source_objects, 2);
+    assert!(report.tick_summary.deleted_manifest_segments > 0);
+    assert!(report.tick_summary.duration_ms > 0);
+    assert_eq!(report.pause_reason.as_deref(), None);
+    assert_eq!(report.candidate_backlog, 1);
+    assert_eq!(report.backlog.len(), 1);
+    assert!(report.backlog.iter().any(|scope| scope.chain == chain
+        && scope.dataset_key == DatasetKey::evm_blocks()
+        && scope.selector_fingerprint == "all"
+        && scope.candidate_backlog == 1
+        && scope.small_objects == 2));
+}
+
+#[test]
+fn test_compaction_pause_report_exposes_backpressure_reason() {
+    let storage = LocalStorage::new(temp_storage_root("compaction-pause-reason"));
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 184, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 185, FinalityLevel::Safe);
+
+    let report = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                min_object_bytes: u64::MAX,
+                query_latency_pause_threshold_ms: 100,
+                pressure: MaintenanceCompactionPressure {
+                    query_latency_ms: Some(250),
+                    write_latency_ms: None,
+                },
+                ..MaintenanceCompactionConfig::default()
+            },
+        )
+        .expect("pressure-paused compaction");
+
+    assert_eq!(report.tick_status, MaintenanceCompactionTickStatus::Paused);
+    assert_eq!(report.pause_reason.as_deref(), Some("query_latency"));
+    assert_eq!(report.candidate_backlog, 1);
+    assert_eq!(report.tick_summary.input_objects, 0);
+    assert_eq!(report.tick_summary.output_objects, 0);
+}
+
+#[test]
 fn test_compaction_tick_stops_before_exceeding_object_store_operation_budgets() {
     let storage = LocalStorage::new(temp_storage_root("operation-budgets"));
     let chain = test_chain();

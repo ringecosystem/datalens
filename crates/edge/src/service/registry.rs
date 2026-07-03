@@ -16,7 +16,7 @@ use datalens_cache_repair::{
 use datalens_chain::ChainAdapter;
 use datalens_core::{DatalensError, DatalensErrorKind, QueryFinalityRequirement};
 use datalens_executor::generate_query_id;
-use datalens_metrics::ApplicationIdentity;
+use datalens_metrics::{ApplicationIdentity, MetricsRecorder};
 use datalens_planner::NativeQueryInput;
 use datalens_warmup::{
     WarmupEnsureOutcome, WarmupRunResult, WarmupSubmitOutcome, WarmupSubmitRequest, WarmupTask,
@@ -529,6 +529,13 @@ impl QueryServiceRegistry {
         } else {
             Some(Ok(texts.join("\n")))
         }
+    }
+
+    pub fn metrics_recorders(&self) -> Vec<MetricsRecorder> {
+        self.services
+            .values()
+            .filter_map(|service| service.metrics_recorder())
+            .collect()
     }
 
     pub fn flush_staged_writes_for_shutdown(
