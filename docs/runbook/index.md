@@ -21,6 +21,9 @@ outputs.
 
 - `chain-adapter-conformance.md`: checklist for wiring a chain adapter into the shared
   conformance suite before durable or hot query path enablement.
+- `compaction-performance-harness.md`: storage smoke harness for comparing compaction
+  before/after and concurrent `read_rows`, `covered_ranges`, `write_rows` latency,
+  error rate, and object-store-operation impact.
 - `application-integration-handbook.md`: handbook for building and operating
   SDK-based application indexers that call the shared Datalens service while owning their
   own business database, handlers, and checkpoints.
