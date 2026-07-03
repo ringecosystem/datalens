@@ -28,6 +28,11 @@ struct FailingDataObjectDeleteStore {
 }
 
 #[derive(Clone, Debug)]
+struct FailingManifestSegmentPutStore {
+    inner: LocalObjectStore,
+}
+
+#[derive(Clone, Debug)]
 struct CountingListStore {
     inner: LocalObjectStore,
     list_prefixes: Arc<Mutex<Vec<String>>>,
@@ -43,6 +48,14 @@ impl FailingDataObjectPutStore {
 }
 
 impl FailingDataObjectDeleteStore {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            inner: LocalObjectStore::new(root),
+        }
+    }
+}
+
+impl FailingManifestSegmentPutStore {
     fn new(root: PathBuf) -> Self {
         Self {
             inner: LocalObjectStore::new(root),
@@ -153,6 +166,47 @@ impl ObjectStore for FailingDataObjectDeleteStore {
             ));
         }
         self.inner.delete(key)
+    }
+}
+
+impl ObjectStore for FailingManifestSegmentPutStore {
+    fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError> {
+        self.inner.get(key)
+    }
+
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
+        if key.contains("/manifest-segments/") && key.ends_with(".json") {
+            return Err(DatalensError::new(
+                DatalensErrorKind::ManifestUpdateFailure,
+                "injected manifest segment write failure",
+            ));
+        }
+        self.inner.put(key, bytes)
+    }
+
+    fn exists(&self, key: &str) -> Result<bool, DatalensError> {
+        self.inner.exists(key)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
+        self.inner.list(prefix)
+    }
+
+    fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ObjectListPage, DatalensError> {
+        self.inner.list_page(prefix, start_after, limit)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), DatalensError> {
+        self.inner.delete(key)
+    }
+
+    fn lock_namespace(&self) -> String {
+        self.inner.lock_namespace()
     }
 }
 
@@ -617,6 +671,161 @@ fn test_compaction_source_delete_failure_leaves_reads_working() {
         )
         .expect("compacted manifest remains readable");
     assert_eq!(rows.row_count(), 2);
+}
+
+#[test]
+fn test_compaction_reconciliation_deletes_unpublished_compacted_orphan() {
+    let storage = LocalStorage::new(temp_storage_root("orphan-compacted-recovery"));
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 74, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 75, FinalityLevel::Safe);
+    let failing_storage = DurableStorage::from_object_store(FailingManifestSegmentPutStore::new(
+        storage.root().into(),
+    ));
+
+    let error = failing_storage
+        .compact_small_objects(MaintenanceCompactionConfig {
+            min_object_bytes: u64::MAX,
+            max_merge_ranges: 8,
+            max_tick_duration_ms: 30_000,
+            max_candidates_per_tick: 8,
+            max_manifest_entries_per_tick: 20_000,
+            delete_source_objects: true,
+        })
+        .expect_err("manifest publish crash leaves compacted object");
+
+    assert_eq!(error.kind, DatalensErrorKind::ManifestUpdateFailure);
+    let orphan_key = compacted_object_keys(&storage, &chain)
+        .into_iter()
+        .next()
+        .expect("orphan compacted object");
+    let report = storage.maintenance_report().expect("maintenance report");
+    assert_eq!(
+        report.compaction_reconciliation.orphan_compacted_objects,
+        vec![orphan_key.clone()]
+    );
+
+    let reconciliation = storage
+        .reconcile_compaction_for_chain(&chain, MaintenanceCompactionConfig::default())
+        .expect("reconcile compaction");
+
+    assert_eq!(reconciliation.deleted_orphan_compacted_objects, 1);
+    assert!(
+        !storage
+            .object_store()
+            .exists(&orphan_key)
+            .expect("orphan exists")
+    );
+    let rows = storage
+        .read_rows(
+            &chain,
+            &DatasetKey::evm_blocks(),
+            &DatasetSelector::all(),
+            LedgerRange::blocks(74, 75).expect("range"),
+        )
+        .expect("source manifest entries remain readable");
+    assert_eq!(rows.row_count(), 2);
+}
+
+#[test]
+fn test_compaction_reconciliation_retries_stale_source_cleanup_after_restart() {
+    let storage = LocalStorage::new(temp_storage_root("stale-source-cleanup-recovery"));
+    let chain = test_chain();
+    let first_object = write_block_object(&storage, &chain, 76, FinalityLevel::Safe);
+    let second_object = write_block_object(&storage, &chain, 77, FinalityLevel::Safe);
+    let failing_storage =
+        DurableStorage::from_object_store(FailingDataObjectDeleteStore::new(storage.root().into()));
+
+    failing_storage
+        .compact_small_objects(MaintenanceCompactionConfig {
+            min_object_bytes: u64::MAX,
+            max_merge_ranges: 8,
+            max_tick_duration_ms: 30_000,
+            max_candidates_per_tick: 8,
+            max_manifest_entries_per_tick: 20_000,
+            delete_source_objects: true,
+        })
+        .expect("compaction with cleanup failures");
+
+    let report = storage.maintenance_report().expect("maintenance report");
+    assert_eq!(
+        report.compaction_reconciliation.stale_source_objects,
+        vec![first_object.clone(), second_object.clone()]
+    );
+
+    let reconciliation = storage
+        .reconcile_compaction_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                delete_source_objects: true,
+                ..MaintenanceCompactionConfig::default()
+            },
+        )
+        .expect("reconcile compaction");
+
+    assert_eq!(reconciliation.deleted_stale_source_objects, 2);
+    assert!(
+        !storage
+            .object_store()
+            .exists(&first_object)
+            .expect("first exists")
+    );
+    assert!(
+        !storage
+            .object_store()
+            .exists(&second_object)
+            .expect("second exists")
+    );
+    let rows = storage
+        .read_rows(
+            &chain,
+            &DatasetKey::evm_blocks(),
+            &DatasetSelector::all(),
+            LedgerRange::blocks(76, 77).expect("range"),
+        )
+        .expect("compacted manifest remains readable");
+    assert_eq!(rows.row_count(), 2);
+}
+
+#[test]
+fn test_compaction_reconciliation_never_deletes_current_manifest_objects() {
+    let storage = LocalStorage::new(temp_storage_root("protect-current-reconciliation"));
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 78, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 79, FinalityLevel::Safe);
+    storage
+        .compact_small_objects(MaintenanceCompactionConfig {
+            min_object_bytes: u64::MAX,
+            max_merge_ranges: 8,
+            max_tick_duration_ms: 30_000,
+            max_candidates_per_tick: 8,
+            max_manifest_entries_per_tick: 20_000,
+            delete_source_objects: true,
+        })
+        .expect("compact small objects");
+    let current_object = storage.manifest().expect("manifest").entries[0]
+        .object_key
+        .clone()
+        .expect("current object");
+
+    let reconciliation = storage
+        .reconcile_compaction_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                delete_source_objects: true,
+                ..MaintenanceCompactionConfig::default()
+            },
+        )
+        .expect("reconcile compaction");
+
+    assert_eq!(reconciliation.deleted_orphan_compacted_objects, 0);
+    assert_eq!(reconciliation.deleted_stale_source_objects, 0);
+    assert!(
+        storage
+            .object_store()
+            .exists(&current_object)
+            .expect("current object exists")
+    );
 }
 
 #[test]
@@ -1163,6 +1372,17 @@ fn write_manifest_json(storage: &LocalStorage, chain: &ChainIdentity, manifest: 
     )
     .expect("create manifest parent");
     std::fs::write(storage.manifest_path(chain), bytes).expect("write manifest");
+}
+
+fn compacted_object_keys(storage: &LocalStorage, chain: &ChainIdentity) -> Vec<String> {
+    storage
+        .object_store()
+        .list(&format!("chains/{}/datasets", chain.key_prefix()))
+        .expect("list data objects")
+        .into_iter()
+        .map(|object| object.key)
+        .filter(|key| key.contains("/compacted/"))
+        .collect()
 }
 
 fn test_chain() -> ChainIdentity {

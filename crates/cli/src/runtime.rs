@@ -244,14 +244,35 @@ impl StorageCompactionWorker {
                     let chain = chains[next_chain_index % chains.len()].clone();
                     next_chain_index = next_chain_index.saturating_add(1);
                     let started = Instant::now();
-                    let result = match &storage {
+                    let reconciliation = match &storage {
                         CompactionStorage::Local(storage) => {
-                            storage.compact_small_objects_for_chain(&chain, config)
+                            storage.reconcile_compaction_for_chain(&chain, config)
                         }
                         CompactionStorage::S3(storage) => {
-                            storage.compact_small_objects_for_chain(&chain, config)
+                            storage.reconcile_compaction_for_chain(&chain, config)
                         }
                     };
+                    let result = reconciliation.and_then(|reconciliation| {
+                        log::info!(
+                            "storage compaction reconciliation completed chain_key={} orphan_compacted_objects={} stale_source_objects={} stale_cleanup_records={} deleted_orphan_compacted_objects={} deleted_stale_source_objects={} deleted_stale_cleanup_records={} delete_failures={}",
+                            chain.key_prefix(),
+                            reconciliation.orphan_compacted_objects.len(),
+                            reconciliation.stale_source_objects.len(),
+                            reconciliation.stale_cleanup_records.len(),
+                            reconciliation.deleted_orphan_compacted_objects,
+                            reconciliation.deleted_stale_source_objects,
+                            reconciliation.deleted_stale_cleanup_records,
+                            reconciliation.delete_failures
+                        );
+                        match &storage {
+                            CompactionStorage::Local(storage) => {
+                                storage.compact_small_objects_for_chain(&chain, config)
+                            }
+                            CompactionStorage::S3(storage) => {
+                                storage.compact_small_objects_for_chain(&chain, config)
+                            }
+                        }
+                    });
                     match result {
                         Ok(report) => {
                             consecutive_failures = 0;

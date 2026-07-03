@@ -23,6 +23,7 @@ pub struct MaintenanceReport {
     pub operations: Vec<MaintenanceOperation>,
     pub check: MaintenanceCheckReport,
     pub compaction: MaintenanceCompactionReport,
+    pub compaction_reconciliation: MaintenanceCompactionReconciliationReport,
     pub retention: MaintenanceRetentionReport,
     pub usage_ledger: MaintenanceUsageLedgerReport,
 }
@@ -91,6 +92,18 @@ pub struct MaintenanceCompactionReport {
     pub compacted_rows: usize,
     pub deleted_source_objects: usize,
     pub source_delete_failures: usize,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MaintenanceCompactionReconciliationReport {
+    pub read_only: bool,
+    pub orphan_compacted_objects: Vec<String>,
+    pub stale_source_objects: Vec<String>,
+    pub stale_cleanup_records: Vec<String>,
+    pub deleted_orphan_compacted_objects: usize,
+    pub deleted_stale_source_objects: usize,
+    pub deleted_stale_cleanup_records: usize,
+    pub delete_failures: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -191,10 +204,14 @@ where
 
         let mut issues = Vec::new();
         let mut manifest = Manifest::default();
+        let mut raw_entries = Vec::new();
         for manifest_key in manifest_keys {
             let bytes = self.object_store().get(&manifest_key)?;
             match serde_json::from_slice::<Manifest>(&bytes) {
-                Ok(object_manifest) => manifest.merge(object_manifest),
+                Ok(object_manifest) => {
+                    raw_entries.extend(object_manifest.entries.clone());
+                    manifest.merge(object_manifest);
+                }
                 Err(error) => issues.push(MaintenanceIssue {
                     issue_kind: MaintenanceIssueKind::ManifestDecodeFailure,
                     chain: None,
@@ -212,6 +229,8 @@ where
         issues.extend(contradictory_coverage_issues(&entries));
 
         let candidates = compaction_candidates(&entries, MaintenanceCompactionConfig::default());
+        let compaction_reconciliation =
+            self.compaction_reconciliation_report(&entries, &raw_entries, true)?;
         let protected_current_objects = current_object_keys(&entries);
         let delete_candidates = self.retention_delete_candidates(&protected_current_objects)?;
 
@@ -241,6 +260,7 @@ where
                 deleted_source_objects: 0,
                 source_delete_failures: 0,
             },
+            compaction_reconciliation,
             retention: MaintenanceRetentionReport {
                 mode: MaintenanceOperationMode::DryRun,
                 policy: RetentionPolicy {
@@ -300,6 +320,81 @@ where
             Some((chain, scan.cursor_advance)),
             scan.partial,
         )?;
+        Ok(report)
+    }
+
+    pub fn reconcile_compaction_for_chain(
+        &self,
+        chain: &ChainIdentity,
+        config: MaintenanceCompactionConfig,
+    ) -> Result<MaintenanceCompactionReconciliationReport, DatalensError> {
+        let current_entries = self.manifest_for_chain(chain)?.entries;
+        let raw_entries = self.raw_manifest_entries_for_chain(chain)?;
+        let mut report =
+            self.compaction_reconciliation_report(&current_entries, &raw_entries, false)?;
+        report.orphan_compacted_objects = report
+            .orphan_compacted_objects
+            .into_iter()
+            .filter(|object_key| object_key.starts_with(&format!("chains/{}/", chain.key_prefix())))
+            .collect();
+        report.stale_source_objects = report
+            .stale_source_objects
+            .into_iter()
+            .filter(|object_key| object_key.starts_with(&format!("chains/{}/", chain.key_prefix())))
+            .collect();
+        report.stale_cleanup_records = report
+            .stale_cleanup_records
+            .into_iter()
+            .filter(|object_key| object_key.starts_with(&format!("chains/{}/", chain.key_prefix())))
+            .collect();
+
+        for object_key in report.orphan_compacted_objects.clone() {
+            match self.object_store().delete(&object_key) {
+                Ok(()) => report.deleted_orphan_compacted_objects += 1,
+                Err(error) => {
+                    report.delete_failures += 1;
+                    log::warn!(
+                        "storage compaction reconciliation orphan delete failed chain_key={} object_key={} kind={:?} message={}",
+                        chain.key_prefix(),
+                        object_key,
+                        error.kind,
+                        error.message
+                    );
+                }
+            }
+        }
+        if config.delete_source_objects {
+            for object_key in report.stale_source_objects.clone() {
+                match self.object_store().delete(&object_key) {
+                    Ok(()) => report.deleted_stale_source_objects += 1,
+                    Err(error) => {
+                        report.delete_failures += 1;
+                        log::warn!(
+                            "storage compaction reconciliation source delete failed chain_key={} object_key={} kind={:?} message={}",
+                            chain.key_prefix(),
+                            object_key,
+                            error.kind,
+                            error.message
+                        );
+                    }
+                }
+            }
+        }
+        for object_key in report.stale_cleanup_records.clone() {
+            match self.object_store().delete(&object_key) {
+                Ok(()) => report.deleted_stale_cleanup_records += 1,
+                Err(error) => {
+                    report.delete_failures += 1;
+                    log::warn!(
+                        "storage compaction reconciliation cleanup record delete failed chain_key={} object_key={} kind={:?} message={}",
+                        chain.key_prefix(),
+                        object_key,
+                        error.kind,
+                        error.message
+                    );
+                }
+            }
+        }
         Ok(report)
     }
 
@@ -450,6 +545,112 @@ where
             }
         }
         Ok(issues)
+    }
+
+    fn raw_manifest_entries_for_chain(
+        &self,
+        chain: &ChainIdentity,
+    ) -> Result<Vec<ManifestEntry>, DatalensError> {
+        let mut entries = Vec::new();
+        let key = manifest_key(chain);
+        if self.object_store().exists(&key)? {
+            let bytes = self.object_store().get(&key)?;
+            entries.extend(decode_manifest_object(&key, &bytes)?.entries);
+        }
+        for object in self.object_store().list(&manifest_segment_prefix(chain))? {
+            if !object.key.ends_with(".json") {
+                continue;
+            }
+            let bytes = self.object_store().get(&object.key)?;
+            entries.extend(decode_manifest_object(&object.key, &bytes)?.entries);
+        }
+        Ok(entries)
+    }
+
+    fn compaction_reconciliation_report(
+        &self,
+        current_entries: &[ManifestEntry],
+        raw_entries: &[ManifestEntry],
+        read_only: bool,
+    ) -> Result<MaintenanceCompactionReconciliationReport, DatalensError> {
+        let current_objects = current_object_keys(current_entries)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let mut orphan_compacted_objects = self
+            .object_store()
+            .list("chains")?
+            .into_iter()
+            .map(|object| object.key)
+            .filter(|key| is_data_object(key))
+            .filter(|key| key.contains("/compacted/"))
+            .filter(|key| !current_objects.contains(key))
+            .collect::<Vec<_>>();
+        orphan_compacted_objects.sort();
+        orphan_compacted_objects.dedup();
+
+        let mut stale_source_objects = Vec::new();
+        for entry in raw_entries {
+            let Some(object_key) = entry.object_key.as_ref() else {
+                continue;
+            };
+            if object_key.contains("/compacted/") || current_objects.contains(object_key) {
+                continue;
+            }
+            if stale_source_object_is_safe(entry, current_entries, self.object_store())? {
+                stale_source_objects.push(object_key.clone());
+            }
+        }
+        stale_source_objects.sort();
+        stale_source_objects.dedup();
+
+        let stale_cleanup_records =
+            self.stale_compaction_cleanup_records(current_entries, raw_entries)?;
+
+        Ok(MaintenanceCompactionReconciliationReport {
+            read_only,
+            orphan_compacted_objects,
+            stale_source_objects,
+            stale_cleanup_records,
+            deleted_orphan_compacted_objects: 0,
+            deleted_stale_source_objects: 0,
+            deleted_stale_cleanup_records: 0,
+            delete_failures: 0,
+        })
+    }
+
+    fn stale_compaction_cleanup_records(
+        &self,
+        current_entries: &[ManifestEntry],
+        raw_entries: &[ManifestEntry],
+    ) -> Result<Vec<String>, DatalensError> {
+        let mut chains = current_entries
+            .iter()
+            .chain(raw_entries.iter())
+            .map(|entry| entry.chain.clone())
+            .collect::<Vec<_>>();
+        chains.sort_by_key(|chain| chain.key_prefix());
+        chains.dedup_by_key(|chain| chain.key_prefix());
+
+        let mut records = Vec::new();
+        for chain in chains {
+            let key = compaction_cursor_key(&chain);
+            if !self.object_store().exists(&key)? {
+                continue;
+            }
+            let candidates = compaction_candidates(
+                &current_entries
+                    .iter()
+                    .filter(|entry| entry.chain == chain)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                MaintenanceCompactionConfig::default(),
+            );
+            if candidates.is_empty() {
+                records.push(key);
+            }
+        }
+        records.sort();
+        Ok(records)
     }
 
     fn delete_compacted_source_objects(
@@ -1122,6 +1323,34 @@ where
             continue;
         };
         if candidate.shadows_segment(entry) && object_store.exists(object_key)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn stale_source_object_is_safe<S>(
+    entry: &ManifestEntry,
+    current_entries: &[ManifestEntry],
+    object_store: &S,
+) -> Result<bool, DatalensError>
+where
+    S: ObjectStore,
+{
+    let Some(source_object_key) = entry.object_key.as_deref() else {
+        return Ok(false);
+    };
+    if !object_store.exists(source_object_key)? {
+        return Ok(false);
+    }
+    for current_entry in current_entries {
+        let Some(current_object_key) = current_entry.object_key.as_deref() else {
+            continue;
+        };
+        if current_object_key == source_object_key {
+            return Ok(false);
+        }
+        if current_entry.shadows_segment(entry) && object_store.exists(current_object_key)? {
             return Ok(true);
         }
     }
