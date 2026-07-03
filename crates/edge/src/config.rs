@@ -105,8 +105,24 @@ pub struct StorageCompactionConfig {
     pub max_tick_duration_ms: u64,
     #[serde(default = "default_storage_compaction_max_candidates_per_tick")]
     pub max_candidates_per_tick: usize,
+    #[serde(default = "default_storage_compaction_max_concurrent_candidates")]
+    pub max_concurrent_candidates: usize,
     #[serde(default = "default_storage_compaction_max_manifest_entries_per_tick")]
     pub max_manifest_entries_per_tick: usize,
+    #[serde(default = "default_storage_compaction_max_gets_per_tick")]
+    pub max_gets_per_tick: usize,
+    #[serde(default = "default_storage_compaction_max_puts_per_tick")]
+    pub max_puts_per_tick: usize,
+    #[serde(default = "default_storage_compaction_max_deletes_per_tick")]
+    pub max_deletes_per_tick: usize,
+    #[serde(default = "default_storage_compaction_object_store_error_pause_ms")]
+    pub object_store_error_pause_ms: u64,
+    #[serde(default = "default_storage_compaction_query_latency_pause_threshold_ms")]
+    pub query_latency_pause_threshold_ms: u64,
+    #[serde(default = "default_storage_compaction_write_latency_pause_threshold_ms")]
+    pub write_latency_pause_threshold_ms: u64,
+    #[serde(default = "default_storage_compaction_pressure_pause_ms")]
+    pub pressure_pause_ms: u64,
     #[serde(default)]
     pub delete_source_objects: bool,
 }
@@ -122,7 +138,17 @@ impl Default for StorageCompactionConfig {
             max_merge_ranges: default_storage_compaction_max_merge_ranges(),
             max_tick_duration_ms: default_storage_compaction_max_tick_duration_ms(),
             max_candidates_per_tick: default_storage_compaction_max_candidates_per_tick(),
+            max_concurrent_candidates: default_storage_compaction_max_concurrent_candidates(),
             max_manifest_entries_per_tick,
+            max_gets_per_tick: default_storage_compaction_max_gets_per_tick(),
+            max_puts_per_tick: default_storage_compaction_max_puts_per_tick(),
+            max_deletes_per_tick: default_storage_compaction_max_deletes_per_tick(),
+            object_store_error_pause_ms: default_storage_compaction_object_store_error_pause_ms(),
+            query_latency_pause_threshold_ms:
+                default_storage_compaction_query_latency_pause_threshold_ms(),
+            write_latency_pause_threshold_ms:
+                default_storage_compaction_write_latency_pause_threshold_ms(),
+            pressure_pause_ms: default_storage_compaction_pressure_pause_ms(),
             delete_source_objects: false,
         }
     }
@@ -467,11 +493,43 @@ fn default_storage_compaction_max_tick_duration_ms() -> u64 {
 }
 
 fn default_storage_compaction_max_candidates_per_tick() -> usize {
-    8
+    1
+}
+
+fn default_storage_compaction_max_concurrent_candidates() -> usize {
+    1
 }
 
 fn default_storage_compaction_max_manifest_entries_per_tick() -> usize {
     20_000
+}
+
+fn default_storage_compaction_max_gets_per_tick() -> usize {
+    64
+}
+
+fn default_storage_compaction_max_puts_per_tick() -> usize {
+    8
+}
+
+fn default_storage_compaction_max_deletes_per_tick() -> usize {
+    64
+}
+
+fn default_storage_compaction_object_store_error_pause_ms() -> u64 {
+    60_000
+}
+
+fn default_storage_compaction_query_latency_pause_threshold_ms() -> u64 {
+    0
+}
+
+fn default_storage_compaction_write_latency_pause_threshold_ms() -> u64 {
+    0
+}
+
+fn default_storage_compaction_pressure_pause_ms() -> u64 {
+    60_000
 }
 
 fn default_native_query_surface() -> GraphqlSurfaceConfig {
