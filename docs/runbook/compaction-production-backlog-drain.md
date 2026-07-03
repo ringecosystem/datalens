@@ -51,10 +51,21 @@ stays within the production budget.
 ## Phase 0: Disabled Hold
 
 Use this phase when preflight inventory or service health is incomplete.
+The checked-in production profile starts here so deployment does not automatically
+begin draining backlog before the runtime owner has captured inventory and baselines.
+It keeps the Phase 1 low-rate limits in the same file, but compaction remains paused
+until runtime explicitly flips `enabled` after preflight.
 
 ```toml
 [storage.compaction]
 enabled = false
+interval_ms = 300000
+min_object_bytes = 1048576
+max_merge_ranges = 8
+max_tick_duration_ms = 5000
+max_candidates_per_tick = 1
+max_manifest_entries_per_tick = 1000
+delete_source_objects = true
 ```
 
 Completion standard: backlog inventory is captured by chain, dataset, and selector;
@@ -62,7 +73,8 @@ backup is complete; query/write and object-store baselines are available.
 
 ## Phase 1: Low-Rate Observation
 
-The checked-in production profile starts here:
+After Phase 0 is complete, runtime starts the first active drain by changing only
+`enabled`:
 
 ```toml
 [storage.compaction]

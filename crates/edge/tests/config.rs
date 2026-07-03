@@ -25,7 +25,7 @@ fn test_config_production_ethereum_rpc_pool_and_log_reliability() {
 }
 
 #[test]
-fn test_config_production_compaction_starts_with_controlled_backlog_drain_limits() {
+fn test_config_production_compaction_starts_with_controlled_backlog_drain_hold() {
     set_production_config_env();
 
     let config_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -34,7 +34,7 @@ fn test_config_production_compaction_starts_with_controlled_backlog_drain_limits
         .expect("production config path");
     let config = DatalensConfig::from_file(&config_path).expect("production config should parse");
 
-    assert!(config.storage.compaction.enabled);
+    assert!(!config.storage.compaction.enabled);
     assert_eq!(config.storage.compaction.interval_ms, 300_000);
     assert_eq!(config.storage.compaction.max_tick_duration_ms, 5_000);
     assert_eq!(config.storage.compaction.max_candidates_per_tick, 1);

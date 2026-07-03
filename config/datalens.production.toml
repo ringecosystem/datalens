@@ -15,7 +15,7 @@ force_path_style = true
 compression = "zstd"
 
 [storage.compaction]
-enabled = true
+enabled = false
 interval_ms = 300000
 min_object_bytes = 1048576
 max_merge_ranges = 8
