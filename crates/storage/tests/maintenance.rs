@@ -15,7 +15,10 @@ use parquet::{
     basic::Compression,
     file::reader::{FileReader, SerializedFileReader},
 };
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 #[derive(Clone, Debug)]
 struct FailingDataObjectPutStore {
@@ -32,6 +35,13 @@ struct CountingListStore {
     inner: LocalObjectStore,
     list_prefixes: Arc<Mutex<Vec<String>>>,
     list_page_prefixes: Arc<Mutex<Vec<String>>>,
+}
+
+#[derive(Clone, Debug)]
+struct OverlappingWriteDuringCompactionStore {
+    inner: LocalObjectStore,
+    injected: Arc<AtomicBool>,
+    chain: ChainIdentity,
 }
 
 impl FailingDataObjectPutStore {
@@ -75,6 +85,20 @@ impl CountingListStore {
             .iter()
             .filter(|listed_prefix| listed_prefix.as_str() == prefix)
             .count()
+    }
+}
+
+impl OverlappingWriteDuringCompactionStore {
+    fn new(root: PathBuf, chain: ChainIdentity) -> Self {
+        Self {
+            inner: LocalObjectStore::new(root),
+            injected: Arc::new(AtomicBool::new(false)),
+            chain,
+        }
+    }
+
+    fn injected(&self) -> bool {
+        self.injected.load(Ordering::SeqCst)
     }
 }
 
@@ -187,6 +211,70 @@ impl ObjectStore for CountingListStore {
             .lock()
             .expect("list page prefixes")
             .push(prefix.to_owned());
+        self.inner.list_page(prefix, start_after, limit)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), DatalensError> {
+        self.inner.delete(key)
+    }
+
+    fn lock_namespace(&self) -> String {
+        self.inner.lock_namespace()
+    }
+}
+
+impl ObjectStore for OverlappingWriteDuringCompactionStore {
+    fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError> {
+        self.inner.get(key)
+    }
+
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
+        self.inner.put(key, bytes)?;
+        if key.contains("/compacted/")
+            && self
+                .injected
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            let rows = DatasetRows::new(
+                DatasetKey::evm_blocks(),
+                QueryRows::EvmBlocks(vec![BlockHeader {
+                    number: 50,
+                    hash: "0xreplacement50".to_owned(),
+                    parent_hash: "0xparent".to_owned(),
+                    timestamp: 50,
+                }]),
+            )
+            .expect("replacement rows");
+            DurableStorage::from_object_store(self.inner.clone()).write_rows_replacing_existing(
+                StorageWriteRequest {
+                    chain: &self.chain,
+                    dataset_key: DatasetKey::evm_blocks(),
+                    selector: &DatasetSelector::all(),
+                    range: LedgerRange::blocks(50, 50).expect("range"),
+                    rows: &rows,
+                    finality_level: FinalityLevel::Safe,
+                    record_empty_coverage: true,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    fn exists(&self, key: &str) -> Result<bool, DatalensError> {
+        self.inner.exists(key)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
+        self.inner.list(prefix)
+    }
+
+    fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ObjectListPage, DatalensError> {
         self.inner.list_page(prefix, start_after, limit)
     }
 
@@ -430,6 +518,56 @@ fn test_compaction_merges_adjacent_small_objects_and_retains_old_objects() {
             .check
             .issues
             .is_empty()
+    );
+}
+
+#[test]
+fn test_compaction_skips_candidate_when_overlapping_write_publishes_before_manifest_update() {
+    let storage = LocalStorage::new(temp_storage_root("compaction-overlap-write"));
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 50, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 51, FinalityLevel::Safe);
+    let injecting_store =
+        OverlappingWriteDuringCompactionStore::new(storage.root().into(), chain.clone());
+    let compacting_storage = DurableStorage::from_object_store(injecting_store.clone());
+
+    let report = compacting_storage
+        .compact_small_objects(MaintenanceCompactionConfig {
+            min_object_bytes: u64::MAX,
+            max_merge_ranges: 8,
+            max_tick_duration_ms: 30_000,
+            max_candidates_per_tick: 8,
+            max_manifest_entries_per_tick: 20_000,
+            delete_source_objects: false,
+        })
+        .expect("compact small objects");
+
+    assert!(injecting_store.injected());
+    assert_eq!(report.candidate_count, 1);
+    assert_eq!(report.processed_candidates, 0);
+    assert_eq!(report.compacted_objects, 0);
+    let rows = storage
+        .read_rows(
+            &chain,
+            &DatasetKey::evm_blocks(),
+            &DatasetSelector::all(),
+            LedgerRange::blocks(50, 51).expect("range"),
+        )
+        .expect("read rows after skipped compaction");
+    assert_eq!(rows.row_count(), 2);
+    let replacement = storage
+        .manifest()
+        .expect("manifest")
+        .entries
+        .into_iter()
+        .find(|entry| entry.range == LedgerRange::blocks(50, 50).expect("range"))
+        .expect("replacement entry");
+    assert_eq!(replacement.row_count, 1);
+    assert!(
+        replacement
+            .object_key
+            .as_deref()
+            .is_some_and(|object_key| !object_key.contains("/compacted/"))
     );
 }
 

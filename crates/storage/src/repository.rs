@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, TryLockError},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -1304,6 +1304,109 @@ where
         self.publish_manifest_segment_unlocked(chain, entry, started)
     }
 
+    pub(crate) fn try_write_compaction_manifest_entry(
+        &self,
+        chain: &ChainIdentity,
+        entry: ManifestEntry,
+        source_entries: &[ManifestEntry],
+    ) -> Result<bool, DatalensError> {
+        let started = Instant::now();
+        let lock = self.manifest_update_lock(chain)?;
+        let Some(_guard) = self.try_lock_manifest_updates(&lock)? else {
+            log::info!(
+                "storage compaction manifest publish skipped reason=manifest_lock_busy chain_key={} range={}-{}",
+                chain.key_prefix(),
+                entry.range.start(),
+                entry.range.end()
+            );
+            return Ok(false);
+        };
+        if let Some(object_key) = entry.object_key.as_deref()
+            && !self.object_store.exists(object_key)?
+        {
+            return Err(DatalensError::new(
+                DatalensErrorKind::ManifestUpdateFailure,
+                format!("manifest entry object not found {object_key}"),
+            ));
+        }
+
+        let current_entries =
+            self.current_compaction_source_entries(chain, &entry, source_entries)?;
+        if !compaction_source_entries_still_current(&current_entries, source_entries) {
+            log::info!(
+                "storage compaction manifest publish skipped reason=stale_manifest_sources chain_key={} range={}-{} source_entries_count={} current_entries_count={}",
+                chain.key_prefix(),
+                entry.range.start(),
+                entry.range.end(),
+                source_entries.len(),
+                current_entries.len()
+            );
+            return Ok(false);
+        }
+
+        let index_entries =
+            coverage_index::read_entries_for_replacement_scope(&self.object_store, &entry)?;
+        if !index_entries.is_empty()
+            && !compaction_source_entries_still_current(&index_entries, source_entries)
+        {
+            log::info!(
+                "storage compaction manifest publish skipped reason=stale_coverage_index_sources chain_key={} range={}-{} source_entries_count={} index_entries_count={}",
+                chain.key_prefix(),
+                entry.range.start(),
+                entry.range.end(),
+                source_entries.len(),
+                index_entries.len()
+            );
+            return Ok(false);
+        }
+
+        self.publish_manifest_segment_unlocked(chain, entry, started)?;
+        Ok(true)
+    }
+
+    fn current_compaction_source_entries(
+        &self,
+        chain: &ChainIdentity,
+        entry: &ManifestEntry,
+        source_entries: &[ManifestEntry],
+    ) -> Result<Vec<ManifestEntry>, DatalensError> {
+        let mut entries = Vec::new();
+        for source_entry in source_entries {
+            let key = manifest_segment_key(chain, source_entry);
+            if !self.object_store.exists(&key)? {
+                continue;
+            }
+            let bytes = self.object_store.get(&key)?;
+            let segment: Manifest = serde_json::from_slice(&bytes).map_err(|error| {
+                DatalensError::new(
+                    DatalensErrorKind::StorageReadFailure,
+                    format!("decode manifest segment {key}: {error}"),
+                )
+            })?;
+            entries.extend(segment.entries.into_iter().filter(|current_entry| {
+                replacement_scope_matches(current_entry, entry)
+                    && current_entry.range.intersection(&entry.range).is_some()
+            }));
+        }
+        let key = manifest_key(chain);
+        if self.object_store.exists(&key)? {
+            let bytes = self.object_store.get(&key)?;
+            let manifest: Manifest = serde_json::from_slice(&bytes).map_err(|error| {
+                DatalensError::new(
+                    DatalensErrorKind::StorageReadFailure,
+                    format!("decode manifest {key}: {error}"),
+                )
+            })?;
+            entries.extend(manifest.entries.into_iter().filter(|current_entry| {
+                replacement_scope_matches(current_entry, entry)
+                    && current_entry.range.intersection(&entry.range).is_some()
+            }));
+        }
+        let mut manifest = Manifest { entries };
+        manifest.normalize();
+        Ok(manifest.entries)
+    }
+
     fn write_data_object_manifest_entry(
         &self,
         chain: &ChainIdentity,
@@ -1642,6 +1745,28 @@ where
         lock.lock()
             .map_err(|_| DatalensError::internal("manifest update lock poisoned"))
     }
+
+    fn try_lock_manifest_updates<'a>(
+        &self,
+        lock: &'a Mutex<()>,
+    ) -> Result<Option<MutexGuard<'a, ()>>, DatalensError> {
+        match lock.try_lock() {
+            Ok(guard) => Ok(Some(guard)),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Poisoned(_)) => {
+                Err(DatalensError::internal("manifest update lock poisoned"))
+            }
+        }
+    }
+}
+
+fn compaction_source_entries_still_current(
+    current_entries: &[ManifestEntry],
+    source_entries: &[ManifestEntry],
+) -> bool {
+    source_entries
+        .iter()
+        .all(|source| current_entries.iter().any(|current| current == source))
 }
 
 pub trait StorageRepository: Send + Sync {
