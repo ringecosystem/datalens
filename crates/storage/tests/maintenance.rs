@@ -566,6 +566,7 @@ fn test_compaction_merges_adjacent_small_objects_and_retains_old_objects() {
             max_tick_duration_ms: 30_000,
             max_candidates_per_tick: 8,
             max_manifest_entries_per_tick: 20_000,
+            cleanup_enabled: false,
             delete_source_objects: false,
             ..MaintenanceCompactionConfig::default()
         })
@@ -662,6 +663,7 @@ fn test_compaction_skips_candidate_when_overlapping_write_publishes_before_manif
             max_tick_duration_ms: 30_000,
             max_candidates_per_tick: 8,
             max_manifest_entries_per_tick: 20_000,
+            cleanup_enabled: false,
             delete_source_objects: false,
             ..MaintenanceCompactionConfig::default()
         })
@@ -715,6 +717,7 @@ fn test_compaction_uses_configured_parquet_compression() {
             max_tick_duration_ms: 30_000,
             max_candidates_per_tick: 8,
             max_manifest_entries_per_tick: 20_000,
+            cleanup_enabled: false,
             delete_source_objects: false,
             ..MaintenanceCompactionConfig::default()
         })
@@ -755,6 +758,7 @@ fn test_compaction_deletes_source_objects_when_enabled() {
             max_tick_duration_ms: 30_000,
             max_candidates_per_tick: 8,
             max_manifest_entries_per_tick: 20_000,
+            cleanup_enabled: true,
             delete_source_objects: true,
             ..MaintenanceCompactionConfig::default()
         })
@@ -829,6 +833,7 @@ fn test_compaction_replacement_write_failure_leaves_old_manifest_readable() {
             max_tick_duration_ms: 30_000,
             max_candidates_per_tick: 8,
             max_manifest_entries_per_tick: 20_000,
+            cleanup_enabled: true,
             delete_source_objects: true,
             ..MaintenanceCompactionConfig::default()
         })
@@ -864,6 +869,7 @@ fn test_compaction_source_delete_failure_leaves_reads_working() {
             max_tick_duration_ms: 30_000,
             max_candidates_per_tick: 8,
             max_manifest_entries_per_tick: 20_000,
+            cleanup_enabled: true,
             delete_source_objects: true,
             ..MaintenanceCompactionConfig::default()
         })
@@ -903,6 +909,7 @@ fn test_compaction_reconciliation_deletes_unpublished_compacted_orphan() {
             max_tick_duration_ms: 30_000,
             max_candidates_per_tick: 8,
             max_manifest_entries_per_tick: 20_000,
+            cleanup_enabled: true,
             delete_source_objects: true,
             ..MaintenanceCompactionConfig::default()
         })
@@ -920,7 +927,13 @@ fn test_compaction_reconciliation_deletes_unpublished_compacted_orphan() {
     );
 
     let reconciliation = storage
-        .reconcile_compaction_for_chain(&chain, MaintenanceCompactionConfig::default())
+        .reconcile_compaction_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                cleanup_enabled: true,
+                ..MaintenanceCompactionConfig::default()
+            },
+        )
         .expect("reconcile compaction");
 
     assert_eq!(reconciliation.deleted_orphan_compacted_objects, 1);
@@ -942,6 +955,51 @@ fn test_compaction_reconciliation_deletes_unpublished_compacted_orphan() {
 }
 
 #[test]
+fn test_compaction_reconciliation_preserves_unpublished_orphan_when_cleanup_disabled() {
+    let storage = LocalStorage::new(temp_storage_root("orphan-compacted-cleanup-disabled"));
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 74, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 75, FinalityLevel::Safe);
+    let failing_storage = DurableStorage::from_object_store(FailingManifestSegmentPutStore::new(
+        storage.root().into(),
+    ));
+
+    failing_storage
+        .compact_small_objects(MaintenanceCompactionConfig {
+            min_object_bytes: u64::MAX,
+            max_merge_ranges: 8,
+            max_tick_duration_ms: 30_000,
+            max_candidates_per_tick: 8,
+            max_concurrent_candidates: 8,
+            max_manifest_entries_per_tick: 20_000,
+            cleanup_enabled: false,
+            delete_source_objects: true,
+            ..MaintenanceCompactionConfig::default()
+        })
+        .expect_err("manifest publish crash leaves compacted object");
+
+    let orphan_key = compacted_object_keys(&storage, &chain)
+        .into_iter()
+        .next()
+        .expect("orphan compacted object");
+    let reconciliation = storage
+        .reconcile_compaction_for_chain(&chain, MaintenanceCompactionConfig::default())
+        .expect("reconcile compaction");
+
+    assert_eq!(
+        reconciliation.orphan_compacted_objects,
+        vec![orphan_key.clone()]
+    );
+    assert_eq!(reconciliation.deleted_orphan_compacted_objects, 0);
+    assert!(
+        storage
+            .object_store()
+            .exists(&orphan_key)
+            .expect("orphan exists")
+    );
+}
+
+#[test]
 fn test_compaction_reconciliation_retries_stale_source_cleanup_after_restart() {
     let storage = LocalStorage::new(temp_storage_root("stale-source-cleanup-recovery"));
     let chain = test_chain();
@@ -957,6 +1015,7 @@ fn test_compaction_reconciliation_retries_stale_source_cleanup_after_restart() {
             max_tick_duration_ms: 30_000,
             max_candidates_per_tick: 8,
             max_manifest_entries_per_tick: 20_000,
+            cleanup_enabled: true,
             delete_source_objects: true,
             ..MaintenanceCompactionConfig::default()
         })
@@ -972,6 +1031,7 @@ fn test_compaction_reconciliation_retries_stale_source_cleanup_after_restart() {
         .reconcile_compaction_for_chain(
             &chain,
             MaintenanceCompactionConfig {
+                cleanup_enabled: true,
                 delete_source_objects: true,
                 ..MaintenanceCompactionConfig::default()
             },
@@ -1015,6 +1075,7 @@ fn test_compaction_reconciliation_never_deletes_current_manifest_objects() {
             max_tick_duration_ms: 30_000,
             max_candidates_per_tick: 8,
             max_manifest_entries_per_tick: 20_000,
+            cleanup_enabled: true,
             delete_source_objects: true,
             ..MaintenanceCompactionConfig::default()
         })
@@ -1028,6 +1089,7 @@ fn test_compaction_reconciliation_never_deletes_current_manifest_objects() {
         .reconcile_compaction_for_chain(
             &chain,
             MaintenanceCompactionConfig {
+                cleanup_enabled: true,
                 delete_source_objects: true,
                 ..MaintenanceCompactionConfig::default()
             },
@@ -1062,6 +1124,7 @@ fn test_compaction_tick_stops_after_candidate_budget_and_reports_partial() {
                 max_tick_duration_ms: 30_000,
                 max_candidates_per_tick: 1,
                 max_manifest_entries_per_tick: 20_000,
+                cleanup_enabled: false,
                 delete_source_objects: false,
                 ..MaintenanceCompactionConfig::default()
             },
@@ -1243,6 +1306,7 @@ fn test_compaction_tick_does_not_reload_manifest_per_candidate() {
                 max_candidates_per_tick: 8,
                 max_concurrent_candidates: 8,
                 max_manifest_entries_per_tick: 20_000,
+                cleanup_enabled: false,
                 delete_source_objects: false,
                 ..MaintenanceCompactionConfig::default()
             },
@@ -1282,6 +1346,7 @@ fn test_compaction_tick_scans_one_manifest_segment_prefix_per_tick() {
                 max_tick_duration_ms: 30_000,
                 max_candidates_per_tick: 8,
                 max_manifest_entries_per_tick: 20_000,
+                cleanup_enabled: false,
                 delete_source_objects: false,
                 ..MaintenanceCompactionConfig::default()
             },
@@ -1308,6 +1373,7 @@ fn test_compaction_cursor_resumes_and_loss_recovers_without_affecting_reads() {
         max_tick_duration_ms: 30_000,
         max_candidates_per_tick: 8,
         max_manifest_entries_per_tick: 2,
+        cleanup_enabled: false,
         delete_source_objects: false,
         ..MaintenanceCompactionConfig::default()
     };
@@ -1382,6 +1448,7 @@ fn test_compaction_legacy_full_manifest_partial_tick_persists_offset_cursor() {
         max_tick_duration_ms: 30_000,
         max_candidates_per_tick: 8,
         max_manifest_entries_per_tick: 1,
+        cleanup_enabled: false,
         delete_source_objects: false,
         ..MaintenanceCompactionConfig::default()
     };
@@ -1448,6 +1515,7 @@ fn test_compaction_legacy_cursor_continues_after_partial_tick_writes_segment() {
         max_tick_duration_ms: 30_000,
         max_candidates_per_tick: 8,
         max_manifest_entries_per_tick: 2,
+        cleanup_enabled: false,
         delete_source_objects: false,
         ..MaintenanceCompactionConfig::default()
     };
@@ -1523,6 +1591,7 @@ fn test_compaction_legacy_cursor_survives_candidate_budget_partial() {
         max_tick_duration_ms: 30_000,
         max_candidates_per_tick: 1,
         max_manifest_entries_per_tick: 4,
+        cleanup_enabled: false,
         delete_source_objects: false,
         ..MaintenanceCompactionConfig::default()
     };
@@ -1621,6 +1690,7 @@ fn test_compaction_ignores_segments_shadowed_by_full_manifest() {
                 max_tick_duration_ms: 30_000,
                 max_candidates_per_tick: 8,
                 max_manifest_entries_per_tick: 20_000,
+                cleanup_enabled: false,
                 delete_source_objects: false,
                 ..MaintenanceCompactionConfig::default()
             },

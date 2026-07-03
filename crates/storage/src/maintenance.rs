@@ -174,6 +174,7 @@ pub struct MaintenanceCompactionConfig {
     pub write_latency_pause_threshold_ms: u64,
     pub pressure_pause_ms: u64,
     pub pressure: MaintenanceCompactionPressure,
+    pub cleanup_enabled: bool,
     pub delete_source_objects: bool,
 }
 
@@ -193,6 +194,7 @@ impl Default for MaintenanceCompactionConfig {
             write_latency_pause_threshold_ms: 0,
             pressure_pause_ms: 60_000,
             pressure: MaintenanceCompactionPressure::default(),
+            cleanup_enabled: false,
             delete_source_objects: false,
         }
     }
@@ -450,29 +452,14 @@ where
             .stale_cleanup_records
             .retain(|object_key| object_key.starts_with(&chain_prefix));
 
-        for object_key in report.orphan_compacted_objects.clone() {
-            match self.object_store().delete(&object_key) {
-                Ok(()) => report.deleted_orphan_compacted_objects += 1,
-                Err(error) => {
-                    report.delete_failures += 1;
-                    log::warn!(
-                        "storage compaction reconciliation orphan delete failed chain_key={} object_key={} kind={:?} message={}",
-                        chain.key_prefix(),
-                        object_key,
-                        error.kind,
-                        error.message
-                    );
-                }
-            }
-        }
-        if config.delete_source_objects {
-            for object_key in report.stale_source_objects.clone() {
+        if config.cleanup_enabled {
+            for object_key in report.orphan_compacted_objects.clone() {
                 match self.object_store().delete(&object_key) {
-                    Ok(()) => report.deleted_stale_source_objects += 1,
+                    Ok(()) => report.deleted_orphan_compacted_objects += 1,
                     Err(error) => {
                         report.delete_failures += 1;
                         log::warn!(
-                            "storage compaction reconciliation source delete failed chain_key={} object_key={} kind={:?} message={}",
+                            "storage compaction reconciliation orphan delete failed chain_key={} object_key={} kind={:?} message={}",
                             chain.key_prefix(),
                             object_key,
                             error.kind,
@@ -481,19 +468,36 @@ where
                     }
                 }
             }
-        }
-        for object_key in report.stale_cleanup_records.clone() {
-            match self.object_store().delete(&object_key) {
-                Ok(()) => report.deleted_stale_cleanup_records += 1,
-                Err(error) => {
-                    report.delete_failures += 1;
-                    log::warn!(
-                        "storage compaction reconciliation cleanup record delete failed chain_key={} object_key={} kind={:?} message={}",
-                        chain.key_prefix(),
-                        object_key,
-                        error.kind,
-                        error.message
-                    );
+            if config.delete_source_objects {
+                for object_key in report.stale_source_objects.clone() {
+                    match self.object_store().delete(&object_key) {
+                        Ok(()) => report.deleted_stale_source_objects += 1,
+                        Err(error) => {
+                            report.delete_failures += 1;
+                            log::warn!(
+                                "storage compaction reconciliation source delete failed chain_key={} object_key={} kind={:?} message={}",
+                                chain.key_prefix(),
+                                object_key,
+                                error.kind,
+                                error.message
+                            );
+                        }
+                    }
+                }
+            }
+            for object_key in report.stale_cleanup_records.clone() {
+                match self.object_store().delete(&object_key) {
+                    Ok(()) => report.deleted_stale_cleanup_records += 1,
+                    Err(error) => {
+                        report.delete_failures += 1;
+                        log::warn!(
+                            "storage compaction reconciliation cleanup record delete failed chain_key={} object_key={} kind={:?} message={}",
+                            chain.key_prefix(),
+                            object_key,
+                            error.kind,
+                            error.message
+                        );
+                    }
                 }
             }
         }
@@ -616,7 +620,8 @@ where
                 candidate.chain.key_prefix(),
                 publish_started.elapsed().as_millis()
             );
-            if config.delete_source_objects
+            if config.cleanup_enabled
+                && config.delete_source_objects
                 && operation_budget.can_delete_sources(candidate.object_keys.len())
             {
                 let cleanup = self.delete_compacted_source_objects(candidate);

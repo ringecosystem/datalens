@@ -2718,6 +2718,10 @@ fn test_production_config_doctor_smoke_uses_nonsecret_environment() {
         .args(["doctor", "--config", "config/datalens.production.toml"])
         .current_dir(workspace_root())
         .env("DATALENS_ETHEREUM_RPC_URL", url)
+        .env(
+            "DATALENS_ETHEREUM_SECONDARY_RPC_URL",
+            "http://secondary.example.invalid",
+        )
         .env("DATALENS_S3_BUCKET", "datalens-production")
         .env("DATALENS_S3_PREFIX", "datalens")
         .env("DATALENS_S3_REGION", "auto")

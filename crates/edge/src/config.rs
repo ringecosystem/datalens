@@ -124,6 +124,8 @@ pub struct StorageCompactionConfig {
     #[serde(default = "default_storage_compaction_pressure_pause_ms")]
     pub pressure_pause_ms: u64,
     #[serde(default)]
+    pub cleanup_enabled: bool,
+    #[serde(default)]
     pub delete_source_objects: bool,
 }
 
@@ -149,6 +151,7 @@ impl Default for StorageCompactionConfig {
             write_latency_pause_threshold_ms:
                 default_storage_compaction_write_latency_pause_threshold_ms(),
             pressure_pause_ms: default_storage_compaction_pressure_pause_ms(),
+            cleanup_enabled: false,
             delete_source_objects: false,
         }
     }
@@ -477,7 +480,7 @@ fn default_storage_compaction_enabled() -> bool {
 }
 
 fn default_storage_compaction_interval_ms() -> u64 {
-    60_000
+    10_000
 }
 
 fn default_storage_compaction_min_object_bytes() -> u64 {
@@ -485,11 +488,11 @@ fn default_storage_compaction_min_object_bytes() -> u64 {
 }
 
 fn default_storage_compaction_max_merge_ranges() -> usize {
-    32
+    4
 }
 
 fn default_storage_compaction_max_tick_duration_ms() -> u64 {
-    30_000
+    2_000
 }
 
 fn default_storage_compaction_max_candidates_per_tick() -> usize {
@@ -501,7 +504,7 @@ fn default_storage_compaction_max_concurrent_candidates() -> usize {
 }
 
 fn default_storage_compaction_max_manifest_entries_per_tick() -> usize {
-    20_000
+    2_000
 }
 
 fn default_storage_compaction_max_gets_per_tick() -> usize {

@@ -165,28 +165,7 @@ pub(crate) fn start_storage_compaction_worker(
         return Ok(None);
     }
     let interval = Duration::from_millis(config.storage.compaction.interval_ms.max(1));
-    let compaction = MaintenanceCompactionConfig {
-        min_object_bytes: config.storage.compaction.min_object_bytes,
-        max_merge_ranges: config.storage.compaction.max_merge_ranges.max(2),
-        max_tick_duration_ms: config.storage.compaction.max_tick_duration_ms,
-        max_candidates_per_tick: config.storage.compaction.max_candidates_per_tick,
-        max_concurrent_candidates: config.storage.compaction.max_concurrent_candidates,
-        max_manifest_entries_per_tick: config.storage.compaction.max_manifest_entries_per_tick,
-        max_gets_per_tick: config.storage.compaction.max_gets_per_tick,
-        max_puts_per_tick: config.storage.compaction.max_puts_per_tick,
-        max_deletes_per_tick: config.storage.compaction.max_deletes_per_tick,
-        query_latency_pause_threshold_ms: config
-            .storage
-            .compaction
-            .query_latency_pause_threshold_ms,
-        write_latency_pause_threshold_ms: config
-            .storage
-            .compaction
-            .write_latency_pause_threshold_ms,
-        pressure_pause_ms: config.storage.compaction.pressure_pause_ms,
-        delete_source_objects: config.storage.compaction.delete_source_objects,
-        ..MaintenanceCompactionConfig::default()
-    };
+    let compaction = maintenance_compaction_config(config.storage.compaction);
     let object_store_error_pause =
         Duration::from_millis(config.storage.compaction.object_store_error_pause_ms);
     let storage = match config.storage.backend.as_str() {
@@ -259,13 +238,14 @@ impl StorageCompactionWorker {
             .name("datalens-storage-compaction".to_owned())
             .spawn(move || {
                 log::info!(
-                    "storage compaction worker started interval_ms={} min_object_bytes={} max_merge_ranges={} max_tick_duration_ms={} max_candidates_per_tick={} max_manifest_entries_per_tick={} delete_source_objects={} chain_count={}",
+                    "storage compaction worker started interval_ms={} min_object_bytes={} max_merge_ranges={} max_tick_duration_ms={} max_candidates_per_tick={} max_manifest_entries_per_tick={} cleanup_enabled={} delete_source_objects={} chain_count={}",
                     interval.as_millis(),
                     config.min_object_bytes,
                     config.max_merge_ranges,
                     config.max_tick_duration_ms,
                     config.max_candidates_per_tick,
                     config.max_manifest_entries_per_tick,
+                    config.cleanup_enabled,
                     config.delete_source_objects,
                     chains.len()
                 );
@@ -488,6 +468,28 @@ fn is_object_store_backpressure_error(error: &DatalensError) -> bool {
         || message.contains("502")
         || message.contains("503")
         || message.contains("504")
+}
+
+fn maintenance_compaction_config(
+    config: datalens_edge::config::StorageCompactionConfig,
+) -> MaintenanceCompactionConfig {
+    MaintenanceCompactionConfig {
+        min_object_bytes: config.min_object_bytes,
+        max_merge_ranges: config.max_merge_ranges.max(2),
+        max_tick_duration_ms: config.max_tick_duration_ms,
+        max_candidates_per_tick: config.max_candidates_per_tick,
+        max_concurrent_candidates: config.max_concurrent_candidates,
+        max_manifest_entries_per_tick: config.max_manifest_entries_per_tick,
+        max_gets_per_tick: config.max_gets_per_tick,
+        max_puts_per_tick: config.max_puts_per_tick,
+        max_deletes_per_tick: config.max_deletes_per_tick,
+        query_latency_pause_threshold_ms: config.query_latency_pause_threshold_ms,
+        write_latency_pause_threshold_ms: config.write_latency_pause_threshold_ms,
+        pressure_pause_ms: config.pressure_pause_ms,
+        cleanup_enabled: config.cleanup_enabled,
+        delete_source_objects: config.delete_source_objects,
+        ..MaintenanceCompactionConfig::default()
+    }
 }
 
 fn build_evm_service_with_storage(
@@ -1305,11 +1307,92 @@ pub(crate) fn finality_summary(chain: &ChainConfig) -> serde_json::Value {
 mod tests {
     use datalens_chain::{AdapterKey, DatasetSelector};
     use datalens_core::{ChainFamily, ChainIdentity, DatasetKey, LedgerRangeKind, NetworkId};
+    use datalens_edge::config::StorageCompactionConfig;
     use datalens_warmup::{
         WarmupChunkPolicy, WarmupRetryPolicy, WarmupSubmitRequest, WarmupTaskMode,
     };
 
     use super::*;
+
+    #[test]
+    fn storage_compaction_cleanup_flag_gates_source_cleanup() {
+        let config = StorageCompactionConfig {
+            enabled: true,
+            interval_ms: 10_000,
+            min_object_bytes: 1_048_576,
+            max_merge_ranges: 4,
+            max_tick_duration_ms: 2_000,
+            max_candidates_per_tick: 1,
+            max_concurrent_candidates: 1,
+            max_manifest_entries_per_tick: 2_000,
+            max_gets_per_tick: 64,
+            max_puts_per_tick: 8,
+            max_deletes_per_tick: 64,
+            object_store_error_pause_ms: 60_000,
+            query_latency_pause_threshold_ms: 0,
+            write_latency_pause_threshold_ms: 0,
+            pressure_pause_ms: 60_000,
+            cleanup_enabled: false,
+            delete_source_objects: true,
+        };
+
+        let compaction = maintenance_compaction_config(config);
+
+        assert!(!compaction.cleanup_enabled);
+        assert!(compaction.delete_source_objects);
+        assert_eq!(compaction.max_candidates_per_tick, 1);
+        assert_eq!(compaction.max_tick_duration_ms, 2_000);
+    }
+
+    #[test]
+    fn storage_compaction_cleanup_flag_preserves_source_cleanup_intent() {
+        let config = StorageCompactionConfig {
+            enabled: true,
+            interval_ms: 10_000,
+            min_object_bytes: 1_048_576,
+            max_merge_ranges: 4,
+            max_tick_duration_ms: 2_000,
+            max_candidates_per_tick: 1,
+            max_concurrent_candidates: 1,
+            max_manifest_entries_per_tick: 2_000,
+            max_gets_per_tick: 64,
+            max_puts_per_tick: 8,
+            max_deletes_per_tick: 64,
+            object_store_error_pause_ms: 60_000,
+            query_latency_pause_threshold_ms: 0,
+            write_latency_pause_threshold_ms: 0,
+            pressure_pause_ms: 60_000,
+            cleanup_enabled: true,
+            delete_source_objects: true,
+        };
+
+        let compaction = maintenance_compaction_config(config);
+
+        assert!(compaction.cleanup_enabled);
+        assert!(compaction.delete_source_objects);
+    }
+
+    #[test]
+    fn storage_compaction_sleep_backs_off_and_caps_at_sixteen_intervals() {
+        let interval = Duration::from_secs(10);
+
+        assert_eq!(
+            compaction_sleep_duration(interval, 0),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            compaction_sleep_duration(interval, 1),
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            compaction_sleep_duration(interval, 4),
+            Duration::from_secs(160)
+        );
+        assert_eq!(
+            compaction_sleep_duration(interval, 7),
+            Duration::from_secs(160)
+        );
+    }
 
     #[test]
     fn test_tron_service_registers_warmup_pool_when_enabled() {
