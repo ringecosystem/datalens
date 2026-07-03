@@ -64,6 +64,33 @@ datalens doctor --config config/datalens.production.toml
 Expected output: JSON with `"status": "ok"`, redacted RPC URLs, configured storage and
 runtime settings, and detected safe/finalized height for every configured chain.
 
+## Compaction Rollout Gate
+
+`config/datalens.production.toml` is the GitOps-facing production parameter source for
+background compaction. Keep the first production rollout conservative:
+
+- `storage.compaction.enabled = true` starts the controller.
+- `storage.compaction.cleanup_enabled = false` keeps deletion cleanup off during the
+  first rollout.
+- `storage.compaction.delete_source_objects = false` preserves source objects even
+  after a compacted replacement is published.
+- `storage.compaction.max_candidates_per_tick = 1`,
+  `storage.compaction.max_tick_duration_ms = 2000`, and
+  `storage.compaction.max_merge_ranges = 4` keep each tick small.
+- `query.metadata.worker_threads = 2`, `query.metadata.queue_capacity = 1024`, and
+  `query.metadata.coalesced_capacity = 256` keep query metadata work bounded so
+  backpressure applies before background work can grow unbounded.
+
+Before enabling cleanup, record the baseline and the post-change values for query latency,
+write latency, object store timeout/5xx rate, and RustFS CPU. Treat sustained regression
+in any of those signals as a rollout stop.
+
+Automatic retreat is built into the compaction worker: failed ticks back off from one
+interval to two, four, eight, then sixteen intervals before retrying. For an immediate
+manual rollback, set `storage.compaction.enabled = false` to stop the controller. To keep
+compaction running but stop deletion cleanup, set `storage.compaction.cleanup_enabled = false`
+and `storage.compaction.delete_source_objects = false`.
+
 ## Local Development Profile
 
 ```bash

@@ -25,6 +25,32 @@ fn test_config_production_ethereum_rpc_pool_and_log_reliability() {
 }
 
 #[test]
+fn test_config_production_compaction_uses_conservative_rollout_defaults() {
+    set_production_config_env();
+
+    let config_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../config/datalens.production.toml")
+        .canonicalize()
+        .expect("production config path");
+    let config = DatalensConfig::from_file(&config_path).expect("production config should parse");
+
+    assert!(config.storage.compaction.enabled);
+    assert!(!config.storage.compaction.cleanup_enabled);
+    assert!(!config.storage.compaction.delete_source_objects);
+    assert_eq!(config.storage.compaction.interval_ms, 10_000);
+    assert_eq!(config.storage.compaction.max_tick_duration_ms, 2_000);
+    assert_eq!(config.storage.compaction.max_candidates_per_tick, 1);
+    assert_eq!(
+        config.storage.compaction.max_manifest_entries_per_tick,
+        2_000
+    );
+    assert_eq!(config.storage.compaction.max_merge_ranges, 4);
+    assert_eq!(config.query.metadata.worker_threads, 2);
+    assert_eq!(config.query.metadata.queue_capacity, 1024);
+    assert_eq!(config.query.metadata.coalesced_capacity, 256);
+}
+
+#[test]
 fn test_config_query_native_namespace_controls_native_graphql_settings() {
     let config: DatalensConfig =
         toml::from_str(&config_text("[query.native]")).expect("query native config should parse");
@@ -145,6 +171,24 @@ fn test_config_storage_compaction_accepts_source_object_cleanup() {
     );
     let config: DatalensConfig = toml::from_str(&input).expect("config should parse");
 
+    assert!(config.storage.compaction.delete_source_objects);
+}
+
+#[test]
+fn test_config_storage_compaction_accepts_cleanup_feature_flag() {
+    let input = config_text("[query.native]").replace(
+        r#"
+        [planner]"#,
+        r#"
+        [storage.compaction]
+        cleanup_enabled = true
+        delete_source_objects = true
+
+        [planner]"#,
+    );
+    let config: DatalensConfig = toml::from_str(&input).expect("config should parse");
+
+    assert!(config.storage.compaction.cleanup_enabled);
     assert!(config.storage.compaction.delete_source_objects);
 }
 
