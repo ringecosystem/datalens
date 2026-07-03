@@ -344,6 +344,39 @@ fn replacement_published_entries(
     Ok(entries)
 }
 
+pub(crate) fn read_entries_for_replacement_scope<S>(
+    object_store: &S,
+    entry: &ManifestEntry,
+) -> Result<Vec<ManifestEntry>, DatalensError>
+where
+    S: ObjectStore,
+{
+    let mut entries = Vec::new();
+    for (bucket_start, bucket_end) in
+        bucket_ranges(&entry.range, DEFAULT_COVERAGE_INDEX_BUCKET_SIZE)
+    {
+        let key = coverage_index_key(
+            &entry.chain,
+            &entry.dataset_key,
+            &entry.range,
+            &entry.selector_fingerprint,
+            entry.finality_level,
+            bucket_start,
+            bucket_end,
+        );
+        let lock = coverage_index_update_lock(object_store, &key)?;
+        let _guard = lock_coverage_index_update(&lock)?;
+        let index = read_index(object_store, &key)?;
+        entries.extend(index.entries.into_iter().filter(|existing_entry| {
+            replacement_scope_matches(existing_entry, entry)
+                && existing_entry.range.intersection(&entry.range).is_some()
+        }));
+    }
+    let mut manifest = Manifest { entries };
+    manifest.normalize();
+    Ok(manifest.entries)
+}
+
 pub(crate) fn publish_replacement<S>(
     object_store: &S,
     entry: &ManifestEntry,

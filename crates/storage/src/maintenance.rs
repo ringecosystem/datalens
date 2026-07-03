@@ -348,6 +348,14 @@ where
                 .map(|entry| entry.entry.clone())
                 .collect::<Vec<_>>();
             let compacted = self.write_compacted_object(candidate, &candidate_entries)?;
+            let publish_started = Instant::now();
+            if !self.try_write_compaction_manifest_entry(
+                &candidate.chain,
+                compacted.entry,
+                &candidate_entries,
+            )? {
+                continue;
+            }
             compacted_rows += compacted.row_count;
             compacted_objects += 1;
             processed_candidates += 1;
@@ -356,8 +364,6 @@ where
                 .filter_map(|entry| entry.segment_key.clone())
                 .max()
                 .or(cursor_advance_key);
-            let publish_started = Instant::now();
-            self.write_manifest_entry(&candidate.chain, compacted.entry)?;
             log::info!(
                 "storage compaction manifest publish chain_key={} duration_ms={}",
                 candidate.chain.key_prefix(),
