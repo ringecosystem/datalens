@@ -1284,7 +1284,7 @@ mod tests {
             warmup_root.display(),
         ))
         .expect("config parses");
-        let registry = build_service_registry(&config).expect("service registry builds");
+        let registry = build_warmup_registry(&config).expect("service registry builds");
         let chain = ChainIdentity::try_new(
             ChainFamily::try_other("tron").expect("family"),
             "tron-mainnet",
@@ -1313,7 +1313,7 @@ mod tests {
         };
 
         let outcome = registry
-            .ensure_warmup_task(request)
+            .ensure(request)
             .expect("Tron warmup service is registered");
 
         assert!(outcome.created);
