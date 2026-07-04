@@ -464,13 +464,22 @@ where
                 entry,
             })
             .collect::<Vec<_>>();
-        self.compact_selected_manifest_entries(entries, config, started, None, false)
+        self.compact_selected_manifest_entries(entries, config, started, None, false, &|| Ok(()))
     }
 
     pub fn compact_small_objects_for_chain(
         &self,
         chain: &ChainIdentity,
         config: MaintenanceCompactionConfig,
+    ) -> Result<MaintenanceCompactionReport, DatalensError> {
+        self.compact_small_objects_for_chain_with_checkpoint(chain, config, || Ok(()))
+    }
+
+    pub fn compact_small_objects_for_chain_with_checkpoint(
+        &self,
+        chain: &ChainIdentity,
+        config: MaintenanceCompactionConfig,
+        checkpoint: impl Fn() -> Result<(), DatalensError>,
     ) -> Result<MaintenanceCompactionReport, DatalensError> {
         let started = Instant::now();
         log::info!(
@@ -487,6 +496,7 @@ where
             started,
             Some(scan.cursor_update),
             scan.partial,
+            &checkpoint,
         )?;
         Ok(report)
     }
@@ -495,6 +505,15 @@ where
         &self,
         chain: &ChainIdentity,
         config: MaintenanceCompactionConfig,
+    ) -> Result<MaintenanceCompactionReconciliationReport, DatalensError> {
+        self.reconcile_compaction_for_chain_with_checkpoint(chain, config, || Ok(()))
+    }
+
+    pub fn reconcile_compaction_for_chain_with_checkpoint(
+        &self,
+        chain: &ChainIdentity,
+        config: MaintenanceCompactionConfig,
+        checkpoint: impl Fn() -> Result<(), DatalensError>,
     ) -> Result<MaintenanceCompactionReconciliationReport, DatalensError> {
         let current_entries = self.manifest_for_chain(chain)?.entries;
         let raw_entries = self.raw_manifest_entries_for_chain(chain)?;
@@ -513,6 +532,7 @@ where
 
         if config.cleanup_enabled {
             for object_key in report.orphan_compacted_objects.clone() {
+                checkpoint()?;
                 match self.object_store().delete(&object_key) {
                     Ok(()) => report.deleted_orphan_compacted_objects += 1,
                     Err(error) => {
@@ -534,6 +554,7 @@ where
                     .into_iter()
                     .take(config.max_deletes_per_tick)
                 {
+                    checkpoint()?;
                     match self.object_store().delete(&record.object_key) {
                         Ok(()) => report.deleted_stale_source_objects += 1,
                         Err(error) => {
@@ -548,6 +569,7 @@ where
                             continue;
                         }
                     }
+                    checkpoint()?;
                     match self.object_store().delete(&record_key) {
                         Ok(()) => report.deleted_stale_cleanup_records += 1,
                         Err(error) => {
@@ -565,6 +587,7 @@ where
                 }
             }
             for object_key in report.stale_cleanup_records.clone() {
+                checkpoint()?;
                 match self.object_store().delete(&object_key) {
                     Ok(()) => report.deleted_stale_cleanup_records += 1,
                     Err(error) => {
@@ -590,6 +613,7 @@ where
         started: Instant,
         cursor: Option<CompactionCursorUpdate>,
         scan_partial: bool,
+        checkpoint: &dyn Fn() -> Result<(), DatalensError>,
     ) -> Result<MaintenanceCompactionReport, DatalensError> {
         let build_started = Instant::now();
         let manifest_entries = entries
@@ -677,14 +701,17 @@ where
                 .iter()
                 .map(|entry| entry.entry.clone())
                 .collect::<Vec<_>>();
+            checkpoint()?;
             let compacted = self.write_compacted_object(candidate, &candidate_entries)?;
             operation_budget.record_gets(candidate_entries.len());
             operation_budget.record_puts(1);
             let publish_started = Instant::now();
+            checkpoint()?;
             if !self.try_write_compaction_manifest_entry(
                 &candidate.chain,
                 compacted.entry,
                 &candidate_entries,
+                checkpoint,
             )? {
                 continue;
             }
@@ -710,6 +737,7 @@ where
                 publish_started.elapsed().as_millis()
             );
             if config.delete_source_objects {
+                checkpoint()?;
                 self.record_superseded_compaction_sources(candidate, config)?;
             }
             if config.cleanup_enabled {
@@ -719,6 +747,7 @@ where
                     .filter(|key| key.contains("/metadata/compaction-queue/"))
                     .collect::<BTreeSet<_>>();
                 if operation_budget.remaining_deletes() >= queue_entry_keys.len() {
+                    checkpoint()?;
                     let cleanup = self.delete_compaction_queue_entries(
                         &candidate.chain,
                         queue_entry_keys.into_iter(),

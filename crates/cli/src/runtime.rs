@@ -1,6 +1,6 @@
 use std::{
     sync::{
-        Arc, Once,
+        Arc, Mutex, Once,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -239,7 +239,19 @@ enum CompactionStorage {
 
 struct CompactionLeaderLock {
     storage: CompactionStorage,
-    lease: Option<ObjectLockLease>,
+    lease: Arc<Mutex<Option<ObjectLockLease>>>,
+    renewal: Option<CompactionLeaderLockRenewal>,
+}
+
+#[derive(Clone)]
+struct CompactionLeaderLockCheckpoint {
+    failure: Arc<Mutex<Option<DatalensError>>>,
+}
+
+struct CompactionLeaderLockRenewal {
+    stop: Arc<AtomicBool>,
+    failure: Arc<Mutex<Option<DatalensError>>>,
+    handle: Option<thread::JoinHandle<()>>,
 }
 
 impl CompactionStorage {
@@ -263,16 +275,26 @@ impl CompactionStorage {
                 .object_store()
                 .try_acquire_lock_with_ttl(&key, &owner, ttl)?,
         };
-        Ok(lease.map(|lease| CompactionLeaderLock {
-            storage: self.clone(),
-            lease: Some(lease),
-        }))
+        lease
+            .map(|lease| CompactionLeaderLock::new(self.clone(), lease, ttl))
+            .transpose()
     }
 
     fn release_compaction_leader_lock(&self, lease: ObjectLockLease) -> Result<(), DatalensError> {
         match self {
             CompactionStorage::Local(storage) => storage.object_store().release_lock(lease),
             CompactionStorage::S3(storage) => storage.object_store().release_lock(lease),
+        }
+    }
+
+    fn renew_compaction_leader_lock(
+        &self,
+        lease: &mut ObjectLockLease,
+        ttl: Duration,
+    ) -> Result<bool, DatalensError> {
+        match self {
+            CompactionStorage::Local(storage) => storage.object_store().renew_lock(lease, ttl),
+            CompactionStorage::S3(storage) => storage.object_store().renew_lock(lease, ttl),
         }
     }
 
@@ -284,9 +306,179 @@ impl CompactionStorage {
     }
 }
 
+impl CompactionLeaderLock {
+    fn new(
+        storage: CompactionStorage,
+        lease: ObjectLockLease,
+        ttl: Duration,
+    ) -> Result<Self, DatalensError> {
+        let release_lease = lease.clone();
+        let lease = Arc::new(Mutex::new(Some(lease)));
+        let failure = Arc::new(Mutex::new(None));
+        let renewal = match CompactionLeaderLockRenewal::start(
+            storage.clone(),
+            lease.clone(),
+            ttl,
+            failure.clone(),
+        ) {
+            Ok(renewal) => renewal,
+            Err(error) => {
+                if let Err(release_error) = storage.release_compaction_leader_lock(release_lease) {
+                    log::warn!(
+                        "storage compaction leader lock release after renewal start failure failed kind={:?} message={}",
+                        release_error.kind,
+                        release_error.message
+                    );
+                }
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            storage,
+            lease,
+            renewal: Some(renewal),
+        })
+    }
+
+    fn checkpoint(&self) -> CompactionLeaderLockCheckpoint {
+        self.renewal
+            .as_ref()
+            .map(|renewal| renewal.checkpoint())
+            .unwrap_or_else(|| CompactionLeaderLockCheckpoint {
+                failure: Arc::new(Mutex::new(Some(DatalensError::new(
+                    DatalensErrorKind::StorageWriteFailure,
+                    "storage compaction leader lock renewal stopped",
+                )))),
+            })
+    }
+}
+
+impl CompactionLeaderLockCheckpoint {
+    fn check(&self) -> Result<(), DatalensError> {
+        let failure = self
+            .failure
+            .lock()
+            .map_err(|_| DatalensError::internal("compaction leader lock renewal state poisoned"))?
+            .clone();
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
+impl CompactionLeaderLockRenewal {
+    fn start(
+        storage: CompactionStorage,
+        lease: Arc<Mutex<Option<ObjectLockLease>>>,
+        ttl: Duration,
+        failure: Arc<Mutex<Option<DatalensError>>>,
+    ) -> Result<Self, DatalensError> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let worker_failure = failure.clone();
+        let interval = compaction_lock_renew_interval(ttl);
+        let handle = thread::Builder::new()
+            .name("datalens-storage-compaction-lock-renewal".to_owned())
+            .spawn(move || {
+                while !worker_stop.load(Ordering::Relaxed) {
+                    thread::park_timeout(interval);
+                    if worker_stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let renewed = {
+                        let mut lease = match lease.lock() {
+                            Ok(lease) => lease,
+                            Err(_) => {
+                                set_compaction_lock_renewal_failure(
+                                    &worker_failure,
+                                    DatalensError::internal(
+                                        "compaction leader lock lease state poisoned",
+                                    ),
+                                );
+                                break;
+                            }
+                        };
+                        let Some(lease) = lease.as_mut() else {
+                            break;
+                        };
+                        storage.renew_compaction_leader_lock(lease, ttl)
+                    };
+                    match renewed {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            let error = DatalensError::new(
+                                DatalensErrorKind::StorageWriteFailure,
+                                "storage compaction leader lock renewal lost ownership",
+                            );
+                            log::warn!(
+                                "storage compaction leader lock renewal lost ownership"
+                            );
+                            set_compaction_lock_renewal_failure(&worker_failure, error);
+                            break;
+                        }
+                        Err(error) => {
+                            let renewal_error = DatalensError::new(
+                                error.kind.clone(),
+                                format!(
+                                    "storage compaction leader lock renewal failed: {}",
+                                    error.message
+                                ),
+                            );
+                            log::warn!(
+                                "storage compaction leader lock renewal failed kind={:?} message={}",
+                                error.kind,
+                                error.message
+                            );
+                            set_compaction_lock_renewal_failure(&worker_failure, renewal_error);
+                            break;
+                        }
+                    }
+                }
+            })
+            .map_err(|error| {
+                DatalensError::new(
+                    DatalensErrorKind::Internal,
+                    format!("start storage compaction leader lock renewal: {error}"),
+                )
+            })?;
+        Ok(Self {
+            stop,
+            failure,
+            handle: Some(handle),
+        })
+    }
+
+    fn checkpoint(&self) -> CompactionLeaderLockCheckpoint {
+        CompactionLeaderLockCheckpoint {
+            failure: self.failure(),
+        }
+    }
+
+    fn failure(&self) -> Arc<Mutex<Option<DatalensError>>> {
+        self.failure.clone()
+    }
+}
+
+fn set_compaction_lock_renewal_failure(
+    failure: &Arc<Mutex<Option<DatalensError>>>,
+    error: DatalensError,
+) {
+    if let Ok(mut failure) = failure.lock()
+        && failure.is_none()
+    {
+        *failure = Some(error);
+    }
+}
+
 impl Drop for CompactionLeaderLock {
     fn drop(&mut self) {
-        let Some(lease) = self.lease.take() else {
+        drop(self.renewal.take());
+        let lease = match self.lease.lock() {
+            Ok(mut lease) => lease.take(),
+            Err(_) => None,
+        };
+        let Some(lease) = lease else {
             return;
         };
         if let Err(error) = self.storage.release_compaction_leader_lock(lease) {
@@ -295,6 +487,18 @@ impl Drop for CompactionLeaderLock {
                 error.kind,
                 error.message
             );
+        }
+    }
+}
+
+impl Drop for CompactionLeaderLockRenewal {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            handle.thread().unpark();
+            if let Err(error) = handle.join() {
+                log::warn!("storage compaction leader lock renewal join failed error={error:?}");
+            }
         }
     }
 }
@@ -385,13 +589,22 @@ impl StorageCompactionWorker {
                                 continue;
                             }
                         };
+                    let leader_checkpoint = leader_lock.checkpoint();
                     let reconciliation = match &storage {
-                        CompactionStorage::Local(storage) => {
-                            storage.reconcile_compaction_for_chain(&chain, tick_config)
-                        }
-                        CompactionStorage::S3(storage) => {
-                            storage.reconcile_compaction_for_chain(&chain, tick_config)
-                        }
+                        CompactionStorage::Local(storage) => leader_checkpoint.check().and_then(|()| {
+                            storage.reconcile_compaction_for_chain_with_checkpoint(
+                                &chain,
+                                tick_config,
+                                || leader_checkpoint.check(),
+                            )
+                        }),
+                        CompactionStorage::S3(storage) => leader_checkpoint.check().and_then(|()| {
+                            storage.reconcile_compaction_for_chain_with_checkpoint(
+                                &chain,
+                                tick_config,
+                                || leader_checkpoint.check(),
+                            )
+                        }),
                     };
                     let result = reconciliation.and_then(|reconciliation| {
                         log::info!(
@@ -406,12 +619,20 @@ impl StorageCompactionWorker {
                             reconciliation.delete_failures
                         );
                         match &storage {
-                            CompactionStorage::Local(storage) => {
-                                storage.compact_small_objects_for_chain(&chain, tick_config)
-                            }
-                            CompactionStorage::S3(storage) => {
-                                storage.compact_small_objects_for_chain(&chain, tick_config)
-                            }
+                            CompactionStorage::Local(storage) => leader_checkpoint.check().and_then(|()| {
+                                storage.compact_small_objects_for_chain_with_checkpoint(
+                                    &chain,
+                                    tick_config,
+                                    || leader_checkpoint.check(),
+                                )
+                            }),
+                            CompactionStorage::S3(storage) => leader_checkpoint.check().and_then(|()| {
+                                storage.compact_small_objects_for_chain_with_checkpoint(
+                                    &chain,
+                                    tick_config,
+                                    || leader_checkpoint.check(),
+                                )
+                            }),
                         }
                     });
                     drop(leader_lock);
@@ -443,10 +664,16 @@ impl StorageCompactionWorker {
                             if backpressure_error && !object_store_error_pause.is_zero() {
                                 pause_until = Some(Instant::now() + object_store_error_pause);
                             }
+                            let leader_lock_error =
+                                is_compaction_leader_lock_renewal_error(&error);
                             record_compaction_failure_metrics(
                                 &metrics_recorders,
                                 &chain,
-                                backpressure_error.then_some("object_store_error"),
+                                if leader_lock_error {
+                                    Some("leader_lock_error")
+                                } else {
+                                    backpressure_error.then_some("object_store_error")
+                                },
                                 started.elapsed(),
                             );
                             log::warn!(
@@ -502,6 +729,11 @@ fn configured_compaction_chains(
 fn compaction_sleep_duration(interval: Duration, consecutive_failures: u32) -> Duration {
     let multiplier = 1_u32 << consecutive_failures.min(4);
     interval.saturating_mul(multiplier)
+}
+
+fn compaction_lock_renew_interval(ttl: Duration) -> Duration {
+    let renew_ms = (ttl.as_millis() / 3).max(1).min(u64::MAX as u128) as u64;
+    Duration::from_millis(renew_ms)
 }
 
 fn compaction_leader_lock_key(chain: &ChainIdentity) -> String {
@@ -589,6 +821,12 @@ fn is_object_store_backpressure_error(error: &DatalensError) -> bool {
         || message.contains("502")
         || message.contains("503")
         || message.contains("504")
+}
+
+fn is_compaction_leader_lock_renewal_error(error: &DatalensError) -> bool {
+    error
+        .message
+        .contains("storage compaction leader lock renewal")
 }
 
 fn maintenance_compaction_config(
@@ -1220,6 +1458,54 @@ impl ObjectStore for WarmupRegistryObjectStore {
             Self::S3(store) => store.delete(key),
         }
     }
+
+    fn try_acquire_lock(
+        &self,
+        key: &str,
+        owner: &[u8],
+    ) -> Result<Option<ObjectLockLease>, DatalensError> {
+        match self {
+            Self::Local(store) => store.try_acquire_lock(key, owner),
+            Self::S3(store) => store.try_acquire_lock(key, owner),
+        }
+    }
+
+    fn release_lock(&self, lease: ObjectLockLease) -> Result<(), DatalensError> {
+        match self {
+            Self::Local(store) => store.release_lock(lease),
+            Self::S3(store) => store.release_lock(lease),
+        }
+    }
+
+    fn renew_lock(
+        &self,
+        lease: &mut ObjectLockLease,
+        ttl: Duration,
+    ) -> Result<bool, DatalensError> {
+        match self {
+            Self::Local(store) => store.renew_lock(lease, ttl),
+            Self::S3(store) => store.renew_lock(lease, ttl),
+        }
+    }
+
+    fn try_acquire_lock_with_ttl(
+        &self,
+        key: &str,
+        owner: &[u8],
+        ttl: Duration,
+    ) -> Result<Option<ObjectLockLease>, DatalensError> {
+        match self {
+            Self::Local(store) => store.try_acquire_lock_with_ttl(key, owner, ttl),
+            Self::S3(store) => store.try_acquire_lock_with_ttl(key, owner, ttl),
+        }
+    }
+
+    fn lock_namespace(&self) -> String {
+        match self {
+            Self::Local(store) => store.lock_namespace(),
+            Self::S3(store) => store.lock_namespace(),
+        }
+    }
 }
 
 fn build_warmup_registry(
@@ -1538,6 +1824,69 @@ mod tests {
             compaction_sleep_duration(interval, 7),
             Duration::from_secs(160)
         );
+    }
+
+    #[test]
+    fn storage_compaction_lock_renew_interval_uses_nonzero_third_of_ttl() {
+        assert_eq!(
+            compaction_lock_renew_interval(Duration::from_millis(2)),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            compaction_lock_renew_interval(Duration::from_millis(90)),
+            Duration::from_millis(30)
+        );
+    }
+
+    #[test]
+    fn storage_compaction_leader_lock_checkpoint_fails_after_renewal_loss() {
+        let root = std::env::temp_dir().join(format!(
+            "datalens-compaction-lock-renewal-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        let storage = CompactionStorage::Local(LocalStorage::new(&root));
+        let chain = ChainIdentity::try_new(
+            ChainFamily::try_other("evm").expect("family"),
+            "ethereum",
+            Some(NetworkId::numeric(1)),
+        )
+        .expect("chain identity");
+        let lock = storage
+            .try_acquire_compaction_leader_lock(&chain, Duration::from_millis(30))
+            .expect("acquire lock")
+            .expect("leader lock");
+        let checkpoint = lock.checkpoint();
+        let key = compaction_leader_lock_key(&chain);
+        if let CompactionStorage::Local(storage) = &storage {
+            storage
+                .object_store()
+                .put(
+                    &key,
+                    br#"{"owner_id":"replacement","acquired_at_unix_seconds":9999999999}"#,
+                )
+                .expect("replace lock owner");
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while checkpoint.check().is_ok() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let error = checkpoint
+            .check()
+            .expect_err("checkpoint reports renewal loss");
+        assert_eq!(error.kind, DatalensErrorKind::StorageWriteFailure);
+        drop(lock);
+        if let CompactionStorage::Local(storage) = &storage {
+            assert_eq!(
+                storage.object_store().get(&key).expect("replacement lock"),
+                br#"{"owner_id":"replacement","acquired_at_unix_seconds":9999999999}"#
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

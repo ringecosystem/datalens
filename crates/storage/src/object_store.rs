@@ -4,7 +4,7 @@ use std::{
     future::Future,
     io::Write,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, Mutex, OnceLock, mpsc},
     time::{Duration, Instant},
 };
 
@@ -72,24 +72,34 @@ pub trait ObjectStore: Clone + Send + Sync {
         key: &str,
         owner: &[u8],
     ) -> Result<Option<ObjectLockLease>, DatalensError> {
-        if self.exists(key)? {
-            return Ok(None);
+        match self.put_if_absent(key, owner)? {
+            ObjectPutIfAbsentResult::Created => Ok(Some(ObjectLockLease {
+                key: key.to_owned(),
+                owner: owner.to_vec(),
+            })),
+            ObjectPutIfAbsentResult::AlreadyExists => Ok(None),
         }
-        self.put(key, owner)?;
-        Ok(Some(ObjectLockLease {
-            key: key.to_owned(),
-            owner: owner.to_vec(),
-        }))
     }
 
     fn release_lock(&self, lease: ObjectLockLease) -> Result<(), DatalensError> {
-        if self
-            .get_optional(&lease.key)?
-            .is_some_and(|owner| owner != lease.owner)
-        {
-            return Ok(());
+        match self.get_optional(&lease.key)? {
+            Some(owner) if owner == lease.owner => Err(DatalensError::new(
+                DatalensErrorKind::StorageWriteFailure,
+                "lock release requires owner-conditional delete support",
+            )),
+            _ => Ok(()),
         }
-        self.delete(&lease.key)
+    }
+
+    fn renew_lock(
+        &self,
+        _lease: &mut ObjectLockLease,
+        _ttl: Duration,
+    ) -> Result<bool, DatalensError> {
+        Err(DatalensError::new(
+            DatalensErrorKind::StorageWriteFailure,
+            "lock renewal requires compare-and-swap support",
+        ))
     }
 
     fn try_acquire_lock_with_ttl(
@@ -110,16 +120,185 @@ pub trait ObjectStore: Clone + Send + Sync {
         let Ok(record) = serde_json::from_slice::<ObjectLockRecord>(&existing) else {
             return Ok(None);
         };
-        let now = unix_seconds_now_for_lock()?;
-        if now.saturating_sub(record.acquired_at_unix_seconds) < ttl.as_secs().max(1) {
+        if !object_lock_record_is_expired(&record, ttl)? {
             return Ok(None);
         }
-        self.delete(key)?;
-        self.try_acquire_lock(key, owner)
+        Err(DatalensError::new(
+            DatalensErrorKind::StorageWriteFailure,
+            "expired lock takeover requires owner-conditional delete support",
+        ))
     }
 
     fn lock_namespace(&self) -> String {
         std::any::type_name::<Self>().to_owned()
+    }
+}
+
+fn object_lock_record_is_expired(
+    record: &ObjectLockRecord,
+    ttl: Duration,
+) -> Result<bool, DatalensError> {
+    let now = unix_seconds_now_for_lock()?;
+    let expires_at = record.expires_at_unix_seconds.unwrap_or_else(|| {
+        record
+            .acquired_at_unix_seconds
+            .saturating_add(ttl.as_secs().max(1))
+    });
+    Ok(now >= expires_at)
+}
+
+fn unsupported_lock_cas(operation: &str, key: &str) -> DatalensError {
+    DatalensError::new(
+        DatalensErrorKind::StorageWriteFailure,
+        format!("{operation} lock {key}: missing conditional update support"),
+    )
+}
+
+fn local_lock_table() -> &'static Mutex<BTreeMap<String, Arc<Mutex<()>>>> {
+    static LOCKS: OnceLock<Mutex<BTreeMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+    LOCKS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn local_lock_key(root: &Path, key: &str) -> String {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    format!("{}:{key}", root.display())
+}
+
+fn local_lock_mutex(root: &Path, key: &str) -> Result<Arc<Mutex<()>>, DatalensError> {
+    let lock_key = local_lock_key(root, key);
+    let mut locks = local_lock_table()
+        .lock()
+        .map_err(|_| DatalensError::internal("local object lock table poisoned"))?;
+    Ok(locks
+        .entry(lock_key)
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone())
+}
+
+struct LocalLockGuard {
+    path: PathBuf,
+}
+
+impl Drop for LocalLockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir(&self.path);
+    }
+}
+
+fn local_lock_guard_path(root: &Path, key: &str) -> PathBuf {
+    local_temp_parent(root).join("locks").join(key)
+}
+
+fn try_acquire_local_lock_guard(
+    root: &Path,
+    key: &str,
+) -> Result<Option<LocalLockGuard>, DatalensError> {
+    let path = local_lock_guard_path(root, key);
+    let parent = path.parent().ok_or_else(|| {
+        DatalensError::new(
+            DatalensErrorKind::StorageWriteFailure,
+            format!("local lock guard {key} has no parent directory"),
+        )
+    })?;
+    fs::create_dir_all(parent).map_err(|error| {
+        DatalensError::new(
+            DatalensErrorKind::StorageWriteFailure,
+            format!(
+                "create local lock guard directory {}: {error}",
+                parent.display()
+            ),
+        )
+    })?;
+    match fs::create_dir(&path) {
+        Ok(()) => Ok(Some(LocalLockGuard { path })),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+        Err(error) => Err(DatalensError::new(
+            DatalensErrorKind::StorageWriteFailure,
+            format!("create local lock guard {}: {error}", path.display()),
+        )),
+    }
+}
+
+fn local_create_lock_file(
+    path: &Path,
+    key: &str,
+    owner: &[u8],
+) -> Result<Option<ObjectLockLease>, DatalensError> {
+    let parent = path.parent().ok_or_else(|| {
+        DatalensError::new(
+            DatalensErrorKind::StorageWriteFailure,
+            format!("lock object {key} has no parent directory"),
+        )
+    })?;
+    fs::create_dir_all(parent).map_err(|error| {
+        DatalensError::new(
+            DatalensErrorKind::StorageWriteFailure,
+            format!("create lock directory {}: {error}", parent.display()),
+        )
+    })?;
+    let mut file = match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(None),
+        Err(error) => {
+            return Err(DatalensError::new(
+                DatalensErrorKind::StorageWriteFailure,
+                format!("create lock object {}: {error}", path.display()),
+            ));
+        }
+    };
+    if let Err(error) = file.write_all(owner).and_then(|()| file.sync_all()) {
+        let _ = fs::remove_file(path);
+        return Err(DatalensError::new(
+            DatalensErrorKind::StorageWriteFailure,
+            format!("write lock object {}: {error}", path.display()),
+        ));
+    }
+    Ok(Some(ObjectLockLease {
+        key: key.to_owned(),
+        owner: owner.to_vec(),
+    }))
+}
+
+fn read_local_lock_file(path: &Path) -> Result<Option<Vec<u8>>, DatalensError> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(DatalensError::new(
+            DatalensErrorKind::StorageReadFailure,
+            format!("read lock object {}: {error}", path.display()),
+        )),
+    }
+}
+
+fn write_local_lock_file(path: &Path, bytes: &[u8]) -> Result<(), DatalensError> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::StorageWriteFailure,
+                format!("open lock object {}: {error}", path.display()),
+            )
+        })?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::StorageWriteFailure,
+                format!("write lock object {}: {error}", path.display()),
+            )
+        })
+}
+
+fn remove_local_lock_file(path: &Path) -> Result<(), DatalensError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(DatalensError::new(
+            DatalensErrorKind::StorageWriteFailure,
+            format!("delete lock object {}: {error}", path.display()),
+        )),
     }
 }
 
@@ -342,39 +521,90 @@ impl ObjectStore for LocalObjectStore {
         owner: &[u8],
     ) -> Result<Option<ObjectLockLease>, DatalensError> {
         let path = self.path(key)?;
-        let parent = path.parent().ok_or_else(|| {
-            DatalensError::new(
-                DatalensErrorKind::StorageWriteFailure,
-                format!("lock object {key} has no parent directory"),
-            )
-        })?;
-        fs::create_dir_all(parent).map_err(|error| {
-            DatalensError::new(
-                DatalensErrorKind::StorageWriteFailure,
-                format!("create lock directory {}: {error}", parent.display()),
-            )
-        })?;
-        let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(None),
-            Err(error) => {
-                return Err(DatalensError::new(
-                    DatalensErrorKind::StorageWriteFailure,
-                    format!("create lock object {}: {error}", path.display()),
-                ));
-            }
+        let lock = local_lock_mutex(&self.root, key)?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| DatalensError::internal("local object lock poisoned"))?;
+        let Some(_file_guard) = try_acquire_local_lock_guard(&self.root, key)? else {
+            return Ok(None);
         };
-        if let Err(error) = file.write_all(owner).and_then(|()| file.sync_all()) {
-            let _ = fs::remove_file(&path);
-            return Err(DatalensError::new(
-                DatalensErrorKind::StorageWriteFailure,
-                format!("write lock object {}: {error}", path.display()),
-            ));
+        local_create_lock_file(&path, key, owner)
+    }
+
+    fn release_lock(&self, lease: ObjectLockLease) -> Result<(), DatalensError> {
+        let path = self.path(&lease.key)?;
+        let lock = local_lock_mutex(&self.root, &lease.key)?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| DatalensError::internal("local object lock poisoned"))?;
+        let Some(_file_guard) = try_acquire_local_lock_guard(&self.root, &lease.key)? else {
+            return Ok(());
+        };
+        match read_local_lock_file(&path)? {
+            Some(current) if current == lease.owner => remove_local_lock_file(&path),
+            _ => Ok(()),
         }
-        Ok(Some(ObjectLockLease {
-            key: key.to_owned(),
-            owner: owner.to_vec(),
-        }))
+    }
+
+    fn renew_lock(
+        &self,
+        lease: &mut ObjectLockLease,
+        ttl: Duration,
+    ) -> Result<bool, DatalensError> {
+        let path = self.path(&lease.key)?;
+        let lock = local_lock_mutex(&self.root, &lease.key)?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| DatalensError::internal("local object lock poisoned"))?;
+        let Some(_file_guard) = try_acquire_local_lock_guard(&self.root, &lease.key)? else {
+            return Ok(false);
+        };
+        let Some(current) = read_local_lock_file(&path)? else {
+            return Ok(false);
+        };
+        if current != lease.owner {
+            return Ok(false);
+        }
+        let renewed_owner = renew_object_lock_owner(&lease.owner, ttl)?;
+        write_local_lock_file(&path, &renewed_owner)?;
+        lease.owner = renewed_owner;
+        Ok(true)
+    }
+
+    fn try_acquire_lock_with_ttl(
+        &self,
+        key: &str,
+        owner: &[u8],
+        ttl: Duration,
+    ) -> Result<Option<ObjectLockLease>, DatalensError> {
+        let path = self.path(key)?;
+        let lock = local_lock_mutex(&self.root, key)?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| DatalensError::internal("local object lock poisoned"))?;
+        let Some(_file_guard) = try_acquire_local_lock_guard(&self.root, key)? else {
+            return Ok(None);
+        };
+        if let Some(lease) = local_create_lock_file(&path, key, owner)? {
+            return Ok(Some(lease));
+        }
+        if ttl.is_zero() {
+            return Ok(None);
+        }
+        let Some(existing) = read_local_lock_file(&path)? else {
+            return local_create_lock_file(&path, key, owner);
+        };
+        let Ok(record) = serde_json::from_slice::<ObjectLockRecord>(&existing) else {
+            return Ok(None);
+        };
+        if !object_lock_record_is_expired(&record, ttl)? {
+            return Ok(None);
+        }
+        match read_local_lock_file(&path)? {
+            Some(current) if current == existing => remove_local_lock_file(&path)?,
+            _ => return Ok(None),
+        }
+        local_create_lock_file(&path, key, owner)
     }
 
     fn lock_namespace(&self) -> String {
@@ -1104,6 +1334,218 @@ impl ObjectStore for S3ObjectStore {
         }))
     }
 
+    fn release_lock(&self, lease: ObjectLockLease) -> Result<(), DatalensError> {
+        let object_key = self.key(&lease.key)?;
+        let log_key = object_key.clone();
+        let lease_owner = lease.owner;
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        self.runtime
+            .block_on_operation("release_lock", log_key, async move {
+                let object = match client
+                    .get_object()
+                    .bucket(&bucket)
+                    .key(&object_key)
+                    .send()
+                    .await
+                {
+                    Ok(object) => object,
+                    Err(error) if service_error_code(&error).is_some_and(is_not_found_code) => {
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        return Err(DatalensError::new(
+                            DatalensErrorKind::StorageReadFailure,
+                            format!("S3 get lock {object_key}: {error}"),
+                        ));
+                    }
+                };
+                let etag = object
+                    .e_tag()
+                    .map(ToOwned::to_owned)
+                    .ok_or_else(|| unsupported_lock_cas("release", &object_key))?;
+                let current = object.body.collect().await.map_err(|error| {
+                    DatalensError::new(
+                        DatalensErrorKind::StorageReadFailure,
+                        format!("S3 read lock body {object_key}: {error}"),
+                    )
+                })?;
+                if current.into_bytes().as_ref() != lease_owner.as_slice() {
+                    return Ok(());
+                }
+                match client
+                    .delete_object()
+                    .bucket(&bucket)
+                    .key(&object_key)
+                    .if_match(etag)
+                    .send()
+                    .await
+                {
+                    Ok(_) => Ok(()),
+                    Err(error) if service_error_code(&error).is_some_and(is_precondition_code) => {
+                        Ok(())
+                    }
+                    Err(error) => Err(DatalensError::new(
+                        DatalensErrorKind::StorageWriteFailure,
+                        format!("S3 release lock {object_key}: {error}"),
+                    )),
+                }
+            })
+    }
+
+    fn renew_lock(
+        &self,
+        lease: &mut ObjectLockLease,
+        ttl: Duration,
+    ) -> Result<bool, DatalensError> {
+        let object_key = self.key(&lease.key)?;
+        let log_key = object_key.clone();
+        let lease_owner = lease.owner.clone();
+        let renewed_owner = renew_object_lock_owner(&lease.owner, ttl)?;
+        let s3_renewed_owner = renewed_owner.clone();
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let renewed = self
+            .runtime
+            .block_on_operation("renew_lock", log_key, async move {
+                let object = match client
+                    .get_object()
+                    .bucket(&bucket)
+                    .key(&object_key)
+                    .send()
+                    .await
+                {
+                    Ok(object) => object,
+                    Err(error) if service_error_code(&error).is_some_and(is_not_found_code) => {
+                        return Ok(false);
+                    }
+                    Err(error) => {
+                        return Err(DatalensError::new(
+                            DatalensErrorKind::StorageReadFailure,
+                            format!("S3 get lock {object_key}: {error}"),
+                        ));
+                    }
+                };
+                let etag = object.e_tag().map(ToOwned::to_owned).ok_or_else(|| {
+                    DatalensError::new(
+                        DatalensErrorKind::StorageReadFailure,
+                        format!("S3 get lock {object_key}: missing ETag"),
+                    )
+                })?;
+                let current = object.body.collect().await.map_err(|error| {
+                    DatalensError::new(
+                        DatalensErrorKind::StorageReadFailure,
+                        format!("S3 read lock body {object_key}: {error}"),
+                    )
+                })?;
+                if current.into_bytes().as_ref() != lease_owner.as_slice() {
+                    return Ok(false);
+                }
+                match client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(&object_key)
+                    .if_match(etag)
+                    .body(ByteStream::from(s3_renewed_owner))
+                    .send()
+                    .await
+                {
+                    Ok(_) => Ok(true),
+                    Err(error) if service_error_code(&error).is_some_and(is_precondition_code) => {
+                        Ok(false)
+                    }
+                    Err(error) => Err(DatalensError::new(
+                        DatalensErrorKind::StorageWriteFailure,
+                        format!("S3 renew lock {object_key}: {error}"),
+                    )),
+                }
+            })?;
+        if renewed {
+            lease.owner = renewed_owner;
+        }
+        Ok(renewed)
+    }
+
+    fn try_acquire_lock_with_ttl(
+        &self,
+        key: &str,
+        owner: &[u8],
+        ttl: Duration,
+    ) -> Result<Option<ObjectLockLease>, DatalensError> {
+        if let Some(lease) = self.try_acquire_lock(key, owner)? {
+            return Ok(Some(lease));
+        }
+        if ttl.is_zero() {
+            return Ok(None);
+        }
+        let object_key = self.key(key)?;
+        let log_key = object_key.clone();
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let deleted =
+            self.runtime
+                .block_on_operation("takeover_expired_lock", log_key, async move {
+                    let object = match client
+                        .get_object()
+                        .bucket(&bucket)
+                        .key(&object_key)
+                        .send()
+                        .await
+                    {
+                        Ok(object) => object,
+                        Err(error) if service_error_code(&error).is_some_and(is_not_found_code) => {
+                            return Ok(true);
+                        }
+                        Err(error) => {
+                            return Err(DatalensError::new(
+                                DatalensErrorKind::StorageReadFailure,
+                                format!("S3 get lock {object_key}: {error}"),
+                            ));
+                        }
+                    };
+                    let etag = object
+                        .e_tag()
+                        .map(ToOwned::to_owned)
+                        .ok_or_else(|| unsupported_lock_cas("take over expired", &object_key))?;
+                    let current = object.body.collect().await.map_err(|error| {
+                        DatalensError::new(
+                            DatalensErrorKind::StorageReadFailure,
+                            format!("S3 read lock body {object_key}: {error}"),
+                        )
+                    })?;
+                    let current = current.into_bytes();
+                    let Ok(record) = serde_json::from_slice::<ObjectLockRecord>(&current) else {
+                        return Ok(false);
+                    };
+                    if !object_lock_record_is_expired(&record, ttl)? {
+                        return Ok(false);
+                    }
+                    match client
+                        .delete_object()
+                        .bucket(&bucket)
+                        .key(&object_key)
+                        .if_match(etag)
+                        .send()
+                        .await
+                    {
+                        Ok(_) => Ok(true),
+                        Err(error)
+                            if service_error_code(&error).is_some_and(is_precondition_code) =>
+                        {
+                            Ok(false)
+                        }
+                        Err(error) => Err(DatalensError::new(
+                            DatalensErrorKind::StorageWriteFailure,
+                            format!("S3 take over expired lock {object_key}: {error}"),
+                        )),
+                    }
+                })?;
+        if deleted {
+            return self.try_acquire_lock(key, owner);
+        }
+        Ok(None)
+    }
+
     fn lock_namespace(&self) -> String {
         format!(
             "s3:{}/{}",
@@ -1134,6 +1576,8 @@ fn is_precondition_code(code: &str) -> bool {
 #[derive(Deserialize)]
 struct ObjectLockRecord {
     acquired_at_unix_seconds: u64,
+    #[serde(default)]
+    expires_at_unix_seconds: Option<u64>,
 }
 
 pub fn encode_object_lock_owner(owner_id: &str) -> Result<Vec<u8>, DatalensError> {
@@ -1145,6 +1589,36 @@ pub fn encode_object_lock_owner(owner_id: &str) -> Result<Vec<u8>, DatalensError
         DatalensError::new(
             DatalensErrorKind::Internal,
             format!("encode object lock owner: {error}"),
+        )
+    })
+}
+
+fn renew_object_lock_owner(owner: &[u8], ttl: Duration) -> Result<Vec<u8>, DatalensError> {
+    let mut record = serde_json::from_slice::<serde_json::Value>(owner).map_err(|error| {
+        DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            format!("decode object lock owner for renewal: {error}"),
+        )
+    })?;
+    let object = record.as_object_mut().ok_or_else(|| {
+        DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "object lock owner must be a JSON object",
+        )
+    })?;
+    let now = unix_seconds_now_for_lock()?;
+    object.insert(
+        "acquired_at_unix_seconds".to_owned(),
+        serde_json::Value::Number(now.into()),
+    );
+    object.insert(
+        "expires_at_unix_seconds".to_owned(),
+        serde_json::Value::Number(now.saturating_add(ttl.as_secs().max(1)).into()),
+    );
+    serde_json::to_vec(&record).map_err(|error| {
+        DatalensError::new(
+            DatalensErrorKind::Internal,
+            format!("encode renewed object lock owner: {error}"),
         )
     })
 }
