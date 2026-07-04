@@ -12,7 +12,7 @@ use std::{
 };
 
 use crate::selector_coverage::{filter_evm_log_rows_for_selector, selector_coverage_candidates};
-use crate::{coverage_index, read_through_cache};
+use crate::{compaction_queue, coverage_index, read_through_cache};
 
 const STORAGE_READ_GET_PARALLELISM: usize = 8;
 
@@ -1505,6 +1505,7 @@ where
         started: Instant,
     ) -> Result<(), DatalensError> {
         let (key, bytes_len) = self.put_manifest_segment_object(chain, &entry)?;
+        compaction_queue::write_entry(&self.object_store, chain, &entry)?;
         self.bump_manifest_version(chain)?;
         coverage_index::write_entry(&self.object_store, &entry)?;
         log::info!(
@@ -1560,6 +1561,7 @@ where
             published_segment_keys.insert(key);
             published_segment_count += 1;
             published_segment_bytes += bytes_len;
+            compaction_queue::write_entry(&self.object_store, chain, published_entry)?;
         }
         let published_update =
             coverage_index::publish_replacement(&self.object_store, &entry, &update)?;
@@ -1575,6 +1577,7 @@ where
                 published_segment_keys.insert(key);
                 published_segment_count += 1;
                 published_segment_bytes += bytes_len;
+                compaction_queue::write_entry(&self.object_store, chain, published_entry)?;
             }
         }
         let mut deleted_segment_count = 0usize;

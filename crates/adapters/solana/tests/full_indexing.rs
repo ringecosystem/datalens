@@ -218,6 +218,9 @@ fn test_small_solana_json_rows_survive_query_executor_restart_with_staging_enabl
         .execute(input.clone())
         .expect("first query fills small JSON rows");
     assert_eq!(first.rows.row_count(), 2);
+    first_executor
+        .flush_staged_writes_for_shutdown()
+        .expect("flush staged rows before restart");
 
     let second_provider = CountingSolanaRpc::default();
     let second_adapter = SolanaAdapter::with_provider(solana_chain(), second_provider.clone())
