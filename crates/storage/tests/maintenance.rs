@@ -35,6 +35,11 @@ struct FailingDataObjectDeleteStore {
 }
 
 #[derive(Clone, Debug)]
+struct FailingCoverageIndexV2DeltaDeleteStore {
+    inner: LocalObjectStore,
+}
+
+#[derive(Clone, Debug)]
 struct FailingManifestSegmentPutStore<S = LocalObjectStore> {
     inner: S,
 }
@@ -75,6 +80,14 @@ impl FailingDataObjectPutStore {
 }
 
 impl FailingDataObjectDeleteStore {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            inner: LocalObjectStore::new(root),
+        }
+    }
+}
+
+impl FailingCoverageIndexV2DeltaDeleteStore {
     fn new(root: PathBuf) -> Self {
         Self {
             inner: LocalObjectStore::new(root),
@@ -276,6 +289,55 @@ impl ObjectStore for FailingDataObjectDeleteStore {
             ));
         }
         self.inner.delete(key)
+    }
+}
+
+impl ObjectStore for FailingCoverageIndexV2DeltaDeleteStore {
+    fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError> {
+        self.inner.get(key)
+    }
+
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
+        self.inner.put(key, bytes)
+    }
+
+    fn put_if_absent(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<ObjectPutIfAbsentResult, DatalensError> {
+        self.inner.put_if_absent(key, bytes)
+    }
+
+    fn exists(&self, key: &str) -> Result<bool, DatalensError> {
+        self.inner.exists(key)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
+        self.inner.list(prefix)
+    }
+
+    fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ObjectListPage, DatalensError> {
+        self.inner.list_page(prefix, start_after, limit)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), DatalensError> {
+        if key.contains("/coverage-index-v2/deltas/") {
+            return Err(DatalensError::new(
+                DatalensErrorKind::StorageWriteFailure,
+                "injected coverage index v2 delta delete failure",
+            ));
+        }
+        self.inner.delete(key)
+    }
+
+    fn lock_namespace(&self) -> String {
+        self.inner.lock_namespace()
     }
 }
 
@@ -2305,6 +2367,515 @@ fn test_compaction_tick_cleans_consumed_queue_entries() {
 }
 
 #[test]
+fn test_compaction_coverage_index_v2_snapshot_without_head_keeps_deltas_queryable() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-v2-snapshot-no-head"));
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 10, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 11, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 12, FinalityLevel::Safe);
+    clear_coverage_index_v1(&storage, &chain);
+    let checkpoints = Arc::new(AtomicUsize::new(0));
+    let checkpoint_state = checkpoints.clone();
+
+    let error = storage
+        .compact_small_objects_for_chain_with_checkpoint(
+            &chain,
+            coverage_index_v2_compaction_config(false),
+            move || {
+                let count = checkpoint_state.fetch_add(1, Ordering::SeqCst);
+                if count == 1 {
+                    Err(DatalensError::internal("injected checkpoint failure"))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .expect_err("checkpoint failure");
+
+    assert_eq!(error.kind, DatalensErrorKind::Internal);
+    assert_eq!(coverage_index_v2_snapshot_count(&storage, &chain), 1);
+    assert_eq!(coverage_index_v2_snapshot_head_count(&storage, &chain), 0);
+    assert_eq!(coverage_index_v2_delta_count(&storage, &chain), 3);
+    assert_block_numbers(
+        storage
+            .read_rows(
+                &chain,
+                &DatasetKey::evm_blocks(),
+                &DatasetSelector::all(),
+                LedgerRange::blocks(10, 12).expect("range"),
+            )
+            .expect("read rows from deltas"),
+        &[10, 11, 12],
+    );
+
+    let report = storage
+        .compact_small_objects_for_chain(&chain, coverage_index_v2_compaction_config(true))
+        .expect("retry coverage index v2 compaction");
+    assert_eq!(report.coverage_index_v2_compacted_buckets, 1);
+    assert_eq!(report.coverage_index_v2_deleted_deltas, 3);
+    assert_eq!(coverage_index_v2_delta_count(&storage, &chain), 0);
+}
+
+#[test]
+fn test_compaction_coverage_index_v2_head_without_cleanup_is_retried() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-v2-head-no-cleanup"));
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 20, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 21, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 22, FinalityLevel::Safe);
+    clear_coverage_index_v1(&storage, &chain);
+    let checkpoints = Arc::new(AtomicUsize::new(0));
+    let checkpoint_state = checkpoints.clone();
+
+    let error = storage
+        .compact_small_objects_for_chain_with_checkpoint(
+            &chain,
+            coverage_index_v2_compaction_config(true),
+            move || {
+                let count = checkpoint_state.fetch_add(1, Ordering::SeqCst);
+                if count == 2 {
+                    Err(DatalensError::internal("injected checkpoint failure"))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .expect_err("checkpoint failure");
+
+    assert_eq!(error.kind, DatalensErrorKind::Internal);
+    assert_eq!(coverage_index_v2_snapshot_count(&storage, &chain), 1);
+    assert_eq!(coverage_index_v2_snapshot_head_count(&storage, &chain), 1);
+    assert_eq!(coverage_index_v2_cleanup_count(&storage, &chain), 0);
+    assert_eq!(coverage_index_v2_delta_count(&storage, &chain), 3);
+    assert_block_numbers(
+        storage
+            .read_rows(
+                &chain,
+                &DatasetKey::evm_blocks(),
+                &DatasetSelector::all(),
+                LedgerRange::blocks(20, 22).expect("range"),
+            )
+            .expect("read rows from snapshot head"),
+        &[20, 21, 22],
+    );
+
+    let report = storage
+        .compact_small_objects_for_chain(&chain, coverage_index_v2_compaction_config(true))
+        .expect("retry coverage index v2 cleanup");
+    assert_eq!(report.coverage_index_v2_cleanup_records, 1);
+    assert_eq!(report.coverage_index_v2_deleted_deltas, 3);
+    assert_eq!(coverage_index_v2_delta_count(&storage, &chain), 0);
+    assert_eq!(coverage_index_v2_cleanup_count(&storage, &chain), 0);
+}
+
+#[test]
+fn test_compaction_coverage_index_v2_recovers_older_head_cleanup_after_new_head() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-v2-older-head-cleanup"));
+    let chain = test_chain();
+    for number in 40..=42 {
+        write_block_object(&storage, &chain, number, FinalityLevel::Safe);
+    }
+    clear_coverage_index_v1(&storage, &chain);
+    let checkpoints = Arc::new(AtomicUsize::new(0));
+    let checkpoint_state = checkpoints.clone();
+
+    let error = storage
+        .compact_small_objects_for_chain_with_checkpoint(
+            &chain,
+            coverage_index_v2_compaction_config(true),
+            move || {
+                let count = checkpoint_state.fetch_add(1, Ordering::SeqCst);
+                if count == 2 {
+                    Err(DatalensError::internal("injected checkpoint failure"))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .expect_err("checkpoint failure");
+
+    assert_eq!(error.kind, DatalensErrorKind::Internal);
+    assert_eq!(coverage_index_v2_snapshot_head_count(&storage, &chain), 1);
+    assert_eq!(coverage_index_v2_cleanup_count(&storage, &chain), 0);
+    for number in 43..=45 {
+        write_block_object(&storage, &chain, number, FinalityLevel::Safe);
+    }
+    clear_coverage_index_v1(&storage, &chain);
+
+    let report = storage
+        .compact_small_objects_for_chain(&chain, coverage_index_v2_compaction_config(true))
+        .expect("recover old cleanup and compact new deltas");
+
+    assert!(report.coverage_index_v2_cleanup_records >= 1);
+    assert_eq!(coverage_index_v2_delta_count(&storage, &chain), 0);
+    assert_eq!(coverage_index_v2_cleanup_count(&storage, &chain), 0);
+    assert_block_numbers(
+        storage
+            .read_rows(
+                &chain,
+                &DatasetKey::evm_blocks(),
+                &DatasetSelector::all(),
+                LedgerRange::blocks(40, 45).expect("range"),
+            )
+            .expect("read rows after cleanup recovery"),
+        &[40, 41, 42, 43, 44, 45],
+    );
+
+    let noop_report = storage
+        .compact_small_objects_for_chain(&chain, coverage_index_v2_compaction_config(true))
+        .expect("no-op coverage index v2 compaction");
+    assert_eq!(noop_report.coverage_index_v2_cleanup_records, 0);
+    assert_eq!(coverage_index_v2_delta_count(&storage, &chain), 0);
+    assert_eq!(coverage_index_v2_cleanup_count(&storage, &chain), 0);
+}
+
+#[test]
+fn test_compaction_coverage_index_v2_cleanup_delete_failure_retries() {
+    let root = temp_storage_root("coverage-v2-delete-retry");
+    let chain = test_chain();
+    let storage = LocalStorage::new(root.clone());
+    write_block_object(&storage, &chain, 30, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 31, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 32, FinalityLevel::Safe);
+    clear_coverage_index_v1(&storage, &chain);
+    let failing_storage = DurableStorage::from_object_store(
+        FailingCoverageIndexV2DeltaDeleteStore::new(root.clone()),
+    );
+
+    let failed_cleanup_report = failing_storage
+        .compact_small_objects_for_chain(&chain, coverage_index_v2_compaction_config(true))
+        .expect("coverage index v2 compaction with delete failure");
+
+    assert_eq!(failed_cleanup_report.coverage_index_v2_compacted_buckets, 1);
+    assert_eq!(
+        failed_cleanup_report.coverage_index_v2_delta_delete_failures,
+        3
+    );
+    assert_eq!(coverage_index_v2_delta_count(&storage, &chain), 3);
+    assert_eq!(coverage_index_v2_cleanup_count(&storage, &chain), 1);
+    assert_block_numbers(
+        storage
+            .read_rows(
+                &chain,
+                &DatasetKey::evm_blocks(),
+                &DatasetSelector::all(),
+                LedgerRange::blocks(30, 32).expect("range"),
+            )
+            .expect("read rows after failed cleanup"),
+        &[30, 31, 32],
+    );
+
+    let retry_report = storage
+        .compact_small_objects_for_chain(&chain, coverage_index_v2_compaction_config(true))
+        .expect("retry coverage index v2 cleanup");
+    assert_eq!(retry_report.coverage_index_v2_deleted_deltas, 3);
+    assert_eq!(retry_report.coverage_index_v2_delta_delete_failures, 0);
+    assert_eq!(coverage_index_v2_delta_count(&storage, &chain), 0);
+    assert_eq!(coverage_index_v2_cleanup_count(&storage, &chain), 0);
+    assert_block_numbers(
+        storage
+            .read_rows(
+                &chain,
+                &DatasetKey::evm_blocks(),
+                &DatasetSelector::all(),
+                LedgerRange::blocks(30, 32).expect("range"),
+            )
+            .expect("read rows after cleanup retry"),
+        &[30, 31, 32],
+    );
+}
+
+#[test]
+fn test_compaction_coverage_index_v2_malformed_cleanup_record_does_not_delete_arbitrary_key() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-v2-malformed-cleanup"));
+    let chain = test_chain();
+    let victim_key = format!("chains/{}/objects/not-a-delta.json", chain.key_prefix());
+    storage
+        .object_store()
+        .put(&victim_key, br#"{"keep":true}"#)
+        .expect("write victim object");
+    write_coverage_index_v2_cleanup_record(
+        &storage,
+        &chain,
+        "malformed",
+        "chains/not-a-real-snapshot.json",
+        vec![victim_key.clone()],
+    );
+
+    storage
+        .compact_small_objects_for_chain(&chain, coverage_index_v2_compaction_config(true))
+        .expect("cleanup tick");
+
+    assert!(
+        storage
+            .object_store()
+            .exists(&victim_key)
+            .expect("victim exists"),
+        "cleanup must not delete keys outside the record bucket delta prefix"
+    );
+}
+
+#[test]
+fn test_compaction_coverage_index_v2_older_head_cleanup_preserves_delta_missing_from_latest_head() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-v2-older-head-missing-delta"));
+    let chain = test_chain();
+    for number in 47..=49 {
+        write_block_object(&storage, &chain, number, FinalityLevel::Safe);
+    }
+    clear_coverage_index_v1(&storage, &chain);
+    let delta_key = first_coverage_index_v2_delta_key(&storage, &chain);
+
+    storage
+        .compact_small_objects_for_chain(&chain, coverage_index_v2_compaction_config(false))
+        .expect("write first coverage index v2 snapshot head");
+    let first_snapshot_key = list_prefix(
+        &storage,
+        &format!("chains/{}/coverage-index-v2/snapshots", chain.key_prefix()),
+    )
+    .into_iter()
+    .next()
+    .expect("first snapshot key");
+    write_coverage_index_v2_cleanup_record(
+        &storage,
+        &chain,
+        "older-head",
+        &first_snapshot_key,
+        vec![delta_key.clone()],
+    );
+    let second_snapshot_key = write_coverage_index_v2_snapshot(
+        &storage,
+        &chain,
+        "newer-missing-delta",
+        9_999_999_999_999,
+        Vec::new(),
+    );
+    write_coverage_index_v2_snapshot_head(
+        &storage,
+        &chain,
+        "newer-missing-delta",
+        9_999_999_999_999,
+        &second_snapshot_key,
+    );
+
+    storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                coverage_index_v2_delta_count_threshold: 999,
+                ..coverage_index_v2_compaction_config(true)
+            },
+        )
+        .expect("cleanup tick");
+
+    assert!(
+        storage
+            .object_store()
+            .exists(&delta_key)
+            .expect("delta exists"),
+        "cleanup must not delete a delta missing from the latest snapshot head"
+    );
+    assert_block_numbers(
+        storage
+            .read_rows(
+                &chain,
+                &DatasetKey::evm_blocks(),
+                &DatasetSelector::all(),
+                LedgerRange::blocks(47, 49).expect("range"),
+            )
+            .expect("read rows after stale cleanup tick"),
+        &[47, 48, 49],
+    );
+}
+
+#[test]
+fn test_compaction_coverage_index_v2_stale_cleanup_record_does_not_delete_delta() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-v2-stale-cleanup"));
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 50, FinalityLevel::Safe);
+    clear_coverage_index_v1(&storage, &chain);
+    let delta_key = first_coverage_index_v2_delta_key(&storage, &chain);
+    write_coverage_index_v2_cleanup_record(
+        &storage,
+        &chain,
+        "stale",
+        "chains/test/coverage-index-v2/snapshots/missing.json",
+        vec![delta_key.clone()],
+    );
+
+    storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                coverage_index_v2_delta_count_threshold: 999,
+                ..coverage_index_v2_compaction_config(true)
+            },
+        )
+        .expect("cleanup tick");
+
+    assert!(
+        storage
+            .object_store()
+            .exists(&delta_key)
+            .expect("delta exists"),
+        "cleanup must prove the snapshot before deleting its compacted delta keys"
+    );
+}
+
+#[test]
+fn test_compaction_coverage_index_v2_default_config_compacts_at_get_budget() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-v2-default-budget"));
+    let chain = test_chain();
+    for number in 0..64 {
+        write_empty_coverage(&storage, &chain, number, FinalityLevel::Safe);
+    }
+    clear_coverage_index_v1(&storage, &chain);
+
+    let report = storage
+        .compact_small_objects_for_chain(&chain, MaintenanceCompactionConfig::default())
+        .expect("default coverage index v2 compaction");
+
+    assert_eq!(report.coverage_index_v2_compacted_buckets, 1);
+    assert_eq!(report.coverage_index_v2_compacted_deltas, 64);
+    assert_eq!(report.get_operations, 64);
+    assert_eq!(coverage_index_v2_snapshot_head_count(&storage, &chain), 1);
+}
+
+#[test]
+fn test_compaction_coverage_index_v2_skips_corrupt_cleanup_record_and_cleans_valid_work() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-v2-corrupt-cleanup"));
+    let chain = test_chain();
+    for number in 90..=92 {
+        write_block_object(&storage, &chain, number, FinalityLevel::Safe);
+    }
+    clear_coverage_index_v1(&storage, &chain);
+    let corrupt_key = format!(
+        "chains/{}/coverage-index-v2/cleanup/exact/evm.blocks/block/all/safe/00000000000000000000-00000000000000099999/corrupt.json",
+        chain.key_prefix()
+    );
+    storage
+        .object_store()
+        .put(&corrupt_key, b"{not-json")
+        .expect("write corrupt cleanup record");
+
+    let report = storage
+        .compact_small_objects_for_chain(&chain, coverage_index_v2_compaction_config(true))
+        .expect("compaction skips corrupt cleanup record");
+
+    assert_eq!(report.coverage_index_v2_compacted_buckets, 1);
+    assert_eq!(report.coverage_index_v2_deleted_deltas, 3);
+    assert_eq!(coverage_index_v2_delta_count(&storage, &chain), 0);
+    assert!(
+        storage
+            .object_store()
+            .exists(&corrupt_key)
+            .expect("corrupt cleanup record exists"),
+        "invalid cleanup record should be skipped rather than blocking the tick"
+    );
+}
+
+#[test]
+fn test_compaction_coverage_index_v2_ignores_sibling_prefixes() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-v2-sibling-prefix"));
+    let chain = test_chain();
+    for number in 60..=62 {
+        write_block_object(&storage, &chain, number, FinalityLevel::Safe);
+    }
+    clear_coverage_index_v1(&storage, &chain);
+    let sibling_key = format!(
+        "chains/{}/coverage-index-v2/deltas-old/exact/evm.blocks/block/all/safe/not-a-number-00000000000000000000/0001.json",
+        chain.key_prefix()
+    );
+    storage
+        .object_store()
+        .put(&sibling_key, br#"{"not":"a v2 delta"}"#)
+        .expect("write sibling object");
+
+    let report = storage
+        .compact_small_objects_for_chain(&chain, coverage_index_v2_compaction_config(false))
+        .expect("compact real v2 deltas");
+
+    assert_eq!(report.coverage_index_v2_compacted_buckets, 1);
+}
+
+#[test]
+fn test_compaction_coverage_index_v2_respects_get_budget() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-v2-get-budget"));
+    let chain = test_chain();
+    for number in 70..=73 {
+        write_block_object(&storage, &chain, number, FinalityLevel::Safe);
+    }
+    clear_coverage_index_v1(&storage, &chain);
+
+    let report = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                max_gets_per_tick: 3,
+                cleanup_enabled: false,
+                coverage_index_v2_delta_count_threshold: 3,
+                ..coverage_index_v2_compaction_config(false)
+            },
+        )
+        .expect("budgeted coverage index v2 compaction");
+
+    assert_eq!(report.coverage_index_v2_compacted_deltas, 3);
+    assert_eq!(report.get_operations, 3);
+    assert_block_numbers(
+        storage
+            .read_rows(
+                &chain,
+                &DatasetKey::evm_blocks(),
+                &DatasetSelector::all(),
+                LedgerRange::blocks(70, 73).expect("range"),
+            )
+            .expect("read rows after budgeted compaction"),
+        &[70, 71, 72, 73],
+    );
+}
+
+#[test]
+fn test_compaction_coverage_index_v2_preserves_replacement_tombstone_snapshot() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-v2-replacement-snapshot"));
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    for number in 80..=82 {
+        write_block_object(&storage, &chain, number, FinalityLevel::Safe);
+    }
+    let empty_rows = DatasetRows::new(DatasetKey::evm_blocks(), QueryRows::EvmBlocks(Vec::new()))
+        .expect("empty rows");
+    storage
+        .write_rows_replacing_existing(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &selector,
+            range: LedgerRange::blocks(81, 81).expect("range"),
+            rows: &empty_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write empty replacement");
+    clear_coverage_index_v1(&storage, &chain);
+
+    let report = storage
+        .compact_small_objects_for_chain(&chain, coverage_index_v2_compaction_config(true))
+        .expect("compact replacement deltas");
+
+    assert_eq!(report.coverage_index_v2_compacted_buckets, 1);
+    assert_eq!(coverage_index_v2_delta_count(&storage, &chain), 0);
+    assert_block_numbers(
+        storage
+            .read_rows(
+                &chain,
+                &DatasetKey::evm_blocks(),
+                &selector,
+                LedgerRange::blocks(80, 82).expect("range"),
+            )
+            .expect("read replacement snapshot"),
+        &[80, 82],
+    );
+}
+
+#[test]
 fn test_compaction_tick_scans_one_manifest_segment_prefix_per_tick() {
     let storage = LocalStorage::new(temp_storage_root("prefix-scope"));
     let chain = test_chain();
@@ -2917,6 +3488,192 @@ fn write_empty_coverage(
             record_empty_coverage: true,
         })
         .expect("write empty coverage");
+}
+
+fn coverage_index_v2_compaction_config(cleanup_enabled: bool) -> MaintenanceCompactionConfig {
+    MaintenanceCompactionConfig {
+        min_object_bytes: 0,
+        max_tick_duration_ms: 30_000,
+        max_candidates_per_tick: 8,
+        max_manifest_entries_per_tick: 20_000,
+        max_gets_per_tick: 128,
+        max_puts_per_tick: 16,
+        max_deletes_per_tick: 128,
+        cleanup_enabled,
+        delete_source_objects: false,
+        coverage_index_v2_delta_count_threshold: 3,
+        coverage_index_v2_delete_grace_ms: 0,
+        ..MaintenanceCompactionConfig::default()
+    }
+}
+
+fn clear_coverage_index_v1<S: ObjectStore>(storage: &DurableStorage<S>, chain: &ChainIdentity) {
+    delete_prefix(
+        storage,
+        &format!("chains/{}/coverage-index", chain.key_prefix()),
+    );
+}
+
+fn coverage_index_v2_delta_count<S: ObjectStore>(
+    storage: &DurableStorage<S>,
+    chain: &ChainIdentity,
+) -> usize {
+    list_prefix(
+        storage,
+        &format!("chains/{}/coverage-index-v2/deltas", chain.key_prefix()),
+    )
+    .len()
+}
+
+fn coverage_index_v2_snapshot_count<S: ObjectStore>(
+    storage: &DurableStorage<S>,
+    chain: &ChainIdentity,
+) -> usize {
+    list_prefix(
+        storage,
+        &format!("chains/{}/coverage-index-v2/snapshots", chain.key_prefix()),
+    )
+    .len()
+}
+
+fn coverage_index_v2_snapshot_head_count<S: ObjectStore>(
+    storage: &DurableStorage<S>,
+    chain: &ChainIdentity,
+) -> usize {
+    list_prefix(
+        storage,
+        &format!(
+            "chains/{}/coverage-index-v2/snapshot-heads",
+            chain.key_prefix()
+        ),
+    )
+    .len()
+}
+
+fn coverage_index_v2_cleanup_count<S: ObjectStore>(
+    storage: &DurableStorage<S>,
+    chain: &ChainIdentity,
+) -> usize {
+    list_prefix(
+        storage,
+        &format!("chains/{}/coverage-index-v2/cleanup", chain.key_prefix()),
+    )
+    .len()
+}
+
+fn first_coverage_index_v2_delta_key<S: ObjectStore>(
+    storage: &DurableStorage<S>,
+    chain: &ChainIdentity,
+) -> String {
+    let delta_prefix = format!("chains/{}/coverage-index-v2/deltas/", chain.key_prefix());
+    list_prefix(
+        storage,
+        &format!("chains/{}/coverage-index-v2/deltas", chain.key_prefix()),
+    )
+    .into_iter()
+    .find(|key| key.starts_with(&delta_prefix))
+    .expect("coverage index v2 delta key")
+}
+
+fn write_coverage_index_v2_cleanup_record<S: ObjectStore>(
+    storage: &DurableStorage<S>,
+    chain: &ChainIdentity,
+    id: &str,
+    snapshot_key: &str,
+    compacted_delta_keys: Vec<String>,
+) -> String {
+    let key = format!(
+        "chains/{}/coverage-index-v2/cleanup/exact/evm.blocks/block/all/safe/00000000000000000000-00000000000000099999/{id}.json",
+        chain.key_prefix()
+    );
+    let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+        "schema_version": 1,
+        "created_at_unix_ms": 1,
+        "scope": "exact/evm.blocks/block/all/safe",
+        "bucket_start": 0,
+        "bucket_end": 99_999,
+        "compaction_id": id,
+        "snapshot_key": snapshot_key,
+        "compacted_delta_keys": compacted_delta_keys,
+    }))
+    .expect("cleanup record bytes");
+    storage
+        .object_store()
+        .put(&key, &bytes)
+        .expect("write cleanup record");
+    key
+}
+
+fn write_coverage_index_v2_snapshot<S: ObjectStore>(
+    storage: &DurableStorage<S>,
+    chain: &ChainIdentity,
+    id: &str,
+    created_at_unix_ms: u64,
+    compacted_delta_keys: Vec<String>,
+) -> String {
+    let key = format!(
+        "chains/{}/coverage-index-v2/snapshots/exact/evm.blocks/block/all/safe/00000000000000000000-00000000000000099999/{id}.json",
+        chain.key_prefix()
+    );
+    let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+        "schema_version": 1,
+        "created_at_unix_ms": created_at_unix_ms,
+        "scope": "exact/evm.blocks/block/all/safe",
+        "bucket_start": 0,
+        "bucket_end": 99_999,
+        "entries": [],
+        "compacted_delta_keys": compacted_delta_keys,
+    }))
+    .expect("snapshot bytes");
+    storage
+        .object_store()
+        .put(&key, &bytes)
+        .expect("write snapshot");
+    key
+}
+
+fn write_coverage_index_v2_snapshot_head<S: ObjectStore>(
+    storage: &DurableStorage<S>,
+    chain: &ChainIdentity,
+    id: &str,
+    created_at_unix_ms: u64,
+    snapshot_key: &str,
+) -> String {
+    let key = format!(
+        "chains/{}/coverage-index-v2/snapshot-heads/exact/evm.blocks/block/all/safe/00000000000000000000-00000000000000099999/{id}.json",
+        chain.key_prefix()
+    );
+    let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+        "schema_version": 1,
+        "created_at_unix_ms": created_at_unix_ms,
+        "scope": "exact/evm.blocks/block/all/safe",
+        "bucket_start": 0,
+        "bucket_end": 99_999,
+        "snapshot_key": snapshot_key,
+        "included_delta_high_watermark": "",
+    }))
+    .expect("snapshot head bytes");
+    storage
+        .object_store()
+        .put(&key, &bytes)
+        .expect("write snapshot head");
+    key
+}
+
+fn list_prefix<S: ObjectStore>(storage: &DurableStorage<S>, prefix: &str) -> Vec<String> {
+    storage
+        .object_store()
+        .list(prefix)
+        .expect("list prefix")
+        .into_iter()
+        .map(|object| object.key)
+        .collect()
+}
+
+fn delete_prefix<S: ObjectStore>(storage: &DurableStorage<S>, prefix: &str) {
+    for key in list_prefix(storage, prefix) {
+        storage.object_store().delete(&key).expect("delete object");
+    }
 }
 
 fn temp_storage_root(name: &str) -> PathBuf {

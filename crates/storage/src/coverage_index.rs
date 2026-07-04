@@ -14,7 +14,10 @@ use std::{
 };
 
 use crate::selector_coverage::{parse_evm_log_canonical_key, selector_coverage_candidates};
-use crate::{Manifest, ManifestEntry, ManifestFinalityLevel, ObjectStore, range_kind_key};
+use crate::{
+    Manifest, ManifestEntry, ManifestFinalityLevel, ObjectMetadata, ObjectStore, range_kind_key,
+    validate_object_key,
+};
 
 pub(crate) const DEFAULT_COVERAGE_INDEX_BUCKET_SIZE: u64 = 100_000;
 const COVERAGE_INDEX_V2_SCHEMA_VERSION: u32 = 1;
@@ -55,24 +58,24 @@ struct CoverageIndexReplacementBucket {
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct CoverageIndexV2Bucket {
-    chain_key: String,
-    scope: String,
-    bucket_start: u64,
-    bucket_end: u64,
+pub(crate) struct CoverageIndexV2Bucket {
+    pub(crate) chain_key: String,
+    pub(crate) scope: String,
+    pub(crate) bucket_start: u64,
+    pub(crate) bucket_end: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CoverageIndexV2Delta {
-    schema_version: u32,
-    created_at_unix_ms: u64,
-    scope: String,
-    bucket_start: u64,
-    bucket_end: u64,
+    pub(crate) schema_version: u32,
+    pub(crate) created_at_unix_ms: u64,
+    pub(crate) scope: String,
+    pub(crate) bucket_start: u64,
+    pub(crate) bucket_end: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     replacement: Option<CoverageIndexV2Replacement>,
-    entries: Vec<ManifestEntry>,
+    pub(crate) entries: Vec<ManifestEntry>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -84,39 +87,61 @@ struct CoverageIndexV2Replacement {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CoverageIndexV2Snapshot {
-    schema_version: u32,
-    created_at_unix_ms: u64,
-    scope: String,
-    bucket_start: u64,
-    bucket_end: u64,
-    entries: Vec<ManifestEntry>,
-    compacted_delta_keys: Vec<String>,
+    pub(crate) schema_version: u32,
+    pub(crate) created_at_unix_ms: u64,
+    pub(crate) scope: String,
+    pub(crate) bucket_start: u64,
+    pub(crate) bucket_end: u64,
+    pub(crate) entries: Vec<ManifestEntry>,
+    pub(crate) compacted_delta_keys: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CoverageIndexV2SnapshotHead {
-    schema_version: u32,
-    created_at_unix_ms: u64,
-    scope: String,
-    bucket_start: u64,
-    bucket_end: u64,
-    snapshot_key: String,
-    included_delta_high_watermark: String,
+    pub(crate) schema_version: u32,
+    pub(crate) created_at_unix_ms: u64,
+    pub(crate) scope: String,
+    pub(crate) bucket_start: u64,
+    pub(crate) bucket_end: u64,
+    pub(crate) snapshot_key: String,
+    pub(crate) included_delta_high_watermark: String,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CoverageIndexV2CleanupRecord {
-    schema_version: u32,
-    created_at_unix_ms: u64,
-    scope: String,
-    bucket_start: u64,
-    bucket_end: u64,
-    compaction_id: String,
-    snapshot_key: String,
-    compacted_delta_keys: Vec<String>,
+    pub(crate) schema_version: u32,
+    pub(crate) created_at_unix_ms: u64,
+    pub(crate) scope: String,
+    pub(crate) bucket_start: u64,
+    pub(crate) bucket_end: u64,
+    pub(crate) compaction_id: String,
+    pub(crate) snapshot_key: String,
+    pub(crate) compacted_delta_keys: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CoverageIndexV2DeltaObject {
+    pub(crate) key: String,
+    pub(crate) size: u64,
+    pub(crate) delta: CoverageIndexV2Delta,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CoverageIndexV2BucketCompaction {
+    pub(crate) bucket: CoverageIndexV2Bucket,
+    pub(crate) entries: Vec<ManifestEntry>,
+    pub(crate) compacted_delta_keys: Vec<String>,
+    pub(crate) newly_compacted_delta_keys: Vec<String>,
+    pub(crate) included_delta_high_watermark: String,
+    pub(crate) input_delta_bytes: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CoverageIndexV2CleanupRecordObject {
+    pub(crate) key: String,
+    pub(crate) record: CoverageIndexV2CleanupRecord,
 }
 
 impl CoverageIndex {
@@ -292,42 +317,304 @@ where
     S: ObjectStore,
 {
     let mut any_bucket_has_index = false;
-    let mut delta_start_after = None;
+    let mut compacted_delta_keys = BTreeSet::new();
     if let Some(head) = latest_v2_snapshot_head(object_store, bucket)? {
-        let snapshot_bytes = object_store.get(&head.snapshot_key)?;
-        let mut snapshot: CoverageIndexV2Snapshot = serde_json::from_slice(&snapshot_bytes)
-            .map_err(|error| {
-                DatalensError::new(
-                    DatalensErrorKind::StorageReadFailure,
-                    format!(
-                        "decode coverage index v2 snapshot {}: {error}",
-                        head.snapshot_key
-                    ),
-                )
-            })?;
-        validate_v2_record_scope(
-            "snapshot",
-            &head.snapshot_key,
-            snapshot.schema_version,
-            &snapshot.scope,
-            snapshot.bucket_start,
-            snapshot.bucket_end,
-            bucket,
-        )?;
+        let mut snapshot = read_v2_snapshot(object_store, bucket, &head.snapshot_key)?;
         any_bucket_has_index = true;
+        compacted_delta_keys.extend(snapshot.compacted_delta_keys);
         entries.append(&mut snapshot.entries);
-        if !head.included_delta_high_watermark.is_empty() {
-            delta_start_after = Some(head.included_delta_high_watermark);
-        }
     }
 
+    for object in
+        list_v2_delta_objects_for_bucket(object_store, bucket, &compacted_delta_keys, None)?
+    {
+        let mut delta = object.delta;
+        any_bucket_has_index = true;
+        if let Some(replacement) = delta.replacement {
+            apply_v2_replacement(entries, &replacement.entry)?;
+        }
+        entries.append(&mut delta.entries);
+    }
+    Ok(any_bucket_has_index)
+}
+
+pub(crate) fn list_v2_delta_buckets_for_chain<S>(
+    object_store: &S,
+    chain: &ChainIdentity,
+) -> Result<Vec<CoverageIndexV2Bucket>, DatalensError>
+where
+    S: ObjectStore,
+{
+    let prefix = format!("chains/{}/coverage-index-v2/deltas", chain.key_prefix());
+    let strict_prefix = format!("{prefix}/");
+    let mut buckets = BTreeSet::new();
+    let mut start_after = None;
+    loop {
+        let page = object_store.list_page(
+            &prefix,
+            start_after.as_deref(),
+            COVERAGE_INDEX_V2_LIST_PAGE_SIZE,
+        )?;
+        for object in &page.objects {
+            if !object.key.starts_with(&strict_prefix) {
+                continue;
+            }
+            if let Some(bucket) = parse_v2_bucket_from_object_key(&prefix, &object.key)? {
+                buckets.insert(bucket);
+            }
+        }
+        if !page.has_more {
+            break;
+        }
+        start_after = page.objects.last().map(|object| object.key.clone());
+    }
+    Ok(buckets.into_iter().collect())
+}
+
+pub(crate) fn prepare_v2_bucket_compaction<S>(
+    object_store: &S,
+    bucket: &CoverageIndexV2Bucket,
+    delta_count_threshold: usize,
+    max_delta_objects: usize,
+) -> Result<Option<CoverageIndexV2BucketCompaction>, DatalensError>
+where
+    S: ObjectStore,
+{
+    let mut entries = Vec::new();
+    let mut previous_compacted_delta_keys = BTreeSet::new();
+    if let Some(head) = latest_v2_snapshot_head(object_store, bucket)? {
+        let snapshot = read_v2_snapshot(object_store, bucket, &head.snapshot_key)?;
+        previous_compacted_delta_keys.extend(snapshot.compacted_delta_keys);
+        entries.extend(snapshot.entries);
+    }
+
+    let deltas = list_v2_delta_objects_for_bucket(
+        object_store,
+        bucket,
+        &previous_compacted_delta_keys,
+        Some(max_delta_objects),
+    )?;
+    if deltas.len() < delta_count_threshold.max(1) {
+        return Ok(None);
+    }
+    let input_delta_bytes = deltas.iter().map(|object| object.size).sum();
+    let included_delta_high_watermark = deltas
+        .last()
+        .map(|object| object.key.clone())
+        .unwrap_or_default();
+    let newly_compacted_delta_keys = deltas
+        .iter()
+        .map(|object| object.key.clone())
+        .collect::<Vec<_>>();
+    for object in deltas {
+        if let Some(replacement) = object.delta.replacement {
+            apply_v2_replacement(&mut entries, &replacement.entry)?;
+        }
+        entries.extend(object.delta.entries);
+    }
+    let mut index = CoverageIndex { entries };
+    index.normalize();
+    let mut compacted_delta_keys = previous_compacted_delta_keys
+        .into_iter()
+        .chain(newly_compacted_delta_keys.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    compacted_delta_keys.sort();
+    compacted_delta_keys.dedup();
+    Ok(Some(CoverageIndexV2BucketCompaction {
+        bucket: bucket.clone(),
+        entries: index.entries,
+        compacted_delta_keys,
+        newly_compacted_delta_keys,
+        included_delta_high_watermark,
+        input_delta_bytes,
+    }))
+}
+
+pub(crate) fn v2_snapshot_cleanup_records_for_bucket<S>(
+    object_store: &S,
+    bucket: &CoverageIndexV2Bucket,
+) -> Result<Vec<CoverageIndexV2CleanupRecord>, DatalensError>
+where
+    S: ObjectStore,
+{
+    let existing_delta_keys = list_v2_delta_object_keys_for_bucket(object_store, bucket)?;
+    let mut records = Vec::new();
+    for (_, head) in list_v2_snapshot_heads_for_bucket(object_store, bucket)? {
+        let snapshot = read_v2_snapshot(object_store, bucket, &head.snapshot_key)?;
+        let compacted_delta_keys = snapshot
+            .compacted_delta_keys
+            .into_iter()
+            .filter(|key| existing_delta_keys.contains(key))
+            .collect::<Vec<_>>();
+        if compacted_delta_keys.is_empty() {
+            continue;
+        }
+        records.push(CoverageIndexV2CleanupRecord {
+            schema_version: COVERAGE_INDEX_V2_SCHEMA_VERSION,
+            created_at_unix_ms: snapshot.created_at_unix_ms,
+            scope: snapshot.scope,
+            bucket_start: snapshot.bucket_start,
+            bucket_end: snapshot.bucket_end,
+            compaction_id: head
+                .snapshot_key
+                .rsplit('/')
+                .next()
+                .unwrap_or("")
+                .trim_end_matches(".json")
+                .to_owned(),
+            snapshot_key: head.snapshot_key,
+            compacted_delta_keys,
+        });
+    }
+    Ok(records)
+}
+
+pub(crate) fn list_v2_cleanup_records_for_chain<S>(
+    object_store: &S,
+    chain: &ChainIdentity,
+    delete_grace_ms: u64,
+    eligible_only: bool,
+) -> Result<Vec<CoverageIndexV2CleanupRecordObject>, DatalensError>
+where
+    S: ObjectStore,
+{
+    let now_ms = unix_ms_now()?;
+    let prefix = coverage_index_v2_cleanup_prefix(&chain.key_prefix());
+    let strict_prefix = format!("{prefix}/");
+    let mut records = Vec::new();
+    let mut start_after = None;
+    loop {
+        let page = object_store.list_page(
+            &prefix,
+            start_after.as_deref(),
+            COVERAGE_INDEX_V2_LIST_PAGE_SIZE,
+        )?;
+        for object in &page.objects {
+            if !object.key.starts_with(&strict_prefix) {
+                continue;
+            }
+            if !object.key.ends_with(".json") {
+                continue;
+            }
+            let bytes = object_store.get(&object.key)?;
+            let record: CoverageIndexV2CleanupRecord = match serde_json::from_slice(&bytes) {
+                Ok(record) => record,
+                Err(error) => {
+                    log::warn!(
+                        "storage coverage index v2 cleanup record skipped object_key={} reason=decode_failed message={}",
+                        object.key,
+                        error
+                    );
+                    continue;
+                }
+            };
+            if record.schema_version != COVERAGE_INDEX_V2_SCHEMA_VERSION {
+                log::warn!(
+                    "storage coverage index v2 cleanup record skipped object_key={} reason=unsupported_schema schema_version={}",
+                    object.key,
+                    record.schema_version
+                );
+                continue;
+            }
+            if !eligible_only || record.created_at_unix_ms.saturating_add(delete_grace_ms) <= now_ms
+            {
+                records.push(CoverageIndexV2CleanupRecordObject {
+                    key: object.key.clone(),
+                    record,
+                });
+            }
+        }
+        if !page.has_more {
+            break;
+        }
+        start_after = page.objects.last().map(|object| object.key.clone());
+    }
+    records.sort_by(|left, right| {
+        left.record
+            .created_at_unix_ms
+            .cmp(&right.record.created_at_unix_ms)
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    Ok(records)
+}
+
+fn list_v2_delta_objects_for_bucket<S>(
+    object_store: &S,
+    bucket: &CoverageIndexV2Bucket,
+    skip_delta_keys: &BTreeSet<String>,
+    max_objects: Option<usize>,
+) -> Result<Vec<CoverageIndexV2DeltaObject>, DatalensError>
+where
+    S: ObjectStore,
+{
+    let objects = list_v2_delta_object_metadata_for_bucket(
+        object_store,
+        bucket,
+        skip_delta_keys,
+        max_objects,
+    )?;
+    let mut deltas = Vec::new();
+    for object in objects {
+        let bytes = object_store.get(&object.key)?;
+        let delta: CoverageIndexV2Delta = serde_json::from_slice(&bytes).map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::StorageReadFailure,
+                format!("decode coverage index v2 delta {}: {error}", object.key),
+            )
+        })?;
+        validate_v2_record_scope(
+            "delta",
+            &object.key,
+            delta.schema_version,
+            &delta.scope,
+            delta.bucket_start,
+            delta.bucket_end,
+            bucket,
+        )?;
+        deltas.push(CoverageIndexV2DeltaObject {
+            key: object.key,
+            size: object.size,
+            delta,
+        });
+    }
+    Ok(deltas)
+}
+
+fn list_v2_delta_object_keys_for_bucket<S>(
+    object_store: &S,
+    bucket: &CoverageIndexV2Bucket,
+) -> Result<BTreeSet<String>, DatalensError>
+where
+    S: ObjectStore,
+{
+    Ok(
+        list_v2_delta_object_metadata_for_bucket(object_store, bucket, &BTreeSet::new(), None)?
+            .into_iter()
+            .map(|object| object.key)
+            .collect(),
+    )
+}
+
+fn list_v2_delta_object_metadata_for_bucket<S>(
+    object_store: &S,
+    bucket: &CoverageIndexV2Bucket,
+    skip_delta_keys: &BTreeSet<String>,
+    max_objects: Option<usize>,
+) -> Result<Vec<ObjectMetadata>, DatalensError>
+where
+    S: ObjectStore,
+{
     let delta_prefix = coverage_index_v2_delta_prefix(
         &bucket.chain_key,
         &bucket.scope,
         bucket.bucket_start,
         bucket.bucket_end,
     );
-    let mut start_after = delta_start_after;
+    let strict_prefix = format!("{delta_prefix}/");
+    let mut objects = Vec::new();
+    let mut start_after = None;
     loop {
         let page = object_store.list_page(
             &delta_prefix,
@@ -335,35 +622,20 @@ where
             COVERAGE_INDEX_V2_LIST_PAGE_SIZE,
         )?;
         for object in &page.objects {
-            let bytes = object_store.get(&object.key)?;
-            let mut delta: CoverageIndexV2Delta =
-                serde_json::from_slice(&bytes).map_err(|error| {
-                    DatalensError::new(
-                        DatalensErrorKind::StorageReadFailure,
-                        format!("decode coverage index v2 delta {}: {error}", object.key),
-                    )
-                })?;
-            validate_v2_record_scope(
-                "delta",
-                &object.key,
-                delta.schema_version,
-                &delta.scope,
-                delta.bucket_start,
-                delta.bucket_end,
-                bucket,
-            )?;
-            any_bucket_has_index = true;
-            if let Some(replacement) = delta.replacement {
-                apply_v2_replacement(entries, &replacement.entry)?;
+            if !object.key.starts_with(&strict_prefix) || skip_delta_keys.contains(&object.key) {
+                continue;
             }
-            entries.append(&mut delta.entries);
+            objects.push(object.clone());
+            if max_objects.is_some_and(|max_objects| objects.len() >= max_objects) {
+                return Ok(objects);
+            }
         }
         if !page.has_more {
             break;
         }
         start_after = page.objects.last().map(|object| object.key.clone());
     }
-    Ok(any_bucket_has_index)
+    Ok(objects)
 }
 
 fn apply_v2_replacement(
@@ -390,10 +662,23 @@ fn apply_v2_replacement(
     Ok(())
 }
 
-fn latest_v2_snapshot_head<S>(
+pub(crate) fn latest_v2_snapshot_head<S>(
     object_store: &S,
     bucket: &CoverageIndexV2Bucket,
 ) -> Result<Option<CoverageIndexV2SnapshotHead>, DatalensError>
+where
+    S: ObjectStore,
+{
+    Ok(list_v2_snapshot_heads_for_bucket(object_store, bucket)?
+        .into_iter()
+        .last()
+        .map(|(_, head)| head))
+}
+
+fn list_v2_snapshot_heads_for_bucket<S>(
+    object_store: &S,
+    bucket: &CoverageIndexV2Bucket,
+) -> Result<Vec<(String, CoverageIndexV2SnapshotHead)>, DatalensError>
 where
     S: ObjectStore,
 {
@@ -403,7 +688,8 @@ where
         bucket.bucket_start,
         bucket.bucket_end,
     );
-    let mut latest = None;
+    let strict_prefix = format!("{prefix}/");
+    let mut heads = Vec::new();
     let mut start_after = None;
     loop {
         let page = object_store.list_page(
@@ -412,6 +698,9 @@ where
             COVERAGE_INDEX_V2_LIST_PAGE_SIZE,
         )?;
         for object in &page.objects {
+            if !object.key.starts_with(&strict_prefix) {
+                continue;
+            }
             let bytes = object_store.get(&object.key)?;
             let head: CoverageIndexV2SnapshotHead =
                 serde_json::from_slice(&bytes).map_err(|error| {
@@ -432,25 +721,120 @@ where
                 head.bucket_end,
                 bucket,
             )?;
-            let is_newer = latest
-                .as_ref()
-                .map(
-                    |(latest_key, latest_head): &(String, CoverageIndexV2SnapshotHead)| {
-                        (head.created_at_unix_ms, object.key.as_str())
-                            > (latest_head.created_at_unix_ms, latest_key.as_str())
-                    },
-                )
-                .unwrap_or(true);
-            if is_newer {
-                latest = Some((object.key.clone(), head));
-            }
+            heads.push((object.key.clone(), head));
         }
         if !page.has_more {
             break;
         }
         start_after = page.objects.last().map(|object| object.key.clone());
     }
-    Ok(latest.map(|(_, head)| head))
+    heads.sort_by(|left, right| {
+        (left.1.created_at_unix_ms, left.0.as_str())
+            .cmp(&(right.1.created_at_unix_ms, right.0.as_str()))
+    });
+    Ok(heads)
+}
+
+pub(crate) fn read_v2_snapshot<S>(
+    object_store: &S,
+    bucket: &CoverageIndexV2Bucket,
+    snapshot_key: &str,
+) -> Result<CoverageIndexV2Snapshot, DatalensError>
+where
+    S: ObjectStore,
+{
+    let snapshot_bytes = object_store.get(snapshot_key)?;
+    let snapshot: CoverageIndexV2Snapshot =
+        serde_json::from_slice(&snapshot_bytes).map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::StorageReadFailure,
+                format!("decode coverage index v2 snapshot {snapshot_key}: {error}"),
+            )
+        })?;
+    validate_v2_record_scope(
+        "snapshot",
+        snapshot_key,
+        snapshot.schema_version,
+        &snapshot.scope,
+        snapshot.bucket_start,
+        snapshot.bucket_end,
+        bucket,
+    )?;
+    Ok(snapshot)
+}
+
+pub(crate) fn v2_cleanup_record_is_safe_to_delete<S>(
+    object_store: &S,
+    chain: &ChainIdentity,
+    cleanup: &CoverageIndexV2CleanupRecordObject,
+) -> Result<bool, DatalensError>
+where
+    S: ObjectStore,
+{
+    let record = &cleanup.record;
+    let bucket = CoverageIndexV2Bucket {
+        chain_key: chain.key_prefix(),
+        scope: record.scope.clone(),
+        bucket_start: record.bucket_start,
+        bucket_end: record.bucket_end,
+    };
+    validate_v2_record_scope(
+        "cleanup record",
+        &cleanup.key,
+        record.schema_version,
+        &record.scope,
+        record.bucket_start,
+        record.bucket_end,
+        &bucket,
+    )?;
+    if record.compacted_delta_keys.is_empty() {
+        return Ok(false);
+    }
+    if !cleanup_record_key_matches_bucket(&cleanup.key, chain, &bucket) {
+        return Ok(false);
+    }
+    let delta_prefix = format!(
+        "{}/",
+        coverage_index_v2_delta_prefix(
+            &bucket.chain_key,
+            &bucket.scope,
+            bucket.bucket_start,
+            bucket.bucket_end,
+        )
+    );
+    for object_key in &record.compacted_delta_keys {
+        if validate_object_key(object_key).is_err()
+            || !object_key.starts_with(&delta_prefix)
+            || !object_key.ends_with(".json")
+        {
+            return Ok(false);
+        }
+    }
+    let Some(latest_head) = latest_v2_snapshot_head(object_store, &bucket)? else {
+        return Ok(false);
+    };
+    let latest_snapshot = read_v2_snapshot(object_store, &bucket, &latest_head.snapshot_key)?;
+    let latest_delta_keys = latest_snapshot
+        .compacted_delta_keys
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    Ok(record
+        .compacted_delta_keys
+        .iter()
+        .all(|key| latest_delta_keys.contains(key)))
+}
+
+fn cleanup_record_key_matches_bucket(
+    key: &str,
+    chain: &ChainIdentity,
+    bucket: &CoverageIndexV2Bucket,
+) -> bool {
+    let prefix = format!("{}/", coverage_index_v2_cleanup_prefix(&chain.key_prefix()));
+    let bucket_prefix = format!(
+        "{}{}/{:020}-{:020}/",
+        prefix, bucket.scope, bucket.bucket_start, bucket.bucket_end
+    );
+    key.starts_with(&bucket_prefix) && key.ends_with(".json")
 }
 
 fn validate_v2_record_scope(
@@ -663,7 +1047,6 @@ where
     Ok(())
 }
 
-#[allow(dead_code)]
 pub(crate) fn write_v2_snapshot<S>(
     object_store: &S,
     chain: &ChainIdentity,
@@ -705,7 +1088,6 @@ where
     Ok(key)
 }
 
-#[allow(dead_code)]
 pub(crate) fn write_v2_snapshot_head<S>(
     object_store: &S,
     chain: &ChainIdentity,
@@ -755,7 +1137,41 @@ where
     Ok(key)
 }
 
-fn unix_ms_now() -> Result<u64, DatalensError> {
+pub(crate) fn write_v2_cleanup_record<S>(
+    object_store: &S,
+    chain: &ChainIdentity,
+    record: CoverageIndexV2CleanupRecord,
+) -> Result<String, DatalensError>
+where
+    S: ObjectStore,
+{
+    let key = format!(
+        "{}/{}/{:020}-{:020}/{}.json",
+        coverage_index_v2_cleanup_prefix(&chain.key_prefix()),
+        record.scope,
+        record.bucket_start,
+        record.bucket_end,
+        coverage_index_v2_immutable_id()?
+    );
+    let bytes = serde_json::to_vec_pretty(&record).map_err(|error| {
+        DatalensError::new(
+            DatalensErrorKind::Internal,
+            format!("encode coverage index v2 cleanup record: {error}"),
+        )
+    })?;
+    object_store.put(&key, &bytes).map_err(|error| {
+        DatalensError::new(
+            DatalensErrorKind::ManifestUpdateFailure,
+            format!(
+                "write coverage index v2 cleanup record {key}: {}",
+                error.message
+            ),
+        )
+    })?;
+    Ok(key)
+}
+
+pub(crate) fn unix_ms_now() -> Result<u64, DatalensError> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| DatalensError::internal("system clock before unix epoch"))?
@@ -1237,6 +1653,60 @@ fn coverage_index_v2_snapshot_head_prefix(
     format!(
         "chains/{chain_key}/coverage-index-v2/snapshot-heads/{scope}/{bucket_start:020}-{bucket_end:020}"
     )
+}
+
+fn coverage_index_v2_cleanup_prefix(chain_key: &str) -> String {
+    format!("chains/{chain_key}/coverage-index-v2/cleanup")
+}
+
+fn parse_v2_bucket_from_object_key(
+    prefix: &str,
+    key: &str,
+) -> Result<Option<CoverageIndexV2Bucket>, DatalensError> {
+    let Some(rest) = key.strip_prefix(prefix) else {
+        return Ok(None);
+    };
+    let rest = rest.trim_start_matches('/');
+    let Some((bucket_path, file_name)) = rest.rsplit_once('/') else {
+        return Ok(None);
+    };
+    if !file_name.ends_with(".json") {
+        return Ok(None);
+    }
+    let Some((scope, bucket_range)) = bucket_path.rsplit_once('/') else {
+        return Ok(None);
+    };
+    let Some((bucket_start, bucket_end)) = bucket_range.split_once('-') else {
+        return Ok(None);
+    };
+    let bucket_start = bucket_start.parse::<u64>().map_err(|error| {
+        DatalensError::new(
+            DatalensErrorKind::StorageReadFailure,
+            format!("parse coverage index v2 bucket start from {key}: {error}"),
+        )
+    })?;
+    let bucket_end = bucket_end.parse::<u64>().map_err(|error| {
+        DatalensError::new(
+            DatalensErrorKind::StorageReadFailure,
+            format!("parse coverage index v2 bucket end from {key}: {error}"),
+        )
+    })?;
+    let chain_key = prefix
+        .strip_prefix("chains/")
+        .and_then(|value| value.strip_suffix("/coverage-index-v2/deltas"))
+        .ok_or_else(|| {
+            DatalensError::new(
+                DatalensErrorKind::StorageReadFailure,
+                format!("parse coverage index v2 chain from prefix {prefix}"),
+            )
+        })?
+        .to_owned();
+    Ok(Some(CoverageIndexV2Bucket {
+        chain_key,
+        scope: scope.to_owned(),
+        bucket_start,
+        bucket_end,
+    }))
 }
 
 fn exact_coverage_index_query_keys_for_ranges(
