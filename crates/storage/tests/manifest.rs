@@ -28,6 +28,9 @@ use parquet::{
 };
 use sha2::{Digest, Sha256};
 
+mod support;
+use support::CountingObjectStore;
+
 #[derive(Clone, Debug)]
 struct FailingPutObjectStore {
     inner: LocalObjectStore,
@@ -580,7 +583,9 @@ struct ManifestAccessCountingStore {
     inner: LocalObjectStore,
     manifest_access_count: Arc<AtomicUsize>,
     manifest_segment_list_count: Arc<AtomicUsize>,
-    coverage_index_list_count: Arc<AtomicUsize>,
+    legacy_coverage_index_list_count: Arc<AtomicUsize>,
+    coverage_index_v2_list_count: Arc<AtomicUsize>,
+    broad_coverage_index_v2_list_count: Arc<AtomicUsize>,
     data_object_put_count: Arc<AtomicUsize>,
     data_object_get_count: Arc<AtomicUsize>,
 }
@@ -591,7 +596,9 @@ impl ManifestAccessCountingStore {
             inner: LocalObjectStore::new(root),
             manifest_access_count: Arc::new(AtomicUsize::new(0)),
             manifest_segment_list_count: Arc::new(AtomicUsize::new(0)),
-            coverage_index_list_count: Arc::new(AtomicUsize::new(0)),
+            legacy_coverage_index_list_count: Arc::new(AtomicUsize::new(0)),
+            coverage_index_v2_list_count: Arc::new(AtomicUsize::new(0)),
+            broad_coverage_index_v2_list_count: Arc::new(AtomicUsize::new(0)),
             data_object_put_count: Arc::new(AtomicUsize::new(0)),
             data_object_get_count: Arc::new(AtomicUsize::new(0)),
         }
@@ -614,11 +621,24 @@ impl ManifestAccessCountingStore {
     }
 
     fn coverage_index_list_count(&self) -> usize {
-        self.coverage_index_list_count.load(Ordering::SeqCst)
+        self.legacy_coverage_index_list_count.load(Ordering::SeqCst)
+    }
+
+    fn coverage_index_v2_list_count(&self) -> usize {
+        self.coverage_index_v2_list_count.load(Ordering::SeqCst)
+    }
+
+    fn broad_coverage_index_v2_list_count(&self) -> usize {
+        self.broad_coverage_index_v2_list_count
+            .load(Ordering::SeqCst)
     }
 
     fn reset_coverage_index_list_count(&self) {
-        self.coverage_index_list_count.store(0, Ordering::SeqCst);
+        self.legacy_coverage_index_list_count
+            .store(0, Ordering::SeqCst);
+        self.coverage_index_v2_list_count.store(0, Ordering::SeqCst);
+        self.broad_coverage_index_v2_list_count
+            .store(0, Ordering::SeqCst);
     }
 
     fn data_object_put_count(&self) -> usize {
@@ -645,6 +665,34 @@ impl ManifestAccessCountingStore {
         key.ends_with("/manifest.json")
             || key.ends_with("/manifest.version")
             || key.contains("/manifest-segments")
+    }
+
+    fn is_coverage_index_v2_list(prefix: &str) -> bool {
+        prefix.contains("/coverage-index-v2")
+    }
+
+    fn is_bounded_coverage_index_v2_list(prefix: &str) -> bool {
+        prefix.contains("/coverage-index-v2/deltas/")
+            || prefix.contains("/coverage-index-v2/snapshot-heads/")
+            || prefix.contains("/coverage-index-v2/snapshots/")
+    }
+
+    fn is_legacy_coverage_index_list(prefix: &str) -> bool {
+        prefix.contains("/coverage-index") && !Self::is_coverage_index_v2_list(prefix)
+    }
+
+    fn count_coverage_index_list(&self, prefix: &str) {
+        if Self::is_coverage_index_v2_list(prefix) {
+            self.coverage_index_v2_list_count
+                .fetch_add(1, Ordering::SeqCst);
+            if !Self::is_bounded_coverage_index_v2_list(prefix) {
+                self.broad_coverage_index_v2_list_count
+                    .fetch_add(1, Ordering::SeqCst);
+            }
+        } else if Self::is_legacy_coverage_index_list(prefix) {
+            self.legacy_coverage_index_list_count
+                .fetch_add(1, Ordering::SeqCst);
+        }
     }
 }
 
@@ -692,10 +740,7 @@ impl ObjectStore for ManifestAccessCountingStore {
             self.manifest_segment_list_count
                 .fetch_add(1, Ordering::SeqCst);
         }
-        if prefix.contains("/coverage-index") {
-            self.coverage_index_list_count
-                .fetch_add(1, Ordering::SeqCst);
-        }
+        self.count_coverage_index_list(prefix);
         self.inner.list(prefix)
     }
 
@@ -712,10 +757,7 @@ impl ObjectStore for ManifestAccessCountingStore {
             self.manifest_segment_list_count
                 .fetch_add(1, Ordering::SeqCst);
         }
-        if prefix.contains("/coverage-index") {
-            self.coverage_index_list_count
-                .fetch_add(1, Ordering::SeqCst);
-        }
+        self.count_coverage_index_list(prefix);
         self.inner.list_page(prefix, start_after, limit)
     }
 
@@ -1458,7 +1500,7 @@ fn coverage_index_keys<S: ObjectStore>(
         .collect()
 }
 
-fn clear_coverage_index<S: ObjectStore>(storage: &DurableStorage<S>, chain: &ChainIdentity) {
+fn clear_coverage_index_v1<S: ObjectStore>(storage: &DurableStorage<S>, chain: &ChainIdentity) {
     for prefix in [
         format!("chains/{}/coverage-index", chain.key_prefix()),
         format!("chains/{}/coverage-index-semantic", chain.key_prefix()),
@@ -1473,6 +1515,204 @@ fn clear_coverage_index<S: ObjectStore>(storage: &DurableStorage<S>, chain: &Cha
                 .delete(&object.key)
                 .expect("delete coverage index object");
         }
+    }
+}
+
+fn clear_coverage_index_v2<S: ObjectStore>(storage: &DurableStorage<S>, chain: &ChainIdentity) {
+    let prefix = format!("chains/{}/coverage-index-v2", chain.key_prefix());
+    for object in storage
+        .object_store()
+        .list(&prefix)
+        .expect("coverage index v2 list")
+    {
+        storage
+            .object_store()
+            .delete(&object.key)
+            .expect("delete coverage index v2 object");
+    }
+}
+
+fn clear_coverage_index<S: ObjectStore>(storage: &DurableStorage<S>, chain: &ChainIdentity) {
+    clear_coverage_index_v1(storage, chain);
+    clear_coverage_index_v2(storage, chain);
+}
+
+fn coverage_index_v2_exact_scope(
+    dataset_key: &DatasetKey,
+    range_kind: &str,
+    selector: &DatasetSelector,
+    finality_level: ManifestFinalityLevel,
+) -> String {
+    format!(
+        "exact/{}/{}/{}/{}",
+        dataset_key.as_str(),
+        range_kind,
+        selector.fingerprint(),
+        finality_level.as_str()
+    )
+}
+
+fn coverage_index_v2_bucket_dir(scope: &str, range: &LedgerRange) -> String {
+    let bucket_size = 100_000;
+    let bucket_start = (range.start() / bucket_size) * bucket_size;
+    let bucket_end = bucket_start + bucket_size - 1;
+    format!("{scope}/{bucket_start:020}-{bucket_end:020}")
+}
+
+fn coverage_index_v2_delta_prefix(
+    chain: &ChainIdentity,
+    scope: &str,
+    range: &LedgerRange,
+) -> String {
+    format!(
+        "chains/{}/coverage-index-v2/deltas/{}",
+        chain.key_prefix(),
+        coverage_index_v2_bucket_dir(scope, range)
+    )
+}
+
+fn write_coverage_index_v2_delta<S: ObjectStore>(
+    storage: &DurableStorage<S>,
+    chain: &ChainIdentity,
+    scope: &str,
+    range: &LedgerRange,
+    id: &str,
+    entries: Vec<ManifestEntry>,
+) -> String {
+    let key = format!(
+        "{}/{id}.json",
+        coverage_index_v2_delta_prefix(chain, scope, range)
+    );
+    let bucket_size = 100_000;
+    let bucket_start = (range.start() / bucket_size) * bucket_size;
+    let bucket_end = bucket_start + bucket_size - 1;
+    let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+        "schema_version": 1,
+        "created_at_unix_ms": 1,
+        "scope": scope,
+        "bucket_start": bucket_start,
+        "bucket_end": bucket_end,
+        "entries": entries,
+    }))
+    .expect("coverage index v2 delta bytes");
+    storage
+        .object_store()
+        .put(&key, &bytes)
+        .expect("write coverage index v2 delta");
+    key
+}
+
+fn write_coverage_index_v2_snapshot<S: ObjectStore>(
+    storage: &DurableStorage<S>,
+    chain: &ChainIdentity,
+    scope: &str,
+    range: &LedgerRange,
+    id: &str,
+    entries: Vec<ManifestEntry>,
+    compacted_delta_keys: Vec<String>,
+) -> String {
+    let bucket_dir = coverage_index_v2_bucket_dir(scope, range);
+    let key = format!(
+        "chains/{}/coverage-index-v2/snapshots/{bucket_dir}/{id}.json",
+        chain.key_prefix()
+    );
+    let bucket_size = 100_000;
+    let bucket_start = (range.start() / bucket_size) * bucket_size;
+    let bucket_end = bucket_start + bucket_size - 1;
+    let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+        "schema_version": 1,
+        "created_at_unix_ms": 1,
+        "scope": scope,
+        "bucket_start": bucket_start,
+        "bucket_end": bucket_end,
+        "entries": entries,
+        "compacted_delta_keys": compacted_delta_keys,
+    }))
+    .expect("coverage index v2 snapshot bytes");
+    storage
+        .object_store()
+        .put(&key, &bytes)
+        .expect("write coverage index v2 snapshot");
+    key
+}
+
+fn write_coverage_index_v2_snapshot_head<S: ObjectStore>(
+    storage: &DurableStorage<S>,
+    chain: &ChainIdentity,
+    scope: &str,
+    range: &LedgerRange,
+    id: &str,
+    snapshot_key: &str,
+    included_delta_high_watermark: &str,
+) -> String {
+    write_coverage_index_v2_snapshot_head_with_created_at(
+        storage,
+        chain,
+        scope,
+        range,
+        (id, 1),
+        snapshot_key,
+        included_delta_high_watermark,
+    )
+}
+
+fn write_coverage_index_v2_snapshot_head_with_created_at<S: ObjectStore>(
+    storage: &DurableStorage<S>,
+    chain: &ChainIdentity,
+    scope: &str,
+    range: &LedgerRange,
+    head_id: (&str, u64),
+    snapshot_key: &str,
+    included_delta_high_watermark: &str,
+) -> String {
+    let (id, created_at_unix_ms) = head_id;
+    let bucket_dir = coverage_index_v2_bucket_dir(scope, range);
+    let key = format!(
+        "chains/{}/coverage-index-v2/snapshot-heads/{bucket_dir}/{id}.json",
+        chain.key_prefix()
+    );
+    let bucket_size = 100_000;
+    let bucket_start = (range.start() / bucket_size) * bucket_size;
+    let bucket_end = bucket_start + bucket_size - 1;
+    let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+        "schema_version": 1,
+        "created_at_unix_ms": created_at_unix_ms,
+        "scope": scope,
+        "bucket_start": bucket_start,
+        "bucket_end": bucket_end,
+        "snapshot_key": snapshot_key,
+        "included_delta_high_watermark": included_delta_high_watermark,
+    }))
+    .expect("coverage index v2 snapshot head bytes");
+    storage
+        .object_store()
+        .put(&key, &bytes)
+        .expect("write coverage index v2 snapshot head");
+    key
+}
+
+fn empty_manifest_entry(
+    chain: &ChainIdentity,
+    dataset_key: DatasetKey,
+    selector: &DatasetSelector,
+    range: LedgerRange,
+    finality_level: ManifestFinalityLevel,
+) -> ManifestEntry {
+    ManifestEntry {
+        chain: chain.clone(),
+        dataset_key,
+        range,
+        selector_fingerprint: selector.fingerprint(),
+        selector_canonical_key: selector.canonical_key(),
+        finality_level,
+        object_key: None,
+        object_encoding: None,
+        object_compression: None,
+        row_count: 0,
+        object_size_bytes: None,
+        checksum: None,
+        checksum_algorithm: None,
+        written_at_unix_seconds: None,
     }
 }
 
@@ -4091,6 +4331,487 @@ fn test_exact_indexed_query_uses_deterministic_keys_without_listing_coverage_ind
 }
 
 #[test]
+fn test_coverage_index_v2_hot_writes_same_bucket_use_distinct_delta_keys() {
+    let object_store = CountingObjectStore::new(LocalObjectStore::new(temp_storage_root(
+        "coverage-index-v2-delta-append-only",
+    )));
+    let storage = DurableStorage::from_object_store(object_store.clone());
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let rows = DatasetRows::new(DatasetKey::evm_blocks(), QueryRows::EvmBlocks(Vec::new()))
+        .expect("dataset rows");
+
+    for block in [10, 11] {
+        storage
+            .write_rows(StorageWriteRequest {
+                chain: &chain,
+                dataset_key: DatasetKey::evm_blocks(),
+                selector: &selector,
+                range: LedgerRange::blocks(block, block).expect("valid range"),
+                rows: &rows,
+                finality_level: FinalityLevel::Safe,
+                record_empty_coverage: true,
+            })
+            .expect("write empty coverage");
+    }
+
+    let scope = coverage_index_v2_exact_scope(
+        &DatasetKey::evm_blocks(),
+        "block",
+        &selector,
+        ManifestFinalityLevel::Safe,
+    );
+    let prefix = coverage_index_v2_delta_prefix(
+        &chain,
+        &scope,
+        &LedgerRange::blocks(10, 10).expect("valid range"),
+    );
+    let delta_keys = storage
+        .object_store()
+        .list(&prefix)
+        .expect("coverage index v2 delta list")
+        .into_iter()
+        .map(|object| object.key)
+        .collect::<Vec<_>>();
+
+    assert_eq!(delta_keys.len(), 2);
+    object_store.assert_no_overwrite(&prefix);
+}
+
+#[test]
+fn test_coverage_index_v2_read_without_snapshot_matches_v1_exact_coverage() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-index-v2-exact-deltas"));
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let range = LedgerRange::blocks(10, 12).expect("valid range");
+    let rows = DatasetRows::new(DatasetKey::evm_blocks(), QueryRows::EvmBlocks(Vec::new()))
+        .expect("dataset rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &selector,
+            range: range.clone(),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write empty coverage");
+
+    assert_eq!(
+        storage
+            .covered_ranges(&chain, &DatasetKey::evm_blocks(), &selector, range.clone(),)
+            .expect("v1 covered ranges"),
+        vec![range.clone()]
+    );
+
+    clear_coverage_index_v1(&storage, &chain);
+
+    assert_eq!(
+        storage
+            .covered_ranges(&chain, &DatasetKey::evm_blocks(), &selector, range.clone())
+            .expect("v2 covered ranges"),
+        vec![range.clone()]
+    );
+    assert_eq!(
+        storage
+            .read_rows(&chain, &DatasetKey::evm_blocks(), &selector, range)
+            .expect("v2 read rows"),
+        rows
+    );
+}
+
+#[test]
+fn test_coverage_index_v2_read_supports_semantic_evm_log_deltas() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-index-v2-semantic-deltas"));
+    let chain = test_chain();
+    let broad_selector = evm_log_selector(Vec::new(), Vec::new());
+    let narrow_selector = evm_log_selector(vec![ADDRESS_A], vec![Some(vec![TOPIC_1])]);
+    let range = LedgerRange::blocks(42, 42).expect("valid range");
+    let rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![
+            log_record(42, 0, ADDRESS_A, vec![TOPIC_1]),
+            log_record(42, 1, ADDRESS_B, vec![TOPIC_2]),
+        ]),
+    )
+    .expect("dataset rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &broad_selector,
+            range: range.clone(),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write log coverage");
+    clear_coverage_index_v1(&storage, &chain);
+
+    let read = storage
+        .read_rows(
+            &chain,
+            &DatasetKey::evm_logs(),
+            &narrow_selector,
+            range.clone(),
+        )
+        .expect("read narrow logs through v2 semantic index");
+
+    match read.into_rows() {
+        QueryRows::EvmLogs(logs) => {
+            assert_eq!(logs.len(), 1);
+            assert_eq!(logs[0].address, ADDRESS_A);
+            assert_eq!(logs[0].topics, vec![TOPIC_1.to_owned()]);
+        }
+        rows => panic!("expected log rows, got {rows:?}"),
+    }
+}
+
+#[test]
+fn test_coverage_index_v1_only_still_reads_after_v2_prefix_is_removed() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-index-v1-only"));
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let range = LedgerRange::blocks(20, 21).expect("valid range");
+    let rows = DatasetRows::new(DatasetKey::evm_blocks(), QueryRows::EvmBlocks(Vec::new()))
+        .expect("dataset rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &selector,
+            range: range.clone(),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write empty coverage");
+    clear_coverage_index_v2(&storage, &chain);
+
+    assert_eq!(
+        storage
+            .covered_ranges(&chain, &DatasetKey::evm_blocks(), &selector, range.clone())
+            .expect("v1 covered ranges"),
+        vec![range]
+    );
+}
+
+#[test]
+fn test_coverage_index_v1_and_v2_coexistence_returns_normalized_coverage() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-index-v1-v2-coexist"));
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let v1_range = LedgerRange::blocks(99_998, 99_999).expect("valid range");
+    let v2_range = LedgerRange::blocks(100_000, 100_001).expect("valid range");
+    let query_range = LedgerRange::blocks(99_998, 100_001).expect("valid range");
+    let v1_entry = empty_manifest_entry(
+        &chain,
+        DatasetKey::evm_blocks(),
+        &selector,
+        v1_range,
+        ManifestFinalityLevel::Safe,
+    );
+    let v2_entry = empty_manifest_entry(
+        &chain,
+        DatasetKey::evm_blocks(),
+        &selector,
+        v2_range.clone(),
+        ManifestFinalityLevel::Safe,
+    );
+    let scope = coverage_index_v2_exact_scope(
+        &DatasetKey::evm_blocks(),
+        "block",
+        &selector,
+        ManifestFinalityLevel::Safe,
+    );
+
+    write_coverage_index_json(
+        &storage,
+        &chain,
+        &DatasetKey::evm_blocks(),
+        "block",
+        &selector,
+        ManifestFinalityLevel::Safe,
+        &query_range,
+        serde_json::json!({ "entries": [v1_entry] }),
+    );
+    write_coverage_index_v2_delta(&storage, &chain, &scope, &v2_range, "0001", vec![v2_entry]);
+
+    assert_eq!(
+        storage
+            .covered_ranges(&chain, &DatasetKey::evm_blocks(), &selector, query_range)
+            .expect("coexisting coverage"),
+        vec![LedgerRange::blocks(99_998, 100_001).expect("valid range")]
+    );
+}
+
+#[test]
+fn test_coverage_index_v2_same_bucket_coexistence_reads_v2_delta() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-index-v1-v2-same-bucket"));
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let v1_range = LedgerRange::blocks(10, 10).expect("valid range");
+    let v2_range = LedgerRange::blocks(11, 12).expect("valid range");
+    let query_range = LedgerRange::blocks(10, 12).expect("valid range");
+    let v1_entry = empty_manifest_entry(
+        &chain,
+        DatasetKey::evm_blocks(),
+        &selector,
+        v1_range,
+        ManifestFinalityLevel::Safe,
+    );
+    let v2_entry = empty_manifest_entry(
+        &chain,
+        DatasetKey::evm_blocks(),
+        &selector,
+        v2_range.clone(),
+        ManifestFinalityLevel::Safe,
+    );
+    let scope = coverage_index_v2_exact_scope(
+        &DatasetKey::evm_blocks(),
+        "block",
+        &selector,
+        ManifestFinalityLevel::Safe,
+    );
+
+    write_coverage_index_json(
+        &storage,
+        &chain,
+        &DatasetKey::evm_blocks(),
+        "block",
+        &selector,
+        ManifestFinalityLevel::Safe,
+        &query_range,
+        serde_json::json!({ "entries": [v1_entry] }),
+    );
+    write_coverage_index_v2_delta(&storage, &chain, &scope, &v2_range, "0001", vec![v2_entry]);
+
+    assert_eq!(
+        storage
+            .covered_ranges(&chain, &DatasetKey::evm_blocks(), &selector, query_range)
+            .expect("coexisting same-bucket coverage"),
+        vec![LedgerRange::blocks(10, 12).expect("valid range")]
+    );
+}
+
+#[test]
+fn test_coverage_index_v2_snapshot_heads_choose_latest_and_apply_pending_deltas() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-index-v2-snapshot-head"));
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let query_range = LedgerRange::blocks(10, 13).expect("valid range");
+    let snapshot_range = LedgerRange::blocks(10, 12).expect("valid range");
+    let old_snapshot_range = LedgerRange::blocks(10, 10).expect("valid range");
+    let compacted_delta_range = LedgerRange::blocks(12, 12).expect("valid range");
+    let pending_delta_range = LedgerRange::blocks(13, 13).expect("valid range");
+    let scope = coverage_index_v2_exact_scope(
+        &DatasetKey::evm_blocks(),
+        "block",
+        &selector,
+        ManifestFinalityLevel::Safe,
+    );
+    let compacted_delta_key = write_coverage_index_v2_delta(
+        &storage,
+        &chain,
+        &scope,
+        &compacted_delta_range,
+        "0001",
+        vec![empty_manifest_entry(
+            &chain,
+            DatasetKey::evm_blocks(),
+            &selector,
+            compacted_delta_range.clone(),
+            ManifestFinalityLevel::Safe,
+        )],
+    );
+    write_coverage_index_v2_delta(
+        &storage,
+        &chain,
+        &scope,
+        &pending_delta_range,
+        "0002",
+        vec![empty_manifest_entry(
+            &chain,
+            DatasetKey::evm_blocks(),
+            &selector,
+            pending_delta_range.clone(),
+            ManifestFinalityLevel::Safe,
+        )],
+    );
+    let old_snapshot_key = write_coverage_index_v2_snapshot(
+        &storage,
+        &chain,
+        &scope,
+        &old_snapshot_range,
+        "old",
+        vec![empty_manifest_entry(
+            &chain,
+            DatasetKey::evm_blocks(),
+            &selector,
+            old_snapshot_range.clone(),
+            ManifestFinalityLevel::Safe,
+        )],
+        Vec::new(),
+    );
+    let latest_snapshot_key = write_coverage_index_v2_snapshot(
+        &storage,
+        &chain,
+        &scope,
+        &snapshot_range,
+        "latest",
+        vec![empty_manifest_entry(
+            &chain,
+            DatasetKey::evm_blocks(),
+            &selector,
+            snapshot_range.clone(),
+            ManifestFinalityLevel::Safe,
+        )],
+        vec![compacted_delta_key.clone()],
+    );
+    write_coverage_index_v2_snapshot_head(
+        &storage,
+        &chain,
+        &scope,
+        &query_range,
+        "0001",
+        &old_snapshot_key,
+        "",
+    );
+    write_coverage_index_v2_snapshot_head(
+        &storage,
+        &chain,
+        &scope,
+        &query_range,
+        "0002",
+        &latest_snapshot_key,
+        &compacted_delta_key,
+    );
+
+    assert_eq!(
+        storage
+            .covered_ranges(&chain, &DatasetKey::evm_blocks(), &selector, query_range)
+            .expect("snapshot coverage"),
+        vec![LedgerRange::blocks(10, 13).expect("valid range")]
+    );
+}
+
+#[test]
+fn test_coverage_index_v2_snapshot_heads_choose_newest_created_at_before_key_order() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-index-v2-snapshot-head-time"));
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let query_range = LedgerRange::blocks(10, 11).expect("valid range");
+    let old_snapshot_range = LedgerRange::blocks(10, 10).expect("valid range");
+    let newest_snapshot_range = LedgerRange::blocks(10, 11).expect("valid range");
+    let scope = coverage_index_v2_exact_scope(
+        &DatasetKey::evm_blocks(),
+        "block",
+        &selector,
+        ManifestFinalityLevel::Safe,
+    );
+    let old_snapshot_key = write_coverage_index_v2_snapshot(
+        &storage,
+        &chain,
+        &scope,
+        &old_snapshot_range,
+        "old",
+        vec![empty_manifest_entry(
+            &chain,
+            DatasetKey::evm_blocks(),
+            &selector,
+            old_snapshot_range.clone(),
+            ManifestFinalityLevel::Safe,
+        )],
+        Vec::new(),
+    );
+    let newest_snapshot_key = write_coverage_index_v2_snapshot(
+        &storage,
+        &chain,
+        &scope,
+        &newest_snapshot_range,
+        "newest",
+        vec![empty_manifest_entry(
+            &chain,
+            DatasetKey::evm_blocks(),
+            &selector,
+            newest_snapshot_range.clone(),
+            ManifestFinalityLevel::Safe,
+        )],
+        Vec::new(),
+    );
+    write_coverage_index_v2_snapshot_head_with_created_at(
+        &storage,
+        &chain,
+        &scope,
+        &query_range,
+        ("zz-old", 1),
+        &old_snapshot_key,
+        "",
+    );
+    write_coverage_index_v2_snapshot_head_with_created_at(
+        &storage,
+        &chain,
+        &scope,
+        &query_range,
+        ("aa-newest", 2),
+        &newest_snapshot_key,
+        "",
+    );
+
+    assert_eq!(
+        storage
+            .covered_ranges(&chain, &DatasetKey::evm_blocks(), &selector, query_range)
+            .expect("snapshot coverage"),
+        vec![newest_snapshot_range]
+    );
+}
+
+#[test]
+fn test_coverage_index_v2_read_uses_paginated_list() {
+    let object_store = CountingObjectStore::new(LocalObjectStore::new(temp_storage_root(
+        "coverage-index-v2-paginated-list",
+    )));
+    let storage = DurableStorage::from_object_store(object_store.clone());
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let range = LedgerRange::blocks(60, 60).expect("valid range");
+    let scope = coverage_index_v2_exact_scope(
+        &DatasetKey::evm_blocks(),
+        "block",
+        &selector,
+        ManifestFinalityLevel::Safe,
+    );
+    let prefix = coverage_index_v2_delta_prefix(&chain, &scope, &range);
+    write_coverage_index_v2_delta(
+        &storage,
+        &chain,
+        &scope,
+        &range,
+        "0001",
+        vec![empty_manifest_entry(
+            &chain,
+            DatasetKey::evm_blocks(),
+            &selector,
+            range.clone(),
+            ManifestFinalityLevel::Safe,
+        )],
+    );
+
+    assert_eq!(
+        storage
+            .covered_ranges(&chain, &DatasetKey::evm_blocks(), &selector, range)
+            .expect("v2 covered ranges"),
+        vec![LedgerRange::blocks(60, 60).expect("valid range")]
+    );
+    assert_eq!(object_store.list_count(&prefix), 0);
+    assert!(object_store.list_page_count(&prefix) > 0);
+}
+
+#[test]
 fn test_exact_indexed_query_does_not_load_unrelated_manifest_segments() {
     let store = ManifestAccessCountingStore::new(temp_storage_root("coverage-index-no-manifest"));
     let storage = DurableStorage::from_object_store(store.clone());
@@ -4457,6 +5178,70 @@ fn test_replacement_write_wins_over_wider_empty_coverage() {
 }
 
 #[test]
+fn test_publish_replacement_tombstones_v2_only_wide_entry() {
+    let storage = LocalStorage::new(temp_storage_root("replacement-v2-only-wide"));
+    let chain = test_chain();
+    let selector = evm_log_selector(vec![ADDRESS_A], vec![Some(vec![TOPIC_1])]);
+    let data_range = LedgerRange::blocks(99_999, 100_001).expect("valid range");
+    let replacement_range = LedgerRange::blocks(100_000, 100_000).expect("valid range");
+    let query_range = LedgerRange::blocks(99_999, 100_000).expect("valid range");
+    let data_rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![
+            log_record(99_999, 0, ADDRESS_A, vec![TOPIC_1]),
+            log_record(100_000, 1, ADDRESS_A, vec![TOPIC_1]),
+            log_record(100_001, 2, ADDRESS_A, vec![TOPIC_1]),
+        ]),
+    )
+    .expect("data rows");
+    let replacement_rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![log_record(100_000, 7, ADDRESS_A, vec![TOPIC_1])]),
+    )
+    .expect("replacement rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &selector,
+            range: data_range,
+            rows: &data_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write data coverage");
+    clear_coverage_index_v1(&storage, &chain);
+    storage
+        .write_rows_replacing_existing(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &selector,
+            range: replacement_range.clone(),
+            rows: &replacement_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write replacement rows");
+    clear_coverage_index_v1(&storage, &chain);
+
+    let rows = storage
+        .read_rows(&chain, &DatasetKey::evm_logs(), &selector, query_range)
+        .expect("read replacement rows through v2");
+    match rows.into_rows() {
+        QueryRows::EvmLogs(logs) => {
+            assert_eq!(
+                logs.into_iter()
+                    .map(|record| (record.block_number, record.log_index))
+                    .collect::<Vec<_>>(),
+                vec![(99_999, 0), (100_000, 7)]
+            );
+        }
+        rows => panic!("expected log rows, got {rows:?}"),
+    }
+}
+
+#[test]
 fn test_replacement_write_updates_coverage_index_without_full_manifest_scan() {
     let store = ManifestAccessCountingStore::new(temp_storage_root("replacement-write-bounded"));
     let storage = DurableStorage::from_object_store(store.clone());
@@ -4500,6 +5285,8 @@ fn test_replacement_write_updates_coverage_index_without_full_manifest_scan() {
 
     assert_eq!(store.manifest_segment_list_count(), 0);
     assert_eq!(store.coverage_index_list_count(), 0);
+    assert_eq!(store.broad_coverage_index_v2_list_count(), 0);
+    assert!(store.coverage_index_v2_list_count() > 0);
 
     let rows = storage
         .read_rows(
@@ -4570,6 +5357,8 @@ fn test_replacement_write_updates_all_buckets_for_replaced_wide_entry() {
 
     assert_eq!(store.manifest_segment_list_count(), 0);
     assert_eq!(store.coverage_index_list_count(), 0);
+    assert_eq!(store.broad_coverage_index_v2_list_count(), 0);
+    assert!(store.coverage_index_v2_list_count() > 0);
 
     let rows = storage
         .read_rows(&chain, &DatasetKey::evm_logs(), &selector, query_range)

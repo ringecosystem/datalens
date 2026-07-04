@@ -2459,6 +2459,7 @@ where
 fn is_data_object(object_key: &str) -> bool {
     object_key != manifest_key_from_object_key(object_key)
         && !object_key.contains("/coverage-index/")
+        && !object_key.contains("/coverage-index-v2/")
         && !object_key.contains("/metadata/compaction-queue/")
         && !object_key.contains("/manifest-segments/")
         && (object_key.ends_with(".json") || object_key.ends_with(".parquet"))

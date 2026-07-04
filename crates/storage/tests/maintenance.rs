@@ -772,6 +772,14 @@ fn test_retention_dry_run_protects_current_manifest_objects() {
     let storage = LocalStorage::new(temp_storage_root("retention"));
     let chain = test_chain();
     let object_key = write_block_object(&storage, &chain, 20, FinalityLevel::Safe);
+    let coverage_index_v2_key = format!(
+        "chains/{}/coverage-index-v2/deltas/exact/evm_blocks/block/all/safe/00000000000000000000-00000000000000099999/0001.json",
+        chain.key_prefix()
+    );
+    storage
+        .object_store()
+        .put(&coverage_index_v2_key, b"{}")
+        .expect("write coverage index v2 object");
     let before = storage.object_store().list("chains").expect("before list");
 
     let report = storage.maintenance_report().expect("maintenance report");
@@ -783,6 +791,12 @@ fn test_retention_dry_run_protects_current_manifest_objects() {
             .retention
             .protected_current_objects
             .contains(&object_key)
+    );
+    assert!(
+        !report
+            .retention
+            .delete_candidates
+            .contains(&coverage_index_v2_key)
     );
     assert!(report.retention.delete_candidates.is_empty());
     assert_eq!(before, after);
