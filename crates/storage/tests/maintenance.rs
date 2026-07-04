@@ -745,8 +745,8 @@ fn test_compaction_uses_configured_parquet_compression() {
 }
 
 #[test]
-fn test_compaction_deletes_source_objects_when_enabled() {
-    let storage = LocalStorage::new(temp_storage_root("execute-compaction-delete-sources"));
+fn test_compaction_records_superseded_source_objects_without_deleting_during_grace() {
+    let storage = LocalStorage::new(temp_storage_root("compaction-superseded-grace"));
     let chain = test_chain();
     let first_object = write_block_object(&storage, &chain, 52, FinalityLevel::Safe);
     let second_object = write_block_object(&storage, &chain, 53, FinalityLevel::Safe);
@@ -760,26 +760,43 @@ fn test_compaction_deletes_source_objects_when_enabled() {
             max_manifest_entries_per_tick: 20_000,
             cleanup_enabled: true,
             delete_source_objects: true,
+            source_delete_grace_ms: 60_000,
             ..MaintenanceCompactionConfig::default()
         })
         .expect("compact small objects");
 
     assert_eq!(report.processed_candidates, 1);
     assert_eq!(report.compacted_objects, 1);
-    assert_eq!(report.deleted_source_objects, 2);
+    assert_eq!(report.deleted_source_objects, 0);
     assert_eq!(report.source_delete_failures, 0);
     assert!(
-        !storage
+        storage
             .object_store()
             .exists(&first_object)
             .expect("first exists")
     );
     assert!(
-        !storage
+        storage
             .object_store()
             .exists(&second_object)
             .expect("second exists")
     );
+    let reconciliation = storage
+        .reconcile_compaction_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                cleanup_enabled: true,
+                delete_source_objects: true,
+                source_delete_grace_ms: 60_000,
+                ..MaintenanceCompactionConfig::default()
+            },
+        )
+        .expect("reconcile during grace");
+    assert_eq!(
+        reconciliation.stale_source_objects,
+        vec![first_object.clone(), second_object.clone()]
+    );
+    assert_eq!(reconciliation.deleted_stale_source_objects, 0);
 
     let manifest = storage.manifest().expect("manifest");
     let compacted_entry = manifest
@@ -818,6 +835,81 @@ fn test_compaction_deletes_source_objects_when_enabled() {
 }
 
 #[test]
+fn test_compaction_cleanup_deletes_superseded_sources_after_grace_with_tick_limit() {
+    let storage = LocalStorage::new(temp_storage_root("compaction-superseded-cleanup-limit"));
+    let chain = test_chain();
+    let first_object = write_block_object(&storage, &chain, 54, FinalityLevel::Safe);
+    let second_object = write_block_object(&storage, &chain, 55, FinalityLevel::Safe);
+
+    storage
+        .compact_small_objects(MaintenanceCompactionConfig {
+            min_object_bytes: u64::MAX,
+            max_merge_ranges: 8,
+            max_tick_duration_ms: 30_000,
+            max_candidates_per_tick: 8,
+            max_manifest_entries_per_tick: 20_000,
+            cleanup_enabled: true,
+            delete_source_objects: true,
+            source_delete_grace_ms: 0,
+            ..MaintenanceCompactionConfig::default()
+        })
+        .expect("compact small objects");
+
+    let first = storage
+        .reconcile_compaction_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                cleanup_enabled: true,
+                delete_source_objects: true,
+                source_delete_grace_ms: 0,
+                max_deletes_per_tick: 1,
+                ..MaintenanceCompactionConfig::default()
+            },
+        )
+        .expect("first cleanup tick");
+
+    assert_eq!(first.stale_source_objects.len(), 2);
+    assert_eq!(first.deleted_stale_source_objects, 1);
+    assert_eq!(first.deleted_stale_cleanup_records, 1);
+    let remaining_exists = storage
+        .object_store()
+        .exists(&first_object)
+        .expect("first exists")
+        || storage
+            .object_store()
+            .exists(&second_object)
+            .expect("second exists");
+    assert!(remaining_exists);
+
+    let second = storage
+        .reconcile_compaction_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                cleanup_enabled: true,
+                delete_source_objects: true,
+                source_delete_grace_ms: 0,
+                max_deletes_per_tick: 1,
+                ..MaintenanceCompactionConfig::default()
+            },
+        )
+        .expect("second cleanup tick");
+
+    assert_eq!(second.deleted_stale_source_objects, 1);
+    assert!(
+        !storage
+            .object_store()
+            .exists(&first_object)
+            .expect("first exists")
+    );
+    assert!(
+        !storage
+            .object_store()
+            .exists(&second_object)
+            .expect("second exists")
+    );
+}
+
+#[test]
 fn test_compaction_replacement_write_failure_leaves_old_manifest_readable() {
     let storage = LocalStorage::new(temp_storage_root("failed-compaction-write"));
     let chain = test_chain();
@@ -835,6 +927,7 @@ fn test_compaction_replacement_write_failure_leaves_old_manifest_readable() {
             max_manifest_entries_per_tick: 20_000,
             cleanup_enabled: true,
             delete_source_objects: true,
+            source_delete_grace_ms: 0,
             ..MaintenanceCompactionConfig::default()
         })
         .expect_err("compaction replacement write failure");
@@ -871,6 +964,7 @@ fn test_compaction_source_delete_failure_leaves_reads_working() {
             max_manifest_entries_per_tick: 20_000,
             cleanup_enabled: true,
             delete_source_objects: true,
+            source_delete_grace_ms: 0,
             ..MaintenanceCompactionConfig::default()
         })
         .expect("compaction reports source delete failure");
@@ -878,7 +972,20 @@ fn test_compaction_source_delete_failure_leaves_reads_working() {
     assert_eq!(report.processed_candidates, 1);
     assert_eq!(report.compacted_objects, 1);
     assert_eq!(report.deleted_source_objects, 0);
-    assert_eq!(report.source_delete_failures, 2);
+    assert_eq!(report.source_delete_failures, 0);
+    let reconciliation = failing_storage
+        .reconcile_compaction_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                cleanup_enabled: true,
+                delete_source_objects: true,
+                source_delete_grace_ms: 0,
+                ..MaintenanceCompactionConfig::default()
+            },
+        )
+        .expect("cleanup reports source delete failure");
+    assert_eq!(reconciliation.deleted_stale_source_objects, 0);
+    assert_eq!(reconciliation.delete_failures, 2);
     let manifest = storage.manifest().expect("manifest");
     assert_eq!(manifest.entries.len(), 1);
     let rows = storage
@@ -911,6 +1018,7 @@ fn test_compaction_reconciliation_deletes_unpublished_compacted_orphan() {
             max_manifest_entries_per_tick: 20_000,
             cleanup_enabled: true,
             delete_source_objects: true,
+            source_delete_grace_ms: 0,
             ..MaintenanceCompactionConfig::default()
         })
         .expect_err("manifest publish crash leaves compacted object");
@@ -1017,6 +1125,7 @@ fn test_compaction_reconciliation_retries_stale_source_cleanup_after_restart() {
             max_manifest_entries_per_tick: 20_000,
             cleanup_enabled: true,
             delete_source_objects: true,
+            source_delete_grace_ms: 0,
             ..MaintenanceCompactionConfig::default()
         })
         .expect("compaction with cleanup failures");
@@ -1033,6 +1142,7 @@ fn test_compaction_reconciliation_retries_stale_source_cleanup_after_restart() {
             MaintenanceCompactionConfig {
                 cleanup_enabled: true,
                 delete_source_objects: true,
+                source_delete_grace_ms: 0,
                 ..MaintenanceCompactionConfig::default()
             },
         )
@@ -1163,7 +1273,7 @@ fn test_compaction_report_exposes_backlog_estimates_and_tick_summary() {
 
     assert_eq!(report.tick_summary.input_objects, 2);
     assert_eq!(report.tick_summary.output_objects, 1);
-    assert_eq!(report.tick_summary.deleted_source_objects, 2);
+    assert_eq!(report.tick_summary.deleted_source_objects, 0);
     assert!(report.tick_summary.deleted_manifest_segments > 0);
     assert!(report.tick_summary.duration_ms > 0);
     assert_eq!(report.pause_reason.as_deref(), None);

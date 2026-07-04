@@ -193,6 +193,24 @@ fn test_config_storage_compaction_accepts_cleanup_feature_flag() {
 }
 
 #[test]
+fn test_config_storage_compaction_accepts_source_delete_grace_and_cleanup_limit() {
+    let input = config_text("[query.native]").replace(
+        r#"
+        [planner]"#,
+        r#"
+        [storage.compaction]
+        source_delete_grace_ms = 120000
+        max_deletes_per_tick = 3
+
+        [planner]"#,
+    );
+    let config: DatalensConfig = toml::from_str(&input).expect("config should parse");
+
+    assert_eq!(config.storage.compaction.source_delete_grace_ms, 120_000);
+    assert_eq!(config.storage.compaction.max_deletes_per_tick, 3);
+}
+
+#[test]
 fn test_config_warmup_follow_query_lifecycle_thresholds_default_to_unset() {
     let config: DatalensConfig =
         toml::from_str(&config_text("[query.native]")).expect("config should parse");

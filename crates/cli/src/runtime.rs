@@ -238,13 +238,15 @@ impl StorageCompactionWorker {
             .name("datalens-storage-compaction".to_owned())
             .spawn(move || {
                 log::info!(
-                    "storage compaction worker started interval_ms={} min_object_bytes={} max_merge_ranges={} max_tick_duration_ms={} max_candidates_per_tick={} max_manifest_entries_per_tick={} cleanup_enabled={} delete_source_objects={} chain_count={}",
+                    "storage compaction worker started interval_ms={} min_object_bytes={} max_merge_ranges={} max_tick_duration_ms={} max_candidates_per_tick={} max_manifest_entries_per_tick={} max_deletes_per_tick={} source_delete_grace_ms={} cleanup_enabled={} delete_source_objects={} chain_count={}",
                     interval.as_millis(),
                     config.min_object_bytes,
                     config.max_merge_ranges,
                     config.max_tick_duration_ms,
                     config.max_candidates_per_tick,
                     config.max_manifest_entries_per_tick,
+                    config.max_deletes_per_tick,
+                    config.source_delete_grace_ms,
                     config.cleanup_enabled,
                     config.delete_source_objects,
                     chains.len()
@@ -483,6 +485,7 @@ fn maintenance_compaction_config(
         max_gets_per_tick: config.max_gets_per_tick,
         max_puts_per_tick: config.max_puts_per_tick,
         max_deletes_per_tick: config.max_deletes_per_tick,
+        source_delete_grace_ms: config.source_delete_grace_ms,
         query_latency_pause_threshold_ms: config.query_latency_pause_threshold_ms,
         write_latency_pause_threshold_ms: config.write_latency_pause_threshold_ms,
         pressure_pause_ms: config.pressure_pause_ms,
@@ -1328,6 +1331,7 @@ mod tests {
             max_gets_per_tick: 64,
             max_puts_per_tick: 8,
             max_deletes_per_tick: 64,
+            source_delete_grace_ms: 300_000,
             object_store_error_pause_ms: 60_000,
             query_latency_pause_threshold_ms: 0,
             write_latency_pause_threshold_ms: 0,
@@ -1358,6 +1362,7 @@ mod tests {
             max_gets_per_tick: 64,
             max_puts_per_tick: 8,
             max_deletes_per_tick: 64,
+            source_delete_grace_ms: 300_000,
             object_store_error_pause_ms: 60_000,
             query_latency_pause_threshold_ms: 0,
             write_latency_pause_threshold_ms: 0,
