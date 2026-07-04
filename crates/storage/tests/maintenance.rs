@@ -122,6 +122,24 @@ impl CountingOperationStore {
     fn delete_count(&self) -> usize {
         self.deletes.lock().expect("deletes").len()
     }
+
+    fn get_keys(&self) -> Vec<String> {
+        self.gets.lock().expect("gets").clone()
+    }
+
+    fn data_object_get_keys(&self) -> Vec<String> {
+        self.gets
+            .lock()
+            .expect("gets")
+            .iter()
+            .filter(|key| key.contains("/datasets/"))
+            .cloned()
+            .collect()
+    }
+
+    fn reset_gets(&self) {
+        self.gets.lock().expect("gets").clear();
+    }
 }
 
 impl OverlappingWriteDuringCompactionStore {
@@ -893,6 +911,122 @@ fn test_compaction_records_superseded_source_objects_without_deleting_during_gra
 }
 
 #[test]
+fn test_compaction_preserves_source_objects_for_old_coverage_plan_after_replacement() {
+    let store = CountingOperationStore::new(temp_storage_root("old-plan-after-compaction"));
+    let storage = DurableStorage::from_object_store(store.clone());
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let first_object = write_block_object_to_storage(&storage, &chain, 80, FinalityLevel::Safe);
+    let second_object = write_block_object_to_storage(&storage, &chain, 81, FinalityLevel::Safe);
+    let query_range = LedgerRange::blocks(80, 81).expect("range");
+    let old_plan = storage
+        .coverage_plan(
+            &chain,
+            &DatasetKey::evm_blocks(),
+            &selector,
+            query_range.clone(),
+        )
+        .expect("old coverage plan");
+
+    storage
+        .compact_small_objects(MaintenanceCompactionConfig {
+            min_object_bytes: u64::MAX,
+            max_input_objects_per_candidate: 8,
+            max_tick_duration_ms: 30_000,
+            max_candidates_per_tick: 8,
+            max_manifest_entries_per_tick: 20_000,
+            cleanup_enabled: true,
+            delete_source_objects: true,
+            source_delete_grace_ms: 60_000,
+            ..MaintenanceCompactionConfig::default()
+        })
+        .expect("compact small objects");
+
+    assert!(
+        storage
+            .object_store()
+            .exists(&first_object)
+            .expect("first source exists")
+    );
+    assert!(
+        storage
+            .object_store()
+            .exists(&second_object)
+            .expect("second source exists")
+    );
+    store.reset_gets();
+
+    let rows = storage
+        .read_rows_with_coverage_plan(
+            &old_plan,
+            &chain,
+            &DatasetKey::evm_blocks(),
+            &selector,
+            query_range,
+        )
+        .expect("read rows through old coverage plan");
+
+    assert_block_numbers(rows, &[80, 81]);
+    let gets = store.get_keys();
+    assert!(
+        gets.contains(&first_object),
+        "old coverage plan should still read the first source object"
+    );
+    assert!(
+        gets.contains(&second_object),
+        "old coverage plan should still read the second source object"
+    );
+}
+
+#[test]
+fn test_new_query_reads_compacted_object_after_replacement_publish() {
+    let store = CountingOperationStore::new(temp_storage_root("new-query-compacted-object"));
+    let storage = DurableStorage::from_object_store(store.clone());
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    write_block_object_to_storage(&storage, &chain, 82, FinalityLevel::Safe);
+    write_block_object_to_storage(&storage, &chain, 83, FinalityLevel::Safe);
+
+    storage
+        .compact_small_objects(MaintenanceCompactionConfig {
+            min_object_bytes: u64::MAX,
+            max_input_objects_per_candidate: 8,
+            max_tick_duration_ms: 30_000,
+            max_candidates_per_tick: 8,
+            max_manifest_entries_per_tick: 20_000,
+            cleanup_enabled: false,
+            delete_source_objects: false,
+            ..MaintenanceCompactionConfig::default()
+        })
+        .expect("compact small objects");
+    let compacted_object = storage.manifest().expect("manifest").entries[0]
+        .object_key
+        .clone()
+        .expect("compacted object");
+    assert!(
+        compacted_object.contains("/compacted/"),
+        "published replacement should point at the compacted object"
+    );
+    store.reset_gets();
+
+    let rows = storage
+        .read_rows(
+            &chain,
+            &DatasetKey::evm_blocks(),
+            &selector,
+            LedgerRange::blocks(82, 83).expect("range"),
+        )
+        .expect("read compacted rows");
+
+    assert_block_numbers(rows, &[82, 83]);
+    assert_eq!(
+        store.data_object_get_keys(),
+        vec![compacted_object],
+        "new reads should use the compacted replacement object"
+    );
+}
+
+#[test]
 fn test_compaction_cleanup_deletes_superseded_sources_after_grace_with_tick_limit() {
     let storage = LocalStorage::new(temp_storage_root("compaction-superseded-cleanup-limit"));
     let chain = test_chain();
@@ -965,6 +1099,79 @@ fn test_compaction_cleanup_deletes_superseded_sources_after_grace_with_tick_limi
             .exists(&second_object)
             .expect("second exists")
     );
+}
+
+#[test]
+fn test_compaction_publish_failure_keeps_old_manifest_index_and_objects_queryable() {
+    let storage = LocalStorage::new(temp_storage_root("failed-compaction-publish-safe"));
+    let chain = test_chain();
+    let first_object = write_block_object(&storage, &chain, 68, FinalityLevel::Safe);
+    let second_object = write_block_object(&storage, &chain, 69, FinalityLevel::Safe);
+    let old_manifest = storage.manifest().expect("old manifest");
+    let old_segments = manifest_segment_keys(&storage, &chain);
+    let old_plan = storage
+        .coverage_plan(
+            &chain,
+            &DatasetKey::evm_blocks(),
+            &DatasetSelector::all(),
+            LedgerRange::blocks(68, 69).expect("range"),
+        )
+        .expect("old coverage plan");
+    let failing_storage = DurableStorage::from_object_store(FailingManifestSegmentPutStore::new(
+        storage.root().into(),
+    ));
+
+    let error = failing_storage
+        .compact_small_objects(MaintenanceCompactionConfig {
+            min_object_bytes: u64::MAX,
+            max_input_objects_per_candidate: 8,
+            max_tick_duration_ms: 30_000,
+            max_candidates_per_tick: 8,
+            max_manifest_entries_per_tick: 20_000,
+            cleanup_enabled: true,
+            delete_source_objects: true,
+            source_delete_grace_ms: 0,
+            ..MaintenanceCompactionConfig::default()
+        })
+        .expect_err("manifest publish failure should not replace coverage");
+
+    assert_eq!(error.kind, DatalensErrorKind::ManifestUpdateFailure);
+    assert_eq!(storage.manifest().expect("manifest"), old_manifest);
+    assert_eq!(manifest_segment_keys(&storage, &chain), old_segments);
+    assert!(
+        storage
+            .object_store()
+            .exists(&first_object)
+            .expect("first source exists")
+    );
+    assert!(
+        storage
+            .object_store()
+            .exists(&second_object)
+            .expect("second source exists")
+    );
+    assert_eq!(
+        storage
+            .coverage_plan(
+                &chain,
+                &DatasetKey::evm_blocks(),
+                &DatasetSelector::all(),
+                LedgerRange::blocks(68, 69).expect("range"),
+            )
+            .expect("current coverage plan"),
+        old_plan
+    );
+
+    let rows = storage
+        .read_rows_with_coverage_plan(
+            &old_plan,
+            &chain,
+            &DatasetKey::evm_blocks(),
+            &DatasetSelector::all(),
+            LedgerRange::blocks(68, 69).expect("range"),
+        )
+        .expect("old coverage plan remains readable");
+    assert_block_numbers(rows, &[68, 69]);
 }
 
 #[test]
@@ -1055,6 +1262,28 @@ fn test_compaction_source_delete_failure_leaves_reads_working() {
         )
         .expect("compacted manifest remains readable");
     assert_eq!(rows.row_count(), 2);
+
+    let new_rows = block_rows(&[74]);
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &DatasetSelector::all(),
+            range: LedgerRange::blocks(74, 74).expect("range"),
+            rows: &new_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write after cleanup failure");
+    let rows = storage
+        .read_rows(
+            &chain,
+            &DatasetKey::evm_blocks(),
+            &DatasetSelector::all(),
+            LedgerRange::blocks(72, 74).expect("range"),
+        )
+        .expect("read after cleanup failure");
+    assert_block_numbers(rows, &[72, 73, 74]);
 }
 
 #[test]
@@ -1883,6 +2112,31 @@ fn write_block_object_with_selector(
     number: u64,
     finality: FinalityLevel,
 ) -> String {
+    write_block_object_to_storage_with_selector(storage, chain, selector, number, finality)
+}
+
+fn write_block_object_to_storage<S: ObjectStore>(
+    storage: &DurableStorage<S>,
+    chain: &ChainIdentity,
+    number: u64,
+    finality: FinalityLevel,
+) -> String {
+    write_block_object_to_storage_with_selector(
+        storage,
+        chain,
+        &DatasetSelector::all(),
+        number,
+        finality,
+    )
+}
+
+fn write_block_object_to_storage_with_selector<S: ObjectStore>(
+    storage: &DurableStorage<S>,
+    chain: &ChainIdentity,
+    selector: &DatasetSelector,
+    number: u64,
+    finality: FinalityLevel,
+) -> String {
     let rows = DatasetRows::new(
         DatasetKey::evm_blocks(),
         QueryRows::EvmBlocks(vec![BlockHeader {
@@ -1905,6 +2159,39 @@ fn write_block_object_with_selector(
         })
         .expect("write rows");
     outcome.data_object.expect("data object").object_key
+}
+
+fn block_rows(numbers: &[u64]) -> DatasetRows {
+    DatasetRows::new(
+        DatasetKey::evm_blocks(),
+        QueryRows::EvmBlocks(
+            numbers
+                .iter()
+                .map(|number| BlockHeader {
+                    number: *number,
+                    hash: format!("0xblock{number}"),
+                    parent_hash: "0xparent".to_owned(),
+                    timestamp: *number,
+                })
+                .collect(),
+        ),
+    )
+    .expect("rows")
+}
+
+fn assert_block_numbers(rows: DatasetRows, expected: &[u64]) {
+    match rows.into_rows() {
+        QueryRows::EvmBlocks(blocks) => {
+            assert_eq!(
+                blocks
+                    .into_iter()
+                    .map(|block| block.number)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+        rows => panic!("expected evm block rows, got {rows:?}"),
+    }
 }
 
 fn write_empty_coverage(
