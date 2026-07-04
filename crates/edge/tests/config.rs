@@ -44,7 +44,19 @@ fn test_config_production_compaction_uses_conservative_rollout_defaults() {
         config.storage.compaction.max_manifest_entries_per_tick,
         2_000
     );
-    assert_eq!(config.storage.compaction.max_merge_ranges, 4);
+    assert_eq!(config.storage.compaction.target_object_bytes, 67_108_864);
+    assert_eq!(
+        config.storage.compaction.max_output_object_bytes,
+        134_217_728
+    );
+    assert_eq!(
+        config.storage.compaction.max_input_objects_per_candidate,
+        512
+    );
+    assert_eq!(
+        config.storage.compaction.max_input_bytes_per_candidate,
+        134_217_728
+    );
     assert_eq!(config.query.metadata.worker_threads, 2);
     assert_eq!(config.query.metadata.queue_capacity, 1024);
     assert_eq!(config.query.metadata.coalesced_capacity, 256);
@@ -190,6 +202,24 @@ fn test_config_storage_compaction_accepts_cleanup_feature_flag() {
 
     assert!(config.storage.compaction.cleanup_enabled);
     assert!(config.storage.compaction.delete_source_objects);
+}
+
+#[test]
+fn test_config_storage_compaction_accepts_source_delete_grace_and_cleanup_limit() {
+    let input = config_text("[query.native]").replace(
+        r#"
+        [planner]"#,
+        r#"
+        [storage.compaction]
+        source_delete_grace_ms = 120000
+        max_deletes_per_tick = 3
+
+        [planner]"#,
+    );
+    let config: DatalensConfig = toml::from_str(&input).expect("config should parse");
+
+    assert_eq!(config.storage.compaction.source_delete_grace_ms, 120_000);
+    assert_eq!(config.storage.compaction.max_deletes_per_tick, 3);
 }
 
 #[test]
