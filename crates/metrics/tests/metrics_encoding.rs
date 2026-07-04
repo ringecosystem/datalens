@@ -1,10 +1,10 @@
 use datalens_core::{ChainFamily, ChainIdentity, DatalensErrorKind, DatasetKey};
 use datalens_metrics::{
     ApplicationIdentity, CacheCoverageOutcome, CompactionBacklogLabels, CompactionTickMetrics,
-    DurableIntentClaimOutcome, DurableIntentOutcome, DurableWriteOutcome, ErrorLabels, FillOutcome,
-    HotReorgOutcome, MetricsLabels, MetricsRecorder, QueryMetadataEnqueueOutcome,
-    QueryMetadataWriteOutcome, QueryOutcome, WarmupFetchOutcome, WarmupTaskOutcome,
-    WarmupWriteOutcome,
+    CoverageDeltaBacklogLabels, DurableIntentClaimOutcome, DurableIntentOutcome,
+    DurableWriteOutcome, ErrorLabels, FillOutcome, HotReorgOutcome, MetricsLabels, MetricsRecorder,
+    QueryMetadataEnqueueOutcome, QueryMetadataWriteOutcome, QueryOutcome, WarmupFetchOutcome,
+    WarmupTaskOutcome, WarmupWriteOutcome,
 };
 
 #[test]
@@ -225,6 +225,46 @@ fn test_compaction_metrics_expose_backlog_progress_and_backpressure() {
         r#"datalens_compaction_paused{chain="ethereum",chain_kind="evm",reason="query_latency"} 1"#
     ));
     assert!(output.contains("datalens_compaction_tick_duration_seconds"));
+}
+
+#[test]
+fn test_storage_coverage_fragmentation_metrics_use_expected_labels() {
+    let recorder = MetricsRecorder::new().expect("metrics recorder");
+    let labels = CoverageDeltaBacklogLabels::new(
+        chain(),
+        DatasetKey::evm_logs(),
+        "exact",
+        "0xabc",
+        100_000,
+        199_999,
+    );
+
+    recorder.set_storage_coverage_delta_backlog(&labels, 4, 2048);
+    recorder.set_storage_coverage_snapshot_age_ms(&chain(), 9000);
+    recorder.record_storage_coverage_compaction(&chain(), "completed", 2);
+    recorder.record_storage_cleanup_failures(&chain(), "coverage_index_v2_delta", 3);
+    recorder.record_storage_lock_renew_failure(&chain());
+
+    let output = recorder.encode().expect("prometheus text");
+
+    assert!(output.contains(
+        r#"datalens_storage_coverage_delta_backlog{bucket_end="199999",bucket_start="100000",chain="ethereum",chain_kind="evm",dataset="evm.logs",scope="0xabc",scope_kind="exact"} 4"#
+    ));
+    assert!(output.contains(
+        r#"datalens_storage_coverage_delta_bytes{bucket_end="199999",bucket_start="100000",chain="ethereum",chain_kind="evm",dataset="evm.logs",scope="0xabc",scope_kind="exact"} 2048"#
+    ));
+    assert!(output.contains(
+        r#"datalens_storage_coverage_snapshot_age_ms{chain="ethereum",chain_kind="evm"} 9000"#
+    ));
+    assert!(output.contains(
+        r#"datalens_storage_coverage_compactions_total{chain="ethereum",chain_kind="evm",status="completed"} 2"#
+    ));
+    assert!(output.contains(
+        r#"datalens_storage_cleanup_failures_total{chain="ethereum",chain_kind="evm",kind="coverage_index_v2_delta"} 3"#
+    ));
+    assert!(output.contains(
+        r#"datalens_storage_lock_renew_failures_total{chain="ethereum",chain_kind="evm"} 1"#
+    ));
 }
 
 #[test]

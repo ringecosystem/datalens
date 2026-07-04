@@ -8,8 +8,8 @@ use std::{
 };
 
 use datalens_core::{
-    ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey, DatasetRows, LedgerRange,
-    LedgerRangeKind,
+    ChainFamily, ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey, DatasetRows,
+    LedgerRange, LedgerRangeKind, NetworkId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -34,6 +34,7 @@ pub struct MaintenanceReport {
     pub mode: MaintenanceOperationMode,
     pub operations: Vec<MaintenanceOperation>,
     pub check: MaintenanceCheckReport,
+    pub fragmentation: MaintenanceFragmentationReport,
     pub compaction_backlog: MaintenanceCompactionBacklogReport,
     pub compaction: MaintenanceCompactionReport,
     pub compaction_reconciliation: MaintenanceCompactionReconciliationReport,
@@ -91,6 +92,33 @@ pub enum MaintenanceIssueKind {
     UnknownChecksumAlgorithm,
     ObjectDecodeFailure,
     ContradictoryCoverage,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MaintenanceFragmentationReport {
+    pub data_object_small_object_count: usize,
+    pub data_object_small_object_bytes: u64,
+    pub manifest_segment_count: usize,
+    pub coverage_delta_count: usize,
+    pub coverage_delta_bytes: u64,
+    pub coverage_snapshot_count: usize,
+    pub coverage_snapshot_age_ms_max: u64,
+    pub coverage_cleanup_record_count: usize,
+    pub coverage_delta_backlog_top: Vec<CoverageDeltaBacklogScope>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CoverageDeltaBacklogScope {
+    pub chain: ChainIdentity,
+    pub dataset_key: DatasetKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_scope: Option<String>,
+    pub bucket_start: u64,
+    pub bucket_end: u64,
+    pub object_count: usize,
+    pub bytes: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -369,6 +397,12 @@ pub struct UsageLedgerRollupModel {
     pub secrets_policy: String,
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+struct CoverageIndexV2CreatedAt {
+    #[serde(default)]
+    created_at_unix_ms: u64,
+}
+
 impl<S> DurableStorage<S>
 where
     S: ObjectStore,
@@ -412,6 +446,18 @@ where
         let candidates = compaction_candidates(&entries, compaction_config);
         let compaction_backlog =
             compaction_backlog_report(&entries, &raw_entries, &manifest_objects, compaction_config);
+        let coverage_fragmentation = coverage_index_v2_fragmentation_report(self.object_store())?;
+        let fragmentation = MaintenanceFragmentationReport {
+            data_object_small_object_count: compaction_backlog.small_object_count,
+            data_object_small_object_bytes: compaction_backlog.small_object_bytes,
+            manifest_segment_count: compaction_backlog.manifest_segment_count,
+            coverage_delta_count: coverage_fragmentation.coverage_delta_count,
+            coverage_delta_bytes: coverage_fragmentation.coverage_delta_bytes,
+            coverage_snapshot_count: coverage_fragmentation.coverage_snapshot_count,
+            coverage_snapshot_age_ms_max: coverage_fragmentation.coverage_snapshot_age_ms_max,
+            coverage_cleanup_record_count: coverage_fragmentation.coverage_cleanup_record_count,
+            coverage_delta_backlog_top: coverage_fragmentation.coverage_delta_backlog_top,
+        };
         let compaction_reconciliation =
             self.compaction_reconciliation_report(&entries, &raw_entries, compaction_config, true)?;
         let protected_current_objects = current_object_keys(&entries);
@@ -431,6 +477,7 @@ where
                 issue_count: issues.len(),
                 issues,
             },
+            fragmentation,
             compaction_backlog,
             compaction: MaintenanceCompactionReport {
                 read_only: true,
@@ -2550,10 +2597,178 @@ struct CoverageIndexV2CompactionReport {
     delete_failures: usize,
 }
 
+#[derive(Clone, Debug, Default)]
+struct CoverageIndexV2FragmentationReport {
+    coverage_delta_count: usize,
+    coverage_delta_bytes: u64,
+    coverage_snapshot_count: usize,
+    coverage_snapshot_age_ms_max: u64,
+    coverage_cleanup_record_count: usize,
+    coverage_delta_backlog_top: Vec<CoverageDeltaBacklogScope>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CoverageDeltaBacklogAccumulator {
+    object_count: usize,
+    bytes: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct CompactionSourceCleanup {
     deleted_objects: usize,
     delete_failures: usize,
+}
+
+fn coverage_index_v2_fragmentation_report<S>(
+    object_store: &S,
+) -> Result<CoverageIndexV2FragmentationReport, DatalensError>
+where
+    S: ObjectStore,
+{
+    let now_ms = unix_millis_now()?;
+    let mut report = CoverageIndexV2FragmentationReport::default();
+    let mut backlog =
+        BTreeMap::<String, (CoverageDeltaBacklogScope, CoverageDeltaBacklogAccumulator)>::new();
+
+    for object in object_store.list("chains")? {
+        if is_coverage_index_v2_delta_object(&object.key) {
+            report.coverage_delta_count += 1;
+            report.coverage_delta_bytes = report.coverage_delta_bytes.saturating_add(object.size);
+            if let Some(scope) = coverage_delta_backlog_scope_from_key(&object.key) {
+                let key = coverage_delta_backlog_scope_key(&scope);
+                let (_, accumulator) = backlog
+                    .entry(key)
+                    .or_insert_with(|| (scope, CoverageDeltaBacklogAccumulator::default()));
+                accumulator.object_count = accumulator.object_count.saturating_add(1);
+                accumulator.bytes = accumulator.bytes.saturating_add(object.size);
+            }
+            continue;
+        }
+        if is_coverage_index_v2_snapshot_object(&object.key) {
+            report.coverage_snapshot_count += 1;
+            let bytes = object_store.get(&object.key)?;
+            if let Ok(created_at) = serde_json::from_slice::<CoverageIndexV2CreatedAt>(&bytes)
+                && created_at.created_at_unix_ms > 0
+            {
+                report.coverage_snapshot_age_ms_max = report
+                    .coverage_snapshot_age_ms_max
+                    .max(now_ms.saturating_sub(created_at.created_at_unix_ms));
+            }
+            continue;
+        }
+        if is_coverage_index_v2_cleanup_object(&object.key) {
+            report.coverage_cleanup_record_count += 1;
+        }
+    }
+
+    let mut top = backlog
+        .into_values()
+        .map(|(mut scope, accumulator)| {
+            scope.object_count = accumulator.object_count;
+            scope.bytes = accumulator.bytes;
+            scope
+        })
+        .collect::<Vec<_>>();
+    top.sort_by(|left, right| {
+        right
+            .bytes
+            .cmp(&left.bytes)
+            .then_with(|| left.chain.key_prefix().cmp(&right.chain.key_prefix()))
+            .then_with(|| left.dataset_key.as_str().cmp(right.dataset_key.as_str()))
+            .then_with(|| left.bucket_start.cmp(&right.bucket_start))
+            .then_with(|| left.bucket_end.cmp(&right.bucket_end))
+    });
+    top.truncate(10);
+    report.coverage_delta_backlog_top = top;
+    Ok(report)
+}
+
+fn is_coverage_index_v2_delta_object(object_key: &str) -> bool {
+    object_key.contains("/coverage-index-v2/deltas/") && object_key.ends_with(".json")
+}
+
+fn is_coverage_index_v2_snapshot_object(object_key: &str) -> bool {
+    object_key.contains("/coverage-index-v2/snapshots/") && object_key.ends_with(".json")
+}
+
+fn is_coverage_index_v2_cleanup_object(object_key: &str) -> bool {
+    object_key.contains("/coverage-index-v2/cleanup/") && object_key.ends_with(".json")
+}
+
+fn coverage_delta_backlog_scope_from_key(object_key: &str) -> Option<CoverageDeltaBacklogScope> {
+    let parts = object_key.split('/').collect::<Vec<_>>();
+    let index_root = parts.iter().position(|part| *part == "coverage-index-v2")?;
+    if parts.first() != Some(&"chains")
+        || parts.get(index_root + 1) != Some(&"deltas")
+        || parts.len() < index_root + 5
+    {
+        return None;
+    }
+    let chain = chain_from_key_prefix(&parts[1..index_root].join("/"))?;
+    let bucket = parts.get(parts.len().saturating_sub(2))?;
+    let (bucket_start, bucket_end) = parse_bucket_range(bucket)?;
+    let scope_parts = &parts[index_root + 2..parts.len().saturating_sub(2)];
+    let dataset_key = scope_parts
+        .get(1)
+        .and_then(|value| DatasetKey::parse(value).ok())?;
+    let (selector_fingerprint, semantic_scope) = match scope_parts.first().copied() {
+        Some("exact") => (
+            scope_parts.get(3).map(|value| (*value).to_owned()),
+            None::<String>,
+        ),
+        Some("semantic") => (None, Some(scope_parts.join("/"))),
+        _ => (None, None),
+    };
+    Some(CoverageDeltaBacklogScope {
+        chain,
+        dataset_key,
+        selector_fingerprint,
+        semantic_scope,
+        bucket_start,
+        bucket_end,
+        object_count: 0,
+        bytes: 0,
+    })
+}
+
+fn coverage_delta_backlog_scope_key(scope: &CoverageDeltaBacklogScope) -> String {
+    format!(
+        "{}|{}|{}|{}|{}|{}",
+        scope.chain.key_prefix(),
+        scope.dataset_key.as_str(),
+        scope.selector_fingerprint.as_deref().unwrap_or(""),
+        scope.semantic_scope.as_deref().unwrap_or(""),
+        scope.bucket_start,
+        scope.bucket_end
+    )
+}
+
+fn chain_from_key_prefix(prefix: &str) -> Option<ChainIdentity> {
+    let parts = prefix.split('/').collect::<Vec<_>>();
+    let family = match parts.first().copied()? {
+        "evm" => ChainFamily::Evm,
+        other => ChainFamily::try_other(other.to_owned()).ok()?,
+    };
+    let configured_name = parts.get(1)?;
+    let network_id = match parts.get(2) {
+        Some(value) => Some(
+            value
+                .parse::<u64>()
+                .map(NetworkId::numeric)
+                .or_else(|_| NetworkId::textual(*value))
+                .ok()?,
+        ),
+        None => None,
+    };
+    if parts.len() > 3 {
+        return None;
+    }
+    ChainIdentity::try_new(family, *configured_name, network_id).ok()
+}
+
+fn parse_bucket_range(value: &str) -> Option<(u64, u64)> {
+    let (start, end) = value.split_once('-')?;
+    Some((start.parse().ok()?, end.parse().ok()?))
 }
 
 fn candidate_selected_entries(

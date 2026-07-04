@@ -666,6 +666,12 @@ impl StorageCompactionWorker {
                             }
                             let leader_lock_error =
                                 is_compaction_leader_lock_renewal_error(&error);
+                            if leader_lock_error {
+                                record_compaction_lock_renew_failure_metrics(
+                                    &metrics_recorders,
+                                    &chain,
+                                );
+                            }
                             record_compaction_failure_metrics(
                                 &metrics_recorders,
                                 &chain,
@@ -778,6 +784,16 @@ fn record_compaction_metrics(
                 duration_seconds: report.tick_summary.duration_ms as f64 / 1_000.0,
             },
         );
+        recorder.record_storage_coverage_compaction(
+            chain,
+            report.tick_status.as_str(),
+            report.coverage_index_v2_compacted_buckets,
+        );
+        recorder.record_storage_cleanup_failures(
+            chain,
+            "coverage_index_v2_delta",
+            report.coverage_index_v2_delta_delete_failures,
+        );
     }
 }
 
@@ -800,6 +816,15 @@ fn record_compaction_failure_metrics(
                 duration_seconds: duration.as_secs_f64(),
             },
         );
+    }
+}
+
+fn record_compaction_lock_renew_failure_metrics(
+    recorders: &[MetricsRecorder],
+    chain: &ChainIdentity,
+) {
+    for recorder in recorders {
+        recorder.record_storage_lock_renew_failure(chain);
     }
 }
 

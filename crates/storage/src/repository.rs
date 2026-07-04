@@ -65,9 +65,10 @@ pub use crate::hot_cache::{
     HotReorgReason, HotWriteOutcome, HotWriteRequest, LocalHotCacheStorage,
 };
 pub use crate::maintenance::{
-    CompactionCandidate, MaintenanceCheckReport, MaintenanceCompactionConfig,
-    MaintenanceCompactionPressure, MaintenanceCompactionPressureMonitor,
-    MaintenanceCompactionReport, MaintenanceCompactionTickStatus, MaintenanceIssue,
+    CompactionCandidate, CoverageDeltaBacklogScope, MaintenanceCheckReport,
+    MaintenanceCompactionConfig, MaintenanceCompactionPressure,
+    MaintenanceCompactionPressureMonitor, MaintenanceCompactionReport,
+    MaintenanceCompactionTickStatus, MaintenanceFragmentationReport, MaintenanceIssue,
     MaintenanceIssueKind, MaintenanceOperation, MaintenanceOperationMode, MaintenanceReport,
     MaintenanceRetentionReport, MaintenanceUsageLedgerReport, RetentionPolicy,
     UsageLedgerRollupModel,

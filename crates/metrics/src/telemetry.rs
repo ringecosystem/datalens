@@ -53,6 +53,17 @@ pub struct CompactionBacklogLabels {
     selector: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoverageDeltaBacklogLabels {
+    chain: String,
+    chain_kind: String,
+    dataset: String,
+    scope_kind: String,
+    scope: String,
+    bucket_start: String,
+    bucket_end: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CompactionTickMetrics<'a> {
     pub status: &'a str,
@@ -87,6 +98,39 @@ impl CompactionBacklogLabels {
             &self.dataset,
             &self.selector_kind,
             &self.selector,
+        ]
+    }
+}
+
+impl CoverageDeltaBacklogLabels {
+    pub fn new(
+        chain: ChainIdentity,
+        dataset_key: DatasetKey,
+        scope_kind: impl Into<String>,
+        scope: impl Into<String>,
+        bucket_start: u64,
+        bucket_end: u64,
+    ) -> Self {
+        Self {
+            chain: chain.configured_name().to_owned(),
+            chain_kind: chain.family_ref().key().to_owned(),
+            dataset: dataset_key.as_str().to_owned(),
+            scope_kind: scope_kind.into(),
+            scope: scope.into(),
+            bucket_start: bucket_start.to_string(),
+            bucket_end: bucket_end.to_string(),
+        }
+    }
+
+    fn label_values(&self) -> [&str; 7] {
+        [
+            &self.chain,
+            &self.chain_kind,
+            &self.dataset,
+            &self.scope_kind,
+            &self.scope,
+            &self.bucket_start,
+            &self.bucket_end,
         ]
     }
 }
@@ -499,6 +543,12 @@ pub struct MetricsRecorder {
     compaction_deleted_manifest_segments_total: CounterVec,
     compaction_tick_duration_seconds: HistogramVec,
     compaction_paused: GaugeVec,
+    storage_coverage_delta_backlog: GaugeVec,
+    storage_coverage_delta_bytes: GaugeVec,
+    storage_coverage_snapshot_age_ms: GaugeVec,
+    storage_coverage_compactions_total: CounterVec,
+    storage_cleanup_failures_total: CounterVec,
+    storage_lock_renew_failures_total: CounterVec,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -878,6 +928,64 @@ impl MetricsRecorder {
             ),
             &["chain", "chain_kind", "reason"],
         )?;
+        let storage_coverage_delta_backlog = GaugeVec::new(
+            Opts::new(
+                "datalens_storage_coverage_delta_backlog",
+                "Coverage-index-v2 delta objects currently backlogged by bucket.",
+            ),
+            &[
+                "chain",
+                "chain_kind",
+                "dataset",
+                "scope_kind",
+                "scope",
+                "bucket_start",
+                "bucket_end",
+            ],
+        )?;
+        let storage_coverage_delta_bytes = GaugeVec::new(
+            Opts::new(
+                "datalens_storage_coverage_delta_bytes",
+                "Coverage-index-v2 delta bytes currently backlogged by bucket.",
+            ),
+            &[
+                "chain",
+                "chain_kind",
+                "dataset",
+                "scope_kind",
+                "scope",
+                "bucket_start",
+                "bucket_end",
+            ],
+        )?;
+        let storage_coverage_snapshot_age_ms = GaugeVec::new(
+            Opts::new(
+                "datalens_storage_coverage_snapshot_age_ms",
+                "Maximum age of coverage-index-v2 snapshots in milliseconds.",
+            ),
+            &["chain", "chain_kind"],
+        )?;
+        let storage_coverage_compactions_total = CounterVec::new(
+            Opts::new(
+                "datalens_storage_coverage_compactions_total",
+                "Coverage-index-v2 bucket compactions by status.",
+            ),
+            &["chain", "chain_kind", "status"],
+        )?;
+        let storage_cleanup_failures_total = CounterVec::new(
+            Opts::new(
+                "datalens_storage_cleanup_failures_total",
+                "Storage cleanup failures by cleanup kind.",
+            ),
+            &["chain", "chain_kind", "kind"],
+        )?;
+        let storage_lock_renew_failures_total = CounterVec::new(
+            Opts::new(
+                "datalens_storage_lock_renew_failures_total",
+                "Storage lock renewal failures.",
+            ),
+            &["chain", "chain_kind"],
+        )?;
 
         registry.register(Box::new(query_total.clone()))?;
         registry.register(Box::new(query_duration_seconds.clone()))?;
@@ -919,6 +1027,12 @@ impl MetricsRecorder {
         registry.register(Box::new(compaction_deleted_manifest_segments_total.clone()))?;
         registry.register(Box::new(compaction_tick_duration_seconds.clone()))?;
         registry.register(Box::new(compaction_paused.clone()))?;
+        registry.register(Box::new(storage_coverage_delta_backlog.clone()))?;
+        registry.register(Box::new(storage_coverage_delta_bytes.clone()))?;
+        registry.register(Box::new(storage_coverage_snapshot_age_ms.clone()))?;
+        registry.register(Box::new(storage_coverage_compactions_total.clone()))?;
+        registry.register(Box::new(storage_cleanup_failures_total.clone()))?;
+        registry.register(Box::new(storage_lock_renew_failures_total.clone()))?;
 
         Ok(Self {
             registry,
@@ -962,6 +1076,12 @@ impl MetricsRecorder {
             compaction_deleted_manifest_segments_total,
             compaction_tick_duration_seconds,
             compaction_paused,
+            storage_coverage_delta_backlog,
+            storage_coverage_delta_bytes,
+            storage_coverage_snapshot_age_ms,
+            storage_coverage_compactions_total,
+            storage_cleanup_failures_total,
+            storage_lock_renew_failures_total,
         })
     }
 
@@ -1267,6 +1387,49 @@ impl MetricsRecorder {
             .set(candidate_backlog as f64);
     }
 
+    pub fn set_storage_coverage_delta_backlog(
+        &self,
+        labels: &CoverageDeltaBacklogLabels,
+        object_count: usize,
+        bytes: u64,
+    ) {
+        self.storage_coverage_delta_backlog
+            .with_label_values(&labels.label_values())
+            .set(object_count as f64);
+        self.storage_coverage_delta_bytes
+            .with_label_values(&labels.label_values())
+            .set(bytes as f64);
+    }
+
+    pub fn set_storage_coverage_snapshot_age_ms(&self, chain: &ChainIdentity, age_ms: u64) {
+        self.storage_coverage_snapshot_age_ms
+            .with_label_values(&chain_label_values(chain))
+            .set(age_ms as f64);
+    }
+
+    pub fn record_storage_coverage_compaction(
+        &self,
+        chain: &ChainIdentity,
+        status: &str,
+        count: usize,
+    ) {
+        self.storage_coverage_compactions_total
+            .with_label_values(&storage_status_label_values(chain, status))
+            .inc_by(count as f64);
+    }
+
+    pub fn record_storage_cleanup_failures(&self, chain: &ChainIdentity, kind: &str, count: usize) {
+        self.storage_cleanup_failures_total
+            .with_label_values(&storage_kind_label_values(chain, kind))
+            .inc_by(count as f64);
+    }
+
+    pub fn record_storage_lock_renew_failure(&self, chain: &ChainIdentity) {
+        self.storage_lock_renew_failures_total
+            .with_label_values(&chain_label_values(chain))
+            .inc();
+    }
+
     pub fn record_compaction_tick(&self, chain: &ChainIdentity, tick: CompactionTickMetrics<'_>) {
         let labels = compaction_tick_label_values(chain, tick.status, tick.pause_reason);
         self.compaction_input_objects_total
@@ -1422,6 +1585,18 @@ fn compaction_tick_label_values<'a>(
 
 fn compaction_paused_label_values<'a>(chain: &'a ChainIdentity, reason: &'a str) -> [&'a str; 3] {
     [chain.configured_name(), chain.family_ref().key(), reason]
+}
+
+fn chain_label_values(chain: &ChainIdentity) -> [&str; 2] {
+    [chain.configured_name(), chain.family_ref().key()]
+}
+
+fn storage_status_label_values<'a>(chain: &'a ChainIdentity, status: &'a str) -> [&'a str; 3] {
+    [chain.configured_name(), chain.family_ref().key(), status]
+}
+
+fn storage_kind_label_values<'a>(chain: &'a ChainIdentity, kind: &'a str) -> [&'a str; 3] {
+    [chain.configured_name(), chain.family_ref().key(), kind]
 }
 
 fn indexer_graphql_query_label_values<'a>(
