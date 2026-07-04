@@ -349,6 +349,28 @@ fn test_authoritative_server_configs_parse_and_validate() {
     }
 }
 
+#[test]
+fn test_validate_config_rejects_compaction_leader_lock_ttl_below_tick_budget() {
+    let config_text = minimal_config_text().replace(
+        r#"
+    [planner]"#,
+        r#"
+    [storage.compaction]
+    enabled = true
+    max_tick_duration_ms = 2000
+    leader_lock_ttl_ms = 1000
+
+    [planner]"#,
+    );
+    let config: DatalensConfig = toml::from_str(&config_text).expect("config parses");
+
+    let error = validate_config(&config).expect_err("short leader lock ttl rejected");
+
+    assert!(error.message.contains(
+        "storage.compaction.leader_lock_ttl_ms must be greater than storage.compaction.max_tick_duration_ms"
+    ));
+}
+
 fn minimal_config_text() -> String {
     r#"
     [server]

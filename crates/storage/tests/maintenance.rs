@@ -818,6 +818,43 @@ fn test_compaction_deletes_source_objects_when_enabled() {
 }
 
 #[test]
+fn test_compaction_preserves_source_objects_when_cleanup_disabled() {
+    let storage = LocalStorage::new(temp_storage_root("execute-compaction-cleanup-disabled"));
+    let chain = test_chain();
+    let first_object = write_block_object(&storage, &chain, 54, FinalityLevel::Safe);
+    let second_object = write_block_object(&storage, &chain, 55, FinalityLevel::Safe);
+
+    let report = storage
+        .compact_small_objects(MaintenanceCompactionConfig {
+            min_object_bytes: u64::MAX,
+            max_merge_ranges: 8,
+            max_tick_duration_ms: 30_000,
+            max_candidates_per_tick: 8,
+            max_manifest_entries_per_tick: 20_000,
+            cleanup_enabled: false,
+            delete_source_objects: true,
+            ..MaintenanceCompactionConfig::default()
+        })
+        .expect("compact small objects");
+
+    assert_eq!(report.processed_candidates, 1);
+    assert_eq!(report.compacted_objects, 1);
+    assert_eq!(report.deleted_source_objects, 0);
+    assert!(
+        storage
+            .object_store()
+            .exists(&first_object)
+            .expect("first exists")
+    );
+    assert!(
+        storage
+            .object_store()
+            .exists(&second_object)
+            .expect("second exists")
+    );
+}
+
+#[test]
 fn test_compaction_replacement_write_failure_leaves_old_manifest_readable() {
     let storage = LocalStorage::new(temp_storage_root("failed-compaction-write"));
     let chain = test_chain();
@@ -1155,6 +1192,7 @@ fn test_compaction_report_exposes_backlog_estimates_and_tick_summary() {
                 max_tick_duration_ms: 30_000,
                 max_candidates_per_tick: 1,
                 max_manifest_entries_per_tick: 20_000,
+                cleanup_enabled: true,
                 delete_source_objects: true,
                 ..MaintenanceCompactionConfig::default()
             },

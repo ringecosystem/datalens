@@ -620,7 +620,8 @@ where
                 candidate.chain.key_prefix(),
                 publish_started.elapsed().as_millis()
             );
-            if config.delete_source_objects
+            if config.cleanup_enabled
+                && config.delete_source_objects
                 && operation_budget.can_delete_sources(candidate.object_keys.len())
             {
                 let cleanup = self.delete_compacted_source_objects(candidate);
