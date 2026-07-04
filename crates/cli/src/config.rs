@@ -170,6 +170,12 @@ pub fn validate_config(config: &DatalensConfig) -> Result<(), DatalensError> {
                 "storage.compaction.leader_lock_ttl_ms must be greater than zero when compaction is enabled",
             ));
         }
+        if config.storage.compaction.leader_lock_ttl_ms / 3 == 0 {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                "storage.compaction.leader_lock_ttl_ms must support a nonzero renewal interval when compaction is enabled",
+            ));
+        }
         if config.storage.compaction.leader_lock_ttl_ms
             <= config.storage.compaction.max_tick_duration_ms
         {

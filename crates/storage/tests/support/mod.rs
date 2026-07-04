@@ -1,10 +1,13 @@
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use datalens_core::DatalensError;
-use datalens_storage::{ObjectListPage, ObjectMetadata, ObjectPutIfAbsentResult, ObjectStore};
+use datalens_storage::{
+    ObjectListPage, ObjectLockLease, ObjectMetadata, ObjectPutIfAbsentResult, ObjectStore,
+};
 
 #[derive(Clone, Debug)]
 pub struct CountingObjectStore<S> {
@@ -157,6 +160,35 @@ impl<S: ObjectStore> ObjectStore for CountingObjectStore<S> {
     fn delete(&self, key: &str) -> Result<(), DatalensError> {
         self.record(|counts| &mut counts.deletes, key);
         self.inner.delete(key)
+    }
+
+    fn try_acquire_lock(
+        &self,
+        key: &str,
+        owner: &[u8],
+    ) -> Result<Option<ObjectLockLease>, DatalensError> {
+        self.inner.try_acquire_lock(key, owner)
+    }
+
+    fn release_lock(&self, lease: ObjectLockLease) -> Result<(), DatalensError> {
+        self.inner.release_lock(lease)
+    }
+
+    fn renew_lock(
+        &self,
+        lease: &mut ObjectLockLease,
+        ttl: Duration,
+    ) -> Result<bool, DatalensError> {
+        self.inner.renew_lock(lease, ttl)
+    }
+
+    fn try_acquire_lock_with_ttl(
+        &self,
+        key: &str,
+        owner: &[u8],
+        ttl: Duration,
+    ) -> Result<Option<ObjectLockLease>, DatalensError> {
+        self.inner.try_acquire_lock_with_ttl(key, owner, ttl)
     }
 
     fn lock_namespace(&self) -> String {

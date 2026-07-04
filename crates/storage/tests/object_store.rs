@@ -1,14 +1,106 @@
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use datalens_core::DatalensErrorKind;
 use datalens_storage::{
-    LocalObjectStore, ObjectPutIfAbsentResult, ObjectStore, S3ObjectStore, S3ObjectStoreConfig,
-    validate_object_key,
+    LocalObjectStore, ObjectLockLease, ObjectPutIfAbsentResult, ObjectStore, S3ObjectStore,
+    S3ObjectStoreConfig, validate_object_key,
 };
 
 mod support;
 
 use support::CountingObjectStore;
+
+#[derive(Clone, Debug)]
+struct ReplaceAfterLockReadStore {
+    inner: LocalObjectStore,
+    trigger_owner: Vec<u8>,
+    replacement_owner: Vec<u8>,
+    replaced: Arc<AtomicBool>,
+}
+
+impl ReplaceAfterLockReadStore {
+    fn new(root: PathBuf, trigger_owner: &[u8], replacement_owner: &[u8]) -> Self {
+        Self {
+            inner: LocalObjectStore::new(root),
+            trigger_owner: trigger_owner.to_vec(),
+            replacement_owner: replacement_owner.to_vec(),
+            replaced: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn maybe_replace_after_read(
+        &self,
+        key: &str,
+        owner: &[u8],
+    ) -> Result<(), datalens_core::DatalensError> {
+        if owner == self.trigger_owner.as_slice()
+            && self
+                .replaced
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            self.inner.put(key, &self.replacement_owner)?;
+        }
+        Ok(())
+    }
+}
+
+impl ObjectStore for ReplaceAfterLockReadStore {
+    fn get(&self, key: &str) -> Result<Vec<u8>, datalens_core::DatalensError> {
+        self.inner.get(key)
+    }
+
+    fn get_optional(&self, key: &str) -> Result<Option<Vec<u8>>, datalens_core::DatalensError> {
+        let owner = self.inner.get_optional(key)?;
+        if let Some(owner) = owner.as_deref() {
+            self.maybe_replace_after_read(key, owner)?;
+        }
+        Ok(owner)
+    }
+
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), datalens_core::DatalensError> {
+        self.inner.put(key, bytes)
+    }
+
+    fn put_if_absent(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<ObjectPutIfAbsentResult, datalens_core::DatalensError> {
+        self.inner.put_if_absent(key, bytes)
+    }
+
+    fn exists(&self, key: &str) -> Result<bool, datalens_core::DatalensError> {
+        self.inner.exists(key)
+    }
+
+    fn list(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<datalens_storage::ObjectMetadata>, datalens_core::DatalensError> {
+        self.inner.list(prefix)
+    }
+
+    fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<datalens_storage::ObjectListPage, datalens_core::DatalensError> {
+        self.inner.list_page(prefix, start_after, limit)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), datalens_core::DatalensError> {
+        self.inner.delete(key)
+    }
+}
 
 #[test]
 fn test_object_store_key_validation_rejects_unsafe_relative_paths() {
@@ -88,6 +180,185 @@ fn test_local_object_store_put_if_absent_creates_once_without_overwrite() {
     );
 
     assert_eq!(store.get(key).expect("read existing object"), b"first");
+}
+
+#[test]
+fn test_object_store_lock_renew_rejects_owner_mismatch() {
+    let store = LocalObjectStore::new(temp_storage_root("local-lock-renew-mismatch"));
+    let key = "locks/compaction/chain-a/scope-a.json";
+    let mut lease = ObjectLockLease {
+        key: key.to_owned(),
+        owner: br#"{"owner_id":"leader-a","acquired_at_unix_seconds":1}"#.to_vec(),
+    };
+    store
+        .put(
+            key,
+            br#"{"owner_id":"leader-b","acquired_at_unix_seconds":1}"#,
+        )
+        .expect("write competing lock");
+
+    let renewed = store
+        .renew_lock(&mut lease, std::time::Duration::from_secs(30))
+        .expect("renew lock");
+
+    assert!(!renewed);
+    assert_eq!(
+        store.get(key).expect("current owner"),
+        br#"{"owner_id":"leader-b","acquired_at_unix_seconds":1}"#
+    );
+}
+
+#[test]
+fn test_object_store_lock_renew_extends_lease_before_reacquire() {
+    let store = LocalObjectStore::new(temp_storage_root("local-lock-renew-extends"));
+    let key = "locks/compaction/chain-a/scope-a.json";
+    let mut lease = ObjectLockLease {
+        key: key.to_owned(),
+        owner: br#"{"owner_id":"leader-a","acquired_at_unix_seconds":1}"#.to_vec(),
+    };
+    store.put(key, &lease.owner).expect("write old lock");
+
+    assert!(
+        store
+            .renew_lock(&mut lease, std::time::Duration::from_secs(60))
+            .expect("renew lock")
+    );
+
+    let contender = store
+        .try_acquire_lock_with_ttl(
+            key,
+            br#"{"owner_id":"leader-b","acquired_at_unix_seconds":9999999999}"#,
+            std::time::Duration::from_secs(1),
+        )
+        .expect("contender acquire");
+    assert!(contender.is_none());
+}
+
+#[test]
+fn test_object_store_lock_release_keeps_replaced_renewed_owner() {
+    let store = LocalObjectStore::new(temp_storage_root("local-lock-renew-release"));
+    let key = "locks/compaction/chain-a/scope-a.json";
+    let mut lease = ObjectLockLease {
+        key: key.to_owned(),
+        owner: br#"{"owner_id":"leader-a","acquired_at_unix_seconds":1}"#.to_vec(),
+    };
+    store.put(key, &lease.owner).expect("write old lock");
+    assert!(
+        store
+            .renew_lock(&mut lease, std::time::Duration::from_secs(60))
+            .expect("renew lock")
+    );
+    store
+        .put(
+            key,
+            br#"{"owner_id":"leader-b","acquired_at_unix_seconds":9999999999}"#,
+        )
+        .expect("replace renewed lock");
+
+    store
+        .release_lock(lease)
+        .expect("release stale renewed lock");
+
+    assert_eq!(
+        store.get(key).expect("current owner"),
+        br#"{"owner_id":"leader-b","acquired_at_unix_seconds":9999999999}"#
+    );
+}
+
+#[test]
+fn test_local_lock_release_fails_closed_when_cross_process_guard_is_held() {
+    let root = temp_storage_root("local-lock-release-cross-process-guard");
+    let stale_process = LocalObjectStore::new(&root);
+    let other_process = LocalObjectStore::new(&root);
+    let key = "locks/compaction/chain-a/scope-a.json";
+    let owner = br#"{"owner_id":"leader-a","acquired_at_unix_seconds":1}"#;
+    other_process.put(key, owner).expect("write lock");
+    let guard = create_local_lock_guard(&root, key);
+
+    stale_process
+        .release_lock(ObjectLockLease {
+            key: key.to_owned(),
+            owner: owner.to_vec(),
+        })
+        .expect("stale release while cross-process guard is held");
+
+    assert_eq!(other_process.get(key).expect("current owner"), owner);
+    std::fs::remove_dir(guard).expect("remove local lock guard");
+}
+
+#[test]
+fn test_local_expired_lock_takeover_fails_closed_when_cross_process_guard_is_held() {
+    let root = temp_storage_root("local-lock-takeover-cross-process-guard");
+    let contender = LocalObjectStore::new(&root);
+    let other_process = LocalObjectStore::new(&root);
+    let key = "locks/compaction/chain-a/scope-a.json";
+    let expired_owner = br#"{"owner_id":"leader-a","acquired_at_unix_seconds":1}"#;
+    other_process
+        .put(key, expired_owner)
+        .expect("write expired lock");
+    let guard = create_local_lock_guard(&root, key);
+
+    let lease = contender
+        .try_acquire_lock_with_ttl(
+            key,
+            br#"{"owner_id":"leader-b","acquired_at_unix_seconds":9999999999}"#,
+            Duration::from_secs(1),
+        )
+        .expect("contender acquire while cross-process guard is held");
+
+    assert!(lease.is_none());
+    assert_eq!(
+        other_process.get(key).expect("current owner"),
+        expired_owner
+    );
+    std::fs::remove_dir(guard).expect("remove local lock guard");
+}
+
+#[test]
+fn test_default_lock_release_fails_closed_after_owner_changes_between_read_and_delete() {
+    let old_owner = br#"{"owner_id":"leader-a","acquired_at_unix_seconds":1}"#;
+    let renewed_owner = br#"{"owner_id":"leader-a","acquired_at_unix_seconds":9999999999,"expires_at_unix_seconds":9999999999}"#;
+    let store = ReplaceAfterLockReadStore::new(
+        temp_storage_root("default-lock-release-fails-closed"),
+        old_owner,
+        renewed_owner,
+    );
+    let key = "locks/compaction/chain-a/scope-a.json";
+    store.put(key, old_owner).expect("write old lock");
+
+    let error = store
+        .release_lock(ObjectLockLease {
+            key: key.to_owned(),
+            owner: old_owner.to_vec(),
+        })
+        .expect_err("generic release must fail without conditional delete");
+
+    assert_eq!(error.kind, DatalensErrorKind::StorageWriteFailure);
+    assert_eq!(store.get(key).expect("current owner"), renewed_owner);
+}
+
+#[test]
+fn test_default_expired_lock_takeover_fails_closed_after_owner_changes_before_delete() {
+    let expired_owner = br#"{"owner_id":"leader-a","acquired_at_unix_seconds":1}"#;
+    let renewed_owner = br#"{"owner_id":"leader-a","acquired_at_unix_seconds":9999999999,"expires_at_unix_seconds":9999999999}"#;
+    let store = ReplaceAfterLockReadStore::new(
+        temp_storage_root("default-expired-lock-takeover-fails-closed"),
+        expired_owner,
+        renewed_owner,
+    );
+    let key = "locks/compaction/chain-a/scope-a.json";
+    store.put(key, expired_owner).expect("write expired lock");
+
+    let error = store
+        .try_acquire_lock_with_ttl(
+            key,
+            br#"{"owner_id":"leader-b","acquired_at_unix_seconds":9999999999}"#,
+            Duration::from_secs(1),
+        )
+        .expect_err("generic expired takeover must fail without conditional delete");
+
+    assert_eq!(error.kind, DatalensErrorKind::StorageWriteFailure);
+    assert_eq!(store.get(key).expect("current owner"), renewed_owner);
 }
 
 #[test]
@@ -341,6 +612,13 @@ fn temp_storage_root(name: &str) -> PathBuf {
     ));
     std::fs::create_dir_all(&root).expect("create temp storage root");
     root
+}
+
+fn create_local_lock_guard(root: &std::path::Path, key: &str) -> PathBuf {
+    let guard = root.join(".datalens-tmp").join("locks").join(key);
+    std::fs::create_dir_all(guard.parent().expect("guard parent")).expect("create guard parent");
+    std::fs::create_dir(&guard).expect("create local lock guard");
+    guard
 }
 
 fn s3_test_config() -> Option<S3ObjectStoreConfig> {

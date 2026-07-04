@@ -1317,6 +1317,7 @@ where
         chain: &ChainIdentity,
         entry: ManifestEntry,
         source_entries: &[ManifestEntry],
+        checkpoint: &dyn Fn() -> Result<(), DatalensError>,
     ) -> Result<bool, DatalensError> {
         let started = Instant::now();
         let lock = self.manifest_update_lock(chain)?;
@@ -1368,7 +1369,8 @@ where
             return Ok(false);
         }
 
-        self.publish_replacement_entry_unlocked(chain, entry, started)?;
+        checkpoint()?;
+        self.publish_replacement_entry_unlocked_with_checkpoint(chain, entry, started, checkpoint)?;
         Ok(true)
     }
 
@@ -1559,17 +1561,30 @@ where
         entry: ManifestEntry,
         started: Instant,
     ) -> Result<(), DatalensError> {
+        self.publish_replacement_entry_unlocked_with_checkpoint(chain, entry, started, &|| Ok(()))
+    }
+
+    fn publish_replacement_entry_unlocked_with_checkpoint(
+        &self,
+        chain: &ChainIdentity,
+        entry: ManifestEntry,
+        started: Instant,
+        checkpoint: &dyn Fn() -> Result<(), DatalensError>,
+    ) -> Result<(), DatalensError> {
+        checkpoint()?;
         let update = coverage_index::replace_entry(&self.object_store, &entry)?;
         let mut published_segment_keys = BTreeSet::new();
         let mut published_segment_count = 0usize;
         let mut published_segment_bytes = 0usize;
         for published_entry in &update.published_entries {
+            checkpoint()?;
             let (key, bytes_len) = self.put_manifest_segment_object(chain, published_entry)?;
             published_segment_keys.insert(key);
             published_segment_count += 1;
             published_segment_bytes += bytes_len;
             compaction_queue::write_entry(&self.object_store, chain, published_entry)?;
         }
+        checkpoint()?;
         let published_update =
             coverage_index::publish_replacement(&self.object_store, &entry, &update)?;
         let replaced_entries_count = published_update.replaced_entries.len();
@@ -1580,6 +1595,7 @@ where
         for published_entry in &published_update.published_entries {
             let key = manifest_segment_key(chain, published_entry);
             if !published_segment_keys.contains(&key) {
+                checkpoint()?;
                 let (key, bytes_len) = self.put_manifest_segment_object(chain, published_entry)?;
                 published_segment_keys.insert(key);
                 published_segment_count += 1;
@@ -1590,6 +1606,7 @@ where
         let mut deleted_segment_count = 0usize;
         for key in old_segment_keys {
             if !published_segment_keys.contains(&key) {
+                checkpoint()?;
                 self.object_store.delete(&key).map_err(|error| {
                     DatalensError::new(
                         DatalensErrorKind::ManifestUpdateFailure,
@@ -1599,8 +1616,10 @@ where
                 deleted_segment_count += 1;
             }
         }
+        checkpoint()?;
         let replaced_base_entries_count =
             self.rewrite_base_manifest_for_replacement_unlocked(chain, &entry)?;
+        checkpoint()?;
         self.bump_manifest_version(chain)?;
         log::info!(
             "storage published replacement coverage chain_key={} dataset={} selector_fingerprint={} range_kind={} range={}-{} finality={} replaced_entries_count={} replaced_base_entries_count={} deleted_manifest_segments_count={} published_manifest_segments_count={} published_manifest_segment_bytes={} duration_ms={}",

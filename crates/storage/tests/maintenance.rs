@@ -17,7 +17,7 @@ use parquet::{
 };
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 mod support;
@@ -890,6 +890,118 @@ fn test_compaction_merges_adjacent_small_objects_and_retains_old_objects() {
             .check
             .issues
             .is_empty()
+    );
+}
+
+#[test]
+fn test_compaction_checkpoint_failure_stops_before_publish() {
+    let storage = LocalStorage::new(temp_storage_root("compaction-checkpoint-failure"));
+    let chain = test_chain();
+    let first_object = write_block_object(&storage, &chain, 50, FinalityLevel::Safe);
+    let second_object = write_block_object(&storage, &chain, 51, FinalityLevel::Safe);
+    let checkpoint_called = AtomicBool::new(false);
+
+    let error = storage
+        .compact_small_objects_for_chain_with_checkpoint(
+            &chain,
+            MaintenanceCompactionConfig {
+                min_object_bytes: u64::MAX,
+                max_input_objects_per_candidate: 8,
+                max_tick_duration_ms: 30_000,
+                max_candidates_per_tick: 8,
+                max_manifest_entries_per_tick: 20_000,
+                cleanup_enabled: false,
+                delete_source_objects: false,
+                ..MaintenanceCompactionConfig::default()
+            },
+            || {
+                checkpoint_called.store(true, Ordering::Relaxed);
+                Err(DatalensError::new(
+                    DatalensErrorKind::StorageWriteFailure,
+                    "leader lock renewal failed",
+                ))
+            },
+        )
+        .expect_err("checkpoint failure stops compaction");
+
+    assert!(checkpoint_called.load(Ordering::Relaxed));
+    assert_eq!(error.kind, DatalensErrorKind::StorageWriteFailure);
+    assert!(
+        storage
+            .object_store()
+            .exists(&first_object)
+            .expect("first source exists")
+    );
+    assert!(
+        storage
+            .object_store()
+            .exists(&second_object)
+            .expect("second source exists")
+    );
+    assert_eq!(storage.manifest().expect("manifest").entries.len(), 2);
+}
+
+#[test]
+fn test_compaction_checkpoint_failure_inside_manifest_publish_keeps_sources_current() {
+    let storage = LocalStorage::new(temp_storage_root("compaction-checkpoint-publish-failure"));
+    let chain = test_chain();
+    let first_object = write_block_object(&storage, &chain, 52, FinalityLevel::Safe);
+    let second_object = write_block_object(&storage, &chain, 53, FinalityLevel::Safe);
+    let old_manifest = storage.manifest().expect("old manifest");
+    let old_segments = manifest_segment_keys(&storage, &chain);
+    let checkpoint_calls = AtomicUsize::new(0);
+
+    let error = storage
+        .compact_small_objects_for_chain_with_checkpoint(
+            &chain,
+            MaintenanceCompactionConfig {
+                min_object_bytes: u64::MAX,
+                max_input_objects_per_candidate: 8,
+                max_tick_duration_ms: 30_000,
+                max_candidates_per_tick: 8,
+                max_manifest_entries_per_tick: 20_000,
+                cleanup_enabled: true,
+                delete_source_objects: true,
+                source_delete_grace_ms: 0,
+                ..MaintenanceCompactionConfig::default()
+            },
+            || {
+                let call = checkpoint_calls.fetch_add(1, Ordering::Relaxed);
+                if call >= 2 {
+                    return Err(DatalensError::new(
+                        DatalensErrorKind::StorageWriteFailure,
+                        "leader lock renewal failed",
+                    ));
+                }
+                Ok(())
+            },
+        )
+        .expect_err("checkpoint failure inside manifest publish stops compaction");
+
+    assert_eq!(error.kind, DatalensErrorKind::StorageWriteFailure);
+    assert!(checkpoint_calls.load(Ordering::Relaxed) >= 3);
+    assert!(
+        storage
+            .object_store()
+            .list(&format!("chains/{}/datasets", chain.key_prefix()))
+            .expect("compacted objects")
+            .iter()
+            .any(|object| object.key.contains("/compacted/")),
+        "compacted object should be created before the helper checkpoint fails"
+    );
+    assert_eq!(storage.manifest().expect("manifest"), old_manifest);
+    assert_eq!(manifest_segment_keys(&storage, &chain), old_segments);
+    assert!(
+        storage
+            .object_store()
+            .exists(&first_object)
+            .expect("first source exists")
+    );
+    assert!(
+        storage
+            .object_store()
+            .exists(&second_object)
+            .expect("second source exists")
     );
 }
 

@@ -371,6 +371,30 @@ fn test_validate_config_rejects_compaction_leader_lock_ttl_below_tick_budget() {
     ));
 }
 
+#[test]
+fn test_validate_config_rejects_compaction_leader_lock_ttl_without_renew_interval() {
+    let config_text = minimal_config_text().replace(
+        r#"
+    [planner]"#,
+        r#"
+    [storage.compaction]
+    enabled = true
+    max_tick_duration_ms = 1
+    leader_lock_ttl_ms = 2
+
+    [planner]"#,
+    );
+    let config: DatalensConfig = toml::from_str(&config_text).expect("config parses");
+
+    let error = validate_config(&config).expect_err("zero renew interval rejected");
+
+    assert!(
+        error.message.contains(
+            "storage.compaction.leader_lock_ttl_ms must support a nonzero renewal interval"
+        )
+    );
+}
+
 fn minimal_config_text() -> String {
     r#"
     [server]
