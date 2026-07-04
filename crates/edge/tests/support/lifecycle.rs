@@ -32,8 +32,8 @@ pub(crate) use datalens_solana::{
 };
 pub(crate) use datalens_storage::{
     DurableStorage, LocalObjectStore, LocalStorage, Manifest, ObjectListPage, ObjectMetadata,
-    ObjectStore, ReadThroughCacheConfig, S3ObjectStore, S3ObjectStoreConfig, StorageRepository,
-    StorageWriteOutcome, StorageWriteRequest,
+    ObjectPutIfAbsentResult, ObjectStore, ReadThroughCacheConfig, S3ObjectStore,
+    S3ObjectStoreConfig, StorageRepository, StorageWriteOutcome, StorageWriteRequest,
 };
 pub(crate) use datalens_tron::{
     TronAdapter, TronBlock, TronFinality, TronFixtureProviderRpc, TronProvider, tron_all_selector,
@@ -81,6 +81,14 @@ impl ObjectStore for CountingObjectStore {
 
     fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
         self.inner.put(key, bytes)
+    }
+
+    fn put_if_absent(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<ObjectPutIfAbsentResult, DatalensError> {
+        self.inner.put_if_absent(key, bytes)
     }
 
     fn exists(&self, key: &str) -> Result<bool, DatalensError> {

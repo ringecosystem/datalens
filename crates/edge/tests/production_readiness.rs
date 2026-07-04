@@ -26,8 +26,9 @@ use datalens_edge::{
 use datalens_metrics::{ApplicationIdentity, MetricsRecorder};
 use datalens_planner::{FieldSelection, NativeQueryInput};
 use datalens_storage::{
-    DurableStorage, LocalObjectStore, LocalStorage, ObjectMetadata, ObjectStore, QueryWatermarkKey,
-    QueryWatermarkRepository, QueryWatermarkStore, ReadThroughCacheConfig,
+    DurableStorage, LocalObjectStore, LocalStorage, ObjectMetadata, ObjectPutIfAbsentResult,
+    ObjectStore, QueryWatermarkKey, QueryWatermarkRepository, QueryWatermarkStore,
+    ReadThroughCacheConfig,
 };
 use datalens_warmup::{
     LocalWarmupRegistry, WarmupChunkPolicy, WarmupRetryPolicy, WarmupRuntime, WarmupRuntimeConfig,
@@ -363,6 +364,14 @@ impl ObjectStore for CountingObjectStore {
 
     fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
         self.inner.put(key, bytes)
+    }
+
+    fn put_if_absent(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<ObjectPutIfAbsentResult, DatalensError> {
+        self.inner.put_if_absent(key, bytes)
     }
 
     fn exists(&self, key: &str) -> Result<bool, DatalensError> {
