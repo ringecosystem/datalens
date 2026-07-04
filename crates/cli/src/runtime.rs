@@ -202,20 +202,33 @@ pub(crate) fn start_storage_compaction_worker(
         }
     };
     Ok(Some(StorageCompactionWorker::start(
-        storage,
-        chains,
-        compaction,
-        interval,
-        object_store_error_pause,
-        leader_lock_ttl,
-        compaction_pressure,
-        metrics_recorders,
+        StorageCompactionWorkerArgs {
+            storage,
+            chains,
+            config: compaction,
+            interval,
+            object_store_error_pause,
+            leader_lock_ttl,
+            compaction_pressure,
+            metrics_recorders,
+        },
     )?))
 }
 
 pub(crate) struct StorageCompactionWorker {
     stop: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
+}
+
+struct StorageCompactionWorkerArgs {
+    storage: CompactionStorage,
+    chains: Vec<ChainIdentity>,
+    config: MaintenanceCompactionConfig,
+    interval: Duration,
+    object_store_error_pause: Duration,
+    leader_lock_ttl: Duration,
+    compaction_pressure: MaintenanceCompactionPressureMonitor,
+    metrics_recorders: Vec<MetricsRecorder>,
 }
 
 #[derive(Clone)]
@@ -287,16 +300,17 @@ impl Drop for CompactionLeaderLock {
 }
 
 impl StorageCompactionWorker {
-    fn start(
-        storage: CompactionStorage,
-        chains: Vec<ChainIdentity>,
-        config: MaintenanceCompactionConfig,
-        interval: Duration,
-        object_store_error_pause: Duration,
-        leader_lock_ttl: Duration,
-        compaction_pressure: MaintenanceCompactionPressureMonitor,
-        metrics_recorders: Vec<MetricsRecorder>,
-    ) -> Result<Self, DatalensError> {
+    fn start(args: StorageCompactionWorkerArgs) -> Result<Self, DatalensError> {
+        let StorageCompactionWorkerArgs {
+            storage,
+            chains,
+            config,
+            interval,
+            object_store_error_pause,
+            leader_lock_ttl,
+            compaction_pressure,
+            metrics_recorders,
+        } = args;
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
         let handle = thread::Builder::new()

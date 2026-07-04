@@ -5,6 +5,10 @@ use datalens_storage::{
     LocalObjectStore, ObjectStore, S3ObjectStore, S3ObjectStoreConfig, validate_object_key,
 };
 
+mod support;
+
+use support::CountingObjectStore;
+
 #[test]
 fn test_object_store_key_validation_rejects_unsafe_relative_paths() {
     for key in [
@@ -134,6 +138,75 @@ fn test_local_object_store_list_page_respects_limit_and_start_after() {
         vec!["chains/ethereum/manifest-segments/a/002.json"]
     );
     assert!(!second.has_more);
+}
+
+#[test]
+fn test_counting_object_store_records_operation_counts() {
+    let store = CountingObjectStore::new(LocalObjectStore::new(temp_storage_root(
+        "counting-object-store",
+    )));
+    let key = "coverage-index-v2/delta/chain/000001.json";
+
+    store.put(key, b"first").expect("put object");
+    store.put(key, b"second").expect("put object again");
+    store.get(key).expect("get object");
+    store.list("coverage-index-v2/delta").expect("list objects");
+    store
+        .list_page("coverage-index-v2/delta", None, 10)
+        .expect("list object page");
+    store.delete(key).expect("delete object");
+
+    assert_eq!(store.put_count(key), 2);
+    assert_eq!(store.get_count(key), 1);
+    assert_eq!(store.list_count("coverage-index-v2/delta"), 1);
+    assert_eq!(store.list_page_count("coverage-index-v2/delta"), 1);
+    assert_eq!(store.delete_count(key), 1);
+    store.assert_put_count_at_most(key, 2);
+}
+
+#[test]
+fn test_counting_object_store_reports_overwrite_violations() {
+    let store = CountingObjectStore::new(LocalObjectStore::new(temp_storage_root(
+        "counting-overwrites",
+    )));
+
+    store
+        .put("coverage-index-v2/delta/chain/000001.json", b"first")
+        .expect("put first delta");
+    store
+        .put("coverage-index-v2/delta/chain/000001.json", b"second")
+        .expect("overwrite first delta");
+    store
+        .put("coverage-index-v2/delta/chain/000002.json", b"third")
+        .expect("put second delta");
+
+    assert_eq!(
+        store.overwrite_budget_violations(),
+        vec![("coverage-index-v2/delta/chain/000001.json".to_owned(), 2)]
+    );
+}
+
+#[test]
+fn test_counting_object_store_filters_overwrite_assertions_by_prefix() {
+    let store = CountingObjectStore::new(LocalObjectStore::new(temp_storage_root(
+        "counting-prefix-filter",
+    )));
+
+    store
+        .put("coverage-index/legacy/head.json", b"first")
+        .expect("put legacy head");
+    store
+        .put("coverage-index/legacy/head.json", b"second")
+        .expect("overwrite legacy head");
+    store
+        .put("coverage-index-v2/delta/chain/000001.json", b"delta")
+        .expect("put v2 delta");
+
+    store.assert_no_overwrite("coverage-index-v2/delta");
+    assert_eq!(
+        store.overwrite_budget_violations_for_prefix("coverage-index/legacy"),
+        vec![("coverage-index/legacy/head.json".to_owned(), 2)]
+    );
 }
 
 #[test]

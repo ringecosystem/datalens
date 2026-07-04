@@ -749,8 +749,6 @@ where
                     .or(cursor.scope_cursor_advance)
             } else if partial {
                 legacy_next_key.or(cursor.scope_cursor_advance)
-            } else if cursor.scope_partial {
-                cursor.scope_cursor_advance
             } else {
                 cursor.scope_cursor_advance
             };
@@ -1437,10 +1435,10 @@ where
     }
 
     fn read_compaction_cursor_key(&self, key: &str) -> Result<CompactionCursor, DatalensError> {
-        if !self.object_store().exists(&key)? {
+        if !self.object_store().exists(key)? {
             return Ok(CompactionCursor::default());
         }
-        let bytes = self.object_store().get(&key)?;
+        let bytes = self.object_store().get(key)?;
         serde_json::from_slice(&bytes).map_err(|error| {
             DatalensError::new(
                 DatalensErrorKind::StorageReadFailure,
@@ -1455,7 +1453,7 @@ where
         cursor: Option<CompactionCursor>,
     ) -> Result<(), DatalensError> {
         let Some(cursor) = cursor else {
-            self.object_store().delete(&key)?;
+            self.object_store().delete(key)?;
             return Ok(());
         };
         let bytes = serde_json::to_vec_pretty(&cursor).map_err(|error| {
@@ -1464,7 +1462,7 @@ where
                 format!("encode compaction cursor: {error}"),
             )
         })?;
-        self.object_store().put(&key, &bytes)
+        self.object_store().put(key, &bytes)
     }
 
     fn scan_compaction_queue_entries(
