@@ -115,6 +115,18 @@ failed compaction ticks by increasing sleep duration for consecutive failures; o
 backpressure must still gate deliberate rate increases based on the pause conditions
 below.
 
+Before each increase, compare the current phase handoff against the baseline window.
+Advance only when all gate decisions are `hold_or_increase`:
+
+| Gate | Hold or increase | Pause or rollback |
+| --- | --- | --- |
+| Query latency | p95 and p99 remain inside the production SLA and error rate is flat. | p95 or p99 breaches SLA for one sustained window, or query errors increase. |
+| Write latency | p95 and p99 remain inside the production SLA and error rate is flat. | p95 or p99 breaches SLA for one sustained window, or write errors increase. |
+| Object store | Timeout and 5xx rates are flat or declining; RustFS list timeout is gone or lower than baseline. | Timeout or 5xx rate increases materially, especially RustFS list timeout. |
+| RustFS capacity | CPU and request queues are flat or declining. | CPU stays saturated or request queues grow. |
+| Datalens capacity | CPU, memory, and restart count are flat or declining. | CPU, memory, restart count, or OOM pressure rises materially. |
+| Compaction health | Ticks complete or remain bounded `partial`; source cleanup failures do not repeat. | Tick failures, `source_delete_failures`, or cleanup failures repeat across windows. |
+
 Completion standard: backlog falls faster than Phase 1, RustFS timeout and 5xx rates
 stay flat or decline, and Datalens CPU, memory, query latency, and write latency remain
 inside budget.
@@ -161,3 +173,36 @@ For each phase handoff, preserve one before/after pair of
 complete when it states current phase, active config values, backlog deltas, SLA status,
 object-store timeout/5xx status, and whether the next action is hold, pause, rollback,
 or increase.
+
+## Phase Handoff Template
+
+Create one handoff record per phase change or hold decision. Keep it outside the repo if
+it contains production metric links or incident system URLs.
+
+| Field | Required content |
+| --- | --- |
+| Current phase | `phase_0_disabled_hold`, `phase_1_low_rate_observation`, `phase_2_backpressure_gated_increase`, or `phase_3_drain_finish`. |
+| Active config | The deployed `storage.compaction` values for `enabled`, `interval_ms`, `max_candidates_per_tick`, `max_manifest_entries_per_tick`, `max_tick_duration_ms`, `max_merge_ranges`, and `delete_source_objects`. |
+| Inventory snapshot | Paths or object keys for the before and after `datalens inspect maintenance` JSON files. |
+| Backlog delta | Before/after `small_object_count`, `small_object_bytes`, and `manifest_segment_count`, plus the top changed `chain` / `dataset_key` / `selector_fingerprint` groups. |
+| SLA status | Query and write p95/p99, error rate, and whether each stayed inside the production SLA for the full window. |
+| Object-store status | Timeout rate, 5xx rate, RustFS list timeout rate, and whether each is gone, lower, flat, or worse than baseline. |
+| Capacity status | RustFS CPU and queue pressure plus Datalens CPU, memory, restart count, and OOM pressure. |
+| Compaction health | Tick status distribution, `processed_candidates`, `compacted_objects`, `deleted_source_objects`, and `source_delete_failures`. |
+| Gate decision | `hold_or_increase`, `hold_same_phase`, `pause`, or `rollback_to_previous_phase`. |
+| Next action | The exact config change, pause command, rollback target, or next inspection time. |
+
+Minimal handoff example:
+
+```text
+Current phase: phase_1_low_rate_observation
+Active config: enabled=true interval_ms=300000 max_candidates_per_tick=1 max_manifest_entries_per_tick=1000 max_tick_duration_ms=5000 max_merge_ranges=8 delete_source_objects=true
+Inventory snapshot: /tmp/datalens-maintenance-before.json -> /tmp/datalens-maintenance-phase-1.json
+Backlog delta: small_object_count 420000 -> 382000; small_object_bytes 96 GiB -> 84 GiB; manifest_segment_count 18000 -> 14200; top groups ethereum/evm.logs/all, ethereum/evm.blocks/all
+SLA status: query p95/p99 inside SLA, write p95/p99 inside SLA, error rate flat
+Object-store status: timeout flat, 5xx flat, RustFS list timeout lower than baseline
+Capacity status: RustFS CPU flat, Datalens CPU/memory flat, no restarts
+Compaction health: completed/partial ticks only, source_delete_failures=0
+Gate decision: hold_or_increase
+Next action: reduce interval_ms to 120000 and observe one baseline window
+```

@@ -168,6 +168,47 @@ fn production_boundary_artifacts_are_declared() {
 }
 
 #[test]
+fn production_compaction_backlog_drain_runbook_covers_controlled_drain_contract() {
+    let production_config = include_str!("../../../config/datalens.production.toml");
+    let production_runbook = include_str!("../../../docs/runbook/production.md");
+    let drain_runbook =
+        include_str!("../../../docs/runbook/compaction-production-backlog-drain.md");
+
+    assert!(production_config.contains("[storage.compaction]"));
+    assert!(production_config.contains("enabled = false"));
+    assert!(production_config.contains("interval_ms = 300000"));
+    assert!(production_config.contains("max_candidates_per_tick = 1"));
+    assert!(production_config.contains("max_manifest_entries_per_tick = 1000"));
+    assert!(production_config.contains("delete_source_objects = true"));
+    assert!(production_runbook.contains("docs/runbook/compaction-production-backlog-drain.md"));
+
+    for required_snippet in [
+        "small_object_count",
+        "manifest_segment_count",
+        "chains[].chain",
+        "chains[].datasets[].dataset_key",
+        "chains[].datasets[].selectors[]",
+        "Phase 0: Disabled Hold",
+        "Phase 1: Low-Rate Observation",
+        "Phase 2: Backpressure-Gated Increase",
+        "Phase 3: Drain Finish",
+        "Query p95 or p99",
+        "Write p95 or p99",
+        "Object-store timeout or 5xx",
+        "RustFS CPU",
+        "Datalens CPU",
+        "Phase Handoff Template",
+        "Backlog delta",
+        "Next action",
+    ] {
+        assert!(
+            drain_runbook.contains(required_snippet),
+            "production compaction drain runbook missing {required_snippet}"
+        );
+    }
+}
+
+#[test]
 fn local_compose_deployment_artifacts_are_declared() {
     let compose = include_str!("../../../docker-compose.yml");
     let env_example = include_str!("../../../.env.example");
