@@ -37,6 +37,9 @@ fn test_solana_slots_complete_fetch_query_cache_flow() {
     };
 
     let first = executor.execute(input.clone()).expect("first query");
+    executor
+        .wait_for_durable_promotions()
+        .expect("first query durable promotion");
     let second = executor.execute(input).expect("second query");
 
     assert_eq!(
@@ -44,7 +47,7 @@ fn test_solana_slots_complete_fetch_query_cache_flow() {
         vec![LedgerRange::slots(10, 12).expect("valid range")]
     );
     assert_eq!(
-        second.cache.hit_ranges,
+        second.cache.durable_hit_ranges,
         vec![LedgerRange::slots(10, 12).expect("valid range")]
     );
     let QueryRows::AdapterJson { rows, .. } = second.rows.rows() else {

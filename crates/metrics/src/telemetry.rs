@@ -2,6 +2,8 @@ use datalens_core::{ChainIdentity, DatalensErrorKind, DatasetKey};
 use prometheus::{CounterVec, GaugeVec, HistogramOpts, HistogramVec, Opts, Registry, TextEncoder};
 
 const APPLICATION: &str = "unknown";
+const COMPACTION_PAUSE_REASONS: [&str; 3] =
+    ["query_latency", "write_latency", "object_store_error"];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApplicationIdentity {
@@ -40,6 +42,53 @@ pub struct MetricsLabels {
     chain: String,
     chain_kind: String,
     dataset: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompactionBacklogLabels {
+    chain: String,
+    chain_kind: String,
+    dataset: String,
+    selector_kind: String,
+    selector: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CompactionTickMetrics<'a> {
+    pub status: &'a str,
+    pub pause_reason: &'a str,
+    pub input_objects: usize,
+    pub output_objects: usize,
+    pub deleted_source_objects: usize,
+    pub deleted_manifest_segments: usize,
+    pub duration_seconds: f64,
+}
+
+impl CompactionBacklogLabels {
+    pub fn new(
+        chain: ChainIdentity,
+        dataset_key: DatasetKey,
+        selector_kind: impl Into<String>,
+        selector: impl Into<String>,
+    ) -> Self {
+        Self {
+            chain: chain.configured_name().to_owned(),
+            chain_kind: chain.family_ref().key().to_owned(),
+            dataset: dataset_key.as_str().to_owned(),
+            selector_kind: selector_kind.into(),
+            selector: selector.into(),
+        }
+    }
+
+    fn label_values(&self) -> [&str; 5] {
+        [
+            &self.chain,
+            &self.chain_kind,
+            &self.dataset,
+            &self.selector_kind,
+            &self.selector,
+        ]
+    }
 }
 
 impl MetricsLabels {
@@ -441,6 +490,15 @@ pub struct MetricsRecorder {
     indexer_graphql_query_duration_seconds: HistogramVec,
     indexer_graphql_auth_failure_total: CounterVec,
     indexer_graphql_rate_limited_total: CounterVec,
+    compaction_small_objects: GaugeVec,
+    compaction_manifest_segments: GaugeVec,
+    compaction_candidate_backlog: GaugeVec,
+    compaction_input_objects_total: CounterVec,
+    compaction_output_objects_total: CounterVec,
+    compaction_deleted_source_objects_total: CounterVec,
+    compaction_deleted_manifest_segments_total: CounterVec,
+    compaction_tick_duration_seconds: HistogramVec,
+    compaction_paused: GaugeVec,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -739,6 +797,87 @@ impl MetricsRecorder {
             ),
             &["application", "chain", "dataset", "index", "output"],
         )?;
+        let compaction_small_objects = GaugeVec::new(
+            Opts::new(
+                "datalens_compaction_small_objects",
+                "Small source objects remaining in the compaction backlog.",
+            ),
+            &[
+                "chain",
+                "chain_kind",
+                "dataset",
+                "selector_kind",
+                "selector",
+            ],
+        )?;
+        let compaction_manifest_segments = GaugeVec::new(
+            Opts::new(
+                "datalens_compaction_manifest_segments",
+                "Manifest segments represented by the remaining compaction backlog.",
+            ),
+            &[
+                "chain",
+                "chain_kind",
+                "dataset",
+                "selector_kind",
+                "selector",
+            ],
+        )?;
+        let compaction_candidate_backlog = GaugeVec::new(
+            Opts::new(
+                "datalens_compaction_candidate_backlog",
+                "Compaction candidate groups remaining after the latest tick.",
+            ),
+            &[
+                "chain",
+                "chain_kind",
+                "dataset",
+                "selector_kind",
+                "selector",
+            ],
+        )?;
+        let compaction_input_objects_total = CounterVec::new(
+            Opts::new(
+                "datalens_compaction_input_objects_total",
+                "Source objects read by compaction ticks.",
+            ),
+            &["chain", "chain_kind", "status", "pause_reason"],
+        )?;
+        let compaction_output_objects_total = CounterVec::new(
+            Opts::new(
+                "datalens_compaction_output_objects_total",
+                "Compacted output objects written by compaction ticks.",
+            ),
+            &["chain", "chain_kind", "status", "pause_reason"],
+        )?;
+        let compaction_deleted_source_objects_total = CounterVec::new(
+            Opts::new(
+                "datalens_compaction_deleted_source_objects_total",
+                "Source objects deleted after successful compaction.",
+            ),
+            &["chain", "chain_kind", "status", "pause_reason"],
+        )?;
+        let compaction_deleted_manifest_segments_total = CounterVec::new(
+            Opts::new(
+                "datalens_compaction_deleted_manifest_segments_total",
+                "Manifest segments superseded by successful compaction.",
+            ),
+            &["chain", "chain_kind", "status", "pause_reason"],
+        )?;
+        let compaction_tick_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "datalens_compaction_tick_duration_seconds",
+                "Storage compaction tick duration in seconds.",
+            ),
+            &["chain", "chain_kind", "status", "pause_reason"],
+        )?;
+        let compaction_paused = GaugeVec::new(
+            Opts::new(
+                "datalens_compaction_paused",
+                "Whether compaction is currently paused for a backpressure reason.",
+            ),
+            &["chain", "chain_kind", "reason"],
+        )?;
 
         registry.register(Box::new(query_total.clone()))?;
         registry.register(Box::new(query_duration_seconds.clone()))?;
@@ -771,6 +910,15 @@ impl MetricsRecorder {
         registry.register(Box::new(indexer_graphql_query_duration_seconds.clone()))?;
         registry.register(Box::new(indexer_graphql_auth_failure_total.clone()))?;
         registry.register(Box::new(indexer_graphql_rate_limited_total.clone()))?;
+        registry.register(Box::new(compaction_small_objects.clone()))?;
+        registry.register(Box::new(compaction_manifest_segments.clone()))?;
+        registry.register(Box::new(compaction_candidate_backlog.clone()))?;
+        registry.register(Box::new(compaction_input_objects_total.clone()))?;
+        registry.register(Box::new(compaction_output_objects_total.clone()))?;
+        registry.register(Box::new(compaction_deleted_source_objects_total.clone()))?;
+        registry.register(Box::new(compaction_deleted_manifest_segments_total.clone()))?;
+        registry.register(Box::new(compaction_tick_duration_seconds.clone()))?;
+        registry.register(Box::new(compaction_paused.clone()))?;
 
         Ok(Self {
             registry,
@@ -805,6 +953,15 @@ impl MetricsRecorder {
             indexer_graphql_query_duration_seconds,
             indexer_graphql_auth_failure_total,
             indexer_graphql_rate_limited_total,
+            compaction_small_objects,
+            compaction_manifest_segments,
+            compaction_candidate_backlog,
+            compaction_input_objects_total,
+            compaction_output_objects_total,
+            compaction_deleted_source_objects_total,
+            compaction_deleted_manifest_segments_total,
+            compaction_tick_duration_seconds,
+            compaction_paused,
         })
     }
 
@@ -1092,6 +1249,53 @@ impl MetricsRecorder {
             .inc();
     }
 
+    pub fn set_compaction_backlog(
+        &self,
+        labels: &CompactionBacklogLabels,
+        small_objects: usize,
+        manifest_segments: usize,
+        candidate_backlog: usize,
+    ) {
+        self.compaction_small_objects
+            .with_label_values(&labels.label_values())
+            .set(small_objects as f64);
+        self.compaction_manifest_segments
+            .with_label_values(&labels.label_values())
+            .set(manifest_segments as f64);
+        self.compaction_candidate_backlog
+            .with_label_values(&labels.label_values())
+            .set(candidate_backlog as f64);
+    }
+
+    pub fn record_compaction_tick(&self, chain: &ChainIdentity, tick: CompactionTickMetrics<'_>) {
+        let labels = compaction_tick_label_values(chain, tick.status, tick.pause_reason);
+        self.compaction_input_objects_total
+            .with_label_values(&labels)
+            .inc_by(tick.input_objects as f64);
+        self.compaction_output_objects_total
+            .with_label_values(&labels)
+            .inc_by(tick.output_objects as f64);
+        self.compaction_deleted_source_objects_total
+            .with_label_values(&labels)
+            .inc_by(tick.deleted_source_objects as f64);
+        self.compaction_deleted_manifest_segments_total
+            .with_label_values(&labels)
+            .inc_by(tick.deleted_manifest_segments as f64);
+        self.compaction_tick_duration_seconds
+            .with_label_values(&labels)
+            .observe(tick.duration_seconds);
+        for reason in COMPACTION_PAUSE_REASONS {
+            if reason != tick.pause_reason {
+                self.compaction_paused
+                    .with_label_values(&compaction_paused_label_values(chain, reason))
+                    .set(0.0);
+            }
+        }
+        self.compaction_paused
+            .with_label_values(&compaction_paused_label_values(chain, tick.pause_reason))
+            .set((tick.pause_reason != "none") as u8 as f64);
+    }
+
     pub fn encode(&self) -> Result<String, prometheus::Error> {
         let families = self.registry.gather();
         let mut output = String::new();
@@ -1201,6 +1405,23 @@ fn indexer_graphql_label_values(labels: &IndexerGraphqlMetricLabels) -> [&str; 5
         labels.index.as_str(),
         labels.output.as_str(),
     ]
+}
+
+fn compaction_tick_label_values<'a>(
+    chain: &'a ChainIdentity,
+    status: &'a str,
+    pause_reason: &'a str,
+) -> [&'a str; 4] {
+    [
+        chain.configured_name(),
+        chain.family_ref().key(),
+        status,
+        pause_reason,
+    ]
+}
+
+fn compaction_paused_label_values<'a>(chain: &'a ChainIdentity, reason: &'a str) -> [&'a str; 3] {
+    [chain.configured_name(), chain.family_ref().key(), reason]
 }
 
 fn indexer_graphql_query_label_values<'a>(

@@ -19,14 +19,17 @@ use datalens_evm::{
     DurableEvmBlockHeaderStore, EvmBlockHeaderFetchMode, EvmBlockHeaderMetadataConfig,
     EvmFinalityPolicy, EvmLogReliabilityConfig, EvmRpcClient,
 };
-use datalens_metrics::ApplicationIdentity;
+use datalens_metrics::{
+    ApplicationIdentity, CompactionBacklogLabels, CompactionTickMetrics, MetricsRecorder,
+};
 use datalens_solana::{SolanaAdapter, SolanaHttpRpc};
 use datalens_storage::{
     DurablePromotionIntentRepository, DurablePromotionIntentStore, DurableStorage,
     LocalObjectStore, LocalStorage, MaintenanceCompactionConfig,
-    MaintenanceCompactionPressureMonitor, ObjectListPage, ObjectMetadata, ObjectStore,
-    QueryActivityRepository, QueryActivityStore, QueryWatermarkRepository, QueryWatermarkStore,
-    S3ObjectStore, UsageLedgerRepository, UsageLedgerStore,
+    MaintenanceCompactionPressureMonitor, MaintenanceCompactionReport, ObjectListPage,
+    ObjectMetadata, ObjectStore, QueryActivityRepository, QueryActivityStore,
+    QueryWatermarkRepository, QueryWatermarkStore, S3ObjectStore, UsageLedgerRepository,
+    UsageLedgerStore,
 };
 use datalens_tron::{TronAdapter, TronGridContractEventsConfig, TronHttpProvider};
 use datalens_warmup::{
@@ -150,6 +153,7 @@ pub(crate) fn build_service_registry_with_compaction_pressure(
 pub(crate) fn start_storage_compaction_worker(
     config: &DatalensConfig,
     compaction_pressure: MaintenanceCompactionPressureMonitor,
+    metrics_recorders: Vec<MetricsRecorder>,
 ) -> Result<Option<StorageCompactionWorker>, DatalensError> {
     if !config.storage.compaction.enabled {
         log::info!("storage compaction worker disabled");
@@ -161,28 +165,7 @@ pub(crate) fn start_storage_compaction_worker(
         return Ok(None);
     }
     let interval = Duration::from_millis(config.storage.compaction.interval_ms.max(1));
-    let compaction = MaintenanceCompactionConfig {
-        min_object_bytes: config.storage.compaction.min_object_bytes,
-        max_merge_ranges: config.storage.compaction.max_merge_ranges.max(2),
-        max_tick_duration_ms: config.storage.compaction.max_tick_duration_ms,
-        max_candidates_per_tick: config.storage.compaction.max_candidates_per_tick,
-        max_concurrent_candidates: config.storage.compaction.max_concurrent_candidates,
-        max_manifest_entries_per_tick: config.storage.compaction.max_manifest_entries_per_tick,
-        max_gets_per_tick: config.storage.compaction.max_gets_per_tick,
-        max_puts_per_tick: config.storage.compaction.max_puts_per_tick,
-        max_deletes_per_tick: config.storage.compaction.max_deletes_per_tick,
-        query_latency_pause_threshold_ms: config
-            .storage
-            .compaction
-            .query_latency_pause_threshold_ms,
-        write_latency_pause_threshold_ms: config
-            .storage
-            .compaction
-            .write_latency_pause_threshold_ms,
-        pressure_pause_ms: config.storage.compaction.pressure_pause_ms,
-        delete_source_objects: config.storage.compaction.delete_source_objects,
-        ..MaintenanceCompactionConfig::default()
-    };
+    let compaction = maintenance_compaction_config(config.storage.compaction);
     let object_store_error_pause =
         Duration::from_millis(config.storage.compaction.object_store_error_pause_ms);
     let storage = match config.storage.backend.as_str() {
@@ -224,6 +207,7 @@ pub(crate) fn start_storage_compaction_worker(
         interval,
         object_store_error_pause,
         compaction_pressure,
+        metrics_recorders,
     )?))
 }
 
@@ -246,6 +230,7 @@ impl StorageCompactionWorker {
         interval: Duration,
         object_store_error_pause: Duration,
         compaction_pressure: MaintenanceCompactionPressureMonitor,
+        metrics_recorders: Vec<MetricsRecorder>,
     ) -> Result<Self, DatalensError> {
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
@@ -253,13 +238,19 @@ impl StorageCompactionWorker {
             .name("datalens-storage-compaction".to_owned())
             .spawn(move || {
                 log::info!(
-                    "storage compaction worker started interval_ms={} min_object_bytes={} max_merge_ranges={} max_tick_duration_ms={} max_candidates_per_tick={} max_manifest_entries_per_tick={} delete_source_objects={} chain_count={}",
+                    "storage compaction worker started interval_ms={} min_object_bytes={} target_object_bytes={} max_output_object_bytes={} max_input_objects_per_candidate={} max_input_bytes_per_candidate={} max_tick_duration_ms={} max_candidates_per_tick={} max_manifest_entries_per_tick={} max_deletes_per_tick={} source_delete_grace_ms={} cleanup_enabled={} delete_source_objects={} chain_count={}",
                     interval.as_millis(),
                     config.min_object_bytes,
-                    config.max_merge_ranges,
+                    config.target_object_bytes,
+                    config.max_output_object_bytes,
+                    config.max_input_objects_per_candidate,
+                    config.max_input_bytes_per_candidate,
                     config.max_tick_duration_ms,
                     config.max_candidates_per_tick,
                     config.max_manifest_entries_per_tick,
+                    config.max_deletes_per_tick,
+                    config.source_delete_grace_ms,
+                    config.cleanup_enabled,
                     config.delete_source_objects,
                     chains.len()
                 );
@@ -318,26 +309,37 @@ impl StorageCompactionWorker {
                     match result {
                         Ok(report) => {
                             consecutive_failures = 0;
+                            record_compaction_metrics(&metrics_recorders, &chain, &report);
                             log::info!(
-                                "storage compaction tick completed chain_key={} candidate_count={} processed_candidates={} compacted_objects={} compacted_rows={} deleted_source_objects={} source_delete_failures={} tick_status={} duration_ms={}",
+                                "storage compaction tick completed chain_key={} candidate_count={} candidate_backlog={} processed_candidates={} input_objects={} output_objects={} compacted_objects={} compacted_rows={} deleted_source_objects={} deleted_manifest_segments={} source_delete_failures={} pause_reason={} tick_status={} duration_ms={}",
                                 chain.key_prefix(),
                                 report.candidate_count,
+                                report.candidate_backlog,
                                 report.processed_candidates,
+                                report.tick_summary.input_objects,
+                                report.tick_summary.output_objects,
                                 report.compacted_objects,
                                 report.compacted_rows,
                                 report.deleted_source_objects,
+                                report.tick_summary.deleted_manifest_segments,
                                 report.source_delete_failures,
+                                report.pause_reason.as_deref().unwrap_or("none"),
                                 report.tick_status.as_str(),
                                 started.elapsed().as_millis()
                             );
                         }
                         Err(error) => {
                             consecutive_failures = consecutive_failures.saturating_add(1);
-                            if is_object_store_backpressure_error(&error)
-                                && !object_store_error_pause.is_zero()
-                            {
+                            let backpressure_error = is_object_store_backpressure_error(&error);
+                            if backpressure_error && !object_store_error_pause.is_zero() {
                                 pause_until = Some(Instant::now() + object_store_error_pause);
                             }
+                            record_compaction_failure_metrics(
+                                &metrics_recorders,
+                                &chain,
+                                backpressure_error.then_some("object_store_error"),
+                                started.elapsed(),
+                            );
                             log::warn!(
                                 "storage compaction tick failed chain_key={} tick_status=failed kind={:?} message={} consecutive_failures={} duration_ms={}",
                                 chain.key_prefix(),
@@ -393,6 +395,66 @@ fn compaction_sleep_duration(interval: Duration, consecutive_failures: u32) -> D
     interval.saturating_mul(multiplier)
 }
 
+fn record_compaction_metrics(
+    recorders: &[MetricsRecorder],
+    chain: &ChainIdentity,
+    report: &MaintenanceCompactionReport,
+) {
+    if recorders.is_empty() {
+        return;
+    }
+    let pause_reason = report.pause_reason.as_deref().unwrap_or("none");
+    for recorder in recorders {
+        for scope in &report.backlog {
+            recorder.set_compaction_backlog(
+                &CompactionBacklogLabels::new(
+                    scope.chain.clone(),
+                    scope.dataset_key.clone(),
+                    &scope.selector_kind,
+                    &scope.selector_fingerprint,
+                ),
+                scope.small_objects,
+                scope.manifest_segments,
+                scope.candidate_backlog,
+            );
+        }
+        recorder.record_compaction_tick(
+            chain,
+            CompactionTickMetrics {
+                status: report.tick_status.as_str(),
+                pause_reason,
+                input_objects: report.tick_summary.input_objects,
+                output_objects: report.tick_summary.output_objects,
+                deleted_source_objects: report.tick_summary.deleted_source_objects,
+                deleted_manifest_segments: report.tick_summary.deleted_manifest_segments,
+                duration_seconds: report.tick_summary.duration_ms as f64 / 1_000.0,
+            },
+        );
+    }
+}
+
+fn record_compaction_failure_metrics(
+    recorders: &[MetricsRecorder],
+    chain: &ChainIdentity,
+    pause_reason: Option<&str>,
+    duration: Duration,
+) {
+    for recorder in recorders {
+        recorder.record_compaction_tick(
+            chain,
+            CompactionTickMetrics {
+                status: "failed",
+                pause_reason: pause_reason.unwrap_or("none"),
+                input_objects: 0,
+                output_objects: 0,
+                deleted_source_objects: 0,
+                deleted_manifest_segments: 0,
+                duration_seconds: duration.as_secs_f64(),
+            },
+        );
+    }
+}
+
 fn is_object_store_backpressure_error(error: &DatalensError) -> bool {
     if !matches!(
         error.kind,
@@ -411,6 +473,32 @@ fn is_object_store_backpressure_error(error: &DatalensError) -> bool {
         || message.contains("502")
         || message.contains("503")
         || message.contains("504")
+}
+
+fn maintenance_compaction_config(
+    config: datalens_edge::config::StorageCompactionConfig,
+) -> MaintenanceCompactionConfig {
+    MaintenanceCompactionConfig {
+        min_object_bytes: config.min_object_bytes,
+        target_object_bytes: config.target_object_bytes,
+        max_output_object_bytes: config.max_output_object_bytes,
+        max_input_objects_per_candidate: config.max_input_objects_per_candidate.max(2),
+        max_input_bytes_per_candidate: config.max_input_bytes_per_candidate,
+        max_tick_duration_ms: config.max_tick_duration_ms,
+        max_candidates_per_tick: config.max_candidates_per_tick,
+        max_concurrent_candidates: config.max_concurrent_candidates,
+        max_manifest_entries_per_tick: config.max_manifest_entries_per_tick,
+        max_gets_per_tick: config.max_gets_per_tick,
+        max_puts_per_tick: config.max_puts_per_tick,
+        max_deletes_per_tick: config.max_deletes_per_tick,
+        source_delete_grace_ms: config.source_delete_grace_ms,
+        query_latency_pause_threshold_ms: config.query_latency_pause_threshold_ms,
+        write_latency_pause_threshold_ms: config.write_latency_pause_threshold_ms,
+        pressure_pause_ms: config.pressure_pause_ms,
+        cleanup_enabled: config.cleanup_enabled,
+        delete_source_objects: config.delete_source_objects,
+        ..MaintenanceCompactionConfig::default()
+    }
 }
 
 fn build_evm_service_with_storage(
@@ -1228,11 +1316,100 @@ pub(crate) fn finality_summary(chain: &ChainConfig) -> serde_json::Value {
 mod tests {
     use datalens_chain::{AdapterKey, DatasetSelector};
     use datalens_core::{ChainFamily, ChainIdentity, DatasetKey, LedgerRangeKind, NetworkId};
+    use datalens_edge::config::StorageCompactionConfig;
     use datalens_warmup::{
         WarmupChunkPolicy, WarmupRetryPolicy, WarmupSubmitRequest, WarmupTaskMode,
     };
 
     use super::*;
+
+    #[test]
+    fn storage_compaction_cleanup_flag_gates_source_cleanup() {
+        let config = StorageCompactionConfig {
+            enabled: true,
+            interval_ms: 10_000,
+            min_object_bytes: 1_048_576,
+            target_object_bytes: 67_108_864,
+            max_output_object_bytes: 134_217_728,
+            max_input_objects_per_candidate: 512,
+            max_input_bytes_per_candidate: 134_217_728,
+            max_tick_duration_ms: 2_000,
+            max_candidates_per_tick: 1,
+            max_concurrent_candidates: 1,
+            max_manifest_entries_per_tick: 2_000,
+            max_gets_per_tick: 64,
+            max_puts_per_tick: 8,
+            max_deletes_per_tick: 64,
+            source_delete_grace_ms: 300_000,
+            object_store_error_pause_ms: 60_000,
+            query_latency_pause_threshold_ms: 0,
+            write_latency_pause_threshold_ms: 0,
+            pressure_pause_ms: 60_000,
+            cleanup_enabled: false,
+            delete_source_objects: true,
+        };
+
+        let compaction = maintenance_compaction_config(config);
+
+        assert!(!compaction.cleanup_enabled);
+        assert!(compaction.delete_source_objects);
+        assert_eq!(compaction.max_candidates_per_tick, 1);
+        assert_eq!(compaction.max_tick_duration_ms, 2_000);
+    }
+
+    #[test]
+    fn storage_compaction_cleanup_flag_preserves_source_cleanup_intent() {
+        let config = StorageCompactionConfig {
+            enabled: true,
+            interval_ms: 10_000,
+            min_object_bytes: 1_048_576,
+            target_object_bytes: 67_108_864,
+            max_output_object_bytes: 134_217_728,
+            max_input_objects_per_candidate: 512,
+            max_input_bytes_per_candidate: 134_217_728,
+            max_tick_duration_ms: 2_000,
+            max_candidates_per_tick: 1,
+            max_concurrent_candidates: 1,
+            max_manifest_entries_per_tick: 2_000,
+            max_gets_per_tick: 64,
+            max_puts_per_tick: 8,
+            max_deletes_per_tick: 64,
+            source_delete_grace_ms: 300_000,
+            object_store_error_pause_ms: 60_000,
+            query_latency_pause_threshold_ms: 0,
+            write_latency_pause_threshold_ms: 0,
+            pressure_pause_ms: 60_000,
+            cleanup_enabled: true,
+            delete_source_objects: true,
+        };
+
+        let compaction = maintenance_compaction_config(config);
+
+        assert!(compaction.cleanup_enabled);
+        assert!(compaction.delete_source_objects);
+    }
+
+    #[test]
+    fn storage_compaction_sleep_backs_off_and_caps_at_sixteen_intervals() {
+        let interval = Duration::from_secs(10);
+
+        assert_eq!(
+            compaction_sleep_duration(interval, 0),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            compaction_sleep_duration(interval, 1),
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            compaction_sleep_duration(interval, 4),
+            Duration::from_secs(160)
+        );
+        assert_eq!(
+            compaction_sleep_duration(interval, 7),
+            Duration::from_secs(160)
+        );
+    }
 
     #[test]
     fn test_tron_service_registers_warmup_pool_when_enabled() {

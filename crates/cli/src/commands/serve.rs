@@ -30,7 +30,11 @@ pub fn serve_command(
     let compaction_pressure = MaintenanceCompactionPressureMonitor::default();
     let registry =
         build_service_registry_with_compaction_pressure(&config, compaction_pressure.clone())?;
-    let _compaction_worker = start_storage_compaction_worker(&config, compaction_pressure)?;
+    let _compaction_worker = start_storage_compaction_worker(
+        &config,
+        compaction_pressure,
+        registry.metrics_recorders(),
+    )?;
     let warmup_scheduler = if config.warmup.enabled {
         Some(
             registry.start_warmup_scheduler(std::time::Duration::from_millis(

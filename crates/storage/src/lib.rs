@@ -1,5 +1,6 @@
 //! Storage boundary for durable datalens objects and coverage metadata.
 
+mod compaction_queue;
 mod coverage_index;
 mod durable_promotion_intent;
 mod helpers;

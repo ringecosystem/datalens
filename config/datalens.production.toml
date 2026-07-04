@@ -18,10 +18,14 @@ compression = "zstd"
 enabled = false
 interval_ms = 300000
 min_object_bytes = 1048576
-max_merge_ranges = 8
+target_object_bytes = 67108864
+max_output_object_bytes = 134217728
+max_input_objects_per_candidate = 512
+max_input_bytes_per_candidate = 134217728
 max_tick_duration_ms = 5000
 max_candidates_per_tick = 1
 max_manifest_entries_per_tick = 1000
+cleanup_enabled = false
 delete_source_objects = true
 
 [planner]
@@ -54,9 +58,9 @@ playground_enabled = false
 playground_path = "/native/graphiql"
 
 [query.metadata]
-queue_capacity = 8192
-worker_threads = 4
-coalesced_capacity = 2048
+queue_capacity = 1024
+worker_threads = 2
+coalesced_capacity = 256
 
 [edge.metrics]
 bearer_token = "${DATALENS_METRICS_TOKEN}"

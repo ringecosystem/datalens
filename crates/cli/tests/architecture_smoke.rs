@@ -82,7 +82,7 @@ fn serve_path_builds_registry_without_first_chain_selection() {
     assert!(source.contains(
         "build_service_registry_with_compaction_pressure(&config, compaction_pressure.clone())?"
     ));
-    assert!(source.contains("start_storage_compaction_worker(&config, compaction_pressure)?"));
+    assert!(source.contains("start_storage_compaction_worker("));
     assert!(!source.contains("fn first_chain("));
     assert!(!source.contains("application_index_config"));
     assert!(!source.contains("IndexDaemon"));
@@ -155,6 +155,11 @@ fn production_boundary_artifacts_are_declared() {
     assert!(production_config.contains("token = \"${DATALENS_PUBLIC_APP_TOKEN}\""));
     assert!(production_config.contains("bucket = \"${DATALENS_S3_BUCKET}\""));
     assert!(production_config.contains("prefix = \"${DATALENS_S3_PREFIX}\""));
+    assert!(production_config.contains("[storage.compaction]"));
+    assert!(production_config.contains("enabled = true"));
+    assert!(production_config.contains("cleanup_enabled = false"));
+    assert!(production_config.contains("max_candidates_per_tick = 1"));
+    assert!(production_config.contains("worker_threads = 2"));
 
     assert!(production_spec.contains("Production release artifact"));
     assert!(production_spec.contains("inspect and maintenance writes"));
@@ -162,6 +167,10 @@ fn production_boundary_artifacts_are_declared() {
     assert!(
         production_runbook.contains("datalens doctor --config config/datalens.production.toml")
     );
+    assert!(production_runbook.contains("query latency"));
+    assert!(production_runbook.contains("write latency"));
+    assert!(production_runbook.contains("object store timeout/5xx"));
+    assert!(production_runbook.contains("RustFS CPU"));
     assert!(justfile.contains("release-check:"));
     assert!(justfile.contains("container-smoke:"));
     assert!(justfile.contains("config-doctor-smoke:"));

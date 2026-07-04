@@ -171,9 +171,14 @@ in the current storage model, so it is not a compaction grouping key.
 
 Empty coverage must not be converted into a data object. Compaction must preserve coverage
 semantics and query results. Executed compaction must write the replacement object
-successfully before updating the manifest. Delayed or skipped deletion of replaced objects
-must not affect query correctness; old object deletion remains protected by dry-run or a
-separate execute workflow.
+successfully and validate that the new object exists before publishing a replacement
+manifest/index entry. The replacement entry must not become visible before that validation
+succeeds. Source objects referenced by the replaced entries must not be deleted before the
+replacement is visible to new coverage planning, and deletion must remain delayed by the
+configured grace period so queries that already hold an older coverage plan can still read
+their planned source objects. Delayed, skipped, or failed deletion of replaced objects must
+not affect query or write correctness; cleanup failures are reported and retried rather
+than promoted into read/write failures.
 
 Retention policy inputs may include chain, dataset key, range age, object age, usage
 ledger activity, application attribution, and storage size. Retention must not delete an

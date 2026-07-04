@@ -61,7 +61,8 @@ until runtime explicitly flips `enabled` after preflight.
 enabled = false
 interval_ms = 300000
 min_object_bytes = 1048576
-max_merge_ranges = 8
+max_input_objects_per_candidate = 512
+max_input_bytes_per_candidate = 134217728
 max_tick_duration_ms = 5000
 max_candidates_per_tick = 1
 max_manifest_entries_per_tick = 1000
@@ -81,7 +82,8 @@ After Phase 0 is complete, runtime starts the first active drain by changing onl
 enabled = true
 interval_ms = 300000
 min_object_bytes = 1048576
-max_merge_ranges = 8
+max_input_objects_per_candidate = 512
+max_input_bytes_per_candidate = 134217728
 max_tick_duration_ms = 5000
 max_candidates_per_tick = 1
 max_manifest_entries_per_tick = 1000
@@ -182,7 +184,7 @@ it contains production metric links or incident system URLs.
 | Field | Required content |
 | --- | --- |
 | Current phase | `phase_0_disabled_hold`, `phase_1_low_rate_observation`, `phase_2_backpressure_gated_increase`, or `phase_3_drain_finish`. |
-| Active config | The deployed `storage.compaction` values for `enabled`, `interval_ms`, `max_candidates_per_tick`, `max_manifest_entries_per_tick`, `max_tick_duration_ms`, `max_merge_ranges`, and `delete_source_objects`. |
+| Active config | The deployed `storage.compaction` values for `enabled`, `interval_ms`, `max_candidates_per_tick`, `max_manifest_entries_per_tick`, `max_tick_duration_ms`, `max_input_objects_per_candidate`, `max_input_bytes_per_candidate`, and `delete_source_objects`. |
 | Inventory snapshot | Paths or object keys for the before and after `datalens inspect maintenance` JSON files. |
 | Backlog delta | Before/after `small_object_count`, `small_object_bytes`, and `manifest_segment_count`, plus the top changed `chain` / `dataset_key` / `selector_fingerprint` groups. |
 | SLA status | Query and write p95/p99, error rate, and whether each stayed inside the production SLA for the full window. |
@@ -196,7 +198,7 @@ Minimal handoff example:
 
 ```text
 Current phase: phase_1_low_rate_observation
-Active config: enabled=true interval_ms=300000 max_candidates_per_tick=1 max_manifest_entries_per_tick=1000 max_tick_duration_ms=5000 max_merge_ranges=8 delete_source_objects=true
+Active config: enabled=true interval_ms=300000 max_candidates_per_tick=1 max_manifest_entries_per_tick=1000 max_tick_duration_ms=5000 max_input_objects_per_candidate=512 max_input_bytes_per_candidate=134217728 delete_source_objects=true
 Inventory snapshot: /tmp/datalens-maintenance-before.json -> /tmp/datalens-maintenance-phase-1.json
 Backlog delta: small_object_count 420000 -> 382000; small_object_bytes 96 GiB -> 84 GiB; manifest_segment_count 18000 -> 14200; top groups ethereum/evm.logs/all, ethereum/evm.blocks/all
 SLA status: query p95/p99 inside SLA, write p95/p99 inside SLA, error rate flat

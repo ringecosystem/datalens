@@ -158,6 +158,13 @@ repository 更新：
 如果对象写入失败，Manifest 覆盖范围不能变化。如果对象写入成功但 Manifest 更新失败，重试
 应能收敛到一致状态，不破坏覆盖范围。
 
+Compaction 是对已经提交的 durable object 的维护优化，不是查询或写入正确性的前置条件。
+Compaction replacement 在发布新的 Manifest/index 覆盖范围前，必须先成功写入 replacement
+object，并校验该 object 已存在；校验成功前，replacement 不能对新的 coverage planning 可见。
+被 replacement 覆盖的 source object 不能在 replacement 可见前删除，并且删除必须遵守配置的
+grace period，让已经拿到旧 coverage plan 的查询仍能读取原计划中的 source object。Source
+object 删除被延迟、跳过或失败时，只能记录并重试 cleanup，不能影响 read/write 正确性。
+
 第一阶段通过拒绝持久化 unsafe range 来避免 durable rollback。如果未来需要更强的 canonical
 chain proof，可以在覆盖记录中扩展 block hash、parent hash 或其他链族 canonicality proof。
 这些 proof 是持久化验证能力的扩展，不是把不稳定 latest 数据写入 durable coverage 的许可。
