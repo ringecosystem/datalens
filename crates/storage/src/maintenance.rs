@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     DurableStorage, Manifest, ManifestEntry, ManifestFinalityLevel, ObjectEncoding, ObjectStore,
-    ParquetCompression, StorageDataObject, checksum_hex, decode_object_rows, encode_object_rows,
-    manifest_key, manifest_segment_prefix, range_kind_key, unix_seconds_now,
+    ParquetCompression, StorageDataObject, checksum_hex, compaction_queue, decode_object_rows,
+    encode_object_rows, manifest_key, manifest_segment_prefix, range_kind_key, unix_seconds_now,
     verify_manifest_object_metadata,
 };
 
@@ -402,6 +402,7 @@ where
             .into_iter()
             .map(|entry| SelectedManifestEntry {
                 segment_key: None,
+                cursor_key: None,
                 entry,
             })
             .collect::<Vec<_>>();
@@ -612,7 +613,7 @@ where
             );
             cursor_advance_key = selected_entries
                 .iter()
-                .filter_map(|entry| entry.segment_key.clone())
+                .filter_map(|entry| entry.cursor_key.clone())
                 .max()
                 .or(cursor_advance_key);
             log::info!(
@@ -620,14 +621,27 @@ where
                 candidate.chain.key_prefix(),
                 publish_started.elapsed().as_millis()
             );
-            if config.cleanup_enabled
-                && config.delete_source_objects
+            if config.delete_source_objects
                 && operation_budget.can_delete_sources(candidate.object_keys.len())
             {
                 let cleanup = self.delete_compacted_source_objects(candidate);
                 operation_budget.record_deletes(candidate.object_keys.len());
                 deleted_source_objects += cleanup.deleted_objects;
                 source_delete_failures += cleanup.delete_failures;
+            }
+            if config.cleanup_enabled {
+                let queue_entry_keys = selected_entries
+                    .iter()
+                    .filter_map(|entry| entry.cursor_key.as_deref())
+                    .filter(|key| key.contains("/metadata/compaction-queue/"))
+                    .collect::<BTreeSet<_>>();
+                if operation_budget.can_delete_sources(queue_entry_keys.len()) {
+                    let cleanup = self.delete_compaction_queue_entries(
+                        &candidate.chain,
+                        queue_entry_keys.into_iter(),
+                    );
+                    operation_budget.record_deletes(cleanup.deleted_objects);
+                }
             }
             log::info!(
                 "storage compaction candidate compacted chain_key={} range_kind={} range={}-{} processed_candidates={} duration_ms={}",
@@ -882,6 +896,41 @@ where
         }
     }
 
+    fn delete_compaction_queue_entries<'a>(
+        &self,
+        chain: &ChainIdentity,
+        queue_entry_keys: impl Iterator<Item = &'a str>,
+    ) -> CompactionSourceCleanup {
+        let mut deleted_objects = 0usize;
+        let mut delete_failures = 0usize;
+        for object_key in queue_entry_keys {
+            match self.object_store().delete(object_key) {
+                Ok(()) => {
+                    deleted_objects += 1;
+                    log::info!(
+                        "storage compaction queue entry deleted chain_key={} object_key={}",
+                        chain.key_prefix(),
+                        object_key
+                    );
+                }
+                Err(error) => {
+                    delete_failures += 1;
+                    log::warn!(
+                        "storage compaction queue entry delete failed chain_key={} object_key={} kind={:?} message={}",
+                        chain.key_prefix(),
+                        object_key,
+                        error.kind,
+                        error.message
+                    );
+                }
+            }
+        }
+        CompactionSourceCleanup {
+            deleted_objects,
+            delete_failures,
+        }
+    }
+
     fn retention_delete_candidates(
         &self,
         protected_current_objects: &[String],
@@ -1003,7 +1052,6 @@ where
         tick_started: Instant,
     ) -> Result<CompactionManifestScan, DatalensError> {
         let load_started = Instant::now();
-        let prefix = manifest_segment_prefix(chain);
         let cursor = self.read_compaction_cursor(chain)?;
         let max_entries = config.max_manifest_entries_per_tick.max(1);
         if cursor.legacy_entry_offset.is_some() {
@@ -1014,13 +1062,20 @@ where
                 load_started,
             );
         }
-        let mut list_page = self.object_store().list_page(
-            &prefix,
-            cursor.next_segment_key.as_deref(),
-            max_entries,
-        )?;
-        if list_page.objects.is_empty() && cursor.next_segment_key.is_some() && !list_page.has_more
-        {
+        let queue_scan =
+            self.scan_compaction_queue_entries(chain, &cursor, max_entries, load_started)?;
+        if !queue_scan.entries.is_empty() || queue_scan.partial {
+            return Ok(queue_scan);
+        }
+        let prefix = manifest_segment_prefix(chain);
+        let manifest_cursor = cursor
+            .next_segment_key
+            .as_deref()
+            .filter(|key| key.starts_with(&prefix));
+        let mut list_page = self
+            .object_store()
+            .list_page(&prefix, manifest_cursor, max_entries)?;
+        if list_page.objects.is_empty() && manifest_cursor.is_some() && !list_page.has_more {
             list_page = self.object_store().list_page(&prefix, None, max_entries)?;
         }
         let mut segment_objects = list_page
@@ -1077,6 +1132,7 @@ where
                 }
                 entries.push(SelectedManifestEntry {
                     segment_key: Some(object.key.clone()),
+                    cursor_key: Some(object.key.clone()),
                     entry,
                 });
                 if entries.len() >= max_entries {
@@ -1137,6 +1193,7 @@ where
             .take(max_entries)
             .map(|entry| SelectedManifestEntry {
                 segment_key: None,
+                cursor_key: None,
                 entry,
             })
             .collect::<Vec<_>>();
@@ -1197,11 +1254,120 @@ where
         })?;
         self.object_store().put(&key, &bytes)
     }
+
+    fn scan_compaction_queue_entries(
+        &self,
+        chain: &ChainIdentity,
+        cursor: &CompactionCursor,
+        max_entries: usize,
+        load_started: Instant,
+    ) -> Result<CompactionManifestScan, DatalensError> {
+        let prefix = compaction_queue::queue_prefix(chain);
+        let queue_cursor = cursor
+            .next_segment_key
+            .as_deref()
+            .filter(|key| key.starts_with(&prefix));
+        let mut list_page = self
+            .object_store()
+            .list_page(&prefix, queue_cursor, max_entries)?;
+        if list_page.objects.is_empty() && queue_cursor.is_some() && !list_page.has_more {
+            list_page = self.object_store().list_page(&prefix, None, max_entries)?;
+        }
+        let mut queue_objects = list_page
+            .objects
+            .into_iter()
+            .filter(|object| object.key.ends_with(".json"))
+            .collect::<Vec<_>>();
+        queue_objects.sort_by(|left, right| left.key.cmp(&right.key));
+        if queue_objects.is_empty() {
+            log::info!(
+                "storage compaction manifest load chain_key={} source=compaction_queue listed_object_count=0 scanned_object_count=0 scanned_entry_count=0 selected_entry_count=0 partial=false duration_ms={}",
+                chain.key_prefix(),
+                load_started.elapsed().as_millis()
+            );
+            return Ok(CompactionManifestScan {
+                entries: Vec::new(),
+                partial: false,
+                cursor_advance: None,
+            });
+        }
+        let base_entries = if self.object_store().exists(&manifest_key(chain))? {
+            let key = manifest_key(chain);
+            let bytes = self.object_store().get(&key)?;
+            decode_manifest_object(&key, &bytes)?.entries
+        } else {
+            Vec::new()
+        };
+        let mut entries = Vec::new();
+        let mut scanned_objects = 0usize;
+        let mut scanned_entries = 0usize;
+        let mut cursor_advance_key = None;
+        let mut active_scope_prefix = None;
+        for object in &queue_objects {
+            if entries.len() >= max_entries {
+                break;
+            }
+            let object_scope_prefix = manifest_segment_scope_prefix(&object.key);
+            if active_scope_prefix.is_none() {
+                active_scope_prefix = object_scope_prefix.clone();
+            } else if active_scope_prefix != object_scope_prefix {
+                break;
+            }
+            let Some(bytes) = self.object_store().get_optional(&object.key)? else {
+                cursor_advance_key = Some(object.key.clone());
+                continue;
+            };
+            let queue_entry = compaction_queue::decode_entry(&object.key, &bytes)?;
+            scanned_objects += 1;
+            cursor_advance_key = Some(object.key.clone());
+            let Some(segment_bytes) = self.object_store().get_optional(&queue_entry.segment_key)?
+            else {
+                continue;
+            };
+            let manifest = decode_manifest_object(&queue_entry.segment_key, &segment_bytes)?;
+            scanned_entries += manifest.entries.len();
+            for entry in manifest.entries {
+                if base_entries
+                    .iter()
+                    .any(|base_entry| base_entry.shadows_segment(&entry))
+                {
+                    continue;
+                }
+                entries.push(SelectedManifestEntry {
+                    segment_key: Some(queue_entry.segment_key.clone()),
+                    cursor_key: Some(object.key.clone()),
+                    entry,
+                });
+                if entries.len() >= max_entries {
+                    break;
+                }
+            }
+        }
+        let partial =
+            !entries.is_empty() && (list_page.has_more || scanned_objects < queue_objects.len());
+        log::info!(
+            "storage compaction manifest load chain_key={} source=compaction_queue listed_object_count={} scanned_object_count={} scanned_entry_count={} selected_entry_count={} scope_prefix={} partial={} duration_ms={}",
+            chain.key_prefix(),
+            queue_objects.len(),
+            scanned_objects,
+            scanned_entries,
+            entries.len(),
+            active_scope_prefix.as_deref().unwrap_or("none"),
+            partial,
+            load_started.elapsed().as_millis()
+        );
+        Ok(CompactionManifestScan {
+            entries,
+            partial,
+            cursor_advance: cursor_advance_key.map(segment_compaction_cursor),
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
 struct SelectedManifestEntry {
     segment_key: Option<String>,
+    cursor_key: Option<String>,
     entry: ManifestEntry,
 }
 
@@ -1688,6 +1854,7 @@ where
 fn is_data_object(object_key: &str) -> bool {
     object_key != manifest_key_from_object_key(object_key)
         && !object_key.contains("/coverage-index/")
+        && !object_key.contains("/metadata/compaction-queue/")
         && !object_key.contains("/manifest-segments/")
         && (object_key.ends_with(".json") || object_key.ends_with(".parquet"))
 }

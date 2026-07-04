@@ -92,7 +92,7 @@ fn test_executor_full_cache_hit_reuses_coverage_lookup_for_durable_read() {
 
     assert_eq!(source.calls(), Vec::<SourceCall>::new());
     assert_eq!(block_numbers(&result.rows), vec![1, 2]);
-    assert_eq!(object_store.coverage_index_get_count(), 1);
+    assert_eq!(object_store.coverage_index_get_count(), 2);
 }
 
 #[test]

@@ -51,6 +51,11 @@ struct CountingOperationStore {
 }
 
 #[derive(Clone, Debug)]
+struct FailingManifestSegmentListPageStore {
+    inner: LocalObjectStore,
+}
+
+#[derive(Clone, Debug)]
 struct OverlappingWriteDuringCompactionStore {
     inner: LocalObjectStore,
     injected: Arc<AtomicBool>,
@@ -129,6 +134,14 @@ impl CountingOperationStore {
 
     fn delete_count(&self) -> usize {
         self.deletes.lock().expect("deletes").len()
+    }
+}
+
+impl FailingManifestSegmentListPageStore {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            inner: LocalObjectStore::new(root),
+        }
     }
 }
 
@@ -338,6 +351,47 @@ impl ObjectStore for CountingOperationStore {
 
     fn delete(&self, key: &str) -> Result<(), DatalensError> {
         self.deletes.lock().expect("deletes").push(key.to_owned());
+        self.inner.delete(key)
+    }
+
+    fn lock_namespace(&self) -> String {
+        self.inner.lock_namespace()
+    }
+}
+
+impl ObjectStore for FailingManifestSegmentListPageStore {
+    fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError> {
+        self.inner.get(key)
+    }
+
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
+        self.inner.put(key, bytes)
+    }
+
+    fn exists(&self, key: &str) -> Result<bool, DatalensError> {
+        self.inner.exists(key)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
+        self.inner.list(prefix)
+    }
+
+    fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ObjectListPage, DatalensError> {
+        if prefix.contains("/manifest-segments") {
+            return Err(DatalensError::new(
+                DatalensErrorKind::StorageReadFailure,
+                "injected manifest segment list timeout",
+            ));
+        }
+        self.inner.list_page(prefix, start_after, limit)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), DatalensError> {
         self.inner.delete(key)
     }
 
@@ -1318,8 +1372,99 @@ fn test_compaction_tick_does_not_reload_manifest_per_candidate() {
     assert_eq!(counting_store.list_count_for_prefix(&manifest_prefix), 0);
     assert_eq!(
         counting_store.list_page_count_for_prefix(&manifest_prefix),
+        0
+    );
+    assert_eq!(
+        counting_store.list_page_count_for_prefix(&format!(
+            "chains/{}/metadata/compaction-queue",
+            chain.key_prefix()
+        )),
         1
     );
+}
+
+#[test]
+fn test_compaction_tick_uses_queue_when_manifest_segment_list_times_out() {
+    let storage = LocalStorage::new(temp_storage_root("queue-avoids-list-timeout"));
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 104, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 105, FinalityLevel::Safe);
+    let failing_store = FailingManifestSegmentListPageStore::new(storage.root().into());
+    let failing_storage = DurableStorage::from_object_store(failing_store);
+
+    let report = failing_storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                min_object_bytes: u64::MAX,
+                max_merge_ranges: 2,
+                max_tick_duration_ms: 30_000,
+                max_candidates_per_tick: 8,
+                max_manifest_entries_per_tick: 20_000,
+                cleanup_enabled: false,
+                delete_source_objects: false,
+                ..MaintenanceCompactionConfig::default()
+            },
+        )
+        .expect("queue-backed compaction");
+
+    assert_eq!(report.candidate_count, 1);
+    assert_eq!(report.processed_candidates, 1);
+}
+
+#[test]
+fn test_compaction_tick_cleans_consumed_queue_entries() {
+    let storage = LocalStorage::new(temp_storage_root("queue-cleanup"));
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 106, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 107, FinalityLevel::Safe);
+    let queue_prefix = format!("chains/{}/metadata/compaction-queue", chain.key_prefix());
+
+    assert_eq!(
+        storage
+            .object_store()
+            .list(&queue_prefix)
+            .expect("queue entries before compaction")
+            .len(),
+        2
+    );
+    let before_queue_keys = storage
+        .object_store()
+        .list(&queue_prefix)
+        .expect("queue entries before compaction")
+        .into_iter()
+        .map(|object| object.key)
+        .collect::<Vec<_>>();
+
+    let report = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                min_object_bytes: u64::MAX,
+                max_merge_ranges: 2,
+                max_tick_duration_ms: 30_000,
+                max_candidates_per_tick: 8,
+                max_manifest_entries_per_tick: 20_000,
+                cleanup_enabled: true,
+                delete_source_objects: false,
+                ..MaintenanceCompactionConfig::default()
+            },
+        )
+        .expect("queue cleanup compaction");
+
+    assert_eq!(report.processed_candidates, 1);
+    let after_queue_keys = storage
+        .object_store()
+        .list(&queue_prefix)
+        .expect("queue entries after compaction")
+        .into_iter()
+        .map(|object| object.key)
+        .collect::<Vec<_>>();
+    assert_eq!(after_queue_keys.len(), 1);
+    assert!(after_queue_keys[0].contains("00000000000000000106-00000000000000000107"));
+    for key in before_queue_keys {
+        assert!(!after_queue_keys.contains(&key));
+    }
 }
 
 #[test]
