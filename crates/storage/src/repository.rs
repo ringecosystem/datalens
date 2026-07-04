@@ -74,8 +74,8 @@ pub use crate::maintenance::{
 };
 pub use crate::manifest::{Manifest, ManifestEntry, ManifestFinalityLevel};
 pub use crate::object_store::{
-    LocalObjectStore, ObjectListPage, ObjectMetadata, ObjectStore, S3ObjectStore,
-    S3ObjectStoreConfig, validate_object_key,
+    LocalObjectStore, ObjectListPage, ObjectLockLease, ObjectMetadata, ObjectStore, S3ObjectStore,
+    S3ObjectStoreConfig, encode_object_lock_owner, validate_object_key,
 };
 pub use crate::query_activity::{QueryActivity, QueryActivityKey, QueryActivityRepository};
 pub use crate::query_watermark::{QueryWatermark, QueryWatermarkKey, QueryWatermarkRepository};
@@ -1126,6 +1126,9 @@ where
         let mut segment_manifest = Manifest::default();
         let mut segment_objects_count = 0usize;
         for object in self.object_store.list(&manifest_segment_prefix(chain))? {
+            if !is_manifest_segment_object(&object.key) {
+                continue;
+            }
             segment_objects_count += 1;
             let bytes = self.object_store.get(&object.key)?;
             let mut object_manifest: Manifest =
@@ -1174,9 +1177,10 @@ where
             manifest.merge(chain_manifest);
         }
         let mut segment_manifest = Manifest::default();
-        for object in objects.iter().filter(|object| {
-            object.key.contains("/manifest-segments/") && object.key.ends_with(".json")
-        }) {
+        for object in objects
+            .iter()
+            .filter(|object| is_manifest_segment_object(&object.key))
+        {
             let bytes = self.object_store.get(&object.key)?;
             let mut object_manifest: Manifest =
                 serde_json::from_slice(&bytes).map_err(|error| {
@@ -1276,6 +1280,9 @@ where
         chain: &ChainIdentity,
     ) -> Result<(), DatalensError> {
         for object in self.object_store.list(&manifest_segment_prefix(chain))? {
+            if !is_manifest_segment_object(&object.key) {
+                continue;
+            }
             self.object_store.delete(&object.key).map_err(|error| {
                 DatalensError::new(
                     DatalensErrorKind::ManifestUpdateFailure,
@@ -1762,6 +1769,12 @@ where
             }
         }
     }
+}
+
+fn is_manifest_segment_object(object_key: &str) -> bool {
+    object_key.contains("/manifest-segments/")
+        && object_key.ends_with(".json")
+        && !object_key.contains("/_metadata/")
 }
 
 fn compaction_source_entries_still_current(

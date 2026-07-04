@@ -30,6 +30,12 @@ pub struct ObjectListPage {
     pub has_more: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObjectLockLease {
+    pub key: String,
+    pub owner: Vec<u8>,
+}
+
 pub trait ObjectStore: Clone + Send + Sync {
     fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError>;
     fn get_optional(&self, key: &str) -> Result<Option<Vec<u8>>, DatalensError> {
@@ -49,6 +55,57 @@ pub trait ObjectStore: Clone + Send + Sync {
         limit: usize,
     ) -> Result<ObjectListPage, DatalensError>;
     fn delete(&self, key: &str) -> Result<(), DatalensError>;
+
+    fn try_acquire_lock(
+        &self,
+        key: &str,
+        owner: &[u8],
+    ) -> Result<Option<ObjectLockLease>, DatalensError> {
+        if self.exists(key)? {
+            return Ok(None);
+        }
+        self.put(key, owner)?;
+        Ok(Some(ObjectLockLease {
+            key: key.to_owned(),
+            owner: owner.to_vec(),
+        }))
+    }
+
+    fn release_lock(&self, lease: ObjectLockLease) -> Result<(), DatalensError> {
+        if self
+            .get_optional(&lease.key)?
+            .is_some_and(|owner| owner != lease.owner)
+        {
+            return Ok(());
+        }
+        self.delete(&lease.key)
+    }
+
+    fn try_acquire_lock_with_ttl(
+        &self,
+        key: &str,
+        owner: &[u8],
+        ttl: Duration,
+    ) -> Result<Option<ObjectLockLease>, DatalensError> {
+        if let Some(lease) = self.try_acquire_lock(key, owner)? {
+            return Ok(Some(lease));
+        }
+        if ttl.is_zero() {
+            return Ok(None);
+        }
+        let Some(existing) = self.get_optional(key)? else {
+            return self.try_acquire_lock(key, owner);
+        };
+        let Ok(record) = serde_json::from_slice::<ObjectLockRecord>(&existing) else {
+            return Ok(None);
+        };
+        let now = unix_seconds_now_for_lock()?;
+        if now.saturating_sub(record.acquired_at_unix_seconds) < ttl.as_secs().max(1) {
+            return Ok(None);
+        }
+        self.delete(key)?;
+        self.try_acquire_lock(key, owner)
+    }
 
     fn lock_namespace(&self) -> String {
         std::any::type_name::<Self>().to_owned()
@@ -226,6 +283,47 @@ impl ObjectStore for LocalObjectStore {
                 format!("delete object {}: {error}", path.display()),
             )),
         }
+    }
+
+    fn try_acquire_lock(
+        &self,
+        key: &str,
+        owner: &[u8],
+    ) -> Result<Option<ObjectLockLease>, DatalensError> {
+        let path = self.path(key)?;
+        let parent = path.parent().ok_or_else(|| {
+            DatalensError::new(
+                DatalensErrorKind::StorageWriteFailure,
+                format!("lock object {key} has no parent directory"),
+            )
+        })?;
+        fs::create_dir_all(parent).map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::StorageWriteFailure,
+                format!("create lock directory {}: {error}", parent.display()),
+            )
+        })?;
+        let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(None),
+            Err(error) => {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::StorageWriteFailure,
+                    format!("create lock object {}: {error}", path.display()),
+                ));
+            }
+        };
+        if let Err(error) = file.write_all(owner).and_then(|()| file.sync_all()) {
+            let _ = fs::remove_file(&path);
+            return Err(DatalensError::new(
+                DatalensErrorKind::StorageWriteFailure,
+                format!("write lock object {}: {error}", path.display()),
+            ));
+        }
+        Ok(Some(ObjectLockLease {
+            key: key.to_owned(),
+            owner: owner.to_vec(),
+        }))
     }
 
     fn lock_namespace(&self) -> String {
@@ -881,6 +979,47 @@ impl ObjectStore for S3ObjectStore {
             })
     }
 
+    fn try_acquire_lock(
+        &self,
+        key: &str,
+        owner: &[u8],
+    ) -> Result<Option<ObjectLockLease>, DatalensError> {
+        let object_key = self.key(key)?;
+        let log_key = object_key.clone();
+        let owner = owner.to_vec();
+        let lease_owner = owner.clone();
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let acquired =
+            self.runtime
+                .block_on_operation("try_acquire_lock", log_key, async move {
+                    match client
+                        .put_object()
+                        .bucket(&bucket)
+                        .key(&object_key)
+                        .if_none_match("*")
+                        .body(ByteStream::from(owner))
+                        .send()
+                        .await
+                    {
+                        Ok(_) => Ok(true),
+                        Err(error)
+                            if service_error_code(&error).is_some_and(is_precondition_code) =>
+                        {
+                            Ok(false)
+                        }
+                        Err(error) => Err(DatalensError::new(
+                            DatalensErrorKind::StorageWriteFailure,
+                            format!("S3 acquire lock {object_key}: {error}"),
+                        )),
+                    }
+                })?;
+        Ok(acquired.then_some(ObjectLockLease {
+            key: key.to_owned(),
+            owner: lease_owner,
+        }))
+    }
+
     fn lock_namespace(&self) -> String {
         format!(
             "s3:{}/{}",
@@ -899,6 +1038,40 @@ where
 
 fn is_not_found_code(code: &str) -> bool {
     matches!(code, "NoSuchKey" | "NotFound" | "404")
+}
+
+fn is_precondition_code(code: &str) -> bool {
+    matches!(
+        code,
+        "PreconditionFailed" | "ConditionalRequestConflict" | "412" | "409"
+    )
+}
+
+#[derive(Deserialize)]
+struct ObjectLockRecord {
+    acquired_at_unix_seconds: u64,
+}
+
+pub fn encode_object_lock_owner(owner_id: &str) -> Result<Vec<u8>, DatalensError> {
+    let record = serde_json::json!({
+        "owner_id": owner_id,
+        "acquired_at_unix_seconds": unix_seconds_now_for_lock()?,
+    });
+    serde_json::to_vec(&record).map_err(|error| {
+        DatalensError::new(
+            DatalensErrorKind::Internal,
+            format!("encode object lock owner: {error}"),
+        )
+    })
+}
+
+fn unix_seconds_now_for_lock() -> Result<u64, DatalensError> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|error| {
+            DatalensError::internal(format!("system clock before unix epoch: {error}"))
+        })
 }
 
 fn should_retry_s3_get(attempt: usize) -> bool {

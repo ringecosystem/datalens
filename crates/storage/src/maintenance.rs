@@ -485,7 +485,7 @@ where
             scan.entries,
             config,
             started,
-            Some((chain, scan.cursor_advance)),
+            Some(scan.cursor_update),
             scan.partial,
         )?;
         Ok(report)
@@ -588,7 +588,7 @@ where
         entries: Vec<SelectedManifestEntry>,
         config: MaintenanceCompactionConfig,
         started: Instant,
-        cursor: Option<(&ChainIdentity, Option<CompactionCursor>)>,
+        cursor: Option<CompactionCursorUpdate>,
         scan_partial: bool,
     ) -> Result<MaintenanceCompactionReport, DatalensError> {
         let build_started = Instant::now();
@@ -737,27 +737,30 @@ where
             );
         }
 
-        if let Some((chain, scan_cursor_advance_key)) = cursor {
-            let next_key = if partial && processed_candidates < candidates.len() {
+        if let Some(cursor) = cursor {
+            let legacy_next_key = legacy_cursor_after_rewritten_manifest(
+                cursor.scope_cursor_advance.clone(),
+                processed_candidates,
+            );
+            let scope_next_key = if partial && processed_candidates < candidates.len() {
                 cursor_advance_key
                     .map(segment_compaction_cursor)
-                    .or_else(|| {
-                        legacy_cursor_after_rewritten_manifest(
-                            scan_cursor_advance_key.clone(),
-                            processed_candidates,
-                        )
-                    })
-                    .or(scan_cursor_advance_key)
+                    .or(legacy_next_key)
+                    .or(cursor.scope_cursor_advance)
             } else if partial {
-                legacy_cursor_after_rewritten_manifest(
-                    scan_cursor_advance_key.clone(),
-                    processed_candidates,
-                )
-                .or(scan_cursor_advance_key)
+                legacy_next_key.or(cursor.scope_cursor_advance)
+            } else if cursor.scope_partial {
+                cursor.scope_cursor_advance
             } else {
-                None
+                cursor.scope_cursor_advance
             };
-            self.write_compaction_cursor(chain, next_key)?;
+            self.write_compaction_cursor_key(&cursor.scope_cursor_key, scope_next_key)?;
+            if !cursor.scope_partial && processed_candidates >= candidates.len() {
+                self.write_compaction_cursor_key(
+                    &cursor.queue_cursor_key,
+                    cursor.queue_cursor_advance,
+                )?;
+            }
         }
         let tick_status = if partial {
             MaintenanceCompactionTickStatus::Partial
@@ -860,7 +863,7 @@ where
             entries.extend(decode_manifest_object(&key, &bytes)?.entries);
         }
         for object in self.object_store().list(&manifest_segment_prefix(chain))? {
-            if !object.key.ends_with(".json") {
+            if !is_manifest_segment_object(&object.key) {
                 continue;
             }
             let bytes = self.object_store().get(&object.key)?;
@@ -1202,48 +1205,87 @@ where
         tick_started: Instant,
     ) -> Result<CompactionManifestScan, DatalensError> {
         let load_started = Instant::now();
-        let cursor = self.read_compaction_cursor(chain)?;
+        let prefix = manifest_segment_prefix(chain);
+        let queue_cursor_key = compaction_queue_cursor_key(chain);
+        let queue_cursor = self.read_compaction_cursor_key(&queue_cursor_key)?;
         let max_entries = config.max_manifest_entries_per_tick.max(1);
-        if cursor.legacy_entry_offset.is_some() {
+        let legacy_cursor = self.read_compaction_legacy_cursor(chain)?;
+        if legacy_cursor != CompactionCursor::default() {
             return self.scan_legacy_compaction_manifest_entries(
                 chain,
-                &cursor,
+                &legacy_cursor,
                 max_entries,
                 load_started,
             );
         }
         let queue_scan =
-            self.scan_compaction_queue_entries(chain, &cursor, max_entries, load_started)?;
+            self.scan_compaction_queue_entries(chain, &queue_cursor, max_entries, load_started)?;
         if !queue_scan.entries.is_empty() || queue_scan.partial {
             return Ok(queue_scan);
         }
-        let prefix = manifest_segment_prefix(chain);
-        let manifest_cursor = cursor
-            .next_segment_key
-            .as_deref()
-            .filter(|key| key.starts_with(&prefix));
-        let mut list_page = self
-            .object_store()
-            .list_page(&prefix, manifest_cursor, max_entries)?;
-        if list_page.objects.is_empty() && manifest_cursor.is_some() && !list_page.has_more {
-            list_page = self.object_store().list_page(&prefix, None, max_entries)?;
+        let mut queue_page =
+            self.object_store()
+                .list_page(&prefix, queue_cursor.next_segment_key.as_deref(), 1)?;
+        if queue_page.objects.is_empty()
+            && queue_cursor.next_segment_key.is_some()
+            && !queue_page.has_more
+        {
+            queue_page = self.object_store().list_page(&prefix, None, 1)?;
+        }
+        let mut first_segment_objects = queue_page
+            .objects
+            .into_iter()
+            .filter(|object| is_manifest_segment_object(&object.key))
+            .collect::<Vec<_>>();
+        first_segment_objects.sort_by(|left, right| left.key.cmp(&right.key));
+
+        let Some(active_scope_prefix) = first_segment_objects
+            .first()
+            .and_then(|object| manifest_segment_scope_prefix(&object.key))
+        else {
+            return self.scan_legacy_compaction_manifest_entries(
+                chain,
+                &legacy_cursor,
+                max_entries,
+                load_started,
+            );
+        };
+        let scope_cursor_key = compaction_scope_cursor_key(&active_scope_prefix);
+        let mut scope_cursor = self.read_compaction_cursor_key(&scope_cursor_key)?;
+        if scope_cursor == CompactionCursor::default()
+            && let Ok(legacy_cursor) = self.read_compaction_legacy_cursor(chain)
+            && legacy_cursor != CompactionCursor::default()
+        {
+            scope_cursor = legacy_cursor;
+        }
+        let mut list_page = self.object_store().list_page(
+            &active_scope_prefix,
+            scope_cursor.next_segment_key.as_deref(),
+            max_entries,
+        )?;
+        if list_page.objects.is_empty()
+            && scope_cursor.next_segment_key.is_some()
+            && !list_page.has_more
+        {
+            list_page = self
+                .object_store()
+                .list_page(&active_scope_prefix, None, max_entries)?;
         }
         let mut segment_objects = list_page
             .objects
             .into_iter()
-            .filter(|object| object.key.ends_with(".json"))
+            .filter(|object| is_manifest_segment_object(&object.key))
             .collect::<Vec<_>>();
         segment_objects.sort_by(|left, right| left.key.cmp(&right.key));
         let mut entries = Vec::new();
         let mut scanned_objects = 0usize;
         let mut scanned_entries = 0usize;
         let mut cursor_advance_key = None;
-        let mut active_scope_prefix = None;
 
         if segment_objects.is_empty() {
             return self.scan_legacy_compaction_manifest_entries(
                 chain,
-                &cursor,
+                &legacy_cursor,
                 max_entries,
                 load_started,
             );
@@ -1260,12 +1302,6 @@ where
             if entries.len() >= max_entries
                 || tick_started.elapsed().as_millis() >= config.max_tick_duration_ms.max(1) as u128
             {
-                break;
-            }
-            let object_scope_prefix = manifest_segment_scope_prefix(&object.key);
-            if active_scope_prefix.is_none() {
-                active_scope_prefix = object_scope_prefix.clone();
-            } else if active_scope_prefix != object_scope_prefix {
                 break;
             }
             let bytes = self.object_store().get(&object.key)?;
@@ -1290,7 +1326,13 @@ where
                 }
             }
         }
-        let partial = list_page.has_more || scanned_objects < segment_objects.len();
+        let scope_partial = list_page.has_more || scanned_objects < segment_objects.len();
+        let partial = scope_partial || queue_page.has_more;
+        let queue_cursor_advance = if scope_partial {
+            None
+        } else {
+            cursor_advance_key.clone().map(segment_compaction_cursor)
+        };
         log::info!(
             "storage compaction manifest load chain_key={} source=manifest_segments listed_object_count={} scanned_object_count={} scanned_entry_count={} selected_entry_count={} scope_prefix={} partial={} duration_ms={}",
             chain.key_prefix(),
@@ -1298,14 +1340,20 @@ where
             scanned_objects,
             scanned_entries,
             entries.len(),
-            active_scope_prefix.as_deref().unwrap_or("none"),
+            active_scope_prefix,
             partial,
             load_started.elapsed().as_millis()
         );
         Ok(CompactionManifestScan {
             entries,
             partial,
-            cursor_advance: cursor_advance_key.map(segment_compaction_cursor),
+            cursor_update: CompactionCursorUpdate {
+                scope_cursor_key,
+                scope_cursor_advance: cursor_advance_key.map(segment_compaction_cursor),
+                scope_partial,
+                queue_cursor_key,
+                queue_cursor_advance,
+            },
         })
     }
 
@@ -1326,7 +1374,13 @@ where
             return Ok(CompactionManifestScan {
                 entries: Vec::new(),
                 partial: false,
-                cursor_advance: None,
+                cursor_update: CompactionCursorUpdate {
+                    scope_cursor_key: compaction_cursor_key(chain),
+                    scope_cursor_advance: None,
+                    scope_partial: false,
+                    queue_cursor_key: compaction_queue_cursor_key(chain),
+                    queue_cursor_advance: None,
+                },
             });
         }
         let bytes = self.object_store().get(&key)?;
@@ -1361,19 +1415,28 @@ where
         Ok(CompactionManifestScan {
             entries,
             partial,
-            cursor_advance: partial.then_some(CompactionCursor {
-                schema_version: 1,
-                next_segment_key: None,
-                legacy_entry_offset: Some(next_offset),
-            }),
+            cursor_update: CompactionCursorUpdate {
+                scope_cursor_key: compaction_cursor_key(chain),
+                scope_cursor_advance: partial.then_some(CompactionCursor {
+                    schema_version: 1,
+                    next_segment_key: None,
+                    legacy_entry_offset: Some(next_offset),
+                }),
+                scope_partial: partial,
+                queue_cursor_key: compaction_queue_cursor_key(chain),
+                queue_cursor_advance: None,
+            },
         })
     }
 
-    fn read_compaction_cursor(
+    fn read_compaction_legacy_cursor(
         &self,
         chain: &ChainIdentity,
     ) -> Result<CompactionCursor, DatalensError> {
-        let key = compaction_cursor_key(chain);
+        self.read_compaction_cursor_key(&compaction_cursor_key(chain))
+    }
+
+    fn read_compaction_cursor_key(&self, key: &str) -> Result<CompactionCursor, DatalensError> {
         if !self.object_store().exists(&key)? {
             return Ok(CompactionCursor::default());
         }
@@ -1386,12 +1449,11 @@ where
         })
     }
 
-    fn write_compaction_cursor(
+    fn write_compaction_cursor_key(
         &self,
-        chain: &ChainIdentity,
+        key: &str,
         cursor: Option<CompactionCursor>,
     ) -> Result<(), DatalensError> {
-        let key = compaction_cursor_key(chain);
         let Some(cursor) = cursor else {
             self.object_store().delete(&key)?;
             return Ok(());
@@ -1438,7 +1500,13 @@ where
             return Ok(CompactionManifestScan {
                 entries: Vec::new(),
                 partial: false,
-                cursor_advance: None,
+                cursor_update: CompactionCursorUpdate {
+                    scope_cursor_key: compaction_queue_cursor_key(chain),
+                    scope_cursor_advance: None,
+                    scope_partial: false,
+                    queue_cursor_key: compaction_queue_cursor_key(chain),
+                    queue_cursor_advance: None,
+                },
             });
         }
         let base_entries = if self.object_store().exists(&manifest_key(chain))? {
@@ -1457,17 +1525,17 @@ where
             if entries.len() >= max_entries {
                 break;
             }
-            let object_scope_prefix = manifest_segment_scope_prefix(&object.key);
-            if active_scope_prefix.is_none() {
-                active_scope_prefix = object_scope_prefix.clone();
-            } else if active_scope_prefix != object_scope_prefix {
-                break;
-            }
             let Some(bytes) = self.object_store().get_optional(&object.key)? else {
                 cursor_advance_key = Some(object.key.clone());
                 continue;
             };
             let queue_entry = compaction_queue::decode_entry(&object.key, &bytes)?;
+            let object_scope_prefix = manifest_segment_scope_prefix(&queue_entry.segment_key);
+            if active_scope_prefix.is_none() {
+                active_scope_prefix = object_scope_prefix.clone();
+            } else if active_scope_prefix != object_scope_prefix {
+                break;
+            }
             scanned_objects += 1;
             cursor_advance_key = Some(object.key.clone());
             let Some(segment_bytes) = self.object_store().get_optional(&queue_entry.segment_key)?
@@ -1493,8 +1561,18 @@ where
                 }
             }
         }
-        let partial =
-            !entries.is_empty() && (list_page.has_more || scanned_objects < queue_objects.len());
+        let scope_partial = scanned_objects < queue_objects.len();
+        let partial = !entries.is_empty() && (scope_partial || list_page.has_more);
+        let cursor_advance = cursor_advance_key.map(segment_compaction_cursor);
+        let scope_cursor_key = active_scope_prefix
+            .as_deref()
+            .map(compaction_scope_cursor_key)
+            .unwrap_or_else(|| compaction_queue_cursor_key(chain));
+        let queue_cursor_advance = if scope_partial {
+            None
+        } else {
+            cursor_advance.clone()
+        };
         log::info!(
             "storage compaction manifest load chain_key={} source=compaction_queue listed_object_count={} scanned_object_count={} scanned_entry_count={} selected_entry_count={} scope_prefix={} partial={} duration_ms={}",
             chain.key_prefix(),
@@ -1509,7 +1587,13 @@ where
         Ok(CompactionManifestScan {
             entries,
             partial,
-            cursor_advance: cursor_advance_key.map(segment_compaction_cursor),
+            cursor_update: CompactionCursorUpdate {
+                scope_cursor_key,
+                scope_cursor_advance: cursor_advance.clone(),
+                scope_partial,
+                queue_cursor_key: compaction_queue_cursor_key(chain),
+                queue_cursor_advance,
+            },
         })
     }
 }
@@ -1525,7 +1609,16 @@ struct SelectedManifestEntry {
 struct CompactionManifestScan {
     entries: Vec<SelectedManifestEntry>,
     partial: bool,
-    cursor_advance: Option<CompactionCursor>,
+    cursor_update: CompactionCursorUpdate,
+}
+
+#[derive(Clone, Debug)]
+struct CompactionCursorUpdate {
+    scope_cursor_key: String,
+    scope_cursor_advance: Option<CompactionCursor>,
+    scope_partial: bool,
+    queue_cursor_key: String,
+    queue_cursor_advance: Option<CompactionCursor>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1602,6 +1695,17 @@ fn compaction_cursor_key(chain: &ChainIdentity) -> String {
         "chains/{}/metadata/compaction-cursor.json",
         chain.key_prefix()
     )
+}
+
+fn compaction_queue_cursor_key(chain: &ChainIdentity) -> String {
+    format!(
+        "chains/{}/metadata/compaction-scope-queue-cursor.json",
+        chain.key_prefix()
+    )
+}
+
+fn compaction_scope_cursor_key(scope_prefix: &str) -> String {
+    format!("{scope_prefix}/_metadata/compaction-cursor.json")
 }
 
 fn superseded_source_record_prefix(chain: &ChainIdentity) -> String {
@@ -2243,12 +2347,13 @@ fn is_data_object(object_key: &str) -> bool {
 }
 
 fn is_manifest_object(object_key: &str) -> bool {
-    object_key.ends_with("/manifest.json")
-        || (object_key.contains("/manifest-segments/") && object_key.ends_with(".json"))
+    object_key.ends_with("/manifest.json") || is_manifest_segment_object(object_key)
 }
 
 fn is_manifest_segment_object(object_key: &str) -> bool {
-    object_key.contains("/manifest-segments/") && object_key.ends_with(".json")
+    object_key.contains("/manifest-segments/")
+        && object_key.ends_with(".json")
+        && !object_key.contains("/_metadata/")
 }
 
 fn manifest_key_from_object_key(object_key: &str) -> String {

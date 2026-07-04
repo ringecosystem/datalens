@@ -164,6 +164,20 @@ pub fn validate_config(config: &DatalensConfig) -> Result<(), DatalensError> {
                 "storage.compaction.max_puts_per_tick must be at least two when compaction is enabled",
             ));
         }
+        if config.storage.compaction.leader_lock_ttl_ms == 0 {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                "storage.compaction.leader_lock_ttl_ms must be greater than zero when compaction is enabled",
+            ));
+        }
+        if config.storage.compaction.leader_lock_ttl_ms
+            <= config.storage.compaction.max_tick_duration_ms
+        {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                "storage.compaction.leader_lock_ttl_ms must be greater than storage.compaction.max_tick_duration_ms when compaction is enabled",
+            ));
+        }
     }
     if config.metrics.enabled && config.metrics.default_application.trim().is_empty() {
         return Err(DatalensError::new(

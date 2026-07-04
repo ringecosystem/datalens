@@ -8,8 +8,8 @@ use datalens_core::{
 use datalens_storage::{
     DurableStorage, DurableStorageConfig, LocalObjectStore, LocalStorage,
     MaintenanceCompactionConfig, MaintenanceCompactionPressure, MaintenanceCompactionTickStatus,
-    MaintenanceIssueKind, MaintenanceOperationMode, Manifest, ObjectListPage, ObjectMetadata,
-    ObjectStore, ParquetCompression, StorageWriteRequest,
+    MaintenanceIssueKind, MaintenanceOperationMode, Manifest, ObjectListPage, ObjectLockLease,
+    ObjectMetadata, ObjectStore, ParquetCompression, StorageWriteRequest,
 };
 use parquet::{
     basic::Compression,
@@ -1012,6 +1012,43 @@ fn test_compaction_records_superseded_source_objects_without_deleting_during_gra
 }
 
 #[test]
+fn test_compaction_preserves_source_objects_when_cleanup_disabled() {
+    let storage = LocalStorage::new(temp_storage_root("execute-compaction-cleanup-disabled"));
+    let chain = test_chain();
+    let first_object = write_block_object(&storage, &chain, 54, FinalityLevel::Safe);
+    let second_object = write_block_object(&storage, &chain, 55, FinalityLevel::Safe);
+
+    let report = storage
+        .compact_small_objects(MaintenanceCompactionConfig {
+            min_object_bytes: u64::MAX,
+            max_input_objects_per_candidate: 8,
+            max_tick_duration_ms: 30_000,
+            max_candidates_per_tick: 8,
+            max_manifest_entries_per_tick: 20_000,
+            cleanup_enabled: false,
+            delete_source_objects: true,
+            ..MaintenanceCompactionConfig::default()
+        })
+        .expect("compact small objects");
+
+    assert_eq!(report.processed_candidates, 1);
+    assert_eq!(report.compacted_objects, 1);
+    assert_eq!(report.deleted_source_objects, 0);
+    assert!(
+        storage
+            .object_store()
+            .exists(&first_object)
+            .expect("first exists")
+    );
+    assert!(
+        storage
+            .object_store()
+            .exists(&second_object)
+            .expect("second exists")
+    );
+}
+
+#[test]
 fn test_compaction_preserves_source_objects_for_old_coverage_plan_after_replacement() {
     let store = CountingOperationStore::new(temp_storage_root("old-plan-after-compaction"));
     let storage = DurableStorage::from_object_store(store.clone());
@@ -1653,6 +1690,7 @@ fn test_compaction_report_exposes_backlog_estimates_and_tick_summary() {
                 max_tick_duration_ms: 30_000,
                 max_candidates_per_tick: 1,
                 max_manifest_entries_per_tick: 20_000,
+                cleanup_enabled: true,
                 delete_source_objects: true,
                 ..MaintenanceCompactionConfig::default()
             },
@@ -1997,6 +2035,123 @@ fn test_compaction_cursor_resumes_and_loss_recovers_without_affecting_reads() {
         )
         .expect("reads remain correct after cursor loss");
     assert_eq!(rows.row_count(), 4);
+}
+
+#[test]
+fn test_compaction_scope_cursor_is_isolated_per_selector_scope() {
+    let storage = LocalStorage::new(temp_storage_root("scope-cursor-isolated"));
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 120, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 121, FinalityLevel::Safe);
+    let other_selector = DatasetSelector::try_other(
+        AdapterKey::try_new("test").expect("adapter key"),
+        "selector-b",
+        "selector-b",
+    )
+    .expect("selector");
+    write_block_object_with_selector(&storage, &chain, &other_selector, 130, FinalityLevel::Safe);
+    write_block_object_with_selector(&storage, &chain, &other_selector, 131, FinalityLevel::Safe);
+
+    let report = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                min_object_bytes: u64::MAX,
+                max_input_objects_per_candidate: 2,
+                max_tick_duration_ms: 30_000,
+                max_candidates_per_tick: 8,
+                max_manifest_entries_per_tick: 2,
+                cleanup_enabled: false,
+                delete_source_objects: false,
+                ..MaintenanceCompactionConfig::default()
+            },
+        )
+        .expect("first scoped tick");
+
+    assert_eq!(report.tick_status, MaintenanceCompactionTickStatus::Partial);
+    assert_eq!(report.candidates[0].selector_fingerprint, "all");
+    assert!(
+        !storage
+            .object_store()
+            .exists(&format!(
+                "chains/{}/metadata/compaction-cursor.json",
+                chain.key_prefix()
+            ))
+            .expect("legacy chain cursor exists check"),
+        "new manifest segment scans must not write a chain-wide compaction cursor"
+    );
+    assert!(
+        storage
+            .object_store()
+            .exists(&format!(
+                "chains/{}/manifest-segments/evm.blocks/block/all/safe/_metadata/compaction-cursor.json",
+                chain.key_prefix()
+            ))
+            .expect("scope cursor exists check"),
+        "the active selector scope should own its own cursor"
+    );
+    assert!(
+        !storage
+            .object_store()
+            .exists(&format!(
+                "chains/{}/manifest-segments/evm.blocks/block/{}/safe/_metadata/compaction-cursor.json",
+                chain.key_prefix(),
+                other_selector.fingerprint()
+            ))
+            .expect("other scope cursor exists check"),
+        "unprocessed selector scopes should not inherit another scope cursor"
+    );
+}
+
+#[test]
+fn test_object_store_lock_lease_prevents_duplicate_leaders_until_released() {
+    let store = LocalObjectStore::new(temp_storage_root("object-lock-lease"));
+    let first = store
+        .try_acquire_lock("locks/compaction/chain-a/scope-a.json", b"first")
+        .expect("first lock acquire")
+        .expect("first lock holder");
+
+    let second = store
+        .try_acquire_lock("locks/compaction/chain-a/scope-a.json", b"second")
+        .expect("second lock acquire");
+    assert!(second.is_none());
+
+    store.release_lock(first).expect("release first lock");
+    let third = store
+        .try_acquire_lock("locks/compaction/chain-a/scope-a.json", b"third")
+        .expect("third lock acquire")
+        .expect("third lock holder");
+    assert_eq!(
+        third,
+        ObjectLockLease {
+            key: "locks/compaction/chain-a/scope-a.json".to_owned(),
+            owner: b"third".to_vec(),
+        }
+    );
+}
+
+#[test]
+fn test_object_store_lock_lease_recovers_expired_leader() {
+    let store = LocalObjectStore::new(temp_storage_root("object-lock-expired"));
+    let key = "locks/compaction/chain-a/scope-a.json";
+    store
+        .put(key, br#"{"owner_id":"old","acquired_at_unix_seconds":1}"#)
+        .expect("write expired lock");
+
+    let lease = store
+        .try_acquire_lock_with_ttl(
+            key,
+            br#"{"owner_id":"new","acquired_at_unix_seconds":9999999999}"#,
+            std::time::Duration::from_secs(1),
+        )
+        .expect("recover expired lock")
+        .expect("new leader lease");
+
+    assert_eq!(lease.key, key);
+    assert_eq!(
+        store.get(key).expect("current lock owner"),
+        br#"{"owner_id":"new","acquired_at_unix_seconds":9999999999}"#
+    );
 }
 
 #[test]
