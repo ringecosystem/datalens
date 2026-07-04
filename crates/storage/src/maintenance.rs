@@ -2356,10 +2356,6 @@ fn is_manifest_segment_object(object_key: &str) -> bool {
         && !object_key.contains("/_metadata/")
 }
 
-fn is_manifest_segment_object(object_key: &str) -> bool {
-    object_key.contains("/manifest-segments/") && object_key.ends_with(".json")
-}
-
 fn manifest_key_from_object_key(object_key: &str) -> String {
     let mut parts = object_key.split('/').take(4).collect::<Vec<_>>();
     if parts.len() == 4 && parts.first() == Some(&"chains") {
