@@ -15,7 +15,7 @@ use datalens_storage::{
     DurableIntentSubmissionOutcome, DurableIntentSubmissionRequest, DurableIntentSubmissionService,
     DurablePromotionIntentCreateOutcome, DurablePromotionIntentRepository,
     DurablePromotionIntentSource, DurablePromotionIntentStatus, DurablePromotionIntentStore,
-    LocalObjectStore, ObjectListPage, ObjectMetadata, ObjectStore,
+    LocalObjectStore, ObjectListPage, ObjectMetadata, ObjectPutIfAbsentResult, ObjectStore,
 };
 
 #[test]
@@ -1716,6 +1716,14 @@ impl ObjectStore for CountingObjectStore {
         self.inner.put(key, bytes)
     }
 
+    fn put_if_absent(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<ObjectPutIfAbsentResult, DatalensError> {
+        self.inner.put_if_absent(key, bytes)
+    }
+
     fn exists(&self, key: &str) -> Result<bool, DatalensError> {
         self.inner.exists(key)
     }
@@ -1789,6 +1797,22 @@ impl ObjectStore for FailOnceIndexPutObjectStore {
             ));
         }
         self.inner.put(key, bytes)
+    }
+
+    fn put_if_absent(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<ObjectPutIfAbsentResult, DatalensError> {
+        if key.starts_with("durable-promotion-intents/v1/index/status=pending/")
+            && self.fail_next_index_put.swap(false, Ordering::SeqCst)
+        {
+            return Err(DatalensError::new(
+                datalens_core::DatalensErrorKind::StorageWriteFailure,
+                "injected pending index put failure",
+            ));
+        }
+        self.inner.put_if_absent(key, bytes)
     }
 
     fn exists(&self, key: &str) -> Result<bool, DatalensError> {

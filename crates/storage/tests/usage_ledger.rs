@@ -14,10 +14,10 @@ use datalens_core::{
     NetworkId,
 };
 use datalens_storage::{
-    CacheOutcome, FillOutcome, LocalObjectStore, ObjectListPage, ObjectMetadata, ObjectStore,
-    QueryActivity, QueryActivityKey, QueryActivityRepository, QueryActivityStore, QueryOutcome,
-    QueryWatermark, QueryWatermarkKey, QueryWatermarkRepository, QueryWatermarkStore,
-    UsageLedgerEntry, UsageLedgerRepository, UsageLedgerStore,
+    CacheOutcome, FillOutcome, LocalObjectStore, ObjectListPage, ObjectMetadata,
+    ObjectPutIfAbsentResult, ObjectStore, QueryActivity, QueryActivityKey, QueryActivityRepository,
+    QueryActivityStore, QueryOutcome, QueryWatermark, QueryWatermarkKey, QueryWatermarkRepository,
+    QueryWatermarkStore, UsageLedgerEntry, UsageLedgerRepository, UsageLedgerStore,
 };
 
 #[test]
@@ -577,6 +577,28 @@ impl ObjectStore for PausingFirstPutObjectStore {
         self.inner.put(key, bytes)
     }
 
+    fn put_if_absent(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<ObjectPutIfAbsentResult, DatalensError> {
+        if self
+            .paused
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            if let Some(started) = self.started.lock().expect("started sender").take() {
+                started.send(()).expect("send first put started");
+            }
+            self.release
+                .lock()
+                .expect("release receiver")
+                .recv()
+                .expect("release first put");
+        }
+        self.inner.put_if_absent(key, bytes)
+    }
+
     fn exists(&self, key: &str) -> Result<bool, DatalensError> {
         self.inner.exists(key)
     }
@@ -627,6 +649,16 @@ impl ObjectStore for CountingObjectStore {
         self.inner.put(key, bytes)
     }
 
+    fn put_if_absent(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<ObjectPutIfAbsentResult, DatalensError> {
+        self.total_put_bytes
+            .fetch_add(bytes.len() as u64, Ordering::SeqCst);
+        self.inner.put_if_absent(key, bytes)
+    }
+
     fn exists(&self, key: &str) -> Result<bool, DatalensError> {
         self.inner.exists(key)
     }
@@ -662,6 +694,17 @@ impl ObjectStore for FailingPutObjectStore {
     }
 
     fn put(&self, _key: &str, _bytes: &[u8]) -> Result<(), DatalensError> {
+        Err(DatalensError::new(
+            DatalensErrorKind::StorageWriteFailure,
+            "injected ledger write failure",
+        ))
+    }
+
+    fn put_if_absent(
+        &self,
+        _key: &str,
+        _bytes: &[u8],
+    ) -> Result<ObjectPutIfAbsentResult, DatalensError> {
         Err(DatalensError::new(
             DatalensErrorKind::StorageWriteFailure,
             "injected ledger write failure",

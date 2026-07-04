@@ -74,8 +74,8 @@ pub use crate::maintenance::{
 };
 pub use crate::manifest::{Manifest, ManifestEntry, ManifestFinalityLevel};
 pub use crate::object_store::{
-    LocalObjectStore, ObjectListPage, ObjectLockLease, ObjectMetadata, ObjectStore, S3ObjectStore,
-    S3ObjectStoreConfig, encode_object_lock_owner, validate_object_key,
+    LocalObjectStore, ObjectListPage, ObjectLockLease, ObjectMetadata, ObjectPutIfAbsentResult,
+    ObjectStore, S3ObjectStore, S3ObjectStoreConfig, encode_object_lock_owner, validate_object_key,
 };
 pub use crate::query_activity::{QueryActivity, QueryActivityKey, QueryActivityRepository};
 pub use crate::query_watermark::{QueryWatermark, QueryWatermarkKey, QueryWatermarkRepository};

@@ -9,7 +9,7 @@ use datalens_storage::{
     DurableStorage, DurableStorageConfig, LocalObjectStore, LocalStorage,
     MaintenanceCompactionConfig, MaintenanceCompactionPressure, MaintenanceCompactionTickStatus,
     MaintenanceIssueKind, MaintenanceOperationMode, Manifest, ObjectListPage, ObjectLockLease,
-    ObjectMetadata, ObjectStore, ParquetCompression, StorageWriteRequest,
+    ObjectMetadata, ObjectPutIfAbsentResult, ObjectStore, ParquetCompression, StorageWriteRequest,
 };
 use parquet::{
     basic::Compression,
@@ -19,6 +19,10 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
+
+mod support;
+
+use support::CountingObjectStore;
 
 #[derive(Clone, Debug)]
 struct FailingDataObjectPutStore {
@@ -31,8 +35,8 @@ struct FailingDataObjectDeleteStore {
 }
 
 #[derive(Clone, Debug)]
-struct FailingManifestSegmentPutStore {
-    inner: LocalObjectStore,
+struct FailingManifestSegmentPutStore<S = LocalObjectStore> {
+    inner: S,
 }
 
 #[derive(Clone, Debug)]
@@ -78,11 +82,17 @@ impl FailingDataObjectDeleteStore {
     }
 }
 
-impl FailingManifestSegmentPutStore {
+impl FailingManifestSegmentPutStore<LocalObjectStore> {
     fn new(root: PathBuf) -> Self {
         Self {
             inner: LocalObjectStore::new(root),
         }
+    }
+}
+
+impl<S> FailingManifestSegmentPutStore<S> {
+    fn from_inner(inner: S) -> Self {
+        Self { inner }
     }
 }
 
@@ -184,6 +194,20 @@ impl ObjectStore for FailingDataObjectPutStore {
         self.inner.put(key, bytes)
     }
 
+    fn put_if_absent(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<ObjectPutIfAbsentResult, DatalensError> {
+        if key.contains("/datasets/") && (key.ends_with(".json") || key.ends_with(".parquet")) {
+            return Err(DatalensError::new(
+                DatalensErrorKind::StorageWriteFailure,
+                "injected data object write failure",
+            ));
+        }
+        self.inner.put_if_absent(key, bytes)
+    }
+
     fn exists(&self, key: &str) -> Result<bool, DatalensError> {
         self.inner.exists(key)
     }
@@ -219,6 +243,14 @@ impl ObjectStore for FailingDataObjectDeleteStore {
         self.inner.put(key, bytes)
     }
 
+    fn put_if_absent(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<ObjectPutIfAbsentResult, DatalensError> {
+        self.inner.put_if_absent(key, bytes)
+    }
+
     fn exists(&self, key: &str) -> Result<bool, DatalensError> {
         self.inner.exists(key)
     }
@@ -247,7 +279,7 @@ impl ObjectStore for FailingDataObjectDeleteStore {
     }
 }
 
-impl ObjectStore for FailingManifestSegmentPutStore {
+impl<S: ObjectStore> ObjectStore for FailingManifestSegmentPutStore<S> {
     fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError> {
         self.inner.get(key)
     }
@@ -260,6 +292,14 @@ impl ObjectStore for FailingManifestSegmentPutStore {
             ));
         }
         self.inner.put(key, bytes)
+    }
+
+    fn put_if_absent(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<ObjectPutIfAbsentResult, DatalensError> {
+        self.inner.put_if_absent(key, bytes)
     }
 
     fn exists(&self, key: &str) -> Result<bool, DatalensError> {
@@ -295,6 +335,14 @@ impl ObjectStore for CountingListStore {
 
     fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
         self.inner.put(key, bytes)
+    }
+
+    fn put_if_absent(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<ObjectPutIfAbsentResult, DatalensError> {
+        self.inner.put_if_absent(key, bytes)
     }
 
     fn exists(&self, key: &str) -> Result<bool, DatalensError> {
@@ -342,6 +390,15 @@ impl ObjectStore for CountingOperationStore {
         self.inner.put(key, bytes)
     }
 
+    fn put_if_absent(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<ObjectPutIfAbsentResult, DatalensError> {
+        self.puts.lock().expect("puts").push(key.to_owned());
+        self.inner.put_if_absent(key, bytes)
+    }
+
     fn exists(&self, key: &str) -> Result<bool, DatalensError> {
         self.inner.exists(key)
     }
@@ -376,6 +433,14 @@ impl ObjectStore for FailingManifestSegmentListPageStore {
 
     fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
         self.inner.put(key, bytes)
+    }
+
+    fn put_if_absent(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<ObjectPutIfAbsentResult, DatalensError> {
+        self.inner.put_if_absent(key, bytes)
     }
 
     fn exists(&self, key: &str) -> Result<bool, DatalensError> {
@@ -446,6 +511,44 @@ impl ObjectStore for OverlappingWriteDuringCompactionStore {
             )?;
         }
         Ok(())
+    }
+
+    fn put_if_absent(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<ObjectPutIfAbsentResult, DatalensError> {
+        let result = self.inner.put_if_absent(key, bytes)?;
+        if result == ObjectPutIfAbsentResult::Created
+            && key.contains("/compacted/")
+            && self
+                .injected
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            let rows = DatasetRows::new(
+                DatasetKey::evm_blocks(),
+                QueryRows::EvmBlocks(vec![BlockHeader {
+                    number: 50,
+                    hash: "0xreplacement50".to_owned(),
+                    parent_hash: "0xparent".to_owned(),
+                    timestamp: 50,
+                }]),
+            )
+            .expect("replacement rows");
+            DurableStorage::from_object_store(self.inner.clone()).write_rows_replacing_existing(
+                StorageWriteRequest {
+                    chain: &self.chain,
+                    dataset_key: DatasetKey::evm_blocks(),
+                    selector: &DatasetSelector::all(),
+                    range: LedgerRange::blocks(50, 50).expect("range"),
+                    rows: &rows,
+                    finality_level: FinalityLevel::Safe,
+                    record_empty_coverage: true,
+                },
+            )?;
+        }
+        Ok(result)
     }
 
     fn exists(&self, key: &str) -> Result<bool, DatalensError> {
@@ -1347,6 +1450,134 @@ fn test_compaction_replacement_write_failure_leaves_old_manifest_readable() {
         )
         .expect("old manifest entries remain readable");
     assert_eq!(rows.row_count(), 2);
+}
+
+#[test]
+fn test_compaction_retry_reuses_existing_identical_compacted_object_without_second_put() {
+    let storage = LocalStorage::new(temp_storage_root("compaction-retry-existing-identical"));
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 74, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 75, FinalityLevel::Safe);
+    let counting_store = CountingObjectStore::new(LocalObjectStore::new(storage.root()));
+    let failing_storage = DurableStorage::from_object_store(
+        FailingManifestSegmentPutStore::from_inner(counting_store.clone()),
+    );
+
+    let error = failing_storage
+        .compact_small_objects(MaintenanceCompactionConfig {
+            min_object_bytes: u64::MAX,
+            max_input_objects_per_candidate: 8,
+            max_tick_duration_ms: 30_000,
+            max_candidates_per_tick: 8,
+            max_manifest_entries_per_tick: 20_000,
+            cleanup_enabled: true,
+            delete_source_objects: true,
+            source_delete_grace_ms: 0,
+            ..MaintenanceCompactionConfig::default()
+        })
+        .expect_err("manifest publish failure should leave compacted object orphaned");
+
+    assert_eq!(error.kind, DatalensErrorKind::ManifestUpdateFailure);
+    let compacted_keys = compacted_object_keys(&storage, &chain);
+    assert_eq!(compacted_keys.len(), 1);
+    let compacted_key = &compacted_keys[0];
+    assert_eq!(counting_store.put_count(compacted_key), 0);
+    assert_eq!(counting_store.put_if_absent_count(compacted_key), 1);
+
+    let retry_storage = DurableStorage::from_object_store(counting_store.clone());
+    let report = retry_storage
+        .compact_small_objects(MaintenanceCompactionConfig {
+            min_object_bytes: u64::MAX,
+            max_input_objects_per_candidate: 8,
+            max_tick_duration_ms: 30_000,
+            max_candidates_per_tick: 8,
+            max_manifest_entries_per_tick: 20_000,
+            cleanup_enabled: true,
+            delete_source_objects: true,
+            source_delete_grace_ms: 0,
+            ..MaintenanceCompactionConfig::default()
+        })
+        .expect("retry compaction reuses existing compacted object");
+
+    assert_eq!(report.compacted_objects, 1);
+    assert_eq!(counting_store.put_count(compacted_key), 0);
+    assert_eq!(counting_store.put_if_absent_count(compacted_key), 1);
+    let manifest = storage.manifest().expect("manifest");
+    assert_eq!(manifest.entries.len(), 1);
+    assert_eq!(
+        manifest.entries[0].object_key.as_deref(),
+        Some(compacted_key.as_str())
+    );
+    let rows = storage
+        .read_rows(
+            &chain,
+            &DatasetKey::evm_blocks(),
+            &DatasetSelector::all(),
+            LedgerRange::blocks(74, 75).expect("range"),
+        )
+        .expect("read reused compacted rows");
+    assert_block_numbers(rows, &[74, 75]);
+}
+
+#[test]
+fn test_compaction_existing_corrupt_compacted_object_fails_before_manifest_publish() {
+    let storage = LocalStorage::new(temp_storage_root("compaction-existing-corrupt"));
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 76, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 77, FinalityLevel::Safe);
+    let old_manifest = storage.manifest().expect("old manifest");
+    let counting_store = CountingObjectStore::new(LocalObjectStore::new(storage.root()));
+    let failing_storage = DurableStorage::from_object_store(
+        FailingManifestSegmentPutStore::from_inner(counting_store.clone()),
+    );
+
+    failing_storage
+        .compact_small_objects(MaintenanceCompactionConfig {
+            min_object_bytes: u64::MAX,
+            max_input_objects_per_candidate: 8,
+            max_tick_duration_ms: 30_000,
+            max_candidates_per_tick: 8,
+            max_manifest_entries_per_tick: 20_000,
+            cleanup_enabled: true,
+            delete_source_objects: true,
+            source_delete_grace_ms: 0,
+            ..MaintenanceCompactionConfig::default()
+        })
+        .expect_err("manifest publish failure should leave compacted object orphaned");
+
+    let compacted_keys = compacted_object_keys(&storage, &chain);
+    assert_eq!(compacted_keys.len(), 1);
+    let compacted_key = &compacted_keys[0];
+    storage
+        .object_store()
+        .put(compacted_key, b"corrupt compacted bytes")
+        .expect("corrupt existing compacted object");
+
+    let error = DurableStorage::from_object_store(counting_store.clone())
+        .compact_small_objects(MaintenanceCompactionConfig {
+            min_object_bytes: u64::MAX,
+            max_input_objects_per_candidate: 8,
+            max_tick_duration_ms: 30_000,
+            max_candidates_per_tick: 8,
+            max_manifest_entries_per_tick: 20_000,
+            cleanup_enabled: true,
+            delete_source_objects: true,
+            source_delete_grace_ms: 0,
+            ..MaintenanceCompactionConfig::default()
+        })
+        .expect_err("corrupt existing compacted object should fail");
+
+    assert_eq!(error.kind, DatalensErrorKind::StorageWriteFailure);
+    assert_eq!(storage.manifest().expect("manifest"), old_manifest);
+    let rows = storage
+        .read_rows(
+            &chain,
+            &DatasetKey::evm_blocks(),
+            &DatasetSelector::all(),
+            LedgerRange::blocks(76, 77).expect("range"),
+        )
+        .expect("old rows remain readable");
+    assert_block_numbers(rows, &[76, 77]);
 }
 
 #[test]

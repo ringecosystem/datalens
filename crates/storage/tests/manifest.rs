@@ -87,6 +87,14 @@ impl ObjectStore for StaleManifestObjectStore {
         self.inner.put(key, bytes)
     }
 
+    fn put_if_absent(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<ObjectPutIfAbsentResult, DatalensError> {
+        self.inner.put_if_absent(key, bytes)
+    }
+
     fn exists(&self, key: &str) -> Result<bool, DatalensError> {
         self.inner.exists(key)
     }
@@ -143,6 +151,14 @@ impl ObjectStore for CountingDataObjectExistsStore {
 
     fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
         self.inner.put(key, bytes)
+    }
+
+    fn put_if_absent(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<ObjectPutIfAbsentResult, DatalensError> {
+        self.inner.put_if_absent(key, bytes)
     }
 
     fn exists(&self, key: &str) -> Result<bool, DatalensError> {
@@ -204,6 +220,14 @@ impl ObjectStore for CountingCoverageIndexExistsStore {
 
     fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
         self.inner.put(key, bytes)
+    }
+
+    fn put_if_absent(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<ObjectPutIfAbsentResult, DatalensError> {
+        self.inner.put_if_absent(key, bytes)
     }
 
     fn exists(&self, key: &str) -> Result<bool, DatalensError> {
@@ -271,6 +295,14 @@ impl ObjectStore for MissingDataObjectExistsStore {
 
     fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
         self.inner.put(key, bytes)
+    }
+
+    fn put_if_absent(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<ObjectPutIfAbsentResult, DatalensError> {
+        self.inner.put_if_absent(key, bytes)
     }
 
     fn exists(&self, key: &str) -> Result<bool, DatalensError> {
@@ -355,6 +387,31 @@ impl ObjectStore for InjectOnManifestSegmentPutStore {
         Ok(())
     }
 
+    fn put_if_absent(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<ObjectPutIfAbsentResult, DatalensError> {
+        let result = self.inner.put_if_absent(key, bytes)?;
+        if result == ObjectPutIfAbsentResult::Created
+            && key.contains("/manifest-segments/")
+            && self
+                .inject_next_segment_put
+                .compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            let objects = self
+                .injected_objects
+                .lock()
+                .expect("lock injected objects")
+                .clone();
+            for (key, bytes) in objects {
+                self.inner.put(&key, &bytes)?;
+            }
+        }
+        Ok(result)
+    }
+
     fn exists(&self, key: &str) -> Result<bool, DatalensError> {
         self.inner.exists(key)
     }
@@ -399,6 +456,25 @@ impl ObjectStore for FailNextManifestSegmentPutStore {
             ));
         }
         self.inner.put(key, bytes)
+    }
+
+    fn put_if_absent(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<ObjectPutIfAbsentResult, DatalensError> {
+        if key.contains("/manifest-segments/")
+            && self
+                .fail_next_segment_put
+                .compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            return Err(DatalensError::new(
+                DatalensErrorKind::StorageWriteFailure,
+                "injected manifest segment write failure",
+            ));
+        }
+        self.inner.put_if_absent(key, bytes)
     }
 
     fn exists(&self, key: &str) -> Result<bool, DatalensError> {
@@ -463,6 +539,14 @@ impl ObjectStore for ManifestGetCountingStore {
 
     fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
         self.inner.put(key, bytes)
+    }
+
+    fn put_if_absent(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<ObjectPutIfAbsentResult, DatalensError> {
+        self.inner.put_if_absent(key, bytes)
     }
 
     fn exists(&self, key: &str) -> Result<bool, DatalensError> {
@@ -580,6 +664,17 @@ impl ObjectStore for ManifestAccessCountingStore {
             self.data_object_put_count.fetch_add(1, Ordering::SeqCst);
         }
         self.inner.put(key, bytes)
+    }
+
+    fn put_if_absent(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<ObjectPutIfAbsentResult, DatalensError> {
+        if key.contains("/datasets/") {
+            self.data_object_put_count.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.put_if_absent(key, bytes)
     }
 
     fn exists(&self, key: &str) -> Result<bool, DatalensError> {
@@ -728,6 +823,29 @@ impl ObjectStore for PausedManifestPutStore {
         self.inner.put(key, bytes)
     }
 
+    fn put_if_absent(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<ObjectPutIfAbsentResult, DatalensError> {
+        if key.starts_with(&self.paused_put_prefix) {
+            {
+                let mut put_started = self.state.put_started.lock().expect("lock put started");
+                *put_started = true;
+                self.state.put_started_ready.notify_all();
+            }
+            let mut release_put = self.state.release_put.lock().expect("lock release put");
+            while !*release_put {
+                release_put = self
+                    .state
+                    .release_put_ready
+                    .wait(release_put)
+                    .expect("wait release put");
+            }
+        }
+        self.inner.put_if_absent(key, bytes)
+    }
+
     fn exists(&self, key: &str) -> Result<bool, DatalensError> {
         self.inner.exists(key)
     }
@@ -780,6 +898,31 @@ impl ObjectStore for RacingCoverageIndexPutStore {
         self.inner.put(key, bytes)
     }
 
+    fn put_if_absent(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<ObjectPutIfAbsentResult, DatalensError> {
+        if key.contains("/coverage-index/") {
+            let mut waiting_puts = self.state.waiting_puts.lock().expect("lock waiting puts");
+            *waiting_puts += 1;
+            self.state.ready.notify_all();
+            while *waiting_puts < 2 {
+                let (guard, timeout) = self
+                    .state
+                    .ready
+                    .wait_timeout(waiting_puts, Duration::from_millis(250))
+                    .expect("wait coverage index put");
+                waiting_puts = guard;
+                if timeout.timed_out() {
+                    break;
+                }
+            }
+            self.state.ready.notify_all();
+        }
+        self.inner.put_if_absent(key, bytes)
+    }
+
     fn exists(&self, key: &str) -> Result<bool, DatalensError> {
         self.inner.exists(key)
     }
@@ -812,6 +955,17 @@ impl ObjectStore for FailingPutObjectStore {
     }
 
     fn put(&self, _key: &str, _bytes: &[u8]) -> Result<(), DatalensError> {
+        Err(DatalensError::new(
+            DatalensErrorKind::StorageWriteFailure,
+            "injected object write failure",
+        ))
+    }
+
+    fn put_if_absent(
+        &self,
+        _key: &str,
+        _bytes: &[u8],
+    ) -> Result<ObjectPutIfAbsentResult, DatalensError> {
         Err(DatalensError::new(
             DatalensErrorKind::StorageWriteFailure,
             "injected object write failure",

@@ -956,6 +956,14 @@ mod tests {
             self.inner.put(key, bytes)
         }
 
+        fn put_if_absent(
+            &self,
+            key: &str,
+            bytes: &[u8],
+        ) -> Result<crate::ObjectPutIfAbsentResult, DatalensError> {
+            self.inner.put_if_absent(key, bytes)
+        }
+
         fn exists(&self, _key: &str) -> Result<bool, DatalensError> {
             panic!("coverage index reads should use get and handle missing keys")
         }

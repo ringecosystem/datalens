@@ -26,10 +26,10 @@ use datalens_storage::{
     DurablePromotionIntentBacklog, DurablePromotionIntentCreateOutcome,
     DurablePromotionIntentRepository, DurablePromotionIntentSource, DurablePromotionIntentStatus,
     DurablePromotionIntentStore, FillOutcome, LocalObjectStore, LocalStorage, Manifest,
-    ObjectListPage, ObjectMetadata, ObjectStore, QueryActivityKey, QueryActivityRepository,
-    QueryActivityStore, QueryOutcome, QueryWatermarkKey, QueryWatermarkRepository,
-    QueryWatermarkStore, StorageRepository, StorageWriteOutcome, StorageWriteRequest,
-    UsageLedgerRepository, UsageLedgerStore,
+    ObjectListPage, ObjectMetadata, ObjectPutIfAbsentResult, ObjectStore, QueryActivityKey,
+    QueryActivityRepository, QueryActivityStore, QueryOutcome, QueryWatermarkKey,
+    QueryWatermarkRepository, QueryWatermarkStore, StorageRepository, StorageWriteOutcome,
+    StorageWriteRequest, UsageLedgerRepository, UsageLedgerStore,
 };
 use datalens_writer::{
     DurableWriteRequest, DurableWriteSegment, DurableWriterConfig, WriteStagingConfig,
@@ -1831,6 +1831,14 @@ impl ObjectStore for CountingObjectStore {
 
     fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
         self.inner.put(key, bytes)
+    }
+
+    fn put_if_absent(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<ObjectPutIfAbsentResult, DatalensError> {
+        self.inner.put_if_absent(key, bytes)
     }
 
     fn exists(&self, key: &str) -> Result<bool, DatalensError> {

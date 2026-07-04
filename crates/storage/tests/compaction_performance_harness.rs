@@ -16,7 +16,7 @@ use datalens_core::{
 };
 use datalens_storage::{
     DurableStorage, LocalObjectStore, MaintenanceCompactionConfig, ObjectListPage, ObjectMetadata,
-    ObjectStore, StorageWriteRequest,
+    ObjectPutIfAbsentResult, ObjectStore, StorageWriteRequest,
 };
 
 #[test]
@@ -289,6 +289,19 @@ impl ObjectStore for InstrumentedObjectStore {
                 .pause_if_enabled(CompactionPhase::RecordingSupersededSources);
         }
         self.inner.put(key, bytes)
+    }
+
+    fn put_if_absent(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<ObjectPutIfAbsentResult, DatalensError> {
+        self.counters.put.fetch_add(1, Ordering::SeqCst);
+        if self.should_pause_key(key) && key.contains("/datasets/") && key.contains("/compacted/") {
+            self.pauses
+                .pause_if_enabled(CompactionPhase::WritingCompactedObject);
+        }
+        self.inner.put_if_absent(key, bytes)
     }
 
     fn exists(&self, key: &str) -> Result<bool, DatalensError> {

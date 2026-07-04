@@ -27,9 +27,9 @@ use datalens_storage::{
     DurablePromotionIntentRepository, DurablePromotionIntentStore, DurableStorage,
     LocalObjectStore, LocalStorage, MaintenanceCompactionConfig,
     MaintenanceCompactionPressureMonitor, MaintenanceCompactionReport, ObjectListPage,
-    ObjectLockLease, ObjectMetadata, ObjectStore, QueryActivityRepository, QueryActivityStore,
-    QueryWatermarkRepository, QueryWatermarkStore, S3ObjectStore, UsageLedgerRepository,
-    UsageLedgerStore, encode_object_lock_owner,
+    ObjectLockLease, ObjectMetadata, ObjectPutIfAbsentResult, ObjectStore, QueryActivityRepository,
+    QueryActivityStore, QueryWatermarkRepository, QueryWatermarkStore, S3ObjectStore,
+    UsageLedgerRepository, UsageLedgerStore, encode_object_lock_owner,
 };
 use datalens_tron::{TronAdapter, TronGridContractEventsConfig, TronHttpProvider};
 use datalens_warmup::{
@@ -1174,6 +1174,17 @@ impl ObjectStore for WarmupRegistryObjectStore {
         match self {
             Self::Local(store) => store.put(key, bytes),
             Self::S3(store) => store.put(key, bytes),
+        }
+    }
+
+    fn put_if_absent(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<ObjectPutIfAbsentResult, DatalensError> {
+        match self {
+            Self::Local(store) => store.put_if_absent(key, bytes),
+            Self::S3(store) => store.put_if_absent(key, bytes),
         }
     }
 
