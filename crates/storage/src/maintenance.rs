@@ -615,7 +615,16 @@ where
             if selected_entries.len() != candidate.entry_count {
                 continue;
             }
-            if !operation_budget.can_process_candidate(candidate, selected_entries.len()) {
+            let manifest_segment_deletes = selected_entries
+                .iter()
+                .filter_map(|entry| entry.segment_key.clone())
+                .collect::<BTreeSet<_>>()
+                .len();
+            if !operation_budget.can_process_candidate(
+                candidate,
+                selected_entries.len(),
+                manifest_segment_deletes,
+            ) {
                 partial = true;
                 break;
             }
@@ -644,6 +653,7 @@ where
                     .iter()
                     .filter_map(|entry| entry.segment_key.clone()),
             );
+            operation_budget.record_deletes(manifest_segment_deletes);
             cursor_advance_key = selected_entries
                 .iter()
                 .filter_map(|entry| entry.segment_key.clone())
@@ -672,9 +682,19 @@ where
             let next_key = if partial && processed_candidates < candidates.len() {
                 cursor_advance_key
                     .map(segment_compaction_cursor)
+                    .or_else(|| {
+                        legacy_cursor_after_rewritten_manifest(
+                            scan_cursor_advance_key.clone(),
+                            processed_candidates,
+                        )
+                    })
                     .or(scan_cursor_advance_key)
             } else if partial {
-                scan_cursor_advance_key
+                legacy_cursor_after_rewritten_manifest(
+                    scan_cursor_advance_key.clone(),
+                    processed_candidates,
+                )
+                .or(scan_cursor_advance_key)
             } else {
                 None
             };
@@ -1291,6 +1311,7 @@ struct CompactionManifestScan {
 struct CompactionOperationBudget {
     max_gets: usize,
     max_puts: usize,
+    max_deletes: usize,
     used_gets: usize,
     used_puts: usize,
     used_deletes: usize,
@@ -1301,15 +1322,23 @@ impl CompactionOperationBudget {
         Self {
             max_gets: config.max_gets_per_tick,
             max_puts: config.max_puts_per_tick,
+            max_deletes: config.max_deletes_per_tick,
             used_gets: 0,
             used_puts: 0,
             used_deletes: 0,
         }
     }
 
-    fn can_process_candidate(&self, candidate: &CompactionCandidate, source_gets: usize) -> bool {
+    fn can_process_candidate(
+        &self,
+        candidate: &CompactionCandidate,
+        source_gets: usize,
+        manifest_segment_deletes: usize,
+    ) -> bool {
         let _ = candidate;
-        self.remaining_gets() >= source_gets && self.remaining_puts() >= 2
+        self.remaining_gets() >= source_gets
+            && self.remaining_puts() >= 2
+            && self.remaining_deletes() >= manifest_segment_deletes
     }
 
     fn record_gets(&mut self, count: usize) {
@@ -1320,12 +1349,20 @@ impl CompactionOperationBudget {
         self.used_puts = self.used_puts.saturating_add(count);
     }
 
+    fn record_deletes(&mut self, count: usize) {
+        self.used_deletes = self.used_deletes.saturating_add(count);
+    }
+
     fn remaining_gets(&self) -> usize {
         self.max_gets.saturating_sub(self.used_gets)
     }
 
     fn remaining_puts(&self) -> usize {
         self.max_puts.saturating_sub(self.used_puts)
+    }
+
+    fn remaining_deletes(&self) -> usize {
+        self.max_deletes.saturating_sub(self.used_deletes)
     }
 }
 
@@ -1367,6 +1404,21 @@ fn segment_compaction_cursor(next_segment_key: String) -> CompactionCursor {
         next_segment_key: Some(next_segment_key),
         legacy_entry_offset: None,
     }
+}
+
+fn legacy_cursor_after_rewritten_manifest(
+    cursor: Option<CompactionCursor>,
+    processed_candidates: usize,
+) -> Option<CompactionCursor> {
+    let cursor = cursor?;
+    if processed_candidates == 0 || cursor.legacy_entry_offset.is_none() {
+        return None;
+    }
+    Some(CompactionCursor {
+        schema_version: 1,
+        next_segment_key: None,
+        legacy_entry_offset: Some(0),
+    })
 }
 
 fn decode_manifest_object(key: &str, bytes: &[u8]) -> Result<Manifest, DatalensError> {
