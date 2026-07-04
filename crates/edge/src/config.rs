@@ -99,8 +99,14 @@ pub struct StorageCompactionConfig {
     pub interval_ms: u64,
     #[serde(default = "default_storage_compaction_min_object_bytes")]
     pub min_object_bytes: u64,
-    #[serde(default = "default_storage_compaction_max_merge_ranges")]
-    pub max_merge_ranges: usize,
+    #[serde(default = "default_storage_compaction_target_object_bytes")]
+    pub target_object_bytes: u64,
+    #[serde(default = "default_storage_compaction_max_output_object_bytes")]
+    pub max_output_object_bytes: u64,
+    #[serde(default = "default_storage_compaction_max_input_objects_per_candidate")]
+    pub max_input_objects_per_candidate: usize,
+    #[serde(default = "default_storage_compaction_max_input_bytes_per_candidate")]
+    pub max_input_bytes_per_candidate: u64,
     #[serde(default = "default_storage_compaction_max_tick_duration_ms")]
     pub max_tick_duration_ms: u64,
     #[serde(default = "default_storage_compaction_max_candidates_per_tick")]
@@ -115,6 +121,8 @@ pub struct StorageCompactionConfig {
     pub max_puts_per_tick: usize,
     #[serde(default = "default_storage_compaction_max_deletes_per_tick")]
     pub max_deletes_per_tick: usize,
+    #[serde(default = "default_storage_compaction_source_delete_grace_ms")]
+    pub source_delete_grace_ms: u64,
     #[serde(default = "default_storage_compaction_object_store_error_pause_ms")]
     pub object_store_error_pause_ms: u64,
     #[serde(default = "default_storage_compaction_query_latency_pause_threshold_ms")]
@@ -137,7 +145,12 @@ impl Default for StorageCompactionConfig {
             enabled: default_storage_compaction_enabled(),
             interval_ms: default_storage_compaction_interval_ms(),
             min_object_bytes: default_storage_compaction_min_object_bytes(),
-            max_merge_ranges: default_storage_compaction_max_merge_ranges(),
+            target_object_bytes: default_storage_compaction_target_object_bytes(),
+            max_output_object_bytes: default_storage_compaction_max_output_object_bytes(),
+            max_input_objects_per_candidate:
+                default_storage_compaction_max_input_objects_per_candidate(),
+            max_input_bytes_per_candidate: default_storage_compaction_max_input_bytes_per_candidate(
+            ),
             max_tick_duration_ms: default_storage_compaction_max_tick_duration_ms(),
             max_candidates_per_tick: default_storage_compaction_max_candidates_per_tick(),
             max_concurrent_candidates: default_storage_compaction_max_concurrent_candidates(),
@@ -145,6 +158,7 @@ impl Default for StorageCompactionConfig {
             max_gets_per_tick: default_storage_compaction_max_gets_per_tick(),
             max_puts_per_tick: default_storage_compaction_max_puts_per_tick(),
             max_deletes_per_tick: default_storage_compaction_max_deletes_per_tick(),
+            source_delete_grace_ms: default_storage_compaction_source_delete_grace_ms(),
             object_store_error_pause_ms: default_storage_compaction_object_store_error_pause_ms(),
             query_latency_pause_threshold_ms:
                 default_storage_compaction_query_latency_pause_threshold_ms(),
@@ -487,8 +501,20 @@ fn default_storage_compaction_min_object_bytes() -> u64 {
     1_048_576
 }
 
-fn default_storage_compaction_max_merge_ranges() -> usize {
-    4
+fn default_storage_compaction_target_object_bytes() -> u64 {
+    64 * 1024 * 1024
+}
+
+fn default_storage_compaction_max_output_object_bytes() -> u64 {
+    128 * 1024 * 1024
+}
+
+fn default_storage_compaction_max_input_objects_per_candidate() -> usize {
+    512
+}
+
+fn default_storage_compaction_max_input_bytes_per_candidate() -> u64 {
+    128 * 1024 * 1024
 }
 
 fn default_storage_compaction_max_tick_duration_ms() -> u64 {
@@ -517,6 +543,10 @@ fn default_storage_compaction_max_puts_per_tick() -> usize {
 
 fn default_storage_compaction_max_deletes_per_tick() -> usize {
     64
+}
+
+fn default_storage_compaction_source_delete_grace_ms() -> u64 {
+    300_000
 }
 
 fn default_storage_compaction_object_store_error_pause_ms() -> u64 {

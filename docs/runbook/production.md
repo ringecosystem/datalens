@@ -76,7 +76,9 @@ background compaction. Keep the first production rollout conservative:
   after a compacted replacement is published.
 - `storage.compaction.max_candidates_per_tick = 1`,
   `storage.compaction.max_tick_duration_ms = 2000`, and
-  `storage.compaction.max_merge_ranges = 4` keep each tick small.
+  `storage.compaction.max_input_objects_per_candidate = 512` keep each tick
+  bounded while letting dense small-object runs converge toward the target
+  object size.
 - `query.metadata.worker_threads = 2`, `query.metadata.queue_capacity = 1024`, and
   `query.metadata.coalesced_capacity = 256` keep query metadata work bounded so
   backpressure applies before background work can grow unbounded.

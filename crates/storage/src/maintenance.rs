@@ -4,7 +4,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use datalens_core::{
@@ -139,6 +139,14 @@ pub struct MaintenanceCompactionReconciliationReport {
     pub delete_failures: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct SupersededCompactionSource {
+    schema_version: u32,
+    object_key: String,
+    superseded_at_unix_ms: u64,
+    delete_after_unix_ms: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MaintenanceCompactionTickStatus {
@@ -162,7 +170,10 @@ impl MaintenanceCompactionTickStatus {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MaintenanceCompactionConfig {
     pub min_object_bytes: u64,
-    pub max_merge_ranges: usize,
+    pub target_object_bytes: u64,
+    pub max_output_object_bytes: u64,
+    pub max_input_objects_per_candidate: usize,
+    pub max_input_bytes_per_candidate: u64,
     pub max_tick_duration_ms: u64,
     pub max_candidates_per_tick: usize,
     pub max_concurrent_candidates: usize,
@@ -176,13 +187,17 @@ pub struct MaintenanceCompactionConfig {
     pub pressure: MaintenanceCompactionPressure,
     pub cleanup_enabled: bool,
     pub delete_source_objects: bool,
+    pub source_delete_grace_ms: u64,
 }
 
 impl Default for MaintenanceCompactionConfig {
     fn default() -> Self {
         Self {
             min_object_bytes: u64::MAX,
-            max_merge_ranges: 32,
+            target_object_bytes: 64 * 1024 * 1024,
+            max_output_object_bytes: 128 * 1024 * 1024,
+            max_input_objects_per_candidate: 512,
+            max_input_bytes_per_candidate: 128 * 1024 * 1024,
             max_tick_duration_ms: 30_000,
             max_candidates_per_tick: 1,
             max_concurrent_candidates: 1,
@@ -196,6 +211,7 @@ impl Default for MaintenanceCompactionConfig {
             pressure: MaintenanceCompactionPressure::default(),
             cleanup_enabled: false,
             delete_source_objects: false,
+            source_delete_grace_ms: 300_000,
         }
     }
 }
@@ -260,6 +276,9 @@ pub struct CompactionCandidate {
     pub object_encoding: ObjectEncoding,
     pub range: LedgerRange,
     pub entry_count: usize,
+    pub input_object_bytes: u64,
+    pub target_object_bytes: u64,
+    pub max_output_object_bytes: u64,
     pub object_keys: Vec<String>,
 }
 
@@ -331,8 +350,12 @@ where
         issues.extend(contradictory_coverage_issues(&entries));
 
         let candidates = compaction_candidates(&entries, MaintenanceCompactionConfig::default());
-        let compaction_reconciliation =
-            self.compaction_reconciliation_report(&entries, &raw_entries, true)?;
+        let compaction_reconciliation = self.compaction_reconciliation_report(
+            &entries,
+            &raw_entries,
+            MaintenanceCompactionConfig::default(),
+            true,
+        )?;
         let protected_current_objects = current_object_keys(&entries);
         let delete_candidates = self.retention_delete_candidates(&protected_current_objects)?;
 
@@ -441,7 +464,7 @@ where
         let current_entries = self.manifest_for_chain(chain)?.entries;
         let raw_entries = self.raw_manifest_entries_for_chain(chain)?;
         let mut report =
-            self.compaction_reconciliation_report(&current_entries, &raw_entries, false)?;
+            self.compaction_reconciliation_report(&current_entries, &raw_entries, config, false)?;
         let chain_prefix = format!("chains/{}/", chain.key_prefix());
         report
             .orphan_compacted_objects
@@ -470,15 +493,35 @@ where
                 }
             }
             if config.delete_source_objects {
-                for object_key in report.stale_source_objects.clone() {
-                    match self.object_store().delete(&object_key) {
+                let eligible_records =
+                    self.superseded_source_records_for_chain(chain, config.source_delete_grace_ms)?;
+                for (record_key, record) in eligible_records
+                    .into_iter()
+                    .take(config.max_deletes_per_tick)
+                {
+                    match self.object_store().delete(&record.object_key) {
                         Ok(()) => report.deleted_stale_source_objects += 1,
                         Err(error) => {
                             report.delete_failures += 1;
                             log::warn!(
                                 "storage compaction reconciliation source delete failed chain_key={} object_key={} kind={:?} message={}",
                                 chain.key_prefix(),
-                                object_key,
+                                record.object_key,
+                                error.kind,
+                                error.message
+                            );
+                            continue;
+                        }
+                    }
+                    match self.object_store().delete(&record_key) {
+                        Ok(()) => report.deleted_stale_cleanup_records += 1,
+                        Err(error) => {
+                            report.delete_failures += 1;
+                            log::warn!(
+                                "storage compaction reconciliation source cleanup record delete failed chain_key={} object_key={} record_key={} kind={:?} message={}",
+                                chain.key_prefix(),
+                                record.object_key,
+                                record_key,
                                 error.kind,
                                 error.message
                             );
@@ -561,8 +604,8 @@ where
         let mut processed_candidates = 0usize;
         let mut input_objects = 0usize;
         let mut deleted_manifest_segments = BTreeSet::new();
-        let mut deleted_source_objects = 0usize;
-        let mut source_delete_failures = 0usize;
+        let deleted_source_objects = 0usize;
+        let source_delete_failures = 0usize;
         let mut cursor_advance_key = None;
         let max_candidates = config
             .max_candidates_per_tick
@@ -582,7 +625,16 @@ where
             if selected_entries.len() != candidate.entry_count {
                 continue;
             }
-            if !operation_budget.can_process_candidate(candidate, selected_entries.len()) {
+            let manifest_segment_deletes = selected_entries
+                .iter()
+                .filter_map(|entry| entry.segment_key.clone())
+                .collect::<BTreeSet<_>>()
+                .len();
+            if !operation_budget.can_process_candidate(
+                candidate,
+                selected_entries.len(),
+                manifest_segment_deletes,
+            ) {
                 partial = true;
                 break;
             }
@@ -611,6 +663,7 @@ where
                     .iter()
                     .filter_map(|entry| entry.segment_key.clone()),
             );
+            operation_budget.record_deletes(manifest_segment_deletes);
             cursor_advance_key = selected_entries
                 .iter()
                 .filter_map(|entry| entry.cursor_key.clone())
@@ -621,13 +674,8 @@ where
                 candidate.chain.key_prefix(),
                 publish_started.elapsed().as_millis()
             );
-            if config.delete_source_objects
-                && operation_budget.can_delete_sources(candidate.object_keys.len())
-            {
-                let cleanup = self.delete_compacted_source_objects(candidate);
-                operation_budget.record_deletes(candidate.object_keys.len());
-                deleted_source_objects += cleanup.deleted_objects;
-                source_delete_failures += cleanup.delete_failures;
+            if config.delete_source_objects {
+                self.record_superseded_compaction_sources(candidate, config)?;
             }
             if config.cleanup_enabled {
                 let queue_entry_keys = selected_entries
@@ -635,7 +683,7 @@ where
                     .filter_map(|entry| entry.cursor_key.as_deref())
                     .filter(|key| key.contains("/metadata/compaction-queue/"))
                     .collect::<BTreeSet<_>>();
-                if operation_budget.can_delete_sources(queue_entry_keys.len()) {
+                if operation_budget.remaining_deletes() >= queue_entry_keys.len() {
                     let cleanup = self.delete_compaction_queue_entries(
                         &candidate.chain,
                         queue_entry_keys.into_iter(),
@@ -658,9 +706,19 @@ where
             let next_key = if partial && processed_candidates < candidates.len() {
                 cursor_advance_key
                     .map(segment_compaction_cursor)
+                    .or_else(|| {
+                        legacy_cursor_after_rewritten_manifest(
+                            scan_cursor_advance_key.clone(),
+                            processed_candidates,
+                        )
+                    })
                     .or(scan_cursor_advance_key)
             } else if partial {
-                scan_cursor_advance_key
+                legacy_cursor_after_rewritten_manifest(
+                    scan_cursor_advance_key.clone(),
+                    processed_candidates,
+                )
+                .or(scan_cursor_advance_key)
             } else {
                 None
             };
@@ -780,6 +838,7 @@ where
         &self,
         current_entries: &[ManifestEntry],
         raw_entries: &[ManifestEntry],
+        config: MaintenanceCompactionConfig,
         read_only: bool,
     ) -> Result<MaintenanceCompactionReconciliationReport, DatalensError> {
         let current_objects = current_object_keys(current_entries)
@@ -797,18 +856,12 @@ where
         orphan_compacted_objects.sort();
         orphan_compacted_objects.dedup();
 
-        let mut stale_source_objects = Vec::new();
-        for entry in raw_entries {
-            let Some(object_key) = entry.object_key.as_ref() else {
-                continue;
-            };
-            if object_key.contains("/compacted/") || current_objects.contains(object_key) {
-                continue;
-            }
-            if stale_source_object_is_safe(entry, current_entries, self.object_store())? {
-                stale_source_objects.push(object_key.clone());
-            }
-        }
+        let mut stale_source_objects = self
+            .superseded_source_records(config.source_delete_grace_ms, false)?
+            .into_iter()
+            .filter(|(_, record)| !current_objects.contains(&record.object_key))
+            .map(|(_, record)| record.object_key)
+            .collect::<Vec<_>>();
         stale_source_objects.sort();
         stale_source_objects.dedup();
 
@@ -862,38 +915,90 @@ where
         Ok(records)
     }
 
-    fn delete_compacted_source_objects(
+    fn record_superseded_compaction_sources(
         &self,
         candidate: &CompactionCandidate,
-    ) -> CompactionSourceCleanup {
-        let mut deleted_objects = 0usize;
-        let mut delete_failures = 0usize;
+        config: MaintenanceCompactionConfig,
+    ) -> Result<(), DatalensError> {
+        let now_ms = unix_millis_now()?;
         for object_key in &candidate.object_keys {
-            match self.object_store().delete(object_key) {
-                Ok(()) => {
-                    deleted_objects += 1;
-                    log::info!(
-                        "storage compaction source object deleted chain_key={} object_key={}",
-                        candidate.chain.key_prefix(),
-                        object_key
-                    );
-                }
-                Err(error) => {
-                    delete_failures += 1;
-                    log::warn!(
-                        "storage compaction source object delete failed chain_key={} object_key={} kind={:?} message={}",
-                        candidate.chain.key_prefix(),
-                        object_key,
-                        error.kind,
-                        error.message
-                    );
-                }
+            let record = SupersededCompactionSource {
+                schema_version: 1,
+                object_key: object_key.clone(),
+                superseded_at_unix_ms: now_ms,
+                delete_after_unix_ms: now_ms.saturating_add(config.source_delete_grace_ms),
+            };
+            let record_key = superseded_source_record_key(&candidate.chain, object_key);
+            let bytes = serde_json::to_vec_pretty(&record).map_err(|error| {
+                DatalensError::new(
+                    DatalensErrorKind::Internal,
+                    format!("encode compaction superseded source record: {error}"),
+                )
+            })?;
+            self.object_store().put(&record_key, &bytes)?;
+            log::info!(
+                "storage compaction source object superseded chain_key={} object_key={} delete_after_unix_ms={}",
+                candidate.chain.key_prefix(),
+                object_key,
+                record.delete_after_unix_ms
+            );
+        }
+        Ok(())
+    }
+
+    fn superseded_source_records_for_chain(
+        &self,
+        chain: &ChainIdentity,
+        grace_ms: u64,
+    ) -> Result<Vec<(String, SupersededCompactionSource)>, DatalensError> {
+        let prefix = superseded_source_record_prefix(chain);
+        Ok(self
+            .superseded_source_records(grace_ms, true)?
+            .into_iter()
+            .filter(|(key, _)| key.starts_with(&prefix))
+            .collect())
+    }
+
+    fn superseded_source_records(
+        &self,
+        grace_ms: u64,
+        eligible_only: bool,
+    ) -> Result<Vec<(String, SupersededCompactionSource)>, DatalensError> {
+        let now_ms = unix_millis_now()?;
+        let mut records = Vec::new();
+        for object in self.object_store().list("chains")? {
+            if !object
+                .key
+                .contains("/metadata/compaction-superseded-sources/")
+                || !object.key.ends_with(".json")
+            {
+                continue;
+            }
+            let bytes = self.object_store().get(&object.key)?;
+            let mut record =
+                serde_json::from_slice::<SupersededCompactionSource>(&bytes).map_err(|error| {
+                    DatalensError::new(
+                        DatalensErrorKind::StorageReadFailure,
+                        format!(
+                            "decode compaction superseded source record {}: {error}",
+                            object.key
+                        ),
+                    )
+                })?;
+            record.delete_after_unix_ms = record
+                .delete_after_unix_ms
+                .max(record.superseded_at_unix_ms.saturating_add(grace_ms));
+            if !eligible_only || record.delete_after_unix_ms <= now_ms {
+                records.push((object.key, record));
             }
         }
-        CompactionSourceCleanup {
-            deleted_objects,
-            delete_failures,
-        }
+        records.sort_by(|left, right| {
+            left.1
+                .delete_after_unix_ms
+                .cmp(&right.1.delete_after_unix_ms)
+                .then_with(|| left.1.object_key.cmp(&right.1.object_key))
+        });
+        Ok(records)
     }
 
     fn delete_compaction_queue_entries<'a>(
@@ -1002,6 +1107,16 @@ where
             &rows,
             object_compression.unwrap_or(ParquetCompression::None),
         )?;
+        if bytes.len() as u64 > candidate.max_output_object_bytes {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                format!(
+                    "compaction output object {} bytes exceeds max_output_object_bytes {}",
+                    bytes.len(),
+                    candidate.max_output_object_bytes
+                ),
+            ));
+        }
         let checksum = checksum_hex(&bytes);
         let object_key = compacted_object_key(candidate, &checksum);
         let data_object = StorageDataObject {
@@ -1386,7 +1501,6 @@ struct CompactionOperationBudget {
     used_gets: usize,
     used_puts: usize,
     used_deletes: usize,
-    delete_source_objects: bool,
 }
 
 impl CompactionOperationBudget {
@@ -1398,20 +1512,19 @@ impl CompactionOperationBudget {
             used_gets: 0,
             used_puts: 0,
             used_deletes: 0,
-            delete_source_objects: config.delete_source_objects,
         }
     }
 
-    fn can_process_candidate(&self, candidate: &CompactionCandidate, source_gets: usize) -> bool {
+    fn can_process_candidate(
+        &self,
+        candidate: &CompactionCandidate,
+        source_gets: usize,
+        manifest_segment_deletes: usize,
+    ) -> bool {
+        let _ = candidate;
         self.remaining_gets() >= source_gets
             && self.remaining_puts() >= 2
-            && (!self.delete_source_objects
-                || self.max_deletes == 0
-                || self.remaining_deletes() >= candidate.object_keys.len())
-    }
-
-    fn can_delete_sources(&self, source_deletes: usize) -> bool {
-        self.remaining_deletes() >= source_deletes
+            && self.remaining_deletes() >= manifest_segment_deletes
     }
 
     fn record_gets(&mut self, count: usize) {
@@ -1456,12 +1569,42 @@ fn compaction_cursor_key(chain: &ChainIdentity) -> String {
     )
 }
 
+fn superseded_source_record_prefix(chain: &ChainIdentity) -> String {
+    format!(
+        "chains/{}/metadata/compaction-superseded-sources",
+        chain.key_prefix()
+    )
+}
+
+fn superseded_source_record_key(chain: &ChainIdentity, object_key: &str) -> String {
+    format!(
+        "{}/{}.json",
+        superseded_source_record_prefix(chain),
+        checksum_hex(object_key.as_bytes())
+    )
+}
+
 fn segment_compaction_cursor(next_segment_key: String) -> CompactionCursor {
     CompactionCursor {
         schema_version: 1,
         next_segment_key: Some(next_segment_key),
         legacy_entry_offset: None,
     }
+}
+
+fn legacy_cursor_after_rewritten_manifest(
+    cursor: Option<CompactionCursor>,
+    processed_candidates: usize,
+) -> Option<CompactionCursor> {
+    let cursor = cursor?;
+    if processed_candidates == 0 || cursor.legacy_entry_offset.is_none() {
+        return None;
+    }
+    Some(CompactionCursor {
+        schema_version: 1,
+        next_segment_key: None,
+        legacy_entry_offset: Some(0),
+    })
 }
 
 fn decode_manifest_object(key: &str, bytes: &[u8]) -> Result<Manifest, DatalensError> {
@@ -1483,6 +1626,18 @@ fn duration_millis(started: Instant) -> u64 {
 
 fn duration_millis_value(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX - 1)
+}
+
+fn unix_millis_now() -> Result<u64, DatalensError> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::Internal,
+                format!("system clock before unix epoch: {error}"),
+            )
+        })?;
+    Ok(duration.as_millis().try_into().unwrap_or(u64::MAX))
 }
 
 fn optional_latency(value: u64) -> Option<u64> {
@@ -1612,21 +1767,49 @@ fn compaction_candidates(
     for (key, mut entries) in groups {
         entries.sort_by_key(|entry| (entry.range.start(), entry.range.end()));
         let mut run = Vec::new();
+        let mut run_bytes = 0u64;
         for entry in entries {
-            if run.last().is_none_or(|last: &&ManifestEntry| {
-                entry.range.start() == last.range.end().saturating_add(1)
-            }) && run.len() < config.max_merge_ranges.max(2)
+            let entry_bytes = entry.object_size_bytes.unwrap_or(0);
+            if !run.is_empty()
+                && (!range_can_extend_run(&run, entry)
+                    || candidate_input_limit_reached(&run, run_bytes, entry_bytes, config))
             {
-                run.push(entry);
-            } else {
-                push_candidate(&mut candidates, &key, &run);
+                push_candidate(&mut candidates, &key, &run, config);
                 run.clear();
-                run.push(entry);
+                run_bytes = 0;
+            }
+            run.push(entry);
+            run_bytes = run_bytes.saturating_add(entry_bytes);
+            if run.len() >= 2 && run_bytes >= config.target_object_bytes {
+                push_candidate(&mut candidates, &key, &run, config);
+                run.clear();
+                run_bytes = 0;
             }
         }
-        push_candidate(&mut candidates, &key, &run);
+        push_candidate(&mut candidates, &key, &run, config);
     }
     candidates
+}
+
+fn range_can_extend_run(run: &[&ManifestEntry], entry: &ManifestEntry) -> bool {
+    run.last()
+        .is_some_and(|last| entry.range.start() == last.range.end().saturating_add(1))
+}
+
+fn candidate_input_limit_reached(
+    run: &[&ManifestEntry],
+    run_bytes: u64,
+    entry_bytes: u64,
+    config: MaintenanceCompactionConfig,
+) -> bool {
+    let max_objects = config.max_input_objects_per_candidate.max(2);
+    if run.len() >= max_objects {
+        return true;
+    }
+    let next_bytes = run_bytes.saturating_add(entry_bytes);
+    let max_input_bytes = config.max_input_bytes_per_candidate.max(1);
+    let max_output_bytes = config.max_output_object_bytes.max(1);
+    run.len() >= 2 && (next_bytes > max_input_bytes || next_bytes > max_output_bytes)
 }
 
 fn compaction_backlog_scopes(candidates: &[CompactionCandidate]) -> Vec<CompactionBacklogScope> {
@@ -1718,8 +1901,16 @@ fn push_candidate(
     candidates: &mut Vec<CompactionCandidate>,
     key: &CompactionKey,
     entries: &[&ManifestEntry],
+    config: MaintenanceCompactionConfig,
 ) {
     if entries.len() < 2 {
+        return;
+    }
+    let input_object_bytes = entries
+        .iter()
+        .filter_map(|entry| entry.object_size_bytes)
+        .fold(0u64, u64::saturating_add);
+    if input_object_bytes > config.max_output_object_bytes.max(1) {
         return;
     }
     let start = entries
@@ -1743,6 +1934,9 @@ fn push_candidate(
         object_encoding: key.object_encoding,
         range,
         entry_count: entries.len(),
+        input_object_bytes,
+        target_object_bytes: config.target_object_bytes,
+        max_output_object_bytes: config.max_output_object_bytes,
         object_keys: entries
             .iter()
             .filter_map(|entry| entry.object_key.clone())
@@ -1817,34 +2011,6 @@ where
             continue;
         };
         if candidate.shadows_segment(entry) && object_store.exists(object_key)? {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn stale_source_object_is_safe<S>(
-    entry: &ManifestEntry,
-    current_entries: &[ManifestEntry],
-    object_store: &S,
-) -> Result<bool, DatalensError>
-where
-    S: ObjectStore,
-{
-    let Some(source_object_key) = entry.object_key.as_deref() else {
-        return Ok(false);
-    };
-    if !object_store.exists(source_object_key)? {
-        return Ok(false);
-    }
-    for current_entry in current_entries {
-        let Some(current_object_key) = current_entry.object_key.as_deref() else {
-            continue;
-        };
-        if current_object_key == source_object_key {
-            return Ok(false);
-        }
-        if current_entry.shadows_segment(entry) && object_store.exists(current_object_key)? {
             return Ok(true);
         }
     }

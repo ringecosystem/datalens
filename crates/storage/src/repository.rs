@@ -1361,7 +1361,7 @@ where
             return Ok(false);
         }
 
-        self.publish_manifest_segment_unlocked(chain, entry, started)?;
+        self.publish_replacement_entry_unlocked(chain, entry, started)?;
         Ok(true)
     }
 
