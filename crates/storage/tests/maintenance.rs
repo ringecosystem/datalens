@@ -829,6 +829,53 @@ fn test_compaction_skips_candidate_when_overlapping_write_publishes_before_manif
 }
 
 #[test]
+fn test_maintenance_report_summarizes_compaction_backlog_by_chain_dataset_selector() {
+    let storage = LocalStorage::new(temp_storage_root("compaction-backlog-report"));
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 10, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 11, FinalityLevel::Safe);
+    let other_selector = DatasetSelector::try_other(
+        AdapterKey::try_new("test").expect("adapter key"),
+        "selector-b",
+        "selector-b",
+    )
+    .expect("selector");
+    write_block_object_with_selector(&storage, &chain, &other_selector, 12, FinalityLevel::Safe);
+
+    let report = storage.maintenance_report().expect("maintenance");
+
+    assert_eq!(report.compaction_backlog.small_object_count, 3);
+    assert!(report.compaction_backlog.small_object_bytes > 0);
+    assert_eq!(report.compaction_backlog.chains.len(), 1);
+    let chain_backlog = &report.compaction_backlog.chains[0];
+    assert_eq!(chain_backlog.chain, chain);
+    assert_eq!(chain_backlog.small_object_count, 3);
+    assert!(
+        chain_backlog.manifest_segment_count >= 3,
+        "each small write should leave an inspectable manifest segment before compaction"
+    );
+    assert_eq!(chain_backlog.datasets.len(), 1);
+    let dataset_backlog = &chain_backlog.datasets[0];
+    assert_eq!(dataset_backlog.dataset_key, DatasetKey::evm_blocks());
+    assert_eq!(dataset_backlog.small_object_count, 3);
+    assert_eq!(dataset_backlog.selectors.len(), 2);
+    assert!(
+        dataset_backlog
+            .selectors
+            .iter()
+            .any(|selector| selector.selector_canonical_key == "all"
+                && selector.small_object_count == 2)
+    );
+    assert!(
+        dataset_backlog
+            .selectors
+            .iter()
+            .any(|selector| selector.selector_canonical_key == "selector-b"
+                && selector.small_object_count == 1)
+    );
+}
+
+#[test]
 fn test_compaction_uses_configured_parquet_compression() {
     let storage = LocalStorage::new_with_config(
         temp_storage_root("compaction-zstd"),

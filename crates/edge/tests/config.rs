@@ -25,7 +25,7 @@ fn test_config_production_ethereum_rpc_pool_and_log_reliability() {
 }
 
 #[test]
-fn test_config_production_compaction_uses_conservative_rollout_defaults() {
+fn test_config_production_compaction_starts_with_controlled_backlog_drain_hold() {
     set_production_config_env();
 
     let config_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -34,15 +34,13 @@ fn test_config_production_compaction_uses_conservative_rollout_defaults() {
         .expect("production config path");
     let config = DatalensConfig::from_file(&config_path).expect("production config should parse");
 
-    assert!(config.storage.compaction.enabled);
-    assert!(!config.storage.compaction.cleanup_enabled);
-    assert!(!config.storage.compaction.delete_source_objects);
-    assert_eq!(config.storage.compaction.interval_ms, 10_000);
-    assert_eq!(config.storage.compaction.max_tick_duration_ms, 2_000);
+    assert!(!config.storage.compaction.enabled);
+    assert_eq!(config.storage.compaction.interval_ms, 300_000);
+    assert_eq!(config.storage.compaction.max_tick_duration_ms, 5_000);
     assert_eq!(config.storage.compaction.max_candidates_per_tick, 1);
     assert_eq!(
         config.storage.compaction.max_manifest_entries_per_tick,
-        2_000
+        1_000
     );
     assert_eq!(config.storage.compaction.target_object_bytes, 67_108_864);
     assert_eq!(
@@ -57,6 +55,8 @@ fn test_config_production_compaction_uses_conservative_rollout_defaults() {
         config.storage.compaction.max_input_bytes_per_candidate,
         134_217_728
     );
+    assert!(!config.storage.compaction.cleanup_enabled);
+    assert!(config.storage.compaction.delete_source_objects);
     assert_eq!(config.query.metadata.worker_threads, 2);
     assert_eq!(config.query.metadata.queue_capacity, 1024);
     assert_eq!(config.query.metadata.coalesced_capacity, 256);
