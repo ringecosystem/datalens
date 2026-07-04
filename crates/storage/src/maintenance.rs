@@ -14,10 +14,10 @@ use datalens_core::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    DurableStorage, Manifest, ManifestEntry, ManifestFinalityLevel, ObjectEncoding, ObjectStore,
-    ParquetCompression, StorageDataObject, checksum_hex, compaction_queue, decode_object_rows,
-    encode_object_rows, manifest_key, manifest_segment_prefix, range_kind_key, unix_seconds_now,
-    verify_manifest_object_metadata,
+    DurableStorage, Manifest, ManifestEntry, ManifestFinalityLevel, ObjectEncoding, ObjectMetadata,
+    ObjectStore, ParquetCompression, StorageDataObject, checksum_hex, compaction_queue,
+    decode_object_rows, encode_object_rows, manifest_key, manifest_segment_prefix, range_kind_key,
+    unix_seconds_now, verify_manifest_object_metadata,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -26,6 +26,7 @@ pub struct MaintenanceReport {
     pub mode: MaintenanceOperationMode,
     pub operations: Vec<MaintenanceOperation>,
     pub check: MaintenanceCheckReport,
+    pub compaction_backlog: MaintenanceCompactionBacklogReport,
     pub compaction: MaintenanceCompactionReport,
     pub compaction_reconciliation: MaintenanceCompactionReconciliationReport,
     pub retention: MaintenanceRetentionReport,
@@ -82,6 +83,40 @@ pub enum MaintenanceIssueKind {
     UnknownChecksumAlgorithm,
     ObjectDecodeFailure,
     ContradictoryCoverage,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MaintenanceCompactionBacklogReport {
+    pub min_object_bytes: u64,
+    pub small_object_count: usize,
+    pub small_object_bytes: u64,
+    pub manifest_segment_count: usize,
+    pub chains: Vec<MaintenanceCompactionBacklogChain>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MaintenanceCompactionBacklogChain {
+    pub chain: ChainIdentity,
+    pub small_object_count: usize,
+    pub small_object_bytes: u64,
+    pub manifest_segment_count: usize,
+    pub datasets: Vec<MaintenanceCompactionBacklogDataset>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MaintenanceCompactionBacklogDataset {
+    pub dataset_key: DatasetKey,
+    pub small_object_count: usize,
+    pub small_object_bytes: u64,
+    pub selectors: Vec<MaintenanceCompactionBacklogSelector>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MaintenanceCompactionBacklogSelector {
+    pub selector_fingerprint: String,
+    pub selector_canonical_key: String,
+    pub small_object_count: usize,
+    pub small_object_bytes: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -349,13 +384,12 @@ where
         issues.extend(self.check_entries(&entries)?);
         issues.extend(contradictory_coverage_issues(&entries));
 
-        let candidates = compaction_candidates(&entries, MaintenanceCompactionConfig::default());
-        let compaction_reconciliation = self.compaction_reconciliation_report(
-            &entries,
-            &raw_entries,
-            MaintenanceCompactionConfig::default(),
-            true,
-        )?;
+        let compaction_config = MaintenanceCompactionConfig::default();
+        let candidates = compaction_candidates(&entries, compaction_config);
+        let compaction_backlog =
+            compaction_backlog_report(&entries, &raw_entries, &manifest_objects, compaction_config);
+        let compaction_reconciliation =
+            self.compaction_reconciliation_report(&entries, &raw_entries, compaction_config, true)?;
         let protected_current_objects = current_object_keys(&entries);
         let delete_candidates = self.retention_delete_candidates(&protected_current_objects)?;
 
@@ -373,6 +407,7 @@ where
                 issue_count: issues.len(),
                 issues,
             },
+            compaction_backlog,
             compaction: MaintenanceCompactionReport {
                 read_only: true,
                 candidate_count: candidates.len(),
@@ -1791,6 +1826,188 @@ fn compaction_candidates(
     candidates
 }
 
+fn compaction_backlog_report(
+    entries: &[ManifestEntry],
+    raw_entries: &[ManifestEntry],
+    manifest_objects: &[ObjectMetadata],
+    config: MaintenanceCompactionConfig,
+) -> MaintenanceCompactionBacklogReport {
+    let mut chains = Vec::<(ChainIdentity, BacklogChainAccumulator)>::new();
+    for entry in raw_entries {
+        if chains.iter().all(|(chain, _)| chain != &entry.chain) {
+            chains.push((entry.chain.clone(), BacklogChainAccumulator::default()));
+        }
+    }
+    for entry in entries {
+        let Some(object_key) = entry.object_key.as_ref() else {
+            continue;
+        };
+        if object_key.is_empty()
+            || entry
+                .object_size_bytes
+                .is_some_and(|size| size >= config.min_object_bytes)
+        {
+            continue;
+        }
+        if let Some((_, accumulator)) = chains.iter_mut().find(|(chain, _)| chain == &entry.chain) {
+            accumulator.add_entry(entry);
+        } else {
+            let mut accumulator = BacklogChainAccumulator::default();
+            accumulator.add_entry(entry);
+            chains.push((entry.chain.clone(), accumulator));
+        }
+    }
+
+    for object in manifest_objects {
+        if !is_manifest_segment_object(&object.key) {
+            continue;
+        }
+        for (chain, accumulator) in &mut chains {
+            if object
+                .key
+                .starts_with(&format!("chains/{}/manifest-segments/", chain.key_prefix()))
+            {
+                accumulator.manifest_segment_count += 1;
+                break;
+            }
+        }
+    }
+
+    let mut chain_reports = chains
+        .into_iter()
+        .map(|(chain, accumulator)| accumulator.into_report(chain))
+        .collect::<Vec<_>>();
+    chain_reports.sort_by_key(|chain| chain.chain.key_prefix());
+
+    MaintenanceCompactionBacklogReport {
+        min_object_bytes: config.min_object_bytes,
+        small_object_count: chain_reports
+            .iter()
+            .map(|chain| chain.small_object_count)
+            .sum(),
+        small_object_bytes: chain_reports
+            .iter()
+            .map(|chain| chain.small_object_bytes)
+            .sum(),
+        manifest_segment_count: chain_reports
+            .iter()
+            .map(|chain| chain.manifest_segment_count)
+            .sum(),
+        chains: chain_reports,
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct BacklogChainAccumulator {
+    small_object_count: usize,
+    small_object_bytes: u64,
+    manifest_segment_count: usize,
+    datasets: Vec<(DatasetKey, BacklogDatasetAccumulator)>,
+}
+
+impl BacklogChainAccumulator {
+    fn add_entry(&mut self, entry: &ManifestEntry) {
+        let object_size_bytes = entry.object_size_bytes.unwrap_or(0);
+        self.small_object_count += 1;
+        self.small_object_bytes = self.small_object_bytes.saturating_add(object_size_bytes);
+        if let Some((_, accumulator)) = self
+            .datasets
+            .iter_mut()
+            .find(|(dataset_key, _)| dataset_key == &entry.dataset_key)
+        {
+            accumulator.add_entry(entry, object_size_bytes);
+        } else {
+            let mut accumulator = BacklogDatasetAccumulator::default();
+            accumulator.add_entry(entry, object_size_bytes);
+            self.datasets.push((entry.dataset_key.clone(), accumulator));
+        }
+    }
+
+    fn into_report(self, chain: ChainIdentity) -> MaintenanceCompactionBacklogChain {
+        MaintenanceCompactionBacklogChain {
+            chain,
+            small_object_count: self.small_object_count,
+            small_object_bytes: self.small_object_bytes,
+            manifest_segment_count: self.manifest_segment_count,
+            datasets: sorted_backlog_datasets(self.datasets),
+        }
+    }
+}
+
+fn sorted_backlog_datasets(
+    mut datasets: Vec<(DatasetKey, BacklogDatasetAccumulator)>,
+) -> Vec<MaintenanceCompactionBacklogDataset> {
+    datasets.sort_by_key(|(dataset_key, _)| dataset_key.as_str().to_owned());
+    datasets
+        .into_iter()
+        .map(|(dataset_key, accumulator)| accumulator.into_report(dataset_key))
+        .collect()
+}
+
+#[derive(Clone, Debug, Default)]
+struct BacklogDatasetAccumulator {
+    small_object_count: usize,
+    small_object_bytes: u64,
+    selectors: BTreeMap<(String, String), BacklogSelectorAccumulator>,
+}
+
+impl BacklogDatasetAccumulator {
+    fn add_entry(&mut self, entry: &ManifestEntry, object_size_bytes: u64) {
+        self.small_object_count += 1;
+        self.small_object_bytes = self.small_object_bytes.saturating_add(object_size_bytes);
+        self.selectors
+            .entry((
+                entry.selector_fingerprint.clone(),
+                entry.selector_canonical_key.clone(),
+            ))
+            .or_default()
+            .add_entry(object_size_bytes);
+    }
+
+    fn into_report(self, dataset_key: DatasetKey) -> MaintenanceCompactionBacklogDataset {
+        MaintenanceCompactionBacklogDataset {
+            dataset_key,
+            small_object_count: self.small_object_count,
+            small_object_bytes: self.small_object_bytes,
+            selectors: self
+                .selectors
+                .into_iter()
+                .map(
+                    |((selector_fingerprint, selector_canonical_key), accumulator)| {
+                        accumulator.into_report(selector_fingerprint, selector_canonical_key)
+                    },
+                )
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct BacklogSelectorAccumulator {
+    small_object_count: usize,
+    small_object_bytes: u64,
+}
+
+impl BacklogSelectorAccumulator {
+    fn add_entry(&mut self, object_size_bytes: u64) {
+        self.small_object_count += 1;
+        self.small_object_bytes = self.small_object_bytes.saturating_add(object_size_bytes);
+    }
+
+    fn into_report(
+        self,
+        selector_fingerprint: String,
+        selector_canonical_key: String,
+    ) -> MaintenanceCompactionBacklogSelector {
+        MaintenanceCompactionBacklogSelector {
+            selector_fingerprint,
+            selector_canonical_key,
+            small_object_count: self.small_object_count,
+            small_object_bytes: self.small_object_bytes,
+        }
+    }
+}
+
 fn range_can_extend_run(run: &[&ManifestEntry], entry: &ManifestEntry) -> bool {
     run.last()
         .is_some_and(|last| entry.range.start() == last.range.end().saturating_add(1))
@@ -2028,6 +2245,10 @@ fn is_data_object(object_key: &str) -> bool {
 fn is_manifest_object(object_key: &str) -> bool {
     object_key.ends_with("/manifest.json")
         || (object_key.contains("/manifest-segments/") && object_key.ends_with(".json"))
+}
+
+fn is_manifest_segment_object(object_key: &str) -> bool {
+    object_key.contains("/manifest-segments/") && object_key.ends_with(".json")
 }
 
 fn manifest_key_from_object_key(object_key: &str) -> String {

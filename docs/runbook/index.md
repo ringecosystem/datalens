@@ -24,6 +24,9 @@ outputs.
 - `compaction-performance-harness.md`: storage smoke harness for comparing compaction
   before/after and concurrent `read_rows`, `covered_ranges`, `write_rows` latency,
   error rate, and object-store-operation impact.
+- `compaction-production-backlog-drain.md`: staged production procedure for inventorying
+  and draining existing small-object and manifest-segment backlog under SLA and
+  object-store backpressure gates.
 - `application-integration-handbook.md`: handbook for building and operating
   SDK-based application indexers that call the shared Datalens service while owning their
   own business database, handlers, and checkpoints.

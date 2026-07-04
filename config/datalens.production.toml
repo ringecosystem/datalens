@@ -15,18 +15,18 @@ force_path_style = true
 compression = "zstd"
 
 [storage.compaction]
-enabled = true
-interval_ms = 10000
+enabled = false
+interval_ms = 300000
 min_object_bytes = 1048576
 target_object_bytes = 67108864
 max_output_object_bytes = 134217728
 max_input_objects_per_candidate = 512
 max_input_bytes_per_candidate = 134217728
-max_tick_duration_ms = 2000
+max_tick_duration_ms = 5000
 max_candidates_per_tick = 1
-max_manifest_entries_per_tick = 2000
+max_manifest_entries_per_tick = 1000
 cleanup_enabled = false
-delete_source_objects = false
+delete_source_objects = true
 
 [planner]
 max_query_range_blocks = 100000
