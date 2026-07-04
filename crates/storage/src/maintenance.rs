@@ -15,9 +15,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     DurableStorage, Manifest, ManifestEntry, ManifestFinalityLevel, ObjectEncoding, ObjectMetadata,
-    ObjectStore, ParquetCompression, StorageDataObject, checksum_hex, compaction_queue,
-    decode_object_rows, encode_object_rows, manifest_key, manifest_segment_prefix, range_kind_key,
-    unix_seconds_now, verify_manifest_object_metadata,
+    ObjectPutIfAbsentResult, ObjectStore, ParquetCompression, StorageDataObject, checksum_hex,
+    compaction_queue, decode_object_rows, encode_object_rows, manifest_key,
+    manifest_segment_prefix, range_kind_key, unix_seconds_now, verify_manifest_object_metadata,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1166,15 +1166,43 @@ where
             written_at_unix_seconds: unix_seconds_now()?,
         };
         let write_started = Instant::now();
-        self.object_store().put(&object_key, &bytes)?;
-        log::info!(
-            "storage compaction object write chain_key={} object_key={} object_bytes={} rows={} duration_ms={}",
-            candidate.chain.key_prefix(),
-            object_key,
-            bytes.len(),
-            rows.row_count(),
-            write_started.elapsed().as_millis()
-        );
+        match self.object_store().get_optional(&object_key)? {
+            Some(existing) => {
+                verify_existing_compacted_object(candidate, &data_object, &existing)?;
+                log::info!(
+                    "storage compaction object reuse chain_key={} object_key={} object_bytes={} rows={} duration_ms={}",
+                    candidate.chain.key_prefix(),
+                    object_key,
+                    bytes.len(),
+                    rows.row_count(),
+                    write_started.elapsed().as_millis()
+                );
+            }
+            None => match self.object_store().put_if_absent(&object_key, &bytes)? {
+                ObjectPutIfAbsentResult::Created => {
+                    log::info!(
+                        "storage compaction object write chain_key={} object_key={} object_bytes={} rows={} duration_ms={}",
+                        candidate.chain.key_prefix(),
+                        object_key,
+                        bytes.len(),
+                        rows.row_count(),
+                        write_started.elapsed().as_millis()
+                    );
+                }
+                ObjectPutIfAbsentResult::AlreadyExists => {
+                    let existing = self.object_store().get(&object_key)?;
+                    verify_existing_compacted_object(candidate, &data_object, &existing)?;
+                    log::info!(
+                        "storage compaction object reuse chain_key={} object_key={} object_bytes={} rows={} duration_ms={}",
+                        candidate.chain.key_prefix(),
+                        object_key,
+                        bytes.len(),
+                        rows.row_count(),
+                        write_started.elapsed().as_millis()
+                    );
+                }
+            },
+        }
         Ok(CompactedObject {
             row_count: rows.row_count(),
             entry: ManifestEntry {
@@ -2277,6 +2305,98 @@ fn compacted_object_key(candidate: &CompactionCandidate, checksum: &str) -> Stri
         checksum_prefix,
         candidate.object_encoding.extension(),
     )
+}
+
+fn verify_existing_compacted_object(
+    candidate: &CompactionCandidate,
+    data_object: &StorageDataObject,
+    bytes: &[u8],
+) -> Result<(), DatalensError> {
+    if data_object.object_encoding != candidate.object_encoding {
+        return Err(DatalensError::new(
+            DatalensErrorKind::StorageWriteFailure,
+            format!(
+                "existing compacted object {} encoding metadata differs",
+                data_object.object_key
+            ),
+        ));
+    }
+    match (data_object.object_encoding, data_object.object_compression) {
+        (ObjectEncoding::Json, None) | (ObjectEncoding::ParquetV1, Some(_)) => {}
+        _ => {
+            return Err(DatalensError::new(
+                DatalensErrorKind::StorageWriteFailure,
+                format!(
+                    "existing compacted object {} compression metadata is incompatible",
+                    data_object.object_key
+                ),
+            ));
+        }
+    }
+    if data_object.checksum_algorithm != "sha256" {
+        return Err(DatalensError::new(
+            DatalensErrorKind::StorageWriteFailure,
+            format!(
+                "existing compacted object {} checksum algorithm {} is unsupported",
+                data_object.object_key, data_object.checksum_algorithm
+            ),
+        ));
+    }
+    let actual_size = bytes.len() as u64;
+    if actual_size != data_object.object_size_bytes {
+        return Err(DatalensError::new(
+            DatalensErrorKind::StorageWriteFailure,
+            format!(
+                "existing compacted object {} size mismatch: expected {} bytes, got {} bytes",
+                data_object.object_key, data_object.object_size_bytes, actual_size
+            ),
+        ));
+    }
+    let actual_checksum = checksum_hex(bytes);
+    if actual_checksum != data_object.checksum {
+        return Err(DatalensError::new(
+            DatalensErrorKind::StorageWriteFailure,
+            format!(
+                "existing compacted object {} checksum mismatch for sha256",
+                data_object.object_key
+            ),
+        ));
+    }
+    let decoded = decode_object_rows(
+        data_object.object_encoding,
+        candidate.dataset_key.clone(),
+        bytes,
+    )
+    .map_err(|error| {
+        DatalensError::new(
+            DatalensErrorKind::StorageWriteFailure,
+            format!(
+                "decode existing compacted object {}: {}",
+                data_object.object_key, error.message
+            ),
+        )
+    })?;
+    if decoded.dataset_key() != &candidate.dataset_key {
+        return Err(DatalensError::new(
+            DatalensErrorKind::StorageWriteFailure,
+            format!(
+                "existing compacted object {} dataset key mismatch",
+                data_object.object_key
+            ),
+        ));
+    }
+    if decoded.row_count() != data_object.row_count {
+        return Err(DatalensError::new(
+            DatalensErrorKind::StorageWriteFailure,
+            format!(
+                "existing compacted object {} row count mismatch: expected {}, got {}",
+                data_object.object_key,
+                data_object.row_count,
+                decoded.row_count()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -2,7 +2,8 @@ use std::path::PathBuf;
 
 use datalens_core::DatalensErrorKind;
 use datalens_storage::{
-    LocalObjectStore, ObjectStore, S3ObjectStore, S3ObjectStoreConfig, validate_object_key,
+    LocalObjectStore, ObjectPutIfAbsentResult, ObjectStore, S3ObjectStore, S3ObjectStoreConfig,
+    validate_object_key,
 };
 
 mod support;
@@ -66,6 +67,27 @@ fn test_local_object_store_put_get_exists_list_delete() {
             .exists("chains/ethereum/manifest.json")
             .expect("exists")
     );
+}
+
+#[test]
+fn test_local_object_store_put_if_absent_creates_once_without_overwrite() {
+    let store = LocalObjectStore::new(temp_storage_root("local-put-if-absent"));
+    let key = "chains/ethereum/compacted/object.parquet";
+
+    assert_eq!(
+        store
+            .put_if_absent(key, b"first")
+            .expect("create absent object"),
+        ObjectPutIfAbsentResult::Created
+    );
+    assert_eq!(
+        store
+            .put_if_absent(key, b"second")
+            .expect("keep existing object"),
+        ObjectPutIfAbsentResult::AlreadyExists
+    );
+
+    assert_eq!(store.get(key).expect("read existing object"), b"first");
 }
 
 #[test]
@@ -149,6 +171,12 @@ fn test_counting_object_store_records_operation_counts() {
 
     store.put(key, b"first").expect("put object");
     store.put(key, b"second").expect("put object again");
+    assert_eq!(
+        store
+            .put_if_absent(key, b"third")
+            .expect("conditional create existing object"),
+        ObjectPutIfAbsentResult::AlreadyExists
+    );
     store.get(key).expect("get object");
     store.list("coverage-index-v2/delta").expect("list objects");
     store
@@ -157,6 +185,7 @@ fn test_counting_object_store_records_operation_counts() {
     store.delete(key).expect("delete object");
 
     assert_eq!(store.put_count(key), 2);
+    assert_eq!(store.put_if_absent_count(key), 1);
     assert_eq!(store.get_count(key), 1);
     assert_eq!(store.list_count("coverage-index-v2/delta"), 1);
     assert_eq!(store.list_page_count("coverage-index-v2/delta"), 1);
@@ -275,6 +304,31 @@ fn test_s3_object_store_put_get_exists_list_delete_with_prefix() {
     store.delete(manifest_key).expect("delete manifest");
     assert!(!store.exists(manifest_key).expect("manifest deleted"));
     store.delete(block_key).expect("delete rows");
+}
+
+#[test]
+fn test_s3_object_store_put_if_absent_creates_once_without_overwrite() {
+    let Some(config) = s3_test_config() else {
+        return;
+    };
+    let store = S3ObjectStore::from_config(config).expect("build S3 object store");
+    let key = "chains/ethereum/compacted/conditional-create.parquet";
+
+    assert_eq!(
+        store
+            .put_if_absent(key, b"first")
+            .expect("create absent object"),
+        ObjectPutIfAbsentResult::Created
+    );
+    assert_eq!(
+        store
+            .put_if_absent(key, b"second")
+            .expect("keep existing object"),
+        ObjectPutIfAbsentResult::AlreadyExists
+    );
+    assert_eq!(store.get(key).expect("read existing object"), b"first");
+
+    store.delete(key).expect("delete object");
 }
 
 fn temp_storage_root(name: &str) -> PathBuf {

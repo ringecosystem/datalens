@@ -10,8 +10,8 @@ use datalens_core::{
     QueryRows,
 };
 use datalens_storage::{
-    DurableStorage, LocalObjectStore, Manifest, ObjectListPage, ObjectMetadata, ObjectStore,
-    ReadThroughCacheConfig, StorageWriteRequest,
+    DurableStorage, LocalObjectStore, Manifest, ObjectListPage, ObjectMetadata,
+    ObjectPutIfAbsentResult, ObjectStore, ReadThroughCacheConfig, StorageWriteRequest,
 };
 
 #[derive(Clone, Debug)]
@@ -61,6 +61,14 @@ impl ObjectStore for CountingObjectStore {
 
     fn put(&self, key: &str, bytes: &[u8]) -> Result<(), datalens_core::DatalensError> {
         self.inner.put(key, bytes)
+    }
+
+    fn put_if_absent(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<ObjectPutIfAbsentResult, datalens_core::DatalensError> {
+        self.inner.put_if_absent(key, bytes)
     }
 
     fn exists(&self, key: &str) -> Result<bool, datalens_core::DatalensError> {

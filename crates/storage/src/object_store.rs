@@ -36,6 +36,12 @@ pub struct ObjectLockLease {
     pub owner: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObjectPutIfAbsentResult {
+    Created,
+    AlreadyExists,
+}
+
 pub trait ObjectStore: Clone + Send + Sync {
     fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError>;
     fn get_optional(&self, key: &str) -> Result<Option<Vec<u8>>, DatalensError> {
@@ -46,6 +52,11 @@ pub trait ObjectStore: Clone + Send + Sync {
         }
     }
     fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError>;
+    fn put_if_absent(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<ObjectPutIfAbsentResult, DatalensError>;
     fn exists(&self, key: &str) -> Result<bool, DatalensError>;
     fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError>;
     fn list_page(
@@ -210,6 +221,46 @@ impl ObjectStore for LocalObjectStore {
                 format!("finalize object {}: {error}", path.display()),
             )
         })
+    }
+
+    fn put_if_absent(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<ObjectPutIfAbsentResult, DatalensError> {
+        let path = self.path(key)?;
+        let parent = path.parent().ok_or_else(|| {
+            DatalensError::new(
+                DatalensErrorKind::StorageWriteFailure,
+                format!("object {key} has no parent directory"),
+            )
+        })?;
+        fs::create_dir_all(parent).map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::StorageWriteFailure,
+                format!("create object directory {}: {error}", parent.display()),
+            )
+        })?;
+        let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Ok(ObjectPutIfAbsentResult::AlreadyExists);
+            }
+            Err(error) => {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::StorageWriteFailure,
+                    format!("create object {}: {error}", path.display()),
+                ));
+            }
+        };
+        if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+            let _ = fs::remove_file(&path);
+            return Err(DatalensError::new(
+                DatalensErrorKind::StorageWriteFailure,
+                format!("write object {}: {error}", path.display()),
+            ));
+        }
+        Ok(ObjectPutIfAbsentResult::Created)
     }
 
     fn exists(&self, key: &str) -> Result<bool, DatalensError> {
@@ -831,6 +882,39 @@ impl ObjectStore for S3ObjectStore {
                 })?;
             Ok(())
         })
+    }
+
+    fn put_if_absent(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<ObjectPutIfAbsentResult, DatalensError> {
+        let key = self.key(key)?;
+        let log_key = key.clone();
+        let bytes = bytes.to_vec();
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        self.runtime
+            .block_on_operation("put_if_absent", log_key, async move {
+                match client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .if_none_match("*")
+                    .body(ByteStream::from(bytes))
+                    .send()
+                    .await
+                {
+                    Ok(_) => Ok(ObjectPutIfAbsentResult::Created),
+                    Err(error) if service_error_code(&error).is_some_and(is_precondition_code) => {
+                        Ok(ObjectPutIfAbsentResult::AlreadyExists)
+                    }
+                    Err(error) => Err(DatalensError::new(
+                        DatalensErrorKind::StorageWriteFailure,
+                        format!("S3 put object if absent {key}: {error}"),
+                    )),
+                }
+            })
     }
 
     fn exists(&self, key: &str) -> Result<bool, DatalensError> {

@@ -4,7 +4,7 @@ use std::{
 };
 
 use datalens_core::DatalensError;
-use datalens_storage::{ObjectListPage, ObjectMetadata, ObjectStore};
+use datalens_storage::{ObjectListPage, ObjectMetadata, ObjectPutIfAbsentResult, ObjectStore};
 
 #[derive(Clone, Debug)]
 pub struct CountingObjectStore<S> {
@@ -16,11 +16,13 @@ pub struct CountingObjectStore<S> {
 struct ObjectStoreCounts {
     gets: BTreeMap<String, usize>,
     puts: BTreeMap<String, usize>,
+    put_if_absents: BTreeMap<String, usize>,
     lists: BTreeMap<String, usize>,
     list_pages: BTreeMap<String, usize>,
     deletes: BTreeMap<String, usize>,
 }
 
+#[allow(dead_code)]
 impl<S> CountingObjectStore<S> {
     pub fn new(inner: S) -> Self {
         Self {
@@ -35,6 +37,10 @@ impl<S> CountingObjectStore<S> {
 
     pub fn put_count(&self, key: &str) -> usize {
         self.count_for(|counts| &counts.puts, key)
+    }
+
+    pub fn put_if_absent_count(&self, key: &str) -> usize {
+        self.count_for(|counts| &counts.put_if_absents, key)
     }
 
     pub fn list_count(&self, prefix: &str) -> usize {
@@ -118,6 +124,15 @@ impl<S: ObjectStore> ObjectStore for CountingObjectStore<S> {
     fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
         self.record(|counts| &mut counts.puts, key);
         self.inner.put(key, bytes)
+    }
+
+    fn put_if_absent(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<ObjectPutIfAbsentResult, DatalensError> {
+        self.record(|counts| &mut counts.put_if_absents, key);
+        self.inner.put_if_absent(key, bytes)
     }
 
     fn exists(&self, key: &str) -> Result<bool, DatalensError> {
