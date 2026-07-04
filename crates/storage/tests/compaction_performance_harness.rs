@@ -403,7 +403,7 @@ fn run_compaction_performance_harness(
     mut compaction_config: MaintenanceCompactionConfig,
 ) -> Result<HarnessReport, DatalensError> {
     compaction_config.min_object_bytes = u64::MAX;
-    compaction_config.max_merge_ranges = config.small_object_count as usize;
+    compaction_config.max_input_objects_per_candidate = config.small_object_count as usize;
     compaction_config.max_candidates_per_tick = 1;
     compaction_config.max_tick_duration_ms = 30_000;
     compaction_config.max_manifest_entries_per_tick = 50_000;

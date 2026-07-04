@@ -44,7 +44,19 @@ fn test_config_production_compaction_uses_conservative_rollout_defaults() {
         config.storage.compaction.max_manifest_entries_per_tick,
         2_000
     );
-    assert_eq!(config.storage.compaction.max_merge_ranges, 4);
+    assert_eq!(config.storage.compaction.target_object_bytes, 67_108_864);
+    assert_eq!(
+        config.storage.compaction.max_output_object_bytes,
+        134_217_728
+    );
+    assert_eq!(
+        config.storage.compaction.max_input_objects_per_candidate,
+        512
+    );
+    assert_eq!(
+        config.storage.compaction.max_input_bytes_per_candidate,
+        134_217_728
+    );
     assert_eq!(config.query.metadata.worker_threads, 2);
     assert_eq!(config.query.metadata.queue_capacity, 1024);
     assert_eq!(config.query.metadata.coalesced_capacity, 256);
