@@ -284,6 +284,10 @@ impl ObjectStore for InstrumentedObjectStore {
             self.pauses
                 .pause_if_enabled(CompactionPhase::PublishingReplacement);
         }
+        if self.should_pause_key(key) && key.contains("/metadata/compaction-superseded-sources/") {
+            self.pauses
+                .pause_if_enabled(CompactionPhase::RecordingSupersededSources);
+        }
         self.inner.put(key, bytes)
     }
 
@@ -309,11 +313,6 @@ impl ObjectStore for InstrumentedObjectStore {
 
     fn delete(&self, key: &str) -> Result<(), DatalensError> {
         self.counters.delete.fetch_add(1, Ordering::SeqCst);
-        if self.should_pause_key(key) && key.contains("/datasets/") && !key.contains("/compacted/")
-        {
-            self.pauses
-                .pause_if_enabled(CompactionPhase::CleaningSources);
-        }
         self.inner.delete(key)
     }
 
@@ -327,7 +326,7 @@ enum CompactionPhase {
     ReadingSources,
     WritingCompactedObject,
     PublishingReplacement,
-    CleaningSources,
+    RecordingSupersededSources,
 }
 
 impl CompactionPhase {
@@ -336,7 +335,7 @@ impl CompactionPhase {
             Self::ReadingSources => "reading_sources",
             Self::WritingCompactedObject => "writing_compacted_object",
             Self::PublishingReplacement => "publishing_replacement",
-            Self::CleaningSources => "cleaning_sources",
+            Self::RecordingSupersededSources => "recording_superseded_sources",
         }
     }
 }
@@ -482,7 +481,7 @@ fn run_concurrent_phase_harness(
         CompactionPhase::ReadingSources,
         CompactionPhase::WritingCompactedObject,
         CompactionPhase::PublishingReplacement,
-        CompactionPhase::CleaningSources,
+        CompactionPhase::RecordingSupersededSources,
     ] {
         pauses.wait_for_phase(phase);
         let metrics = measure_workload(
@@ -627,7 +626,7 @@ fn phase_write_base(phase: CompactionPhase) -> u64 {
         CompactionPhase::ReadingSources => 30_000,
         CompactionPhase::WritingCompactedObject => 40_000,
         CompactionPhase::PublishingReplacement => 50_000,
-        CompactionPhase::CleaningSources => 60_000,
+        CompactionPhase::RecordingSupersededSources => 60_000,
     }
 }
 

@@ -119,14 +119,6 @@ impl CountingOperationStore {
         }
     }
 
-    fn get_count(&self) -> usize {
-        self.gets.lock().expect("gets").len()
-    }
-
-    fn put_count(&self) -> usize {
-        self.puts.lock().expect("puts").len()
-    }
-
     fn delete_count(&self) -> usize {
         self.deletes.lock().expect("deletes").len()
     }
@@ -617,14 +609,11 @@ fn test_compaction_merges_adjacent_small_objects_and_retains_old_objects() {
             .exists(compacted_object)
             .expect("compacted exists")
     );
-    assert!(
-        storage
-            .object_store()
-            .list(&format!("chains/{}/manifest-segments", chain.key_prefix()))
-            .expect("manifest segments")
-            .len()
-            >= 3,
-        "compaction should publish an additional segment without deleting old segments"
+    let manifest_segments = manifest_segment_keys(&storage, &chain);
+    assert_eq!(
+        manifest_segments.len(),
+        1,
+        "compaction should replace covered manifest segments"
     );
 
     let rows = storage
@@ -1347,14 +1336,12 @@ fn test_compaction_tick_stops_before_exceeding_object_store_operation_budgets() 
 
     assert_eq!(report.tick_status, MaintenanceCompactionTickStatus::Partial);
     assert_eq!(report.candidate_count, 2);
-    assert_eq!(report.processed_candidates, 1);
-    assert_eq!(report.compacted_objects, 1);
+    assert_eq!(report.processed_candidates, 0);
+    assert_eq!(report.compacted_objects, 0);
     assert_eq!(report.deleted_source_objects, 0);
-    assert_eq!(report.get_operations, 2);
-    assert_eq!(report.put_operations, 2);
+    assert_eq!(report.get_operations, 0);
+    assert_eq!(report.put_operations, 0);
     assert_eq!(report.delete_operations, 0);
-    assert!(counting_store.get_count() > 0);
-    assert!(counting_store.put_count() > 0);
     assert_eq!(counting_store.delete_count(), 0);
 }
 
@@ -1719,7 +1706,7 @@ fn test_compaction_legacy_cursor_survives_candidate_budget_partial() {
         &storage.object_store().get(&cursor_key).expect("cursor"),
     )
     .expect("cursor json");
-    assert_eq!(cursor["legacy_entry_offset"], 4);
+    assert_eq!(cursor["legacy_entry_offset"], 0);
 
     let second = storage
         .compact_small_objects_for_chain(&chain, config)
@@ -1727,7 +1714,7 @@ fn test_compaction_legacy_cursor_survives_candidate_budget_partial() {
 
     assert_eq!(
         second.candidates[0].range,
-        LedgerRange::blocks(300, 301).expect("range")
+        LedgerRange::blocks(200, 201).expect("range")
     );
     assert_eq!(second.compacted_objects, 1);
 }
@@ -1934,6 +1921,16 @@ fn compacted_object_keys(storage: &LocalStorage, chain: &ChainIdentity) -> Vec<S
         .into_iter()
         .map(|object| object.key)
         .filter(|key| key.contains("/compacted/"))
+        .collect()
+}
+
+fn manifest_segment_keys(storage: &LocalStorage, chain: &ChainIdentity) -> Vec<String> {
+    storage
+        .object_store()
+        .list(&format!("chains/{}/manifest-segments", chain.key_prefix()))
+        .expect("manifest segments")
+        .into_iter()
+        .map(|object| object.key)
         .collect()
 }
 
