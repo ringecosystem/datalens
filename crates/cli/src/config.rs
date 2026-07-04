@@ -164,6 +164,17 @@ pub fn validate_config(config: &DatalensConfig) -> Result<(), DatalensError> {
                 "storage.compaction.max_puts_per_tick must be at least two when compaction is enabled",
             ));
         }
+        if config
+            .storage
+            .compaction
+            .coverage_index_v2_delta_count_threshold
+            == 0
+        {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                "storage.compaction.coverage_index_v2_delta_count_threshold must be greater than zero when compaction is enabled",
+            ));
+        }
         if config.storage.compaction.leader_lock_ttl_ms == 0 {
             return Err(DatalensError::new(
                 DatalensErrorKind::InvalidInput,

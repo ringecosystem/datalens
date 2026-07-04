@@ -16,8 +16,16 @@ use serde::{Deserialize, Serialize};
 use crate::{
     DurableStorage, Manifest, ManifestEntry, ManifestFinalityLevel, ObjectEncoding, ObjectMetadata,
     ObjectPutIfAbsentResult, ObjectStore, ParquetCompression, StorageDataObject, checksum_hex,
-    compaction_queue, decode_object_rows, encode_object_rows, manifest_key,
-    manifest_segment_prefix, range_kind_key, unix_seconds_now, verify_manifest_object_metadata,
+    compaction_queue,
+    coverage_index::{
+        CoverageIndexV2CleanupRecord, CoverageIndexV2CleanupRecordObject,
+        list_v2_cleanup_records_for_chain, list_v2_delta_buckets_for_chain,
+        prepare_v2_bucket_compaction, unix_ms_now as coverage_index_v2_unix_ms_now,
+        v2_cleanup_record_is_safe_to_delete, v2_snapshot_cleanup_records_for_bucket,
+        write_v2_cleanup_record, write_v2_snapshot, write_v2_snapshot_head,
+    },
+    decode_object_rows, encode_object_rows, manifest_key, manifest_segment_prefix, range_kind_key,
+    unix_seconds_now, verify_manifest_object_metadata,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -139,6 +147,18 @@ pub struct MaintenanceCompactionReport {
     pub get_operations: usize,
     pub put_operations: usize,
     pub delete_operations: usize,
+    #[serde(default)]
+    pub coverage_index_v2_compacted_buckets: usize,
+    #[serde(default)]
+    pub coverage_index_v2_compacted_deltas: usize,
+    #[serde(default)]
+    pub coverage_index_v2_input_delta_bytes: u64,
+    #[serde(default)]
+    pub coverage_index_v2_cleanup_records: usize,
+    #[serde(default)]
+    pub coverage_index_v2_deleted_deltas: usize,
+    #[serde(default)]
+    pub coverage_index_v2_delta_delete_failures: usize,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -223,6 +243,8 @@ pub struct MaintenanceCompactionConfig {
     pub cleanup_enabled: bool,
     pub delete_source_objects: bool,
     pub source_delete_grace_ms: u64,
+    pub coverage_index_v2_delta_count_threshold: usize,
+    pub coverage_index_v2_delete_grace_ms: u64,
 }
 
 impl Default for MaintenanceCompactionConfig {
@@ -247,6 +269,8 @@ impl Default for MaintenanceCompactionConfig {
             cleanup_enabled: false,
             delete_source_objects: false,
             source_delete_grace_ms: 300_000,
+            coverage_index_v2_delta_count_threshold: 64,
+            coverage_index_v2_delete_grace_ms: 300_000,
         }
     }
 }
@@ -426,6 +450,12 @@ where
                 get_operations: 0,
                 put_operations: 0,
                 delete_operations: 0,
+                coverage_index_v2_compacted_buckets: 0,
+                coverage_index_v2_compacted_deltas: 0,
+                coverage_index_v2_input_delta_bytes: 0,
+                coverage_index_v2_cleanup_records: 0,
+                coverage_index_v2_deleted_deltas: 0,
+                coverage_index_v2_delta_delete_failures: 0,
             },
             compaction_reconciliation,
             retention: MaintenanceRetentionReport {
@@ -464,7 +494,15 @@ where
                 entry,
             })
             .collect::<Vec<_>>();
-        self.compact_selected_manifest_entries(entries, config, started, None, false, &|| Ok(()))
+        self.compact_selected_manifest_entries(CompactSelectedManifestEntriesArgs {
+            entries,
+            config,
+            started,
+            cursor: None,
+            scan_partial: false,
+            chain: None,
+            checkpoint: &|| Ok(()),
+        })
     }
 
     pub fn compact_small_objects_for_chain(
@@ -490,14 +528,16 @@ where
             config.max_manifest_entries_per_tick
         );
         let scan = self.scan_compaction_manifest_entries(chain, config, started)?;
-        let report = self.compact_selected_manifest_entries(
-            scan.entries,
-            config,
-            started,
-            Some(scan.cursor_update),
-            scan.partial,
-            &checkpoint,
-        )?;
+        let report =
+            self.compact_selected_manifest_entries(CompactSelectedManifestEntriesArgs {
+                entries: scan.entries,
+                config,
+                started,
+                cursor: Some(scan.cursor_update),
+                scan_partial: scan.partial,
+                chain: Some(chain),
+                checkpoint: &checkpoint,
+            })?;
         Ok(report)
     }
 
@@ -608,13 +648,17 @@ where
 
     fn compact_selected_manifest_entries(
         &self,
-        entries: Vec<SelectedManifestEntry>,
-        config: MaintenanceCompactionConfig,
-        started: Instant,
-        cursor: Option<CompactionCursorUpdate>,
-        scan_partial: bool,
-        checkpoint: &dyn Fn() -> Result<(), DatalensError>,
+        args: CompactSelectedManifestEntriesArgs<'_>,
     ) -> Result<MaintenanceCompactionReport, DatalensError> {
+        let CompactSelectedManifestEntriesArgs {
+            entries,
+            config,
+            started,
+            cursor,
+            scan_partial,
+            chain,
+            checkpoint,
+        } = args;
         let build_started = Instant::now();
         let manifest_entries = entries
             .iter()
@@ -656,6 +700,12 @@ where
                 get_operations: 0,
                 put_operations: 0,
                 delete_operations: 0,
+                coverage_index_v2_compacted_buckets: 0,
+                coverage_index_v2_compacted_deltas: 0,
+                coverage_index_v2_input_delta_bytes: 0,
+                coverage_index_v2_cleanup_records: 0,
+                coverage_index_v2_deleted_deltas: 0,
+                coverage_index_v2_delta_delete_failures: 0,
             });
         }
         let mut compacted_objects = 0usize;
@@ -673,6 +723,7 @@ where
         let max_duration = Duration::from_millis(config.max_tick_duration_ms.max(1));
         let mut partial = scan_partial;
         let mut operation_budget = CompactionOperationBudget::new(config);
+        let mut coverage_index_v2_report = CoverageIndexV2CompactionReport::default();
 
         for candidate in &candidates {
             if processed_candidates >= max_candidates || started.elapsed() >= max_duration {
@@ -766,6 +817,15 @@ where
             );
         }
 
+        if config.cleanup_enabled || config.coverage_index_v2_delta_count_threshold > 0 {
+            coverage_index_v2_report = self.compact_coverage_index_v2_for_chain_inner(
+                chain,
+                config,
+                checkpoint,
+                &mut operation_budget,
+            )?;
+        }
+
         if let Some(cursor) = cursor {
             let legacy_next_key = legacy_cursor_after_rewritten_manifest(
                 cursor.scope_cursor_advance.clone(),
@@ -835,6 +895,12 @@ where
             get_operations: operation_budget.used_gets,
             put_operations: operation_budget.used_puts,
             delete_operations: operation_budget.used_deletes,
+            coverage_index_v2_compacted_buckets: coverage_index_v2_report.compacted_buckets,
+            coverage_index_v2_compacted_deltas: coverage_index_v2_report.compacted_deltas,
+            coverage_index_v2_input_delta_bytes: coverage_index_v2_report.input_delta_bytes,
+            coverage_index_v2_cleanup_records: coverage_index_v2_report.cleanup_records,
+            coverage_index_v2_deleted_deltas: coverage_index_v2_report.deleted_deltas,
+            coverage_index_v2_delta_delete_failures: coverage_index_v2_report.delete_failures,
         })
     }
 
@@ -1087,6 +1153,232 @@ where
                     delete_failures += 1;
                     log::warn!(
                         "storage compaction queue entry delete failed chain_key={} object_key={} kind={:?} message={}",
+                        chain.key_prefix(),
+                        object_key,
+                        error.kind,
+                        error.message
+                    );
+                }
+            }
+        }
+        CompactionSourceCleanup {
+            deleted_objects,
+            delete_failures,
+        }
+    }
+
+    fn compact_coverage_index_v2_for_chain_inner(
+        &self,
+        chain: Option<&ChainIdentity>,
+        config: MaintenanceCompactionConfig,
+        checkpoint: &dyn Fn() -> Result<(), DatalensError>,
+        operation_budget: &mut CompactionOperationBudget,
+    ) -> Result<CoverageIndexV2CompactionReport, DatalensError> {
+        let Some(chain) = chain else {
+            return Ok(CoverageIndexV2CompactionReport::default());
+        };
+        let mut report = CoverageIndexV2CompactionReport::default();
+        let cleanup_records = list_v2_cleanup_records_for_chain(
+            self.object_store(),
+            chain,
+            config.coverage_index_v2_delete_grace_ms,
+            false,
+        )?;
+        let mut cleanup_snapshot_keys = cleanup_records
+            .iter()
+            .map(|object| object.record.snapshot_key.clone())
+            .collect::<BTreeSet<_>>();
+        let mut cleanup_delta_keys = cleanup_records
+            .iter()
+            .flat_map(|object| object.record.compacted_delta_keys.iter().cloned())
+            .collect::<BTreeSet<_>>();
+
+        for bucket in list_v2_delta_buckets_for_chain(self.object_store(), chain)? {
+            if config.cleanup_enabled && operation_budget.remaining_puts() > 0 {
+                for mut record in
+                    v2_snapshot_cleanup_records_for_bucket(self.object_store(), &bucket)?
+                {
+                    record
+                        .compacted_delta_keys
+                        .retain(|key| !cleanup_delta_keys.contains(key));
+                    if record.compacted_delta_keys.is_empty()
+                        || cleanup_snapshot_keys.contains(&record.snapshot_key)
+                        || operation_budget.remaining_puts() == 0
+                    {
+                        continue;
+                    }
+                    checkpoint()?;
+                    let snapshot_key = record.snapshot_key.clone();
+                    cleanup_delta_keys.extend(record.compacted_delta_keys.iter().cloned());
+                    write_v2_cleanup_record(self.object_store(), chain, record)?;
+                    operation_budget.record_puts(1);
+                    cleanup_snapshot_keys.insert(snapshot_key);
+                    report.cleanup_records += 1;
+                }
+            }
+            if operation_budget.remaining_gets()
+                < config.coverage_index_v2_delta_count_threshold.max(1)
+            {
+                break;
+            }
+            if operation_budget.remaining_puts() < 2 {
+                break;
+            }
+            if let Some(compaction) = prepare_v2_bucket_compaction(
+                self.object_store(),
+                &bucket,
+                config.coverage_index_v2_delta_count_threshold,
+                operation_budget.remaining_gets(),
+            )? {
+                checkpoint()?;
+                let snapshot_key = write_v2_snapshot(
+                    self.object_store(),
+                    chain,
+                    &compaction.bucket.scope,
+                    compaction.bucket.bucket_start,
+                    compaction.bucket.bucket_end,
+                    compaction.entries,
+                    compaction.compacted_delta_keys.clone(),
+                )?;
+                operation_budget.record_puts(1);
+                operation_budget.record_gets(compaction.newly_compacted_delta_keys.len());
+                checkpoint()?;
+                write_v2_snapshot_head(
+                    self.object_store(),
+                    chain,
+                    &compaction.bucket.scope,
+                    compaction.bucket.bucket_start,
+                    compaction.bucket.bucket_end,
+                    snapshot_key.clone(),
+                    compaction.included_delta_high_watermark,
+                )?;
+                operation_budget.record_puts(1);
+                report.compacted_buckets += 1;
+                report.compacted_deltas += compaction.newly_compacted_delta_keys.len();
+                report.input_delta_bytes = report
+                    .input_delta_bytes
+                    .saturating_add(compaction.input_delta_bytes);
+                if config.cleanup_enabled && operation_budget.remaining_puts() > 0 {
+                    let mut compacted_delta_keys = compaction.compacted_delta_keys;
+                    compacted_delta_keys.retain(|key| !cleanup_delta_keys.contains(key));
+                    if compacted_delta_keys.is_empty() {
+                        continue;
+                    }
+                    checkpoint()?;
+                    cleanup_delta_keys.extend(compacted_delta_keys.iter().cloned());
+                    write_v2_cleanup_record(
+                        self.object_store(),
+                        chain,
+                        CoverageIndexV2CleanupRecord {
+                            schema_version: 1,
+                            created_at_unix_ms: coverage_index_v2_unix_ms_now()?,
+                            scope: compaction.bucket.scope,
+                            bucket_start: compaction.bucket.bucket_start,
+                            bucket_end: compaction.bucket.bucket_end,
+                            compaction_id: snapshot_key
+                                .rsplit('/')
+                                .next()
+                                .unwrap_or("")
+                                .trim_end_matches(".json")
+                                .to_owned(),
+                            snapshot_key: snapshot_key.clone(),
+                            compacted_delta_keys,
+                        },
+                    )?;
+                    operation_budget.record_puts(1);
+                    cleanup_snapshot_keys.insert(snapshot_key);
+                    report.cleanup_records += 1;
+                }
+            }
+        }
+
+        if config.cleanup_enabled {
+            self.cleanup_coverage_index_v2_for_chain(
+                chain,
+                config,
+                checkpoint,
+                operation_budget,
+                &mut report,
+            )?;
+        }
+        Ok(report)
+    }
+
+    fn cleanup_coverage_index_v2_for_chain(
+        &self,
+        chain: &ChainIdentity,
+        config: MaintenanceCompactionConfig,
+        checkpoint: &dyn Fn() -> Result<(), DatalensError>,
+        operation_budget: &mut CompactionOperationBudget,
+        report: &mut CoverageIndexV2CompactionReport,
+    ) -> Result<(), DatalensError> {
+        let records = list_v2_cleanup_records_for_chain(
+            self.object_store(),
+            chain,
+            config.coverage_index_v2_delete_grace_ms,
+            true,
+        )?;
+        for record in records {
+            let required_deletes = record.record.compacted_delta_keys.len().saturating_add(1);
+            if operation_budget.remaining_deletes() < required_deletes {
+                break;
+            }
+            if !v2_cleanup_record_is_safe_to_delete(self.object_store(), chain, &record)? {
+                checkpoint()?;
+                self.object_store().delete(&record.key)?;
+                operation_budget.record_deletes(1);
+                continue;
+            }
+            let cleanup = self.delete_coverage_index_v2_cleanup_deltas(chain, &record, checkpoint);
+            operation_budget.record_deletes(cleanup.deleted_objects);
+            report.deleted_deltas = report
+                .deleted_deltas
+                .saturating_add(cleanup.deleted_objects);
+            report.delete_failures = report
+                .delete_failures
+                .saturating_add(cleanup.delete_failures);
+            if cleanup.delete_failures == 0 {
+                checkpoint()?;
+                self.object_store().delete(&record.key)?;
+                operation_budget.record_deletes(1);
+            }
+        }
+        Ok(())
+    }
+
+    fn delete_coverage_index_v2_cleanup_deltas(
+        &self,
+        chain: &ChainIdentity,
+        cleanup: &CoverageIndexV2CleanupRecordObject,
+        checkpoint: &dyn Fn() -> Result<(), DatalensError>,
+    ) -> CompactionSourceCleanup {
+        let mut deleted_objects = 0usize;
+        let mut delete_failures = 0usize;
+        for object_key in &cleanup.record.compacted_delta_keys {
+            if let Err(error) = checkpoint() {
+                delete_failures += 1;
+                log::warn!(
+                    "storage coverage index v2 cleanup checkpoint failed chain_key={} object_key={} kind={:?} message={}",
+                    chain.key_prefix(),
+                    object_key,
+                    error.kind,
+                    error.message
+                );
+                break;
+            }
+            match self.object_store().delete(object_key) {
+                Ok(()) => {
+                    deleted_objects += 1;
+                    log::info!(
+                        "storage coverage index v2 delta deleted chain_key={} object_key={}",
+                        chain.key_prefix(),
+                        object_key
+                    );
+                }
+                Err(error) => {
+                    delete_failures += 1;
+                    log::warn!(
+                        "storage coverage index v2 delta delete failed chain_key={} object_key={} kind={:?} message={}",
                         chain.key_prefix(),
                         object_key,
                         error.kind,
@@ -1658,6 +1950,16 @@ struct SelectedManifestEntry {
     segment_key: Option<String>,
     cursor_key: Option<String>,
     entry: ManifestEntry,
+}
+
+struct CompactSelectedManifestEntriesArgs<'a> {
+    entries: Vec<SelectedManifestEntry>,
+    config: MaintenanceCompactionConfig,
+    started: Instant,
+    cursor: Option<CompactionCursorUpdate>,
+    scan_partial: bool,
+    chain: Option<&'a ChainIdentity>,
+    checkpoint: &'a dyn Fn() -> Result<(), DatalensError>,
 }
 
 #[derive(Clone, Debug)]
@@ -2236,6 +2538,16 @@ fn compaction_selector_kind(candidate: &CompactionCandidate) -> String {
 struct CompactedObject {
     row_count: usize,
     entry: ManifestEntry,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CoverageIndexV2CompactionReport {
+    compacted_buckets: usize,
+    compacted_deltas: usize,
+    input_delta_bytes: u64,
+    cleanup_records: usize,
+    deleted_deltas: usize,
+    delete_failures: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
