@@ -170,7 +170,10 @@ impl MaintenanceCompactionTickStatus {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MaintenanceCompactionConfig {
     pub min_object_bytes: u64,
-    pub max_merge_ranges: usize,
+    pub target_object_bytes: u64,
+    pub max_output_object_bytes: u64,
+    pub max_input_objects_per_candidate: usize,
+    pub max_input_bytes_per_candidate: u64,
     pub max_tick_duration_ms: u64,
     pub max_candidates_per_tick: usize,
     pub max_concurrent_candidates: usize,
@@ -191,7 +194,10 @@ impl Default for MaintenanceCompactionConfig {
     fn default() -> Self {
         Self {
             min_object_bytes: u64::MAX,
-            max_merge_ranges: 32,
+            target_object_bytes: 64 * 1024 * 1024,
+            max_output_object_bytes: 128 * 1024 * 1024,
+            max_input_objects_per_candidate: 512,
+            max_input_bytes_per_candidate: 128 * 1024 * 1024,
             max_tick_duration_ms: 30_000,
             max_candidates_per_tick: 1,
             max_concurrent_candidates: 1,
@@ -270,6 +276,9 @@ pub struct CompactionCandidate {
     pub object_encoding: ObjectEncoding,
     pub range: LedgerRange,
     pub entry_count: usize,
+    pub input_object_bytes: u64,
+    pub target_object_bytes: u64,
+    pub max_output_object_bytes: u64,
     pub object_keys: Vec<String>,
 }
 
@@ -1048,6 +1057,16 @@ where
             &rows,
             object_compression.unwrap_or(ParquetCompression::None),
         )?;
+        if bytes.len() as u64 > candidate.max_output_object_bytes {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                format!(
+                    "compaction output object {} bytes exceeds max_output_object_bytes {}",
+                    bytes.len(),
+                    candidate.max_output_object_bytes
+                ),
+            ));
+        }
         let checksum = checksum_hex(&bytes);
         let object_key = compacted_object_key(candidate, &checksum);
         let data_object = StorageDataObject {
@@ -1581,21 +1600,49 @@ fn compaction_candidates(
     for (key, mut entries) in groups {
         entries.sort_by_key(|entry| (entry.range.start(), entry.range.end()));
         let mut run = Vec::new();
+        let mut run_bytes = 0u64;
         for entry in entries {
-            if run.last().is_none_or(|last: &&ManifestEntry| {
-                entry.range.start() == last.range.end().saturating_add(1)
-            }) && run.len() < config.max_merge_ranges.max(2)
+            let entry_bytes = entry.object_size_bytes.unwrap_or(0);
+            if !run.is_empty()
+                && (!range_can_extend_run(&run, entry)
+                    || candidate_input_limit_reached(&run, run_bytes, entry_bytes, config))
             {
-                run.push(entry);
-            } else {
-                push_candidate(&mut candidates, &key, &run);
+                push_candidate(&mut candidates, &key, &run, config);
                 run.clear();
-                run.push(entry);
+                run_bytes = 0;
+            }
+            run.push(entry);
+            run_bytes = run_bytes.saturating_add(entry_bytes);
+            if run.len() >= 2 && run_bytes >= config.target_object_bytes {
+                push_candidate(&mut candidates, &key, &run, config);
+                run.clear();
+                run_bytes = 0;
             }
         }
-        push_candidate(&mut candidates, &key, &run);
+        push_candidate(&mut candidates, &key, &run, config);
     }
     candidates
+}
+
+fn range_can_extend_run(run: &[&ManifestEntry], entry: &ManifestEntry) -> bool {
+    run.last()
+        .is_some_and(|last| entry.range.start() == last.range.end().saturating_add(1))
+}
+
+fn candidate_input_limit_reached(
+    run: &[&ManifestEntry],
+    run_bytes: u64,
+    entry_bytes: u64,
+    config: MaintenanceCompactionConfig,
+) -> bool {
+    let max_objects = config.max_input_objects_per_candidate.max(2);
+    if run.len() >= max_objects {
+        return true;
+    }
+    let next_bytes = run_bytes.saturating_add(entry_bytes);
+    let max_input_bytes = config.max_input_bytes_per_candidate.max(1);
+    let max_output_bytes = config.max_output_object_bytes.max(1);
+    run.len() >= 2 && (next_bytes > max_input_bytes || next_bytes > max_output_bytes)
 }
 
 fn compaction_backlog_scopes(candidates: &[CompactionCandidate]) -> Vec<CompactionBacklogScope> {
@@ -1681,8 +1728,16 @@ fn push_candidate(
     candidates: &mut Vec<CompactionCandidate>,
     key: &CompactionKey,
     entries: &[&ManifestEntry],
+    config: MaintenanceCompactionConfig,
 ) {
     if entries.len() < 2 {
+        return;
+    }
+    let input_object_bytes = entries
+        .iter()
+        .filter_map(|entry| entry.object_size_bytes)
+        .fold(0u64, u64::saturating_add);
+    if input_object_bytes > config.max_output_object_bytes.max(1) {
         return;
     }
     let start = entries
@@ -1706,6 +1761,9 @@ fn push_candidate(
         object_encoding: key.object_encoding,
         range,
         entry_count: entries.len(),
+        input_object_bytes,
+        target_object_bytes: config.target_object_bytes,
+        max_output_object_bytes: config.max_output_object_bytes,
         object_keys: entries
             .iter()
             .filter_map(|entry| entry.object_key.clone())

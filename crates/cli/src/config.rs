@@ -100,10 +100,32 @@ pub fn validate_config(config: &DatalensConfig) -> Result<(), DatalensError> {
                 "storage.compaction.interval_ms must be greater than zero when compaction is enabled",
             ));
         }
-        if config.storage.compaction.max_merge_ranges < 2 {
+        if config.storage.compaction.target_object_bytes == 0 {
             return Err(DatalensError::new(
                 DatalensErrorKind::InvalidInput,
-                "storage.compaction.max_merge_ranges must be at least two when compaction is enabled",
+                "storage.compaction.target_object_bytes must be greater than zero when compaction is enabled",
+            ));
+        }
+        if config.storage.compaction.max_output_object_bytes
+            < config.storage.compaction.target_object_bytes
+        {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                "storage.compaction.max_output_object_bytes must be greater than or equal to target_object_bytes when compaction is enabled",
+            ));
+        }
+        if config.storage.compaction.max_input_objects_per_candidate < 2 {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                "storage.compaction.max_input_objects_per_candidate must be at least two when compaction is enabled",
+            ));
+        }
+        if config.storage.compaction.max_input_bytes_per_candidate
+            < config.storage.compaction.target_object_bytes
+        {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                "storage.compaction.max_input_bytes_per_candidate must be greater than or equal to target_object_bytes when compaction is enabled",
             ));
         }
         if config.storage.compaction.max_tick_duration_ms == 0 {

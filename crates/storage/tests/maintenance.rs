@@ -506,6 +506,75 @@ fn test_compaction_candidates_do_not_mix_selector_canonical_keys() {
 }
 
 #[test]
+fn test_compaction_candidate_builder_targets_object_size_instead_of_fixed_range_count() {
+    let storage = LocalStorage::new(temp_storage_root("compaction-target-size-candidates"));
+    let chain = test_chain();
+    for number in 100..220 {
+        write_block_object(&storage, &chain, number, FinalityLevel::Safe);
+    }
+    let manifest = storage.manifest().expect("manifest");
+    let source_bytes = manifest
+        .entries
+        .iter()
+        .filter_map(|entry| entry.object_size_bytes)
+        .collect::<Vec<_>>();
+    let per_object_bytes = source_bytes
+        .iter()
+        .copied()
+        .max()
+        .expect("source object bytes");
+    let target_object_bytes = per_object_bytes.saturating_mul(80);
+    let max_output_object_bytes = target_object_bytes.saturating_add(per_object_bytes);
+
+    let report = storage
+        .compact_small_objects(MaintenanceCompactionConfig {
+            min_object_bytes: u64::MAX,
+            target_object_bytes,
+            max_output_object_bytes,
+            max_input_objects_per_candidate: 512,
+            max_input_bytes_per_candidate: u64::MAX,
+            max_tick_duration_ms: 30_000,
+            max_candidates_per_tick: 8,
+            max_concurrent_candidates: 8,
+            max_manifest_entries_per_tick: 20_000,
+            max_gets_per_tick: 512,
+            cleanup_enabled: false,
+            delete_source_objects: false,
+            ..MaintenanceCompactionConfig::default()
+        })
+        .expect("compact small objects");
+
+    assert!(
+        report.candidate_count <= 2,
+        "target-size builder should reduce 120 one-block objects to a small candidate set"
+    );
+    assert!(
+        report
+            .candidates
+            .iter()
+            .any(|candidate| candidate.entry_count > 32)
+    );
+    assert_eq!(report.processed_candidates, report.candidate_count);
+    let manifest = storage.manifest().expect("compacted manifest");
+    assert!(manifest.entries.len() <= 2);
+    for entry in &manifest.entries {
+        assert!(
+            entry.object_size_bytes.expect("compacted size") <= max_output_object_bytes,
+            "compacted object should stay within the configured output cap"
+        );
+    }
+    let rows = storage
+        .read_rows(
+            &chain,
+            &DatasetKey::evm_blocks(),
+            &DatasetSelector::all(),
+            LedgerRange::blocks(100, 219).expect("range"),
+        )
+        .expect("read compacted rows");
+    assert_eq!(rows.row_count(), 120);
+}
+
+#[test]
 fn test_maintenance_check_reports_contradictory_coverage() {
     let storage = LocalStorage::new(temp_storage_root("contradictory-coverage"));
     let chain = test_chain();
@@ -554,7 +623,7 @@ fn test_compaction_merges_adjacent_small_objects_and_retains_old_objects() {
     let report = storage
         .compact_small_objects(MaintenanceCompactionConfig {
             min_object_bytes: u64::MAX,
-            max_merge_ranges: 8,
+            max_input_objects_per_candidate: 8,
             max_tick_duration_ms: 30_000,
             max_candidates_per_tick: 8,
             max_manifest_entries_per_tick: 20_000,
@@ -648,7 +717,7 @@ fn test_compaction_skips_candidate_when_overlapping_write_publishes_before_manif
     let report = compacting_storage
         .compact_small_objects(MaintenanceCompactionConfig {
             min_object_bytes: u64::MAX,
-            max_merge_ranges: 8,
+            max_input_objects_per_candidate: 8,
             max_tick_duration_ms: 30_000,
             max_candidates_per_tick: 8,
             max_manifest_entries_per_tick: 20_000,
@@ -702,7 +771,7 @@ fn test_compaction_uses_configured_parquet_compression() {
     storage
         .compact_small_objects(MaintenanceCompactionConfig {
             min_object_bytes: u64::MAX,
-            max_merge_ranges: 8,
+            max_input_objects_per_candidate: 8,
             max_tick_duration_ms: 30_000,
             max_candidates_per_tick: 8,
             max_manifest_entries_per_tick: 20_000,
@@ -743,7 +812,7 @@ fn test_compaction_records_superseded_source_objects_without_deleting_during_gra
     let report = storage
         .compact_small_objects(MaintenanceCompactionConfig {
             min_object_bytes: u64::MAX,
-            max_merge_ranges: 8,
+            max_input_objects_per_candidate: 8,
             max_tick_duration_ms: 30_000,
             max_candidates_per_tick: 8,
             max_manifest_entries_per_tick: 20_000,
@@ -833,7 +902,7 @@ fn test_compaction_cleanup_deletes_superseded_sources_after_grace_with_tick_limi
     storage
         .compact_small_objects(MaintenanceCompactionConfig {
             min_object_bytes: u64::MAX,
-            max_merge_ranges: 8,
+            max_input_objects_per_candidate: 8,
             max_tick_duration_ms: 30_000,
             max_candidates_per_tick: 8,
             max_manifest_entries_per_tick: 20_000,
@@ -910,7 +979,7 @@ fn test_compaction_replacement_write_failure_leaves_old_manifest_readable() {
     let error = failing_storage
         .compact_small_objects(MaintenanceCompactionConfig {
             min_object_bytes: u64::MAX,
-            max_merge_ranges: 8,
+            max_input_objects_per_candidate: 8,
             max_tick_duration_ms: 30_000,
             max_candidates_per_tick: 8,
             max_manifest_entries_per_tick: 20_000,
@@ -947,7 +1016,7 @@ fn test_compaction_source_delete_failure_leaves_reads_working() {
     let report = failing_storage
         .compact_small_objects(MaintenanceCompactionConfig {
             min_object_bytes: u64::MAX,
-            max_merge_ranges: 8,
+            max_input_objects_per_candidate: 8,
             max_tick_duration_ms: 30_000,
             max_candidates_per_tick: 8,
             max_manifest_entries_per_tick: 20_000,
@@ -1001,7 +1070,7 @@ fn test_compaction_reconciliation_deletes_unpublished_compacted_orphan() {
     let error = failing_storage
         .compact_small_objects(MaintenanceCompactionConfig {
             min_object_bytes: u64::MAX,
-            max_merge_ranges: 8,
+            max_input_objects_per_candidate: 8,
             max_tick_duration_ms: 30_000,
             max_candidates_per_tick: 8,
             max_manifest_entries_per_tick: 20_000,
@@ -1064,7 +1133,7 @@ fn test_compaction_reconciliation_preserves_unpublished_orphan_when_cleanup_disa
     failing_storage
         .compact_small_objects(MaintenanceCompactionConfig {
             min_object_bytes: u64::MAX,
-            max_merge_ranges: 8,
+            max_input_objects_per_candidate: 8,
             max_tick_duration_ms: 30_000,
             max_candidates_per_tick: 8,
             max_concurrent_candidates: 8,
@@ -1108,7 +1177,7 @@ fn test_compaction_reconciliation_retries_stale_source_cleanup_after_restart() {
     failing_storage
         .compact_small_objects(MaintenanceCompactionConfig {
             min_object_bytes: u64::MAX,
-            max_merge_ranges: 8,
+            max_input_objects_per_candidate: 8,
             max_tick_duration_ms: 30_000,
             max_candidates_per_tick: 8,
             max_manifest_entries_per_tick: 20_000,
@@ -1170,7 +1239,7 @@ fn test_compaction_reconciliation_never_deletes_current_manifest_objects() {
     storage
         .compact_small_objects(MaintenanceCompactionConfig {
             min_object_bytes: u64::MAX,
-            max_merge_ranges: 8,
+            max_input_objects_per_candidate: 8,
             max_tick_duration_ms: 30_000,
             max_candidates_per_tick: 8,
             max_manifest_entries_per_tick: 20_000,
@@ -1219,7 +1288,7 @@ fn test_compaction_tick_stops_after_candidate_budget_and_reports_partial() {
             &chain,
             MaintenanceCompactionConfig {
                 min_object_bytes: u64::MAX,
-                max_merge_ranges: 2,
+                max_input_objects_per_candidate: 2,
                 max_tick_duration_ms: 30_000,
                 max_candidates_per_tick: 1,
                 max_manifest_entries_per_tick: 20_000,
@@ -1250,7 +1319,7 @@ fn test_compaction_report_exposes_backlog_estimates_and_tick_summary() {
             &chain,
             MaintenanceCompactionConfig {
                 min_object_bytes: u64::MAX,
-                max_merge_ranges: 2,
+                max_input_objects_per_candidate: 2,
                 max_tick_duration_ms: 30_000,
                 max_candidates_per_tick: 1,
                 max_manifest_entries_per_tick: 20_000,
@@ -1320,7 +1389,7 @@ fn test_compaction_tick_stops_before_exceeding_object_store_operation_budgets() 
             &chain,
             MaintenanceCompactionConfig {
                 min_object_bytes: u64::MAX,
-                max_merge_ranges: 2,
+                max_input_objects_per_candidate: 2,
                 max_tick_duration_ms: 30_000,
                 max_candidates_per_tick: 8,
                 max_concurrent_candidates: 1,
@@ -1398,7 +1467,7 @@ fn test_compaction_tick_does_not_reload_manifest_per_candidate() {
             &chain,
             MaintenanceCompactionConfig {
                 min_object_bytes: u64::MAX,
-                max_merge_ranges: 2,
+                max_input_objects_per_candidate: 2,
                 max_tick_duration_ms: 30_000,
                 max_candidates_per_tick: 8,
                 max_concurrent_candidates: 8,
@@ -1439,7 +1508,7 @@ fn test_compaction_tick_scans_one_manifest_segment_prefix_per_tick() {
             &chain,
             MaintenanceCompactionConfig {
                 min_object_bytes: u64::MAX,
-                max_merge_ranges: 2,
+                max_input_objects_per_candidate: 2,
                 max_tick_duration_ms: 30_000,
                 max_candidates_per_tick: 8,
                 max_manifest_entries_per_tick: 20_000,
@@ -1466,7 +1535,7 @@ fn test_compaction_cursor_resumes_and_loss_recovers_without_affecting_reads() {
     write_block_object(&storage, &chain, 131, FinalityLevel::Safe);
     let config = MaintenanceCompactionConfig {
         min_object_bytes: u64::MAX,
-        max_merge_ranges: 2,
+        max_input_objects_per_candidate: 2,
         max_tick_duration_ms: 30_000,
         max_candidates_per_tick: 8,
         max_manifest_entries_per_tick: 2,
@@ -1541,7 +1610,7 @@ fn test_compaction_legacy_full_manifest_partial_tick_persists_offset_cursor() {
     .expect("write full manifest");
     let config = MaintenanceCompactionConfig {
         min_object_bytes: u64::MAX,
-        max_merge_ranges: 2,
+        max_input_objects_per_candidate: 2,
         max_tick_duration_ms: 30_000,
         max_candidates_per_tick: 8,
         max_manifest_entries_per_tick: 1,
@@ -1608,7 +1677,7 @@ fn test_compaction_legacy_cursor_continues_after_partial_tick_writes_segment() {
     .expect("write full manifest");
     let config = MaintenanceCompactionConfig {
         min_object_bytes: u64::MAX,
-        max_merge_ranges: 2,
+        max_input_objects_per_candidate: 2,
         max_tick_duration_ms: 30_000,
         max_candidates_per_tick: 8,
         max_manifest_entries_per_tick: 2,
@@ -1684,7 +1753,7 @@ fn test_compaction_legacy_cursor_survives_candidate_budget_partial() {
     .expect("write full manifest");
     let config = MaintenanceCompactionConfig {
         min_object_bytes: u64::MAX,
-        max_merge_ranges: 2,
+        max_input_objects_per_candidate: 2,
         max_tick_duration_ms: 30_000,
         max_candidates_per_tick: 1,
         max_manifest_entries_per_tick: 4,
@@ -1783,7 +1852,7 @@ fn test_compaction_ignores_segments_shadowed_by_full_manifest() {
             &chain,
             MaintenanceCompactionConfig {
                 min_object_bytes: u64::MAX,
-                max_merge_ranges: 2,
+                max_input_objects_per_candidate: 2,
                 max_tick_duration_ms: 30_000,
                 max_candidates_per_tick: 8,
                 max_manifest_entries_per_tick: 20_000,
