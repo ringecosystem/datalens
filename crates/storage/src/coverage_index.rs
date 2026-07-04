@@ -5,21 +5,27 @@ use datalens_core::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, hash_map::RandomState},
+    hash::BuildHasher,
+    process,
+    sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex, MutexGuard, OnceLock, Weak},
-    time::Instant,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::selector_coverage::{parse_evm_log_canonical_key, selector_coverage_candidates};
 use crate::{Manifest, ManifestEntry, ManifestFinalityLevel, ObjectStore, range_kind_key};
 
 pub(crate) const DEFAULT_COVERAGE_INDEX_BUCKET_SIZE: u64 = 100_000;
+const COVERAGE_INDEX_V2_SCHEMA_VERSION: u32 = 1;
+const COVERAGE_INDEX_V2_LIST_PAGE_SIZE: usize = 256;
 const EVM_LOG_SEMANTIC_INDEX_VERSION: &str = "evm-logs-v1";
 const MAX_EVM_LOG_TOPIC_VALUE_SEMANTIC_KEYS: usize = 128;
 const EVM_LOG_LARGE_TOPIC_VALUE_SCOPE: &str = "_large-any-of";
 
 static COVERAGE_INDEX_UPDATE_LOCKS: OnceLock<Mutex<BTreeMap<String, Weak<Mutex<()>>>>> =
     OnceLock::new();
+static COVERAGE_INDEX_V2_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -46,6 +52,71 @@ struct CoverageIndexReplacementBucket {
     key: String,
     bucket_start: u64,
     bucket_end: u64,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CoverageIndexV2Bucket {
+    chain_key: String,
+    scope: String,
+    bucket_start: u64,
+    bucket_end: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CoverageIndexV2Delta {
+    schema_version: u32,
+    created_at_unix_ms: u64,
+    scope: String,
+    bucket_start: u64,
+    bucket_end: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    replacement: Option<CoverageIndexV2Replacement>,
+    entries: Vec<ManifestEntry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CoverageIndexV2Replacement {
+    entry: ManifestEntry,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CoverageIndexV2Snapshot {
+    schema_version: u32,
+    created_at_unix_ms: u64,
+    scope: String,
+    bucket_start: u64,
+    bucket_end: u64,
+    entries: Vec<ManifestEntry>,
+    compacted_delta_keys: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CoverageIndexV2SnapshotHead {
+    schema_version: u32,
+    created_at_unix_ms: u64,
+    scope: String,
+    bucket_start: u64,
+    bucket_end: u64,
+    snapshot_key: String,
+    included_delta_high_watermark: String,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CoverageIndexV2CleanupRecord {
+    schema_version: u32,
+    created_at_unix_ms: u64,
+    scope: String,
+    bucket_start: u64,
+    bucket_end: u64,
+    compaction_id: String,
+    snapshot_key: String,
+    compacted_delta_keys: Vec<String>,
 }
 
 impl CoverageIndex {
@@ -80,7 +151,15 @@ where
         selector,
         std::slice::from_ref(range),
     );
+    let exact_v2_buckets = exact_coverage_index_v2_query_buckets_for_ranges(
+        chain,
+        dataset_key,
+        selector,
+        std::slice::from_ref(range),
+    );
     let exact_has_index = read_entries_for_keys(object_store, exact_keys, &mut exact_entries)?;
+    let exact_has_v2_index =
+        read_entries_for_v2_buckets(object_store, exact_v2_buckets, &mut exact_entries)?;
     let exact_entries =
         normalized_query_entries(exact_entries, chain, dataset_key, selector, range);
     let exact_covered =
@@ -93,8 +172,16 @@ where
     let mut entries = exact_entries;
     let semantic_keys =
         semantic_coverage_index_query_keys_for_ranges(chain, dataset_key, selector, &exact_missing);
+    let semantic_v2_buckets = semantic_coverage_index_v2_query_buckets_for_ranges(
+        chain,
+        dataset_key,
+        selector,
+        &exact_missing,
+    );
     let semantic_has_index = read_entries_for_keys(object_store, semantic_keys, &mut entries)?;
-    if !exact_has_index && !semantic_has_index {
+    let semantic_has_v2_index =
+        read_entries_for_v2_buckets(object_store, semantic_v2_buckets, &mut entries)?;
+    if !exact_has_index && !exact_has_v2_index && !semantic_has_index && !semantic_has_v2_index {
         return Ok(None);
     }
 
@@ -130,7 +217,14 @@ where
         selector,
         std::slice::from_ref(range),
     );
+    let v2_buckets = semantic_coverage_index_v2_query_buckets_for_ranges(
+        chain,
+        dataset_key,
+        selector,
+        std::slice::from_ref(range),
+    );
     read_entries_for_keys(object_store, keys, &mut entries)?;
+    read_entries_for_v2_buckets(object_store, v2_buckets, &mut entries)?;
     let mut index = CoverageIndex { entries };
     index.normalize();
     Ok(index
@@ -172,6 +266,220 @@ where
         entries.append(&mut index.entries);
     }
     Ok(any_key_has_index)
+}
+
+fn read_entries_for_v2_buckets<S>(
+    object_store: &S,
+    buckets: BTreeSet<CoverageIndexV2Bucket>,
+    entries: &mut Vec<ManifestEntry>,
+) -> Result<bool, DatalensError>
+where
+    S: ObjectStore,
+{
+    let mut any_bucket_has_index = false;
+    for bucket in buckets {
+        any_bucket_has_index |= read_entries_for_v2_bucket(object_store, &bucket, entries)?;
+    }
+    Ok(any_bucket_has_index)
+}
+
+fn read_entries_for_v2_bucket<S>(
+    object_store: &S,
+    bucket: &CoverageIndexV2Bucket,
+    entries: &mut Vec<ManifestEntry>,
+) -> Result<bool, DatalensError>
+where
+    S: ObjectStore,
+{
+    let mut any_bucket_has_index = false;
+    let mut delta_start_after = None;
+    if let Some(head) = latest_v2_snapshot_head(object_store, bucket)? {
+        let snapshot_bytes = object_store.get(&head.snapshot_key)?;
+        let mut snapshot: CoverageIndexV2Snapshot = serde_json::from_slice(&snapshot_bytes)
+            .map_err(|error| {
+                DatalensError::new(
+                    DatalensErrorKind::StorageReadFailure,
+                    format!(
+                        "decode coverage index v2 snapshot {}: {error}",
+                        head.snapshot_key
+                    ),
+                )
+            })?;
+        validate_v2_record_scope(
+            "snapshot",
+            &head.snapshot_key,
+            snapshot.schema_version,
+            &snapshot.scope,
+            snapshot.bucket_start,
+            snapshot.bucket_end,
+            bucket,
+        )?;
+        any_bucket_has_index = true;
+        entries.append(&mut snapshot.entries);
+        if !head.included_delta_high_watermark.is_empty() {
+            delta_start_after = Some(head.included_delta_high_watermark);
+        }
+    }
+
+    let delta_prefix = coverage_index_v2_delta_prefix(
+        &bucket.chain_key,
+        &bucket.scope,
+        bucket.bucket_start,
+        bucket.bucket_end,
+    );
+    let mut start_after = delta_start_after;
+    loop {
+        let page = object_store.list_page(
+            &delta_prefix,
+            start_after.as_deref(),
+            COVERAGE_INDEX_V2_LIST_PAGE_SIZE,
+        )?;
+        for object in &page.objects {
+            let bytes = object_store.get(&object.key)?;
+            let mut delta: CoverageIndexV2Delta =
+                serde_json::from_slice(&bytes).map_err(|error| {
+                    DatalensError::new(
+                        DatalensErrorKind::StorageReadFailure,
+                        format!("decode coverage index v2 delta {}: {error}", object.key),
+                    )
+                })?;
+            validate_v2_record_scope(
+                "delta",
+                &object.key,
+                delta.schema_version,
+                &delta.scope,
+                delta.bucket_start,
+                delta.bucket_end,
+                bucket,
+            )?;
+            any_bucket_has_index = true;
+            if let Some(replacement) = delta.replacement {
+                apply_v2_replacement(entries, &replacement.entry)?;
+            }
+            entries.append(&mut delta.entries);
+        }
+        if !page.has_more {
+            break;
+        }
+        start_after = page.objects.last().map(|object| object.key.clone());
+    }
+    Ok(any_bucket_has_index)
+}
+
+fn apply_v2_replacement(
+    entries: &mut Vec<ManifestEntry>,
+    replacement_entry: &ManifestEntry,
+) -> Result<(), DatalensError> {
+    let mut retained = Vec::new();
+    for existing_entry in entries.drain(..) {
+        if replacement_scope_matches(&existing_entry, replacement_entry)
+            && existing_entry
+                .range
+                .intersection(&replacement_entry.range)
+                .is_some()
+        {
+            retained.extend(split_entry_around_range(
+                existing_entry,
+                &replacement_entry.range,
+            )?);
+        } else {
+            retained.push(existing_entry);
+        }
+    }
+    *entries = retained;
+    Ok(())
+}
+
+fn latest_v2_snapshot_head<S>(
+    object_store: &S,
+    bucket: &CoverageIndexV2Bucket,
+) -> Result<Option<CoverageIndexV2SnapshotHead>, DatalensError>
+where
+    S: ObjectStore,
+{
+    let prefix = coverage_index_v2_snapshot_head_prefix(
+        &bucket.chain_key,
+        &bucket.scope,
+        bucket.bucket_start,
+        bucket.bucket_end,
+    );
+    let mut latest = None;
+    let mut start_after = None;
+    loop {
+        let page = object_store.list_page(
+            &prefix,
+            start_after.as_deref(),
+            COVERAGE_INDEX_V2_LIST_PAGE_SIZE,
+        )?;
+        for object in &page.objects {
+            let bytes = object_store.get(&object.key)?;
+            let head: CoverageIndexV2SnapshotHead =
+                serde_json::from_slice(&bytes).map_err(|error| {
+                    DatalensError::new(
+                        DatalensErrorKind::StorageReadFailure,
+                        format!(
+                            "decode coverage index v2 snapshot head {}: {error}",
+                            object.key
+                        ),
+                    )
+                })?;
+            validate_v2_record_scope(
+                "snapshot head",
+                &object.key,
+                head.schema_version,
+                &head.scope,
+                head.bucket_start,
+                head.bucket_end,
+                bucket,
+            )?;
+            let is_newer = latest
+                .as_ref()
+                .map(
+                    |(latest_key, latest_head): &(String, CoverageIndexV2SnapshotHead)| {
+                        (head.created_at_unix_ms, object.key.as_str())
+                            > (latest_head.created_at_unix_ms, latest_key.as_str())
+                    },
+                )
+                .unwrap_or(true);
+            if is_newer {
+                latest = Some((object.key.clone(), head));
+            }
+        }
+        if !page.has_more {
+            break;
+        }
+        start_after = page.objects.last().map(|object| object.key.clone());
+    }
+    Ok(latest.map(|(_, head)| head))
+}
+
+fn validate_v2_record_scope(
+    record_kind: &str,
+    key: &str,
+    schema_version: u32,
+    scope: &str,
+    bucket_start: u64,
+    bucket_end: u64,
+    bucket: &CoverageIndexV2Bucket,
+) -> Result<(), DatalensError> {
+    if schema_version != COVERAGE_INDEX_V2_SCHEMA_VERSION {
+        return Err(DatalensError::new(
+            DatalensErrorKind::StorageReadFailure,
+            format!(
+                "coverage index v2 {record_kind} {key} has unsupported schema_version {schema_version}"
+            ),
+        ));
+    }
+    if scope != bucket.scope
+        || bucket_start != bucket.bucket_start
+        || bucket_end != bucket.bucket_end
+    {
+        return Err(DatalensError::new(
+            DatalensErrorKind::StorageReadFailure,
+            format!("coverage index v2 {record_kind} {key} scope does not match object key"),
+        ));
+    }
+    Ok(())
 }
 
 fn normalized_query_entries(
@@ -252,7 +560,221 @@ where
             );
         }
     }
+    write_v2_entry_delta(object_store, entry)?;
     Ok(())
+}
+
+fn write_v2_entry_delta<S>(object_store: &S, entry: &ManifestEntry) -> Result<(), DatalensError>
+where
+    S: ObjectStore,
+{
+    for bucket in coverage_index_v2_entry_buckets(entry) {
+        let delta = CoverageIndexV2Delta {
+            schema_version: COVERAGE_INDEX_V2_SCHEMA_VERSION,
+            created_at_unix_ms: unix_ms_now()?,
+            scope: bucket.scope.clone(),
+            bucket_start: bucket.bucket_start,
+            bucket_end: bucket.bucket_end,
+            replacement: None,
+            entries: vec![entry.clone()],
+        };
+        let key = format!(
+            "{}/{}.json",
+            coverage_index_v2_delta_prefix(
+                &bucket.chain_key,
+                &bucket.scope,
+                bucket.bucket_start,
+                bucket.bucket_end,
+            ),
+            coverage_index_v2_immutable_id()?
+        );
+        let bytes = serde_json::to_vec_pretty(&delta).map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::Internal,
+                format!("encode coverage index v2 delta: {error}"),
+            )
+        })?;
+        object_store.put(&key, &bytes).map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::ManifestUpdateFailure,
+                format!("write coverage index v2 delta {key}: {}", error.message),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn write_v2_replacement_delta<S>(
+    object_store: &S,
+    replacement_entry: &ManifestEntry,
+    replaced_entries: &[ManifestEntry],
+    published_entries: &[ManifestEntry],
+) -> Result<(), DatalensError>
+where
+    S: ObjectStore,
+{
+    let mut buckets = coverage_index_v2_entry_buckets(replacement_entry);
+    for entry in replaced_entries.iter().chain(published_entries) {
+        buckets.extend(coverage_index_v2_entry_buckets(entry));
+    }
+    for bucket in buckets {
+        let entries = published_entries
+            .iter()
+            .filter(|entry| coverage_index_v2_entry_buckets(entry).contains(&bucket))
+            .cloned()
+            .collect::<Vec<_>>();
+        let delta = CoverageIndexV2Delta {
+            schema_version: COVERAGE_INDEX_V2_SCHEMA_VERSION,
+            created_at_unix_ms: unix_ms_now()?,
+            scope: bucket.scope.clone(),
+            bucket_start: bucket.bucket_start,
+            bucket_end: bucket.bucket_end,
+            replacement: Some(CoverageIndexV2Replacement {
+                entry: replacement_entry.clone(),
+            }),
+            entries,
+        };
+        let key = format!(
+            "{}/{}.json",
+            coverage_index_v2_delta_prefix(
+                &bucket.chain_key,
+                &bucket.scope,
+                bucket.bucket_start,
+                bucket.bucket_end,
+            ),
+            coverage_index_v2_immutable_id()?
+        );
+        let bytes = serde_json::to_vec_pretty(&delta).map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::Internal,
+                format!("encode coverage index v2 replacement delta: {error}"),
+            )
+        })?;
+        object_store.put(&key, &bytes).map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::ManifestUpdateFailure,
+                format!(
+                    "write coverage index v2 replacement delta {key}: {}",
+                    error.message
+                ),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub(crate) fn write_v2_snapshot<S>(
+    object_store: &S,
+    chain: &ChainIdentity,
+    scope: &str,
+    bucket_start: u64,
+    bucket_end: u64,
+    entries: Vec<ManifestEntry>,
+    compacted_delta_keys: Vec<String>,
+) -> Result<String, DatalensError>
+where
+    S: ObjectStore,
+{
+    let key = format!(
+        "{}/{}.json",
+        coverage_index_v2_snapshot_prefix(&chain.key_prefix(), scope, bucket_start, bucket_end),
+        coverage_index_v2_immutable_id()?
+    );
+    let snapshot = CoverageIndexV2Snapshot {
+        schema_version: COVERAGE_INDEX_V2_SCHEMA_VERSION,
+        created_at_unix_ms: unix_ms_now()?,
+        scope: scope.to_owned(),
+        bucket_start,
+        bucket_end,
+        entries,
+        compacted_delta_keys,
+    };
+    let bytes = serde_json::to_vec_pretty(&snapshot).map_err(|error| {
+        DatalensError::new(
+            DatalensErrorKind::Internal,
+            format!("encode coverage index v2 snapshot: {error}"),
+        )
+    })?;
+    object_store.put(&key, &bytes).map_err(|error| {
+        DatalensError::new(
+            DatalensErrorKind::ManifestUpdateFailure,
+            format!("write coverage index v2 snapshot {key}: {}", error.message),
+        )
+    })?;
+    Ok(key)
+}
+
+#[allow(dead_code)]
+pub(crate) fn write_v2_snapshot_head<S>(
+    object_store: &S,
+    chain: &ChainIdentity,
+    scope: &str,
+    bucket_start: u64,
+    bucket_end: u64,
+    snapshot_key: String,
+    included_delta_high_watermark: String,
+) -> Result<String, DatalensError>
+where
+    S: ObjectStore,
+{
+    let key = format!(
+        "{}/{}.json",
+        coverage_index_v2_snapshot_head_prefix(
+            &chain.key_prefix(),
+            scope,
+            bucket_start,
+            bucket_end,
+        ),
+        coverage_index_v2_immutable_id()?
+    );
+    let head = CoverageIndexV2SnapshotHead {
+        schema_version: COVERAGE_INDEX_V2_SCHEMA_VERSION,
+        created_at_unix_ms: unix_ms_now()?,
+        scope: scope.to_owned(),
+        bucket_start,
+        bucket_end,
+        snapshot_key,
+        included_delta_high_watermark,
+    };
+    let bytes = serde_json::to_vec_pretty(&head).map_err(|error| {
+        DatalensError::new(
+            DatalensErrorKind::Internal,
+            format!("encode coverage index v2 snapshot head: {error}"),
+        )
+    })?;
+    object_store.put(&key, &bytes).map_err(|error| {
+        DatalensError::new(
+            DatalensErrorKind::ManifestUpdateFailure,
+            format!(
+                "write coverage index v2 snapshot head {key}: {}",
+                error.message
+            ),
+        )
+    })?;
+    Ok(key)
+}
+
+fn unix_ms_now() -> Result<u64, DatalensError> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| DatalensError::internal("system clock before unix epoch"))?
+        .as_millis() as u64)
+}
+
+fn coverage_index_v2_immutable_id() -> Result<String, DatalensError> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| DatalensError::internal("system clock before unix epoch"))?;
+    let sequence = COVERAGE_INDEX_V2_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let entropy = RandomState::new().hash_one((duration.as_nanos(), process::id(), sequence));
+    Ok(format!(
+        "{:020}-{:010}-{:020}-{:016x}",
+        duration.as_nanos(),
+        process::id(),
+        sequence,
+        entropy
+    ))
 }
 
 pub(crate) fn replace_entry<S>(
@@ -283,6 +805,16 @@ where
                 && existing_entry.range.intersection(&entry.range).is_some()
         }));
     }
+    let mut v2_entries = Vec::new();
+    read_entries_for_v2_buckets(
+        object_store,
+        coverage_index_v2_entry_buckets(entry),
+        &mut v2_entries,
+    )?;
+    replaced_entries.extend(v2_entries.into_iter().filter(|existing_entry| {
+        replacement_scope_matches(existing_entry, entry)
+            && existing_entry.range.intersection(&entry.range).is_some()
+    }));
     let mut replaced_manifest = Manifest {
         entries: replaced_entries,
     };
@@ -490,6 +1022,12 @@ where
         entries: replacement_published_entries(&replaced_manifest.entries, entry)?,
     };
     published_manifest.normalize();
+    write_v2_replacement_delta(
+        object_store,
+        entry,
+        &replaced_manifest.entries,
+        &published_manifest.entries,
+    )?;
     Ok(CoverageIndexReplacementPublish {
         replaced_entries: replaced_manifest.entries,
         published_entries: published_manifest.entries,
@@ -566,6 +1104,7 @@ where
     for prefix in [
         coverage_index_prefix(chain),
         semantic_coverage_index_prefix(chain),
+        coverage_index_v2_prefix(chain),
     ] {
         for object in object_store.list(&prefix)? {
             object_store.delete(&object.key).map_err(|error| {
@@ -587,6 +1126,10 @@ fn coverage_index_prefix(chain: &ChainIdentity) -> String {
 #[allow(dead_code)]
 fn semantic_coverage_index_prefix(chain: &ChainIdentity) -> String {
     format!("chains/{}/coverage-index-semantic", chain.key_prefix())
+}
+
+fn coverage_index_v2_prefix(chain: &ChainIdentity) -> String {
+    format!("chains/{}/coverage-index-v2", chain.key_prefix())
 }
 
 fn coverage_index_key(
@@ -632,6 +1175,70 @@ fn semantic_coverage_index_key(
     )
 }
 
+fn coverage_index_v2_exact_scope(
+    dataset_key: &DatasetKey,
+    range: &LedgerRange,
+    selector_fingerprint: &str,
+    finality_level: ManifestFinalityLevel,
+) -> String {
+    format!(
+        "exact/{}/{}/{}/{}",
+        dataset_key.as_str(),
+        range_kind_key(range.kind()),
+        selector_fingerprint,
+        finality_level.as_str()
+    )
+}
+
+fn coverage_index_v2_semantic_scope(
+    dataset_key: &DatasetKey,
+    range: &LedgerRange,
+    finality_level: ManifestFinalityLevel,
+    scope: &str,
+) -> String {
+    format!(
+        "semantic/{}/{}/{}/{}/{}",
+        dataset_key.as_str(),
+        range_kind_key(range.kind()),
+        finality_level.as_str(),
+        EVM_LOG_SEMANTIC_INDEX_VERSION,
+        scope
+    )
+}
+
+fn coverage_index_v2_delta_prefix(
+    chain_key: &str,
+    scope: &str,
+    bucket_start: u64,
+    bucket_end: u64,
+) -> String {
+    format!(
+        "chains/{chain_key}/coverage-index-v2/deltas/{scope}/{bucket_start:020}-{bucket_end:020}"
+    )
+}
+
+fn coverage_index_v2_snapshot_prefix(
+    chain_key: &str,
+    scope: &str,
+    bucket_start: u64,
+    bucket_end: u64,
+) -> String {
+    format!(
+        "chains/{chain_key}/coverage-index-v2/snapshots/{scope}/{bucket_start:020}-{bucket_end:020}"
+    )
+}
+
+fn coverage_index_v2_snapshot_head_prefix(
+    chain_key: &str,
+    scope: &str,
+    bucket_start: u64,
+    bucket_end: u64,
+) -> String {
+    format!(
+        "chains/{chain_key}/coverage-index-v2/snapshot-heads/{scope}/{bucket_start:020}-{bucket_end:020}"
+    )
+}
+
 fn exact_coverage_index_query_keys_for_ranges(
     chain: &ChainIdentity,
     dataset_key: &DatasetKey,
@@ -658,6 +1265,36 @@ fn exact_coverage_index_query_keys_for_ranges(
         }
     }
     keys
+}
+
+fn exact_coverage_index_v2_query_buckets_for_ranges(
+    chain: &ChainIdentity,
+    dataset_key: &DatasetKey,
+    selector: &DatasetSelector,
+    ranges: &[LedgerRange],
+) -> BTreeSet<CoverageIndexV2Bucket> {
+    let mut buckets = BTreeSet::new();
+    for range in ranges {
+        for (bucket_start, bucket_end) in bucket_ranges(range, DEFAULT_COVERAGE_INDEX_BUCKET_SIZE) {
+            for finality_level in [
+                ManifestFinalityLevel::Safe,
+                ManifestFinalityLevel::Finalized,
+            ] {
+                buckets.insert(CoverageIndexV2Bucket {
+                    chain_key: chain.key_prefix(),
+                    scope: coverage_index_v2_exact_scope(
+                        dataset_key,
+                        range,
+                        &selector.fingerprint(),
+                        finality_level,
+                    ),
+                    bucket_start,
+                    bucket_end,
+                });
+            }
+        }
+    }
+    buckets
 }
 
 fn semantic_coverage_index_query_keys_for_ranges(
@@ -697,6 +1334,45 @@ fn semantic_coverage_index_query_keys_for_ranges(
     keys
 }
 
+fn semantic_coverage_index_v2_query_buckets_for_ranges(
+    chain: &ChainIdentity,
+    dataset_key: &DatasetKey,
+    selector: &DatasetSelector,
+    ranges: &[LedgerRange],
+) -> BTreeSet<CoverageIndexV2Bucket> {
+    let mut buckets = BTreeSet::new();
+    if *dataset_key != DatasetKey::evm_logs() {
+        return buckets;
+    }
+    let DatasetSelector::EvmLogs(filter) = selector else {
+        return buckets;
+    };
+    let scopes = evm_log_query_semantic_scopes(filter);
+    for range in ranges {
+        for (bucket_start, bucket_end) in bucket_ranges(range, DEFAULT_COVERAGE_INDEX_BUCKET_SIZE) {
+            for finality_level in [
+                ManifestFinalityLevel::Safe,
+                ManifestFinalityLevel::Finalized,
+            ] {
+                for scope in &scopes {
+                    buckets.insert(CoverageIndexV2Bucket {
+                        chain_key: chain.key_prefix(),
+                        scope: coverage_index_v2_semantic_scope(
+                            dataset_key,
+                            range,
+                            finality_level,
+                            scope,
+                        ),
+                        bucket_start,
+                        bucket_end,
+                    });
+                }
+            }
+        }
+    }
+    buckets
+}
+
 fn coverage_index_entry_keys(
     entry: &ManifestEntry,
     bucket_start: u64,
@@ -731,6 +1407,43 @@ fn coverage_index_entry_keys(
         );
     }
     keys.into_iter().collect()
+}
+
+fn coverage_index_v2_entry_buckets(entry: &ManifestEntry) -> BTreeSet<CoverageIndexV2Bucket> {
+    let mut buckets = BTreeSet::new();
+    for (bucket_start, bucket_end) in
+        bucket_ranges(&entry.range, DEFAULT_COVERAGE_INDEX_BUCKET_SIZE)
+    {
+        buckets.insert(CoverageIndexV2Bucket {
+            chain_key: entry.chain.key_prefix(),
+            scope: coverage_index_v2_exact_scope(
+                &entry.dataset_key,
+                &entry.range,
+                &entry.selector_fingerprint,
+                entry.finality_level,
+            ),
+            bucket_start,
+            bucket_end,
+        });
+        if entry.dataset_key == DatasetKey::evm_logs()
+            && let Some(filter) = parse_evm_log_canonical_key(&entry.selector_canonical_key)
+        {
+            for scope in evm_log_entry_semantic_scopes(&filter) {
+                buckets.insert(CoverageIndexV2Bucket {
+                    chain_key: entry.chain.key_prefix(),
+                    scope: coverage_index_v2_semantic_scope(
+                        &entry.dataset_key,
+                        &entry.range,
+                        entry.finality_level,
+                        &scope,
+                    ),
+                    bucket_start,
+                    bucket_end,
+                });
+            }
+        }
+    }
+    buckets
 }
 
 fn evm_log_entry_semantic_scopes(filter: &EvmLogFilter) -> BTreeSet<String> {
