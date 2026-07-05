@@ -2394,6 +2394,44 @@ fn test_compaction_pauses_when_query_latency_exceeds_threshold_and_reads_still_w
 }
 
 #[test]
+fn test_compaction_pauses_when_write_latency_exceeds_threshold() {
+    let storage = LocalStorage::new(temp_storage_root("write-pressure-pause"));
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 86, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 87, FinalityLevel::Safe);
+
+    let report = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                min_object_bytes: u64::MAX,
+                write_latency_pause_threshold_ms: 100,
+                pressure: MaintenanceCompactionPressure {
+                    query_latency_ms: None,
+                    write_latency_ms: Some(250),
+                },
+                ..MaintenanceCompactionConfig::default()
+            },
+        )
+        .expect("write-pressure-paused compaction");
+
+    assert_eq!(report.tick_status, MaintenanceCompactionTickStatus::Paused);
+    assert_eq!(report.pause_reason.as_deref(), Some("write_latency"));
+    assert_eq!(report.processed_candidates, 0);
+    assert_eq!(
+        storage
+            .manifest()
+            .expect("manifest")
+            .entries
+            .iter()
+            .filter(|entry| entry.object_key.is_some())
+            .count(),
+        2,
+        "write pressure pause must not publish a compacted replacement"
+    );
+}
+
+#[test]
 fn test_compaction_tick_does_not_reload_manifest_per_candidate() {
     let storage = LocalStorage::new(temp_storage_root("no-repeated-reload"));
     let chain = test_chain();
@@ -2742,6 +2780,63 @@ fn test_compaction_coverage_index_v2_cleanup_delete_failure_retries() {
 }
 
 #[test]
+fn test_compaction_coverage_index_v2_cleanup_checkpoint_failure_stops_delta_delete_until_retry() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-v2-cleanup-checkpoint-retry"));
+    let chain = test_chain();
+    for number in 33..=35 {
+        write_block_object(&storage, &chain, number, FinalityLevel::Safe);
+    }
+    clear_coverage_index_v1(&storage, &chain);
+    let checkpoints = Arc::new(AtomicUsize::new(0));
+    let checkpoint_state = checkpoints.clone();
+
+    let failed_cleanup_report = storage
+        .compact_small_objects_for_chain_with_checkpoint(
+            &chain,
+            coverage_index_v2_compaction_config(true),
+            move || {
+                let count = checkpoint_state.fetch_add(1, Ordering::SeqCst);
+                if count == 3 {
+                    Err(DatalensError::internal(
+                        "injected cleanup checkpoint failure",
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .expect("checkpoint failure is reported as deferred cleanup work");
+
+    assert_eq!(failed_cleanup_report.coverage_index_v2_compacted_buckets, 1);
+    assert_eq!(
+        failed_cleanup_report.coverage_index_v2_delta_delete_failures, 1,
+        "leader checkpoint failure must stop coverage delta deletes before any key is removed"
+    );
+    assert_eq!(failed_cleanup_report.coverage_index_v2_deleted_deltas, 0);
+    assert_eq!(coverage_index_v2_delta_count(&storage, &chain), 3);
+    assert_eq!(coverage_index_v2_cleanup_count(&storage, &chain), 1);
+    assert_block_numbers(
+        storage
+            .read_rows(
+                &chain,
+                &DatasetKey::evm_blocks(),
+                &DatasetSelector::all(),
+                LedgerRange::blocks(33, 35).expect("range"),
+            )
+            .expect("read rows while cleanup is deferred"),
+        &[33, 34, 35],
+    );
+
+    let retry_report = storage
+        .compact_small_objects_for_chain(&chain, coverage_index_v2_compaction_config(true))
+        .expect("retry deferred cleanup");
+    assert_eq!(retry_report.coverage_index_v2_deleted_deltas, 3);
+    assert_eq!(retry_report.coverage_index_v2_delta_delete_failures, 0);
+    assert_eq!(coverage_index_v2_delta_count(&storage, &chain), 0);
+    assert_eq!(coverage_index_v2_cleanup_count(&storage, &chain), 0);
+}
+
+#[test]
 fn test_compaction_coverage_index_v2_malformed_cleanup_record_does_not_delete_arbitrary_key() {
     let storage = LocalStorage::new(temp_storage_root("coverage-v2-malformed-cleanup"));
     let chain = test_chain();
@@ -2874,6 +2969,96 @@ fn test_compaction_coverage_index_v2_stale_cleanup_record_does_not_delete_delta(
             .exists(&delta_key)
             .expect("delta exists"),
         "cleanup must prove the snapshot before deleting its compacted delta keys"
+    );
+}
+
+#[test]
+fn test_compaction_coverage_index_v2_delta_count_threshold_triggers_compaction() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-v2-delta-threshold"));
+    let chain = test_chain();
+    for number in 100..=101 {
+        write_block_object(&storage, &chain, number, FinalityLevel::Safe);
+    }
+    clear_coverage_index_v1(&storage, &chain);
+    let config = MaintenanceCompactionConfig {
+        coverage_index_v2_delta_count_threshold: 3,
+        ..coverage_index_v2_compaction_config(false)
+    };
+
+    let below_threshold = storage
+        .compact_small_objects_for_chain(&chain, config)
+        .expect("below threshold compaction");
+    assert_eq!(below_threshold.coverage_index_v2_compacted_buckets, 0);
+    assert_eq!(coverage_index_v2_snapshot_head_count(&storage, &chain), 0);
+    assert_eq!(coverage_index_v2_delta_count(&storage, &chain), 2);
+
+    write_block_object(&storage, &chain, 102, FinalityLevel::Safe);
+    clear_coverage_index_v1(&storage, &chain);
+    let at_threshold = storage
+        .compact_small_objects_for_chain(&chain, config)
+        .expect("at threshold compaction");
+
+    assert_eq!(
+        at_threshold.coverage_index_v2_compacted_buckets, 1,
+        "delta_count threshold must trigger coverage-index-v2 compaction exactly at budget"
+    );
+    assert_eq!(at_threshold.coverage_index_v2_compacted_deltas, 3);
+    assert_eq!(coverage_index_v2_snapshot_head_count(&storage, &chain), 1);
+    assert_block_numbers(
+        storage
+            .read_rows(
+                &chain,
+                &DatasetKey::evm_blocks(),
+                &DatasetSelector::all(),
+                LedgerRange::blocks(100, 102).expect("range"),
+            )
+            .expect("read rows after threshold compaction"),
+        &[100, 101, 102],
+    );
+}
+
+#[test]
+fn test_compaction_coverage_index_v2_snapshot_head_writes_stay_within_overwrite_budget() {
+    let object_store = CountingObjectStore::new(LocalObjectStore::new(temp_storage_root(
+        "coverage-v2-head-overwrite-budget",
+    )));
+    let storage = DurableStorage::from_object_store(object_store.clone());
+    let chain = test_chain();
+    for number in 110..=112 {
+        write_block_object_to_storage(&storage, &chain, number, FinalityLevel::Safe);
+    }
+    clear_coverage_index_v1(&storage, &chain);
+
+    storage
+        .compact_small_objects_for_chain(&chain, coverage_index_v2_compaction_config(false))
+        .expect("first coverage index v2 compaction");
+    for number in 113..=115 {
+        write_block_object_to_storage(&storage, &chain, number, FinalityLevel::Safe);
+    }
+    clear_coverage_index_v1(&storage, &chain);
+    storage
+        .compact_small_objects_for_chain(&chain, coverage_index_v2_compaction_config(false))
+        .expect("second coverage index v2 compaction");
+
+    let prefix = format!("chains/{}/coverage-index-v2", chain.key_prefix());
+    object_store.assert_no_overwrite(&format!("{prefix}/snapshots/"));
+    object_store.assert_no_overwrite(&format!("{prefix}/snapshot-heads/"));
+    assert_eq!(
+        object_store.overwrite_budget_violations_for_prefix(&prefix),
+        Vec::<(String, usize)>::new(),
+        "coverage-index-v2 compaction should use immutable records instead of same-key PUT retries"
+    );
+    assert_eq!(coverage_index_v2_snapshot_head_count(&storage, &chain), 2);
+    assert_block_numbers(
+        storage
+            .read_rows(
+                &chain,
+                &DatasetKey::evm_blocks(),
+                &DatasetSelector::all(),
+                LedgerRange::blocks(110, 115).expect("range"),
+            )
+            .expect("read rows after immutable head writes"),
+        &[110, 111, 112, 113, 114, 115],
     );
 }
 
