@@ -319,7 +319,7 @@ git commit -m "fix(storage): clean compaction metadata fragments"
 - Modify only if needed: `docs/runbook/compaction-production-backlog-drain.md`
 - No code changes unless tests reveal a product bug.
 
-- [ ] **Step 1: Run local RustFS or S3-compatible validation**
+- [x] **Step 1: Run local RustFS or S3-compatible validation**
 
 Use the existing compose setup if available. Generate synthetic fragmentation with:
 
@@ -328,7 +328,7 @@ Use the existing compose setup if available. Generate synthetic fragmentation wi
 - Several non-candidate scopes before candidate scopes.
 - At least one chain with manifest metadata fragments but no small data object candidates.
 
-- [ ] **Step 2: Capture before/after metrics**
+- [x] **Step 2: Capture before/after metrics**
 
 Record:
 
@@ -338,6 +338,17 @@ Record:
 - `compacted` count.
 - `datalens inspect maintenance` duration.
 - Query/read correctness before and after.
+
+Latest local RustFS validation (`DATALENS_S3_ENDPOINT_URL=http://localhost:9100`) used
+`test_s3_compaction_cleans_fragmentation_without_read_regression` with eight synthetic
+single-block EVM rows and full `BlockHeader` readback checks:
+
+- `manifest-segments`: 8 before, 2 after compaction, 2 after cleanup.
+- `metadata/compaction-queue`: 8 before, 9 after cleanup-disabled compaction, 1 after cleanup-enabled cleanup.
+- `compacted` data objects: 0 before, 1 after compaction, 1 after cleanup.
+- First compaction report: `processed_candidates=1`, `compacted_objects=1`, `compacted_rows=8`, `deleted_source_objects=0`.
+- Cleanup report: `processed_candidates=0`, `compacted_objects=0`, `deleted_source_objects=0`, `source_delete_failures=0`.
+- Readback passed before compaction, after compaction, and after cleanup.
 
 - [ ] **Step 3: Commit any runbook guardrail updates**
 
