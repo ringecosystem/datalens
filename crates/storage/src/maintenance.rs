@@ -1621,8 +1621,12 @@ where
                 load_started,
             );
         }
-        let queue_scan =
-            self.scan_compaction_queue_entries(chain, &queue_cursor, max_entries, load_started)?;
+        let queue_scan = self.scan_compaction_queue_entries(
+            chain,
+            &queue_cursor,
+            max_entries.max(2),
+            load_started,
+        )?;
         if !queue_scan.entries.is_empty() || queue_scan.partial {
             return Ok(queue_scan);
         }

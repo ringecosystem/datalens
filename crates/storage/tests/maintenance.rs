@@ -2678,6 +2678,40 @@ fn test_compaction_queue_partial_scope_without_candidates_makes_overlap_progress
 }
 
 #[test]
+fn test_compaction_queue_minimum_scan_width_avoids_single_entry_livelock() {
+    let storage = LocalStorage::new(temp_storage_root("queue-minimum-scan-width"));
+    let chain = test_chain();
+    for number in [1, 3, 4] {
+        write_block_object(&storage, &chain, number, FinalityLevel::Safe);
+    }
+    let config = MaintenanceCompactionConfig {
+        min_object_bytes: u64::MAX,
+        max_input_objects_per_candidate: 2,
+        max_tick_duration_ms: 30_000,
+        max_candidates_per_tick: 1,
+        max_manifest_entries_per_tick: 1,
+        cleanup_enabled: false,
+        delete_source_objects: false,
+        ..MaintenanceCompactionConfig::default()
+    };
+
+    let first = storage
+        .compact_small_objects_for_chain(&chain, config)
+        .expect("first minimum-width tick");
+    assert_eq!(first.tick_status, MaintenanceCompactionTickStatus::Partial);
+    assert_eq!(first.candidate_count, 0);
+
+    let second = storage
+        .compact_small_objects_for_chain(&chain, config)
+        .expect("second minimum-width tick");
+    assert_eq!(second.compacted_objects, 1);
+    assert_eq!(
+        second.candidates[0].range,
+        LedgerRange::blocks(3, 4).expect("range")
+    );
+}
+
+#[test]
 fn test_compaction_coverage_index_v2_snapshot_without_head_keeps_deltas_queryable() {
     let storage = LocalStorage::new(temp_storage_root("coverage-v2-snapshot-no-head"));
     let chain = test_chain();
