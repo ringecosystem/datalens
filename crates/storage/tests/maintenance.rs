@@ -1167,6 +1167,162 @@ fn test_maintenance_report_summarizes_compaction_backlog_by_chain_dataset_select
 }
 
 #[test]
+fn test_maintenance_report_populates_fragmentation_fields() {
+    let storage = LocalStorage::new(temp_storage_root("fragmentation-report"));
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 10, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 11, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 12, FinalityLevel::Safe);
+    let delta_keys = list_prefix(
+        &storage,
+        &format!("chains/{}/coverage-index-v2/deltas", chain.key_prefix()),
+    );
+    let snapshot_key =
+        write_coverage_index_v2_snapshot(&storage, &chain, "snapshot-a", 1, delta_keys.clone());
+    write_coverage_index_v2_snapshot_head(&storage, &chain, "head-a", 1, &snapshot_key);
+    write_coverage_index_v2_cleanup_record(
+        &storage,
+        &chain,
+        "cleanup-a",
+        &snapshot_key,
+        delta_keys.clone(),
+    );
+
+    let report = storage.maintenance_report().expect("maintenance");
+
+    assert_eq!(report.fragmentation.data_object_small_object_count, 3);
+    assert!(report.fragmentation.data_object_small_object_bytes > 0);
+    assert!(
+        report.fragmentation.manifest_segment_count >= 3,
+        "small writes should leave manifest segment fragments"
+    );
+    assert_eq!(report.fragmentation.coverage_delta_count, delta_keys.len());
+    assert!(report.fragmentation.coverage_delta_bytes > 0);
+    assert_eq!(report.fragmentation.coverage_snapshot_count, 1);
+    assert!(report.fragmentation.coverage_snapshot_age_ms_max > 0);
+    assert_eq!(report.fragmentation.coverage_cleanup_record_count, 1);
+    assert_eq!(report.fragmentation.coverage_delta_backlog_top.len(), 1);
+    let backlog = &report.fragmentation.coverage_delta_backlog_top[0];
+    assert_eq!(backlog.chain, chain);
+    assert_eq!(backlog.dataset_key, DatasetKey::evm_blocks());
+    assert_eq!(backlog.scope_kind, "exact");
+    assert_eq!(backlog.scope_class, "all");
+    assert_eq!(backlog.selector_fingerprint.as_deref(), Some("all"));
+    assert_eq!(backlog.bucket_start, 0);
+    assert_eq!(backlog.bucket_end, 99_999);
+    assert_eq!(backlog.object_count, delta_keys.len());
+    assert_eq!(backlog.bytes, report.fragmentation.coverage_delta_bytes);
+}
+
+#[test]
+fn test_maintenance_report_sanitizes_semantic_coverage_delta_backlog_scope() {
+    let storage = LocalStorage::new(temp_storage_root("fragmentation-semantic-scope"));
+    let chain = test_chain();
+    let address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let topic = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let address_key = format!(
+        "chains/{}/coverage-index-v2/deltas/semantic/evm.logs/block/safe/v1/addr/{}/00000000000000000000-00000000000000099999/address.json",
+        chain.key_prefix(),
+        address
+    );
+    let topic_key = format!(
+        "chains/{}/coverage-index-v2/deltas/semantic/evm.logs/block/safe/v1/topic/0/{}/00000000000000000000-00000000000000099999/topic.json",
+        chain.key_prefix(),
+        topic
+    );
+    storage
+        .object_store()
+        .put(&address_key, b"address delta")
+        .expect("write address semantic delta");
+    storage
+        .object_store()
+        .put(&topic_key, b"topic delta")
+        .expect("write topic semantic delta");
+
+    let report = storage.maintenance_report().expect("maintenance");
+    let encoded = serde_json::to_string(&report).expect("encode report");
+
+    assert_eq!(report.fragmentation.coverage_delta_backlog_top.len(), 2);
+    assert!(encoded.contains(r#""scope_kind":"semantic""#));
+    assert!(encoded.contains(r#""scope_class":"addr_value""#));
+    assert!(encoded.contains(r#""scope_class":"topic_value""#));
+    assert!(!encoded.contains(address));
+    assert!(!encoded.contains(topic));
+    assert!(!encoded.contains("semantic_scope"));
+}
+
+#[test]
+fn test_maintenance_report_does_not_expose_exact_canonical_selector_key() {
+    let storage = LocalStorage::new(temp_storage_root("fragmentation-exact-canonical-scope"));
+    let chain = test_chain();
+    let address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let topic = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let delta_key = format!(
+        "chains/{}/coverage-index-v2/deltas/exact/evm.logs/block/addresses={}/topics={}/safe/00000000000000000000-00000000000000099999/exact.json",
+        chain.key_prefix(),
+        address,
+        topic
+    );
+    storage
+        .object_store()
+        .put(&delta_key, b"exact canonical delta")
+        .expect("write exact canonical delta");
+
+    let report = storage.maintenance_report().expect("maintenance");
+    let encoded = serde_json::to_string(&report).expect("encode report");
+
+    assert_eq!(report.fragmentation.coverage_delta_backlog_top.len(), 1);
+    assert_eq!(
+        report.fragmentation.coverage_delta_backlog_top[0].selector_fingerprint,
+        None
+    );
+    assert!(encoded.contains(r#""scope_kind":"exact""#));
+    assert!(encoded.contains(r#""scope_class":"selector""#));
+    assert!(!encoded.contains(address));
+    assert!(!encoded.contains(topic));
+    assert!(!encoded.contains("addresses="));
+    assert!(!encoded.contains("topics="));
+}
+
+#[test]
+fn test_maintenance_report_orders_coverage_delta_backlog_by_bytes_desc() {
+    let storage = LocalStorage::new(temp_storage_root("fragmentation-backlog-order"));
+    let chain = test_chain();
+    let small_key = format!(
+        "chains/{}/coverage-index-v2/deltas/exact/evm.blocks/block/all/safe/00000000000000000000-00000000000000099999/small.json",
+        chain.key_prefix()
+    );
+    let large_key = format!(
+        "chains/{}/coverage-index-v2/deltas/exact/evm.blocks/block/all/safe/00000000000100000000-00000000000199999/large.json",
+        chain.key_prefix()
+    );
+    storage
+        .object_store()
+        .put(&small_key, b"small")
+        .expect("write small delta");
+    storage
+        .object_store()
+        .put(&large_key, b"larger coverage delta bytes")
+        .expect("write large delta");
+
+    let report = storage.maintenance_report().expect("maintenance");
+
+    assert_eq!(report.fragmentation.coverage_delta_backlog_top.len(), 2);
+    assert_eq!(
+        report.fragmentation.coverage_delta_backlog_top[0].bucket_start,
+        100_000_000
+    );
+    assert_eq!(
+        report.fragmentation.coverage_delta_backlog_top[1].bucket_start,
+        0
+    );
+    assert!(
+        report.fragmentation.coverage_delta_backlog_top[0].bytes
+            > report.fragmentation.coverage_delta_backlog_top[1].bytes
+    );
+}
+
+#[test]
 fn test_compaction_uses_configured_parquet_compression() {
     let storage = LocalStorage::new_with_config(
         temp_storage_root("compaction-zstd"),
