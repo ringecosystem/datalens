@@ -285,8 +285,8 @@ Implement metadata cleanup in the compaction maintenance flow:
 - Only run when `cleanup_enabled=true`.
 - Continue deleting consumed queue entries for compacted candidates.
 - Delete stale queue entries whose `segment_key` is missing.
-- Delete stale queue entries whose referenced segment entries are fully shadowed by current base/current manifest entries.
 - Preserve live non-candidate queue entries. A singleton entry is not stale just because it cannot currently form a candidate.
+- Preserve retry progress when queue cleanup is limited by delete budget or delete failure; do not advance queue or scope cursors past entries that still need cleanup.
 - Respect `max_deletes_per_tick` and `max_tick_duration_ms`.
 - Do not delete source data objects outside the existing superseded-source grace flow.
 - Do not delete current manifest objects or manifest segments by broad prefix scan.
