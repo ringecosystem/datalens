@@ -881,6 +881,7 @@ where
             let processed_scope_cursor = cursor_advance_key.clone().map(segment_compaction_cursor);
             let scope_next_key = if partial {
                 processed_scope_cursor
+                    .or(cursor.scope_cursor_overlap)
                     .or(legacy_next_key)
                     .or(cursor.scope_cursor_current)
             } else if processed_candidates < candidates.len() {
@@ -1747,6 +1748,7 @@ where
             cursor_update: CompactionCursorUpdate {
                 scope_cursor_key,
                 scope_cursor_current: Some(scope_cursor),
+                scope_cursor_overlap: None,
                 scope_cursor_advance: cursor_advance_key.map(segment_compaction_cursor),
                 scope_partial,
                 queue_cursor_key,
@@ -1775,6 +1777,7 @@ where
                 cursor_update: CompactionCursorUpdate {
                     scope_cursor_key: compaction_cursor_key(chain),
                     scope_cursor_current: Some(cursor.clone()),
+                    scope_cursor_overlap: None,
                     scope_cursor_advance: None,
                     scope_partial: false,
                     queue_cursor_key: compaction_queue_cursor_key(chain),
@@ -1817,6 +1820,7 @@ where
             cursor_update: CompactionCursorUpdate {
                 scope_cursor_key: compaction_cursor_key(chain),
                 scope_cursor_current: Some(cursor.clone()),
+                scope_cursor_overlap: None,
                 scope_cursor_advance: partial.then_some(CompactionCursor {
                     schema_version: 1,
                     next_segment_key: None,
@@ -1903,6 +1907,7 @@ where
                 cursor_update: CompactionCursorUpdate {
                     scope_cursor_key: compaction_queue_cursor_key(chain),
                     scope_cursor_current: None,
+                    scope_cursor_overlap: None,
                     scope_cursor_advance: None,
                     scope_partial: false,
                     queue_cursor_key: compaction_queue_cursor_key(chain),
@@ -1960,6 +1965,7 @@ where
         let mut entries = Vec::new();
         let mut scanned_objects = 0usize;
         let mut scanned_entries = 0usize;
+        let mut cursor_overlap_key = None;
         let mut stopped_at_next_scope = false;
         for object in &queue_objects {
             if entries.len() >= max_entries {
@@ -1978,6 +1984,7 @@ where
                 break;
             }
             scanned_objects += 1;
+            cursor_overlap_key = cursor_advance_key.clone();
             cursor_advance_key = Some(object.key.clone());
             let Some(segment_bytes) = self.object_store().get_optional(&queue_entry.segment_key)?
             else {
@@ -2010,6 +2017,7 @@ where
             .as_deref()
             .map(compaction_scope_cursor_key)
             .unwrap_or_else(|| compaction_queue_cursor_key(chain));
+        let cursor_overlap = cursor_overlap_key.map(segment_compaction_cursor);
         let queue_cursor_advance = if scope_partial {
             None
         } else {
@@ -2032,6 +2040,7 @@ where
             cursor_update: CompactionCursorUpdate {
                 scope_cursor_key,
                 scope_cursor_current: active_scope_cursor,
+                scope_cursor_overlap: cursor_overlap,
                 scope_cursor_advance: cursor_advance.clone(),
                 scope_partial,
                 queue_cursor_key: compaction_queue_cursor_key(chain),
@@ -2069,6 +2078,7 @@ struct CompactionManifestScan {
 struct CompactionCursorUpdate {
     scope_cursor_key: String,
     scope_cursor_current: Option<CompactionCursor>,
+    scope_cursor_overlap: Option<CompactionCursor>,
     scope_cursor_advance: Option<CompactionCursor>,
     scope_partial: bool,
     queue_cursor_key: String,
