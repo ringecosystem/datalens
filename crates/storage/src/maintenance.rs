@@ -878,13 +878,16 @@ where
                 cursor.scope_cursor_advance.clone(),
                 processed_candidates,
             );
-            let scope_next_key = if partial && processed_candidates < candidates.len() {
+            let processed_scope_cursor = cursor_advance_key.clone().map(segment_compaction_cursor);
+            let scope_next_key = if partial {
+                processed_scope_cursor
+                    .or(legacy_next_key)
+                    .or(cursor.scope_cursor_current)
+            } else if processed_candidates < candidates.len() {
                 cursor_advance_key
                     .map(segment_compaction_cursor)
                     .or(legacy_next_key)
                     .or(cursor.scope_cursor_advance)
-            } else if partial {
-                legacy_next_key.or(cursor.scope_cursor_advance)
             } else {
                 cursor.scope_cursor_advance
             };
@@ -1743,6 +1746,7 @@ where
             partial,
             cursor_update: CompactionCursorUpdate {
                 scope_cursor_key,
+                scope_cursor_current: Some(scope_cursor),
                 scope_cursor_advance: cursor_advance_key.map(segment_compaction_cursor),
                 scope_partial,
                 queue_cursor_key,
@@ -1770,6 +1774,7 @@ where
                 partial: false,
                 cursor_update: CompactionCursorUpdate {
                     scope_cursor_key: compaction_cursor_key(chain),
+                    scope_cursor_current: Some(cursor.clone()),
                     scope_cursor_advance: None,
                     scope_partial: false,
                     queue_cursor_key: compaction_queue_cursor_key(chain),
@@ -1811,6 +1816,7 @@ where
             partial,
             cursor_update: CompactionCursorUpdate {
                 scope_cursor_key: compaction_cursor_key(chain),
+                scope_cursor_current: Some(cursor.clone()),
                 scope_cursor_advance: partial.then_some(CompactionCursor {
                     schema_version: 1,
                     next_segment_key: None,
@@ -1896,6 +1902,7 @@ where
                 partial: false,
                 cursor_update: CompactionCursorUpdate {
                     scope_cursor_key: compaction_queue_cursor_key(chain),
+                    scope_cursor_current: None,
                     scope_cursor_advance: None,
                     scope_partial: false,
                     queue_cursor_key: compaction_queue_cursor_key(chain),
@@ -1905,6 +1912,7 @@ where
         }
         let mut cursor_advance_key = None;
         let mut active_scope_prefix = None;
+        let mut active_scope_cursor = None;
         for object in &queue_objects {
             let Some(bytes) = self.object_store().get_optional(&object.key)? else {
                 cursor_advance_key = Some(object.key.clone());
@@ -1921,6 +1929,7 @@ where
                 .next_segment_key
                 .as_deref()
                 .filter(|key| key.starts_with(&prefix));
+            active_scope_cursor = Some(scope_cursor.clone());
             let should_resume_scope = match (scope_queue_cursor, queue_cursor) {
                 (Some(scope_key), Some(queue_key)) => scope_key > queue_key,
                 (Some(_), None) => true,
@@ -2022,6 +2031,7 @@ where
             partial,
             cursor_update: CompactionCursorUpdate {
                 scope_cursor_key,
+                scope_cursor_current: active_scope_cursor,
                 scope_cursor_advance: cursor_advance.clone(),
                 scope_partial,
                 queue_cursor_key: compaction_queue_cursor_key(chain),
@@ -2058,6 +2068,7 @@ struct CompactionManifestScan {
 #[derive(Clone, Debug)]
 struct CompactionCursorUpdate {
     scope_cursor_key: String,
+    scope_cursor_current: Option<CompactionCursor>,
     scope_cursor_advance: Option<CompactionCursor>,
     scope_partial: bool,
     queue_cursor_key: String,

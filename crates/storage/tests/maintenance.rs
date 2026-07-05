@@ -2605,6 +2605,44 @@ fn test_compaction_queue_advances_after_non_candidate_scope() {
 }
 
 #[test]
+fn test_compaction_queue_partial_scope_does_not_skip_unprocessed_entry() {
+    let storage = LocalStorage::new(temp_storage_root("queue-partial-scope-no-skip"));
+    let chain = test_chain();
+    for number in 1..=4 {
+        write_block_object(&storage, &chain, number, FinalityLevel::Safe);
+    }
+    let config = MaintenanceCompactionConfig {
+        min_object_bytes: u64::MAX,
+        max_input_objects_per_candidate: 2,
+        max_tick_duration_ms: 30_000,
+        max_candidates_per_tick: 1,
+        max_manifest_entries_per_tick: 3,
+        cleanup_enabled: false,
+        delete_source_objects: false,
+        ..MaintenanceCompactionConfig::default()
+    };
+
+    let first = storage
+        .compact_small_objects_for_chain(&chain, config)
+        .expect("first partial scope tick");
+    assert_eq!(first.tick_status, MaintenanceCompactionTickStatus::Partial);
+    assert_eq!(first.compacted_objects, 1);
+    assert_eq!(
+        first.candidates[0].range,
+        LedgerRange::blocks(1, 2).expect("range")
+    );
+
+    let second = storage
+        .compact_small_objects_for_chain(&chain, config)
+        .expect("second partial scope tick");
+    assert_eq!(second.compacted_objects, 1);
+    assert_eq!(
+        second.candidates[0].range,
+        LedgerRange::blocks(3, 4).expect("range")
+    );
+}
+
+#[test]
 fn test_compaction_coverage_index_v2_snapshot_without_head_keeps_deltas_queryable() {
     let storage = LocalStorage::new(temp_storage_root("coverage-v2-snapshot-no-head"));
     let chain = test_chain();
