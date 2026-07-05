@@ -1915,6 +1915,7 @@ where
         let mut scanned_entries = 0usize;
         let mut cursor_advance_key = None;
         let mut active_scope_prefix = None;
+        let mut stopped_at_next_scope = false;
         for object in &queue_objects {
             if entries.len() >= max_entries {
                 break;
@@ -1928,6 +1929,7 @@ where
             if active_scope_prefix.is_none() {
                 active_scope_prefix = object_scope_prefix.clone();
             } else if active_scope_prefix != object_scope_prefix {
+                stopped_at_next_scope = true;
                 break;
             }
             scanned_objects += 1;
@@ -1955,13 +1957,11 @@ where
                 }
             }
         }
-        let scope_partial = scanned_objects < queue_objects.len();
-        let partial = !entries.is_empty() && (scope_partial || list_page.has_more);
+        let scope_partial =
+            !stopped_at_next_scope && (scanned_objects < queue_objects.len() || list_page.has_more);
+        let partial = !entries.is_empty() && (scope_partial || stopped_at_next_scope);
         let cursor_advance = cursor_advance_key.map(segment_compaction_cursor);
-        let scope_cursor_key = active_scope_prefix
-            .as_deref()
-            .map(compaction_scope_cursor_key)
-            .unwrap_or_else(|| compaction_queue_cursor_key(chain));
+        let scope_cursor_key = compaction_queue_cursor_key(chain);
         let queue_cursor_advance = if scope_partial {
             None
         } else {

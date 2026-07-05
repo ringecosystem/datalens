@@ -2561,6 +2561,50 @@ fn test_compaction_tick_cleans_consumed_queue_entries() {
 }
 
 #[test]
+fn test_compaction_queue_advances_after_non_candidate_scope() {
+    let storage = LocalStorage::new(temp_storage_root("queue-non-candidate-scope"));
+    let chain = test_chain();
+    let selector_a = DatasetSelector::try_other(
+        AdapterKey::try_new("test").expect("adapter key"),
+        "selector-a",
+        "selector-a",
+    )
+    .expect("selector a");
+    let selector_b = DatasetSelector::try_other(
+        AdapterKey::try_new("test").expect("adapter key"),
+        "selector-b",
+        "selector-b",
+    )
+    .expect("selector b");
+    write_block_object_with_selector(&storage, &chain, &selector_a, 108, FinalityLevel::Safe);
+    write_block_object_with_selector(&storage, &chain, &selector_b, 109, FinalityLevel::Safe);
+    write_block_object_with_selector(&storage, &chain, &selector_b, 110, FinalityLevel::Safe);
+    let config = MaintenanceCompactionConfig {
+        min_object_bytes: u64::MAX,
+        max_input_objects_per_candidate: 2,
+        max_tick_duration_ms: 30_000,
+        max_candidates_per_tick: 1,
+        max_manifest_entries_per_tick: 20_000,
+        cleanup_enabled: false,
+        delete_source_objects: false,
+        ..MaintenanceCompactionConfig::default()
+    };
+
+    let first = storage
+        .compact_small_objects_for_chain(&chain, config)
+        .expect("first tick");
+    assert_eq!(first.candidate_count, 0);
+    assert_eq!(first.processed_candidates, 0);
+
+    let second = storage
+        .compact_small_objects_for_chain(&chain, config)
+        .expect("second tick");
+    assert_eq!(second.candidate_count, 1);
+    assert_eq!(second.processed_candidates, 1);
+    assert_eq!(second.compacted_objects, 1);
+}
+
+#[test]
 fn test_compaction_coverage_index_v2_snapshot_without_head_keeps_deltas_queryable() {
     let storage = LocalStorage::new(temp_storage_root("coverage-v2-snapshot-no-head"));
     let chain = test_chain();
