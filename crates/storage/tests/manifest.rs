@@ -4423,6 +4423,72 @@ fn test_coverage_index_v2_read_without_snapshot_matches_v1_exact_coverage() {
 }
 
 #[test]
+fn test_coverage_index_v2_exact_data_delta_matches_v1_coverage() {
+    let v1_storage = LocalStorage::new(temp_storage_root("coverage-index-v2-exact-v1-parity"));
+    let v2_storage = LocalStorage::new(temp_storage_root("coverage-index-v2-exact-v2-parity"));
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let ranges = [
+        LedgerRange::blocks(10, 10).expect("valid range"),
+        LedgerRange::blocks(12, 12).expect("valid range"),
+    ];
+
+    for storage in [&v1_storage, &v2_storage] {
+        for range in ranges.clone() {
+            storage
+                .write_rows(StorageWriteRequest {
+                    chain: &chain,
+                    dataset_key: DatasetKey::evm_blocks(),
+                    selector: &selector,
+                    range: range.clone(),
+                    rows: &single_block_rows(range.start()),
+                    finality_level: FinalityLevel::Safe,
+                    record_empty_coverage: true,
+                })
+                .expect("write block coverage");
+        }
+    }
+    clear_coverage_index_v2(&v1_storage, &chain);
+    clear_coverage_index_v1(&v2_storage, &chain);
+
+    let query_range = LedgerRange::blocks(10, 12).expect("valid range");
+    let v1_covered = v1_storage
+        .covered_ranges(
+            &chain,
+            &DatasetKey::evm_blocks(),
+            &selector,
+            query_range.clone(),
+        )
+        .expect("v1 covered ranges");
+    let v2_covered = v2_storage
+        .covered_ranges(
+            &chain,
+            &DatasetKey::evm_blocks(),
+            &selector,
+            query_range.clone(),
+        )
+        .expect("v2 covered ranges");
+    assert_eq!(
+        v2_covered, v1_covered,
+        "coverage-index-v2 exact data deltas must not widen or drop v1 coverage"
+    );
+    assert_eq!(
+        v2_storage
+            .read_rows(&chain, &DatasetKey::evm_blocks(), &selector, query_range)
+            .expect("v2 read rows"),
+        v1_storage
+            .read_rows(
+                &chain,
+                &DatasetKey::evm_blocks(),
+                &selector,
+                LedgerRange::blocks(10, 12).expect("valid range"),
+            )
+            .expect("v1 read rows"),
+        "coverage-index-v2 exact data deltas must resolve the same rows as v1"
+    );
+}
+
+#[test]
 fn test_coverage_index_v2_read_supports_semantic_evm_log_deltas() {
     let storage = LocalStorage::new(temp_storage_root("coverage-index-v2-semantic-deltas"));
     let chain = test_chain();
@@ -4468,6 +4534,242 @@ fn test_coverage_index_v2_read_supports_semantic_evm_log_deltas() {
         }
         rows => panic!("expected log rows, got {rows:?}"),
     }
+}
+
+#[test]
+fn test_coverage_index_v2_semantic_evm_log_delta_matches_v1_coverage() {
+    let v1_storage = LocalStorage::new(temp_storage_root("coverage-index-v2-semantic-v1-parity"));
+    let v2_storage = LocalStorage::new(temp_storage_root("coverage-index-v2-semantic-v2-parity"));
+    let chain = test_chain();
+    let broad_selector = evm_log_selector(Vec::new(), Vec::new());
+    let narrow_selector = evm_log_selector(vec![ADDRESS_A], vec![Some(vec![TOPIC_1])]);
+    let range = LedgerRange::blocks(42, 42).expect("valid range");
+    let rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![
+            log_record(42, 0, ADDRESS_A, vec![TOPIC_1]),
+            log_record(42, 1, ADDRESS_B, vec![TOPIC_2]),
+        ]),
+    )
+    .expect("dataset rows");
+
+    for storage in [&v1_storage, &v2_storage] {
+        storage
+            .write_rows(StorageWriteRequest {
+                chain: &chain,
+                dataset_key: DatasetKey::evm_logs(),
+                selector: &broad_selector,
+                range: range.clone(),
+                rows: &rows,
+                finality_level: FinalityLevel::Safe,
+                record_empty_coverage: true,
+            })
+            .expect("write log coverage");
+    }
+    clear_coverage_index_v2(&v1_storage, &chain);
+    clear_coverage_index_v1(&v2_storage, &chain);
+
+    assert_eq!(
+        v2_storage
+            .covered_ranges(
+                &chain,
+                &DatasetKey::evm_logs(),
+                &narrow_selector,
+                range.clone(),
+            )
+            .expect("v2 covered ranges"),
+        v1_storage
+            .covered_ranges(
+                &chain,
+                &DatasetKey::evm_logs(),
+                &narrow_selector,
+                range.clone(),
+            )
+            .expect("v1 covered ranges"),
+        "coverage-index-v2 semantic log deltas must preserve v1 narrowing coverage"
+    );
+    assert_eq!(
+        v2_storage
+            .read_rows(
+                &chain,
+                &DatasetKey::evm_logs(),
+                &narrow_selector,
+                range.clone()
+            )
+            .expect("v2 read rows"),
+        v1_storage
+            .read_rows(&chain, &DatasetKey::evm_logs(), &narrow_selector, range)
+            .expect("v1 read rows"),
+        "coverage-index-v2 semantic log deltas must preserve v1 filtered rows"
+    );
+}
+
+#[test]
+fn test_coverage_index_v2_empty_deltas_coalesce_adjacent_ranges() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-index-v2-empty-coalesce"));
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let rows = DatasetRows::new(DatasetKey::evm_blocks(), QueryRows::EvmBlocks(Vec::new()))
+        .expect("dataset rows");
+
+    for block in [10, 11] {
+        storage
+            .write_rows(StorageWriteRequest {
+                chain: &chain,
+                dataset_key: DatasetKey::evm_blocks(),
+                selector: &selector,
+                range: LedgerRange::blocks(block, block).expect("valid range"),
+                rows: &rows,
+                finality_level: FinalityLevel::Safe,
+                record_empty_coverage: true,
+            })
+            .expect("write empty coverage");
+    }
+    clear_coverage_index_v1(&storage, &chain);
+
+    assert_eq!(
+        storage
+            .covered_ranges(
+                &chain,
+                &DatasetKey::evm_blocks(),
+                &selector,
+                LedgerRange::blocks(10, 11).expect("valid range"),
+            )
+            .expect("v2 empty covered ranges"),
+        vec![LedgerRange::blocks(10, 11).expect("valid range")],
+        "adjacent empty coverage deltas must coalesce instead of leaving a coverage gap"
+    );
+    assert_eq!(
+        storage
+            .read_rows(
+                &chain,
+                &DatasetKey::evm_blocks(),
+                &selector,
+                LedgerRange::blocks(10, 11).expect("valid range"),
+            )
+            .expect("v2 empty read rows")
+            .row_count(),
+        0
+    );
+}
+
+#[test]
+fn test_coverage_index_v2_partial_exact_coverage_falls_back_to_semantic_logs() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-index-v2-exact-semantic-gap"));
+    let chain = test_chain();
+    let narrow_selector = evm_log_selector(vec![ADDRESS_A], vec![Some(vec![TOPIC_1])]);
+    let broad_selector = evm_log_selector(Vec::new(), Vec::new());
+    let exact_rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![log_record(41, 1, ADDRESS_A, vec![TOPIC_1])]),
+    )
+    .expect("exact rows");
+
+    for block in [40, 42] {
+        let broad_rows = DatasetRows::new(
+            DatasetKey::evm_logs(),
+            QueryRows::EvmLogs(vec![log_record(block, 0, ADDRESS_A, vec![TOPIC_1])]),
+        )
+        .expect("broad rows");
+        storage
+            .write_rows(StorageWriteRequest {
+                chain: &chain,
+                dataset_key: DatasetKey::evm_logs(),
+                selector: &broad_selector,
+                range: LedgerRange::blocks(block, block).expect("valid range"),
+                rows: &broad_rows,
+                finality_level: FinalityLevel::Safe,
+                record_empty_coverage: true,
+            })
+            .expect("write broad semantic coverage");
+    }
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &narrow_selector,
+            range: LedgerRange::blocks(41, 41).expect("valid range"),
+            rows: &exact_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write exact coverage");
+    clear_coverage_index_v1(&storage, &chain);
+
+    assert_eq!(
+        storage
+            .covered_ranges(
+                &chain,
+                &DatasetKey::evm_logs(),
+                &narrow_selector,
+                LedgerRange::blocks(40, 42).expect("valid range"),
+            )
+            .expect("mixed v2 coverage"),
+        vec![LedgerRange::blocks(40, 42).expect("valid range")],
+        "partial exact v2 coverage must use semantic v2 coverage for missing ranges"
+    );
+    let read = storage
+        .read_rows(
+            &chain,
+            &DatasetKey::evm_logs(),
+            &narrow_selector,
+            LedgerRange::blocks(40, 42).expect("valid range"),
+        )
+        .expect("mixed exact and semantic rows");
+    match read.into_rows() {
+        QueryRows::EvmLogs(logs) => assert_eq!(
+            logs.into_iter()
+                .map(|record| (record.block_number, record.log_index))
+                .collect::<Vec<_>>(),
+            vec![(40, 0), (41, 1), (42, 0)]
+        ),
+        rows => panic!("expected log rows, got {rows:?}"),
+    }
+}
+
+#[test]
+fn test_coverage_index_v2_finalized_read_does_not_mix_safe_only_delta() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-index-v2-finality-isolated"));
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &selector,
+            range: LedgerRange::blocks(50, 50).expect("valid range"),
+            rows: &single_block_rows(50),
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write safe coverage");
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &selector,
+            range: LedgerRange::blocks(51, 51).expect("valid range"),
+            rows: &single_block_rows(51),
+            finality_level: FinalityLevel::Finalized,
+            record_empty_coverage: true,
+        })
+        .expect("write finalized coverage");
+    clear_coverage_index_v1(&storage, &chain);
+
+    assert_eq!(
+        storage
+            .read_rows_for_finality(
+                &chain,
+                &DatasetKey::evm_blocks(),
+                &selector,
+                LedgerRange::blocks(50, 51).expect("valid range"),
+                FinalityLevel::Finalized,
+            )
+            .expect("finalized v2 read rows"),
+        single_block_rows(51),
+        "finalized reads must not include safe-only v2 coverage from the same bucket"
+    );
 }
 
 #[test]
