@@ -7,10 +7,15 @@ use std::{
     time::Duration,
 };
 
-use datalens_core::DatalensErrorKind;
+use datalens_chain::{DatasetSelector, FinalityLevel};
+use datalens_core::{
+    BlockHeader, ChainFamily, ChainIdentity, DatalensErrorKind, DatasetKey, DatasetRows,
+    LedgerRange, NetworkId, QueryRows,
+};
 use datalens_storage::{
-    LocalObjectStore, ObjectLockLease, ObjectPutIfAbsentResult, ObjectStore, S3ObjectStore,
-    S3ObjectStoreConfig, validate_object_key,
+    DurableStorage, LocalObjectStore, MaintenanceCompactionConfig, ObjectLockLease,
+    ObjectPutIfAbsentResult, ObjectStore, S3ObjectStore, S3ObjectStoreConfig, StorageWriteRequest,
+    validate_object_key,
 };
 
 mod support;
@@ -600,6 +605,232 @@ fn test_s3_object_store_put_if_absent_creates_once_without_overwrite() {
     assert_eq!(store.get(key).expect("read existing object"), b"first");
 
     store.delete(key).expect("delete object");
+}
+
+#[test]
+fn test_s3_compaction_cleans_fragmentation_without_read_regression() {
+    let Some(config) = s3_test_config() else {
+        return;
+    };
+    let chain = s3_compaction_test_chain();
+    let selector = DatasetSelector::all();
+    let store = S3ObjectStore::from_config(config).expect("build S3 object store");
+    let storage = DurableStorage::from_object_store(store);
+    let manifest_segment_prefix = format!("chains/{}/manifest-segments", chain.key_prefix());
+    let queue_prefix = format!("chains/{}/metadata/compaction-queue", chain.key_prefix());
+    let data_prefix = format!("chains/{}/datasets", chain.key_prefix());
+    let source_blocks = (10_000..10_008).collect::<Vec<_>>();
+
+    for block_number in &source_blocks {
+        write_block_object_to_storage(
+            &storage,
+            &chain,
+            &selector,
+            *block_number,
+            FinalityLevel::Safe,
+        );
+    }
+
+    let before_manifest_segments = list_prefix(&storage, &manifest_segment_prefix).len();
+    let before_queue_entries = list_prefix(&storage, &queue_prefix).len();
+    let before_compacted_objects = compacted_object_keys(&storage, &data_prefix).len();
+    assert_eq!(before_manifest_segments, source_blocks.len());
+    assert_eq!(before_queue_entries, source_blocks.len());
+    assert_eq!(before_compacted_objects, 0);
+    assert_read_block_numbers(&storage, &chain, &selector, &source_blocks);
+
+    let first_report = storage
+        .compact_small_objects_for_chain(&chain, s3_compaction_config(false))
+        .expect("first s3 compaction");
+    assert_eq!(first_report.compacted_objects, 1);
+    assert_eq!(first_report.compacted_rows, source_blocks.len());
+    assert_eq!(first_report.deleted_source_objects, 0);
+    assert_read_block_numbers(&storage, &chain, &selector, &source_blocks);
+
+    let after_first_manifest_segments = list_prefix(&storage, &manifest_segment_prefix).len();
+    let after_first_queue_entries = list_prefix(&storage, &queue_prefix).len();
+    let after_first_compacted_objects = compacted_object_keys(&storage, &data_prefix).len();
+    assert!(
+        after_first_manifest_segments < before_manifest_segments,
+        "compaction should replace fragmented manifest segments"
+    );
+    assert!(
+        after_first_compacted_objects > before_compacted_objects,
+        "compaction should create a compacted data object"
+    );
+    assert!(
+        after_first_queue_entries > before_queue_entries,
+        "cleanup disabled should leave consumed queue entries plus the compacted entry"
+    );
+
+    let second_report = storage
+        .compact_small_objects_for_chain(&chain, s3_compaction_config(true))
+        .expect("second s3 compaction cleanup");
+    assert_eq!(second_report.compacted_objects, 0);
+    assert_eq!(second_report.deleted_source_objects, 0);
+    assert_read_block_numbers(&storage, &chain, &selector, &source_blocks);
+
+    let after_second_manifest_segments = list_prefix(&storage, &manifest_segment_prefix).len();
+    let after_second_queue_entries = list_prefix(&storage, &queue_prefix).len();
+    let after_second_compacted_objects = compacted_object_keys(&storage, &data_prefix).len();
+    assert_eq!(
+        after_second_manifest_segments,
+        after_first_manifest_segments
+    );
+    assert_eq!(
+        after_second_compacted_objects,
+        after_first_compacted_objects
+    );
+    assert!(
+        after_second_queue_entries < after_first_queue_entries,
+        "cleanup enabled should remove consumed or stale queue entries"
+    );
+    assert_eq!(
+        after_second_queue_entries, after_first_compacted_objects,
+        "cleanup should leave only the live compacted queue entry"
+    );
+
+    println!(
+        "{}",
+        serde_json::json!({
+            "test": "test_s3_compaction_cleans_fragmentation_without_read_regression",
+            "chain": chain.key_prefix(),
+            "blocks": source_blocks.len(),
+            "manifest_segments": {
+                "before": before_manifest_segments,
+                "after_first": after_first_manifest_segments,
+                "after_second": after_second_manifest_segments,
+            },
+            "compaction_queue": {
+                "before": before_queue_entries,
+                "after_first": after_first_queue_entries,
+                "after_second": after_second_queue_entries,
+            },
+            "compacted_objects": {
+                "before": before_compacted_objects,
+                "after_first": after_first_compacted_objects,
+                "after_second": after_second_compacted_objects,
+            },
+            "first_report": {
+                "compacted_objects": first_report.compacted_objects,
+                "compacted_rows": first_report.compacted_rows,
+                "processed_candidates": first_report.processed_candidates,
+                "deleted_source_objects": first_report.deleted_source_objects,
+            },
+            "second_report": {
+                "compacted_objects": second_report.compacted_objects,
+                "compacted_rows": second_report.compacted_rows,
+                "processed_candidates": second_report.processed_candidates,
+                "deleted_source_objects": second_report.deleted_source_objects,
+                "source_delete_failures": second_report.source_delete_failures,
+            },
+        })
+    );
+}
+
+fn s3_compaction_config(cleanup_enabled: bool) -> MaintenanceCompactionConfig {
+    MaintenanceCompactionConfig {
+        min_object_bytes: u64::MAX,
+        max_input_objects_per_candidate: 16,
+        max_tick_duration_ms: 30_000,
+        max_candidates_per_tick: 4,
+        max_concurrent_candidates: 4,
+        max_manifest_entries_per_tick: 20_000,
+        max_gets_per_tick: 128,
+        max_puts_per_tick: 16,
+        max_deletes_per_tick: 128,
+        cleanup_enabled,
+        delete_source_objects: false,
+        ..MaintenanceCompactionConfig::default()
+    }
+}
+
+fn write_block_object_to_storage<S: ObjectStore>(
+    storage: &DurableStorage<S>,
+    chain: &ChainIdentity,
+    selector: &DatasetSelector,
+    number: u64,
+    finality: FinalityLevel,
+) {
+    let rows = DatasetRows::new(
+        DatasetKey::evm_blocks(),
+        QueryRows::EvmBlocks(vec![BlockHeader {
+            number,
+            hash: format!("0xblock{number}"),
+            parent_hash: "0xparent".to_owned(),
+            timestamp: number,
+        }]),
+    )
+    .expect("rows");
+    storage
+        .write_rows(StorageWriteRequest {
+            chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector,
+            range: LedgerRange::blocks(number, number).expect("range"),
+            rows: &rows,
+            finality_level: finality,
+            record_empty_coverage: true,
+        })
+        .expect("write rows");
+}
+
+fn assert_read_block_numbers<S: ObjectStore>(
+    storage: &DurableStorage<S>,
+    chain: &ChainIdentity,
+    selector: &DatasetSelector,
+    expected: &[u64],
+) {
+    let rows = storage
+        .read_rows(
+            chain,
+            &DatasetKey::evm_blocks(),
+            selector,
+            LedgerRange::blocks(
+                *expected.first().expect("first expected block"),
+                *expected.last().expect("last expected block"),
+            )
+            .expect("read range"),
+        )
+        .expect("read rows");
+    match rows.into_rows() {
+        QueryRows::EvmBlocks(blocks) => {
+            assert_eq!(
+                blocks
+                    .into_iter()
+                    .map(|block| block.number)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+        rows => panic!("expected evm block rows, got {rows:?}"),
+    }
+}
+
+fn list_prefix<S: ObjectStore>(storage: &DurableStorage<S>, prefix: &str) -> Vec<String> {
+    let mut keys = storage
+        .object_store()
+        .list(prefix)
+        .expect("list prefix")
+        .into_iter()
+        .map(|object| object.key)
+        .collect::<Vec<_>>();
+    keys.sort();
+    keys
+}
+
+fn compacted_object_keys<S: ObjectStore>(
+    storage: &DurableStorage<S>,
+    data_prefix: &str,
+) -> Vec<String> {
+    list_prefix(storage, data_prefix)
+        .into_iter()
+        .filter(|key| key.contains("/compacted/"))
+        .collect()
+}
+
+fn s3_compaction_test_chain() -> ChainIdentity {
+    ChainIdentity::expect_with_network_id(ChainFamily::Evm, "ethereum", NetworkId::numeric(1))
 }
 
 fn temp_storage_root(name: &str) -> PathBuf {
