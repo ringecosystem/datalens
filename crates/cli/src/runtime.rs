@@ -590,33 +590,56 @@ impl StorageCompactionWorker {
                             }
                         };
                     let leader_checkpoint = leader_lock.checkpoint();
-                    let reconciliation = match &storage {
-                        CompactionStorage::Local(storage) => leader_checkpoint.check().and_then(|()| {
-                            storage.reconcile_compaction_for_chain_with_checkpoint(
-                                &chain,
-                                tick_config,
-                                || leader_checkpoint.check(),
-                            )
-                        }),
-                        CompactionStorage::S3(storage) => leader_checkpoint.check().and_then(|()| {
-                            storage.reconcile_compaction_for_chain_with_checkpoint(
-                                &chain,
-                                tick_config,
-                                || leader_checkpoint.check(),
-                            )
-                        }),
-                    };
-                    let result = reconciliation.and_then(|reconciliation| {
+                    let result = if storage_compaction_tick_needs_reconciliation(tick_config) {
+                        let reconciliation = match &storage {
+                            CompactionStorage::Local(storage) => leader_checkpoint.check().and_then(|()| {
+                                storage.reconcile_compaction_for_chain_with_checkpoint(
+                                    &chain,
+                                    tick_config,
+                                    || leader_checkpoint.check(),
+                                )
+                            }),
+                            CompactionStorage::S3(storage) => leader_checkpoint.check().and_then(|()| {
+                                storage.reconcile_compaction_for_chain_with_checkpoint(
+                                    &chain,
+                                    tick_config,
+                                    || leader_checkpoint.check(),
+                                )
+                            }),
+                        };
+                        reconciliation.and_then(|reconciliation| {
+                            log::info!(
+                                "storage compaction reconciliation completed chain_key={} orphan_compacted_objects={} stale_source_objects={} stale_cleanup_records={} deleted_orphan_compacted_objects={} deleted_stale_source_objects={} deleted_stale_cleanup_records={} delete_failures={}",
+                                chain.key_prefix(),
+                                reconciliation.orphan_compacted_objects.len(),
+                                reconciliation.stale_source_objects.len(),
+                                reconciliation.stale_cleanup_records.len(),
+                                reconciliation.deleted_orphan_compacted_objects,
+                                reconciliation.deleted_stale_source_objects,
+                                reconciliation.deleted_stale_cleanup_records,
+                                reconciliation.delete_failures
+                            );
+                            match &storage {
+                                CompactionStorage::Local(storage) => leader_checkpoint.check().and_then(|()| {
+                                    storage.compact_small_objects_for_chain_with_checkpoint(
+                                        &chain,
+                                        tick_config,
+                                        || leader_checkpoint.check(),
+                                    )
+                                }),
+                                CompactionStorage::S3(storage) => leader_checkpoint.check().and_then(|()| {
+                                    storage.compact_small_objects_for_chain_with_checkpoint(
+                                        &chain,
+                                        tick_config,
+                                        || leader_checkpoint.check(),
+                                    )
+                                }),
+                            }
+                        })
+                    } else {
                         log::info!(
-                            "storage compaction reconciliation completed chain_key={} orphan_compacted_objects={} stale_source_objects={} stale_cleanup_records={} deleted_orphan_compacted_objects={} deleted_stale_source_objects={} deleted_stale_cleanup_records={} delete_failures={}",
-                            chain.key_prefix(),
-                            reconciliation.orphan_compacted_objects.len(),
-                            reconciliation.stale_source_objects.len(),
-                            reconciliation.stale_cleanup_records.len(),
-                            reconciliation.deleted_orphan_compacted_objects,
-                            reconciliation.deleted_stale_source_objects,
-                            reconciliation.deleted_stale_cleanup_records,
-                            reconciliation.delete_failures
+                            "storage compaction reconciliation skipped reason=cleanup_disabled chain_key={}",
+                            chain.key_prefix()
                         );
                         match &storage {
                             CompactionStorage::Local(storage) => leader_checkpoint.check().and_then(|()| {
@@ -634,7 +657,7 @@ impl StorageCompactionWorker {
                                 )
                             }),
                         }
-                    });
+                    };
                     drop(leader_lock);
                     match result {
                         Ok(report) => {
@@ -880,6 +903,10 @@ fn maintenance_compaction_config(
         delete_source_objects: config.delete_source_objects,
         ..MaintenanceCompactionConfig::default()
     }
+}
+
+fn storage_compaction_tick_needs_reconciliation(config: MaintenanceCompactionConfig) -> bool {
+    config.cleanup_enabled
 }
 
 fn build_evm_service_with_storage(
@@ -1833,6 +1860,26 @@ mod tests {
 
         assert!(compaction.cleanup_enabled);
         assert!(compaction.delete_source_objects);
+    }
+
+    #[test]
+    fn storage_compaction_reconciliation_is_skipped_when_cleanup_disabled() {
+        let config = MaintenanceCompactionConfig {
+            cleanup_enabled: false,
+            ..MaintenanceCompactionConfig::default()
+        };
+
+        assert!(!storage_compaction_tick_needs_reconciliation(config));
+    }
+
+    #[test]
+    fn storage_compaction_reconciliation_runs_when_cleanup_enabled() {
+        let config = MaintenanceCompactionConfig {
+            cleanup_enabled: true,
+            ..MaintenanceCompactionConfig::default()
+        };
+
+        assert!(storage_compaction_tick_needs_reconciliation(config));
     }
 
     #[test]

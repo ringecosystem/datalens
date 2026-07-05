@@ -543,6 +543,7 @@ where
             .collect::<Vec<_>>();
         self.compact_selected_manifest_entries(CompactSelectedManifestEntriesArgs {
             entries,
+            stale_queue_entry_keys: Vec::new(),
             config,
             started,
             cursor: None,
@@ -578,6 +579,7 @@ where
         let report =
             self.compact_selected_manifest_entries(CompactSelectedManifestEntriesArgs {
                 entries: scan.entries,
+                stale_queue_entry_keys: scan.stale_queue_entry_keys,
                 config,
                 started,
                 cursor: Some(scan.cursor_update),
@@ -699,6 +701,7 @@ where
     ) -> Result<MaintenanceCompactionReport, DatalensError> {
         let CompactSelectedManifestEntriesArgs {
             entries,
+            stale_queue_entry_keys,
             config,
             started,
             cursor,
@@ -761,7 +764,7 @@ where
         let mut input_objects = 0usize;
         let mut deleted_manifest_segments = BTreeSet::new();
         let deleted_source_objects = 0usize;
-        let source_delete_failures = 0usize;
+        let mut source_delete_failures = 0usize;
         let mut cursor_advance_key = None;
         let max_candidates = config
             .max_candidates_per_tick
@@ -769,6 +772,7 @@ where
             .min(config.max_concurrent_candidates.max(1));
         let max_duration = Duration::from_millis(config.max_tick_duration_ms.max(1));
         let mut partial = scan_partial;
+        let mut cleanup_incomplete = false;
         let mut operation_budget = CompactionOperationBudget::new(config);
         let mut coverage_index_v2_report = CoverageIndexV2CompactionReport::default();
 
@@ -851,6 +855,15 @@ where
                         queue_entry_keys.into_iter(),
                     );
                     operation_budget.record_deletes(cleanup.deleted_objects);
+                    source_delete_failures =
+                        source_delete_failures.saturating_add(cleanup.delete_failures);
+                    if cleanup.delete_failures > 0 {
+                        partial = true;
+                        cleanup_incomplete = true;
+                    }
+                } else if !queue_entry_keys.is_empty() {
+                    partial = true;
+                    cleanup_incomplete = true;
                 }
             }
             log::info!(
@@ -862,6 +875,32 @@ where
                 processed_candidates,
                 candidate_started.elapsed().as_millis()
             );
+        }
+
+        if config.cleanup_enabled
+            && let Some(chain) = chain
+            && !stale_queue_entry_keys.is_empty()
+        {
+            let remaining_deletes = operation_budget.remaining_deletes();
+            if remaining_deletes == 0 {
+                partial = true;
+                cleanup_incomplete = true;
+            } else {
+                let attempted_deletes = stale_queue_entry_keys.len().min(remaining_deletes);
+                let queue_entry_keys = stale_queue_entry_keys
+                    .iter()
+                    .take(attempted_deletes)
+                    .map(String::as_str);
+                checkpoint()?;
+                let cleanup = self.delete_compaction_queue_entries(chain, queue_entry_keys);
+                operation_budget.record_deletes(cleanup.deleted_objects);
+                source_delete_failures =
+                    source_delete_failures.saturating_add(cleanup.delete_failures);
+                if attempted_deletes < stale_queue_entry_keys.len() || cleanup.delete_failures > 0 {
+                    partial = true;
+                    cleanup_incomplete = true;
+                }
+            }
         }
 
         if config.cleanup_enabled || config.coverage_index_v2_delta_count_threshold > 0 {
@@ -878,18 +917,32 @@ where
                 cursor.scope_cursor_advance.clone(),
                 processed_candidates,
             );
-            let scope_next_key = if partial && processed_candidates < candidates.len() {
+            let processed_scope_cursor = cursor_advance_key.clone().map(segment_compaction_cursor);
+            let legacy_scan_cursor = cursor
+                .scope_cursor_advance
+                .clone()
+                .filter(|cursor| cursor.legacy_entry_offset.is_some());
+            let scope_next_key = if cleanup_incomplete {
+                cursor.scope_cursor_current
+            } else if partial {
+                processed_scope_cursor
+                    .or(legacy_next_key)
+                    .or(legacy_scan_cursor)
+                    .or(cursor.scope_cursor_overlap)
+                    .or(cursor.scope_cursor_current)
+            } else if processed_candidates < candidates.len() {
                 cursor_advance_key
                     .map(segment_compaction_cursor)
                     .or(legacy_next_key)
                     .or(cursor.scope_cursor_advance)
-            } else if partial {
-                legacy_next_key.or(cursor.scope_cursor_advance)
             } else {
                 cursor.scope_cursor_advance
             };
             self.write_compaction_cursor_key(&cursor.scope_cursor_key, scope_next_key)?;
-            if !cursor.scope_partial && processed_candidates >= candidates.len() {
+            if !cleanup_incomplete
+                && !cursor.scope_partial
+                && processed_candidates >= candidates.len()
+            {
                 self.write_compaction_cursor_key(
                     &cursor.queue_cursor_key,
                     cursor.queue_cursor_advance,
@@ -1612,9 +1665,16 @@ where
                 load_started,
             );
         }
-        let queue_scan =
-            self.scan_compaction_queue_entries(chain, &queue_cursor, max_entries, load_started)?;
-        if !queue_scan.entries.is_empty() || queue_scan.partial {
+        let queue_scan = self.scan_compaction_queue_entries(
+            chain,
+            &queue_cursor,
+            max_entries.max(2),
+            load_started,
+        )?;
+        if !queue_scan.entries.is_empty()
+            || queue_scan.partial
+            || (config.cleanup_enabled && !queue_scan.stale_queue_entry_keys.is_empty())
+        {
             return Ok(queue_scan);
         }
         let mut queue_page =
@@ -1740,9 +1800,12 @@ where
         );
         Ok(CompactionManifestScan {
             entries,
+            stale_queue_entry_keys: Vec::new(),
             partial,
             cursor_update: CompactionCursorUpdate {
                 scope_cursor_key,
+                scope_cursor_current: Some(scope_cursor),
+                scope_cursor_overlap: None,
                 scope_cursor_advance: cursor_advance_key.map(segment_compaction_cursor),
                 scope_partial,
                 queue_cursor_key,
@@ -1767,9 +1830,12 @@ where
             );
             return Ok(CompactionManifestScan {
                 entries: Vec::new(),
+                stale_queue_entry_keys: Vec::new(),
                 partial: false,
                 cursor_update: CompactionCursorUpdate {
                     scope_cursor_key: compaction_cursor_key(chain),
+                    scope_cursor_current: Some(cursor.clone()),
+                    scope_cursor_overlap: None,
                     scope_cursor_advance: None,
                     scope_partial: false,
                     queue_cursor_key: compaction_queue_cursor_key(chain),
@@ -1808,9 +1874,12 @@ where
         );
         Ok(CompactionManifestScan {
             entries,
+            stale_queue_entry_keys: Vec::new(),
             partial,
             cursor_update: CompactionCursorUpdate {
                 scope_cursor_key: compaction_cursor_key(chain),
+                scope_cursor_current: Some(cursor.clone()),
+                scope_cursor_overlap: None,
                 scope_cursor_advance: partial.then_some(CompactionCursor {
                     schema_version: 1,
                     next_segment_key: None,
@@ -1893,15 +1962,58 @@ where
             );
             return Ok(CompactionManifestScan {
                 entries: Vec::new(),
+                stale_queue_entry_keys: Vec::new(),
                 partial: false,
                 cursor_update: CompactionCursorUpdate {
                     scope_cursor_key: compaction_queue_cursor_key(chain),
+                    scope_cursor_current: None,
+                    scope_cursor_overlap: None,
                     scope_cursor_advance: None,
                     scope_partial: false,
                     queue_cursor_key: compaction_queue_cursor_key(chain),
                     queue_cursor_advance: None,
                 },
             });
+        }
+        let mut cursor_advance_key = None;
+        let mut active_scope_prefix = None;
+        let mut active_scope_cursor = None;
+        for object in &queue_objects {
+            let Some(bytes) = self.object_store().get_optional(&object.key)? else {
+                cursor_advance_key = Some(object.key.clone());
+                continue;
+            };
+            let queue_entry = compaction_queue::decode_entry(&object.key, &bytes)?;
+            active_scope_prefix = manifest_segment_scope_prefix(&queue_entry.segment_key);
+            break;
+        }
+        if let Some(active_scope_prefix) = active_scope_prefix.as_deref() {
+            let scope_cursor_key = compaction_scope_cursor_key(active_scope_prefix);
+            let scope_cursor = self.read_compaction_cursor_key(&scope_cursor_key)?;
+            let scope_queue_cursor = scope_cursor
+                .next_segment_key
+                .as_deref()
+                .filter(|key| key.starts_with(&prefix));
+            active_scope_cursor = Some(scope_cursor.clone());
+            let should_resume_scope = match (scope_queue_cursor, queue_cursor) {
+                (Some(scope_key), Some(queue_key)) => scope_key > queue_key,
+                (Some(_), None) => true,
+                _ => false,
+            };
+            if should_resume_scope && let Some(scope_queue_cursor) = scope_queue_cursor {
+                cursor_advance_key = Some(scope_queue_cursor.to_owned());
+                list_page = self.object_store().list_page(
+                    &prefix,
+                    Some(scope_queue_cursor),
+                    max_entries,
+                )?;
+                queue_objects = list_page
+                    .objects
+                    .into_iter()
+                    .filter(|object| object.key.ends_with(".json"))
+                    .collect::<Vec<_>>();
+                queue_objects.sort_by(|left, right| left.key.cmp(&right.key));
+            }
         }
         let base_entries = if self.object_store().exists(&manifest_key(chain))? {
             let key = manifest_key(chain);
@@ -1913,8 +2025,9 @@ where
         let mut entries = Vec::new();
         let mut scanned_objects = 0usize;
         let mut scanned_entries = 0usize;
-        let mut cursor_advance_key = None;
-        let mut active_scope_prefix = None;
+        let mut cursor_overlap_key = None;
+        let mut stopped_at_next_scope = false;
+        let mut stale_queue_entry_keys = Vec::new();
         for object in &queue_objects {
             if entries.len() >= max_entries {
                 break;
@@ -1928,12 +2041,15 @@ where
             if active_scope_prefix.is_none() {
                 active_scope_prefix = object_scope_prefix.clone();
             } else if active_scope_prefix != object_scope_prefix {
+                stopped_at_next_scope = true;
                 break;
             }
             scanned_objects += 1;
+            cursor_overlap_key = cursor_advance_key.clone();
             cursor_advance_key = Some(object.key.clone());
             let Some(segment_bytes) = self.object_store().get_optional(&queue_entry.segment_key)?
             else {
+                stale_queue_entry_keys.push(object.key.clone());
                 continue;
             };
             let manifest = decode_manifest_object(&queue_entry.segment_key, &segment_bytes)?;
@@ -1955,13 +2071,15 @@ where
                 }
             }
         }
-        let scope_partial = scanned_objects < queue_objects.len();
-        let partial = !entries.is_empty() && (scope_partial || list_page.has_more);
+        let scope_partial =
+            !stopped_at_next_scope && (scanned_objects < queue_objects.len() || list_page.has_more);
+        let partial = !entries.is_empty() && (scope_partial || stopped_at_next_scope);
         let cursor_advance = cursor_advance_key.map(segment_compaction_cursor);
         let scope_cursor_key = active_scope_prefix
             .as_deref()
             .map(compaction_scope_cursor_key)
             .unwrap_or_else(|| compaction_queue_cursor_key(chain));
+        let cursor_overlap = cursor_overlap_key.map(segment_compaction_cursor);
         let queue_cursor_advance = if scope_partial {
             None
         } else {
@@ -1980,9 +2098,12 @@ where
         );
         Ok(CompactionManifestScan {
             entries,
+            stale_queue_entry_keys,
             partial,
             cursor_update: CompactionCursorUpdate {
                 scope_cursor_key,
+                scope_cursor_current: active_scope_cursor,
+                scope_cursor_overlap: cursor_overlap,
                 scope_cursor_advance: cursor_advance.clone(),
                 scope_partial,
                 queue_cursor_key: compaction_queue_cursor_key(chain),
@@ -2001,6 +2122,7 @@ struct SelectedManifestEntry {
 
 struct CompactSelectedManifestEntriesArgs<'a> {
     entries: Vec<SelectedManifestEntry>,
+    stale_queue_entry_keys: Vec<String>,
     config: MaintenanceCompactionConfig,
     started: Instant,
     cursor: Option<CompactionCursorUpdate>,
@@ -2012,6 +2134,7 @@ struct CompactSelectedManifestEntriesArgs<'a> {
 #[derive(Clone, Debug)]
 struct CompactionManifestScan {
     entries: Vec<SelectedManifestEntry>,
+    stale_queue_entry_keys: Vec<String>,
     partial: bool,
     cursor_update: CompactionCursorUpdate,
 }
@@ -2019,6 +2142,8 @@ struct CompactionManifestScan {
 #[derive(Clone, Debug)]
 struct CompactionCursorUpdate {
     scope_cursor_key: String,
+    scope_cursor_current: Option<CompactionCursor>,
+    scope_cursor_overlap: Option<CompactionCursor>,
     scope_cursor_advance: Option<CompactionCursor>,
     scope_partial: bool,
     queue_cursor_key: String,

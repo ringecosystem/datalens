@@ -40,6 +40,11 @@ struct FailingCoverageIndexV2DeltaDeleteStore {
 }
 
 #[derive(Clone, Debug)]
+struct FailingCompactionQueueDeleteStore {
+    inner: LocalObjectStore,
+}
+
+#[derive(Clone, Debug)]
 struct FailingManifestSegmentPutStore<S = LocalObjectStore> {
     inner: S,
 }
@@ -88,6 +93,14 @@ impl FailingDataObjectDeleteStore {
 }
 
 impl FailingCoverageIndexV2DeltaDeleteStore {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            inner: LocalObjectStore::new(root),
+        }
+    }
+}
+
+impl FailingCompactionQueueDeleteStore {
     fn new(root: PathBuf) -> Self {
         Self {
             inner: LocalObjectStore::new(root),
@@ -331,6 +344,55 @@ impl ObjectStore for FailingCoverageIndexV2DeltaDeleteStore {
             return Err(DatalensError::new(
                 DatalensErrorKind::StorageWriteFailure,
                 "injected coverage index v2 delta delete failure",
+            ));
+        }
+        self.inner.delete(key)
+    }
+
+    fn lock_namespace(&self) -> String {
+        self.inner.lock_namespace()
+    }
+}
+
+impl ObjectStore for FailingCompactionQueueDeleteStore {
+    fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError> {
+        self.inner.get(key)
+    }
+
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
+        self.inner.put(key, bytes)
+    }
+
+    fn put_if_absent(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<ObjectPutIfAbsentResult, DatalensError> {
+        self.inner.put_if_absent(key, bytes)
+    }
+
+    fn exists(&self, key: &str) -> Result<bool, DatalensError> {
+        self.inner.exists(key)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
+        self.inner.list(prefix)
+    }
+
+    fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ObjectListPage, DatalensError> {
+        self.inner.list_page(prefix, start_after, limit)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), DatalensError> {
+        if key.contains("/metadata/compaction-queue/") {
+            return Err(DatalensError::new(
+                DatalensErrorKind::StorageWriteFailure,
+                "injected compaction queue delete failure",
             ));
         }
         self.inner.delete(key)
@@ -2561,6 +2623,489 @@ fn test_compaction_tick_cleans_consumed_queue_entries() {
 }
 
 #[test]
+fn test_compaction_cleanup_deletes_stale_queue_entries_for_missing_manifest_segments() {
+    let storage = LocalStorage::new(temp_storage_root("queue-cleanup-missing-segment"));
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 108, FinalityLevel::Safe);
+    let queue_prefix = format!("chains/{}/metadata/compaction-queue", chain.key_prefix());
+
+    assert_eq!(
+        storage
+            .object_store()
+            .list(&queue_prefix)
+            .expect("queue entries before cleanup")
+            .len(),
+        1
+    );
+    for segment_key in manifest_segment_keys(&storage, &chain) {
+        storage
+            .object_store()
+            .delete(&segment_key)
+            .expect("delete manifest segment");
+    }
+
+    let report = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                cleanup_enabled: true,
+                delete_source_objects: false,
+                max_deletes_per_tick: 8,
+                ..MaintenanceCompactionConfig::default()
+            },
+        )
+        .expect("stale queue cleanup");
+
+    assert_eq!(report.processed_candidates, 0);
+    assert_eq!(
+        storage
+            .object_store()
+            .list(&queue_prefix)
+            .expect("queue entries after cleanup")
+            .len(),
+        0
+    );
+}
+
+#[test]
+fn test_compaction_cleanup_disabled_preserves_stale_queue_entries_for_missing_manifest_segments() {
+    let storage = LocalStorage::new(temp_storage_root("queue-cleanup-disabled-missing-segment"));
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 108, FinalityLevel::Safe);
+    let queue_prefix = format!("chains/{}/metadata/compaction-queue", chain.key_prefix());
+
+    for segment_key in manifest_segment_keys(&storage, &chain) {
+        storage
+            .object_store()
+            .delete(&segment_key)
+            .expect("delete manifest segment");
+    }
+
+    let report = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                cleanup_enabled: false,
+                delete_source_objects: false,
+                max_deletes_per_tick: 8,
+                ..MaintenanceCompactionConfig::default()
+            },
+        )
+        .expect("stale queue cleanup disabled");
+
+    assert_eq!(report.processed_candidates, 0);
+    assert_eq!(
+        storage
+            .object_store()
+            .list(&queue_prefix)
+            .expect("queue entries after cleanup")
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn test_compaction_cleanup_preserves_live_non_candidate_queue_entries() {
+    let storage = LocalStorage::new(temp_storage_root("queue-cleanup-preserves-live"));
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 109, FinalityLevel::Safe);
+    let queue_prefix = format!("chains/{}/metadata/compaction-queue", chain.key_prefix());
+
+    let report = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                cleanup_enabled: true,
+                delete_source_objects: false,
+                max_deletes_per_tick: 8,
+                ..MaintenanceCompactionConfig::default()
+            },
+        )
+        .expect("live queue cleanup");
+
+    assert_eq!(report.processed_candidates, 0);
+    assert_eq!(
+        storage
+            .object_store()
+            .list(&queue_prefix)
+            .expect("queue entries after cleanup")
+            .len(),
+        1
+    );
+    let rows = storage
+        .read_rows(
+            &chain,
+            &DatasetKey::evm_blocks(),
+            &DatasetSelector::all(),
+            LedgerRange::blocks(109, 109).expect("range"),
+        )
+        .expect("read live row");
+    assert_eq!(rows.row_count(), 1);
+}
+
+#[test]
+fn test_compaction_queue_stale_cleanup_obeys_delete_budget() {
+    let storage = LocalStorage::new(temp_storage_root("queue-cleanup-delete-budget"));
+    let chain = test_chain();
+    for number in [110, 120, 130] {
+        write_block_object(&storage, &chain, number, FinalityLevel::Safe);
+    }
+    let before_queue_keys = queue_keys(&storage, &chain);
+
+    assert_eq!(before_queue_keys.len(), 3);
+    for segment_key in manifest_segment_keys(&storage, &chain) {
+        storage
+            .object_store()
+            .delete(&segment_key)
+            .expect("delete manifest segment");
+    }
+    let config = MaintenanceCompactionConfig {
+        cleanup_enabled: true,
+        delete_source_objects: false,
+        max_deletes_per_tick: 2,
+        ..MaintenanceCompactionConfig::default()
+    };
+
+    let first = storage
+        .compact_small_objects_for_chain(&chain, config)
+        .expect("first stale queue cleanup");
+    assert_eq!(first.processed_candidates, 0);
+    assert_eq!(first.tick_status, MaintenanceCompactionTickStatus::Partial);
+    assert_eq!(
+        queue_keys(&storage, &chain),
+        vec![before_queue_keys[2].clone()]
+    );
+    write_block_object(&storage, &chain, 140, FinalityLevel::Safe);
+    let mut expected_after_second = queue_keys(&storage, &chain);
+    expected_after_second.retain(|key| !before_queue_keys.contains(key));
+
+    let second = storage
+        .compact_small_objects_for_chain(&chain, config)
+        .expect("second stale queue cleanup");
+    assert_eq!(second.processed_candidates, 0);
+    assert_eq!(queue_keys(&storage, &chain), expected_after_second);
+}
+
+#[test]
+fn test_compaction_queue_stale_cleanup_delete_failure_is_reported_and_retried() {
+    let storage = LocalStorage::new(temp_storage_root("queue-cleanup-delete-failure"));
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 150, FinalityLevel::Safe);
+    let stale_queue_keys = queue_keys(&storage, &chain);
+
+    for segment_key in manifest_segment_keys(&storage, &chain) {
+        storage
+            .object_store()
+            .delete(&segment_key)
+            .expect("delete manifest segment");
+    }
+    let failing_storage = DurableStorage::from_object_store(
+        FailingCompactionQueueDeleteStore::new(storage.root().into()),
+    );
+
+    let failed = failing_storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                cleanup_enabled: true,
+                delete_source_objects: false,
+                max_deletes_per_tick: 8,
+                ..MaintenanceCompactionConfig::default()
+            },
+        )
+        .expect("stale queue cleanup with delete failure");
+    assert_eq!(failed.tick_status, MaintenanceCompactionTickStatus::Partial);
+    assert_eq!(failed.source_delete_failures, 1);
+    assert_eq!(queue_keys(&storage, &chain), stale_queue_keys);
+    write_block_object(&storage, &chain, 160, FinalityLevel::Safe);
+    let mut expected_after_retry = queue_keys(&storage, &chain);
+    expected_after_retry.retain(|key| !stale_queue_keys.contains(key));
+
+    let retried = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                cleanup_enabled: true,
+                delete_source_objects: false,
+                max_deletes_per_tick: 8,
+                ..MaintenanceCompactionConfig::default()
+            },
+        )
+        .expect("retry stale queue cleanup");
+    assert_eq!(retried.processed_candidates, 0);
+    assert_eq!(queue_keys(&storage, &chain), expected_after_retry);
+}
+
+#[test]
+fn test_compaction_queue_consumed_cleanup_delete_failure_retries_without_scope_cursor_skip() {
+    let storage = LocalStorage::new(temp_storage_root("queue-consumed-delete-failure-retry"));
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 170, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 171, FinalityLevel::Safe);
+    let consumed_queue_keys = queue_keys(&storage, &chain);
+    let failing_storage = DurableStorage::from_object_store(
+        FailingCompactionQueueDeleteStore::new(storage.root().into()),
+    );
+
+    let failed = failing_storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                min_object_bytes: u64::MAX,
+                max_input_objects_per_candidate: 2,
+                max_tick_duration_ms: 30_000,
+                max_candidates_per_tick: 8,
+                max_manifest_entries_per_tick: 20_000,
+                cleanup_enabled: true,
+                delete_source_objects: false,
+                max_deletes_per_tick: 8,
+                ..MaintenanceCompactionConfig::default()
+            },
+        )
+        .expect("compaction with consumed queue cleanup failure");
+    assert_eq!(failed.processed_candidates, 1);
+    assert_eq!(failed.tick_status, MaintenanceCompactionTickStatus::Partial);
+    assert_eq!(failed.source_delete_failures, consumed_queue_keys.len());
+    let failed_queue_keys = queue_keys(&storage, &chain);
+    for key in &consumed_queue_keys {
+        assert!(failed_queue_keys.contains(key));
+    }
+    let mut expected_after_retry = failed_queue_keys
+        .into_iter()
+        .filter(|key| !consumed_queue_keys.contains(key))
+        .collect::<Vec<_>>();
+    write_block_object(&storage, &chain, 180, FinalityLevel::Safe);
+    for key in queue_keys(&storage, &chain) {
+        if !expected_after_retry.contains(&key) && !consumed_queue_keys.contains(&key) {
+            expected_after_retry.push(key);
+        }
+    }
+    expected_after_retry.sort();
+
+    let retried = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                cleanup_enabled: true,
+                delete_source_objects: false,
+                max_deletes_per_tick: 8,
+                ..MaintenanceCompactionConfig::default()
+            },
+        )
+        .expect("retry consumed queue cleanup as stale entries");
+    assert_eq!(retried.processed_candidates, 0);
+    assert_eq!(queue_keys(&storage, &chain), expected_after_retry);
+}
+
+#[test]
+fn test_compaction_queue_consumed_cleanup_budget_exhaustion_preserves_retry_cursor() {
+    let storage = LocalStorage::new(temp_storage_root("queue-consumed-budget-retry"));
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 190, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 191, FinalityLevel::Safe);
+    let consumed_queue_keys = queue_keys(&storage, &chain);
+
+    let first = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                min_object_bytes: u64::MAX,
+                max_input_objects_per_candidate: 2,
+                max_tick_duration_ms: 30_000,
+                max_candidates_per_tick: 8,
+                max_manifest_entries_per_tick: 20_000,
+                cleanup_enabled: true,
+                delete_source_objects: false,
+                max_deletes_per_tick: 2,
+                ..MaintenanceCompactionConfig::default()
+            },
+        )
+        .expect("compaction with consumed queue cleanup budget exhaustion");
+    assert_eq!(first.processed_candidates, 1);
+    assert_eq!(first.tick_status, MaintenanceCompactionTickStatus::Partial);
+    let first_queue_keys = queue_keys(&storage, &chain);
+    for key in &consumed_queue_keys {
+        assert!(first_queue_keys.contains(key));
+    }
+    let mut expected_after_retry = first_queue_keys
+        .into_iter()
+        .filter(|key| !consumed_queue_keys.contains(key))
+        .collect::<Vec<_>>();
+    write_block_object(&storage, &chain, 200, FinalityLevel::Safe);
+    for key in queue_keys(&storage, &chain) {
+        if !expected_after_retry.contains(&key) && !consumed_queue_keys.contains(&key) {
+            expected_after_retry.push(key);
+        }
+    }
+    expected_after_retry.sort();
+
+    let retried = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                cleanup_enabled: true,
+                delete_source_objects: false,
+                max_deletes_per_tick: 8,
+                ..MaintenanceCompactionConfig::default()
+            },
+        )
+        .expect("retry consumed queue cleanup after budget exhaustion");
+    assert_eq!(retried.processed_candidates, 0);
+    assert_eq!(queue_keys(&storage, &chain), expected_after_retry);
+}
+
+#[test]
+fn test_compaction_queue_advances_after_non_candidate_scope() {
+    let storage = LocalStorage::new(temp_storage_root("queue-non-candidate-scope"));
+    let chain = test_chain();
+    let selector_a = DatasetSelector::try_other(
+        AdapterKey::try_new("test").expect("adapter key"),
+        "selector-a",
+        "selector-a",
+    )
+    .expect("selector a");
+    let selector_b = DatasetSelector::try_other(
+        AdapterKey::try_new("test").expect("adapter key"),
+        "selector-b",
+        "selector-b",
+    )
+    .expect("selector b");
+    write_block_object_with_selector(&storage, &chain, &selector_a, 108, FinalityLevel::Safe);
+    write_block_object_with_selector(&storage, &chain, &selector_b, 109, FinalityLevel::Safe);
+    write_block_object_with_selector(&storage, &chain, &selector_b, 110, FinalityLevel::Safe);
+    let config = MaintenanceCompactionConfig {
+        min_object_bytes: u64::MAX,
+        max_input_objects_per_candidate: 2,
+        max_tick_duration_ms: 30_000,
+        max_candidates_per_tick: 1,
+        max_manifest_entries_per_tick: 20_000,
+        cleanup_enabled: false,
+        delete_source_objects: false,
+        ..MaintenanceCompactionConfig::default()
+    };
+
+    let first = storage
+        .compact_small_objects_for_chain(&chain, config)
+        .expect("first tick");
+    assert_eq!(first.candidate_count, 0);
+    assert_eq!(first.processed_candidates, 0);
+
+    let second = storage
+        .compact_small_objects_for_chain(&chain, config)
+        .expect("second tick");
+    assert_eq!(second.candidate_count, 1);
+    assert_eq!(second.processed_candidates, 1);
+    assert_eq!(second.compacted_objects, 1);
+}
+
+#[test]
+fn test_compaction_queue_partial_scope_does_not_skip_unprocessed_entry() {
+    let storage = LocalStorage::new(temp_storage_root("queue-partial-scope-no-skip"));
+    let chain = test_chain();
+    for number in 1..=4 {
+        write_block_object(&storage, &chain, number, FinalityLevel::Safe);
+    }
+    let config = MaintenanceCompactionConfig {
+        min_object_bytes: u64::MAX,
+        max_input_objects_per_candidate: 2,
+        max_tick_duration_ms: 30_000,
+        max_candidates_per_tick: 1,
+        max_manifest_entries_per_tick: 3,
+        cleanup_enabled: false,
+        delete_source_objects: false,
+        ..MaintenanceCompactionConfig::default()
+    };
+
+    let first = storage
+        .compact_small_objects_for_chain(&chain, config)
+        .expect("first partial scope tick");
+    assert_eq!(first.tick_status, MaintenanceCompactionTickStatus::Partial);
+    assert_eq!(first.compacted_objects, 1);
+    assert_eq!(
+        first.candidates[0].range,
+        LedgerRange::blocks(1, 2).expect("range")
+    );
+
+    let second = storage
+        .compact_small_objects_for_chain(&chain, config)
+        .expect("second partial scope tick");
+    assert_eq!(second.compacted_objects, 1);
+    assert_eq!(
+        second.candidates[0].range,
+        LedgerRange::blocks(3, 4).expect("range")
+    );
+}
+
+#[test]
+fn test_compaction_queue_partial_scope_without_candidates_makes_overlap_progress() {
+    let storage = LocalStorage::new(temp_storage_root("queue-partial-scope-overlap"));
+    let chain = test_chain();
+    for number in [1, 3, 4] {
+        write_block_object(&storage, &chain, number, FinalityLevel::Safe);
+    }
+    let config = MaintenanceCompactionConfig {
+        min_object_bytes: u64::MAX,
+        max_input_objects_per_candidate: 2,
+        max_tick_duration_ms: 30_000,
+        max_candidates_per_tick: 1,
+        max_manifest_entries_per_tick: 2,
+        cleanup_enabled: false,
+        delete_source_objects: false,
+        ..MaintenanceCompactionConfig::default()
+    };
+
+    let first = storage
+        .compact_small_objects_for_chain(&chain, config)
+        .expect("first overlap tick");
+    assert_eq!(first.tick_status, MaintenanceCompactionTickStatus::Partial);
+    assert_eq!(first.candidate_count, 0);
+    assert_eq!(first.processed_candidates, 0);
+
+    let second = storage
+        .compact_small_objects_for_chain(&chain, config)
+        .expect("second overlap tick");
+    assert_eq!(second.compacted_objects, 1);
+    assert_eq!(
+        second.candidates[0].range,
+        LedgerRange::blocks(3, 4).expect("range")
+    );
+}
+
+#[test]
+fn test_compaction_queue_minimum_scan_width_avoids_single_entry_livelock() {
+    let storage = LocalStorage::new(temp_storage_root("queue-minimum-scan-width"));
+    let chain = test_chain();
+    for number in [1, 3, 4] {
+        write_block_object(&storage, &chain, number, FinalityLevel::Safe);
+    }
+    let config = MaintenanceCompactionConfig {
+        min_object_bytes: u64::MAX,
+        max_input_objects_per_candidate: 2,
+        max_tick_duration_ms: 30_000,
+        max_candidates_per_tick: 1,
+        max_manifest_entries_per_tick: 1,
+        cleanup_enabled: false,
+        delete_source_objects: false,
+        ..MaintenanceCompactionConfig::default()
+    };
+
+    let first = storage
+        .compact_small_objects_for_chain(&chain, config)
+        .expect("first minimum-width tick");
+    assert_eq!(first.tick_status, MaintenanceCompactionTickStatus::Partial);
+    assert_eq!(first.candidate_count, 0);
+
+    let second = storage
+        .compact_small_objects_for_chain(&chain, config)
+        .expect("second minimum-width tick");
+    assert_eq!(second.compacted_objects, 1);
+    assert_eq!(
+        second.candidates[0].range,
+        LedgerRange::blocks(3, 4).expect("range")
+    );
+}
+
+#[test]
 fn test_compaction_coverage_index_v2_snapshot_without_head_keeps_deltas_queryable() {
     let storage = LocalStorage::new(temp_storage_root("coverage-v2-snapshot-no-head"));
     let chain = test_chain();
@@ -3350,6 +3895,16 @@ fn test_compaction_scope_cursor_is_isolated_per_selector_scope() {
         "new manifest segment scans must not write a chain-wide compaction cursor"
     );
     assert!(
+        !storage
+            .object_store()
+            .exists(&format!(
+                "chains/{}/metadata/compaction-scope-queue-cursor.json",
+                chain.key_prefix()
+            ))
+            .expect("queue cursor exists check"),
+        "partial active queue scopes must not advance the chain-level queue cursor"
+    );
+    assert!(
         storage
             .object_store()
             .exists(&format!(
@@ -4090,6 +4645,21 @@ fn manifest_segment_keys(storage: &LocalStorage, chain: &ChainIdentity) -> Vec<S
         .into_iter()
         .map(|object| object.key)
         .collect()
+}
+
+fn queue_keys(storage: &LocalStorage, chain: &ChainIdentity) -> Vec<String> {
+    let mut keys = storage
+        .object_store()
+        .list(&format!(
+            "chains/{}/metadata/compaction-queue",
+            chain.key_prefix()
+        ))
+        .expect("queue entries")
+        .into_iter()
+        .map(|object| object.key)
+        .collect::<Vec<_>>();
+    keys.sort();
+    keys
 }
 
 fn test_chain() -> ChainIdentity {
