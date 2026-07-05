@@ -318,16 +318,24 @@ where
 {
     let mut any_bucket_has_index = false;
     let mut compacted_delta_keys = BTreeSet::new();
+    let mut start_after_delta_key = None;
     if let Some(head) = latest_v2_snapshot_head(object_store, bucket)? {
         let mut snapshot = read_v2_snapshot(object_store, bucket, &head.snapshot_key)?;
         any_bucket_has_index = true;
         compacted_delta_keys.extend(snapshot.compacted_delta_keys);
+        if !head.included_delta_high_watermark.is_empty() {
+            start_after_delta_key = Some(head.included_delta_high_watermark);
+        }
         entries.append(&mut snapshot.entries);
     }
 
-    for object in
-        list_v2_delta_objects_for_bucket(object_store, bucket, &compacted_delta_keys, None)?
-    {
+    for object in list_v2_delta_objects_for_bucket(
+        object_store,
+        bucket,
+        &compacted_delta_keys,
+        None,
+        start_after_delta_key.as_deref(),
+    )? {
         let mut delta = object.delta;
         any_bucket_has_index = true;
         if let Some(replacement) = delta.replacement {
@@ -349,9 +357,13 @@ where
 {
     let mut entries = Vec::new();
     let mut previous_compacted_delta_keys = BTreeSet::new();
+    let mut start_after_delta_key = None;
     if let Some(head) = latest_v2_snapshot_head(object_store, bucket)? {
         let snapshot = read_v2_snapshot(object_store, bucket, &head.snapshot_key)?;
         previous_compacted_delta_keys.extend(snapshot.compacted_delta_keys);
+        if !head.included_delta_high_watermark.is_empty() {
+            start_after_delta_key = Some(head.included_delta_high_watermark);
+        }
         entries.extend(snapshot.entries);
     }
 
@@ -360,6 +372,7 @@ where
         bucket,
         &previous_compacted_delta_keys,
         Some(max_delta_objects),
+        start_after_delta_key.as_deref(),
     )?;
     if deltas.len() < delta_count_threshold.max(1) {
         return Ok(None);
@@ -443,6 +456,7 @@ fn list_v2_delta_objects_for_bucket<S>(
     bucket: &CoverageIndexV2Bucket,
     skip_delta_keys: &BTreeSet<String>,
     max_objects: Option<usize>,
+    start_after_delta_key: Option<&str>,
 ) -> Result<Vec<CoverageIndexV2DeltaObject>, DatalensError>
 where
     S: ObjectStore,
@@ -452,6 +466,7 @@ where
         bucket,
         skip_delta_keys,
         max_objects,
+        start_after_delta_key,
     )?;
     let mut deltas = Vec::new();
     for object in objects {
@@ -487,12 +502,16 @@ fn list_v2_delta_object_keys_for_bucket<S>(
 where
     S: ObjectStore,
 {
-    Ok(
-        list_v2_delta_object_metadata_for_bucket(object_store, bucket, &BTreeSet::new(), None)?
-            .into_iter()
-            .map(|object| object.key)
-            .collect(),
-    )
+    Ok(list_v2_delta_object_metadata_for_bucket(
+        object_store,
+        bucket,
+        &BTreeSet::new(),
+        None,
+        None,
+    )?
+    .into_iter()
+    .map(|object| object.key)
+    .collect())
 }
 
 fn list_v2_delta_object_metadata_for_bucket<S>(
@@ -500,6 +519,7 @@ fn list_v2_delta_object_metadata_for_bucket<S>(
     bucket: &CoverageIndexV2Bucket,
     skip_delta_keys: &BTreeSet<String>,
     max_objects: Option<usize>,
+    start_after_delta_key: Option<&str>,
 ) -> Result<Vec<ObjectMetadata>, DatalensError>
 where
     S: ObjectStore,
@@ -512,7 +532,7 @@ where
     );
     let strict_prefix = format!("{delta_prefix}/");
     let mut objects = Vec::new();
-    let mut start_after = None;
+    let mut start_after = start_after_delta_key.map(ToOwned::to_owned);
     loop {
         let page = object_store.list_page(
             &delta_prefix,

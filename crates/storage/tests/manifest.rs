@@ -5235,13 +5235,15 @@ fn test_coverage_index_v2_snapshot_heads_choose_latest_and_apply_pending_deltas(
 }
 
 #[test]
-fn test_coverage_index_v2_snapshot_skips_only_explicit_compacted_delta_keys() {
-    let storage = LocalStorage::new(temp_storage_root("coverage-index-v2-explicit-skip"));
+fn test_coverage_index_v2_snapshot_lists_only_deltas_after_high_watermark() {
+    let object_store = CountingObjectStore::new(LocalObjectStore::new(temp_storage_root(
+        "coverage-index-v2-snapshot-high-watermark",
+    )));
+    let storage = DurableStorage::from_object_store(object_store.clone());
     let chain = test_chain();
     let selector = DatasetSelector::all();
     let query_range = LedgerRange::blocks(10, 11).expect("valid range");
     let snapshot_range = LedgerRange::blocks(10, 10).expect("valid range");
-    let compacted_delta_range = LedgerRange::blocks(10, 10).expect("valid range");
     let pending_delta_range = LedgerRange::blocks(11, 11).expect("valid range");
     let scope = coverage_index_v2_exact_scope(
         &DatasetKey::evm_blocks(),
@@ -5249,26 +5251,34 @@ fn test_coverage_index_v2_snapshot_skips_only_explicit_compacted_delta_keys() {
         &selector,
         ManifestFinalityLevel::Safe,
     );
-    let compacted_delta_key = write_coverage_index_v2_delta(
-        &storage,
-        &chain,
-        &scope,
-        &compacted_delta_range,
-        "zzzz-compacted",
-        vec![empty_manifest_entry(
+    let old_delta_range = LedgerRange::blocks(10, 10).expect("valid range");
+    let mut compacted_delta_keys = Vec::new();
+    for index in 0..300 {
+        compacted_delta_keys.push(write_coverage_index_v2_delta(
+            &storage,
             &chain,
-            DatasetKey::evm_blocks(),
-            &selector,
-            compacted_delta_range.clone(),
-            ManifestFinalityLevel::Safe,
-        )],
-    );
-    write_coverage_index_v2_delta(
+            &scope,
+            &old_delta_range,
+            &format!("{index:04}-compacted"),
+            vec![empty_manifest_entry(
+                &chain,
+                DatasetKey::evm_blocks(),
+                &selector,
+                old_delta_range.clone(),
+                ManifestFinalityLevel::Safe,
+            )],
+        ));
+    }
+    let included_delta_high_watermark = compacted_delta_keys
+        .last()
+        .expect("compacted delta key")
+        .clone();
+    let pending_delta_key = write_coverage_index_v2_delta(
         &storage,
         &chain,
         &scope,
         &pending_delta_range,
-        "aaaa-late",
+        "zzzz-pending",
         vec![empty_manifest_entry(
             &chain,
             DatasetKey::evm_blocks(),
@@ -5290,7 +5300,7 @@ fn test_coverage_index_v2_snapshot_skips_only_explicit_compacted_delta_keys() {
             snapshot_range.clone(),
             ManifestFinalityLevel::Safe,
         )],
-        vec![compacted_delta_key.clone()],
+        compacted_delta_keys.clone(),
     );
     write_coverage_index_v2_snapshot_head(
         &storage,
@@ -5299,15 +5309,21 @@ fn test_coverage_index_v2_snapshot_skips_only_explicit_compacted_delta_keys() {
         &query_range,
         "head",
         &snapshot_key,
-        &compacted_delta_key,
+        &included_delta_high_watermark,
     );
 
+    let delta_prefix = coverage_index_v2_delta_prefix(&chain, &scope, &query_range);
     assert_eq!(
         storage
             .covered_ranges(&chain, &DatasetKey::evm_blocks(), &selector, query_range)
             .expect("snapshot coverage"),
         vec![LedgerRange::blocks(10, 11).expect("valid range")]
     );
+    assert_eq!(object_store.list_page_count(&delta_prefix), 1);
+    assert_eq!(object_store.get_count(&pending_delta_key), 1);
+    for compacted_delta_key in compacted_delta_keys {
+        assert_eq!(object_store.get_count(&compacted_delta_key), 0);
+    }
 }
 
 #[test]
