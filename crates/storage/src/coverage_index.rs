@@ -21,7 +21,7 @@ use crate::{
 
 pub(crate) const DEFAULT_COVERAGE_INDEX_BUCKET_SIZE: u64 = 100_000;
 const COVERAGE_INDEX_V2_SCHEMA_VERSION: u32 = 1;
-const COVERAGE_INDEX_V2_LIST_PAGE_SIZE: usize = 256;
+pub(crate) const COVERAGE_INDEX_V2_LIST_PAGE_SIZE: usize = 256;
 const EVM_LOG_SEMANTIC_INDEX_VERSION: &str = "evm-logs-v1";
 const MAX_EVM_LOG_TOPIC_VALUE_SEMANTIC_KEYS: usize = 128;
 const EVM_LOG_LARGE_TOPIC_VALUE_SCOPE: &str = "_large-any-of";
@@ -338,39 +338,6 @@ where
     Ok(any_bucket_has_index)
 }
 
-pub(crate) fn list_v2_delta_buckets_for_chain<S>(
-    object_store: &S,
-    chain: &ChainIdentity,
-) -> Result<Vec<CoverageIndexV2Bucket>, DatalensError>
-where
-    S: ObjectStore,
-{
-    let prefix = format!("chains/{}/coverage-index-v2/deltas", chain.key_prefix());
-    let strict_prefix = format!("{prefix}/");
-    let mut buckets = BTreeSet::new();
-    let mut start_after = None;
-    loop {
-        let page = object_store.list_page(
-            &prefix,
-            start_after.as_deref(),
-            COVERAGE_INDEX_V2_LIST_PAGE_SIZE,
-        )?;
-        for object in &page.objects {
-            if !object.key.starts_with(&strict_prefix) {
-                continue;
-            }
-            if let Some(bucket) = parse_v2_bucket_from_object_key(&prefix, &object.key)? {
-                buckets.insert(bucket);
-            }
-        }
-        if !page.has_more {
-            break;
-        }
-        start_after = page.objects.last().map(|object| object.key.clone());
-    }
-    Ok(buckets.into_iter().collect())
-}
-
 pub(crate) fn prepare_v2_bucket_compaction<S>(
     object_store: &S,
     bucket: &CoverageIndexV2Bucket,
@@ -468,75 +435,6 @@ where
             compacted_delta_keys,
         });
     }
-    Ok(records)
-}
-
-pub(crate) fn list_v2_cleanup_records_for_chain<S>(
-    object_store: &S,
-    chain: &ChainIdentity,
-    delete_grace_ms: u64,
-    eligible_only: bool,
-) -> Result<Vec<CoverageIndexV2CleanupRecordObject>, DatalensError>
-where
-    S: ObjectStore,
-{
-    let now_ms = unix_ms_now()?;
-    let prefix = coverage_index_v2_cleanup_prefix(&chain.key_prefix());
-    let strict_prefix = format!("{prefix}/");
-    let mut records = Vec::new();
-    let mut start_after = None;
-    loop {
-        let page = object_store.list_page(
-            &prefix,
-            start_after.as_deref(),
-            COVERAGE_INDEX_V2_LIST_PAGE_SIZE,
-        )?;
-        for object in &page.objects {
-            if !object.key.starts_with(&strict_prefix) {
-                continue;
-            }
-            if !object.key.ends_with(".json") {
-                continue;
-            }
-            let bytes = object_store.get(&object.key)?;
-            let record: CoverageIndexV2CleanupRecord = match serde_json::from_slice(&bytes) {
-                Ok(record) => record,
-                Err(error) => {
-                    log::warn!(
-                        "storage coverage index v2 cleanup record skipped object_key={} reason=decode_failed message={}",
-                        object.key,
-                        error
-                    );
-                    continue;
-                }
-            };
-            if record.schema_version != COVERAGE_INDEX_V2_SCHEMA_VERSION {
-                log::warn!(
-                    "storage coverage index v2 cleanup record skipped object_key={} reason=unsupported_schema schema_version={}",
-                    object.key,
-                    record.schema_version
-                );
-                continue;
-            }
-            if !eligible_only || record.created_at_unix_ms.saturating_add(delete_grace_ms) <= now_ms
-            {
-                records.push(CoverageIndexV2CleanupRecordObject {
-                    key: object.key.clone(),
-                    record,
-                });
-            }
-        }
-        if !page.has_more {
-            break;
-        }
-        start_after = page.objects.last().map(|object| object.key.clone());
-    }
-    records.sort_by(|left, right| {
-        left.record
-            .created_at_unix_ms
-            .cmp(&right.record.created_at_unix_ms)
-            .then_with(|| left.key.cmp(&right.key))
-    });
     Ok(records)
 }
 
@@ -1739,7 +1637,7 @@ fn coverage_index_v2_cleanup_prefix(chain_key: &str) -> String {
     format!("chains/{chain_key}/coverage-index-v2/cleanup")
 }
 
-fn parse_v2_bucket_from_object_key(
+pub(crate) fn parse_v2_bucket_from_object_key(
     prefix: &str,
     key: &str,
 ) -> Result<Option<CoverageIndexV2Bucket>, DatalensError> {

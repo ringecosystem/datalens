@@ -18,8 +18,8 @@ use crate::{
     ObjectPutIfAbsentResult, ObjectStore, ParquetCompression, StorageDataObject, checksum_hex,
     compaction_queue,
     coverage_index::{
-        CoverageIndexV2CleanupRecord, CoverageIndexV2CleanupRecordObject,
-        list_v2_cleanup_records_for_chain, list_v2_delta_buckets_for_chain,
+        COVERAGE_INDEX_V2_LIST_PAGE_SIZE, CoverageIndexV2Bucket, CoverageIndexV2CleanupRecord,
+        CoverageIndexV2CleanupRecordObject, parse_v2_bucket_from_object_key,
         prepare_v2_bucket_compaction, unix_ms_now as coverage_index_v2_unix_ms_now,
         v2_cleanup_record_is_safe_to_delete, v2_snapshot_cleanup_records_for_bucket,
         write_v2_cleanup_record, write_v2_snapshot, write_v2_snapshot_head,
@@ -904,12 +904,19 @@ where
         }
 
         if config.cleanup_enabled || config.coverage_index_v2_delta_count_threshold > 0 {
-            coverage_index_v2_report = self.compact_coverage_index_v2_for_chain_inner(
-                chain,
-                config,
-                checkpoint,
-                &mut operation_budget,
-            )?;
+            if started.elapsed() >= max_duration {
+                partial = true;
+            } else {
+                let (report, v2_partial) = self.compact_coverage_index_v2_for_chain_inner(
+                    chain,
+                    config,
+                    started,
+                    checkpoint,
+                    &mut operation_budget,
+                )?;
+                coverage_index_v2_report = report;
+                partial |= v2_partial;
+            }
         }
 
         if let Some(cursor) = cursor {
@@ -1271,33 +1278,67 @@ where
         &self,
         chain: Option<&ChainIdentity>,
         config: MaintenanceCompactionConfig,
+        tick_started: Instant,
         checkpoint: &dyn Fn() -> Result<(), DatalensError>,
         operation_budget: &mut CompactionOperationBudget,
-    ) -> Result<CoverageIndexV2CompactionReport, DatalensError> {
+    ) -> Result<(CoverageIndexV2CompactionReport, bool), DatalensError> {
         let Some(chain) = chain else {
-            return Ok(CoverageIndexV2CompactionReport::default());
+            return Ok((CoverageIndexV2CompactionReport::default(), false));
         };
+        let max_duration = Duration::from_millis(config.max_tick_duration_ms.max(1));
         let mut report = CoverageIndexV2CompactionReport::default();
-        let cleanup_records = list_v2_cleanup_records_for_chain(
-            self.object_store(),
-            chain,
-            config.coverage_index_v2_delete_grace_ms,
-            false,
-        )?;
-        let mut cleanup_snapshot_keys = cleanup_records
-            .iter()
+        let mut cleanup_scan = if config.cleanup_enabled {
+            let max_records = operation_budget.remaining_gets();
+            if max_records == 0 {
+                None
+            } else {
+                let cursor_key = coverage_index_v2_cleanup_cursor_key(chain);
+                let cursor = self.read_compaction_cursor_key(&cursor_key)?;
+                let cleanup_scan = self.scan_coverage_index_v2_cleanup_records(
+                    chain,
+                    config,
+                    &cursor,
+                    max_records,
+                )?;
+                operation_budget.record_gets(cleanup_scan.get_operations);
+                Some(cleanup_scan)
+            }
+        } else {
+            None
+        };
+        let mut cleanup_snapshot_keys = cleanup_scan
+            .as_ref()
+            .into_iter()
+            .flat_map(|scan| scan.records.iter())
             .map(|object| object.record.snapshot_key.clone())
             .collect::<BTreeSet<_>>();
-        let mut cleanup_delta_keys = cleanup_records
-            .iter()
+        let mut cleanup_delta_keys = cleanup_scan
+            .as_ref()
+            .into_iter()
+            .flat_map(|scan| scan.records.iter())
             .flat_map(|object| object.record.compacted_delta_keys.iter().cloned())
             .collect::<BTreeSet<_>>();
+        let cursor_key = coverage_index_v2_compaction_cursor_key(chain);
+        let cursor = self.read_compaction_cursor_key(&cursor_key)?;
+        let bucket_scan = self.scan_coverage_index_v2_delta_buckets(chain, &cursor)?;
+        let had_buckets = !bucket_scan.buckets.is_empty();
+        let mut cursor_advance_key = None;
+        let mut partial = bucket_scan.partial;
 
-        for bucket in list_v2_delta_buckets_for_chain(self.object_store(), chain)? {
+        for bucket_scan_item in bucket_scan.buckets {
+            if tick_started.elapsed() >= max_duration {
+                partial = true;
+                break;
+            }
+            let bucket = bucket_scan_item.bucket;
             if config.cleanup_enabled && operation_budget.remaining_puts() > 0 {
                 for mut record in
                     v2_snapshot_cleanup_records_for_bucket(self.object_store(), &bucket)?
                 {
+                    if tick_started.elapsed() >= max_duration {
+                        partial = true;
+                        break;
+                    }
                     record
                         .compacted_delta_keys
                         .retain(|key| !cleanup_delta_keys.contains(key));
@@ -1310,11 +1351,24 @@ where
                     checkpoint()?;
                     let snapshot_key = record.snapshot_key.clone();
                     cleanup_delta_keys.extend(record.compacted_delta_keys.iter().cloned());
-                    write_v2_cleanup_record(self.object_store(), chain, record)?;
+                    let record_key =
+                        write_v2_cleanup_record(self.object_store(), chain, record.clone())?;
                     operation_budget.record_puts(1);
                     cleanup_snapshot_keys.insert(snapshot_key);
+                    if let Some(cleanup_scan) = cleanup_scan.as_mut() {
+                        cleanup_scan
+                            .records
+                            .push(CoverageIndexV2CleanupRecordObject {
+                                key: record_key,
+                                record,
+                            });
+                    }
                     report.cleanup_records += 1;
                 }
+            }
+            if tick_started.elapsed() >= max_duration {
+                partial = true;
+                break;
             }
             if operation_budget.remaining_gets()
                 < config.coverage_index_v2_delta_count_threshold.max(1)
@@ -1366,67 +1420,133 @@ where
                     }
                     checkpoint()?;
                     cleanup_delta_keys.extend(compacted_delta_keys.iter().cloned());
-                    write_v2_cleanup_record(
-                        self.object_store(),
-                        chain,
-                        CoverageIndexV2CleanupRecord {
-                            schema_version: 1,
-                            created_at_unix_ms: coverage_index_v2_unix_ms_now()?,
-                            scope: compaction.bucket.scope,
-                            bucket_start: compaction.bucket.bucket_start,
-                            bucket_end: compaction.bucket.bucket_end,
-                            compaction_id: snapshot_key
-                                .rsplit('/')
-                                .next()
-                                .unwrap_or("")
-                                .trim_end_matches(".json")
-                                .to_owned(),
-                            snapshot_key: snapshot_key.clone(),
-                            compacted_delta_keys,
-                        },
-                    )?;
+                    let record = CoverageIndexV2CleanupRecord {
+                        schema_version: 1,
+                        created_at_unix_ms: coverage_index_v2_unix_ms_now()?,
+                        scope: compaction.bucket.scope,
+                        bucket_start: compaction.bucket.bucket_start,
+                        bucket_end: compaction.bucket.bucket_end,
+                        compaction_id: snapshot_key
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or("")
+                            .trim_end_matches(".json")
+                            .to_owned(),
+                        snapshot_key: snapshot_key.clone(),
+                        compacted_delta_keys,
+                    };
+                    let record_key =
+                        write_v2_cleanup_record(self.object_store(), chain, record.clone())?;
                     operation_budget.record_puts(1);
                     cleanup_snapshot_keys.insert(snapshot_key);
+                    if let Some(cleanup_scan) = cleanup_scan.as_mut() {
+                        cleanup_scan
+                            .records
+                            .push(CoverageIndexV2CleanupRecordObject {
+                                key: record_key,
+                                record,
+                            });
+                    }
                     report.cleanup_records += 1;
                 }
             }
+            cursor_advance_key = bucket_scan_item.last_delta_key;
         }
-
-        if config.cleanup_enabled {
-            self.cleanup_coverage_index_v2_for_chain(
-                chain,
-                config,
-                checkpoint,
-                operation_budget,
-                &mut report,
+        if cursor_advance_key.is_none() && !had_buckets {
+            cursor_advance_key = bucket_scan.page_last_key;
+        }
+        if let Some(cursor_advance_key) = cursor_advance_key {
+            self.write_compaction_cursor_key(
+                &cursor_key,
+                Some(CompactionCursor {
+                    schema_version: 1,
+                    next_segment_key: Some(cursor_advance_key),
+                    legacy_entry_offset: None,
+                }),
             )?;
         }
-        Ok(report)
+
+        if config.cleanup_enabled && tick_started.elapsed() < max_duration {
+            let cleanup_partial = self.cleanup_coverage_index_v2_for_chain(
+                chain,
+                checkpoint,
+                operation_budget,
+                cleanup_scan,
+                &mut report,
+            )?;
+            partial |= cleanup_partial;
+        } else if config.cleanup_enabled {
+            partial = true;
+        }
+        Ok((report, partial))
+    }
+
+    fn scan_coverage_index_v2_delta_buckets(
+        &self,
+        chain: &ChainIdentity,
+        cursor: &CompactionCursor,
+    ) -> Result<CoverageIndexV2BucketScan, DatalensError> {
+        let prefix = format!("chains/{}/coverage-index-v2/deltas", chain.key_prefix());
+        let strict_prefix = format!("{prefix}/");
+        let mut list_page = self.object_store().list_page(
+            &prefix,
+            cursor.next_segment_key.as_deref(),
+            COVERAGE_INDEX_V2_LIST_PAGE_SIZE,
+        )?;
+        if list_page.objects.is_empty() && cursor.next_segment_key.is_some() && !list_page.has_more
+        {
+            list_page =
+                self.object_store()
+                    .list_page(&prefix, None, COVERAGE_INDEX_V2_LIST_PAGE_SIZE)?;
+        }
+        let mut buckets = BTreeMap::<CoverageIndexV2Bucket, String>::new();
+        for object in &list_page.objects {
+            if !object.key.starts_with(&strict_prefix) || !object.key.ends_with(".json") {
+                continue;
+            }
+            if let Some(bucket) = parse_v2_bucket_from_object_key(&prefix, &object.key)? {
+                buckets.insert(bucket, object.key.clone());
+            }
+        }
+        Ok(CoverageIndexV2BucketScan {
+            buckets: buckets
+                .into_iter()
+                .map(|(bucket, last_delta_key)| CoverageIndexV2BucketScanItem {
+                    bucket,
+                    last_delta_key: Some(last_delta_key),
+                })
+                .collect(),
+            partial: list_page.has_more,
+            page_last_key: list_page.objects.last().map(|object| object.key.clone()),
+        })
     }
 
     fn cleanup_coverage_index_v2_for_chain(
         &self,
         chain: &ChainIdentity,
-        config: MaintenanceCompactionConfig,
         checkpoint: &dyn Fn() -> Result<(), DatalensError>,
         operation_budget: &mut CompactionOperationBudget,
+        cleanup_scan: Option<CoverageIndexV2CleanupScan>,
         report: &mut CoverageIndexV2CompactionReport,
-    ) -> Result<(), DatalensError> {
-        let records = list_v2_cleanup_records_for_chain(
-            self.object_store(),
-            chain,
-            config.coverage_index_v2_delete_grace_ms,
-            true,
-        )?;
-        for record in records {
+    ) -> Result<bool, DatalensError> {
+        let cursor_key = coverage_index_v2_cleanup_cursor_key(chain);
+        let Some(cleanup_scan) = cleanup_scan else {
+            return Ok(true);
+        };
+        let had_records = !cleanup_scan.records.is_empty();
+        let mut partial = cleanup_scan.partial;
+        let mut cursor_advance_key = None;
+        for record in cleanup_scan.records {
             let required_deletes = record.record.compacted_delta_keys.len().saturating_add(1);
             if operation_budget.remaining_deletes() < required_deletes {
+                partial = true;
                 break;
             }
             if !v2_cleanup_record_is_safe_to_delete(self.object_store(), chain, &record)? {
                 checkpoint()?;
                 self.object_store().delete(&record.key)?;
                 operation_budget.record_deletes(1);
+                cursor_advance_key = Some(record.key);
                 continue;
             }
             let cleanup = self.delete_coverage_index_v2_cleanup_deltas(chain, &record, checkpoint);
@@ -1441,9 +1561,96 @@ where
                 checkpoint()?;
                 self.object_store().delete(&record.key)?;
                 operation_budget.record_deletes(1);
+                cursor_advance_key = Some(record.key);
+            } else {
+                partial = true;
+                break;
             }
         }
-        Ok(())
+        if cursor_advance_key.is_none() && !had_records {
+            cursor_advance_key = cleanup_scan.page_last_key;
+        }
+        if let Some(cursor_advance_key) = cursor_advance_key {
+            self.write_compaction_cursor_key(
+                &cursor_key,
+                Some(CompactionCursor {
+                    schema_version: 1,
+                    next_segment_key: Some(cursor_advance_key),
+                    legacy_entry_offset: None,
+                }),
+            )?;
+        }
+        Ok(partial)
+    }
+
+    fn scan_coverage_index_v2_cleanup_records(
+        &self,
+        chain: &ChainIdentity,
+        config: MaintenanceCompactionConfig,
+        cursor: &CompactionCursor,
+        max_records: usize,
+    ) -> Result<CoverageIndexV2CleanupScan, DatalensError> {
+        let now_ms = coverage_index_v2_unix_ms_now()?;
+        let prefix = format!("chains/{}/coverage-index-v2/cleanup", chain.key_prefix());
+        let strict_prefix = format!("{prefix}/");
+        let mut list_page = self.object_store().list_page(
+            &prefix,
+            cursor.next_segment_key.as_deref(),
+            COVERAGE_INDEX_V2_LIST_PAGE_SIZE,
+        )?;
+        if list_page.objects.is_empty() && cursor.next_segment_key.is_some() && !list_page.has_more
+        {
+            list_page =
+                self.object_store()
+                    .list_page(&prefix, None, COVERAGE_INDEX_V2_LIST_PAGE_SIZE)?;
+        }
+        let mut records = Vec::new();
+        let mut get_operations = 0usize;
+        let mut partial = list_page.has_more;
+        for object in &list_page.objects {
+            if !object.key.starts_with(&strict_prefix) || !object.key.ends_with(".json") {
+                continue;
+            }
+            if records.len() >= max_records {
+                partial = true;
+                break;
+            }
+            let bytes = self.object_store().get(&object.key)?;
+            get_operations = get_operations.saturating_add(1);
+            let record: CoverageIndexV2CleanupRecord = match serde_json::from_slice(&bytes) {
+                Ok(record) => record,
+                Err(error) => {
+                    log::warn!(
+                        "storage coverage index v2 cleanup record skipped object_key={} reason=decode_failed message={}",
+                        object.key,
+                        error
+                    );
+                    continue;
+                }
+            };
+            if record
+                .created_at_unix_ms
+                .saturating_add(config.coverage_index_v2_delete_grace_ms)
+                <= now_ms
+            {
+                records.push(CoverageIndexV2CleanupRecordObject {
+                    key: object.key.clone(),
+                    record,
+                });
+            }
+        }
+        records.sort_by(|left, right| {
+            left.record
+                .created_at_unix_ms
+                .cmp(&right.record.created_at_unix_ms)
+                .then_with(|| left.key.cmp(&right.key))
+        });
+        Ok(CoverageIndexV2CleanupScan {
+            records,
+            partial,
+            page_last_key: list_page.objects.last().map(|object| object.key.clone()),
+            get_operations,
+        })
     }
 
     fn delete_coverage_index_v2_cleanup_deltas(
@@ -2140,6 +2347,27 @@ struct CompactionManifestScan {
 }
 
 #[derive(Clone, Debug)]
+struct CoverageIndexV2BucketScan {
+    buckets: Vec<CoverageIndexV2BucketScanItem>,
+    partial: bool,
+    page_last_key: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct CoverageIndexV2BucketScanItem {
+    bucket: CoverageIndexV2Bucket,
+    last_delta_key: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct CoverageIndexV2CleanupScan {
+    records: Vec<CoverageIndexV2CleanupRecordObject>,
+    partial: bool,
+    page_last_key: Option<String>,
+    get_operations: usize,
+}
+
+#[derive(Clone, Debug)]
 struct CompactionCursorUpdate {
     scope_cursor_key: String,
     scope_cursor_current: Option<CompactionCursor>,
@@ -2229,6 +2457,20 @@ fn compaction_cursor_key(chain: &ChainIdentity) -> String {
 fn compaction_queue_cursor_key(chain: &ChainIdentity) -> String {
     format!(
         "chains/{}/metadata/compaction-scope-queue-cursor.json",
+        chain.key_prefix()
+    )
+}
+
+fn coverage_index_v2_compaction_cursor_key(chain: &ChainIdentity) -> String {
+    format!(
+        "chains/{}/metadata/coverage-index-v2-compaction-cursor.json",
+        chain.key_prefix()
+    )
+}
+
+fn coverage_index_v2_cleanup_cursor_key(chain: &ChainIdentity) -> String {
+    format!(
+        "chains/{}/metadata/coverage-index-v2-cleanup-cursor.json",
         chain.key_prefix()
     )
 }
