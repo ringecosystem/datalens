@@ -764,7 +764,7 @@ where
         let mut input_objects = 0usize;
         let mut deleted_manifest_segments = BTreeSet::new();
         let deleted_source_objects = 0usize;
-        let source_delete_failures = 0usize;
+        let mut source_delete_failures = 0usize;
         let mut cursor_advance_key = None;
         let max_candidates = config
             .max_candidates_per_tick
@@ -772,6 +772,7 @@ where
             .min(config.max_concurrent_candidates.max(1));
         let max_duration = Duration::from_millis(config.max_tick_duration_ms.max(1));
         let mut partial = scan_partial;
+        let mut cleanup_incomplete = false;
         let mut operation_budget = CompactionOperationBudget::new(config);
         let mut coverage_index_v2_report = CoverageIndexV2CompactionReport::default();
 
@@ -854,6 +855,15 @@ where
                         queue_entry_keys.into_iter(),
                     );
                     operation_budget.record_deletes(cleanup.deleted_objects);
+                    source_delete_failures =
+                        source_delete_failures.saturating_add(cleanup.delete_failures);
+                    if cleanup.delete_failures > 0 {
+                        partial = true;
+                        cleanup_incomplete = true;
+                    }
+                } else if !queue_entry_keys.is_empty() {
+                    partial = true;
+                    cleanup_incomplete = true;
                 }
             }
             log::info!(
@@ -869,16 +879,28 @@ where
 
         if config.cleanup_enabled
             && let Some(chain) = chain
-            && operation_budget.remaining_deletes() > 0
             && !stale_queue_entry_keys.is_empty()
         {
-            let queue_entry_keys = stale_queue_entry_keys
-                .iter()
-                .take(operation_budget.remaining_deletes())
-                .map(String::as_str);
-            checkpoint()?;
-            let cleanup = self.delete_compaction_queue_entries(chain, queue_entry_keys);
-            operation_budget.record_deletes(cleanup.deleted_objects);
+            let remaining_deletes = operation_budget.remaining_deletes();
+            if remaining_deletes == 0 {
+                partial = true;
+                cleanup_incomplete = true;
+            } else {
+                let attempted_deletes = stale_queue_entry_keys.len().min(remaining_deletes);
+                let queue_entry_keys = stale_queue_entry_keys
+                    .iter()
+                    .take(attempted_deletes)
+                    .map(String::as_str);
+                checkpoint()?;
+                let cleanup = self.delete_compaction_queue_entries(chain, queue_entry_keys);
+                operation_budget.record_deletes(cleanup.deleted_objects);
+                source_delete_failures =
+                    source_delete_failures.saturating_add(cleanup.delete_failures);
+                if attempted_deletes < stale_queue_entry_keys.len() || cleanup.delete_failures > 0 {
+                    partial = true;
+                    cleanup_incomplete = true;
+                }
+            }
         }
 
         if config.cleanup_enabled || config.coverage_index_v2_delta_count_threshold > 0 {
@@ -915,7 +937,10 @@ where
                 cursor.scope_cursor_advance
             };
             self.write_compaction_cursor_key(&cursor.scope_cursor_key, scope_next_key)?;
-            if !cursor.scope_partial && processed_candidates >= candidates.len() {
+            if !cleanup_incomplete
+                && !cursor.scope_partial
+                && processed_candidates >= candidates.len()
+            {
                 self.write_compaction_cursor_key(
                     &cursor.queue_cursor_key,
                     cursor.queue_cursor_advance,
