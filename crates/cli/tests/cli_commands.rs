@@ -314,28 +314,7 @@ fn test_validate_config_rejects_server_index_graphql_surface() {
 
 #[test]
 fn test_authoritative_server_configs_parse_and_validate() {
-    unsafe {
-        std::env::set_var("DATALENS_ETHEREUM_RPC_URL", "http://example.invalid");
-        std::env::set_var(
-            "DATALENS_ETHEREUM_SECONDARY_RPC_URL",
-            "http://example.invalid/secondary",
-        );
-        std::env::set_var("DATALENS_ARBITRUM_RPC_URL", "http://example.invalid");
-        std::env::set_var("DATALENS_BASE_RPC_URL", "http://example.invalid");
-        std::env::set_var("DATALENS_DARWINIA_RPC_URL", "http://example.invalid");
-        std::env::set_var("DATALENS_SOLANA_RPC_URL", "http://example.invalid");
-        std::env::set_var("DATALENS_TRON_RPC_URL", "http://example.invalid");
-        std::env::set_var("DATALENS_TRONGRID_API_KEY", "");
-        std::env::set_var("DATALENS_S3_BUCKET", "datalens");
-        std::env::set_var("DATALENS_S3_PREFIX", "test");
-        std::env::set_var("DATALENS_S3_REGION", "auto");
-        std::env::set_var("DATALENS_S3_ENDPOINT_URL", "http://127.0.0.1:9000");
-        std::env::set_var("DATALENS_PUBLIC_APP_TOKEN", "replace-with-public-token");
-        std::env::set_var("DATALENS_ORMP_TOKEN", "replace-with-ormp-token");
-        std::env::set_var("DATALENS_LIVE_SMOKE_TOKEN", "replace-with-live-smoke-token");
-        std::env::set_var("DATALENS_DEGOV_TOKEN", "replace-with-degov-token");
-        std::env::set_var("DATALENS_METRICS_TOKEN", "replace-with-metrics-token");
-    }
+    set_authoritative_config_env();
 
     for path in [
         "config/datalens.dev.toml",
@@ -347,6 +326,25 @@ fn test_authoritative_server_configs_parse_and_validate() {
 
         validate_config(&config).unwrap_or_else(|error| panic!("{path} should validate: {error}"));
     }
+}
+
+#[test]
+fn test_production_config_keeps_initial_compaction_rollout_safe() {
+    set_authoritative_config_env();
+
+    let config =
+        DatalensConfig::from_file(workspace_root().join("config/datalens.production.toml"))
+            .expect("production config should parse");
+
+    validate_config(&config).expect("production config should validate");
+    assert!(!config.storage.compaction.enabled);
+    assert!(!config.storage.compaction.cleanup_enabled);
+    assert!(!config.storage.compaction.delete_source_objects);
+    assert!(config.storage.compaction.source_delete_grace_ms > 0);
+    assert!(config.storage.compaction.coverage_index_v2_delete_grace_ms > 0);
+    assert!(config.storage.compaction.max_gets_per_tick > 0);
+    assert!(config.storage.compaction.max_puts_per_tick >= 2);
+    assert!(config.storage.compaction.max_deletes_per_tick > 0);
 }
 
 #[test]
@@ -395,6 +393,52 @@ fn test_validate_config_rejects_compaction_leader_lock_ttl_without_renew_interva
     );
 }
 
+#[test]
+fn test_validate_config_rejects_compaction_cleanup_source_delete_zero_grace() {
+    let config_text = minimal_config_text().replace(
+        r#"
+    [planner]"#,
+        r#"
+    [storage.compaction]
+    enabled = true
+    cleanup_enabled = true
+    delete_source_objects = true
+    source_delete_grace_ms = 0
+
+    [planner]"#,
+    );
+    let config: DatalensConfig = toml::from_str(&config_text).expect("config parses");
+
+    let error = validate_config(&config).expect_err("zero source delete grace rejected");
+
+    assert!(error.message.contains(
+        "storage.compaction.source_delete_grace_ms must be greater than zero when cleanup and source deletes are enabled"
+    ));
+}
+
+#[test]
+fn test_validate_config_rejects_compaction_cleanup_zero_coverage_index_v2_grace() {
+    let config_text = minimal_config_text().replace(
+        r#"
+    [planner]"#,
+        r#"
+    [storage.compaction]
+    enabled = true
+    cleanup_enabled = true
+    delete_source_objects = false
+    coverage_index_v2_delete_grace_ms = 0
+
+    [planner]"#,
+    );
+    let config: DatalensConfig = toml::from_str(&config_text).expect("config parses");
+
+    let error = validate_config(&config).expect_err("zero coverage index v2 grace rejected");
+
+    assert!(error.message.contains(
+        "storage.compaction.coverage_index_v2_delete_grace_ms must be greater than zero when cleanup is enabled"
+    ));
+}
+
 fn minimal_config_text() -> String {
     r#"
     [server]
@@ -430,6 +474,31 @@ fn minimal_config_text() -> String {
     max_addresses_per_query = 2
     "#
     .to_owned()
+}
+
+fn set_authoritative_config_env() {
+    unsafe {
+        std::env::set_var("DATALENS_ETHEREUM_RPC_URL", "http://example.invalid");
+        std::env::set_var(
+            "DATALENS_ETHEREUM_SECONDARY_RPC_URL",
+            "http://example.invalid/secondary",
+        );
+        std::env::set_var("DATALENS_ARBITRUM_RPC_URL", "http://example.invalid");
+        std::env::set_var("DATALENS_BASE_RPC_URL", "http://example.invalid");
+        std::env::set_var("DATALENS_DARWINIA_RPC_URL", "http://example.invalid");
+        std::env::set_var("DATALENS_SOLANA_RPC_URL", "http://example.invalid");
+        std::env::set_var("DATALENS_TRON_RPC_URL", "http://example.invalid");
+        std::env::set_var("DATALENS_TRONGRID_API_KEY", "");
+        std::env::set_var("DATALENS_S3_BUCKET", "datalens");
+        std::env::set_var("DATALENS_S3_PREFIX", "test");
+        std::env::set_var("DATALENS_S3_REGION", "auto");
+        std::env::set_var("DATALENS_S3_ENDPOINT_URL", "http://127.0.0.1:9000");
+        std::env::set_var("DATALENS_PUBLIC_APP_TOKEN", "replace-with-public-token");
+        std::env::set_var("DATALENS_ORMP_TOKEN", "replace-with-ormp-token");
+        std::env::set_var("DATALENS_LIVE_SMOKE_TOKEN", "replace-with-live-smoke-token");
+        std::env::set_var("DATALENS_DEGOV_TOKEN", "replace-with-degov-token");
+        std::env::set_var("DATALENS_METRICS_TOKEN", "replace-with-metrics-token");
+    }
 }
 
 #[test]

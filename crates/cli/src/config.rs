@@ -164,6 +164,23 @@ pub fn validate_config(config: &DatalensConfig) -> Result<(), DatalensError> {
                 "storage.compaction.max_puts_per_tick must be at least two when compaction is enabled",
             ));
         }
+        if config.storage.compaction.cleanup_enabled
+            && config.storage.compaction.delete_source_objects
+            && config.storage.compaction.source_delete_grace_ms == 0
+        {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                "storage.compaction.source_delete_grace_ms must be greater than zero when cleanup and source deletes are enabled",
+            ));
+        }
+        if config.storage.compaction.cleanup_enabled
+            && config.storage.compaction.coverage_index_v2_delete_grace_ms == 0
+        {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                "storage.compaction.coverage_index_v2_delete_grace_ms must be greater than zero when cleanup is enabled",
+            ));
+        }
         if config
             .storage
             .compaction

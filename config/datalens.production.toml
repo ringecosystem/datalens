@@ -25,8 +25,13 @@ max_input_bytes_per_candidate = 134217728
 max_tick_duration_ms = 5000
 max_candidates_per_tick = 1
 max_manifest_entries_per_tick = 1000
+max_gets_per_tick = 64
+max_puts_per_tick = 8
+max_deletes_per_tick = 64
+source_delete_grace_ms = 300000
+coverage_index_v2_delete_grace_ms = 300000
 cleanup_enabled = false
-delete_source_objects = true
+delete_source_objects = false
 
 [planner]
 max_query_range_blocks = 100000

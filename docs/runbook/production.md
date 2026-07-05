@@ -69,13 +69,14 @@ runtime settings, and detected safe/finalized height for every configured chain.
 `config/datalens.production.toml` is the GitOps-facing production parameter source for
 background compaction. Keep the first production rollout conservative:
 
-- `storage.compaction.enabled = true` starts the controller.
+- `storage.compaction.enabled = false` keeps the controller paused until preflight
+  inventory and baselines are captured.
 - `storage.compaction.cleanup_enabled = false` keeps reconciliation cleanup deletes
   off during the first rollout.
 - `storage.compaction.delete_source_objects = false` preserves source objects even
   after a compacted replacement is published.
 - `storage.compaction.max_candidates_per_tick = 1`,
-  `storage.compaction.max_tick_duration_ms = 2000`, and
+  `storage.compaction.max_tick_duration_ms = 5000`, and
   `storage.compaction.max_input_objects_per_candidate = 512` keep each tick
   bounded while letting dense small-object runs converge toward the target
   object size.
