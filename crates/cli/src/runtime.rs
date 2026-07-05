@@ -179,7 +179,7 @@ pub(crate) fn start_storage_compaction_worker(
             })?;
             CompactionStorage::Local(LocalStorage::new_with_config(
                 &local.root,
-                config.storage.parquet.into(),
+                (&config.storage).into(),
             ))
         }
         "s3" => {
@@ -191,7 +191,7 @@ pub(crate) fn start_storage_compaction_worker(
             })?;
             CompactionStorage::S3(DurableStorage::from_object_store_with_config(
                 S3ObjectStore::from_config(s3)?,
-                config.storage.parquet.into(),
+                (&config.storage).into(),
             ))
         }
         _ => {
@@ -1264,7 +1264,7 @@ pub(crate) fn build_storage(
             })?;
             Ok(Box::new(LocalStorage::new_with_config(
                 &local.root,
-                config.storage.parquet.into(),
+                (&config.storage).into(),
             )))
         }
         "s3" => {
@@ -1277,7 +1277,7 @@ pub(crate) fn build_storage(
             let store = S3ObjectStore::from_config(s3)?;
             Ok(Box::new(DurableStorage::from_object_store_with_config(
                 store,
-                config.storage.parquet.into(),
+                (&config.storage).into(),
             )))
         }
         _ => Err(DatalensError::new(

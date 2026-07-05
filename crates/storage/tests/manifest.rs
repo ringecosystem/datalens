@@ -1896,6 +1896,7 @@ fn test_evm_blocks_rows_write_zstd_parquet_and_read_back() {
         temp_storage_root("blocks-zstd-roundtrip"),
         DurableStorageConfig {
             parquet_compression: ParquetCompression::Zstd,
+            ..DurableStorageConfig::default()
         },
     );
     let chain = test_chain();
@@ -1951,6 +1952,7 @@ fn test_evm_block_headers_rows_write_parquet_and_read_back_by_range() {
         temp_storage_root("block-headers-parquet-roundtrip"),
         DurableStorageConfig {
             parquet_compression: ParquetCompression::Snappy,
+            ..DurableStorageConfig::default()
         },
     );
     let chain = test_chain();
@@ -2069,6 +2071,7 @@ fn test_evm_logs_rows_write_snappy_parquet_and_read_back() {
         temp_storage_root("logs-snappy-roundtrip"),
         DurableStorageConfig {
             parquet_compression: ParquetCompression::Snappy,
+            ..DurableStorageConfig::default()
         },
     );
     let chain = test_chain();
@@ -2189,6 +2192,7 @@ fn test_empty_coverage_does_not_record_object_compression() {
         temp_storage_root("empty-no-compression"),
         DurableStorageConfig {
             parquet_compression: ParquetCompression::Zstd,
+            ..DurableStorageConfig::default()
         },
     );
     let chain = test_chain();
@@ -4376,6 +4380,235 @@ fn test_coverage_index_v2_hot_writes_same_bucket_use_distinct_delta_keys() {
 
     assert_eq!(delta_keys.len(), 2);
     object_store.assert_no_overwrite(&prefix);
+}
+
+#[test]
+fn test_hot_writes_do_not_update_legacy_coverage_index_objects() {
+    let object_store = CountingObjectStore::new(LocalObjectStore::new(temp_storage_root(
+        "coverage-index-v2-only-hot-writes",
+    )));
+    let storage = DurableStorage::from_object_store_with_config(
+        object_store.clone(),
+        DurableStorageConfig {
+            legacy_coverage_index_write_enabled: false,
+            ..DurableStorageConfig::default()
+        },
+    );
+    let chain = test_chain();
+    let selector = evm_log_selector(vec![ADDRESS_A], vec![Some(vec![TOPIC_1])]);
+
+    for block in [10, 11] {
+        let rows = DatasetRows::new(
+            DatasetKey::evm_logs(),
+            QueryRows::EvmLogs(vec![log_record(block, 0, ADDRESS_A, vec![TOPIC_1])]),
+        )
+        .expect("dataset rows");
+        storage
+            .write_rows(StorageWriteRequest {
+                chain: &chain,
+                dataset_key: DatasetKey::evm_logs(),
+                selector: &selector,
+                range: LedgerRange::blocks(block, block).expect("valid range"),
+                rows: &rows,
+                finality_level: FinalityLevel::Safe,
+                record_empty_coverage: true,
+            })
+            .expect("write log coverage");
+    }
+
+    assert!(
+        storage
+            .object_store()
+            .list(&format!("chains/{}/coverage-index", chain.key_prefix()))
+            .expect("legacy coverage index list")
+            .is_empty()
+    );
+    assert!(
+        storage
+            .object_store()
+            .list(&format!(
+                "chains/{}/coverage-index-semantic",
+                chain.key_prefix()
+            ))
+            .expect("legacy semantic coverage index list")
+            .is_empty()
+    );
+    assert_eq!(
+        storage
+            .read_rows(
+                &chain,
+                &DatasetKey::evm_logs(),
+                &selector,
+                LedgerRange::blocks(10, 11).expect("valid range"),
+            )
+            .expect("read rows from v2 coverage"),
+        DatasetRows::new(
+            DatasetKey::evm_logs(),
+            QueryRows::EvmLogs(vec![
+                log_record(10, 0, ADDRESS_A, vec![TOPIC_1]),
+                log_record(11, 0, ADDRESS_A, vec![TOPIC_1]),
+            ]),
+        )
+        .expect("expected rows")
+    );
+    object_store.assert_no_overwrite(&format!("chains/{}/coverage-index-v2", chain.key_prefix()));
+}
+
+#[test]
+fn test_replacement_does_not_update_legacy_coverage_index_objects_when_disabled() {
+    let object_store = CountingObjectStore::new(LocalObjectStore::new(temp_storage_root(
+        "coverage-index-v2-only-replacement",
+    )));
+    let storage = DurableStorage::from_object_store_with_config(
+        object_store.clone(),
+        DurableStorageConfig {
+            legacy_coverage_index_write_enabled: false,
+            ..DurableStorageConfig::default()
+        },
+    );
+    let chain = test_chain();
+    let selector = evm_log_selector(vec![ADDRESS_A], vec![Some(vec![TOPIC_1])]);
+    let data_range = LedgerRange::blocks(20, 22).expect("valid range");
+    let replacement_range = LedgerRange::blocks(21, 21).expect("valid range");
+    let data_rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![
+            log_record(20, 0, ADDRESS_A, vec![TOPIC_1]),
+            log_record(21, 1, ADDRESS_A, vec![TOPIC_1]),
+            log_record(22, 2, ADDRESS_A, vec![TOPIC_1]),
+        ]),
+    )
+    .expect("data rows");
+    let replacement_rows = DatasetRows::new(
+        DatasetKey::evm_logs(),
+        QueryRows::EvmLogs(vec![log_record(21, 7, ADDRESS_A, vec![TOPIC_1])]),
+    )
+    .expect("replacement rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &selector,
+            range: data_range,
+            rows: &data_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write data coverage");
+    storage
+        .write_rows_replacing_existing(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &selector,
+            range: replacement_range.clone(),
+            rows: &replacement_rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write replacement rows");
+
+    assert!(
+        storage
+            .object_store()
+            .list(&format!("chains/{}/coverage-index", chain.key_prefix()))
+            .expect("legacy coverage index list")
+            .is_empty()
+    );
+    assert!(
+        storage
+            .object_store()
+            .list(&format!(
+                "chains/{}/coverage-index-semantic",
+                chain.key_prefix()
+            ))
+            .expect("legacy semantic coverage index list")
+            .is_empty()
+    );
+    let rows = storage
+        .read_rows(
+            &chain,
+            &DatasetKey::evm_logs(),
+            &selector,
+            replacement_range,
+        )
+        .expect("read replacement rows");
+    match rows.into_rows() {
+        QueryRows::EvmLogs(logs) => {
+            assert_eq!(logs.len(), 1);
+            assert_eq!(logs[0].log_index, 7);
+        }
+        rows => panic!("expected log rows, got {rows:?}"),
+    }
+    object_store.assert_no_overwrite(&format!("chains/{}/coverage-index-v2", chain.key_prefix()));
+}
+
+#[test]
+fn test_full_manifest_write_does_not_update_legacy_coverage_index_objects_when_disabled() {
+    let object_store = CountingObjectStore::new(LocalObjectStore::new(temp_storage_root(
+        "coverage-index-v2-only-full-manifest",
+    )));
+    let storage = DurableStorage::from_object_store_with_config(
+        object_store.clone(),
+        DurableStorageConfig {
+            legacy_coverage_index_write_enabled: false,
+            ..DurableStorageConfig::default()
+        },
+    );
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let range = LedgerRange::blocks(30, 30).expect("valid range");
+    let rows = DatasetRows::new(
+        DatasetKey::evm_blocks(),
+        QueryRows::EvmBlocks(vec![BlockHeader {
+            number: 30,
+            hash: "0xblock30".to_owned(),
+            parent_hash: "0xparent".to_owned(),
+            timestamp: 30,
+        }]),
+    )
+    .expect("rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &selector,
+            range: range.clone(),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write rows");
+    let manifest = storage.manifest().expect("manifest");
+    storage
+        .write_manifest(&chain, &manifest)
+        .expect("write full manifest");
+
+    assert!(
+        storage
+            .object_store()
+            .list(&format!("chains/{}/coverage-index", chain.key_prefix()))
+            .expect("legacy coverage index list")
+            .is_empty()
+    );
+    assert!(
+        storage
+            .object_store()
+            .list(&format!(
+                "chains/{}/coverage-index-semantic",
+                chain.key_prefix()
+            ))
+            .expect("legacy semantic coverage index list")
+            .is_empty()
+    );
+    assert_eq!(
+        storage
+            .read_rows(&chain, &DatasetKey::evm_blocks(), &selector, range)
+            .expect("read rows"),
+        rows
+    );
+    object_store.assert_no_overwrite(&format!("chains/{}/coverage-index-v2", chain.key_prefix()));
 }
 
 #[test]

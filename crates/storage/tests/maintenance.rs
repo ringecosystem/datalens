@@ -74,6 +74,14 @@ struct OverlappingWriteDuringCompactionStore {
     inner: LocalObjectStore,
     injected: Arc<AtomicBool>,
     chain: ChainIdentity,
+    trigger: OverlappingWriteTrigger,
+    storage_config: DurableStorageConfig,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum OverlappingWriteTrigger {
+    CompactedObject,
+    ManifestSegment,
 }
 
 impl FailingDataObjectPutStore {
@@ -197,11 +205,58 @@ impl OverlappingWriteDuringCompactionStore {
             inner: LocalObjectStore::new(root),
             injected: Arc::new(AtomicBool::new(false)),
             chain,
+            trigger: OverlappingWriteTrigger::CompactedObject,
+            storage_config: DurableStorageConfig::default(),
+        }
+    }
+
+    fn new_for_manifest_segment(
+        root: PathBuf,
+        chain: ChainIdentity,
+        storage_config: DurableStorageConfig,
+    ) -> Self {
+        Self {
+            inner: LocalObjectStore::new(root),
+            injected: Arc::new(AtomicBool::new(false)),
+            chain,
+            trigger: OverlappingWriteTrigger::ManifestSegment,
+            storage_config,
         }
     }
 
     fn injected(&self) -> bool {
         self.injected.load(Ordering::SeqCst)
+    }
+
+    fn should_inject_after_put(&self, key: &str) -> bool {
+        match self.trigger {
+            OverlappingWriteTrigger::CompactedObject => key.contains("/compacted/"),
+            OverlappingWriteTrigger::ManifestSegment => key.contains("/manifest-segments/"),
+        }
+    }
+
+    fn inject_replacement(&self) -> Result<(), DatalensError> {
+        let rows = DatasetRows::new(
+            DatasetKey::evm_blocks(),
+            QueryRows::EvmBlocks(vec![BlockHeader {
+                number: 50,
+                hash: "0xreplacement50".to_owned(),
+                parent_hash: "0xparent".to_owned(),
+                timestamp: 50,
+            }]),
+        )
+        .expect("replacement rows");
+        DurableStorage::from_object_store_with_config(self.inner.clone(), self.storage_config)
+            .write_rows_replacing_existing(StorageWriteRequest {
+                chain: &self.chain,
+                dataset_key: DatasetKey::evm_blocks(),
+                selector: &DatasetSelector::all(),
+                range: LedgerRange::blocks(50, 50).expect("range"),
+                rows: &rows,
+                finality_level: FinalityLevel::Safe,
+                record_empty_coverage: true,
+            })?;
+        Ok(())
     }
 }
 
@@ -606,33 +661,13 @@ impl ObjectStore for OverlappingWriteDuringCompactionStore {
 
     fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
         self.inner.put(key, bytes)?;
-        if key.contains("/compacted/")
+        if self.should_inject_after_put(key)
             && self
                 .injected
                 .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
         {
-            let rows = DatasetRows::new(
-                DatasetKey::evm_blocks(),
-                QueryRows::EvmBlocks(vec![BlockHeader {
-                    number: 50,
-                    hash: "0xreplacement50".to_owned(),
-                    parent_hash: "0xparent".to_owned(),
-                    timestamp: 50,
-                }]),
-            )
-            .expect("replacement rows");
-            DurableStorage::from_object_store(self.inner.clone()).write_rows_replacing_existing(
-                StorageWriteRequest {
-                    chain: &self.chain,
-                    dataset_key: DatasetKey::evm_blocks(),
-                    selector: &DatasetSelector::all(),
-                    range: LedgerRange::blocks(50, 50).expect("range"),
-                    rows: &rows,
-                    finality_level: FinalityLevel::Safe,
-                    record_empty_coverage: true,
-                },
-            )?;
+            self.inject_replacement()?;
         }
         Ok(())
     }
@@ -644,33 +679,13 @@ impl ObjectStore for OverlappingWriteDuringCompactionStore {
     ) -> Result<ObjectPutIfAbsentResult, DatalensError> {
         let result = self.inner.put_if_absent(key, bytes)?;
         if result == ObjectPutIfAbsentResult::Created
-            && key.contains("/compacted/")
+            && self.should_inject_after_put(key)
             && self
                 .injected
                 .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
         {
-            let rows = DatasetRows::new(
-                DatasetKey::evm_blocks(),
-                QueryRows::EvmBlocks(vec![BlockHeader {
-                    number: 50,
-                    hash: "0xreplacement50".to_owned(),
-                    parent_hash: "0xparent".to_owned(),
-                    timestamp: 50,
-                }]),
-            )
-            .expect("replacement rows");
-            DurableStorage::from_object_store(self.inner.clone()).write_rows_replacing_existing(
-                StorageWriteRequest {
-                    chain: &self.chain,
-                    dataset_key: DatasetKey::evm_blocks(),
-                    selector: &DatasetSelector::all(),
-                    range: LedgerRange::blocks(50, 50).expect("range"),
-                    rows: &rows,
-                    finality_level: FinalityLevel::Safe,
-                    record_empty_coverage: true,
-                },
-            )?;
+            self.inject_replacement()?;
         }
         Ok(result)
     }
@@ -1182,6 +1197,167 @@ fn test_compaction_skips_candidate_when_overlapping_write_publishes_before_manif
 }
 
 #[test]
+fn test_v2_only_late_replacement_during_compaction_manifest_publish_wins() {
+    let config = DurableStorageConfig {
+        legacy_coverage_index_write_enabled: false,
+        ..DurableStorageConfig::default()
+    };
+    let storage = LocalStorage::new_with_config(
+        temp_storage_root("compaction-v2-only-late-replacement"),
+        config,
+    );
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 50, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 51, FinalityLevel::Safe);
+    let injecting_store = OverlappingWriteDuringCompactionStore::new_for_manifest_segment(
+        storage.root().into(),
+        chain.clone(),
+        config,
+    );
+    let compacting_storage =
+        DurableStorage::from_object_store_with_config(injecting_store.clone(), config);
+
+    let report = compacting_storage
+        .compact_small_objects(MaintenanceCompactionConfig {
+            min_object_bytes: u64::MAX,
+            max_input_objects_per_candidate: 8,
+            max_tick_duration_ms: 30_000,
+            max_candidates_per_tick: 8,
+            max_manifest_entries_per_tick: 20_000,
+            cleanup_enabled: false,
+            delete_source_objects: false,
+            ..MaintenanceCompactionConfig::default()
+        })
+        .expect("compact small objects");
+
+    assert!(injecting_store.injected());
+    assert_eq!(report.candidate_count, 1);
+    assert_eq!(report.processed_candidates, 1);
+    assert_eq!(report.compacted_objects, 1);
+    assert!(
+        storage
+            .object_store()
+            .list(&format!("chains/{}/coverage-index", chain.key_prefix()))
+            .expect("legacy coverage index list")
+            .is_empty()
+    );
+    let rows = storage
+        .read_rows(
+            &chain,
+            &DatasetKey::evm_blocks(),
+            &DatasetSelector::all(),
+            LedgerRange::blocks(50, 51).expect("range"),
+        )
+        .expect("read rows after late replacement");
+    match rows.into_rows() {
+        QueryRows::EvmBlocks(blocks) => {
+            assert_eq!(blocks.len(), 2);
+            assert_eq!(blocks[0].hash, "0xreplacement50");
+            assert_eq!(blocks[1].hash, "0xblock51");
+        }
+        rows => panic!("expected block rows, got {rows:?}"),
+    }
+}
+
+#[test]
+fn test_compaction_skips_candidate_when_v2_only_index_has_newer_replacement() {
+    let storage = LocalStorage::new_with_config(
+        temp_storage_root("compaction-v2-only-index-newer-replacement"),
+        DurableStorageConfig {
+            legacy_coverage_index_write_enabled: false,
+            ..DurableStorageConfig::default()
+        },
+    );
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 50, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 51, FinalityLevel::Safe);
+    let old_segments = storage
+        .object_store()
+        .list(&format!("chains/{}/manifest-segments", chain.key_prefix()))
+        .expect("old manifest segments")
+        .into_iter()
+        .map(|object| {
+            let bytes = storage
+                .object_store()
+                .get(&object.key)
+                .expect("old manifest segment bytes");
+            (object.key, bytes)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(old_segments.len(), 2);
+
+    let rows = DatasetRows::new(DatasetKey::evm_blocks(), QueryRows::EvmBlocks(Vec::new()))
+        .expect("replacement rows");
+    storage
+        .write_rows_replacing_existing(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &DatasetSelector::all(),
+            range: LedgerRange::blocks(50, 50).expect("range"),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write replacement rows");
+
+    for object in storage
+        .object_store()
+        .list(&format!("chains/{}/manifest-segments", chain.key_prefix()))
+        .expect("current manifest segments")
+    {
+        storage
+            .object_store()
+            .delete(&object.key)
+            .expect("delete current manifest segment");
+    }
+    for (key, bytes) in old_segments {
+        storage
+            .object_store()
+            .put(&key, &bytes)
+            .expect("restore old manifest segment");
+    }
+
+    let report = storage
+        .compact_small_objects(MaintenanceCompactionConfig {
+            min_object_bytes: u64::MAX,
+            max_input_objects_per_candidate: 8,
+            max_tick_duration_ms: 30_000,
+            max_candidates_per_tick: 8,
+            max_manifest_entries_per_tick: 20_000,
+            cleanup_enabled: false,
+            delete_source_objects: false,
+            ..MaintenanceCompactionConfig::default()
+        })
+        .expect("compact small objects");
+
+    assert_eq!(report.candidate_count, 1);
+    assert_eq!(report.processed_candidates, 0);
+    assert_eq!(report.compacted_objects, 0);
+    assert!(
+        storage
+            .object_store()
+            .list(&format!("chains/{}/coverage-index", chain.key_prefix()))
+            .expect("legacy coverage index list")
+            .is_empty()
+    );
+    let rows = storage
+        .read_rows(
+            &chain,
+            &DatasetKey::evm_blocks(),
+            &DatasetSelector::all(),
+            LedgerRange::blocks(50, 51).expect("range"),
+        )
+        .expect("read rows after skipped compaction");
+    match rows.into_rows() {
+        QueryRows::EvmBlocks(blocks) => {
+            assert_eq!(blocks.len(), 1);
+            assert_eq!(blocks[0].hash, "0xblock51");
+        }
+        rows => panic!("expected block rows, got {rows:?}"),
+    }
+}
+
+#[test]
 fn test_maintenance_report_summarizes_compaction_backlog_by_chain_dataset_selector() {
     let storage = LocalStorage::new(temp_storage_root("compaction-backlog-report"));
     let chain = test_chain();
@@ -1390,6 +1566,7 @@ fn test_compaction_uses_configured_parquet_compression() {
         temp_storage_root("compaction-zstd"),
         DurableStorageConfig {
             parquet_compression: ParquetCompression::Zstd,
+            ..DurableStorageConfig::default()
         },
     );
     let chain = test_chain();

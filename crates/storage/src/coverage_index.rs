@@ -896,52 +896,66 @@ fn covered_ranges_from_entries(
     crate::merge_ranges(ranges)
 }
 
+#[allow(dead_code)]
 pub(crate) fn write_entry<S>(object_store: &S, entry: &ManifestEntry) -> Result<(), DatalensError>
 where
     S: ObjectStore,
 {
-    for (bucket_start, bucket_end) in
-        bucket_ranges(&entry.range, DEFAULT_COVERAGE_INDEX_BUCKET_SIZE)
-    {
-        let started = Instant::now();
-        for key in coverage_index_entry_keys(entry, bucket_start, bucket_end) {
-            let lock = coverage_index_update_lock(object_store, &key)?;
-            let _guard = lock_coverage_index_update(&lock)?;
-            let mut index = if object_store.exists(&key)? {
-                let bytes = object_store.get(&key)?;
-                serde_json::from_slice(&bytes).map_err(|error| {
+    write_entry_with_legacy_index(object_store, entry, true)
+}
+
+pub(crate) fn write_entry_with_legacy_index<S>(
+    object_store: &S,
+    entry: &ManifestEntry,
+    legacy_write_enabled: bool,
+) -> Result<(), DatalensError>
+where
+    S: ObjectStore,
+{
+    if legacy_write_enabled {
+        for (bucket_start, bucket_end) in
+            bucket_ranges(&entry.range, DEFAULT_COVERAGE_INDEX_BUCKET_SIZE)
+        {
+            let started = Instant::now();
+            for key in coverage_index_entry_keys(entry, bucket_start, bucket_end) {
+                let lock = coverage_index_update_lock(object_store, &key)?;
+                let _guard = lock_coverage_index_update(&lock)?;
+                let mut index = if object_store.exists(&key)? {
+                    let bytes = object_store.get(&key)?;
+                    serde_json::from_slice(&bytes).map_err(|error| {
+                        DatalensError::new(
+                            DatalensErrorKind::StorageReadFailure,
+                            format!("decode coverage index {key}: {error}"),
+                        )
+                    })?
+                } else {
+                    CoverageIndex::default()
+                };
+                index.upsert(entry.clone());
+                let bytes = serde_json::to_vec_pretty(&index).map_err(|error| {
                     DatalensError::new(
-                        DatalensErrorKind::StorageReadFailure,
-                        format!("decode coverage index {key}: {error}"),
+                        DatalensErrorKind::Internal,
+                        format!("encode coverage index: {error}"),
                     )
-                })?
-            } else {
-                CoverageIndex::default()
-            };
-            index.upsert(entry.clone());
-            let bytes = serde_json::to_vec_pretty(&index).map_err(|error| {
-                DatalensError::new(
-                    DatalensErrorKind::Internal,
-                    format!("encode coverage index: {error}"),
-                )
-            })?;
-            object_store.put(&key, &bytes).map_err(|error| {
-                DatalensError::new(
-                    DatalensErrorKind::ManifestUpdateFailure,
-                    format!("write coverage index {key}: {}", error.message),
-                )
-            })?;
-            log::info!(
-                "storage wrote coverage index chain_key={} dataset={} selector_fingerprint={} range_kind={} bucket={}-{} entries_count={} duration_ms={}",
-                entry.chain.key_prefix(),
-                entry.dataset_key.as_str(),
-                entry.selector_fingerprint,
-                range_kind_key(entry.range.kind()),
-                bucket_start,
-                bucket_end,
-                index.entries.len(),
-                started.elapsed().as_millis()
-            );
+                })?;
+                object_store.put(&key, &bytes).map_err(|error| {
+                    DatalensError::new(
+                        DatalensErrorKind::ManifestUpdateFailure,
+                        format!("write coverage index {key}: {}", error.message),
+                    )
+                })?;
+                log::info!(
+                    "storage wrote coverage index chain_key={} dataset={} selector_fingerprint={} range_kind={} bucket={}-{} entries_count={} duration_ms={}",
+                    entry.chain.key_prefix(),
+                    entry.dataset_key.as_str(),
+                    entry.selector_fingerprint,
+                    range_kind_key(entry.range.kind()),
+                    bucket_start,
+                    bucket_end,
+                    index.entries.len(),
+                    started.elapsed().as_millis()
+                );
+            }
         }
     }
     write_v2_entry_delta(object_store, entry)?;
@@ -1193,6 +1207,7 @@ fn coverage_index_v2_immutable_id() -> Result<String, DatalensError> {
     ))
 }
 
+#[allow(dead_code)]
 pub(crate) fn replace_entry<S>(
     object_store: &S,
     entry: &ManifestEntry,
@@ -1200,26 +1215,39 @@ pub(crate) fn replace_entry<S>(
 where
     S: ObjectStore,
 {
+    replace_entry_with_legacy_index(object_store, entry, true)
+}
+
+pub(crate) fn replace_entry_with_legacy_index<S>(
+    object_store: &S,
+    entry: &ManifestEntry,
+    legacy_write_enabled: bool,
+) -> Result<CoverageIndexReplacement, DatalensError>
+where
+    S: ObjectStore,
+{
     let mut replaced_entries = Vec::new();
-    for (bucket_start, bucket_end) in
-        bucket_ranges(&entry.range, DEFAULT_COVERAGE_INDEX_BUCKET_SIZE)
-    {
-        let key = coverage_index_key(
-            &entry.chain,
-            &entry.dataset_key,
-            &entry.range,
-            &entry.selector_fingerprint,
-            entry.finality_level,
-            bucket_start,
-            bucket_end,
-        );
-        let lock = coverage_index_update_lock(object_store, &key)?;
-        let _guard = lock_coverage_index_update(&lock)?;
-        let index = read_index(object_store, &key)?;
-        replaced_entries.extend(index.entries.into_iter().filter(|existing_entry| {
-            replacement_scope_matches(existing_entry, entry)
-                && existing_entry.range.intersection(&entry.range).is_some()
-        }));
+    if legacy_write_enabled {
+        for (bucket_start, bucket_end) in
+            bucket_ranges(&entry.range, DEFAULT_COVERAGE_INDEX_BUCKET_SIZE)
+        {
+            let key = coverage_index_key(
+                &entry.chain,
+                &entry.dataset_key,
+                &entry.range,
+                &entry.selector_fingerprint,
+                entry.finality_level,
+                bucket_start,
+                bucket_end,
+            );
+            let lock = coverage_index_update_lock(object_store, &key)?;
+            let _guard = lock_coverage_index_update(&lock)?;
+            let index = read_index(object_store, &key)?;
+            replaced_entries.extend(index.entries.into_iter().filter(|existing_entry| {
+                replacement_scope_matches(existing_entry, entry)
+                    && existing_entry.range.intersection(&entry.range).is_some()
+            }));
+        }
     }
     let mut v2_entries = Vec::new();
     read_entries_for_v2_buckets(
@@ -1320,11 +1348,22 @@ where
                 && existing_entry.range.intersection(&entry.range).is_some()
         }));
     }
+    let mut v2_entries = Vec::new();
+    read_entries_for_v2_buckets(
+        object_store,
+        coverage_index_v2_entry_buckets(entry),
+        &mut v2_entries,
+    )?;
+    entries.extend(v2_entries.into_iter().filter(|existing_entry| {
+        replacement_scope_matches(existing_entry, entry)
+            && existing_entry.range.intersection(&entry.range).is_some()
+    }));
     let mut manifest = Manifest { entries };
     manifest.normalize();
     Ok(manifest.entries)
 }
 
+#[allow(dead_code)]
 pub(crate) fn publish_replacement<S>(
     object_store: &S,
     entry: &ManifestEntry,
@@ -1333,6 +1372,36 @@ pub(crate) fn publish_replacement<S>(
 where
     S: ObjectStore,
 {
+    publish_replacement_with_legacy_index(object_store, entry, replacement, true)
+}
+
+pub(crate) fn publish_replacement_with_legacy_index<S>(
+    object_store: &S,
+    entry: &ManifestEntry,
+    replacement: &CoverageIndexReplacement,
+    legacy_write_enabled: bool,
+) -> Result<CoverageIndexReplacementPublish, DatalensError>
+where
+    S: ObjectStore,
+{
+    if !legacy_write_enabled {
+        let replaced_entries = read_entries_for_replacement_scope(object_store, entry)?;
+        let mut published_manifest = Manifest {
+            entries: replacement_published_entries(&replaced_entries, entry)?,
+        };
+        published_manifest.normalize();
+        write_v2_replacement_delta(
+            object_store,
+            entry,
+            &replaced_entries,
+            &published_manifest.entries,
+        )?;
+        return Ok(CoverageIndexReplacementPublish {
+            replaced_entries,
+            published_entries: published_manifest.entries,
+        });
+    }
+
     let replacement_buckets = bucket_ranges(&entry.range, DEFAULT_COVERAGE_INDEX_BUCKET_SIZE)
         .into_iter()
         .flat_map(|(bucket_start, bucket_end)| {
@@ -1506,8 +1575,19 @@ pub(crate) fn write_entries<S>(
 where
     S: ObjectStore,
 {
+    write_entries_with_legacy_index(object_store, entries, true)
+}
+
+pub(crate) fn write_entries_with_legacy_index<S>(
+    object_store: &S,
+    entries: &[ManifestEntry],
+    legacy_write_enabled: bool,
+) -> Result<(), DatalensError>
+where
+    S: ObjectStore,
+{
     for entry in entries {
-        write_entry(object_store, entry)?;
+        write_entry_with_legacy_index(object_store, entry, legacy_write_enabled)?;
     }
     Ok(())
 }

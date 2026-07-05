@@ -66,6 +66,8 @@ pub struct StorageConfig {
     #[serde(default)]
     pub parquet: StorageParquetConfig,
     #[serde(default)]
+    pub coverage_index: StorageCoverageIndexConfig,
+    #[serde(default)]
     pub compaction: StorageCompactionConfig,
 }
 
@@ -82,10 +84,26 @@ pub struct StorageParquetConfig {
     pub compression: ParquetCompression,
 }
 
-impl From<StorageParquetConfig> for DurableStorageConfig {
-    fn from(config: StorageParquetConfig) -> Self {
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageCoverageIndexConfig {
+    #[serde(default = "default_storage_coverage_index_legacy_write_enabled")]
+    pub legacy_write_enabled: bool,
+}
+
+impl Default for StorageCoverageIndexConfig {
+    fn default() -> Self {
         Self {
-            parquet_compression: config.compression,
+            legacy_write_enabled: default_storage_coverage_index_legacy_write_enabled(),
+        }
+    }
+}
+
+impl From<&StorageConfig> for DurableStorageConfig {
+    fn from(config: &StorageConfig) -> Self {
+        Self {
+            parquet_compression: config.parquet.compression,
+            legacy_coverage_index_write_enabled: config.coverage_index.legacy_write_enabled,
         }
     }
 }
@@ -558,6 +576,10 @@ fn default_storage_compaction_max_deletes_per_tick() -> usize {
 
 fn default_storage_compaction_source_delete_grace_ms() -> u64 {
     300_000
+}
+
+fn default_storage_coverage_index_legacy_write_enabled() -> bool {
+    true
 }
 
 fn default_storage_compaction_coverage_index_v2_delta_count_threshold() -> usize {
