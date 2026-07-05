@@ -2561,6 +2561,147 @@ fn test_compaction_tick_cleans_consumed_queue_entries() {
 }
 
 #[test]
+fn test_compaction_cleanup_deletes_stale_queue_entries_for_missing_manifest_segments() {
+    let storage = LocalStorage::new(temp_storage_root("queue-cleanup-missing-segment"));
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 108, FinalityLevel::Safe);
+    let queue_prefix = format!("chains/{}/metadata/compaction-queue", chain.key_prefix());
+
+    assert_eq!(
+        storage
+            .object_store()
+            .list(&queue_prefix)
+            .expect("queue entries before cleanup")
+            .len(),
+        1
+    );
+    for segment_key in manifest_segment_keys(&storage, &chain) {
+        storage
+            .object_store()
+            .delete(&segment_key)
+            .expect("delete manifest segment");
+    }
+
+    let report = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                cleanup_enabled: true,
+                delete_source_objects: false,
+                max_deletes_per_tick: 8,
+                ..MaintenanceCompactionConfig::default()
+            },
+        )
+        .expect("stale queue cleanup");
+
+    assert_eq!(report.processed_candidates, 0);
+    assert_eq!(
+        storage
+            .object_store()
+            .list(&queue_prefix)
+            .expect("queue entries after cleanup")
+            .len(),
+        0
+    );
+}
+
+#[test]
+fn test_compaction_cleanup_preserves_live_non_candidate_queue_entries() {
+    let storage = LocalStorage::new(temp_storage_root("queue-cleanup-preserves-live"));
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 109, FinalityLevel::Safe);
+    let queue_prefix = format!("chains/{}/metadata/compaction-queue", chain.key_prefix());
+
+    let report = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                cleanup_enabled: true,
+                delete_source_objects: false,
+                max_deletes_per_tick: 8,
+                ..MaintenanceCompactionConfig::default()
+            },
+        )
+        .expect("live queue cleanup");
+
+    assert_eq!(report.processed_candidates, 0);
+    assert_eq!(
+        storage
+            .object_store()
+            .list(&queue_prefix)
+            .expect("queue entries after cleanup")
+            .len(),
+        1
+    );
+    let rows = storage
+        .read_rows(
+            &chain,
+            &DatasetKey::evm_blocks(),
+            &DatasetSelector::all(),
+            LedgerRange::blocks(109, 109).expect("range"),
+        )
+        .expect("read live row");
+    assert_eq!(rows.row_count(), 1);
+}
+
+#[test]
+fn test_compaction_queue_stale_cleanup_obeys_delete_budget() {
+    let storage = LocalStorage::new(temp_storage_root("queue-cleanup-delete-budget"));
+    let chain = test_chain();
+    for number in [110, 120, 130] {
+        write_block_object(&storage, &chain, number, FinalityLevel::Safe);
+    }
+    let queue_prefix = format!("chains/{}/metadata/compaction-queue", chain.key_prefix());
+
+    assert_eq!(
+        storage
+            .object_store()
+            .list(&queue_prefix)
+            .expect("queue entries before cleanup")
+            .len(),
+        3
+    );
+    for segment_key in manifest_segment_keys(&storage, &chain) {
+        storage
+            .object_store()
+            .delete(&segment_key)
+            .expect("delete manifest segment");
+    }
+    let config = MaintenanceCompactionConfig {
+        cleanup_enabled: true,
+        delete_source_objects: false,
+        max_deletes_per_tick: 2,
+        ..MaintenanceCompactionConfig::default()
+    };
+
+    let first = storage
+        .compact_small_objects_for_chain(&chain, config)
+        .expect("first stale queue cleanup");
+    assert_eq!(first.processed_candidates, 0);
+    assert_eq!(
+        storage
+            .object_store()
+            .list(&queue_prefix)
+            .expect("queue entries after first cleanup")
+            .len(),
+        1
+    );
+
+    let second = storage
+        .compact_small_objects_for_chain(&chain, config)
+        .expect("second stale queue cleanup");
+    assert_eq!(second.processed_candidates, 0);
+    assert_eq!(
+        storage
+            .object_store()
+            .list(&queue_prefix)
+            .expect("queue entries after second cleanup")
+            .len(),
+        0
+    );
+}
+
+#[test]
 fn test_compaction_queue_advances_after_non_candidate_scope() {
     let storage = LocalStorage::new(temp_storage_root("queue-non-candidate-scope"));
     let chain = test_chain();

@@ -543,6 +543,7 @@ where
             .collect::<Vec<_>>();
         self.compact_selected_manifest_entries(CompactSelectedManifestEntriesArgs {
             entries,
+            stale_queue_entry_keys: Vec::new(),
             config,
             started,
             cursor: None,
@@ -578,6 +579,7 @@ where
         let report =
             self.compact_selected_manifest_entries(CompactSelectedManifestEntriesArgs {
                 entries: scan.entries,
+                stale_queue_entry_keys: scan.stale_queue_entry_keys,
                 config,
                 started,
                 cursor: Some(scan.cursor_update),
@@ -699,6 +701,7 @@ where
     ) -> Result<MaintenanceCompactionReport, DatalensError> {
         let CompactSelectedManifestEntriesArgs {
             entries,
+            stale_queue_entry_keys,
             config,
             started,
             cursor,
@@ -862,6 +865,20 @@ where
                 processed_candidates,
                 candidate_started.elapsed().as_millis()
             );
+        }
+
+        if config.cleanup_enabled
+            && let Some(chain) = chain
+            && operation_budget.remaining_deletes() > 0
+            && !stale_queue_entry_keys.is_empty()
+        {
+            let queue_entry_keys = stale_queue_entry_keys
+                .iter()
+                .take(operation_budget.remaining_deletes())
+                .map(String::as_str);
+            checkpoint()?;
+            let cleanup = self.delete_compaction_queue_entries(chain, queue_entry_keys);
+            operation_budget.record_deletes(cleanup.deleted_objects);
         }
 
         if config.cleanup_enabled || config.coverage_index_v2_delta_count_threshold > 0 {
@@ -1627,7 +1644,10 @@ where
             max_entries.max(2),
             load_started,
         )?;
-        if !queue_scan.entries.is_empty() || queue_scan.partial {
+        if !queue_scan.entries.is_empty()
+            || queue_scan.partial
+            || (config.cleanup_enabled && !queue_scan.stale_queue_entry_keys.is_empty())
+        {
             return Ok(queue_scan);
         }
         let mut queue_page =
@@ -1753,6 +1773,7 @@ where
         );
         Ok(CompactionManifestScan {
             entries,
+            stale_queue_entry_keys: Vec::new(),
             partial,
             cursor_update: CompactionCursorUpdate {
                 scope_cursor_key,
@@ -1782,6 +1803,7 @@ where
             );
             return Ok(CompactionManifestScan {
                 entries: Vec::new(),
+                stale_queue_entry_keys: Vec::new(),
                 partial: false,
                 cursor_update: CompactionCursorUpdate {
                     scope_cursor_key: compaction_cursor_key(chain),
@@ -1825,6 +1847,7 @@ where
         );
         Ok(CompactionManifestScan {
             entries,
+            stale_queue_entry_keys: Vec::new(),
             partial,
             cursor_update: CompactionCursorUpdate {
                 scope_cursor_key: compaction_cursor_key(chain),
@@ -1912,6 +1935,7 @@ where
             );
             return Ok(CompactionManifestScan {
                 entries: Vec::new(),
+                stale_queue_entry_keys: Vec::new(),
                 partial: false,
                 cursor_update: CompactionCursorUpdate {
                     scope_cursor_key: compaction_queue_cursor_key(chain),
@@ -1976,6 +2000,7 @@ where
         let mut scanned_entries = 0usize;
         let mut cursor_overlap_key = None;
         let mut stopped_at_next_scope = false;
+        let mut stale_queue_entry_keys = Vec::new();
         for object in &queue_objects {
             if entries.len() >= max_entries {
                 break;
@@ -1997,6 +2022,7 @@ where
             cursor_advance_key = Some(object.key.clone());
             let Some(segment_bytes) = self.object_store().get_optional(&queue_entry.segment_key)?
             else {
+                stale_queue_entry_keys.push(object.key.clone());
                 continue;
             };
             let manifest = decode_manifest_object(&queue_entry.segment_key, &segment_bytes)?;
@@ -2045,6 +2071,7 @@ where
         );
         Ok(CompactionManifestScan {
             entries,
+            stale_queue_entry_keys,
             partial,
             cursor_update: CompactionCursorUpdate {
                 scope_cursor_key,
@@ -2068,6 +2095,7 @@ struct SelectedManifestEntry {
 
 struct CompactSelectedManifestEntriesArgs<'a> {
     entries: Vec<SelectedManifestEntry>,
+    stale_queue_entry_keys: Vec<String>,
     config: MaintenanceCompactionConfig,
     started: Instant,
     cursor: Option<CompactionCursorUpdate>,
@@ -2079,6 +2107,7 @@ struct CompactSelectedManifestEntriesArgs<'a> {
 #[derive(Clone, Debug)]
 struct CompactionManifestScan {
     entries: Vec<SelectedManifestEntry>,
+    stale_queue_entry_keys: Vec<String>,
     partial: bool,
     cursor_update: CompactionCursorUpdate,
 }
