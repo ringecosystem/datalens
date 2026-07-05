@@ -1,5 +1,5 @@
 use datalens_edge::config::DatalensConfig;
-use datalens_storage::ParquetCompression;
+use datalens_storage::{DurableStorageConfig, ParquetCompression};
 use datalens_warmup::DEFAULT_WARMUP_STALE_RUNNING_TTL_MS;
 
 #[test]
@@ -167,7 +167,26 @@ fn test_config_storage_parquet_compression_defaults_to_disabled() {
         toml::from_str(&config_text("[query.native]")).expect("config should parse");
 
     assert_eq!(config.storage.parquet.compression, ParquetCompression::None);
+    assert!(config.storage.coverage_index.legacy_write_enabled);
     assert!(!config.storage.compaction.delete_source_objects);
+}
+
+#[test]
+fn test_config_storage_coverage_index_accepts_legacy_write_disable() {
+    let input = config_text("[query.native]").replace(
+        r#"
+        [planner]"#,
+        r#"
+        [storage.coverage_index]
+        legacy_write_enabled = false
+
+        [planner]"#,
+    );
+    let config: DatalensConfig = toml::from_str(&input).expect("config should parse");
+    let storage_config = DurableStorageConfig::from(&config.storage);
+
+    assert!(!config.storage.coverage_index.legacy_write_enabled);
+    assert!(!storage_config.legacy_coverage_index_write_enabled);
 }
 
 #[test]

@@ -106,11 +106,26 @@ struct ManifestCacheEntry {
 
 pub type LocalStorage = DurableStorage<LocalObjectStore>;
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DurableStorageConfig {
     #[serde(default)]
     pub parquet_compression: ParquetCompression,
+    #[serde(default = "default_legacy_coverage_index_write_enabled")]
+    pub legacy_coverage_index_write_enabled: bool,
+}
+
+const fn default_legacy_coverage_index_write_enabled() -> bool {
+    true
+}
+
+impl Default for DurableStorageConfig {
+    fn default() -> Self {
+        Self {
+            parquet_compression: ParquetCompression::default(),
+            legacy_coverage_index_write_enabled: default_legacy_coverage_index_write_enabled(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -511,6 +526,10 @@ where
 
     pub(crate) fn parquet_compression(&self) -> ParquetCompression {
         self.config.parquet_compression
+    }
+
+    fn legacy_coverage_index_write_enabled(&self) -> bool {
+        self.config.legacy_coverage_index_write_enabled
     }
 
     pub fn covered_ranges(
@@ -1231,7 +1250,11 @@ where
         self.publish_manifest_unlocked(chain, manifest, "full", started)?;
         self.bump_manifest_version(chain)?;
         self.delete_manifest_segments_unlocked(chain)?;
-        coverage_index::write_entries(&self.object_store, &manifest.entries)?;
+        coverage_index::write_entries_with_legacy_index(
+            &self.object_store,
+            &manifest.entries,
+            self.legacy_coverage_index_write_enabled(),
+        )?;
         self.cache_manifest(chain, manifest.clone())?;
         Ok(())
     }
@@ -1517,7 +1540,11 @@ where
         let (key, bytes_len) = self.put_manifest_segment_object(chain, &entry)?;
         compaction_queue::write_entry(&self.object_store, chain, &entry)?;
         self.bump_manifest_version(chain)?;
-        coverage_index::write_entry(&self.object_store, &entry)?;
+        coverage_index::write_entry_with_legacy_index(
+            &self.object_store,
+            &entry,
+            self.legacy_coverage_index_write_enabled(),
+        )?;
         log::info!(
             "storage published manifest segment chain_key={} range={}-{} selector_fingerprint={} segment_key={} segment_bytes={} duration_ms={}",
             chain.key_prefix(),
@@ -1573,11 +1600,31 @@ where
         checkpoint: &dyn Fn() -> Result<(), DatalensError>,
     ) -> Result<(), DatalensError> {
         checkpoint()?;
-        let update = coverage_index::replace_entry(&self.object_store, &entry)?;
+        let legacy_coverage_index_write_enabled = self.legacy_coverage_index_write_enabled();
+        let update = coverage_index::replace_entry_with_legacy_index(
+            &self.object_store,
+            &entry,
+            legacy_coverage_index_write_enabled,
+        )?;
+        let mut published_update = if legacy_coverage_index_write_enabled {
+            None
+        } else {
+            checkpoint()?;
+            Some(coverage_index::publish_replacement_with_legacy_index(
+                &self.object_store,
+                &entry,
+                &update,
+                false,
+            )?)
+        };
         let mut published_segment_keys = BTreeSet::new();
         let mut published_segment_count = 0usize;
         let mut published_segment_bytes = 0usize;
-        for published_entry in &update.published_entries {
+        let published_entries = published_update
+            .as_ref()
+            .map(|update| update.published_entries.as_slice())
+            .unwrap_or(update.published_entries.as_slice());
+        for published_entry in published_entries {
             checkpoint()?;
             let (key, bytes_len) = self.put_manifest_segment_object(chain, published_entry)?;
             published_segment_keys.insert(key);
@@ -1585,9 +1632,17 @@ where
             published_segment_bytes += bytes_len;
             compaction_queue::write_entry(&self.object_store, chain, published_entry)?;
         }
-        checkpoint()?;
-        let published_update =
-            coverage_index::publish_replacement(&self.object_store, &entry, &update)?;
+        let published_update = if let Some(published_update) = published_update.take() {
+            published_update
+        } else {
+            checkpoint()?;
+            coverage_index::publish_replacement_with_legacy_index(
+                &self.object_store,
+                &entry,
+                &update,
+                true,
+            )?
+        };
         let replaced_entries_count = published_update.replaced_entries.len();
         let mut old_segment_keys = BTreeSet::new();
         for replaced_entry in &published_update.replaced_entries {
