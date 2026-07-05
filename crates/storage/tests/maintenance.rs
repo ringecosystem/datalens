@@ -2750,16 +2750,9 @@ fn test_compaction_queue_stale_cleanup_obeys_delete_budget() {
     for number in [110, 120, 130] {
         write_block_object(&storage, &chain, number, FinalityLevel::Safe);
     }
-    let queue_prefix = format!("chains/{}/metadata/compaction-queue", chain.key_prefix());
+    let before_queue_keys = queue_keys(&storage, &chain);
 
-    assert_eq!(
-        storage
-            .object_store()
-            .list(&queue_prefix)
-            .expect("queue entries before cleanup")
-            .len(),
-        3
-    );
+    assert_eq!(before_queue_keys.len(), 3);
     for segment_key in manifest_segment_keys(&storage, &chain) {
         storage
             .object_store()
@@ -2779,27 +2772,18 @@ fn test_compaction_queue_stale_cleanup_obeys_delete_budget() {
     assert_eq!(first.processed_candidates, 0);
     assert_eq!(first.tick_status, MaintenanceCompactionTickStatus::Partial);
     assert_eq!(
-        storage
-            .object_store()
-            .list(&queue_prefix)
-            .expect("queue entries after first cleanup")
-            .len(),
-        1
+        queue_keys(&storage, &chain),
+        vec![before_queue_keys[2].clone()]
     );
     write_block_object(&storage, &chain, 140, FinalityLevel::Safe);
+    let mut expected_after_second = queue_keys(&storage, &chain);
+    expected_after_second.retain(|key| !before_queue_keys.contains(key));
 
     let second = storage
         .compact_small_objects_for_chain(&chain, config)
         .expect("second stale queue cleanup");
     assert_eq!(second.processed_candidates, 0);
-    assert_eq!(
-        storage
-            .object_store()
-            .list(&queue_prefix)
-            .expect("queue entries after second cleanup")
-            .len(),
-        1
-    );
+    assert_eq!(queue_keys(&storage, &chain), expected_after_second);
 }
 
 #[test]
@@ -2807,7 +2791,7 @@ fn test_compaction_queue_stale_cleanup_delete_failure_is_reported_and_retried() 
     let storage = LocalStorage::new(temp_storage_root("queue-cleanup-delete-failure"));
     let chain = test_chain();
     write_block_object(&storage, &chain, 150, FinalityLevel::Safe);
-    let queue_prefix = format!("chains/{}/metadata/compaction-queue", chain.key_prefix());
+    let stale_queue_keys = queue_keys(&storage, &chain);
 
     for segment_key in manifest_segment_keys(&storage, &chain) {
         storage
@@ -2832,15 +2816,10 @@ fn test_compaction_queue_stale_cleanup_delete_failure_is_reported_and_retried() 
         .expect("stale queue cleanup with delete failure");
     assert_eq!(failed.tick_status, MaintenanceCompactionTickStatus::Partial);
     assert_eq!(failed.source_delete_failures, 1);
-    assert_eq!(
-        storage
-            .object_store()
-            .list(&queue_prefix)
-            .expect("queue entries after failed cleanup")
-            .len(),
-        1
-    );
+    assert_eq!(queue_keys(&storage, &chain), stale_queue_keys);
     write_block_object(&storage, &chain, 160, FinalityLevel::Safe);
+    let mut expected_after_retry = queue_keys(&storage, &chain);
+    expected_after_retry.retain(|key| !stale_queue_keys.contains(key));
 
     let retried = storage
         .compact_small_objects_for_chain(
@@ -2854,14 +2833,125 @@ fn test_compaction_queue_stale_cleanup_delete_failure_is_reported_and_retried() 
         )
         .expect("retry stale queue cleanup");
     assert_eq!(retried.processed_candidates, 0);
-    assert_eq!(
-        storage
-            .object_store()
-            .list(&queue_prefix)
-            .expect("queue entries after retry")
-            .len(),
-        1
+    assert_eq!(queue_keys(&storage, &chain), expected_after_retry);
+}
+
+#[test]
+fn test_compaction_queue_consumed_cleanup_delete_failure_retries_without_scope_cursor_skip() {
+    let storage = LocalStorage::new(temp_storage_root("queue-consumed-delete-failure-retry"));
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 170, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 171, FinalityLevel::Safe);
+    let consumed_queue_keys = queue_keys(&storage, &chain);
+    let failing_storage = DurableStorage::from_object_store(
+        FailingCompactionQueueDeleteStore::new(storage.root().into()),
     );
+
+    let failed = failing_storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                min_object_bytes: u64::MAX,
+                max_input_objects_per_candidate: 2,
+                max_tick_duration_ms: 30_000,
+                max_candidates_per_tick: 8,
+                max_manifest_entries_per_tick: 20_000,
+                cleanup_enabled: true,
+                delete_source_objects: false,
+                max_deletes_per_tick: 8,
+                ..MaintenanceCompactionConfig::default()
+            },
+        )
+        .expect("compaction with consumed queue cleanup failure");
+    assert_eq!(failed.processed_candidates, 1);
+    assert_eq!(failed.tick_status, MaintenanceCompactionTickStatus::Partial);
+    assert_eq!(failed.source_delete_failures, consumed_queue_keys.len());
+    let failed_queue_keys = queue_keys(&storage, &chain);
+    for key in &consumed_queue_keys {
+        assert!(failed_queue_keys.contains(key));
+    }
+    let mut expected_after_retry = failed_queue_keys
+        .into_iter()
+        .filter(|key| !consumed_queue_keys.contains(key))
+        .collect::<Vec<_>>();
+    write_block_object(&storage, &chain, 180, FinalityLevel::Safe);
+    for key in queue_keys(&storage, &chain) {
+        if !expected_after_retry.contains(&key) && !consumed_queue_keys.contains(&key) {
+            expected_after_retry.push(key);
+        }
+    }
+    expected_after_retry.sort();
+
+    let retried = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                cleanup_enabled: true,
+                delete_source_objects: false,
+                max_deletes_per_tick: 8,
+                ..MaintenanceCompactionConfig::default()
+            },
+        )
+        .expect("retry consumed queue cleanup as stale entries");
+    assert_eq!(retried.processed_candidates, 0);
+    assert_eq!(queue_keys(&storage, &chain), expected_after_retry);
+}
+
+#[test]
+fn test_compaction_queue_consumed_cleanup_budget_exhaustion_preserves_retry_cursor() {
+    let storage = LocalStorage::new(temp_storage_root("queue-consumed-budget-retry"));
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 190, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 191, FinalityLevel::Safe);
+    let consumed_queue_keys = queue_keys(&storage, &chain);
+
+    let first = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                min_object_bytes: u64::MAX,
+                max_input_objects_per_candidate: 2,
+                max_tick_duration_ms: 30_000,
+                max_candidates_per_tick: 8,
+                max_manifest_entries_per_tick: 20_000,
+                cleanup_enabled: true,
+                delete_source_objects: false,
+                max_deletes_per_tick: 2,
+                ..MaintenanceCompactionConfig::default()
+            },
+        )
+        .expect("compaction with consumed queue cleanup budget exhaustion");
+    assert_eq!(first.processed_candidates, 1);
+    assert_eq!(first.tick_status, MaintenanceCompactionTickStatus::Partial);
+    let first_queue_keys = queue_keys(&storage, &chain);
+    for key in &consumed_queue_keys {
+        assert!(first_queue_keys.contains(key));
+    }
+    let mut expected_after_retry = first_queue_keys
+        .into_iter()
+        .filter(|key| !consumed_queue_keys.contains(key))
+        .collect::<Vec<_>>();
+    write_block_object(&storage, &chain, 200, FinalityLevel::Safe);
+    for key in queue_keys(&storage, &chain) {
+        if !expected_after_retry.contains(&key) && !consumed_queue_keys.contains(&key) {
+            expected_after_retry.push(key);
+        }
+    }
+    expected_after_retry.sort();
+
+    let retried = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                cleanup_enabled: true,
+                delete_source_objects: false,
+                max_deletes_per_tick: 8,
+                ..MaintenanceCompactionConfig::default()
+            },
+        )
+        .expect("retry consumed queue cleanup after budget exhaustion");
+    assert_eq!(retried.processed_candidates, 0);
+    assert_eq!(queue_keys(&storage, &chain), expected_after_retry);
 }
 
 #[test]
@@ -4555,6 +4645,21 @@ fn manifest_segment_keys(storage: &LocalStorage, chain: &ChainIdentity) -> Vec<S
         .into_iter()
         .map(|object| object.key)
         .collect()
+}
+
+fn queue_keys(storage: &LocalStorage, chain: &ChainIdentity) -> Vec<String> {
+    let mut keys = storage
+        .object_store()
+        .list(&format!(
+            "chains/{}/metadata/compaction-queue",
+            chain.key_prefix()
+        ))
+        .expect("queue entries")
+        .into_iter()
+        .map(|object| object.key)
+        .collect::<Vec<_>>();
+    keys.sort();
+    keys
 }
 
 fn test_chain() -> ChainIdentity {

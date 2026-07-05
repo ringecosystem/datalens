@@ -922,7 +922,9 @@ where
                 .scope_cursor_advance
                 .clone()
                 .filter(|cursor| cursor.legacy_entry_offset.is_some());
-            let scope_next_key = if partial {
+            let scope_next_key = if cleanup_incomplete {
+                cursor.scope_cursor_current
+            } else if partial {
                 processed_scope_cursor
                     .or(legacy_next_key)
                     .or(legacy_scan_cursor)
