@@ -192,7 +192,8 @@ Required behavior:
 
 - If the loop breaks because the next queue object belongs to a different scope, the current scope is complete.
 - If the current scope is complete, set `queue_cursor_advance = cursor_advance.clone()` even when `queue_objects.len()` is larger.
-- Do not write an unused manifest-scope cursor for queue scans; the next queue scan reads only `compaction_queue_cursor_key(chain)`.
+- Preserve the per-scope cursor for partial active queue scopes.
+- Separately advance the chain-level queue cursor only when the active queue scope is complete.
 - Keep `partial=true` when the page still has more objects, but allow chain-level queue cursor progress after a completed scope.
 
 - [ ] **Step 4: Add queue scan tick budget test**
@@ -217,41 +218,43 @@ git add crates/storage/src/maintenance.rs crates/storage/tests/maintenance.rs
 git commit -m "fix(storage): advance compaction queue past non-candidate scopes"
 ```
 
-## PR 3: Add Metadata Fragmentation Cleanup
+## PR 3: Add Stale Queue Metadata Cleanup
 
-**Intent:** Data object compaction alone is insufficient. The production bucket is dominated by `manifest-segments` and `metadata/compaction-queue` objects, so metadata objects must be consolidated or cleaned without changing query-visible coverage.
+**Intent:** Data object compaction already consolidates matching manifest segments when replacement publish succeeds. PR 3 should safely reduce stale `metadata/compaction-queue` objects without deleting query-visible data, live manifest segments, or live non-candidate queue entries.
 
 **Files:**
 - Modify: `crates/storage/src/maintenance.rs`
-- Modify: `crates/storage/src/repository.rs` only if publish-side metadata state needs a small helper.
 - Test: `crates/storage/tests/maintenance.rs`
 
-- [ ] **Step 1: Add a manifest segment consolidation regression test**
+- [ ] **Step 1: Add stale queue cleanup regression tests**
 
-Create a test that writes many entries for one selector scope, runs compaction/metadata cleanup with `cleanup_enabled=true`, and verifies:
+Add tests near the existing compaction queue tests:
 
-- Reads before and after return the same rows.
-- Manifest segment object count decreases.
-- The current manifest still exposes the same coverage.
+- `test_compaction_cleanup_deletes_stale_queue_entries_for_missing_manifest_segments`
+- `test_compaction_cleanup_preserves_live_non_candidate_queue_entries`
+- `test_compaction_queue_stale_cleanup_obeys_delete_budget`
 
-Test outline:
+The missing-segment test should:
 
 ```rust
 #[test]
-fn test_compaction_cleanup_consolidates_manifest_segments_without_changing_reads() {
-    let storage = LocalStorage::new(temp_storage_root("manifest-segment-consolidation"));
+fn test_compaction_cleanup_deletes_stale_queue_entries_for_missing_manifest_segments() {
+    let storage = LocalStorage::new(temp_storage_root("stale-queue-missing-segment"));
     let chain = test_chain();
-    for number in 1..=20 {
-        write_block_object(&storage, &chain, number, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 1, FinalityLevel::Safe);
+    let queue_prefix = format!("chains/{}/metadata/compaction-queue", chain.key_prefix());
+    let queue_keys_before = list_prefix(&storage, &queue_prefix);
+    assert_eq!(queue_keys_before.len(), 1);
+    for segment_key in manifest_segment_keys(&storage, &chain) {
+        storage.object_store().delete(&segment_key).expect("delete segment");
     }
-    let before_segments = manifest_segment_keys(&storage, &chain).len();
 
     let report = storage
         .compact_small_objects_for_chain(
             &chain,
             MaintenanceCompactionConfig {
                 min_object_bytes: u64::MAX,
-                max_input_objects_per_candidate: 20,
+                max_input_objects_per_candidate: 2,
                 max_tick_duration_ms: 30_000,
                 max_candidates_per_tick: 1,
                 max_manifest_entries_per_tick: 20_000,
@@ -260,38 +263,34 @@ fn test_compaction_cleanup_consolidates_manifest_segments_without_changing_reads
                 ..MaintenanceCompactionConfig::default()
             },
         )
-        .expect("metadata compaction");
+        .expect("stale queue cleanup");
 
-    let after_segments = manifest_segment_keys(&storage, &chain).len();
-    assert_eq!(report.compacted_objects, 1);
-    assert!(after_segments < before_segments);
-    assert_block_numbers(
-        storage
-            .read_rows(
-                &chain,
-                &DatasetKey::evm_blocks(),
-                &DatasetSelector::all(),
-                LedgerRange::blocks(1, 20).expect("range"),
-            )
-            .expect("read rows"),
-        &(1..=20).collect::<Vec<_>>(),
-    );
+    assert_eq!(report.processed_candidates, 0);
+    assert!(list_prefix(&storage, &queue_prefix).is_empty());
 }
 ```
 
-- [ ] **Step 2: Add stale/non-candidate queue cleanup regression test**
+- [ ] **Step 2: Verify manifest segment consolidation is already covered**
 
-Create a test with queue entries whose manifest segments are shadowed by base manifest or no longer form candidates. With `cleanup_enabled=true`, cleanup should delete stale queue entries without deleting live data objects.
+Do not add a broad manifest segment cleanup path. Existing replacement publish already writes the replacement entry, deletes old segment keys, rewrites the base manifest, and bumps the manifest version. Preserve existing tests that prove:
 
-- [ ] **Step 3: Implement metadata cleanup behind `cleanup_enabled`**
+- source segments become one compacted manifest segment after successful compaction.
+- failed replacement publish keeps old manifest/segments current.
+- reads use the compacted replacement after publish.
+
+- [ ] **Step 3: Implement stale queue cleanup behind `cleanup_enabled`**
 
 Implement metadata cleanup in the compaction maintenance flow:
 
 - Only run when `cleanup_enabled=true`.
-- Delete consumed queue entries for compacted candidates.
-- Delete or advance stale queue entries whose referenced segment is missing or shadowed.
-- Consolidate manifest segment state only after the replacement manifest entry is safely published.
-- Respect `max_deletes_per_tick`, `max_puts_per_tick`, and `max_tick_duration_ms`.
+- Continue deleting consumed queue entries for compacted candidates.
+- Delete stale queue entries whose `segment_key` is missing.
+- Delete stale queue entries whose referenced segment entries are fully shadowed by current base/current manifest entries.
+- Preserve live non-candidate queue entries. A singleton entry is not stale just because it cannot currently form a candidate.
+- Respect `max_deletes_per_tick` and `max_tick_duration_ms`.
+- Do not delete source data objects outside the existing superseded-source grace flow.
+- Do not delete current manifest objects or manifest segments by broad prefix scan.
+- Do not change coverage-index v2 cleanup semantics.
 
 - [ ] **Step 4: Verify PR 3**
 
@@ -299,6 +298,7 @@ Run:
 
 ```bash
 cargo test -p datalens-storage --test maintenance compaction_cleanup -- --nocapture
+cargo test -p datalens-storage --test maintenance compaction_queue -- --nocapture
 cargo test -p datalens-storage --test maintenance coverage_index_v2 -- --nocapture
 ```
 
@@ -307,7 +307,7 @@ Expected: PASS.
 - [ ] **Step 5: Commit PR 3**
 
 ```bash
-git add crates/storage/src/maintenance.rs crates/storage/src/repository.rs crates/storage/tests/maintenance.rs
+git add crates/storage/src/maintenance.rs crates/storage/tests/maintenance.rs
 git commit -m "fix(storage): clean compaction metadata fragments"
 ```
 
