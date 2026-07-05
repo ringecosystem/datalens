@@ -3394,6 +3394,16 @@ fn test_compaction_scope_cursor_is_isolated_per_selector_scope() {
         "new manifest segment scans must not write a chain-wide compaction cursor"
     );
     assert!(
+        !storage
+            .object_store()
+            .exists(&format!(
+                "chains/{}/metadata/compaction-scope-queue-cursor.json",
+                chain.key_prefix()
+            ))
+            .expect("queue cursor exists check"),
+        "partial active queue scopes must not advance the chain-level queue cursor"
+    );
+    assert!(
         storage
             .object_store()
             .exists(&format!(

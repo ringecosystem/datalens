@@ -1903,6 +1903,44 @@ where
                 },
             });
         }
+        let mut cursor_advance_key = None;
+        let mut active_scope_prefix = None;
+        for object in &queue_objects {
+            let Some(bytes) = self.object_store().get_optional(&object.key)? else {
+                cursor_advance_key = Some(object.key.clone());
+                continue;
+            };
+            let queue_entry = compaction_queue::decode_entry(&object.key, &bytes)?;
+            active_scope_prefix = manifest_segment_scope_prefix(&queue_entry.segment_key);
+            break;
+        }
+        if let Some(active_scope_prefix) = active_scope_prefix.as_deref() {
+            let scope_cursor_key = compaction_scope_cursor_key(active_scope_prefix);
+            let scope_cursor = self.read_compaction_cursor_key(&scope_cursor_key)?;
+            let scope_queue_cursor = scope_cursor
+                .next_segment_key
+                .as_deref()
+                .filter(|key| key.starts_with(&prefix));
+            let should_resume_scope = match (scope_queue_cursor, queue_cursor) {
+                (Some(scope_key), Some(queue_key)) => scope_key > queue_key,
+                (Some(_), None) => true,
+                _ => false,
+            };
+            if should_resume_scope && let Some(scope_queue_cursor) = scope_queue_cursor {
+                cursor_advance_key = Some(scope_queue_cursor.to_owned());
+                list_page = self.object_store().list_page(
+                    &prefix,
+                    Some(scope_queue_cursor),
+                    max_entries,
+                )?;
+                queue_objects = list_page
+                    .objects
+                    .into_iter()
+                    .filter(|object| object.key.ends_with(".json"))
+                    .collect::<Vec<_>>();
+                queue_objects.sort_by(|left, right| left.key.cmp(&right.key));
+            }
+        }
         let base_entries = if self.object_store().exists(&manifest_key(chain))? {
             let key = manifest_key(chain);
             let bytes = self.object_store().get(&key)?;
@@ -1913,8 +1951,6 @@ where
         let mut entries = Vec::new();
         let mut scanned_objects = 0usize;
         let mut scanned_entries = 0usize;
-        let mut cursor_advance_key = None;
-        let mut active_scope_prefix = None;
         let mut stopped_at_next_scope = false;
         for object in &queue_objects {
             if entries.len() >= max_entries {
@@ -1961,7 +1997,10 @@ where
             !stopped_at_next_scope && (scanned_objects < queue_objects.len() || list_page.has_more);
         let partial = !entries.is_empty() && (scope_partial || stopped_at_next_scope);
         let cursor_advance = cursor_advance_key.map(segment_compaction_cursor);
-        let scope_cursor_key = compaction_queue_cursor_key(chain);
+        let scope_cursor_key = active_scope_prefix
+            .as_deref()
+            .map(compaction_scope_cursor_key)
+            .unwrap_or_else(|| compaction_queue_cursor_key(chain));
         let queue_cursor_advance = if scope_partial {
             None
         } else {
