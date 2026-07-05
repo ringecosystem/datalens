@@ -879,10 +879,15 @@ where
                 processed_candidates,
             );
             let processed_scope_cursor = cursor_advance_key.clone().map(segment_compaction_cursor);
+            let legacy_scan_cursor = cursor
+                .scope_cursor_advance
+                .clone()
+                .filter(|cursor| cursor.legacy_entry_offset.is_some());
             let scope_next_key = if partial {
                 processed_scope_cursor
-                    .or(cursor.scope_cursor_overlap)
                     .or(legacy_next_key)
+                    .or(legacy_scan_cursor)
+                    .or(cursor.scope_cursor_overlap)
                     .or(cursor.scope_cursor_current)
             } else if processed_candidates < candidates.len() {
                 cursor_advance_key
