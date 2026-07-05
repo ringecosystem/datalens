@@ -31,7 +31,7 @@
 - Modify: `crates/cli/src/runtime.rs`
 - Test: `crates/cli/src/runtime.rs`
 
-- [ ] **Step 1: Add a worker test that no-cleanup ticks skip reconciliation**
+- [x] **Step 1: Add a worker test that no-cleanup ticks skip reconciliation**
 
 Add a focused unit test near existing `storage_compaction_*` tests in `crates/cli/src/runtime.rs`.
 
@@ -65,7 +65,7 @@ fn storage_compaction_reconciliation_runs_when_cleanup_enabled() {
 }
 ```
 
-- [ ] **Step 2: Run the failing tests**
+- [x] **Step 2: Run the failing tests**
 
 Run:
 
@@ -75,7 +75,7 @@ cargo test -p datalens-cli storage_compaction_reconciliation -- --nocapture
 
 Expected: FAIL because `storage_compaction_tick_needs_reconciliation` does not exist.
 
-- [ ] **Step 3: Add the helper and gate reconciliation**
+- [x] **Step 3: Add the helper and gate reconciliation**
 
 In `crates/cli/src/runtime.rs`, add:
 
@@ -96,7 +96,7 @@ log::info!(
 
 The subsequent `compact_small_objects_for_chain_with_checkpoint` call must still run.
 
-- [ ] **Step 4: Verify PR 1**
+- [x] **Step 4: Verify PR 1**
 
 Run:
 
@@ -107,7 +107,7 @@ cargo test -p datalens-storage --test maintenance compaction_tick -- --nocapture
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit PR 1**
+- [x] **Step 5: Commit PR 1**
 
 ```bash
 git add crates/cli/src/runtime.rs
@@ -122,7 +122,7 @@ git commit -m "fix(cli): skip compaction reconciliation when cleanup is disabled
 - Modify: `crates/storage/src/maintenance.rs`
 - Test: `crates/storage/tests/maintenance.rs`
 
-- [ ] **Step 1: Add a regression test for non-candidate queue scope progress**
+- [x] **Step 1: Add a regression test for non-candidate queue scope progress**
 
 Add a test near existing compaction queue tests in `crates/storage/tests/maintenance.rs`:
 
@@ -174,7 +174,7 @@ fn test_compaction_queue_advances_after_non_candidate_scope() {
 }
 ```
 
-- [ ] **Step 2: Run the failing storage test**
+- [x] **Step 2: Run the failing storage test**
 
 Run:
 
@@ -184,7 +184,7 @@ cargo test -p datalens-storage --test maintenance test_compaction_queue_advances
 
 Expected: FAIL because the second tick still scans the first non-candidate scope.
 
-- [ ] **Step 3: Fix queue cursor semantics**
+- [x] **Step 3: Fix queue cursor semantics**
 
 In `scan_compaction_queue_entries`, track whether the current active scope was completely scanned separately from whether the page contained more scopes.
 
@@ -196,11 +196,11 @@ Required behavior:
 - Separately advance the chain-level queue cursor only when the active queue scope is complete.
 - Keep `partial=true` when the page still has more objects, but allow chain-level queue cursor progress after a completed scope.
 
-- [ ] **Step 4: Add queue scan tick budget test**
+- [x] **Step 4: Add queue scan tick budget test**
 
 Add a test that uses a very small `max_manifest_entries_per_tick` or `max_tick_duration_ms` to prove the queue scanner can stop without losing progress. The assertion should be that a later tick resumes after the last scanned queue object and eventually reaches a candidate scope.
 
-- [ ] **Step 5: Verify PR 2**
+- [x] **Step 5: Verify PR 2**
 
 Run:
 
@@ -211,7 +211,7 @@ cargo test -p datalens-storage --test maintenance compaction_cursor -- --nocaptu
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit PR 2**
+- [x] **Step 6: Commit PR 2**
 
 ```bash
 git add crates/storage/src/maintenance.rs crates/storage/tests/maintenance.rs
@@ -226,7 +226,7 @@ git commit -m "fix(storage): advance compaction queue past non-candidate scopes"
 - Modify: `crates/storage/src/maintenance.rs`
 - Test: `crates/storage/tests/maintenance.rs`
 
-- [ ] **Step 1: Add stale queue cleanup regression tests**
+- [x] **Step 1: Add stale queue cleanup regression tests**
 
 Add tests near the existing compaction queue tests:
 
@@ -270,7 +270,7 @@ fn test_compaction_cleanup_deletes_stale_queue_entries_for_missing_manifest_segm
 }
 ```
 
-- [ ] **Step 2: Verify manifest segment consolidation is already covered**
+- [x] **Step 2: Verify manifest segment consolidation is already covered**
 
 Do not add a broad manifest segment cleanup path. Existing replacement publish already writes the replacement entry, deletes old segment keys, rewrites the base manifest, and bumps the manifest version. Preserve existing tests that prove:
 
@@ -278,7 +278,7 @@ Do not add a broad manifest segment cleanup path. Existing replacement publish a
 - failed replacement publish keeps old manifest/segments current.
 - reads use the compacted replacement after publish.
 
-- [ ] **Step 3: Implement stale queue cleanup behind `cleanup_enabled`**
+- [x] **Step 3: Implement stale queue cleanup behind `cleanup_enabled`**
 
 Implement metadata cleanup in the compaction maintenance flow:
 
@@ -292,7 +292,7 @@ Implement metadata cleanup in the compaction maintenance flow:
 - Do not delete current manifest objects or manifest segments by broad prefix scan.
 - Do not change coverage-index v2 cleanup semantics.
 
-- [ ] **Step 4: Verify PR 3**
+- [x] **Step 4: Verify PR 3**
 
 Run:
 
@@ -304,7 +304,7 @@ cargo test -p datalens-storage --test maintenance coverage_index_v2 -- --nocaptu
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit PR 3**
+- [x] **Step 5: Commit PR 3**
 
 ```bash
 git add crates/storage/src/maintenance.rs crates/storage/tests/maintenance.rs
