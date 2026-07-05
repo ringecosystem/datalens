@@ -3888,6 +3888,140 @@ fn test_compaction_coverage_index_v2_delta_cursor_skips_sibling_prefix_page() {
 }
 
 #[test]
+fn test_compaction_coverage_index_v2_compacts_semantic_evm_logs_behind_exact_page() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-v2-semantic-behind-exact"));
+    let chain = test_chain();
+    for index in 0..256 {
+        let bucket_start = index * 100_000;
+        write_coverage_index_v2_delta(
+            &storage,
+            &chain,
+            "exact/evm.blocks/block/all/safe",
+            bucket_start,
+            bucket_start + 99_999,
+            "exact",
+        );
+    }
+    let address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let semantic_scope = format!("semantic/evm.logs/block/safe/evm-logs-v1/addr/{address}");
+    for index in 0..3 {
+        write_coverage_index_v2_delta(
+            &storage,
+            &chain,
+            &semantic_scope,
+            0,
+            99_999,
+            &format!("semantic-{index}"),
+        );
+    }
+
+    let report = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                coverage_index_v2_delta_count_threshold: 3,
+                max_gets_per_tick: 3,
+                max_puts_per_tick: 2,
+                cleanup_enabled: false,
+                delete_source_objects: false,
+                ..coverage_index_v2_compaction_config(false)
+            },
+        )
+        .expect("compact semantic coverage index v2 bucket");
+
+    assert_eq!(report.coverage_index_v2_compacted_buckets, 1);
+    assert_eq!(report.coverage_index_v2_compacted_deltas, 3);
+    assert!(report.coverage_index_v2_input_delta_bytes > 0);
+    assert_eq!(
+        list_prefix(
+            &storage,
+            &format!(
+                "chains/{}/coverage-index-v2/snapshot-heads/semantic/evm.logs",
+                chain.key_prefix()
+            ),
+        )
+        .len(),
+        1,
+        "semantic evm.logs bucket should publish a snapshot head even when exact deltas fill the root page"
+    );
+}
+
+#[test]
+fn test_compaction_coverage_index_v2_alternates_semantic_and_root_priority() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-v2-alternate-priority"));
+    let chain = test_chain();
+    let exact_scope = "exact/evm.blocks/block/all/safe";
+    for index in 0..3 {
+        write_coverage_index_v2_delta(
+            &storage,
+            &chain,
+            exact_scope,
+            0,
+            99_999,
+            &format!("exact-{index}"),
+        );
+    }
+    let address = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let semantic_scope = format!("semantic/evm.logs/block/safe/evm-logs-v1/addr/{address}");
+    for index in 0..3 {
+        write_coverage_index_v2_delta(
+            &storage,
+            &chain,
+            &semantic_scope,
+            0,
+            99_999,
+            &format!("semantic-{index}"),
+        );
+    }
+    let config = MaintenanceCompactionConfig {
+        coverage_index_v2_delta_count_threshold: 3,
+        max_gets_per_tick: 3,
+        max_puts_per_tick: 2,
+        cleanup_enabled: false,
+        delete_source_objects: false,
+        ..coverage_index_v2_compaction_config(false)
+    };
+
+    let first = storage
+        .compact_small_objects_for_chain(&chain, config)
+        .expect("first priority tick");
+    assert_eq!(first.coverage_index_v2_compacted_buckets, 1);
+    assert_eq!(
+        first.tick_status,
+        MaintenanceCompactionTickStatus::Partial,
+        "root bucket remains eligible after semantic consumes the tick budget"
+    );
+    assert_eq!(
+        list_prefix(
+            &storage,
+            &format!(
+                "chains/{}/coverage-index-v2/snapshot-heads/semantic/evm.logs",
+                chain.key_prefix()
+            ),
+        )
+        .len(),
+        1
+    );
+
+    let second = storage
+        .compact_small_objects_for_chain(&chain, config)
+        .expect("second priority tick");
+    assert_eq!(second.coverage_index_v2_compacted_buckets, 1);
+    assert_eq!(
+        list_prefix(
+            &storage,
+            &format!(
+                "chains/{}/coverage-index-v2/snapshot-heads/{exact_scope}",
+                chain.key_prefix()
+            ),
+        )
+        .len(),
+        1,
+        "root bucket should be prioritized on the tick after semantic compaction"
+    );
+}
+
+#[test]
 fn test_compaction_coverage_index_v2_cleanup_scan_respects_get_budget() {
     let storage = LocalStorage::new(temp_storage_root("coverage-v2-cleanup-get-budget"));
     let chain = test_chain();
@@ -4836,6 +4970,34 @@ fn first_coverage_index_v2_delta_key<S: ObjectStore>(
     .into_iter()
     .find(|key| key.starts_with(&delta_prefix))
     .expect("coverage index v2 delta key")
+}
+
+fn write_coverage_index_v2_delta<S: ObjectStore>(
+    storage: &DurableStorage<S>,
+    chain: &ChainIdentity,
+    scope: &str,
+    bucket_start: u64,
+    bucket_end: u64,
+    id: &str,
+) -> String {
+    let key = format!(
+        "chains/{}/coverage-index-v2/deltas/{scope}/{bucket_start:020}-{bucket_end:020}/{id}.json",
+        chain.key_prefix()
+    );
+    let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+        "schema_version": 1,
+        "created_at_unix_ms": 1,
+        "scope": scope,
+        "bucket_start": bucket_start,
+        "bucket_end": bucket_end,
+        "entries": [],
+    }))
+    .expect("delta bytes");
+    storage
+        .object_store()
+        .put(&key, &bytes)
+        .expect("write delta");
+    key
 }
 
 fn write_coverage_index_v2_cleanup_record<S: ObjectStore>(
