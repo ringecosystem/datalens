@@ -66,7 +66,13 @@ max_input_bytes_per_candidate = 134217728
 max_tick_duration_ms = 5000
 max_candidates_per_tick = 1
 max_manifest_entries_per_tick = 1000
-delete_source_objects = true
+max_gets_per_tick = 64
+max_puts_per_tick = 8
+max_deletes_per_tick = 64
+source_delete_grace_ms = 300000
+coverage_index_v2_delete_grace_ms = 300000
+cleanup_enabled = false
+delete_source_objects = false
 ```
 
 Completion standard: backlog inventory is captured by chain, dataset, and selector;
@@ -87,7 +93,13 @@ max_input_bytes_per_candidate = 134217728
 max_tick_duration_ms = 5000
 max_candidates_per_tick = 1
 max_manifest_entries_per_tick = 1000
-delete_source_objects = true
+max_gets_per_tick = 64
+max_puts_per_tick = 8
+max_deletes_per_tick = 64
+source_delete_grace_ms = 300000
+coverage_index_v2_delete_grace_ms = 300000
+cleanup_enabled = false
+delete_source_objects = false
 ```
 
 Run this phase for at least one baseline window after deploy. Inspect every 15 to 30
@@ -184,7 +196,7 @@ it contains production metric links or incident system URLs.
 | Field | Required content |
 | --- | --- |
 | Current phase | `phase_0_disabled_hold`, `phase_1_low_rate_observation`, `phase_2_backpressure_gated_increase`, or `phase_3_drain_finish`. |
-| Active config | The deployed `storage.compaction` values for `enabled`, `interval_ms`, `max_candidates_per_tick`, `max_manifest_entries_per_tick`, `max_tick_duration_ms`, `max_input_objects_per_candidate`, `max_input_bytes_per_candidate`, and `delete_source_objects`. |
+| Active config | The deployed `storage.compaction` values for `enabled`, `interval_ms`, `max_candidates_per_tick`, `max_manifest_entries_per_tick`, `max_tick_duration_ms`, `max_input_objects_per_candidate`, `max_input_bytes_per_candidate`, `cleanup_enabled`, and `delete_source_objects`. |
 | Inventory snapshot | Paths or object keys for the before and after `datalens inspect maintenance` JSON files. |
 | Backlog delta | Before/after `small_object_count`, `small_object_bytes`, and `manifest_segment_count`, plus the top changed `chain` / `dataset_key` / `selector_fingerprint` groups. |
 | SLA status | Query and write p95/p99, error rate, and whether each stayed inside the production SLA for the full window. |
@@ -198,7 +210,7 @@ Minimal handoff example:
 
 ```text
 Current phase: phase_1_low_rate_observation
-Active config: enabled=true interval_ms=300000 max_candidates_per_tick=1 max_manifest_entries_per_tick=1000 max_tick_duration_ms=5000 max_input_objects_per_candidate=512 max_input_bytes_per_candidate=134217728 delete_source_objects=true
+Active config: enabled=true interval_ms=300000 max_candidates_per_tick=1 max_manifest_entries_per_tick=1000 max_tick_duration_ms=5000 max_input_objects_per_candidate=512 max_input_bytes_per_candidate=134217728 cleanup_enabled=false delete_source_objects=false
 Inventory snapshot: /tmp/datalens-maintenance-before.json -> /tmp/datalens-maintenance-phase-1.json
 Backlog delta: small_object_count 420000 -> 382000; small_object_bytes 96 GiB -> 84 GiB; manifest_segment_count 18000 -> 14200; top groups ethereum/evm.logs/all, ethereum/evm.blocks/all
 SLA status: query p95/p99 inside SLA, write p95/p99 inside SLA, error rate flat

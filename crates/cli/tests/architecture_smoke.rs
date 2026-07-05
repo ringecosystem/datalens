@@ -156,9 +156,15 @@ fn production_boundary_artifacts_are_declared() {
     assert!(production_config.contains("bucket = \"${DATALENS_S3_BUCKET}\""));
     assert!(production_config.contains("prefix = \"${DATALENS_S3_PREFIX}\""));
     assert!(production_config.contains("[storage.compaction]"));
-    assert!(production_config.contains("enabled = true"));
+    assert!(production_config.contains("enabled = false"));
     assert!(production_config.contains("cleanup_enabled = false"));
+    assert!(production_config.contains("delete_source_objects = false"));
     assert!(production_config.contains("max_candidates_per_tick = 1"));
+    assert!(production_config.contains("max_gets_per_tick = "));
+    assert!(production_config.contains("max_puts_per_tick = "));
+    assert!(production_config.contains("max_deletes_per_tick = "));
+    assert!(production_config.contains("source_delete_grace_ms = "));
+    assert!(production_config.contains("coverage_index_v2_delete_grace_ms = "));
     assert!(production_config.contains("worker_threads = 2"));
 
     assert!(production_spec.contains("Production release artifact"));
@@ -188,8 +194,10 @@ fn production_compaction_backlog_drain_runbook_covers_controlled_drain_contract(
     assert!(production_config.contains("interval_ms = 300000"));
     assert!(production_config.contains("max_candidates_per_tick = 1"));
     assert!(production_config.contains("max_manifest_entries_per_tick = 1000"));
-    assert!(production_config.contains("delete_source_objects = true"));
+    assert!(production_config.contains("cleanup_enabled = false"));
+    assert!(production_config.contains("delete_source_objects = false"));
     assert!(production_runbook.contains("docs/runbook/compaction-production-backlog-drain.md"));
+    assert!(drain_runbook.contains("delete_source_objects = false"));
 
     for required_snippet in [
         "small_object_count",
