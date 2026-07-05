@@ -1864,16 +1864,20 @@ mod tests {
 
     #[test]
     fn storage_compaction_reconciliation_is_skipped_when_cleanup_disabled() {
-        let mut config = MaintenanceCompactionConfig::default();
-        config.cleanup_enabled = false;
+        let config = MaintenanceCompactionConfig {
+            cleanup_enabled: false,
+            ..MaintenanceCompactionConfig::default()
+        };
 
         assert!(!storage_compaction_tick_needs_reconciliation(config));
     }
 
     #[test]
     fn storage_compaction_reconciliation_runs_when_cleanup_enabled() {
-        let mut config = MaintenanceCompactionConfig::default();
-        config.cleanup_enabled = true;
+        let config = MaintenanceCompactionConfig {
+            cleanup_enabled: true,
+            ..MaintenanceCompactionConfig::default()
+        };
 
         assert!(storage_compaction_tick_needs_reconciliation(config));
     }
