@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use datalens_chain::{AdapterKey, DatasetSelector, FinalityLevel};
 use datalens_core::{
@@ -62,6 +62,11 @@ struct CountingOperationStore {
     gets: Arc<Mutex<Vec<String>>>,
     puts: Arc<Mutex<Vec<String>>>,
     deletes: Arc<Mutex<Vec<String>>>,
+}
+
+#[derive(Clone, Debug)]
+struct SiblingPrefixListStore {
+    inner: LocalObjectStore,
 }
 
 #[derive(Clone, Debug)]
@@ -188,6 +193,14 @@ impl CountingOperationStore {
 
     fn reset_gets(&self) {
         self.gets.lock().expect("gets").clear();
+    }
+}
+
+impl SiblingPrefixListStore {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            inner: LocalObjectStore::new(root),
+        }
     }
 }
 
@@ -597,6 +610,66 @@ impl ObjectStore for CountingOperationStore {
 
     fn delete(&self, key: &str) -> Result<(), DatalensError> {
         self.deletes.lock().expect("deletes").push(key.to_owned());
+        self.inner.delete(key)
+    }
+
+    fn lock_namespace(&self) -> String {
+        self.inner.lock_namespace()
+    }
+}
+
+impl ObjectStore for SiblingPrefixListStore {
+    fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError> {
+        self.inner.get(key)
+    }
+
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
+        self.inner.put(key, bytes)
+    }
+
+    fn put_if_absent(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<ObjectPutIfAbsentResult, DatalensError> {
+        self.inner.put_if_absent(key, bytes)
+    }
+
+    fn exists(&self, key: &str) -> Result<bool, DatalensError> {
+        self.inner.exists(key)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
+        self.inner.list(prefix)
+    }
+
+    fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ObjectListPage, DatalensError> {
+        if prefix.ends_with("/coverage-index-v2/deltas") && start_after.is_none() {
+            let objects = (0..limit)
+                .map(|index| ObjectMetadata {
+                    key: format!("{prefix}.old/{index:020}.json"),
+                    size: 1,
+                })
+                .collect();
+            return Ok(ObjectListPage {
+                objects,
+                has_more: true,
+            });
+        }
+        if prefix.ends_with("/coverage-index-v2/deltas")
+            && start_after.is_some_and(|key| key.contains("/coverage-index-v2/deltas.old/"))
+        {
+            return self.inner.list_page(prefix, None, limit);
+        }
+        self.inner.list_page(prefix, start_after, limit)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), DatalensError> {
         self.inner.delete(key)
     }
 
@@ -2527,6 +2600,50 @@ fn test_compaction_report_exposes_backlog_estimates_and_tick_summary() {
 }
 
 #[test]
+fn test_compaction_skips_coverage_index_v2_when_tick_budget_is_exhausted() {
+    let storage = LocalStorage::new(temp_storage_root("compaction-v2-budget-exhausted"));
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 182, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 183, FinalityLevel::Safe);
+    clear_coverage_index_v1(&storage, &chain);
+
+    let counting_store = CountingListStore::new(storage.root().into());
+    let counting_storage = DurableStorage::from_object_store(counting_store.clone());
+    let checkpoint_slept = AtomicBool::new(false);
+    let report = counting_storage
+        .compact_small_objects_for_chain_with_checkpoint(
+            &chain,
+            MaintenanceCompactionConfig {
+                min_object_bytes: u64::MAX,
+                max_tick_duration_ms: 1,
+                max_candidates_per_tick: 1,
+                coverage_index_v2_delta_count_threshold: 2,
+                cleanup_enabled: false,
+                delete_source_objects: false,
+                ..MaintenanceCompactionConfig::default()
+            },
+            || {
+                if !checkpoint_slept.swap(true, Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(())
+            },
+        )
+        .expect("budgeted compaction");
+
+    assert_eq!(report.tick_status, MaintenanceCompactionTickStatus::Partial);
+    assert_eq!(report.coverage_index_v2_compacted_buckets, 0);
+    assert_eq!(
+        counting_store.list_page_count_for_prefix(&format!(
+            "chains/{}/coverage-index-v2/deltas",
+            chain.key_prefix()
+        )),
+        0,
+        "coverage-index-v2 bucket scan must not start after the tick budget is exhausted"
+    );
+}
+
+#[test]
 fn test_compaction_pause_report_exposes_backpressure_reason() {
     let storage = LocalStorage::new(temp_storage_root("compaction-pause-reason"));
     let chain = test_chain();
@@ -3737,6 +3854,79 @@ fn test_compaction_coverage_index_v2_delta_count_threshold_triggers_compaction()
             .expect("read rows after threshold compaction"),
         &[100, 101, 102],
     );
+}
+
+#[test]
+fn test_compaction_coverage_index_v2_delta_cursor_skips_sibling_prefix_page() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-v2-sibling-prefix-page"));
+    let chain = test_chain();
+    for number in 110..=112 {
+        write_block_object(&storage, &chain, number, FinalityLevel::Safe);
+    }
+    clear_coverage_index_v1(&storage, &chain);
+    let sibling_store = SiblingPrefixListStore::new(storage.root().into());
+    let sibling_storage = DurableStorage::from_object_store(sibling_store);
+    let config = MaintenanceCompactionConfig {
+        coverage_index_v2_delta_count_threshold: 3,
+        ..coverage_index_v2_compaction_config(false)
+    };
+
+    let sibling_page = sibling_storage
+        .compact_small_objects_for_chain(&chain, config)
+        .expect("sibling page tick");
+    assert_eq!(sibling_page.coverage_index_v2_compacted_buckets, 0);
+    assert_eq!(
+        sibling_page.tick_status,
+        MaintenanceCompactionTickStatus::Partial
+    );
+
+    let real_delta_page = sibling_storage
+        .compact_small_objects_for_chain(&chain, config)
+        .expect("real delta page tick");
+    assert_eq!(real_delta_page.coverage_index_v2_compacted_buckets, 1);
+    assert_eq!(real_delta_page.coverage_index_v2_compacted_deltas, 3);
+}
+
+#[test]
+fn test_compaction_coverage_index_v2_cleanup_scan_respects_get_budget() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-v2-cleanup-get-budget"));
+    let chain = test_chain();
+    for index in 0..300 {
+        write_coverage_index_v2_cleanup_record(
+            &storage,
+            &chain,
+            &format!("cleanup-{index:020}"),
+            "chains/test/coverage-index-v2/snapshots/missing.json",
+            vec![format!(
+                "chains/{}/coverage-index-v2/deltas/evm.blocks/all/block/safe/00000000000000000000-00000000000000100000/{index:020}.json",
+                chain.key_prefix()
+            )],
+        );
+    }
+    let counting_store = CountingOperationStore::new(storage.root().into());
+    let counting_storage = DurableStorage::from_object_store(counting_store.clone());
+
+    let report = counting_storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                coverage_index_v2_delta_count_threshold: 999,
+                max_gets_per_tick: 3,
+                max_deletes_per_tick: 0,
+                coverage_index_v2_delete_grace_ms: 0,
+                ..coverage_index_v2_compaction_config(true)
+            },
+        )
+        .expect("cleanup budget tick");
+    let cleanup_gets = counting_store
+        .get_keys()
+        .into_iter()
+        .filter(|key| key.contains("/coverage-index-v2/cleanup/"))
+        .count();
+
+    assert_eq!(report.tick_status, MaintenanceCompactionTickStatus::Partial);
+    assert_eq!(report.get_operations, 3);
+    assert_eq!(cleanup_gets, 3);
 }
 
 #[test]
