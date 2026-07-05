@@ -615,20 +615,16 @@ fn test_s3_compaction_cleans_fragmentation_without_read_regression() {
     let chain = s3_compaction_test_chain();
     let selector = DatasetSelector::all();
     let store = S3ObjectStore::from_config(config).expect("build S3 object store");
+    let mut cleanup = S3PrefixCleanup::new(store.clone(), ["chains"]);
     let storage = DurableStorage::from_object_store(store);
     let manifest_segment_prefix = format!("chains/{}/manifest-segments", chain.key_prefix());
     let queue_prefix = format!("chains/{}/metadata/compaction-queue", chain.key_prefix());
     let data_prefix = format!("chains/{}/datasets", chain.key_prefix());
     let source_blocks = (10_000..10_008).collect::<Vec<_>>();
+    let expected_blocks = expected_block_headers(&source_blocks);
 
-    for block_number in &source_blocks {
-        write_block_object_to_storage(
-            &storage,
-            &chain,
-            &selector,
-            *block_number,
-            FinalityLevel::Safe,
-        );
+    for block in &expected_blocks {
+        write_block_object_to_storage(&storage, &chain, &selector, block, FinalityLevel::Safe);
     }
 
     let before_manifest_segments = list_prefix(&storage, &manifest_segment_prefix).len();
@@ -637,7 +633,7 @@ fn test_s3_compaction_cleans_fragmentation_without_read_regression() {
     assert_eq!(before_manifest_segments, source_blocks.len());
     assert_eq!(before_queue_entries, source_blocks.len());
     assert_eq!(before_compacted_objects, 0);
-    assert_read_block_numbers(&storage, &chain, &selector, &source_blocks);
+    assert_read_block_headers(&storage, &chain, &selector, &expected_blocks);
 
     let first_report = storage
         .compact_small_objects_for_chain(&chain, s3_compaction_config(false))
@@ -645,7 +641,7 @@ fn test_s3_compaction_cleans_fragmentation_without_read_regression() {
     assert_eq!(first_report.compacted_objects, 1);
     assert_eq!(first_report.compacted_rows, source_blocks.len());
     assert_eq!(first_report.deleted_source_objects, 0);
-    assert_read_block_numbers(&storage, &chain, &selector, &source_blocks);
+    assert_read_block_headers(&storage, &chain, &selector, &expected_blocks);
 
     let after_first_manifest_segments = list_prefix(&storage, &manifest_segment_prefix).len();
     let after_first_queue_entries = list_prefix(&storage, &queue_prefix).len();
@@ -668,7 +664,7 @@ fn test_s3_compaction_cleans_fragmentation_without_read_regression() {
         .expect("second s3 compaction cleanup");
     assert_eq!(second_report.compacted_objects, 0);
     assert_eq!(second_report.deleted_source_objects, 0);
-    assert_read_block_numbers(&storage, &chain, &selector, &source_blocks);
+    assert_read_block_headers(&storage, &chain, &selector, &expected_blocks);
 
     let after_second_manifest_segments = list_prefix(&storage, &manifest_segment_prefix).len();
     let after_second_queue_entries = list_prefix(&storage, &queue_prefix).len();
@@ -726,6 +722,7 @@ fn test_s3_compaction_cleans_fragmentation_without_read_regression() {
             },
         })
     );
+    cleanup.cleanup();
 }
 
 fn s3_compaction_config(cleanup_enabled: bool) -> MaintenanceCompactionConfig {
@@ -749,17 +746,12 @@ fn write_block_object_to_storage<S: ObjectStore>(
     storage: &DurableStorage<S>,
     chain: &ChainIdentity,
     selector: &DatasetSelector,
-    number: u64,
+    block: &BlockHeader,
     finality: FinalityLevel,
 ) {
     let rows = DatasetRows::new(
         DatasetKey::evm_blocks(),
-        QueryRows::EvmBlocks(vec![BlockHeader {
-            number,
-            hash: format!("0xblock{number}"),
-            parent_hash: "0xparent".to_owned(),
-            timestamp: number,
-        }]),
+        QueryRows::EvmBlocks(vec![block.clone()]),
     )
     .expect("rows");
     storage
@@ -767,7 +759,7 @@ fn write_block_object_to_storage<S: ObjectStore>(
             chain,
             dataset_key: DatasetKey::evm_blocks(),
             selector,
-            range: LedgerRange::blocks(number, number).expect("range"),
+            range: LedgerRange::blocks(block.number, block.number).expect("range"),
             rows: &rows,
             finality_level: finality,
             record_empty_coverage: true,
@@ -775,11 +767,11 @@ fn write_block_object_to_storage<S: ObjectStore>(
         .expect("write rows");
 }
 
-fn assert_read_block_numbers<S: ObjectStore>(
+fn assert_read_block_headers<S: ObjectStore>(
     storage: &DurableStorage<S>,
     chain: &ChainIdentity,
     selector: &DatasetSelector,
-    expected: &[u64],
+    expected: &[BlockHeader],
 ) {
     let rows = storage
         .read_rows(
@@ -787,24 +779,28 @@ fn assert_read_block_numbers<S: ObjectStore>(
             &DatasetKey::evm_blocks(),
             selector,
             LedgerRange::blocks(
-                *expected.first().expect("first expected block"),
-                *expected.last().expect("last expected block"),
+                expected.first().expect("first expected block").number,
+                expected.last().expect("last expected block").number,
             )
             .expect("read range"),
         )
         .expect("read rows");
     match rows.into_rows() {
-        QueryRows::EvmBlocks(blocks) => {
-            assert_eq!(
-                blocks
-                    .into_iter()
-                    .map(|block| block.number)
-                    .collect::<Vec<_>>(),
-                expected
-            );
-        }
+        QueryRows::EvmBlocks(blocks) => assert_eq!(blocks.as_slice(), expected),
         rows => panic!("expected evm block rows, got {rows:?}"),
     }
+}
+
+fn expected_block_headers(numbers: &[u64]) -> Vec<BlockHeader> {
+    numbers
+        .iter()
+        .map(|number| BlockHeader {
+            number: *number,
+            hash: format!("0xblock{number}"),
+            parent_hash: format!("0xparent{number}"),
+            timestamp: number.saturating_mul(12),
+        })
+        .collect()
 }
 
 fn list_prefix<S: ObjectStore>(storage: &DurableStorage<S>, prefix: &str) -> Vec<String> {
@@ -831,6 +827,55 @@ fn compacted_object_keys<S: ObjectStore>(
 
 fn s3_compaction_test_chain() -> ChainIdentity {
     ChainIdentity::expect_with_network_id(ChainFamily::Evm, "ethereum", NetworkId::numeric(1))
+}
+
+struct S3PrefixCleanup {
+    store: S3ObjectStore,
+    prefixes: Vec<String>,
+    cleaned: bool,
+}
+
+impl S3PrefixCleanup {
+    fn new<const N: usize>(store: S3ObjectStore, prefixes: [&str; N]) -> Self {
+        Self {
+            store,
+            prefixes: prefixes.into_iter().map(ToOwned::to_owned).collect(),
+            cleaned: false,
+        }
+    }
+
+    fn cleanup(&mut self) {
+        if self.cleaned {
+            return;
+        }
+        self.cleaned = true;
+        for prefix in &self.prefixes {
+            let objects = match self.store.list(prefix) {
+                Ok(objects) => objects,
+                Err(error) => {
+                    eprintln!(
+                        "warning: S3 test cleanup failed to list prefix {prefix}: {:?}: {}",
+                        error.kind, error.message
+                    );
+                    continue;
+                }
+            };
+            for object in objects {
+                if let Err(error) = self.store.delete(&object.key) {
+                    eprintln!(
+                        "warning: S3 test cleanup failed to delete {}: {:?}: {}",
+                        object.key, error.kind, error.message
+                    );
+                }
+            }
+        }
+    }
+}
+
+impl Drop for S3PrefixCleanup {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
 }
 
 fn temp_storage_root(name: &str) -> PathBuf {
