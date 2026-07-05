@@ -111,10 +111,10 @@ pub struct MaintenanceFragmentationReport {
 pub struct CoverageDeltaBacklogScope {
     pub chain: ChainIdentity,
     pub dataset_key: DatasetKey,
+    pub scope_kind: String,
+    pub scope_class: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selector_fingerprint: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub semantic_scope: Option<String>,
     pub bucket_start: u64,
     pub bucket_end: u64,
     pub object_count: usize,
@@ -2711,19 +2711,32 @@ fn coverage_delta_backlog_scope_from_key(object_key: &str) -> Option<CoverageDel
     let dataset_key = scope_parts
         .get(1)
         .and_then(|value| DatasetKey::parse(value).ok())?;
-    let (selector_fingerprint, semantic_scope) = match scope_parts.first().copied() {
-        Some("exact") => (
-            scope_parts.get(3).map(|value| (*value).to_owned()),
-            None::<String>,
+    let (scope_kind, scope_class, selector_fingerprint) = match scope_parts.first().copied() {
+        Some("exact") => {
+            let raw_selector_fingerprint = exact_coverage_delta_backlog_selector(scope_parts);
+            let selector_fingerprint = raw_selector_fingerprint
+                .as_deref()
+                .filter(|value| is_safe_exact_coverage_delta_backlog_selector(value))
+                .map(str::to_owned);
+            (
+                "exact".to_owned(),
+                exact_coverage_delta_backlog_scope_class(raw_selector_fingerprint.as_deref()),
+                selector_fingerprint,
+            )
+        }
+        Some("semantic") => (
+            "semantic".to_owned(),
+            semantic_coverage_delta_backlog_scope_class(scope_parts.get(5..).unwrap_or(&[])),
+            None,
         ),
-        Some("semantic") => (None, Some(scope_parts.join("/"))),
-        _ => (None, None),
+        _ => ("unknown".to_owned(), "unknown".to_owned(), None),
     };
     Some(CoverageDeltaBacklogScope {
         chain,
         dataset_key,
+        scope_kind,
+        scope_class,
         selector_fingerprint,
-        semantic_scope,
         bucket_start,
         bucket_end,
         object_count: 0,
@@ -2733,14 +2746,58 @@ fn coverage_delta_backlog_scope_from_key(object_key: &str) -> Option<CoverageDel
 
 fn coverage_delta_backlog_scope_key(scope: &CoverageDeltaBacklogScope) -> String {
     format!(
-        "{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}",
         scope.chain.key_prefix(),
         scope.dataset_key.as_str(),
+        scope.scope_kind.as_str(),
+        scope.scope_class.as_str(),
         scope.selector_fingerprint.as_deref().unwrap_or(""),
-        scope.semantic_scope.as_deref().unwrap_or(""),
         scope.bucket_start,
         scope.bucket_end
     )
+}
+
+fn exact_coverage_delta_backlog_selector(scope_parts: &[&str]) -> Option<String> {
+    if scope_parts.len() < 5 {
+        return None;
+    }
+    let selector_parts = &scope_parts[3..scope_parts.len().saturating_sub(1)];
+    if selector_parts.is_empty() {
+        None
+    } else {
+        Some(selector_parts.join("/"))
+    }
+}
+
+fn exact_coverage_delta_backlog_scope_class(selector_fingerprint: Option<&str>) -> String {
+    match selector_fingerprint {
+        Some("all") => "all".to_owned(),
+        Some(_) => "selector".to_owned(),
+        None => "unknown".to_owned(),
+    }
+}
+
+fn is_safe_exact_coverage_delta_backlog_selector(value: &str) -> bool {
+    value == "all"
+        || (value.len() <= 128
+            && !value.contains('=')
+            && !value.contains("0x")
+            && value
+                .chars()
+                .all(|char| char.is_ascii_alphanumeric() || matches!(char, '/' | '-' | '_' | '.')))
+}
+
+fn semantic_coverage_delta_backlog_scope_class(scope_parts: &[&str]) -> String {
+    match scope_parts {
+        ["addr", "*"] => "addr_wildcard".to_owned(),
+        ["addr", _] => "addr_value".to_owned(),
+        ["topic", "*"] => "topic_wildcard".to_owned(),
+        ["topic", _, "*"] => "topic_slot_wildcard".to_owned(),
+        ["topic", _, "[]"] => "topic_empty".to_owned(),
+        ["topic", _, "_large-any-of"] => "topic_large_any_of".to_owned(),
+        ["topic", _, _] => "topic_value".to_owned(),
+        _ => "other".to_owned(),
+    }
 }
 
 fn chain_from_key_prefix(prefix: &str) -> Option<ChainIdentity> {

@@ -1205,12 +1205,83 @@ fn test_maintenance_report_populates_fragmentation_fields() {
     let backlog = &report.fragmentation.coverage_delta_backlog_top[0];
     assert_eq!(backlog.chain, chain);
     assert_eq!(backlog.dataset_key, DatasetKey::evm_blocks());
+    assert_eq!(backlog.scope_kind, "exact");
+    assert_eq!(backlog.scope_class, "all");
     assert_eq!(backlog.selector_fingerprint.as_deref(), Some("all"));
-    assert_eq!(backlog.semantic_scope, None);
     assert_eq!(backlog.bucket_start, 0);
     assert_eq!(backlog.bucket_end, 99_999);
     assert_eq!(backlog.object_count, delta_keys.len());
     assert_eq!(backlog.bytes, report.fragmentation.coverage_delta_bytes);
+}
+
+#[test]
+fn test_maintenance_report_sanitizes_semantic_coverage_delta_backlog_scope() {
+    let storage = LocalStorage::new(temp_storage_root("fragmentation-semantic-scope"));
+    let chain = test_chain();
+    let address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let topic = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let address_key = format!(
+        "chains/{}/coverage-index-v2/deltas/semantic/evm.logs/block/safe/v1/addr/{}/00000000000000000000-00000000000000099999/address.json",
+        chain.key_prefix(),
+        address
+    );
+    let topic_key = format!(
+        "chains/{}/coverage-index-v2/deltas/semantic/evm.logs/block/safe/v1/topic/0/{}/00000000000000000000-00000000000000099999/topic.json",
+        chain.key_prefix(),
+        topic
+    );
+    storage
+        .object_store()
+        .put(&address_key, b"address delta")
+        .expect("write address semantic delta");
+    storage
+        .object_store()
+        .put(&topic_key, b"topic delta")
+        .expect("write topic semantic delta");
+
+    let report = storage.maintenance_report().expect("maintenance");
+    let encoded = serde_json::to_string(&report).expect("encode report");
+
+    assert_eq!(report.fragmentation.coverage_delta_backlog_top.len(), 2);
+    assert!(encoded.contains(r#""scope_kind":"semantic""#));
+    assert!(encoded.contains(r#""scope_class":"addr_value""#));
+    assert!(encoded.contains(r#""scope_class":"topic_value""#));
+    assert!(!encoded.contains(address));
+    assert!(!encoded.contains(topic));
+    assert!(!encoded.contains("semantic_scope"));
+}
+
+#[test]
+fn test_maintenance_report_does_not_expose_exact_canonical_selector_key() {
+    let storage = LocalStorage::new(temp_storage_root("fragmentation-exact-canonical-scope"));
+    let chain = test_chain();
+    let address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let topic = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let delta_key = format!(
+        "chains/{}/coverage-index-v2/deltas/exact/evm.logs/block/addresses={}/topics={}/safe/00000000000000000000-00000000000000099999/exact.json",
+        chain.key_prefix(),
+        address,
+        topic
+    );
+    storage
+        .object_store()
+        .put(&delta_key, b"exact canonical delta")
+        .expect("write exact canonical delta");
+
+    let report = storage.maintenance_report().expect("maintenance");
+    let encoded = serde_json::to_string(&report).expect("encode report");
+
+    assert_eq!(report.fragmentation.coverage_delta_backlog_top.len(), 1);
+    assert_eq!(
+        report.fragmentation.coverage_delta_backlog_top[0].selector_fingerprint,
+        None
+    );
+    assert!(encoded.contains(r#""scope_kind":"exact""#));
+    assert!(encoded.contains(r#""scope_class":"selector""#));
+    assert!(!encoded.contains(address));
+    assert!(!encoded.contains(topic));
+    assert!(!encoded.contains("addresses="));
+    assert!(!encoded.contains("topics="));
 }
 
 #[test]

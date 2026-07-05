@@ -20,16 +20,18 @@ use datalens_evm::{
     EvmFinalityPolicy, EvmLogReliabilityConfig, EvmRpcClient,
 };
 use datalens_metrics::{
-    ApplicationIdentity, CompactionBacklogLabels, CompactionTickMetrics, MetricsRecorder,
+    ApplicationIdentity, CompactionBacklogLabels, CompactionTickMetrics,
+    CoverageDeltaBacklogLabels, MetricsRecorder,
 };
 use datalens_solana::{SolanaAdapter, SolanaHttpRpc};
 use datalens_storage::{
     DurablePromotionIntentRepository, DurablePromotionIntentStore, DurableStorage,
     LocalObjectStore, LocalStorage, MaintenanceCompactionConfig,
-    MaintenanceCompactionPressureMonitor, MaintenanceCompactionReport, ObjectListPage,
-    ObjectLockLease, ObjectMetadata, ObjectPutIfAbsentResult, ObjectStore, QueryActivityRepository,
-    QueryActivityStore, QueryWatermarkRepository, QueryWatermarkStore, S3ObjectStore,
-    UsageLedgerRepository, UsageLedgerStore, encode_object_lock_owner,
+    MaintenanceCompactionPressureMonitor, MaintenanceCompactionReport,
+    MaintenanceFragmentationReport, ObjectListPage, ObjectLockLease, ObjectMetadata,
+    ObjectPutIfAbsentResult, ObjectStore, QueryActivityRepository, QueryActivityStore,
+    QueryWatermarkRepository, QueryWatermarkStore, S3ObjectStore, UsageLedgerRepository,
+    UsageLedgerStore, encode_object_lock_owner,
 };
 use datalens_tron::{TronAdapter, TronGridContractEventsConfig, TronHttpProvider};
 use datalens_warmup::{
@@ -235,6 +237,15 @@ struct StorageCompactionWorkerArgs {
 enum CompactionStorage {
     Local(LocalStorage),
     S3(DurableStorage<S3ObjectStore>),
+}
+
+impl CompactionStorage {
+    fn maintenance_report(&self) -> Result<datalens_storage::MaintenanceReport, DatalensError> {
+        match self {
+            Self::Local(storage) => storage.maintenance_report(),
+            Self::S3(storage) => storage.maintenance_report(),
+        }
+    }
 }
 
 struct CompactionLeaderLock {
@@ -640,6 +651,7 @@ impl StorageCompactionWorker {
                         Ok(report) => {
                             consecutive_failures = 0;
                             record_compaction_metrics(&metrics_recorders, &chain, &report);
+                            record_fragmentation_metrics(&metrics_recorders, &storage);
                             log::info!(
                                 "storage compaction tick completed chain_key={} candidate_count={} candidate_backlog={} processed_candidates={} input_objects={} output_objects={} compacted_objects={} compacted_rows={} deleted_source_objects={} deleted_manifest_segments={} source_delete_failures={} pause_reason={} tick_status={} duration_ms={}",
                                 chain.key_prefix(),
@@ -794,6 +806,44 @@ fn record_compaction_metrics(
             "coverage_index_v2_delta",
             report.coverage_index_v2_delta_delete_failures,
         );
+    }
+}
+
+fn record_fragmentation_metrics(recorders: &[MetricsRecorder], storage: &CompactionStorage) {
+    if recorders.is_empty() {
+        return;
+    }
+    match storage.maintenance_report() {
+        Ok(report) => {
+            record_fragmentation_report_metrics(recorders, &report.fragmentation);
+        }
+        Err(error) => {
+            log::warn!(
+                "storage fragmentation metrics skipped kind={:?} message={}",
+                error.kind,
+                error.message
+            );
+        }
+    }
+}
+
+fn record_fragmentation_report_metrics(
+    recorders: &[MetricsRecorder],
+    report: &MaintenanceFragmentationReport,
+) {
+    for recorder in recorders {
+        for scope in &report.coverage_delta_backlog_top {
+            recorder.set_storage_coverage_delta_backlog(
+                &CoverageDeltaBacklogLabels::new(
+                    scope.chain.clone(),
+                    scope.dataset_key.clone(),
+                    &scope.scope_kind,
+                    &scope.scope_class,
+                ),
+                scope.object_count,
+                scope.bytes,
+            );
+        }
     }
 }
 

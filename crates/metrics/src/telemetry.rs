@@ -59,9 +59,7 @@ pub struct CoverageDeltaBacklogLabels {
     chain_kind: String,
     dataset: String,
     scope_kind: String,
-    scope: String,
-    bucket_start: String,
-    bucket_end: String,
+    scope_class: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -107,31 +105,49 @@ impl CoverageDeltaBacklogLabels {
         chain: ChainIdentity,
         dataset_key: DatasetKey,
         scope_kind: impl Into<String>,
-        scope: impl Into<String>,
-        bucket_start: u64,
-        bucket_end: u64,
+        scope_class: impl Into<String>,
     ) -> Self {
         Self {
             chain: chain.configured_name().to_owned(),
             chain_kind: chain.family_ref().key().to_owned(),
             dataset: dataset_key.as_str().to_owned(),
-            scope_kind: scope_kind.into(),
-            scope: scope.into(),
-            bucket_start: bucket_start.to_string(),
-            bucket_end: bucket_end.to_string(),
+            scope_kind: coverage_delta_backlog_scope_kind_label(scope_kind.into()),
+            scope_class: coverage_delta_backlog_scope_class_label(scope_class.into()),
         }
     }
 
-    fn label_values(&self) -> [&str; 7] {
+    fn label_values(&self) -> [&str; 5] {
         [
             &self.chain,
             &self.chain_kind,
             &self.dataset,
             &self.scope_kind,
-            &self.scope,
-            &self.bucket_start,
-            &self.bucket_end,
+            &self.scope_class,
         ]
+    }
+}
+
+fn coverage_delta_backlog_scope_kind_label(value: String) -> String {
+    match value.as_str() {
+        "exact" | "semantic" | "unknown" => value,
+        _ => "unknown".to_owned(),
+    }
+}
+
+fn coverage_delta_backlog_scope_class_label(value: String) -> String {
+    match value.as_str() {
+        "all"
+        | "selector"
+        | "addr_wildcard"
+        | "addr_value"
+        | "topic_wildcard"
+        | "topic_slot_wildcard"
+        | "topic_empty"
+        | "topic_large_any_of"
+        | "topic_value"
+        | "other"
+        | "unknown" => value,
+        _ => "other".to_owned(),
     }
 }
 
@@ -931,31 +947,27 @@ impl MetricsRecorder {
         let storage_coverage_delta_backlog = GaugeVec::new(
             Opts::new(
                 "datalens_storage_coverage_delta_backlog",
-                "Coverage-index-v2 delta objects currently backlogged by bucket.",
+                "Coverage-index-v2 delta objects currently backlogged by bounded scope class.",
             ),
             &[
                 "chain",
                 "chain_kind",
                 "dataset",
                 "scope_kind",
-                "scope",
-                "bucket_start",
-                "bucket_end",
+                "scope_class",
             ],
         )?;
         let storage_coverage_delta_bytes = GaugeVec::new(
             Opts::new(
                 "datalens_storage_coverage_delta_bytes",
-                "Coverage-index-v2 delta bytes currently backlogged by bucket.",
+                "Coverage-index-v2 delta bytes currently backlogged by bounded scope class.",
             ),
             &[
                 "chain",
                 "chain_kind",
                 "dataset",
                 "scope_kind",
-                "scope",
-                "bucket_start",
-                "bucket_end",
+                "scope_class",
             ],
         )?;
         let storage_coverage_snapshot_age_ms = GaugeVec::new(

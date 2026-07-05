@@ -230,14 +230,8 @@ fn test_compaction_metrics_expose_backlog_progress_and_backpressure() {
 #[test]
 fn test_storage_coverage_fragmentation_metrics_use_expected_labels() {
     let recorder = MetricsRecorder::new().expect("metrics recorder");
-    let labels = CoverageDeltaBacklogLabels::new(
-        chain(),
-        DatasetKey::evm_logs(),
-        "exact",
-        "0xabc",
-        100_000,
-        199_999,
-    );
+    let labels =
+        CoverageDeltaBacklogLabels::new(chain(), DatasetKey::evm_logs(), "semantic", "addr_value");
 
     recorder.set_storage_coverage_delta_backlog(&labels, 4, 2048);
     recorder.set_storage_coverage_snapshot_age_ms(&chain(), 9000);
@@ -248,11 +242,15 @@ fn test_storage_coverage_fragmentation_metrics_use_expected_labels() {
     let output = recorder.encode().expect("prometheus text");
 
     assert!(output.contains(
-        r#"datalens_storage_coverage_delta_backlog{bucket_end="199999",bucket_start="100000",chain="ethereum",chain_kind="evm",dataset="evm.logs",scope="0xabc",scope_kind="exact"} 4"#
+        r#"datalens_storage_coverage_delta_backlog{chain="ethereum",chain_kind="evm",dataset="evm.logs",scope_class="addr_value",scope_kind="semantic"} 4"#
     ));
     assert!(output.contains(
-        r#"datalens_storage_coverage_delta_bytes{bucket_end="199999",bucket_start="100000",chain="ethereum",chain_kind="evm",dataset="evm.logs",scope="0xabc",scope_kind="exact"} 2048"#
+        r#"datalens_storage_coverage_delta_bytes{chain="ethereum",chain_kind="evm",dataset="evm.logs",scope_class="addr_value",scope_kind="semantic"} 2048"#
     ));
+    assert!(!output.contains("scope="));
+    assert!(!output.contains("bucket_start="));
+    assert!(!output.contains("bucket_end="));
+    assert!(!output.contains("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
     assert!(output.contains(
         r#"datalens_storage_coverage_snapshot_age_ms{chain="ethereum",chain_kind="evm"} 9000"#
     ));
