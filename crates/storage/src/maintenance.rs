@@ -1324,9 +1324,16 @@ where
             .flat_map(|scan| scan.records.iter())
             .flat_map(|object| object.record.compacted_delta_keys.iter().cloned())
             .collect::<BTreeSet<_>>();
-        let bucket_scan = self.scan_coverage_index_v2_delta_buckets(chain)?;
+        let priority_cursor_key = coverage_index_v2_compaction_priority_cursor_key(chain);
+        let priority_cursor = self.read_compaction_cursor_key(&priority_cursor_key)?;
+        let next_priority = match priority_cursor.next_segment_key.as_deref() {
+            Some(COVERAGE_INDEX_V2_COMPACTION_PRIORITY_ROOT) => CoverageIndexV2ScanPriority::Root,
+            _ => CoverageIndexV2ScanPriority::SemanticEvmLogs,
+        };
+        let bucket_scan = self.scan_coverage_index_v2_delta_buckets(chain, next_priority)?;
         let mut cursor_advances = BTreeMap::<String, String>::new();
         let mut partial = bucket_scan.partial;
+        let mut processed_v2_bucket = false;
 
         for bucket_scan_item in bucket_scan.buckets {
             if tick_started.elapsed() >= max_duration {
@@ -1376,9 +1383,11 @@ where
             if operation_budget.remaining_gets()
                 < config.coverage_index_v2_delta_count_threshold.max(1)
             {
+                partial = true;
                 break;
             }
             if operation_budget.remaining_puts() < 2 {
+                partial = true;
                 break;
             }
             if let Some(compaction) = prepare_v2_bucket_compaction(
@@ -1415,6 +1424,7 @@ where
                 report.input_delta_bytes = report
                     .input_delta_bytes
                     .saturating_add(compaction.input_delta_bytes);
+                processed_v2_bucket = true;
                 if config.cleanup_enabled && operation_budget.remaining_puts() > 0 {
                     let mut compacted_delta_keys = compaction.compacted_delta_keys;
                     compacted_delta_keys.retain(|key| !cleanup_delta_keys.contains(key));
@@ -1472,6 +1482,22 @@ where
                 }),
             )?;
         }
+        if processed_v2_bucket {
+            self.write_compaction_cursor_key(
+                &priority_cursor_key,
+                Some(CompactionCursor {
+                    schema_version: 1,
+                    next_segment_key: Some(
+                        bucket_scan
+                            .priority
+                            .next_priority()
+                            .cursor_value()
+                            .to_owned(),
+                    ),
+                    legacy_entry_offset: None,
+                }),
+            )?;
+        }
 
         if config.cleanup_enabled && tick_started.elapsed() < max_duration {
             let cleanup_partial = self.cleanup_coverage_index_v2_for_chain(
@@ -1491,21 +1517,24 @@ where
     fn scan_coverage_index_v2_delta_buckets(
         &self,
         chain: &ChainIdentity,
+        priority: CoverageIndexV2ScanPriority,
     ) -> Result<CoverageIndexV2BucketScan, DatalensError> {
         let prefix = format!("chains/{}/coverage-index-v2/deltas", chain.key_prefix());
         let semantic_evm_logs_prefix = format!("{prefix}/semantic/evm.logs");
-        let scan_prefixes = [
-            (
-                semantic_evm_logs_prefix.as_str(),
-                coverage_index_v2_semantic_evm_logs_compaction_cursor_key(chain),
-                false,
-            ),
-            (
-                prefix.as_str(),
-                coverage_index_v2_compaction_cursor_key(chain),
-                true,
-            ),
-        ];
+        let semantic_scan = (
+            semantic_evm_logs_prefix.as_str(),
+            coverage_index_v2_semantic_evm_logs_compaction_cursor_key(chain),
+            false,
+        );
+        let root_scan = (
+            prefix.as_str(),
+            coverage_index_v2_compaction_cursor_key(chain),
+            true,
+        );
+        let scan_prefixes = match priority {
+            CoverageIndexV2ScanPriority::SemanticEvmLogs => [semantic_scan, root_scan],
+            CoverageIndexV2ScanPriority::Root => [root_scan, semantic_scan],
+        };
         let mut buckets = Vec::new();
         let mut seen_buckets = BTreeSet::<CoverageIndexV2Bucket>::new();
         let mut empty_cursor_advances = Vec::new();
@@ -1567,6 +1596,7 @@ where
             buckets,
             empty_cursor_advances,
             partial,
+            priority,
         })
     }
 
@@ -2400,6 +2430,7 @@ struct CoverageIndexV2BucketScan {
     buckets: Vec<CoverageIndexV2BucketScanItem>,
     empty_cursor_advances: Vec<CoverageIndexV2CursorAdvance>,
     partial: bool,
+    priority: CoverageIndexV2ScanPriority,
 }
 
 #[derive(Clone, Debug)]
@@ -2413,6 +2444,31 @@ struct CoverageIndexV2BucketScanItem {
 struct CoverageIndexV2CursorAdvance {
     cursor_key: String,
     next_segment_key: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CoverageIndexV2ScanPriority {
+    SemanticEvmLogs,
+    Root,
+}
+
+const COVERAGE_INDEX_V2_COMPACTION_PRIORITY_SEMANTIC_EVM_LOGS: &str = "semantic-evm-logs";
+const COVERAGE_INDEX_V2_COMPACTION_PRIORITY_ROOT: &str = "root";
+
+impl CoverageIndexV2ScanPriority {
+    fn next_priority(self) -> Self {
+        match self {
+            Self::SemanticEvmLogs => Self::Root,
+            Self::Root => Self::SemanticEvmLogs,
+        }
+    }
+
+    fn cursor_value(self) -> &'static str {
+        match self {
+            Self::SemanticEvmLogs => COVERAGE_INDEX_V2_COMPACTION_PRIORITY_SEMANTIC_EVM_LOGS,
+            Self::Root => COVERAGE_INDEX_V2_COMPACTION_PRIORITY_ROOT,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2527,6 +2583,13 @@ fn coverage_index_v2_compaction_cursor_key(chain: &ChainIdentity) -> String {
 fn coverage_index_v2_semantic_evm_logs_compaction_cursor_key(chain: &ChainIdentity) -> String {
     format!(
         "chains/{}/metadata/coverage-index-v2-compaction-semantic-evm-logs-cursor.json",
+        chain.key_prefix()
+    )
+}
+
+fn coverage_index_v2_compaction_priority_cursor_key(chain: &ChainIdentity) -> String {
+    format!(
+        "chains/{}/metadata/coverage-index-v2-compaction-priority-cursor.json",
         chain.key_prefix()
     )
 }

@@ -5327,6 +5327,86 @@ fn test_coverage_index_v2_snapshot_lists_only_deltas_after_high_watermark() {
 }
 
 #[test]
+fn test_coverage_index_v2_snapshot_empty_high_watermark_keeps_lower_pending_delta() {
+    let object_store = CountingObjectStore::new(LocalObjectStore::new(temp_storage_root(
+        "coverage-index-v2-snapshot-empty-high-watermark",
+    )));
+    let storage = DurableStorage::from_object_store(object_store.clone());
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let query_range = LedgerRange::blocks(10, 11).expect("valid range");
+    let snapshot_range = LedgerRange::blocks(10, 10).expect("valid range");
+    let pending_delta_range = LedgerRange::blocks(11, 11).expect("valid range");
+    let scope = coverage_index_v2_exact_scope(
+        &DatasetKey::evm_blocks(),
+        "block",
+        &selector,
+        ManifestFinalityLevel::Safe,
+    );
+    let compacted_delta_key = write_coverage_index_v2_delta(
+        &storage,
+        &chain,
+        &scope,
+        &snapshot_range,
+        "zzzz-compacted",
+        vec![empty_manifest_entry(
+            &chain,
+            DatasetKey::evm_blocks(),
+            &selector,
+            snapshot_range.clone(),
+            ManifestFinalityLevel::Safe,
+        )],
+    );
+    let pending_delta_key = write_coverage_index_v2_delta(
+        &storage,
+        &chain,
+        &scope,
+        &pending_delta_range,
+        "0000-pending",
+        vec![empty_manifest_entry(
+            &chain,
+            DatasetKey::evm_blocks(),
+            &selector,
+            pending_delta_range.clone(),
+            ManifestFinalityLevel::Safe,
+        )],
+    );
+    let snapshot_key = write_coverage_index_v2_snapshot(
+        &storage,
+        &chain,
+        &scope,
+        &snapshot_range,
+        "snapshot",
+        vec![empty_manifest_entry(
+            &chain,
+            DatasetKey::evm_blocks(),
+            &selector,
+            snapshot_range.clone(),
+            ManifestFinalityLevel::Safe,
+        )],
+        vec![compacted_delta_key.clone()],
+    );
+    write_coverage_index_v2_snapshot_head(
+        &storage,
+        &chain,
+        &scope,
+        &query_range,
+        "head",
+        &snapshot_key,
+        "",
+    );
+
+    assert_eq!(
+        storage
+            .covered_ranges(&chain, &DatasetKey::evm_blocks(), &selector, query_range)
+            .expect("snapshot coverage"),
+        vec![LedgerRange::blocks(10, 11).expect("valid range")]
+    );
+    assert_eq!(object_store.get_count(&pending_delta_key), 1);
+    assert_eq!(object_store.get_count(&compacted_delta_key), 0);
+}
+
+#[test]
 fn test_coverage_index_v2_snapshot_heads_choose_newest_created_at_before_key_order() {
     let storage = LocalStorage::new(temp_storage_root("coverage-index-v2-snapshot-head-time"));
     let chain = test_chain();

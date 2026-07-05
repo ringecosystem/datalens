@@ -3947,6 +3947,81 @@ fn test_compaction_coverage_index_v2_compacts_semantic_evm_logs_behind_exact_pag
 }
 
 #[test]
+fn test_compaction_coverage_index_v2_alternates_semantic_and_root_priority() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-v2-alternate-priority"));
+    let chain = test_chain();
+    let exact_scope = "exact/evm.blocks/block/all/safe";
+    for index in 0..3 {
+        write_coverage_index_v2_delta(
+            &storage,
+            &chain,
+            exact_scope,
+            0,
+            99_999,
+            &format!("exact-{index}"),
+        );
+    }
+    let address = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let semantic_scope = format!("semantic/evm.logs/block/safe/evm-logs-v1/addr/{address}");
+    for index in 0..3 {
+        write_coverage_index_v2_delta(
+            &storage,
+            &chain,
+            &semantic_scope,
+            0,
+            99_999,
+            &format!("semantic-{index}"),
+        );
+    }
+    let config = MaintenanceCompactionConfig {
+        coverage_index_v2_delta_count_threshold: 3,
+        max_gets_per_tick: 3,
+        max_puts_per_tick: 2,
+        cleanup_enabled: false,
+        delete_source_objects: false,
+        ..coverage_index_v2_compaction_config(false)
+    };
+
+    let first = storage
+        .compact_small_objects_for_chain(&chain, config)
+        .expect("first priority tick");
+    assert_eq!(first.coverage_index_v2_compacted_buckets, 1);
+    assert_eq!(
+        first.tick_status,
+        MaintenanceCompactionTickStatus::Partial,
+        "root bucket remains eligible after semantic consumes the tick budget"
+    );
+    assert_eq!(
+        list_prefix(
+            &storage,
+            &format!(
+                "chains/{}/coverage-index-v2/snapshot-heads/semantic/evm.logs",
+                chain.key_prefix()
+            ),
+        )
+        .len(),
+        1
+    );
+
+    let second = storage
+        .compact_small_objects_for_chain(&chain, config)
+        .expect("second priority tick");
+    assert_eq!(second.coverage_index_v2_compacted_buckets, 1);
+    assert_eq!(
+        list_prefix(
+            &storage,
+            &format!(
+                "chains/{}/coverage-index-v2/snapshot-heads/{exact_scope}",
+                chain.key_prefix()
+            ),
+        )
+        .len(),
+        1,
+        "root bucket should be prioritized on the tick after semantic compaction"
+    );
+}
+
+#[test]
 fn test_compaction_coverage_index_v2_cleanup_scan_respects_get_budget() {
     let storage = LocalStorage::new(temp_storage_root("coverage-v2-cleanup-get-budget"));
     let chain = test_chain();

@@ -323,6 +323,10 @@ where
         let mut snapshot = read_v2_snapshot(object_store, bucket, &head.snapshot_key)?;
         any_bucket_has_index = true;
         compacted_delta_keys.extend(snapshot.compacted_delta_keys);
+        // Snapshot heads written by the v2 compactor use this as a compacted
+        // prefix watermark: all delta objects at or below the key are already
+        // represented in the snapshot. Older heads left it empty, which keeps
+        // the conservative full-bucket scan.
         if !head.included_delta_high_watermark.is_empty() {
             start_after_delta_key = Some(head.included_delta_high_watermark);
         }
@@ -361,6 +365,8 @@ where
     if let Some(head) = latest_v2_snapshot_head(object_store, bucket)? {
         let snapshot = read_v2_snapshot(object_store, bucket, &head.snapshot_key)?;
         previous_compacted_delta_keys.extend(snapshot.compacted_delta_keys);
+        // See read_entries_for_v2_bucket: non-empty watermarks are only
+        // published by compaction after folding the listed delta prefix.
         if !head.included_delta_high_watermark.is_empty() {
             start_after_delta_key = Some(head.included_delta_high_watermark);
         }
