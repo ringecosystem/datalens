@@ -228,7 +228,7 @@ fn test_compaction_metrics_expose_backlog_progress_and_backpressure() {
 }
 
 #[test]
-fn test_storage_coverage_fragmentation_metrics_use_expected_labels() {
+fn test_storage_coverage_delta_backlog_recorder_uses_bounded_labels() {
     let recorder = MetricsRecorder::new().expect("metrics recorder");
     let labels =
         CoverageDeltaBacklogLabels::new(chain(), DatasetKey::evm_logs(), "semantic", "addr_value");
