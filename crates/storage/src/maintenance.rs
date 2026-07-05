@@ -975,12 +975,18 @@ where
             duration_ms,
         };
         log::info!(
-            "storage compaction tick summary status={} pause_reason=none input_objects={} output_objects={} deleted_source_objects={} deleted_manifest_segments={} duration_ms={}",
+            "storage compaction tick summary status={} pause_reason=none input_objects={} output_objects={} deleted_source_objects={} deleted_manifest_segments={} coverage_index_v2_compacted_buckets={} coverage_index_v2_compacted_deltas={} coverage_index_v2_input_delta_bytes={} coverage_index_v2_cleanup_records={} coverage_index_v2_deleted_deltas={} coverage_index_v2_delta_delete_failures={} duration_ms={}",
             tick_status.as_str(),
             tick_summary.input_objects,
             tick_summary.output_objects,
             tick_summary.deleted_source_objects,
             tick_summary.deleted_manifest_segments,
+            coverage_index_v2_report.compacted_buckets,
+            coverage_index_v2_report.compacted_deltas,
+            coverage_index_v2_report.input_delta_bytes,
+            coverage_index_v2_report.cleanup_records,
+            coverage_index_v2_report.deleted_deltas,
+            coverage_index_v2_report.delete_failures,
             tick_summary.duration_ms
         );
 
@@ -1318,11 +1324,8 @@ where
             .flat_map(|scan| scan.records.iter())
             .flat_map(|object| object.record.compacted_delta_keys.iter().cloned())
             .collect::<BTreeSet<_>>();
-        let cursor_key = coverage_index_v2_compaction_cursor_key(chain);
-        let cursor = self.read_compaction_cursor_key(&cursor_key)?;
-        let bucket_scan = self.scan_coverage_index_v2_delta_buckets(chain, &cursor)?;
-        let had_buckets = !bucket_scan.buckets.is_empty();
-        let mut cursor_advance_key = None;
+        let bucket_scan = self.scan_coverage_index_v2_delta_buckets(chain)?;
+        let mut cursor_advances = BTreeMap::<String, String>::new();
         let mut partial = bucket_scan.partial;
 
         for bucket_scan_item in bucket_scan.buckets {
@@ -1450,12 +1453,16 @@ where
                     report.cleanup_records += 1;
                 }
             }
-            cursor_advance_key = bucket_scan_item.last_delta_key;
+            if let Some(last_delta_key) = bucket_scan_item.last_delta_key {
+                cursor_advances.insert(bucket_scan_item.cursor_key, last_delta_key);
+            }
         }
-        if cursor_advance_key.is_none() && !had_buckets {
-            cursor_advance_key = bucket_scan.page_last_key;
+        for cursor_advance in bucket_scan.empty_cursor_advances {
+            cursor_advances
+                .entry(cursor_advance.cursor_key)
+                .or_insert(cursor_advance.next_segment_key);
         }
-        if let Some(cursor_advance_key) = cursor_advance_key {
+        for (cursor_key, cursor_advance_key) in cursor_advances {
             self.write_compaction_cursor_key(
                 &cursor_key,
                 Some(CompactionCursor {
@@ -1484,40 +1491,82 @@ where
     fn scan_coverage_index_v2_delta_buckets(
         &self,
         chain: &ChainIdentity,
-        cursor: &CompactionCursor,
     ) -> Result<CoverageIndexV2BucketScan, DatalensError> {
         let prefix = format!("chains/{}/coverage-index-v2/deltas", chain.key_prefix());
-        let strict_prefix = format!("{prefix}/");
-        let mut list_page = self.object_store().list_page(
-            &prefix,
-            cursor.next_segment_key.as_deref(),
-            COVERAGE_INDEX_V2_LIST_PAGE_SIZE,
-        )?;
-        if list_page.objects.is_empty() && cursor.next_segment_key.is_some() && !list_page.has_more
-        {
-            list_page =
-                self.object_store()
-                    .list_page(&prefix, None, COVERAGE_INDEX_V2_LIST_PAGE_SIZE)?;
-        }
-        let mut buckets = BTreeMap::<CoverageIndexV2Bucket, String>::new();
-        for object in &list_page.objects {
-            if !object.key.starts_with(&strict_prefix) || !object.key.ends_with(".json") {
-                continue;
+        let semantic_evm_logs_prefix = format!("{prefix}/semantic/evm.logs");
+        let scan_prefixes = [
+            (
+                semantic_evm_logs_prefix.as_str(),
+                coverage_index_v2_semantic_evm_logs_compaction_cursor_key(chain),
+                false,
+            ),
+            (
+                prefix.as_str(),
+                coverage_index_v2_compaction_cursor_key(chain),
+                true,
+            ),
+        ];
+        let mut buckets = Vec::new();
+        let mut seen_buckets = BTreeSet::<CoverageIndexV2Bucket>::new();
+        let mut empty_cursor_advances = Vec::new();
+        let mut partial = false;
+        for (scan_prefix, cursor_key, skip_semantic_evm_logs) in scan_prefixes {
+            let cursor = self.read_compaction_cursor_key(&cursor_key)?;
+            let strict_prefix = format!("{scan_prefix}/");
+            let mut list_page = self.object_store().list_page(
+                scan_prefix,
+                cursor.next_segment_key.as_deref(),
+                COVERAGE_INDEX_V2_LIST_PAGE_SIZE,
+            )?;
+            if list_page.objects.is_empty()
+                && cursor.next_segment_key.is_some()
+                && !list_page.has_more
+            {
+                list_page = self.object_store().list_page(
+                    scan_prefix,
+                    None,
+                    COVERAGE_INDEX_V2_LIST_PAGE_SIZE,
+                )?;
             }
-            if let Some(bucket) = parse_v2_bucket_from_object_key(&prefix, &object.key)? {
-                buckets.insert(bucket, object.key.clone());
+            let mut had_buckets = false;
+            let mut bucket_last_delta_keys = BTreeMap::<CoverageIndexV2Bucket, String>::new();
+            for object in &list_page.objects {
+                if !object.key.starts_with(&strict_prefix) || !object.key.ends_with(".json") {
+                    continue;
+                }
+                let Some(bucket) = parse_v2_bucket_from_object_key(&prefix, &object.key)? else {
+                    continue;
+                };
+                if skip_semantic_evm_logs && bucket.scope.starts_with("semantic/evm.logs/") {
+                    continue;
+                }
+                had_buckets = true;
+                bucket_last_delta_keys.insert(bucket, object.key.clone());
             }
+            for (bucket, last_delta_key) in bucket_last_delta_keys {
+                if seen_buckets.insert(bucket.clone()) {
+                    buckets.push(CoverageIndexV2BucketScanItem {
+                        cursor_key: cursor_key.clone(),
+                        bucket,
+                        last_delta_key: Some(last_delta_key),
+                    });
+                }
+            }
+            if !had_buckets
+                && let Some(next_segment_key) =
+                    list_page.objects.last().map(|object| object.key.clone())
+            {
+                empty_cursor_advances.push(CoverageIndexV2CursorAdvance {
+                    cursor_key,
+                    next_segment_key,
+                });
+            }
+            partial |= list_page.has_more;
         }
         Ok(CoverageIndexV2BucketScan {
-            buckets: buckets
-                .into_iter()
-                .map(|(bucket, last_delta_key)| CoverageIndexV2BucketScanItem {
-                    bucket,
-                    last_delta_key: Some(last_delta_key),
-                })
-                .collect(),
-            partial: list_page.has_more,
-            page_last_key: list_page.objects.last().map(|object| object.key.clone()),
+            buckets,
+            empty_cursor_advances,
+            partial,
         })
     }
 
@@ -2349,14 +2398,21 @@ struct CompactionManifestScan {
 #[derive(Clone, Debug)]
 struct CoverageIndexV2BucketScan {
     buckets: Vec<CoverageIndexV2BucketScanItem>,
+    empty_cursor_advances: Vec<CoverageIndexV2CursorAdvance>,
     partial: bool,
-    page_last_key: Option<String>,
 }
 
 #[derive(Clone, Debug)]
 struct CoverageIndexV2BucketScanItem {
+    cursor_key: String,
     bucket: CoverageIndexV2Bucket,
     last_delta_key: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct CoverageIndexV2CursorAdvance {
+    cursor_key: String,
+    next_segment_key: String,
 }
 
 #[derive(Clone, Debug)]
@@ -2464,6 +2520,13 @@ fn compaction_queue_cursor_key(chain: &ChainIdentity) -> String {
 fn coverage_index_v2_compaction_cursor_key(chain: &ChainIdentity) -> String {
     format!(
         "chains/{}/metadata/coverage-index-v2-compaction-cursor.json",
+        chain.key_prefix()
+    )
+}
+
+fn coverage_index_v2_semantic_evm_logs_compaction_cursor_key(chain: &ChainIdentity) -> String {
+    format!(
+        "chains/{}/metadata/coverage-index-v2-compaction-semantic-evm-logs-cursor.json",
         chain.key_prefix()
     )
 }
