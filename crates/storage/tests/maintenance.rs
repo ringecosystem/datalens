@@ -1041,6 +1041,86 @@ fn test_compaction_splits_sparse_candidates_to_fit_put_budget() {
 }
 
 #[test]
+fn test_compaction_splits_sparse_candidates_by_range_span() {
+    let storage = LocalStorage::new(temp_storage_root("compaction-sparse-range-span"));
+    let chain = test_chain();
+    for number in [10, 20, 30, 400_000, 400_010, 400_020] {
+        write_block_object(&storage, &chain, number, FinalityLevel::Safe);
+    }
+    let config = MaintenanceCompactionConfig {
+        min_object_bytes: u64::MAX,
+        max_input_objects_per_candidate: 512,
+        max_candidates_per_tick: 8,
+        max_concurrent_candidates: 8,
+        max_gets_per_tick: 64,
+        max_puts_per_tick: 8,
+        max_manifest_entries_per_tick: 20_000,
+        cleanup_enabled: false,
+        delete_source_objects: false,
+        ..MaintenanceCompactionConfig::default()
+    };
+
+    let report = storage
+        .compact_small_objects(config)
+        .expect("sparse compaction should avoid large range spans");
+
+    assert_eq!(report.candidate_count, 2);
+    assert_eq!(report.processed_candidates, 2);
+    assert_eq!(report.compacted_objects, 2);
+    assert_eq!(report.compacted_rows, 6);
+    assert!(report.candidates.iter().all(|candidate| {
+        candidate
+            .range
+            .end()
+            .saturating_sub(candidate.range.start())
+            .saturating_add(1)
+            <= 100_000
+    }));
+
+    let manifest = storage.manifest().expect("manifest");
+    assert_eq!(manifest.entries.len(), 6);
+    let compacted_keys = manifest
+        .entries
+        .iter()
+        .map(|entry| entry.object_key.as_deref().expect("object key"))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(compacted_keys.len(), 2);
+    assert!(
+        compacted_keys
+            .iter()
+            .all(|object_key| object_key.contains("/compacted/"))
+    );
+}
+
+#[test]
+fn test_compaction_skips_sparse_candidate_with_only_large_gaps() {
+    let storage = LocalStorage::new(temp_storage_root("compaction-sparse-large-gaps"));
+    let chain = test_chain();
+    for number in [10, 400_000, 800_000] {
+        write_block_object(&storage, &chain, number, FinalityLevel::Safe);
+    }
+
+    let report = storage
+        .compact_small_objects(MaintenanceCompactionConfig {
+            min_object_bytes: u64::MAX,
+            max_input_objects_per_candidate: 512,
+            max_candidates_per_tick: 8,
+            max_concurrent_candidates: 8,
+            max_gets_per_tick: 64,
+            max_puts_per_tick: 8,
+            max_manifest_entries_per_tick: 20_000,
+            cleanup_enabled: false,
+            delete_source_objects: false,
+            ..MaintenanceCompactionConfig::default()
+        })
+        .expect("sparse compaction should skip isolated large gaps");
+
+    assert_eq!(report.candidate_count, 0);
+    assert_eq!(report.processed_candidates, 0);
+    assert_eq!(report.compacted_objects, 0);
+}
+
+#[test]
 fn test_compaction_candidates_do_not_mix_selector_canonical_keys() {
     let storage = LocalStorage::new(temp_storage_root("compaction-selector-canonical"));
     let chain = test_chain();
