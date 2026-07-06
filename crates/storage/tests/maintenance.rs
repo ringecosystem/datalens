@@ -3013,9 +3013,12 @@ fn test_compaction_prioritizes_coverage_index_v2_before_manifest_scan() {
         )
         .expect("budgeted compaction");
 
-    assert_eq!(
-        report.tick_status,
-        MaintenanceCompactionTickStatus::Completed
+    assert!(
+        matches!(
+            report.tick_status,
+            MaintenanceCompactionTickStatus::Completed | MaintenanceCompactionTickStatus::Partial
+        ),
+        "v2 work may consume the tiny tick budget, but must not be paused"
     );
     assert_eq!(report.coverage_index_v2_compacted_buckets, 1);
     assert_eq!(report.coverage_index_v2_compacted_deltas, 2);
@@ -4290,6 +4293,69 @@ fn test_compaction_coverage_index_v2_cleanup_checkpoint_failure_stops_delta_dele
     assert_eq!(retry_report.coverage_index_v2_delta_delete_failures, 0);
     assert_eq!(coverage_index_v2_delta_count(&storage, &chain), 0);
     assert_eq!(coverage_index_v2_cleanup_count(&storage, &chain), 0);
+}
+
+#[test]
+fn test_compaction_coverage_index_v2_cleanup_reserves_get_budget_for_compaction() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-v2-cleanup-reserves-gets"));
+    let chain = test_chain();
+    let scope = "exact/evm.blocks/block/all/safe";
+    let stale_deltas = (0..3)
+        .map(|index| {
+            write_coverage_index_v2_delta(
+                &storage,
+                &chain,
+                scope,
+                0,
+                99_999,
+                &format!("stale-delta-{index}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    for index in 0..3 {
+        write_coverage_index_v2_delta(
+            &storage,
+            &chain,
+            scope,
+            0,
+            99_999,
+            &format!("pending-delta-{index}"),
+        );
+    }
+    let snapshot_key =
+        write_coverage_index_v2_snapshot(&storage, &chain, "cleanup-snapshot", 1, stale_deltas);
+    write_coverage_index_v2_snapshot_head(&storage, &chain, "cleanup-head", 1, &snapshot_key);
+    for index in 0..3 {
+        write_coverage_index_v2_cleanup_record(
+            &storage,
+            &chain,
+            &format!("cleanup-record-{index}"),
+            &snapshot_key,
+            vec![format!(
+                "chains/{}/coverage-index-v2/deltas/{scope}/00000000000000000000-00000000000000099999/stale-delta-{index}.json",
+                chain.key_prefix()
+            )],
+        );
+    }
+
+    let report = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                cleanup_enabled: true,
+                coverage_index_v2_delete_grace_ms: 0,
+                coverage_index_v2_delta_count_threshold: 3,
+                max_gets_per_tick: 6,
+                max_deletes_per_tick: 16,
+                max_puts_per_tick: 16,
+                ..coverage_index_v2_compaction_config(true)
+            },
+        )
+        .expect("cleanup should not starve compaction");
+
+    assert_eq!(report.coverage_index_v2_deleted_deltas, 3);
+    assert_eq!(report.coverage_index_v2_compacted_buckets, 1);
+    assert_eq!(report.coverage_index_v2_compacted_deltas, 3);
 }
 
 #[test]

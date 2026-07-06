@@ -1408,7 +1408,13 @@ where
         let max_duration = Duration::from_millis(config.max_tick_duration_ms.max(1));
         let mut report = CoverageIndexV2CompactionReport::default();
         let mut cleanup_scan = if config.cleanup_enabled {
-            let max_records = operation_budget.remaining_gets();
+            let reserved_compaction_gets = config.coverage_index_v2_delta_count_threshold.max(1);
+            let remaining_gets = operation_budget.remaining_gets();
+            let max_records = if remaining_gets > reserved_compaction_gets {
+                remaining_gets - reserved_compaction_gets
+            } else {
+                remaining_gets
+            };
             if max_records == 0 {
                 None
             } else {
