@@ -4060,6 +4060,53 @@ fn test_compaction_coverage_index_v2_cleanup_deletes_before_new_compaction_work(
 }
 
 #[test]
+fn test_compaction_coverage_index_v2_cleanup_record_deletes_in_batches() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-v2-cleanup-batches"));
+    let chain = test_chain();
+    let scope = "exact/evm.blocks/block/all/safe";
+    let delta_a = write_coverage_index_v2_delta(&storage, &chain, scope, 0, 99_999, "delta-a");
+    let delta_b = write_coverage_index_v2_delta(&storage, &chain, scope, 0, 99_999, "delta-b");
+    let delta_c = write_coverage_index_v2_delta(&storage, &chain, scope, 0, 99_999, "delta-c");
+    let snapshot_key = write_coverage_index_v2_snapshot(
+        &storage,
+        &chain,
+        "batch-snapshot",
+        1,
+        vec![delta_a.clone(), delta_b.clone(), delta_c.clone()],
+    );
+    write_coverage_index_v2_snapshot_head(&storage, &chain, "batch-head", 1, &snapshot_key);
+    write_coverage_index_v2_cleanup_record(
+        &storage,
+        &chain,
+        "batch-cleanup",
+        &snapshot_key,
+        vec![delta_a, delta_b, delta_c],
+    );
+
+    let config = MaintenanceCompactionConfig {
+        cleanup_enabled: true,
+        coverage_index_v2_delete_grace_ms: 0,
+        coverage_index_v2_delta_count_threshold: 10,
+        max_deletes_per_tick: 2,
+        ..MaintenanceCompactionConfig::default()
+    };
+
+    let first_report = storage
+        .compact_small_objects_for_chain(&chain, config)
+        .expect("delete first batch");
+    assert_eq!(first_report.coverage_index_v2_deleted_deltas, 2);
+    assert_eq!(coverage_index_v2_cleanup_count(&storage, &chain), 1);
+    assert_eq!(coverage_index_v2_delta_count(&storage, &chain), 1);
+
+    let second_report = storage
+        .compact_small_objects_for_chain(&chain, config)
+        .expect("delete remaining batch");
+    assert_eq!(second_report.coverage_index_v2_deleted_deltas, 1);
+    assert_eq!(coverage_index_v2_cleanup_count(&storage, &chain), 0);
+    assert_eq!(coverage_index_v2_delta_count(&storage, &chain), 0);
+}
+
+#[test]
 fn test_compaction_coverage_index_v2_recovers_older_head_cleanup_after_new_head() {
     let storage = LocalStorage::new(temp_storage_root("coverage-v2-older-head-cleanup"));
     let chain = test_chain();

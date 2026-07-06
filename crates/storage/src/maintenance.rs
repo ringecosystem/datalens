@@ -1726,7 +1726,8 @@ where
         let mut cursor_advance_key = None;
         for record in cleanup_scan.records {
             let required_deletes = record.record.compacted_delta_keys.len().saturating_add(1);
-            if operation_budget.remaining_deletes() < required_deletes {
+            let remaining_deletes = operation_budget.remaining_deletes();
+            if remaining_deletes == 0 {
                 partial = true;
                 break;
             }
@@ -1737,7 +1738,22 @@ where
                 cursor_advance_key = Some(record.key);
                 continue;
             }
-            let cleanup = self.delete_coverage_index_v2_cleanup_deltas(chain, &record, checkpoint);
+            let can_finish_record = remaining_deletes >= required_deletes;
+            if !can_finish_record && operation_budget.remaining_puts() == 0 {
+                partial = true;
+                break;
+            }
+            let delta_delete_budget = if can_finish_record {
+                record.record.compacted_delta_keys.len()
+            } else {
+                remaining_deletes
+            };
+            let cleanup = self.delete_coverage_index_v2_cleanup_deltas(
+                chain,
+                &record,
+                checkpoint,
+                delta_delete_budget,
+            );
             operation_budget.record_deletes(cleanup.deleted_objects);
             report.deleted_deltas = report
                 .deleted_deltas
@@ -1746,10 +1762,29 @@ where
                 .delete_failures
                 .saturating_add(cleanup.delete_failures);
             if cleanup.delete_failures == 0 {
-                checkpoint()?;
-                self.object_store().delete(&record.key)?;
-                operation_budget.record_deletes(1);
-                cursor_advance_key = Some(record.key);
+                if cleanup.deleted_objects >= record.record.compacted_delta_keys.len() {
+                    checkpoint()?;
+                    self.object_store().delete(&record.key)?;
+                    operation_budget.record_deletes(1);
+                    cursor_advance_key = Some(record.key);
+                } else {
+                    let deleted_keys = cleanup.deleted_keys.into_iter().collect::<BTreeSet<_>>();
+                    let mut updated_record = record.record;
+                    updated_record
+                        .compacted_delta_keys
+                        .retain(|key| !deleted_keys.contains(key));
+                    let bytes = serde_json::to_vec_pretty(&updated_record).map_err(|error| {
+                        DatalensError::new(
+                            DatalensErrorKind::Internal,
+                            format!("encode coverage index v2 cleanup record: {error}"),
+                        )
+                    })?;
+                    checkpoint()?;
+                    self.object_store().put(&record.key, &bytes)?;
+                    operation_budget.record_puts(1);
+                    partial = true;
+                    break;
+                }
             } else {
                 partial = true;
                 break;
@@ -1858,10 +1893,12 @@ where
         chain: &ChainIdentity,
         cleanup: &CoverageIndexV2CleanupRecordObject,
         checkpoint: &dyn Fn() -> Result<(), DatalensError>,
-    ) -> CompactionSourceCleanup {
+        max_deletes: usize,
+    ) -> CoverageIndexV2DeltaCleanup {
         let mut deleted_objects = 0usize;
         let mut delete_failures = 0usize;
-        for object_key in &cleanup.record.compacted_delta_keys {
+        let mut deleted_keys = Vec::new();
+        for object_key in cleanup.record.compacted_delta_keys.iter().take(max_deletes) {
             if let Err(error) = checkpoint() {
                 delete_failures += 1;
                 log::warn!(
@@ -1876,6 +1913,7 @@ where
             match self.object_store().delete(object_key) {
                 Ok(()) => {
                     deleted_objects += 1;
+                    deleted_keys.push(object_key.clone());
                     log::info!(
                         "storage coverage index v2 delta deleted chain_key={} object_key={}",
                         chain.key_prefix(),
@@ -1894,9 +1932,10 @@ where
                 }
             }
         }
-        CompactionSourceCleanup {
+        CoverageIndexV2DeltaCleanup {
             deleted_objects,
             delete_failures,
+            deleted_keys,
         }
     }
 
@@ -3292,6 +3331,13 @@ struct CoverageDeltaBacklogAccumulator {
 struct CompactionSourceCleanup {
     deleted_objects: usize,
     delete_failures: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CoverageIndexV2DeltaCleanup {
+    deleted_objects: usize,
+    delete_failures: usize,
+    deleted_keys: Vec<String>,
 }
 
 fn coverage_index_v2_fragmentation_report<S>(
