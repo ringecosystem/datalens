@@ -561,17 +561,56 @@ where
             }
 
             if self.durable_intents.is_some() {
-                if let Err(error) =
-                    self.submit_durable_intent(&task, &missing, safe_height.finality)
-                {
-                    if error.is_retryable() {
-                        self.mark_retryable_failure(&mut task, &mut cursor, chunk, &error)?;
-                    } else {
-                        self.mark_failed(&mut task, &mut cursor, chunk, &error)?;
+                match self.submit_durable_intent(&task, &missing, safe_height.finality) {
+                    Ok(DurableIntentSubmissionOutcome::AlreadyCompleted(_)) => {
+                        if !uncommitted_staged_coverage_seen
+                            && chunk.start() == cursor.next
+                            && match self.is_durable_covered(&task, chunk.clone()) {
+                                Ok(covered) => covered,
+                                Err(error) if error.is_retryable() => {
+                                    self.mark_retryable_failure(
+                                        &mut task,
+                                        &mut cursor,
+                                        chunk,
+                                        &error,
+                                    )?;
+                                    return Err(error);
+                                }
+                                Err(error) => {
+                                    self.mark_failed(&mut task, &mut cursor, chunk, &error)?;
+                                    return Err(error);
+                                }
+                            }
+                        {
+                            cursor.mark_committed(chunk.clone(), unix_seconds_now()?);
+                            self.registry.save_cursor(&cursor)?;
+                            next = cursor.next;
+                            result.checkpoints.push(WarmupCheckpoint {
+                                task_id: task.task_id.clone(),
+                                range_kind: task.range_kind.clone(),
+                                committed_range: chunk,
+                                rows_written: 0,
+                                provider_calls: 0,
+                            });
+                            continue;
+                        }
                     }
-                    return Err(error);
+                    Ok(
+                        DurableIntentSubmissionOutcome::Submitted(_)
+                        | DurableIntentSubmissionOutcome::AlreadyPending(_),
+                    ) => {}
+                    Ok(DurableIntentSubmissionOutcome::Failed(error)) | Err(error) => {
+                        if error.is_retryable() {
+                            self.mark_retryable_failure(&mut task, &mut cursor, chunk, &error)?;
+                        } else {
+                            self.mark_failed(&mut task, &mut cursor, chunk, &error)?;
+                        }
+                        return Err(error);
+                    }
                 }
                 result.status = WarmupRunStatus::Partial;
+                task.state = WarmupTaskState::Queued;
+                task.touch(unix_seconds_now()?);
                 self.registry.save_task(&task)?;
                 self.registry.save_cursor(&cursor)?;
                 return Ok(result);
@@ -707,9 +746,12 @@ where
         task: &WarmupTask,
         ranges: &[LedgerRange],
         finality: FinalityLevel,
-    ) -> Result<(), DatalensError> {
+    ) -> Result<DurableIntentSubmissionOutcome, DatalensError> {
         let Some(repository) = &self.durable_intents else {
-            return Ok(());
+            return Err(DatalensError::new(
+                DatalensErrorKind::Internal,
+                "durable intent repository is not configured",
+            ));
         };
         let service = DurableIntentSubmissionService::new(repository.clone());
         match service.submit(DurableIntentSubmissionRequest {
@@ -735,7 +777,7 @@ where
                     intent.selector_fingerprint,
                     format_ranges(&intent.ranges)
                 );
-                Ok(())
+                Ok(DurableIntentSubmissionOutcome::Submitted(intent))
             }
             DurableIntentSubmissionOutcome::AlreadyPending(intent) => {
                 self.record_durable_intent_metric(
@@ -751,7 +793,7 @@ where
                     intent.selector_fingerprint,
                     format_ranges(&intent.ranges)
                 );
-                Ok(())
+                Ok(DurableIntentSubmissionOutcome::AlreadyPending(intent))
             }
             DurableIntentSubmissionOutcome::AlreadyCompleted(intent) => {
                 self.record_durable_intent_metric(
@@ -767,11 +809,11 @@ where
                     intent.selector_fingerprint,
                     format_ranges(&intent.ranges)
                 );
-                Ok(())
+                Ok(DurableIntentSubmissionOutcome::AlreadyCompleted(intent))
             }
             DurableIntentSubmissionOutcome::Failed(error) => {
                 self.record_durable_intent_metric(task, MetricsDurableIntentOutcome::Error);
-                Err(error)
+                Ok(DurableIntentSubmissionOutcome::Failed(error))
             }
         }
     }

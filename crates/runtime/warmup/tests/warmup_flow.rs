@@ -545,10 +545,71 @@ fn test_warmup_with_durable_intents_schedules_without_fetching_or_advancing_curs
         .expect("load cursor")
         .expect("cursor exists");
     assert_eq!(cursor.next, 1);
+    let task = registry.get(&task_id).expect("load task").expect("task");
+    assert_eq!(task.state, WarmupTaskState::Queued);
     let recorded = recorded.lock().expect("recorded intents");
     assert_eq!(recorded.len(), 1);
     assert_eq!(recorded[0].application, "app-a");
     assert_eq!(recorded[0].ranges, vec![blocks(1, 3)]);
+}
+
+#[test]
+fn test_warmup_with_completed_durable_intent_advances_over_visible_coverage() {
+    let adapter = FixtureAdapter::new(10).with_logs(vec![log_record(1, 0)]);
+    let storage = LocalStorage::new(temp_root("intent-completed-storage"));
+    seed_log_coverage(&storage, blocks(1, 3), vec![log_record(1, 0)]);
+    let registry = LocalWarmupRegistry::new(object_store("intent-completed-registry"));
+    let runtime = WarmupRuntime::new(adapter.clone(), storage, registry.clone(), writer_config())
+        .with_durable_intents(ExistingIntentRepository {
+            status: DurablePromotionIntentStatus::Completed,
+        });
+    let task_id = registry
+        .submit(submit_request(Some(3), WarmupTaskMode::FixedRange))
+        .expect("submit")
+        .task_id;
+
+    let result = runtime.run_task_once(&task_id).expect("warmup run");
+
+    assert_eq!(result.status, WarmupRunStatus::Completed);
+    assert!(adapter.fetches().is_empty());
+    assert_eq!(result.checkpoints.len(), 1);
+    assert_eq!(result.checkpoints[0].committed_range, blocks(1, 3));
+    let cursor = registry
+        .load_cursor(&task_id)
+        .expect("load cursor")
+        .expect("cursor exists");
+    assert_eq!(cursor.next, 4);
+    let task = registry.get(&task_id).expect("load task").expect("task");
+    assert_eq!(task.state, WarmupTaskState::Completed);
+}
+
+#[test]
+fn test_warmup_with_completed_durable_intent_waits_for_visible_coverage() {
+    let adapter = FixtureAdapter::new(10).with_logs(vec![log_record(1, 0)]);
+    let storage = LocalStorage::new(temp_root("intent-completed-without-coverage-storage"));
+    let registry =
+        LocalWarmupRegistry::new(object_store("intent-completed-without-coverage-registry"));
+    let runtime = WarmupRuntime::new(adapter.clone(), storage, registry.clone(), writer_config())
+        .with_durable_intents(ExistingIntentRepository {
+            status: DurablePromotionIntentStatus::Completed,
+        });
+    let task_id = registry
+        .submit(submit_request(Some(3), WarmupTaskMode::FixedRange))
+        .expect("submit")
+        .task_id;
+
+    let result = runtime.run_task_once(&task_id).expect("warmup run");
+
+    assert_eq!(result.status, WarmupRunStatus::Partial);
+    assert!(adapter.fetches().is_empty());
+    assert!(result.checkpoints.is_empty());
+    let cursor = registry
+        .load_cursor(&task_id)
+        .expect("load cursor")
+        .expect("cursor exists");
+    assert_eq!(cursor.next, 1);
+    let task = registry.get(&task_id).expect("load task").expect("task");
+    assert_eq!(task.state, WarmupTaskState::Queued);
 }
 
 #[test]
@@ -3099,6 +3160,11 @@ struct RecordingIntentRepository {
 }
 
 #[derive(Clone)]
+struct ExistingIntentRepository {
+    status: DurablePromotionIntentStatus,
+}
+
+#[derive(Clone)]
 struct FailingIntentRepository {
     error: DatalensError,
 }
@@ -3115,6 +3181,81 @@ impl DurablePromotionIntentRepository for RecordingIntentRepository {
         Ok(DurablePromotionIntentCreateOutcome::Created(
             intent_from_request(request),
         ))
+    }
+
+    fn get(&self, _intent_id: &str) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        Ok(None)
+    }
+
+    fn list_pending(
+        &self,
+        _now_unix_seconds: u64,
+        _limit: usize,
+    ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+        Ok(Vec::new())
+    }
+
+    fn list_pending_for_chain(
+        &self,
+        _chain: &ChainIdentity,
+        _now_unix_seconds: u64,
+        _limit: usize,
+    ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+        Ok(Vec::new())
+    }
+
+    fn mark_running(
+        &self,
+        _intent_id: &str,
+        _now_unix_seconds: u64,
+    ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        Ok(None)
+    }
+
+    fn mark_completed(
+        &self,
+        _intent_id: &str,
+        _now_unix_seconds: u64,
+    ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        Ok(None)
+    }
+
+    fn mark_retryable_failure(
+        &self,
+        _intent_id: &str,
+        _error: &str,
+        _now_unix_seconds: u64,
+        _next_retry_at_unix_seconds: u64,
+    ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        Ok(None)
+    }
+
+    fn mark_terminal_failure(
+        &self,
+        _intent_id: &str,
+        _error: &str,
+        _now_unix_seconds: u64,
+    ) -> Result<Option<DurablePromotionIntent>, DatalensError> {
+        Ok(None)
+    }
+
+    fn reset_stale_running(
+        &self,
+        _stale_before_unix_seconds: u64,
+        _now_unix_seconds: u64,
+    ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+        Ok(Vec::new())
+    }
+}
+
+impl DurablePromotionIntentRepository for ExistingIntentRepository {
+    fn create_or_get(
+        &self,
+        request: CreateDurablePromotionIntent,
+    ) -> Result<DurablePromotionIntentCreateOutcome, DatalensError> {
+        let mut intent = intent_from_request(request);
+        intent.status = self.status;
+        Ok(DurablePromotionIntentCreateOutcome::Existing(intent))
     }
 
     fn get(&self, _intent_id: &str) -> Result<Option<DurablePromotionIntent>, DatalensError> {
