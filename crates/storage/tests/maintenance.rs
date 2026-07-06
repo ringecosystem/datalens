@@ -2864,6 +2864,53 @@ fn test_compaction_source_cleanup_record_for_current_object_is_discarded_without
 }
 
 #[test]
+fn test_compaction_reconciliation_for_chain_uses_scoped_cleanup_lists() {
+    let storage = LocalStorage::new(temp_storage_root("scoped-compaction-reconciliation"));
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 78, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 79, FinalityLevel::Safe);
+    storage
+        .compact_small_objects(MaintenanceCompactionConfig {
+            min_object_bytes: u64::MAX,
+            max_input_objects_per_candidate: 8,
+            max_tick_duration_ms: 30_000,
+            max_candidates_per_tick: 8,
+            max_manifest_entries_per_tick: 20_000,
+            cleanup_enabled: true,
+            delete_source_objects: true,
+            source_delete_grace_ms: 0,
+            ..MaintenanceCompactionConfig::default()
+        })
+        .expect("compact small objects");
+    let counting_store = CountingListStore::new(storage.root().into());
+    let counting_storage = DurableStorage::from_object_store(counting_store.clone());
+
+    counting_storage
+        .reconcile_compaction_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                cleanup_enabled: true,
+                delete_source_objects: true,
+                source_delete_grace_ms: 0,
+                ..MaintenanceCompactionConfig::default()
+            },
+        )
+        .expect("reconcile compaction");
+
+    assert_eq!(counting_store.list_count_for_prefix("chains"), 0);
+    assert!(
+        counting_store.list_count_for_prefix(&format!("chains/{}/datasets", chain.key_prefix()))
+            > 0
+    );
+    assert!(
+        counting_store.list_count_for_prefix(&format!(
+            "chains/{}/metadata/compaction-superseded-sources",
+            chain.key_prefix()
+        )) > 0
+    );
+}
+
+#[test]
 fn test_compaction_tick_stops_after_candidate_budget_and_reports_partial() {
     let storage = LocalStorage::new(temp_storage_root("candidate-budget"));
     let chain = test_chain();
