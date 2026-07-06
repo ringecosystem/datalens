@@ -894,6 +894,7 @@ fn maintenance_compaction_config(
         max_puts_per_tick: config.max_puts_per_tick,
         max_deletes_per_tick: config.max_deletes_per_tick,
         source_delete_grace_ms: config.source_delete_grace_ms,
+        validate_coverage_index_sources: config.validate_coverage_index_sources,
         coverage_index_v2_delta_count_threshold: config.coverage_index_v2_delta_count_threshold,
         coverage_index_v2_delete_grace_ms: config.coverage_index_v2_delete_grace_ms,
         query_latency_pause_threshold_ms: config.query_latency_pause_threshold_ms,
@@ -1808,6 +1809,7 @@ mod tests {
             max_puts_per_tick: 8,
             max_deletes_per_tick: 64,
             source_delete_grace_ms: 300_000,
+            validate_coverage_index_sources: true,
             coverage_index_v2_delta_count_threshold: 128,
             coverage_index_v2_delete_grace_ms: 300_000,
             object_store_error_pause_ms: 60_000,
@@ -1823,6 +1825,7 @@ mod tests {
 
         assert!(!compaction.cleanup_enabled);
         assert!(compaction.delete_source_objects);
+        assert!(compaction.validate_coverage_index_sources);
         assert_eq!(compaction.max_candidates_per_tick, 1);
         assert_eq!(compaction.max_tick_duration_ms, 2_000);
     }
@@ -1845,6 +1848,7 @@ mod tests {
             max_puts_per_tick: 8,
             max_deletes_per_tick: 64,
             source_delete_grace_ms: 300_000,
+            validate_coverage_index_sources: true,
             coverage_index_v2_delta_count_threshold: 128,
             coverage_index_v2_delete_grace_ms: 300_000,
             object_store_error_pause_ms: 60_000,

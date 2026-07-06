@@ -1341,6 +1341,7 @@ where
         chain: &ChainIdentity,
         entry: ManifestEntry,
         source_entries: &[ManifestEntry],
+        validate_coverage_index_sources: bool,
         checkpoint: &dyn Fn() -> Result<(), DatalensError>,
     ) -> Result<bool, DatalensError> {
         let started = Instant::now();
@@ -1377,29 +1378,36 @@ where
             return Ok(false);
         }
 
-        let index_entries =
-            coverage_index::read_entries_for_replacement_scope(&self.object_store, &entry)?;
-        if !index_entries.is_empty()
-            && !compaction_source_entries_still_current(&index_entries, source_entries)
-        {
-            log::info!(
-                "storage compaction manifest publish skipped reason=stale_coverage_index_sources chain_key={} range={}-{} source_entries_count={} index_entries_count={}",
-                chain.key_prefix(),
-                entry.range.start(),
-                entry.range.end(),
-                source_entries.len(),
-                index_entries.len()
-            );
-            return Ok(false);
-        }
-
         checkpoint()?;
         let legacy_coverage_index_write_enabled = self.legacy_coverage_index_write_enabled();
-        let replacement = if legacy_coverage_index_write_enabled {
-            None
+        let replacement = if legacy_coverage_index_write_enabled || validate_coverage_index_sources
+        {
+            let index_entries =
+                coverage_index::read_entries_for_replacement_scope(&self.object_store, &entry)?;
+            if !index_entries.is_empty()
+                && !compaction_source_entries_still_current(&index_entries, source_entries)
+            {
+                log::info!(
+                    "storage compaction manifest publish skipped reason=stale_coverage_index_sources chain_key={} range={}-{} source_entries_count={} index_entries_count={}",
+                    chain.key_prefix(),
+                    entry.range.start(),
+                    entry.range.end(),
+                    source_entries.len(),
+                    index_entries.len()
+                );
+                return Ok(false);
+            }
+            if legacy_coverage_index_write_enabled {
+                None
+            } else {
+                Some(coverage_index::replacement_from_replaced_entries(
+                    index_entries,
+                    &entry,
+                )?)
+            }
         } else {
             Some(coverage_index::replacement_from_replaced_entries(
-                index_entries,
+                current_entries,
                 &entry,
             )?)
         };

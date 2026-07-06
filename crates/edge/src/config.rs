@@ -141,6 +141,8 @@ pub struct StorageCompactionConfig {
     pub max_deletes_per_tick: usize,
     #[serde(default = "default_storage_compaction_source_delete_grace_ms")]
     pub source_delete_grace_ms: u64,
+    #[serde(default = "default_storage_compaction_validate_coverage_index_sources")]
+    pub validate_coverage_index_sources: bool,
     #[serde(default = "default_storage_compaction_coverage_index_v2_delta_count_threshold")]
     pub coverage_index_v2_delta_count_threshold: usize,
     #[serde(default = "default_storage_compaction_coverage_index_v2_delete_grace_ms")]
@@ -183,6 +185,8 @@ impl Default for StorageCompactionConfig {
             max_puts_per_tick: default_storage_compaction_max_puts_per_tick(),
             max_deletes_per_tick: default_storage_compaction_max_deletes_per_tick(),
             source_delete_grace_ms: default_storage_compaction_source_delete_grace_ms(),
+            validate_coverage_index_sources:
+                default_storage_compaction_validate_coverage_index_sources(),
             coverage_index_v2_delta_count_threshold:
                 default_storage_compaction_coverage_index_v2_delta_count_threshold(),
             coverage_index_v2_delete_grace_ms:
@@ -579,6 +583,10 @@ fn default_storage_compaction_source_delete_grace_ms() -> u64 {
 }
 
 fn default_storage_coverage_index_legacy_write_enabled() -> bool {
+    true
+}
+
+fn default_storage_compaction_validate_coverage_index_sources() -> bool {
     true
 }
 

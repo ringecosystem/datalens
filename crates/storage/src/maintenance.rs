@@ -273,6 +273,7 @@ pub struct MaintenanceCompactionConfig {
     pub cleanup_enabled: bool,
     pub delete_source_objects: bool,
     pub source_delete_grace_ms: u64,
+    pub validate_coverage_index_sources: bool,
     pub coverage_index_v2_delta_count_threshold: usize,
     pub coverage_index_v2_delete_grace_ms: u64,
 }
@@ -299,6 +300,7 @@ impl Default for MaintenanceCompactionConfig {
             cleanup_enabled: false,
             delete_source_objects: false,
             source_delete_grace_ms: 300_000,
+            validate_coverage_index_sources: true,
             coverage_index_v2_delta_count_threshold: 64,
             coverage_index_v2_delete_grace_ms: 300_000,
         }
@@ -816,6 +818,7 @@ where
                 &candidate.chain,
                 &compacted.entries,
                 &candidate_entries,
+                config.validate_coverage_index_sources,
                 checkpoint,
             )?;
             if !manifest_publish.completed {
@@ -1793,6 +1796,7 @@ where
         chain: &ChainIdentity,
         compacted_entries: &[ManifestEntry],
         source_entries: &[ManifestEntry],
+        validate_coverage_index_sources: bool,
         checkpoint: &dyn Fn() -> Result<(), DatalensError>,
     ) -> Result<CompactionManifestPublishResult, DatalensError> {
         let mut published_entries = 0usize;
@@ -1817,6 +1821,7 @@ where
                 chain,
                 compacted_entry.clone(),
                 &matching_source_entries,
+                validate_coverage_index_sources,
                 checkpoint,
             )? {
                 return Ok(CompactionManifestPublishResult {
