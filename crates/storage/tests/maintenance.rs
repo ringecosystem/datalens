@@ -4028,14 +4028,12 @@ fn test_compaction_coverage_index_v2_head_without_cleanup_is_retried() {
 }
 
 #[test]
-fn test_compaction_coverage_index_v2_cleanup_deletes_before_new_compaction_work() {
+fn test_compaction_coverage_index_v2_cleanup_deletes_when_no_new_compaction_work() {
     let storage = LocalStorage::new(temp_storage_root("coverage-v2-cleanup-priority"));
     let chain = test_chain();
     let scope = "exact/evm.blocks/block/all/safe";
     let stale_delta =
         write_coverage_index_v2_delta(&storage, &chain, scope, 0, 99_999, "stale-delta");
-    write_coverage_index_v2_delta(&storage, &chain, scope, 0, 99_999, "pending-delta-a");
-    write_coverage_index_v2_delta(&storage, &chain, scope, 0, 99_999, "pending-delta-b");
     let snapshot_key = write_coverage_index_v2_snapshot(
         &storage,
         &chain,
@@ -4059,7 +4057,7 @@ fn test_compaction_coverage_index_v2_cleanup_deletes_before_new_compaction_work(
                 cleanup_enabled: true,
                 coverage_index_v2_delete_grace_ms: 0,
                 coverage_index_v2_delta_count_threshold: 2,
-                max_tick_duration_ms: 1,
+                max_tick_duration_ms: 1_000,
                 ..MaintenanceCompactionConfig::default()
             },
             || {
@@ -4067,11 +4065,11 @@ fn test_compaction_coverage_index_v2_cleanup_deletes_before_new_compaction_work(
                 Ok(())
             },
         )
-        .expect("prioritize mature cleanup records");
+        .expect("delete mature cleanup records when there is no compaction work");
 
     assert_eq!(report.coverage_index_v2_deleted_deltas, 1);
     assert_eq!(coverage_index_v2_cleanup_count(&storage, &chain), 0);
-    assert_eq!(coverage_index_v2_delta_count(&storage, &chain), 2);
+    assert_eq!(coverage_index_v2_delta_count(&storage, &chain), 0);
 }
 
 #[test]
@@ -4353,9 +4351,58 @@ fn test_compaction_coverage_index_v2_cleanup_reserves_get_budget_for_compaction(
         )
         .expect("cleanup should not starve compaction");
 
-    assert_eq!(report.coverage_index_v2_deleted_deltas, 3);
+    assert_eq!(report.coverage_index_v2_deleted_deltas, 6);
     assert_eq!(report.coverage_index_v2_compacted_buckets, 1);
     assert_eq!(report.coverage_index_v2_compacted_deltas, 3);
+}
+
+#[test]
+fn test_compaction_coverage_index_v2_slow_cleanup_does_not_block_compaction() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-v2-slow-cleanup-does-not-block"));
+    let chain = test_chain();
+    let scope = "exact/evm.blocks/block/all/safe";
+    let stale_delta =
+        write_coverage_index_v2_delta(&storage, &chain, scope, 0, 99_999, "stale-delta");
+    write_coverage_index_v2_delta(&storage, &chain, scope, 0, 99_999, "pending-delta-a");
+    write_coverage_index_v2_delta(&storage, &chain, scope, 0, 99_999, "pending-delta-b");
+    let snapshot_key = write_coverage_index_v2_snapshot(
+        &storage,
+        &chain,
+        "cleanup-snapshot",
+        1,
+        vec![stale_delta.clone()],
+    );
+    write_coverage_index_v2_snapshot_head(&storage, &chain, "cleanup-head", 1, &snapshot_key);
+    write_coverage_index_v2_cleanup_record(
+        &storage,
+        &chain,
+        "cleanup-record",
+        &snapshot_key,
+        vec![stale_delta],
+    );
+
+    let report = storage
+        .compact_small_objects_for_chain_with_checkpoint(
+            &chain,
+            MaintenanceCompactionConfig {
+                cleanup_enabled: true,
+                coverage_index_v2_delete_grace_ms: 0,
+                coverage_index_v2_delta_count_threshold: 2,
+                max_tick_duration_ms: 20,
+                ..MaintenanceCompactionConfig::default()
+            },
+            || {
+                std::thread::sleep(Duration::from_millis(50));
+                Ok(())
+            },
+        )
+        .expect("slow cleanup should not block compaction");
+
+    assert_eq!(report.coverage_index_v2_compacted_buckets, 1);
+    assert_eq!(report.coverage_index_v2_compacted_deltas, 2);
+    assert_eq!(report.coverage_index_v2_deleted_deltas, 0);
+    assert_eq!(coverage_index_v2_cleanup_count(&storage, &chain), 2);
+    assert_eq!(coverage_index_v2_delta_count(&storage, &chain), 3);
 }
 
 #[test]

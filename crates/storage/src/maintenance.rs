@@ -1448,6 +1448,7 @@ where
             .collect::<BTreeSet<_>>();
         let mut cleanup_partial = false;
         if config.cleanup_enabled
+            && !reserve_compaction_budget
             && cleanup_scan
                 .as_ref()
                 .is_some_and(|scan| !scan.records.is_empty())
