@@ -2812,6 +2812,58 @@ fn test_compaction_reconciliation_never_deletes_current_manifest_objects() {
 }
 
 #[test]
+fn test_compaction_source_cleanup_record_for_current_object_is_discarded_without_delete() {
+    let storage = LocalStorage::new(temp_storage_root("protect-current-source-record"));
+    let chain = test_chain();
+    let current_object = write_block_object(&storage, &chain, 78, FinalityLevel::Safe);
+    let record_key = format!(
+        "chains/{}/metadata/compaction-superseded-sources/current-object.json",
+        chain.key_prefix()
+    );
+    let record = serde_json::json!({
+        "schema_version": 1,
+        "object_key": current_object,
+        "superseded_at_unix_ms": 0,
+        "delete_after_unix_ms": 0
+    });
+    storage
+        .object_store()
+        .put(
+            &record_key,
+            &serde_json::to_vec_pretty(&record).expect("record bytes"),
+        )
+        .expect("write stale source record");
+
+    let reconciliation = storage
+        .reconcile_compaction_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                cleanup_enabled: true,
+                delete_source_objects: true,
+                source_delete_grace_ms: 0,
+                ..MaintenanceCompactionConfig::default()
+            },
+        )
+        .expect("reconcile compaction");
+
+    assert_eq!(reconciliation.deleted_stale_source_objects, 0);
+    assert_eq!(reconciliation.deleted_stale_cleanup_records, 1);
+    assert_eq!(reconciliation.delete_failures, 0);
+    assert!(
+        storage
+            .object_store()
+            .exists(&current_object)
+            .expect("current object exists")
+    );
+    assert!(
+        !storage
+            .object_store()
+            .exists(&record_key)
+            .expect("record deleted")
+    );
+}
+
+#[test]
 fn test_compaction_tick_stops_after_candidate_budget_and_reports_partial() {
     let storage = LocalStorage::new(temp_storage_root("candidate-budget"));
     let chain = test_chain();

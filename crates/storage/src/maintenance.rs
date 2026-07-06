@@ -650,6 +650,29 @@ where
                     .take(config.max_deletes_per_tick)
                 {
                     checkpoint()?;
+                    if self.compaction_source_is_current(chain, &record.object_key)? {
+                        log::info!(
+                            "storage compaction reconciliation source delete skipped current manifest object chain_key={} object_key={} record_key={}",
+                            chain.key_prefix(),
+                            record.object_key,
+                            record_key
+                        );
+                        match self.object_store().delete(&record_key) {
+                            Ok(()) => report.deleted_stale_cleanup_records += 1,
+                            Err(error) => {
+                                report.delete_failures += 1;
+                                log::warn!(
+                                    "storage compaction reconciliation source cleanup record delete failed chain_key={} object_key={} record_key={} kind={:?} message={}",
+                                    chain.key_prefix(),
+                                    record.object_key,
+                                    record_key,
+                                    error.kind,
+                                    error.message
+                                );
+                            }
+                        }
+                        continue;
+                    }
                     match self.object_store().delete(&record.object_key) {
                         Ok(()) => report.deleted_stale_source_objects += 1,
                         Err(error) => {
@@ -699,6 +722,18 @@ where
             }
         }
         Ok(report)
+    }
+
+    fn compaction_source_is_current(
+        &self,
+        chain: &ChainIdentity,
+        object_key: &str,
+    ) -> Result<bool, DatalensError> {
+        Ok(
+            current_object_keys(&self.manifest_for_chain(chain)?.entries)
+                .iter()
+                .any(|current_key| current_key == object_key),
+        )
     }
 
     fn compact_selected_manifest_entries(
