@@ -1414,6 +1414,21 @@ where
             .flat_map(|scan| scan.records.iter())
             .flat_map(|object| object.record.compacted_delta_keys.iter().cloned())
             .collect::<BTreeSet<_>>();
+        let mut cleanup_partial = false;
+        if config.cleanup_enabled
+            && cleanup_scan
+                .as_ref()
+                .is_some_and(|scan| !scan.records.is_empty())
+        {
+            cleanup_partial = self.cleanup_coverage_index_v2_for_chain(
+                chain,
+                checkpoint,
+                operation_budget,
+                cleanup_scan.clone(),
+                &mut report,
+            )?;
+            cleanup_scan = None;
+        }
         let priority_cursor_key = coverage_index_v2_compaction_priority_cursor_key(chain);
         let priority_cursor = self.read_compaction_cursor_key(&priority_cursor_key)?;
         let next_priority = match priority_cursor.next_segment_key.as_deref() {
@@ -1422,7 +1437,7 @@ where
         };
         let bucket_scan = self.scan_coverage_index_v2_delta_buckets(chain, next_priority)?;
         let mut cursor_advances = BTreeMap::<String, String>::new();
-        let mut partial = bucket_scan.partial;
+        let mut partial = cleanup_partial || bucket_scan.partial;
         let mut processed_v2_bucket = false;
 
         for bucket_scan_item in bucket_scan.buckets {
