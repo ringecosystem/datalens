@@ -2982,8 +2982,8 @@ fn test_compaction_report_exposes_backlog_estimates_and_tick_summary() {
 }
 
 #[test]
-fn test_compaction_skips_coverage_index_v2_when_tick_budget_is_exhausted() {
-    let storage = LocalStorage::new(temp_storage_root("compaction-v2-budget-exhausted"));
+fn test_compaction_prioritizes_coverage_index_v2_before_manifest_scan() {
+    let storage = LocalStorage::new(temp_storage_root("compaction-v2-before-manifest-scan"));
     let chain = test_chain();
     write_block_object(&storage, &chain, 182, FinalityLevel::Safe);
     write_block_object(&storage, &chain, 183, FinalityLevel::Safe);
@@ -3013,15 +3013,27 @@ fn test_compaction_skips_coverage_index_v2_when_tick_budget_is_exhausted() {
         )
         .expect("budgeted compaction");
 
-    assert_eq!(report.tick_status, MaintenanceCompactionTickStatus::Partial);
-    assert_eq!(report.coverage_index_v2_compacted_buckets, 0);
+    assert_eq!(
+        report.tick_status,
+        MaintenanceCompactionTickStatus::Completed
+    );
+    assert_eq!(report.coverage_index_v2_compacted_buckets, 1);
+    assert_eq!(report.coverage_index_v2_compacted_deltas, 2);
     assert_eq!(
         counting_store.list_page_count_for_prefix(&format!(
             "chains/{}/coverage-index-v2/deltas",
             chain.key_prefix()
         )),
+        1,
+        "coverage-index-v2 bucket scan should run before ordinary manifest compaction"
+    );
+    assert_eq!(
+        counting_store.list_page_count_for_prefix(&format!(
+            "chains/{}/manifest-segments",
+            chain.key_prefix()
+        )),
         0,
-        "coverage-index-v2 bucket scan must not start after the tick budget is exhausted"
+        "ordinary manifest segment scan should not run after coverage-index-v2 does useful work"
     );
 }
 

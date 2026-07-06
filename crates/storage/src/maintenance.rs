@@ -556,6 +556,7 @@ where
             scan_partial: false,
             chain: None,
             checkpoint: &|| Ok(()),
+            coverage_index_v2_checked: false,
         })
     }
 
@@ -581,6 +582,25 @@ where
             config.max_candidates_per_tick,
             config.max_manifest_entries_per_tick
         );
+        if config.cleanup_enabled || config.coverage_index_v2_delta_count_threshold > 0 {
+            let mut operation_budget = CompactionOperationBudget::new(config);
+            let (coverage_index_v2_report, v2_partial) = self
+                .compact_coverage_index_v2_for_chain_inner(
+                    Some(chain),
+                    config,
+                    started,
+                    &checkpoint,
+                    &mut operation_budget,
+                )?;
+            if coverage_index_v2_report_has_work(&coverage_index_v2_report) || v2_partial {
+                return Ok(coverage_index_v2_only_compaction_report(
+                    started,
+                    v2_partial,
+                    operation_budget,
+                    coverage_index_v2_report,
+                ));
+            }
+        }
         let scan = self.scan_compaction_manifest_entries(chain, config, started)?;
         let report =
             self.compact_selected_manifest_entries(CompactSelectedManifestEntriesArgs {
@@ -592,6 +612,7 @@ where
                 scan_partial: scan.partial,
                 chain: Some(chain),
                 checkpoint: &checkpoint,
+                coverage_index_v2_checked: true,
             })?;
         Ok(report)
     }
@@ -754,6 +775,7 @@ where
             scan_partial,
             chain,
             checkpoint,
+            coverage_index_v2_checked,
         } = args;
         let build_started = Instant::now();
         let manifest_entries = entries
@@ -952,7 +974,9 @@ where
             }
         }
 
-        if config.cleanup_enabled || config.coverage_index_v2_delta_count_threshold > 0 {
+        if !coverage_index_v2_checked
+            && (config.cleanup_enabled || config.coverage_index_v2_delta_count_threshold > 0)
+        {
             if started.elapsed() >= max_duration {
                 partial = true;
             } else {
@@ -2637,6 +2661,7 @@ struct CompactSelectedManifestEntriesArgs<'a> {
     scan_partial: bool,
     chain: Option<&'a ChainIdentity>,
     checkpoint: &'a dyn Fn() -> Result<(), DatalensError>,
+    coverage_index_v2_checked: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -2696,6 +2721,67 @@ impl CoverageIndexV2ScanPriority {
             Self::SemanticEvmLogs => COVERAGE_INDEX_V2_COMPACTION_PRIORITY_SEMANTIC_EVM_LOGS,
             Self::Root => COVERAGE_INDEX_V2_COMPACTION_PRIORITY_ROOT,
         }
+    }
+}
+
+fn coverage_index_v2_report_has_work(report: &CoverageIndexV2CompactionReport) -> bool {
+    report.compacted_buckets > 0
+        || report.compacted_deltas > 0
+        || report.cleanup_records > 0
+        || report.deleted_deltas > 0
+        || report.delete_failures > 0
+}
+
+fn coverage_index_v2_only_compaction_report(
+    started: Instant,
+    partial: bool,
+    operation_budget: CompactionOperationBudget,
+    coverage_index_v2_report: CoverageIndexV2CompactionReport,
+) -> MaintenanceCompactionReport {
+    let duration_ms = duration_millis(started);
+    let tick_status = if partial {
+        MaintenanceCompactionTickStatus::Partial
+    } else {
+        MaintenanceCompactionTickStatus::Completed
+    };
+    log::info!(
+        "storage compaction tick summary status={} pause_reason=none input_objects=0 output_objects=0 deleted_source_objects=0 deleted_manifest_segments=0 coverage_index_v2_compacted_buckets={} coverage_index_v2_compacted_deltas={} coverage_index_v2_input_delta_bytes={} coverage_index_v2_cleanup_records={} coverage_index_v2_deleted_deltas={} coverage_index_v2_delta_delete_failures={} duration_ms={}",
+        tick_status.as_str(),
+        coverage_index_v2_report.compacted_buckets,
+        coverage_index_v2_report.compacted_deltas,
+        coverage_index_v2_report.input_delta_bytes,
+        coverage_index_v2_report.cleanup_records,
+        coverage_index_v2_report.deleted_deltas,
+        coverage_index_v2_report.delete_failures,
+        duration_ms
+    );
+    MaintenanceCompactionReport {
+        read_only: false,
+        candidates: Vec::new(),
+        candidate_count: 0,
+        candidate_backlog: 0,
+        backlog: Vec::new(),
+        processed_candidates: 0,
+        duration_ms,
+        tick_status,
+        pause_reason: None,
+        tick_summary: MaintenanceCompactionTickSummary {
+            duration_ms,
+            ..MaintenanceCompactionTickSummary::default()
+        },
+        compacted_objects: 0,
+        compacted_rows: 0,
+        deleted_source_objects: 0,
+        source_delete_failures: 0,
+        get_operations: operation_budget.used_gets,
+        put_operations: operation_budget.used_puts,
+        delete_operations: operation_budget.used_deletes,
+        coverage_index_v2_compacted_buckets: coverage_index_v2_report.compacted_buckets,
+        coverage_index_v2_compacted_deltas: coverage_index_v2_report.compacted_deltas,
+        coverage_index_v2_input_delta_bytes: coverage_index_v2_report.input_delta_bytes,
+        coverage_index_v2_cleanup_records: coverage_index_v2_report.cleanup_records,
+        coverage_index_v2_deleted_deltas: coverage_index_v2_report.deleted_deltas,
+        coverage_index_v2_delta_delete_failures: coverage_index_v2_report.delete_failures,
     }
 }
 
