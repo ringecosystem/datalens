@@ -36,6 +36,9 @@ pub(crate) fn write_entry<S>(
 where
     S: ObjectStore,
 {
+    if entry.object_key.is_none() {
+        return Ok(());
+    }
     let queue_entry = CompactionQueueEntry {
         schema_version: 1,
         segment_key: manifest_segment_key(chain, entry),
