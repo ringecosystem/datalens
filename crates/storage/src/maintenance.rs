@@ -29,6 +29,7 @@ use crate::{
 };
 
 const MAX_SPARSE_SOURCE_RANGES_PER_CANDIDATE: usize = 3;
+const MAX_SPARSE_CANDIDATE_RANGE_SPAN_BLOCKS: u64 = 100_000;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MaintenanceReport {
@@ -3445,7 +3446,7 @@ fn push_candidate(
             .saturating_sub(1)
             .min(MAX_SPARSE_SOURCE_RANGES_PER_CANDIDATE);
         if source_ranges.len() > max_sparse_source_ranges {
-            push_sparse_candidates_within_put_budget(
+            push_sparse_candidates_within_limits(
                 candidates,
                 key,
                 entries,
@@ -3472,6 +3473,22 @@ fn push_candidate(
         .map(|entry| entry.range.end())
         .max()
         .expect("end");
+    if !source_ranges_are_contiguous(&source_ranges)
+        && range_span_blocks(start, end) > MAX_SPARSE_CANDIDATE_RANGE_SPAN_BLOCKS
+    {
+        let max_sparse_source_ranges = config
+            .max_puts_per_tick
+            .saturating_sub(1)
+            .min(MAX_SPARSE_SOURCE_RANGES_PER_CANDIDATE);
+        push_sparse_candidates_within_limits(
+            candidates,
+            key,
+            entries,
+            config,
+            max_sparse_source_ranges,
+        );
+        return;
+    }
     let range = LedgerRange::try_new(key.range_kind.clone(), start, end).expect("valid range");
     candidates.push(CompactionCandidate {
         chain: key.chain.clone(),
@@ -3494,7 +3511,7 @@ fn push_candidate(
     });
 }
 
-fn push_sparse_candidates_within_put_budget(
+fn push_sparse_candidates_within_limits(
     candidates: &mut Vec<CompactionCandidate>,
     key: &CompactionKey,
     entries: &[&ManifestEntry],
@@ -3515,7 +3532,20 @@ fn push_sparse_candidates_within_put_budget(
     let mut offset = 0usize;
     while offset < entries.len() {
         let remaining = entries.len() - offset;
-        let mut chunk_len = remaining.min(max_sparse_source_ranges);
+        let mut chunk_len = 0usize;
+        while chunk_len < remaining && chunk_len < max_sparse_source_ranges {
+            let next_len = chunk_len + 1;
+            if entries_range_span_blocks(&entries[offset..offset + next_len])
+                > MAX_SPARSE_CANDIDATE_RANGE_SPAN_BLOCKS
+            {
+                break;
+            }
+            chunk_len = next_len;
+        }
+        if chunk_len < min_sparse_source_ranges {
+            offset += 1;
+            continue;
+        }
         let trailing = remaining.saturating_sub(chunk_len);
         if trailing > 0 && trailing < min_sparse_source_ranges {
             let borrow = min_sparse_source_ranges - trailing;
@@ -3532,6 +3562,24 @@ fn push_sparse_candidates_within_put_budget(
         );
         offset += chunk_len;
     }
+}
+
+fn entries_range_span_blocks(entries: &[&ManifestEntry]) -> u64 {
+    let start = entries
+        .iter()
+        .map(|entry| entry.range.start())
+        .min()
+        .unwrap_or(0);
+    let end = entries
+        .iter()
+        .map(|entry| entry.range.end())
+        .max()
+        .unwrap_or(0);
+    range_span_blocks(start, end)
+}
+
+fn range_span_blocks(start: u64, end: u64) -> u64 {
+    end.saturating_sub(start).saturating_add(1)
 }
 
 impl CompactionCandidate {
