@@ -907,7 +907,7 @@ fn maintenance_compaction_config(
 }
 
 fn storage_compaction_tick_needs_reconciliation(config: MaintenanceCompactionConfig) -> bool {
-    config.cleanup_enabled
+    config.cleanup_enabled && config.delete_source_objects
 }
 
 fn build_evm_service_with_storage(
@@ -1877,9 +1877,21 @@ mod tests {
     }
 
     #[test]
-    fn storage_compaction_reconciliation_runs_when_cleanup_enabled() {
+    fn storage_compaction_reconciliation_is_skipped_when_source_delete_disabled() {
         let config = MaintenanceCompactionConfig {
             cleanup_enabled: true,
+            delete_source_objects: false,
+            ..MaintenanceCompactionConfig::default()
+        };
+
+        assert!(!storage_compaction_tick_needs_reconciliation(config));
+    }
+
+    #[test]
+    fn storage_compaction_reconciliation_runs_when_source_delete_enabled() {
+        let config = MaintenanceCompactionConfig {
+            cleanup_enabled: true,
+            delete_source_objects: true,
             ..MaintenanceCompactionConfig::default()
         };
 
