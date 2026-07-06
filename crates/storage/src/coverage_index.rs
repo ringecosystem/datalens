@@ -934,10 +934,11 @@ where
     Ok(snapshot)
 }
 
-pub(crate) fn v2_cleanup_record_is_safe_to_delete<S>(
+pub(crate) fn v2_cleanup_record_is_safe_to_delete_with_cache<S>(
     object_store: &S,
     chain: &ChainIdentity,
     cleanup: &CoverageIndexV2CleanupRecordObject,
+    latest_delta_key_cache: &mut BTreeMap<CoverageIndexV2Bucket, Option<BTreeSet<String>>>,
 ) -> Result<bool, DatalensError>
 where
     S: ObjectStore,
@@ -981,14 +982,28 @@ where
             return Ok(false);
         }
     }
-    let Some(latest_head) = latest_v2_snapshot_head(object_store, &bucket)? else {
+    if !latest_delta_key_cache.contains_key(&bucket) {
+        let latest_delta_keys = match latest_v2_snapshot_head(object_store, &bucket)? {
+            Some(latest_head) => {
+                let latest_snapshot =
+                    read_v2_snapshot(object_store, &bucket, &latest_head.snapshot_key)?;
+                Some(
+                    latest_snapshot
+                        .compacted_delta_keys
+                        .into_iter()
+                        .collect::<BTreeSet<_>>(),
+                )
+            }
+            None => None,
+        };
+        latest_delta_key_cache.insert(bucket.clone(), latest_delta_keys);
+    }
+    let Some(latest_delta_keys) = latest_delta_key_cache
+        .get(&bucket)
+        .and_then(|keys| keys.as_ref())
+    else {
         return Ok(false);
     };
-    let latest_snapshot = read_v2_snapshot(object_store, &bucket, &latest_head.snapshot_key)?;
-    let latest_delta_keys = latest_snapshot
-        .compacted_delta_keys
-        .into_iter()
-        .collect::<BTreeSet<_>>();
     Ok(record
         .compacted_delta_keys
         .iter()

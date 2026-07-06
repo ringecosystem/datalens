@@ -21,7 +21,7 @@ use crate::{
         COVERAGE_INDEX_V2_LIST_PAGE_SIZE, CoverageIndexV2Bucket, CoverageIndexV2CleanupRecord,
         CoverageIndexV2CleanupRecordObject, parse_v2_bucket_from_object_key,
         prepare_v2_bucket_compaction, unix_ms_now as coverage_index_v2_unix_ms_now,
-        v2_cleanup_record_is_safe_to_delete, v2_snapshot_cleanup_records_for_bucket,
+        v2_cleanup_record_is_safe_to_delete_with_cache, v2_snapshot_cleanup_records_for_bucket,
         write_v2_cleanup_record, write_v2_snapshot, write_v2_snapshot_head,
     },
     decode_object_rows, encode_object_rows, manifest_key, manifest_segment_prefix, range_kind_key,
@@ -1797,6 +1797,7 @@ where
         let mut partial = cleanup_scan.partial;
         let mut cursor_advance_key = None;
         let mut remaining_delta_deletes = max_delta_deletes.unwrap_or(usize::MAX);
+        let mut latest_delta_key_cache = BTreeMap::new();
         for record in cleanup_scan.records {
             if remaining_delta_deletes == 0 {
                 partial = true;
@@ -1808,7 +1809,12 @@ where
                 partial = true;
                 break;
             }
-            if !v2_cleanup_record_is_safe_to_delete(self.object_store(), chain, &record)? {
+            if !v2_cleanup_record_is_safe_to_delete_with_cache(
+                self.object_store(),
+                chain,
+                &record,
+                &mut latest_delta_key_cache,
+            )? {
                 checkpoint()?;
                 self.object_store().delete(&record.key)?;
                 operation_budget.record_deletes(1);
