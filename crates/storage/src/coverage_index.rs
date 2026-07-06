@@ -10,6 +10,7 @@ use std::{
     process,
     sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex, MutexGuard, OnceLock, Weak},
+    thread,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -25,6 +26,7 @@ pub(crate) const COVERAGE_INDEX_V2_LIST_PAGE_SIZE: usize = 256;
 const EVM_LOG_SEMANTIC_INDEX_VERSION: &str = "evm-logs-v1";
 const MAX_EVM_LOG_TOPIC_VALUE_SEMANTIC_KEYS: usize = 128;
 const EVM_LOG_LARGE_TOPIC_VALUE_SCOPE: &str = "_large-any-of";
+const MAX_COVERAGE_INDEX_V2_BUCKET_READ_THREADS: usize = 8;
 
 static COVERAGE_INDEX_UPDATE_LOCKS: OnceLock<Mutex<BTreeMap<String, Weak<Mutex<()>>>>> =
     OnceLock::new();
@@ -302,8 +304,41 @@ where
     S: ObjectStore,
 {
     let mut any_bucket_has_index = false;
-    for bucket in buckets {
-        any_bucket_has_index |= read_entries_for_v2_bucket(object_store, &bucket, entries)?;
+    let buckets = buckets.into_iter().collect::<Vec<_>>();
+    for chunk in buckets.chunks(MAX_COVERAGE_INDEX_V2_BUCKET_READ_THREADS) {
+        let chunk_results = thread::scope(|scope| {
+            let handles = chunk
+                .iter()
+                .cloned()
+                .map(|bucket| {
+                    let object_store = object_store.clone();
+                    scope.spawn(move || {
+                        let mut bucket_entries = Vec::new();
+                        let has_index = read_entries_for_v2_bucket(
+                            &object_store,
+                            &bucket,
+                            &mut bucket_entries,
+                        )?;
+                        Ok::<_, DatalensError>((has_index, bucket_entries))
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle.join().map_err(|_| {
+                        DatalensError::new(
+                            DatalensErrorKind::StorageReadFailure,
+                            "coverage index v2 bucket read worker panicked",
+                        )
+                    })?
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })?;
+        for (has_index, mut bucket_entries) in chunk_results {
+            any_bucket_has_index |= has_index;
+            entries.append(&mut bucket_entries);
+        }
     }
     Ok(any_bucket_has_index)
 }
@@ -2117,6 +2152,7 @@ fn can_merge_empty(left: &ManifestEntry, right: &ManifestEntry) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::LocalObjectStore;
     use datalens_core::{ChainFamily, LogFilter, NetworkId};
 
     fn temp_storage_root(name: &str) -> std::path::PathBuf {
@@ -2179,6 +2215,83 @@ mod tests {
             start_after: Option<&str>,
             limit: usize,
         ) -> Result<crate::ObjectListPage, DatalensError> {
+            self.inner.list_page(prefix, start_after, limit)
+        }
+
+        fn delete(&self, key: &str) -> Result<(), DatalensError> {
+            self.inner.delete(key)
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct DelayedV2ListObjectStore {
+        inner: LocalObjectStore,
+        in_flight: Arc<std::sync::atomic::AtomicUsize>,
+        max_in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl DelayedV2ListObjectStore {
+        fn new(root: std::path::PathBuf) -> Self {
+            Self {
+                inner: LocalObjectStore::new(root),
+                in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                max_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+
+        fn max_in_flight(&self) -> usize {
+            self.max_in_flight.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn delay_v2_list(&self, prefix: &str) {
+            if !prefix.contains("/coverage-index-v2/") {
+                return;
+            }
+            let current = self
+                .in_flight
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            self.max_in_flight
+                .fetch_max(current, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            self.in_flight
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl ObjectStore for DelayedV2ListObjectStore {
+        fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError> {
+            self.inner.get(key)
+        }
+
+        fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
+            self.inner.put(key, bytes)
+        }
+
+        fn put_if_absent(
+            &self,
+            key: &str,
+            bytes: &[u8],
+        ) -> Result<crate::ObjectPutIfAbsentResult, DatalensError> {
+            self.inner.put_if_absent(key, bytes)
+        }
+
+        fn exists(&self, key: &str) -> Result<bool, DatalensError> {
+            self.inner.exists(key)
+        }
+
+        fn list(&self, prefix: &str) -> Result<Vec<crate::ObjectMetadata>, DatalensError> {
+            self.delay_v2_list(prefix);
+            self.inner.list(prefix)
+        }
+
+        fn list_page(
+            &self,
+            prefix: &str,
+            start_after: Option<&str>,
+            limit: usize,
+        ) -> Result<crate::ObjectListPage, DatalensError> {
+            self.delay_v2_list(prefix);
             self.inner.list_page(prefix, start_after, limit)
         }
 
@@ -2359,6 +2472,32 @@ mod tests {
         .expect("missing coverage index should not fail");
 
         assert_eq!(entries, None);
+    }
+
+    #[test]
+    fn test_read_entries_for_v2_buckets_reads_independent_buckets_concurrently() {
+        let object_store =
+            DelayedV2ListObjectStore::new(temp_storage_root("parallel-v2-bucket-read"));
+        let chain = test_chain();
+        let buckets = (0..4)
+            .map(|index| CoverageIndexV2Bucket {
+                chain_key: chain.key_prefix(),
+                scope: format!("scope-{index}"),
+                bucket_start: index * DEFAULT_COVERAGE_INDEX_BUCKET_SIZE,
+                bucket_end: ((index + 1) * DEFAULT_COVERAGE_INDEX_BUCKET_SIZE) - 1,
+            })
+            .collect::<BTreeSet<_>>();
+        let mut entries = Vec::new();
+
+        let has_index = read_entries_for_v2_buckets(&object_store, buckets, &mut entries)
+            .expect("read v2 buckets");
+
+        assert!(!has_index);
+        assert!(entries.is_empty());
+        assert!(
+            object_store.max_in_flight() > 1,
+            "v2 bucket reads should overlap instead of running serially"
+        );
     }
 
     #[test]
