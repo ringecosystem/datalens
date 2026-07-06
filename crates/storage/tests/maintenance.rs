@@ -2997,7 +2997,7 @@ fn test_compaction_prioritizes_coverage_index_v2_before_manifest_scan() {
             &chain,
             MaintenanceCompactionConfig {
                 min_object_bytes: u64::MAX,
-                max_tick_duration_ms: 1,
+                max_tick_duration_ms: 1_000,
                 max_candidates_per_tick: 1,
                 coverage_index_v2_delta_count_threshold: 2,
                 cleanup_enabled: false,
@@ -4791,6 +4791,46 @@ fn test_compaction_coverage_index_v2_cleanup_scan_respects_get_budget() {
     assert_eq!(report.tick_status, MaintenanceCompactionTickStatus::Partial);
     assert_eq!(report.get_operations, 3);
     assert_eq!(cleanup_gets, 3);
+}
+
+#[test]
+fn test_compaction_coverage_index_v2_skips_sparse_buckets_on_partial_scan_page() {
+    let object_store = CountingListStore::new(temp_storage_root("coverage-v2-sparse-page"));
+    let storage = DurableStorage::from_object_store(object_store.clone());
+    let chain = test_chain();
+    let scope = "exact/evm.blocks/block/all/safe";
+    for index in 0..300 {
+        write_coverage_index_v2_delta(
+            &storage,
+            &chain,
+            scope,
+            index * 100_000,
+            index * 100_000 + 99_999,
+            "sparse",
+        );
+    }
+    let sparse_bucket_prefix = format!(
+        "chains/{}/coverage-index-v2/deltas/{scope}/00000000000000000000-00000000000000099999",
+        chain.key_prefix()
+    );
+
+    let report = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                coverage_index_v2_delta_count_threshold: 3,
+                ..coverage_index_v2_compaction_config(false)
+            },
+        )
+        .expect("scan sparse page");
+
+    assert_eq!(report.coverage_index_v2_compacted_buckets, 0);
+    assert_eq!(report.coverage_index_v2_compacted_deltas, 0);
+    assert_eq!(
+        object_store.list_page_count_for_prefix(&sparse_bucket_prefix),
+        0,
+        "sparse buckets observed below threshold in a partial scan page should not be listed again"
+    );
 }
 
 #[test]
