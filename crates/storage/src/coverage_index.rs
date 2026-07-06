@@ -2189,7 +2189,7 @@ fn coverage_index_entry_keys(
         && let Some(filter) = parse_evm_log_canonical_key(&entry.selector_canonical_key)
     {
         keys.extend(
-            evm_log_entry_semantic_scopes(&filter)
+            evm_log_entry_semantic_scopes_for_entry(entry, &filter)
                 .into_iter()
                 .map(|scope| {
                     semantic_coverage_index_key(
@@ -2226,7 +2226,7 @@ fn coverage_index_v2_entry_buckets(entry: &ManifestEntry) -> BTreeSet<CoverageIn
         if entry.dataset_key == DatasetKey::evm_logs()
             && let Some(filter) = parse_evm_log_canonical_key(&entry.selector_canonical_key)
         {
-            for scope in evm_log_entry_semantic_scopes(&filter) {
+            for scope in evm_log_entry_semantic_scopes_for_entry(entry, &filter) {
                 buckets.insert(CoverageIndexV2Bucket {
                     chain_key: entry.chain.key_prefix(),
                     scope: coverage_index_v2_semantic_scope(
@@ -2244,18 +2244,18 @@ fn coverage_index_v2_entry_buckets(entry: &ManifestEntry) -> BTreeSet<CoverageIn
     buckets
 }
 
-fn evm_log_entry_semantic_scopes(filter: &EvmLogFilter) -> BTreeSet<String> {
-    let mut scopes = BTreeSet::new();
-    if filter.addresses().is_empty() {
-        scopes.insert("addr/*".to_owned());
-    } else {
-        scopes.extend(
-            filter
-                .addresses()
-                .iter()
-                .map(|address| format!("addr/{address}")),
-        );
+fn evm_log_entry_semantic_scopes_for_entry(
+    entry: &ManifestEntry,
+    filter: &EvmLogFilter,
+) -> BTreeSet<String> {
+    if entry.object_key.is_none() && !filter.addresses().is_empty() {
+        return evm_log_address_semantic_scopes(filter);
     }
+    evm_log_entry_semantic_scopes(filter)
+}
+
+fn evm_log_entry_semantic_scopes(filter: &EvmLogFilter) -> BTreeSet<String> {
+    let mut scopes = evm_log_address_semantic_scopes(filter);
 
     if filter.topics().is_empty()
         || filter
@@ -2283,6 +2283,21 @@ fn evm_log_entry_semantic_scopes(filter: &EvmLogFilter) -> BTreeSet<String> {
                 }
             }
         }
+    }
+    scopes
+}
+
+fn evm_log_address_semantic_scopes(filter: &EvmLogFilter) -> BTreeSet<String> {
+    let mut scopes = BTreeSet::new();
+    if filter.addresses().is_empty() {
+        scopes.insert("addr/*".to_owned());
+    } else {
+        scopes.extend(
+            filter
+                .addresses()
+                .iter()
+                .map(|address| format!("addr/{address}")),
+        );
     }
     scopes
 }
@@ -3444,5 +3459,46 @@ mod tests {
                 BTreeSet::from(["addr/*".to_owned()])
             ]
         );
+    }
+
+    #[test]
+    fn test_evm_log_empty_coverage_buckets_skip_topic_scopes_when_addressed() {
+        let chain = test_chain();
+        let selector =
+            evm_logs_selector_with_addresses(vec![address(1)], vec![Some(vec![topic(1)])]);
+        let entry = evm_logs_entry(&chain, &selector, 10, 20, 0);
+
+        let scopes = coverage_index_v2_entry_buckets(&entry)
+            .into_iter()
+            .map(|bucket| bucket.scope)
+            .collect::<BTreeSet<_>>();
+
+        assert!(scopes.iter().any(|scope| scope.starts_with("exact/")));
+        assert!(
+            scopes
+                .iter()
+                .any(|scope| scope.contains(&format!("/addr/{}", address(1))))
+        );
+        assert!(!scopes.iter().any(|scope| scope.contains("/topic/")));
+    }
+
+    #[test]
+    fn test_evm_log_data_buckets_keep_topic_scopes_when_addressed() {
+        let chain = test_chain();
+        let selector =
+            evm_logs_selector_with_addresses(vec![address(1)], vec![Some(vec![topic(1)])]);
+        let entry = evm_logs_entry(&chain, &selector, 10, 20, 1);
+
+        let scopes = coverage_index_v2_entry_buckets(&entry)
+            .into_iter()
+            .map(|bucket| bucket.scope)
+            .collect::<BTreeSet<_>>();
+
+        assert!(
+            scopes
+                .iter()
+                .any(|scope| scope.contains(&format!("/addr/{}", address(1))))
+        );
+        assert!(scopes.iter().any(|scope| scope.contains("/topic/")));
     }
 }
