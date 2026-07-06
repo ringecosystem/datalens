@@ -1394,7 +1394,22 @@ where
         }
 
         checkpoint()?;
-        self.publish_replacement_entry_unlocked_with_checkpoint(chain, entry, started, checkpoint)?;
+        let legacy_coverage_index_write_enabled = self.legacy_coverage_index_write_enabled();
+        let replacement = if legacy_coverage_index_write_enabled {
+            None
+        } else {
+            Some(coverage_index::replacement_from_replaced_entries(
+                index_entries,
+                &entry,
+            )?)
+        };
+        self.publish_replacement_entry_unlocked_with_checkpoint(
+            chain,
+            entry,
+            started,
+            checkpoint,
+            replacement,
+        )?;
         Ok(true)
     }
 
@@ -1589,7 +1604,13 @@ where
         entry: ManifestEntry,
         started: Instant,
     ) -> Result<(), DatalensError> {
-        self.publish_replacement_entry_unlocked_with_checkpoint(chain, entry, started, &|| Ok(()))
+        self.publish_replacement_entry_unlocked_with_checkpoint(
+            chain,
+            entry,
+            started,
+            &|| Ok(()),
+            None,
+        )
     }
 
     fn publish_replacement_entry_unlocked_with_checkpoint(
@@ -1598,14 +1619,18 @@ where
         entry: ManifestEntry,
         started: Instant,
         checkpoint: &dyn Fn() -> Result<(), DatalensError>,
+        replacement: Option<coverage_index::CoverageIndexReplacement>,
     ) -> Result<(), DatalensError> {
         checkpoint()?;
         let legacy_coverage_index_write_enabled = self.legacy_coverage_index_write_enabled();
-        let update = coverage_index::replace_entry_with_legacy_index(
-            &self.object_store,
-            &entry,
-            legacy_coverage_index_write_enabled,
-        )?;
+        let update = match replacement {
+            Some(replacement) => replacement,
+            None => coverage_index::replace_entry_with_legacy_index(
+                &self.object_store,
+                &entry,
+                legacy_coverage_index_write_enabled,
+            )?,
+        };
         let mut published_update = if legacy_coverage_index_write_enabled {
             None
         } else {
