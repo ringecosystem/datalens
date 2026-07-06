@@ -3001,6 +3001,55 @@ fn test_broad_evm_log_empty_coverage_index_satisfies_compatible_narrow_query() {
 }
 
 #[test]
+fn test_narrow_evm_log_empty_coverage_plan_skips_polluted_empty_repair_scan() {
+    let storage = LocalStorage::new(temp_storage_root("narrow-empty-skips-polluted-repair"));
+    let chain = test_chain();
+    let stored_selector = evm_log_selector(vec![ADDRESS_A, ADDRESS_B, ADDRESS_C], vec![]);
+    let query_selector = evm_log_selector(vec![ADDRESS_A], vec![Some(vec![TOPIC_1])]);
+    let range = LedgerRange::blocks(20, 22).expect("valid range");
+    let rows = DatasetRows::new(DatasetKey::evm_logs(), QueryRows::EvmLogs(Vec::new()))
+        .expect("empty rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_logs(),
+            selector: &stored_selector,
+            range: range.clone(),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write empty coverage");
+
+    let coverage_plan = storage
+        .coverage_plan(
+            &chain,
+            &DatasetKey::evm_logs(),
+            &query_selector,
+            range.clone(),
+        )
+        .expect("coverage plan");
+    let store = ManifestAccessCountingStore::new(storage.root().to_path_buf());
+    let read_storage = DurableStorage::from_object_store(store.clone());
+    store.reset_coverage_index_list_count();
+
+    let read = read_storage
+        .read_rows_with_coverage_plan(
+            &coverage_plan,
+            &chain,
+            &DatasetKey::evm_logs(),
+            &query_selector,
+            range,
+        )
+        .expect("read rows");
+
+    assert_eq!(read.row_count(), 0);
+    assert_eq!(store.coverage_index_list_count(), 0);
+    assert_eq!(store.coverage_index_v2_list_count(), 0);
+}
+
+#[test]
 fn test_narrow_evm_log_data_read_pierces_polluted_broad_empty_coverage() {
     let storage = LocalStorage::new(temp_storage_root("semantic-narrow-data-over-broad-empty"));
     let chain = test_chain();

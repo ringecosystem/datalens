@@ -1,7 +1,7 @@
 use datalens_chain::{DatasetSelector, FinalityLevel};
 use datalens_core::{
     ChainIdentity, DatalensError, DatalensErrorKind, DatasetKey, DatasetRows, LedgerRange,
-    missing_ranges,
+    TopicFilter, missing_ranges,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -185,6 +185,17 @@ fn durable_finality_satisfies(
         }
         ManifestFinalityLevel::Finalized => entry == ManifestFinalityLevel::Finalized,
     }
+}
+
+fn should_repair_polluted_empty_evm_log_coverage(selector: &DatasetSelector) -> bool {
+    let DatasetSelector::EvmLogs(filter) = selector else {
+        return false;
+    };
+    filter.topics().is_empty()
+        || filter
+            .topics()
+            .iter()
+            .all(|topic| matches!(topic, TopicFilter::Wildcard))
 }
 
 fn replacement_scope_matches(existing: &ManifestEntry, replacement: &ManifestEntry) -> bool {
@@ -903,6 +914,9 @@ where
         if *dataset_key != DatasetKey::evm_logs()
             || !matches!(selector, DatasetSelector::EvmLogs(_))
         {
+            return Ok(());
+        }
+        if !should_repair_polluted_empty_evm_log_coverage(selector) {
             return Ok(());
         }
 
