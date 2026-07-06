@@ -3363,6 +3363,18 @@ fn test_compaction_tick_cleans_consumed_queue_entries() {
 }
 
 #[test]
+fn test_empty_coverage_writes_do_not_enqueue_compaction_work() {
+    let storage = LocalStorage::new(temp_storage_root("empty-coverage-no-queue"));
+    let chain = test_chain();
+
+    write_empty_coverage(&storage, &chain, 108, FinalityLevel::Safe);
+    assert_eq!(queue_keys(&storage, &chain), Vec::<String>::new());
+
+    write_block_object(&storage, &chain, 109, FinalityLevel::Safe);
+    assert_eq!(queue_keys(&storage, &chain).len(), 1);
+}
+
+#[test]
 fn test_compaction_cleanup_deletes_stale_queue_entries_for_missing_manifest_segments() {
     let storage = LocalStorage::new(temp_storage_root("queue-cleanup-missing-segment"));
     let chain = test_chain();
