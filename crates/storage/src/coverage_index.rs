@@ -155,6 +155,7 @@ pub(crate) struct CoverageIndexV2CleanupRecordObject {
 #[derive(Clone, Debug)]
 struct CoverageIndexV2BucketReadCacheEntry {
     inserted_at: Instant,
+    dirty: bool,
     has_index: bool,
     delta_objects: Vec<ObjectMetadata>,
     entries: Vec<ManifestEntry>,
@@ -365,6 +366,11 @@ fn read_entries_for_v2_bucket<S>(
 where
     S: ObjectStore,
 {
+    let cache_key = coverage_index_v2_bucket_read_cache_key(object_store, bucket);
+    if let Some(cached) = get_fresh_cached_v2_bucket_entries(&cache_key) {
+        entries.extend(cached.entries);
+        return Ok(cached.has_index);
+    }
     let mut any_bucket_has_index = false;
     let mut compacted_delta_keys = BTreeSet::new();
     let mut start_after_delta_key = None;
@@ -392,8 +398,6 @@ where
         None,
         start_after_delta_key,
     )?;
-    let cache_key =
-        coverage_index_v2_bucket_read_cache_key(object_store, bucket, snapshot_head.as_ref());
     let (mut bucket_entries, remaining_delta_objects) = if let Some(cached) =
         get_cached_v2_bucket_entries(&cache_key)
         && object_metadata_prefix_matches(&cached.delta_objects, &delta_objects)
@@ -599,7 +603,6 @@ where
 fn coverage_index_v2_bucket_read_cache_key<S>(
     object_store: &S,
     bucket: &CoverageIndexV2Bucket,
-    snapshot_head: Option<&CoverageIndexV2SnapshotHead>,
 ) -> String
 where
     S: ObjectStore,
@@ -610,21 +613,9 @@ where
     #[cfg(debug_assertions)]
     std::thread::current().id().hash(&mut hasher);
     let debug_namespace = hasher.finish();
-    let snapshot_key = snapshot_head
-        .map(|head| head.snapshot_key.as_str())
-        .unwrap_or("");
-    let snapshot_watermark = snapshot_head
-        .map(|head| head.included_delta_high_watermark.as_str())
-        .unwrap_or("");
     format!(
-        "{}\n{}\n{}\n{}\n{}\n{}\n{:016x}",
-        bucket.chain_key,
-        bucket.scope,
-        bucket.bucket_start,
-        bucket.bucket_end,
-        snapshot_key,
-        snapshot_watermark,
-        debug_namespace
+        "{}\n{}\n{}\n{}\n{:016x}",
+        bucket.chain_key, bucket.scope, bucket.bucket_start, bucket.bucket_end, debug_namespace
     )
 }
 
@@ -653,6 +644,11 @@ fn get_cached_v2_bucket_entries(key: &str) -> Option<CoverageIndexV2BucketReadCa
     }
 }
 
+fn get_fresh_cached_v2_bucket_entries(key: &str) -> Option<CoverageIndexV2BucketReadCacheEntry> {
+    let cached = get_cached_v2_bucket_entries(key)?;
+    (!cached.dirty).then_some(cached)
+}
+
 fn put_cached_v2_bucket_entries(
     key: String,
     has_index: bool,
@@ -678,11 +674,24 @@ fn put_cached_v2_bucket_entries(
         key,
         CoverageIndexV2BucketReadCacheEntry {
             inserted_at: now,
+            dirty: false,
             has_index,
             delta_objects,
             entries,
         },
     );
+}
+
+fn mark_cached_v2_bucket_entries_dirty<S>(object_store: &S, bucket: &CoverageIndexV2Bucket)
+where
+    S: ObjectStore,
+{
+    let key = coverage_index_v2_bucket_read_cache_key(object_store, bucket);
+    if let Ok(mut cache) = coverage_index_v2_bucket_read_cache().lock()
+        && let Some(entry) = cache.get_mut(&key)
+    {
+        entry.dirty = true;
+    }
 }
 
 fn coverage_index_v2_bucket_read_cache()
@@ -1142,6 +1151,7 @@ where
                 format!("write coverage index v2 delta {key}: {}", error.message),
             )
         })?;
+        mark_cached_v2_bucket_entries_dirty(object_store, &bucket);
     }
     Ok(())
 }
@@ -1201,6 +1211,7 @@ where
                 ),
             )
         })?;
+        mark_cached_v2_bucket_entries_dirty(object_store, &bucket);
     }
     Ok(())
 }
@@ -1292,6 +1303,15 @@ where
             ),
         )
     })?;
+    mark_cached_v2_bucket_entries_dirty(
+        object_store,
+        &CoverageIndexV2Bucket {
+            chain_key: chain.key_prefix(),
+            scope: scope.to_owned(),
+            bucket_start,
+            bucket_end,
+        },
+    );
     Ok(key)
 }
 
@@ -2491,6 +2511,7 @@ mod tests {
         in_flight: Arc<std::sync::atomic::AtomicUsize>,
         max_in_flight: Arc<std::sync::atomic::AtomicUsize>,
         delta_gets: Arc<std::sync::atomic::AtomicUsize>,
+        list_pages: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl DelayedV2DeltaGetObjectStore {
@@ -2500,6 +2521,7 @@ mod tests {
                 in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 max_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 delta_gets: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                list_pages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             }
         }
 
@@ -2509,6 +2531,10 @@ mod tests {
 
         fn delta_gets(&self) -> usize {
             self.delta_gets.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn list_pages(&self) -> usize {
+            self.list_pages.load(std::sync::atomic::Ordering::SeqCst)
         }
 
         fn delay_v2_delta_get(&self, key: &str) {
@@ -2562,6 +2588,10 @@ mod tests {
             start_after: Option<&str>,
             limit: usize,
         ) -> Result<crate::ObjectListPage, DatalensError> {
+            if prefix.contains("/coverage-index-v2/") {
+                self.list_pages
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             self.inner.list_page(prefix, start_after, limit)
         }
 
@@ -2719,6 +2749,15 @@ mod tests {
         };
         let bytes = serde_json::to_vec_pretty(&delta).expect("encode test delta");
         object_store.put(&key, &bytes).expect("write test delta");
+        mark_cached_v2_bucket_entries_dirty(
+            object_store,
+            &CoverageIndexV2Bucket {
+                chain_key: chain.key_prefix(),
+                scope: scope.to_owned(),
+                bucket_start,
+                bucket_end,
+            },
+        );
         key
     }
 
@@ -2907,6 +2946,7 @@ mod tests {
             read_entries_for_v2_bucket(&object_store, &bucket, &mut first_read_entries)
                 .expect("read v2 bucket first time");
         let delta_gets_after_first_read = object_store.delta_gets();
+        let list_pages_after_first_read = object_store.list_pages();
         let mut second_read_entries = Vec::new();
         let second_has_index =
             read_entries_for_v2_bucket(&object_store, &bucket, &mut second_read_entries)
@@ -2916,6 +2956,7 @@ mod tests {
         assert!(second_has_index);
         assert_eq!(delta_gets_after_first_read, 2);
         assert_eq!(object_store.delta_gets(), delta_gets_after_first_read);
+        assert_eq!(object_store.list_pages(), list_pages_after_first_read);
         assert_eq!(second_read_entries, first_read_entries);
 
         let third = empty_entry(&chain, 41, 42);
@@ -2936,6 +2977,7 @@ mod tests {
 
         assert!(third_has_index);
         assert_eq!(object_store.delta_gets(), delta_gets_after_first_read + 1);
+        assert!(object_store.list_pages() > list_pages_after_first_read);
         assert_eq!(
             third_read_entries
                 .iter()
