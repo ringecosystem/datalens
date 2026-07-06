@@ -950,7 +950,7 @@ where
             };
             self.write_compaction_cursor_key(&cursor.scope_cursor_key, scope_next_key)?;
             if !cleanup_incomplete
-                && !cursor.scope_partial
+                && (!cursor.scope_partial || cursor.queue_cursor_advance.is_some())
                 && processed_candidates >= candidates.len()
             {
                 self.write_compaction_cursor_key(
@@ -1990,6 +1990,7 @@ where
         let queue_scan = self.scan_compaction_queue_entries(
             chain,
             &queue_cursor,
+            config,
             max_entries.max(2),
             load_started,
         )?;
@@ -2256,6 +2257,7 @@ where
         &self,
         chain: &ChainIdentity,
         cursor: &CompactionCursor,
+        config: MaintenanceCompactionConfig,
         max_entries: usize,
         load_started: Instant,
     ) -> Result<CompactionManifestScan, DatalensError> {
@@ -2345,13 +2347,19 @@ where
             Vec::new()
         };
         let mut entries = Vec::new();
+        let mut scope_entries = Vec::new();
         let mut scanned_objects = 0usize;
         let mut scanned_entries = 0usize;
-        let mut cursor_overlap_key = None;
+        let mut scope_cursor_overlap_key = None;
+        let mut scope_cursor_advance_key = None;
+        let mut drained_queue_cursor_advance_key = None;
         let mut stopped_at_next_scope = false;
         let mut stale_queue_entry_keys = Vec::new();
         for object in &queue_objects {
-            if entries.len() >= max_entries {
+            if entries.len() + scope_entries.len() >= max_entries {
+                break;
+            }
+            if load_started.elapsed().as_millis() >= config.max_tick_duration_ms.max(1) as u128 {
                 break;
             }
             let Some(bytes) = self.object_store().get_optional(&object.key)? else {
@@ -2363,12 +2371,32 @@ where
             if active_scope_prefix.is_none() {
                 active_scope_prefix = object_scope_prefix.clone();
             } else if active_scope_prefix != object_scope_prefix {
-                stopped_at_next_scope = true;
-                break;
+                if compaction_candidates(
+                    &scope_entries
+                        .iter()
+                        .map(|entry: &SelectedManifestEntry| entry.entry.clone())
+                        .collect::<Vec<_>>(),
+                    config,
+                )
+                .is_empty()
+                {
+                    drained_queue_cursor_advance_key = cursor_advance_key.clone();
+                    scope_entries.clear();
+                    active_scope_prefix = object_scope_prefix.clone();
+                    active_scope_cursor = active_scope_prefix
+                        .as_deref()
+                        .map(compaction_scope_cursor_key)
+                        .map(|key| self.read_compaction_cursor_key(&key))
+                        .transpose()?;
+                } else {
+                    stopped_at_next_scope = true;
+                    break;
+                }
             }
             scanned_objects += 1;
-            cursor_overlap_key = cursor_advance_key.clone();
+            scope_cursor_overlap_key = cursor_advance_key.clone();
             cursor_advance_key = Some(object.key.clone());
+            scope_cursor_advance_key = Some(object.key.clone());
             let Some(segment_bytes) = self.object_store().get_optional(&queue_entry.segment_key)?
             else {
                 stale_queue_entry_keys.push(object.key.clone());
@@ -2383,27 +2411,30 @@ where
                 {
                     continue;
                 }
-                entries.push(SelectedManifestEntry {
+                scope_entries.push(SelectedManifestEntry {
                     segment_key: Some(queue_entry.segment_key.clone()),
                     cursor_key: Some(object.key.clone()),
                     entry,
                 });
-                if entries.len() >= max_entries {
+                if entries.len() + scope_entries.len() >= max_entries {
                     break;
                 }
             }
         }
+        entries.extend(scope_entries);
         let scope_partial =
             !stopped_at_next_scope && (scanned_objects < queue_objects.len() || list_page.has_more);
         let partial = !entries.is_empty() && (scope_partial || stopped_at_next_scope);
-        let cursor_advance = cursor_advance_key.map(segment_compaction_cursor);
+        let cursor_advance = scope_cursor_advance_key
+            .or(cursor_advance_key)
+            .map(segment_compaction_cursor);
         let scope_cursor_key = active_scope_prefix
             .as_deref()
             .map(compaction_scope_cursor_key)
             .unwrap_or_else(|| compaction_queue_cursor_key(chain));
-        let cursor_overlap = cursor_overlap_key.map(segment_compaction_cursor);
+        let cursor_overlap = scope_cursor_overlap_key.map(segment_compaction_cursor);
         let queue_cursor_advance = if scope_partial {
-            None
+            drained_queue_cursor_advance_key.map(segment_compaction_cursor)
         } else {
             cursor_advance.clone()
         };

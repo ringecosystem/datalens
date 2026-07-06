@@ -3446,15 +3446,140 @@ fn test_compaction_queue_advances_after_non_candidate_scope() {
     let first = storage
         .compact_small_objects_for_chain(&chain, config)
         .expect("first tick");
-    assert_eq!(first.candidate_count, 0);
-    assert_eq!(first.processed_candidates, 0);
+    assert_eq!(first.candidate_count, 1);
+    assert_eq!(first.processed_candidates, 1);
+    assert_eq!(first.compacted_objects, 1);
 
     let second = storage
         .compact_small_objects_for_chain(&chain, config)
         .expect("second tick");
-    assert_eq!(second.candidate_count, 1);
-    assert_eq!(second.processed_candidates, 1);
+    assert_eq!(second.candidate_count, 0);
+    assert_eq!(second.processed_candidates, 0);
+    assert_eq!(second.compacted_objects, 0);
+}
+
+#[test]
+fn test_compaction_queue_drains_multiple_non_candidate_scopes_in_one_tick() {
+    let storage = LocalStorage::new(temp_storage_root("queue-drain-non-candidate-scopes"));
+    let chain = test_chain();
+    let selector_a = DatasetSelector::try_other(
+        AdapterKey::try_new("test").expect("adapter key"),
+        "selector-a",
+        "selector-a",
+    )
+    .expect("selector a");
+    let selector_b = DatasetSelector::try_other(
+        AdapterKey::try_new("test").expect("adapter key"),
+        "selector-b",
+        "selector-b",
+    )
+    .expect("selector b");
+    let selector_c = DatasetSelector::try_other(
+        AdapterKey::try_new("test").expect("adapter key"),
+        "selector-c",
+        "selector-c",
+    )
+    .expect("selector c");
+    write_empty_coverage_with_selector(&storage, &chain, &selector_a, 108, FinalityLevel::Safe);
+    write_block_object_with_selector(&storage, &chain, &selector_b, 109, FinalityLevel::Safe);
+    write_block_object_with_selector(&storage, &chain, &selector_c, 110, FinalityLevel::Safe);
+    write_block_object_with_selector(&storage, &chain, &selector_c, 111, FinalityLevel::Safe);
+
+    let report = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                min_object_bytes: u64::MAX,
+                max_input_objects_per_candidate: 2,
+                max_tick_duration_ms: 30_000,
+                max_candidates_per_tick: 1,
+                max_manifest_entries_per_tick: 20_000,
+                cleanup_enabled: false,
+                delete_source_objects: false,
+                ..MaintenanceCompactionConfig::default()
+            },
+        )
+        .expect("compaction after draining non-candidate queue scopes");
+
+    assert_eq!(report.candidate_count, 1);
+    assert_eq!(report.processed_candidates, 1);
+    assert_eq!(report.compacted_objects, 1);
+    assert_eq!(report.candidates[0].selector_fingerprint, "selector-c");
+
+    let second = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                min_object_bytes: u64::MAX,
+                max_input_objects_per_candidate: 2,
+                max_tick_duration_ms: 30_000,
+                max_candidates_per_tick: 1,
+                max_manifest_entries_per_tick: 20_000,
+                cleanup_enabled: false,
+                delete_source_objects: false,
+                ..MaintenanceCompactionConfig::default()
+            },
+        )
+        .expect("second compaction after drained non-candidate queue scopes");
+    assert_eq!(second.candidate_count, 0);
+    assert_eq!(second.processed_candidates, 0);
+}
+
+#[test]
+fn test_compaction_queue_drained_scope_before_partial_candidate_scope_keeps_remainder() {
+    let storage = LocalStorage::new(temp_storage_root("queue-drain-before-partial-scope"));
+    let chain = test_chain();
+    let selector_a = DatasetSelector::try_other(
+        AdapterKey::try_new("test").expect("adapter key"),
+        "selector-a",
+        "selector-a",
+    )
+    .expect("selector a");
+    let selector_b = DatasetSelector::try_other(
+        AdapterKey::try_new("test").expect("adapter key"),
+        "selector-b",
+        "selector-b",
+    )
+    .expect("selector b");
+    write_empty_coverage_with_selector(&storage, &chain, &selector_a, 108, FinalityLevel::Safe);
+    for number in 110..=113 {
+        write_block_object_with_selector(
+            &storage,
+            &chain,
+            &selector_b,
+            number,
+            FinalityLevel::Safe,
+        );
+    }
+    let config = MaintenanceCompactionConfig {
+        min_object_bytes: u64::MAX,
+        max_input_objects_per_candidate: 2,
+        max_tick_duration_ms: 30_000,
+        max_candidates_per_tick: 1,
+        max_manifest_entries_per_tick: 3,
+        cleanup_enabled: false,
+        delete_source_objects: false,
+        ..MaintenanceCompactionConfig::default()
+    };
+
+    let first = storage
+        .compact_small_objects_for_chain(&chain, config)
+        .expect("first tick after drained non-candidate scope");
+    assert_eq!(first.tick_status, MaintenanceCompactionTickStatus::Partial);
+    assert_eq!(first.compacted_objects, 1);
+    assert_eq!(
+        first.candidates[0].range,
+        LedgerRange::blocks(110, 111).expect("range")
+    );
+
+    let second = storage
+        .compact_small_objects_for_chain(&chain, config)
+        .expect("second tick resumes partial candidate scope");
     assert_eq!(second.compacted_objects, 1);
+    assert_eq!(
+        second.candidates[0].range,
+        LedgerRange::blocks(112, 113).expect("range")
+    );
 }
 
 #[test]
@@ -5041,13 +5166,23 @@ fn write_empty_coverage(
     number: u64,
     finality: FinalityLevel,
 ) {
+    write_empty_coverage_with_selector(storage, chain, &DatasetSelector::all(), number, finality)
+}
+
+fn write_empty_coverage_with_selector(
+    storage: &LocalStorage,
+    chain: &ChainIdentity,
+    selector: &DatasetSelector,
+    number: u64,
+    finality: FinalityLevel,
+) {
     let rows =
         DatasetRows::new(DatasetKey::evm_blocks(), QueryRows::EvmBlocks(Vec::new())).expect("rows");
     storage
         .write_rows(StorageWriteRequest {
             chain,
             dataset_key: DatasetKey::evm_blocks(),
-            selector: &DatasetSelector::all(),
+            selector,
             range: LedgerRange::blocks(number, number).expect("range"),
             rows: &rows,
             finality_level: finality,
