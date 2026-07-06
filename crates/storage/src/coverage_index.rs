@@ -22,7 +22,7 @@ use crate::{
 
 pub(crate) const DEFAULT_COVERAGE_INDEX_BUCKET_SIZE: u64 = 100_000;
 const COVERAGE_INDEX_V2_SCHEMA_VERSION: u32 = 1;
-pub(crate) const COVERAGE_INDEX_V2_LIST_PAGE_SIZE: usize = 256;
+pub(crate) const COVERAGE_INDEX_V2_LIST_PAGE_SIZE: usize = 1_000;
 const EVM_LOG_SEMANTIC_INDEX_VERSION: &str = "evm-logs-v1";
 const MAX_EVM_LOG_TOPIC_VALUE_SEMANTIC_KEYS: usize = 128;
 const EVM_LOG_LARGE_TOPIC_VALUE_SCOPE: &str = "_large-any-of";
