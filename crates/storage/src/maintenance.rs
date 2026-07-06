@@ -1407,8 +1407,10 @@ where
         };
         let max_duration = Duration::from_millis(config.max_tick_duration_ms.max(1));
         let mut report = CoverageIndexV2CompactionReport::default();
+        let reserved_compaction_gets = config.coverage_index_v2_delta_count_threshold.max(1);
+        let reserve_compaction_budget =
+            operation_budget.remaining_gets() > reserved_compaction_gets;
         let mut cleanup_scan = if config.cleanup_enabled {
-            let reserved_compaction_gets = config.coverage_index_v2_delta_count_threshold.max(1);
             let remaining_gets = operation_budget.remaining_gets();
             let max_records = if remaining_gets > reserved_compaction_gets {
                 remaining_gets - reserved_compaction_gets
@@ -1455,6 +1457,7 @@ where
                 checkpoint,
                 operation_budget,
                 cleanup_scan.clone(),
+                reserve_compaction_budget.then_some(reserved_compaction_gets),
                 &mut report,
             )?;
             cleanup_scan = None;
@@ -1644,6 +1647,7 @@ where
                 checkpoint,
                 operation_budget,
                 cleanup_scan,
+                None,
                 &mut report,
             )?;
             partial |= cleanup_partial;
@@ -1745,6 +1749,7 @@ where
         checkpoint: &dyn Fn() -> Result<(), DatalensError>,
         operation_budget: &mut CompactionOperationBudget,
         cleanup_scan: Option<CoverageIndexV2CleanupScan>,
+        max_delta_deletes: Option<usize>,
         report: &mut CoverageIndexV2CompactionReport,
     ) -> Result<bool, DatalensError> {
         let cursor_key = coverage_index_v2_cleanup_cursor_key(chain);
@@ -1754,7 +1759,12 @@ where
         let had_records = !cleanup_scan.records.is_empty();
         let mut partial = cleanup_scan.partial;
         let mut cursor_advance_key = None;
+        let mut remaining_delta_deletes = max_delta_deletes.unwrap_or(usize::MAX);
         for record in cleanup_scan.records {
+            if remaining_delta_deletes == 0 {
+                partial = true;
+                break;
+            }
             let required_deletes = record.record.compacted_delta_keys.len().saturating_add(1);
             let remaining_deletes = operation_budget.remaining_deletes();
             if remaining_deletes == 0 {
@@ -1777,7 +1787,8 @@ where
                 record.record.compacted_delta_keys.len()
             } else {
                 remaining_deletes
-            };
+            }
+            .min(remaining_delta_deletes);
             let cleanup = self.delete_coverage_index_v2_cleanup_deltas(
                 chain,
                 &record,
@@ -1785,6 +1796,8 @@ where
                 delta_delete_budget,
             );
             operation_budget.record_deletes(cleanup.deleted_objects);
+            remaining_delta_deletes =
+                remaining_delta_deletes.saturating_sub(cleanup.deleted_objects);
             report.deleted_deltas = report
                 .deleted_deltas
                 .saturating_add(cleanup.deleted_objects);
