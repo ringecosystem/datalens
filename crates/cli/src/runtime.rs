@@ -553,8 +553,13 @@ impl StorageCompactionWorker {
                         }
                         pause_until = None;
                     }
-                    let chain = chains[next_chain_index % chains.len()].clone();
-                    next_chain_index = next_chain_index.saturating_add(1);
+                    for chain_index in
+                        compaction_chain_batch_indexes(&mut next_chain_index, chains.len())
+                    {
+                        if worker_stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let chain = chains[chain_index].clone();
                     let started = Instant::now();
                     let tick_config = MaintenanceCompactionConfig {
                         pressure: compaction_pressure.snapshot(),
@@ -719,7 +724,11 @@ impl StorageCompactionWorker {
                                 consecutive_failures,
                                 started.elapsed().as_millis()
                             );
+                            if backpressure_error {
+                                break;
+                            }
                         }
+                    }
                     }
                 }
                 log::info!("storage compaction worker stopped");
@@ -764,6 +773,15 @@ fn configured_compaction_chains(
 fn compaction_sleep_duration(interval: Duration, consecutive_failures: u32) -> Duration {
     let multiplier = 1_u32 << consecutive_failures.min(4);
     interval.saturating_mul(multiplier)
+}
+
+fn compaction_chain_batch_indexes(next_chain_index: &mut usize, chain_count: usize) -> Vec<usize> {
+    let mut indexes = Vec::with_capacity(chain_count);
+    for _ in 0..chain_count {
+        indexes.push(*next_chain_index % chain_count);
+        *next_chain_index = next_chain_index.saturating_add(1);
+    }
+    indexes
 }
 
 fn compaction_lock_renew_interval(ttl: Duration) -> Duration {
@@ -1923,6 +1941,28 @@ mod tests {
         assert_eq!(
             compaction_sleep_duration(interval, 7),
             Duration::from_secs(160)
+        );
+    }
+
+    #[test]
+    fn storage_compaction_chain_batch_covers_all_chains_per_wake() {
+        let mut next_chain_index = 0;
+
+        assert_eq!(
+            compaction_chain_batch_indexes(&mut next_chain_index, 3),
+            vec![0, 1, 2]
+        );
+        assert_eq!(next_chain_index, 3);
+        assert_eq!(
+            compaction_chain_batch_indexes(&mut next_chain_index, 3),
+            vec![0, 1, 2]
+        );
+        assert_eq!(next_chain_index, 6);
+
+        next_chain_index = 2;
+        assert_eq!(
+            compaction_chain_batch_indexes(&mut next_chain_index, 3),
+            vec![2, 0, 1]
         );
     }
 

@@ -212,18 +212,36 @@ where
     }
 
     let mut entries = exact_entries;
-    let semantic_keys =
-        semantic_coverage_index_query_keys_for_ranges(chain, dataset_key, selector, &exact_missing);
-    let semantic_v2_buckets = semantic_coverage_index_v2_query_buckets_for_ranges(
-        chain,
-        dataset_key,
-        selector,
-        &exact_missing,
-    );
-    let semantic_has_index = read_entries_for_keys(object_store, semantic_keys, &mut entries)?;
-    let semantic_has_v2_index =
-        read_entries_for_v2_buckets(object_store, semantic_v2_buckets, &mut entries)?;
-    if !exact_has_index && !exact_has_v2_index && !semantic_has_index && !semantic_has_v2_index {
+    let mut any_semantic_has_index = false;
+    let mut missing = exact_missing;
+    for semantic_scopes in evm_log_query_semantic_scope_groups(dataset_key, selector) {
+        let semantic_keys = semantic_coverage_index_query_keys_for_scopes(
+            chain,
+            dataset_key,
+            selector,
+            &missing,
+            &semantic_scopes,
+        );
+        let semantic_v2_buckets = semantic_coverage_index_v2_query_buckets_for_scopes(
+            chain,
+            dataset_key,
+            selector,
+            &missing,
+            &semantic_scopes,
+        );
+        any_semantic_has_index |= read_entries_for_keys(object_store, semantic_keys, &mut entries)?;
+        any_semantic_has_index |=
+            read_entries_for_v2_buckets(object_store, semantic_v2_buckets, &mut entries)?;
+        let normalized =
+            normalized_query_entries(entries.clone(), chain, dataset_key, selector, range);
+        let covered = covered_ranges_from_entries(&normalized, chain, dataset_key, selector, range);
+        missing = missing_ranges(range.clone(), &covered);
+        if missing.is_empty() {
+            entries = normalized;
+            break;
+        }
+    }
+    if !exact_has_index && !exact_has_v2_index && !any_semantic_has_index {
         return Ok(None);
     }
 
@@ -2031,14 +2049,21 @@ fn semantic_coverage_index_query_keys_for_ranges(
     selector: &DatasetSelector,
     ranges: &[LedgerRange],
 ) -> BTreeSet<String> {
+    let scopes = evm_log_query_semantic_scope_groups(dataset_key, selector)
+        .into_iter()
+        .flatten()
+        .collect::<BTreeSet<_>>();
+    semantic_coverage_index_query_keys_for_scopes(chain, dataset_key, selector, ranges, &scopes)
+}
+
+fn semantic_coverage_index_query_keys_for_scopes(
+    chain: &ChainIdentity,
+    dataset_key: &DatasetKey,
+    _selector: &DatasetSelector,
+    ranges: &[LedgerRange],
+    scopes: &BTreeSet<String>,
+) -> BTreeSet<String> {
     let mut keys = BTreeSet::new();
-    if *dataset_key != DatasetKey::evm_logs() {
-        return keys;
-    }
-    let DatasetSelector::EvmLogs(filter) = selector else {
-        return keys;
-    };
-    let scopes = evm_log_query_semantic_scopes(filter);
     for range in ranges {
         for (bucket_start, bucket_end) in bucket_ranges(range, DEFAULT_COVERAGE_INDEX_BUCKET_SIZE) {
             for finality_level in [
@@ -2068,21 +2093,34 @@ fn semantic_coverage_index_v2_query_buckets_for_ranges(
     selector: &DatasetSelector,
     ranges: &[LedgerRange],
 ) -> BTreeSet<CoverageIndexV2Bucket> {
+    let scopes = evm_log_query_semantic_scope_groups(dataset_key, selector)
+        .into_iter()
+        .flatten()
+        .collect::<BTreeSet<_>>();
+    semantic_coverage_index_v2_query_buckets_for_scopes(
+        chain,
+        dataset_key,
+        selector,
+        ranges,
+        &scopes,
+    )
+}
+
+fn semantic_coverage_index_v2_query_buckets_for_scopes(
+    chain: &ChainIdentity,
+    dataset_key: &DatasetKey,
+    _selector: &DatasetSelector,
+    ranges: &[LedgerRange],
+    scopes: &BTreeSet<String>,
+) -> BTreeSet<CoverageIndexV2Bucket> {
     let mut buckets = BTreeSet::new();
-    if *dataset_key != DatasetKey::evm_logs() {
-        return buckets;
-    }
-    let DatasetSelector::EvmLogs(filter) = selector else {
-        return buckets;
-    };
-    let scopes = evm_log_query_semantic_scopes(filter);
     for range in ranges {
         for (bucket_start, bucket_end) in bucket_ranges(range, DEFAULT_COVERAGE_INDEX_BUCKET_SIZE) {
             for finality_level in [
                 ManifestFinalityLevel::Safe,
                 ManifestFinalityLevel::Finalized,
             ] {
-                for scope in &scopes {
+                for scope in scopes {
                     buckets.insert(CoverageIndexV2Bucket {
                         chain_key: chain.key_prefix(),
                         scope: coverage_index_v2_semantic_scope(
@@ -2099,6 +2137,23 @@ fn semantic_coverage_index_v2_query_buckets_for_ranges(
         }
     }
     buckets
+}
+
+fn evm_log_query_semantic_scope_groups(
+    dataset_key: &DatasetKey,
+    selector: &DatasetSelector,
+) -> Vec<BTreeSet<String>> {
+    if *dataset_key != DatasetKey::evm_logs() {
+        return Vec::new();
+    }
+    let DatasetSelector::EvmLogs(filter) = selector else {
+        return Vec::new();
+    };
+    let groups = evm_log_query_semantic_scope_groups_for_filter(filter);
+    groups
+        .into_iter()
+        .filter(|scopes| !scopes.is_empty())
+        .collect()
 }
 
 fn coverage_index_entry_keys(
@@ -2217,19 +2272,26 @@ fn evm_log_entry_semantic_scopes(filter: &EvmLogFilter) -> BTreeSet<String> {
     scopes
 }
 
+#[cfg(test)]
 fn evm_log_query_semantic_scopes(filter: &EvmLogFilter) -> BTreeSet<String> {
+    evm_log_query_semantic_scope_groups_for_filter(filter)
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+fn evm_log_query_semantic_scope_groups_for_filter(filter: &EvmLogFilter) -> Vec<BTreeSet<String>> {
     let mut scopes = BTreeSet::new();
     if filter.addresses().is_empty() {
         scopes.insert("addr/*".to_owned());
     } else {
-        scopes.insert("addr/*".to_owned());
         scopes.extend(
             filter
                 .addresses()
                 .iter()
                 .map(|address| format!("addr/{address}")),
         );
-        return scopes;
+        return vec![scopes, BTreeSet::from(["addr/*".to_owned()])];
     }
 
     scopes.insert("topic/*".to_owned());
@@ -2248,7 +2310,7 @@ fn evm_log_query_semantic_scopes(filter: &EvmLogFilter) -> BTreeSet<String> {
             }
         }
     }
-    scopes
+    vec![scopes]
 }
 
 fn replacement_scope_matches(existing: &ManifestEntry, replacement: &ManifestEntry) -> bool {
@@ -2554,6 +2616,75 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
             self.in_flight
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct ForbiddenScopeReadStore {
+        inner: LocalObjectStore,
+        forbidden: String,
+    }
+
+    impl ForbiddenScopeReadStore {
+        fn new(inner: LocalObjectStore, forbidden: &str) -> Self {
+            Self {
+                inner,
+                forbidden: forbidden.to_owned(),
+            }
+        }
+
+        fn check(&self, key: &str) {
+            assert!(
+                !key.contains(&self.forbidden),
+                "unexpected read of forbidden scope {} via key {}",
+                self.forbidden,
+                key
+            );
+        }
+    }
+
+    impl ObjectStore for ForbiddenScopeReadStore {
+        fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError> {
+            self.check(key);
+            self.inner.get(key)
+        }
+
+        fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
+            self.inner.put(key, bytes)
+        }
+
+        fn put_if_absent(
+            &self,
+            key: &str,
+            bytes: &[u8],
+        ) -> Result<crate::ObjectPutIfAbsentResult, DatalensError> {
+            self.inner.put_if_absent(key, bytes)
+        }
+
+        fn exists(&self, key: &str) -> Result<bool, DatalensError> {
+            self.inner.exists(key)
+        }
+
+        fn list(&self, prefix: &str) -> Result<Vec<crate::ObjectMetadata>, DatalensError> {
+            self.check(prefix);
+            self.inner.list(prefix)
+        }
+
+        fn list_page(
+            &self,
+            prefix: &str,
+            start_after: Option<&str>,
+            limit: usize,
+        ) -> Result<crate::ObjectListPage, DatalensError> {
+            self.check(prefix);
+            if let Some(start_after) = start_after {
+                self.check(start_after);
+            }
+            self.inner.list_page(prefix, start_after, limit)
+        }
+
+        fn delete(&self, key: &str) -> Result<(), DatalensError> {
+            self.inner.delete(key)
         }
     }
 
@@ -3143,6 +3274,36 @@ mod tests {
     }
 
     #[test]
+    fn test_read_entries_for_query_with_address_skips_wildcard_addr_when_address_covers() {
+        let object_store =
+            crate::LocalObjectStore::new(temp_storage_root("address-semantic-before-wildcard"));
+        let guarded_store = ForbiddenScopeReadStore::new(object_store.clone(), "/addr/*/");
+        let chain = test_chain();
+        let all_logs = evm_logs_selector(Vec::new());
+        let addressed = evm_logs_selector_with_addresses(
+            vec![address(1)],
+            vec![Some(vec![topic(1)]), Some(vec![topic(2)])],
+        );
+        let all_logs_entry = evm_logs_entry(&chain, &all_logs, 10, 20, 1);
+        let addressed_entry = evm_logs_entry(&chain, &addressed, 10, 20, 1);
+
+        write_entry(&object_store, &all_logs_entry).expect("write wildcard coverage");
+        write_entry(&object_store, &addressed_entry).expect("write address coverage");
+
+        let entries = read_entries_for_query(
+            &guarded_store,
+            &chain,
+            &DatasetKey::evm_logs(),
+            &addressed,
+            &LedgerRange::blocks(10, 20).expect("valid range"),
+        )
+        .expect("read coverage index")
+        .expect("coverage index entries");
+
+        assert_eq!(entries, vec![addressed_entry]);
+    }
+
+    #[test]
     fn test_read_entries_for_query_without_address_uses_topic_semantic_bucket() {
         let object_store = crate::LocalObjectStore::new(temp_storage_root("topic-semantic-query"));
         let chain = test_chain();
@@ -3258,5 +3419,15 @@ mod tests {
         assert!(scopes.contains(&format!("addr/{}", address(1))));
         assert!(scopes.contains(&format!("addr/{}", address(2))));
         assert!(!scopes.iter().any(|scope| scope.starts_with("topic/")));
+        assert_eq!(
+            evm_log_query_semantic_scope_groups_for_filter(&filter),
+            vec![
+                BTreeSet::from([
+                    format!("addr/{}", address(1)),
+                    format!("addr/{}", address(2)),
+                ]),
+                BTreeSet::from(["addr/*".to_owned()])
+            ]
+        );
     }
 }
