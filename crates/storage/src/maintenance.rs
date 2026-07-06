@@ -772,6 +772,97 @@ where
         Ok(report)
     }
 
+    pub fn cleanup_superseded_sources_for_chain(
+        &self,
+        chain: &ChainIdentity,
+        config: MaintenanceCompactionConfig,
+    ) -> Result<MaintenanceCompactionReconciliationReport, DatalensError> {
+        self.cleanup_superseded_sources_for_chain_with_checkpoint(chain, config, || Ok(()))
+    }
+
+    pub fn cleanup_superseded_sources_for_chain_with_checkpoint(
+        &self,
+        chain: &ChainIdentity,
+        config: MaintenanceCompactionConfig,
+        checkpoint: impl Fn() -> Result<(), DatalensError>,
+    ) -> Result<MaintenanceCompactionReconciliationReport, DatalensError> {
+        let mut report = MaintenanceCompactionReconciliationReport {
+            read_only: false,
+            orphan_compacted_objects: Vec::new(),
+            stale_source_objects: Vec::new(),
+            stale_cleanup_records: Vec::new(),
+            deleted_orphan_compacted_objects: 0,
+            deleted_stale_source_objects: 0,
+            deleted_stale_cleanup_records: 0,
+            delete_failures: 0,
+        };
+        if !config.cleanup_enabled || !config.delete_source_objects {
+            return Ok(report);
+        }
+        let eligible_records =
+            self.superseded_source_records_for_chain(chain, config.source_delete_grace_ms)?;
+        for (record_key, record) in eligible_records
+            .into_iter()
+            .take(config.max_deletes_per_tick)
+        {
+            checkpoint()?;
+            if self.compaction_source_is_current(chain, &record.object_key)? {
+                log::info!(
+                    "storage compaction source delete skipped current manifest object chain_key={} object_key={} record_key={}",
+                    chain.key_prefix(),
+                    record.object_key,
+                    record_key
+                );
+                match self.object_store().delete(&record_key) {
+                    Ok(()) => report.deleted_stale_cleanup_records += 1,
+                    Err(error) => {
+                        report.delete_failures += 1;
+                        log::warn!(
+                            "storage compaction source cleanup record delete failed chain_key={} object_key={} record_key={} kind={:?} message={}",
+                            chain.key_prefix(),
+                            record.object_key,
+                            record_key,
+                            error.kind,
+                            error.message
+                        );
+                    }
+                }
+                continue;
+            }
+            report.stale_source_objects.push(record.object_key.clone());
+            match self.object_store().delete(&record.object_key) {
+                Ok(()) => report.deleted_stale_source_objects += 1,
+                Err(error) => {
+                    report.delete_failures += 1;
+                    log::warn!(
+                        "storage compaction source delete failed chain_key={} object_key={} kind={:?} message={}",
+                        chain.key_prefix(),
+                        record.object_key,
+                        error.kind,
+                        error.message
+                    );
+                    continue;
+                }
+            }
+            checkpoint()?;
+            match self.object_store().delete(&record_key) {
+                Ok(()) => report.deleted_stale_cleanup_records += 1,
+                Err(error) => {
+                    report.delete_failures += 1;
+                    log::warn!(
+                        "storage compaction source cleanup record delete failed chain_key={} object_key={} record_key={} kind={:?} message={}",
+                        chain.key_prefix(),
+                        record.object_key,
+                        record_key,
+                        error.kind,
+                        error.message
+                    );
+                }
+            }
+        }
+        Ok(report)
+    }
+
     fn compaction_source_is_current(
         &self,
         chain: &ChainIdentity,
