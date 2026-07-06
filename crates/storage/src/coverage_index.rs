@@ -27,6 +27,7 @@ const EVM_LOG_SEMANTIC_INDEX_VERSION: &str = "evm-logs-v1";
 const MAX_EVM_LOG_TOPIC_VALUE_SEMANTIC_KEYS: usize = 128;
 const EVM_LOG_LARGE_TOPIC_VALUE_SCOPE: &str = "_large-any-of";
 const MAX_COVERAGE_INDEX_V2_BUCKET_READ_THREADS: usize = 8;
+const MAX_COVERAGE_INDEX_V2_DELTA_GET_THREADS: usize = 8;
 
 static COVERAGE_INDEX_UPDATE_LOCKS: OnceLock<Mutex<BTreeMap<String, Weak<Mutex<()>>>>> =
     OnceLock::new();
@@ -510,30 +511,63 @@ where
         start_after_delta_key,
     )?;
     let mut deltas = Vec::new();
-    for object in objects {
-        let bytes = object_store.get(&object.key)?;
-        let delta: CoverageIndexV2Delta = serde_json::from_slice(&bytes).map_err(|error| {
-            DatalensError::new(
-                DatalensErrorKind::StorageReadFailure,
-                format!("decode coverage index v2 delta {}: {error}", object.key),
-            )
+    for chunk in objects.chunks(MAX_COVERAGE_INDEX_V2_DELTA_GET_THREADS) {
+        let chunk_results = thread::scope(|scope| {
+            let handles = chunk
+                .iter()
+                .cloned()
+                .map(|object| {
+                    let object_store = object_store.clone();
+                    let bucket = bucket.clone();
+                    scope.spawn(move || read_v2_delta_object(&object_store, &bucket, object))
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle.join().map_err(|_| {
+                        DatalensError::new(
+                            DatalensErrorKind::StorageReadFailure,
+                            "coverage index v2 delta read worker panicked",
+                        )
+                    })?
+                })
+                .collect::<Result<Vec<_>, _>>()
         })?;
-        validate_v2_record_scope(
-            "delta",
-            &object.key,
-            delta.schema_version,
-            &delta.scope,
-            delta.bucket_start,
-            delta.bucket_end,
-            bucket,
-        )?;
-        deltas.push(CoverageIndexV2DeltaObject {
-            key: object.key,
-            size: object.size,
-            delta,
-        });
+        deltas.extend(chunk_results);
     }
     Ok(deltas)
+}
+
+fn read_v2_delta_object<S>(
+    object_store: &S,
+    bucket: &CoverageIndexV2Bucket,
+    object: ObjectMetadata,
+) -> Result<CoverageIndexV2DeltaObject, DatalensError>
+where
+    S: ObjectStore,
+{
+    let bytes = object_store.get(&object.key)?;
+    let delta: CoverageIndexV2Delta = serde_json::from_slice(&bytes).map_err(|error| {
+        DatalensError::new(
+            DatalensErrorKind::StorageReadFailure,
+            format!("decode coverage index v2 delta {}: {error}", object.key),
+        )
+    })?;
+    validate_v2_record_scope(
+        "delta",
+        &object.key,
+        delta.schema_version,
+        &delta.scope,
+        delta.bucket_start,
+        delta.bucket_end,
+        bucket,
+    )?;
+    Ok(CoverageIndexV2DeltaObject {
+        key: object.key,
+        size: object.size,
+        delta,
+    })
 }
 
 fn list_v2_delta_object_keys_for_bucket<S>(
@@ -2300,6 +2334,83 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Debug)]
+    struct DelayedV2DeltaGetObjectStore {
+        inner: LocalObjectStore,
+        in_flight: Arc<std::sync::atomic::AtomicUsize>,
+        max_in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl DelayedV2DeltaGetObjectStore {
+        fn new(root: std::path::PathBuf) -> Self {
+            Self {
+                inner: LocalObjectStore::new(root),
+                in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                max_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+
+        fn max_in_flight(&self) -> usize {
+            self.max_in_flight.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn delay_v2_delta_get(&self, key: &str) {
+            if !key.contains("/coverage-index-v2/deltas/") {
+                return;
+            }
+            let current = self
+                .in_flight
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            self.max_in_flight
+                .fetch_max(current, std::sync::atomic::Ordering::SeqCst);
+            let delay_ms = if key.contains("0001-slow") { 80 } else { 10 };
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            self.in_flight
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl ObjectStore for DelayedV2DeltaGetObjectStore {
+        fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError> {
+            self.delay_v2_delta_get(key);
+            self.inner.get(key)
+        }
+
+        fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
+            self.inner.put(key, bytes)
+        }
+
+        fn put_if_absent(
+            &self,
+            key: &str,
+            bytes: &[u8],
+        ) -> Result<crate::ObjectPutIfAbsentResult, DatalensError> {
+            self.inner.put_if_absent(key, bytes)
+        }
+
+        fn exists(&self, key: &str) -> Result<bool, DatalensError> {
+            self.inner.exists(key)
+        }
+
+        fn list(&self, prefix: &str) -> Result<Vec<crate::ObjectMetadata>, DatalensError> {
+            self.inner.list(prefix)
+        }
+
+        fn list_page(
+            &self,
+            prefix: &str,
+            start_after: Option<&str>,
+            limit: usize,
+        ) -> Result<crate::ObjectListPage, DatalensError> {
+            self.inner.list_page(prefix, start_after, limit)
+        }
+
+        fn delete(&self, key: &str) -> Result<(), DatalensError> {
+            self.inner.delete(key)
+        }
+    }
+
     fn empty_entry(chain: &ChainIdentity, start: u64, end: u64) -> ManifestEntry {
         ManifestEntry {
             chain: chain.clone(),
@@ -2420,6 +2531,38 @@ mod tests {
         }
     }
 
+    fn write_test_v2_delta<S: ObjectStore>(
+        object_store: &S,
+        chain: &ChainIdentity,
+        scope: &str,
+        range: &LedgerRange,
+        id: &str,
+        entries: Vec<ManifestEntry>,
+        replacement_entry: Option<ManifestEntry>,
+    ) -> String {
+        let (bucket_start, bucket_end) = bucket_ranges(range, DEFAULT_COVERAGE_INDEX_BUCKET_SIZE)
+            .into_iter()
+            .next()
+            .expect("bucket range");
+        let key = format!(
+            "{}/{}.json",
+            coverage_index_v2_delta_prefix(&chain.key_prefix(), scope, bucket_start, bucket_end),
+            id
+        );
+        let delta = CoverageIndexV2Delta {
+            schema_version: COVERAGE_INDEX_V2_SCHEMA_VERSION,
+            created_at_unix_ms: 1,
+            scope: scope.to_owned(),
+            bucket_start,
+            bucket_end,
+            replacement: replacement_entry.map(|entry| CoverageIndexV2Replacement { entry }),
+            entries,
+        };
+        let bytes = serde_json::to_vec_pretty(&delta).expect("encode test delta");
+        object_store.put(&key, &bytes).expect("write test delta");
+        key
+    }
+
     fn index_bucket_ranges(
         object_store: &crate::LocalObjectStore,
         chain: &ChainIdentity,
@@ -2497,6 +2640,65 @@ mod tests {
         assert!(
             object_store.max_in_flight() > 1,
             "v2 bucket reads should overlap instead of running serially"
+        );
+    }
+
+    #[test]
+    fn test_read_entries_for_v2_bucket_reads_deltas_concurrently_in_key_order() {
+        let object_store =
+            DelayedV2DeltaGetObjectStore::new(temp_storage_root("parallel-v2-delta-read"));
+        let chain = test_chain();
+        let selector = DatasetSelector::all();
+        let scope = coverage_index_v2_exact_scope(
+            &DatasetKey::evm_blocks(),
+            &LedgerRange::blocks(10, 20).expect("valid range"),
+            &selector.fingerprint(),
+            ManifestFinalityLevel::Safe,
+        );
+        let bucket = CoverageIndexV2Bucket {
+            chain_key: chain.key_prefix(),
+            scope: scope.clone(),
+            bucket_start: 0,
+            bucket_end: DEFAULT_COVERAGE_INDEX_BUCKET_SIZE - 1,
+        };
+        let existing = empty_entry(&chain, 10, 20);
+        let replacement = empty_entry(&chain, 12, 14);
+        let existing_range = existing.range.clone();
+        let replacement_range = replacement.range.clone();
+        write_test_v2_delta(
+            &object_store,
+            &chain,
+            &scope,
+            &existing_range,
+            "0001-slow",
+            vec![existing],
+            None,
+        );
+        write_test_v2_delta(
+            &object_store,
+            &chain,
+            &scope,
+            &replacement_range,
+            "0002-fast",
+            vec![replacement.clone()],
+            Some(replacement),
+        );
+        let mut entries = Vec::new();
+
+        let has_index = read_entries_for_v2_bucket(&object_store, &bucket, &mut entries)
+            .expect("read v2 bucket");
+
+        assert!(has_index);
+        assert!(
+            object_store.max_in_flight() > 1,
+            "v2 delta gets should overlap instead of running serially"
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| (entry.range.start(), entry.range.end()))
+                .collect::<Vec<_>>(),
+            vec![(10, 11), (15, 20), (12, 14)]
         );
     }
 
