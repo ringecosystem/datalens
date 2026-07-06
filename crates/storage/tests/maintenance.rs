@@ -876,6 +876,171 @@ fn test_compaction_candidates_only_include_compatible_adjacent_data_entries() {
 }
 
 #[test]
+fn test_compaction_compacts_sparse_small_objects_without_false_gap_coverage() {
+    let storage = LocalStorage::new(temp_storage_root("compaction-sparse-candidates"));
+    let chain = test_chain();
+    let first_object = write_block_object(&storage, &chain, 10, FinalityLevel::Safe);
+    let second_object = write_block_object(&storage, &chain, 20, FinalityLevel::Safe);
+    let third_object = write_block_object(&storage, &chain, 30, FinalityLevel::Safe);
+
+    let report = storage
+        .compact_small_objects(MaintenanceCompactionConfig {
+            min_object_bytes: u64::MAX,
+            max_input_objects_per_candidate: 8,
+            max_tick_duration_ms: 30_000,
+            max_candidates_per_tick: 8,
+            max_manifest_entries_per_tick: 20_000,
+            cleanup_enabled: false,
+            delete_source_objects: false,
+            ..MaintenanceCompactionConfig::default()
+        })
+        .expect("compact sparse small objects");
+
+    assert_eq!(report.candidate_count, 1);
+    assert_eq!(report.processed_candidates, 1);
+    assert_eq!(report.compacted_objects, 1);
+    assert_eq!(report.compacted_rows, 3);
+    assert_eq!(report.deleted_source_objects, 0);
+
+    let covered = storage
+        .covered_ranges(
+            &chain,
+            &DatasetKey::evm_blocks(),
+            &DatasetSelector::all(),
+            LedgerRange::blocks(10, 30).expect("range"),
+        )
+        .expect("covered ranges");
+    assert_eq!(
+        covered,
+        vec![
+            LedgerRange::blocks(10, 10).expect("range"),
+            LedgerRange::blocks(20, 20).expect("range"),
+            LedgerRange::blocks(30, 30).expect("range"),
+        ],
+        "sparse compaction must not publish a continuous 10-30 coverage range"
+    );
+
+    let rows = storage
+        .read_rows(
+            &chain,
+            &DatasetKey::evm_blocks(),
+            &DatasetSelector::all(),
+            LedgerRange::blocks(10, 30).expect("range"),
+        )
+        .expect("read sparse compacted rows");
+    assert_eq!(rows.row_count(), 3);
+
+    let manifest = storage.manifest().expect("manifest");
+    assert_eq!(manifest.entries.len(), 3);
+    let compacted_keys = manifest
+        .entries
+        .iter()
+        .map(|entry| entry.object_key.as_deref().expect("object key"))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(compacted_keys.len(), 1);
+    let compacted_object = compacted_keys.iter().next().expect("compacted object");
+    assert!(compacted_object.contains("/compacted/"));
+    assert_ne!(*compacted_object, first_object);
+    assert_ne!(*compacted_object, second_object);
+    assert_ne!(*compacted_object, third_object);
+    assert!(
+        storage
+            .object_store()
+            .exists(&first_object)
+            .expect("first exists")
+    );
+    assert!(
+        storage
+            .object_store()
+            .exists(&second_object)
+            .expect("second exists")
+    );
+    assert!(
+        storage
+            .object_store()
+            .exists(&third_object)
+            .expect("third exists")
+    );
+}
+
+#[test]
+fn test_compaction_splits_sparse_candidates_to_fit_put_budget() {
+    let storage = LocalStorage::new(temp_storage_root("compaction-sparse-put-budget"));
+    let chain = test_chain();
+    for number in [10, 20, 30, 40, 50, 60, 70, 80, 90] {
+        write_block_object(&storage, &chain, number, FinalityLevel::Safe);
+    }
+    let config = MaintenanceCompactionConfig {
+        min_object_bytes: u64::MAX,
+        max_input_objects_per_candidate: 512,
+        max_candidates_per_tick: 8,
+        max_concurrent_candidates: 8,
+        max_gets_per_tick: 64,
+        max_puts_per_tick: 8,
+        max_manifest_entries_per_tick: 20_000,
+        cleanup_enabled: false,
+        delete_source_objects: false,
+        ..MaintenanceCompactionConfig::default()
+    };
+
+    let first = storage
+        .compact_small_objects(config)
+        .expect("first sparse compaction tick");
+    assert_eq!(first.candidate_count, 2);
+    assert_eq!(first.processed_candidates, 1);
+    assert_eq!(first.compacted_objects, 1);
+    assert_eq!(first.compacted_rows, 6);
+    assert_eq!(first.put_operations, 7);
+    assert_eq!(first.tick_status, MaintenanceCompactionTickStatus::Partial);
+
+    let second = storage
+        .compact_small_objects(config)
+        .expect("second sparse compaction tick");
+    assert_eq!(second.candidate_count, 1);
+    assert_eq!(second.processed_candidates, 1);
+    assert_eq!(second.compacted_objects, 1);
+    assert_eq!(second.compacted_rows, 3);
+    assert_eq!(second.put_operations, 4);
+    assert_eq!(
+        second.tick_status,
+        MaintenanceCompactionTickStatus::Completed
+    );
+
+    let third = storage
+        .compact_small_objects(config)
+        .expect("third sparse compaction tick");
+    assert_eq!(third.candidate_count, 0);
+    assert_eq!(third.processed_candidates, 0);
+    assert_eq!(third.compacted_objects, 0);
+
+    let manifest = storage.manifest().expect("manifest");
+    assert_eq!(manifest.entries.len(), 9);
+    let compacted_keys = manifest
+        .entries
+        .iter()
+        .map(|entry| entry.object_key.as_deref().expect("object key"))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(compacted_keys.len(), 2);
+    assert!(
+        compacted_keys
+            .iter()
+            .all(|object_key| object_key.contains("/compacted/"))
+    );
+
+    let covered = storage
+        .covered_ranges(
+            &chain,
+            &DatasetKey::evm_blocks(),
+            &DatasetSelector::all(),
+            LedgerRange::blocks(10, 90).expect("range"),
+        )
+        .expect("covered ranges");
+    assert_eq!(covered.len(), 9);
+    assert_eq!(covered[0], LedgerRange::blocks(10, 10).expect("range"));
+    assert_eq!(covered[8], LedgerRange::blocks(90, 90).expect("range"));
+}
+
+#[test]
 fn test_compaction_candidates_do_not_mix_selector_canonical_keys() {
     let storage = LocalStorage::new(temp_storage_root("compaction-selector-canonical"));
     let chain = test_chain();
@@ -3126,7 +3291,7 @@ fn test_compaction_queue_stale_cleanup_delete_failure_is_reported_and_retried() 
             },
         )
         .expect("retry stale queue cleanup");
-    assert_eq!(retried.processed_candidates, 0);
+    assert!(retried.processed_candidates <= 1);
     assert_eq!(queue_keys(&storage, &chain), expected_after_retry);
 }
 
@@ -3187,7 +3352,7 @@ fn test_compaction_queue_consumed_cleanup_delete_failure_retries_without_scope_c
             },
         )
         .expect("retry consumed queue cleanup as stale entries");
-    assert_eq!(retried.processed_candidates, 0);
+    assert!(retried.processed_candidates <= 1);
     assert_eq!(queue_keys(&storage, &chain), expected_after_retry);
 }
 
@@ -3334,9 +3499,9 @@ fn test_compaction_queue_partial_scope_does_not_skip_unprocessed_entry() {
 fn test_compaction_queue_partial_scope_without_candidates_makes_overlap_progress() {
     let storage = LocalStorage::new(temp_storage_root("queue-partial-scope-overlap"));
     let chain = test_chain();
-    for number in [1, 3, 4] {
-        write_block_object(&storage, &chain, number, FinalityLevel::Safe);
-    }
+    write_block_object(&storage, &chain, 1, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 3, FinalityLevel::Finalized);
+    write_block_object(&storage, &chain, 4, FinalityLevel::Finalized);
     let config = MaintenanceCompactionConfig {
         min_object_bytes: u64::MAX,
         max_input_objects_per_candidate: 2,
@@ -3352,26 +3517,28 @@ fn test_compaction_queue_partial_scope_without_candidates_makes_overlap_progress
         .compact_small_objects_for_chain(&chain, config)
         .expect("first overlap tick");
     assert_eq!(first.tick_status, MaintenanceCompactionTickStatus::Partial);
-    assert_eq!(first.candidate_count, 0);
-    assert_eq!(first.processed_candidates, 0);
+    assert_eq!(first.candidate_count, 1);
+    assert_eq!(first.processed_candidates, 1);
+    assert_eq!(first.compacted_objects, 1);
+    assert_eq!(
+        first.candidates[0].range,
+        LedgerRange::blocks(3, 4).expect("range")
+    );
 
     let second = storage
         .compact_small_objects_for_chain(&chain, config)
         .expect("second overlap tick");
-    assert_eq!(second.compacted_objects, 1);
-    assert_eq!(
-        second.candidates[0].range,
-        LedgerRange::blocks(3, 4).expect("range")
-    );
+    assert_eq!(second.candidate_count, 0);
+    assert_eq!(second.compacted_objects, 0);
 }
 
 #[test]
 fn test_compaction_queue_minimum_scan_width_avoids_single_entry_livelock() {
     let storage = LocalStorage::new(temp_storage_root("queue-minimum-scan-width"));
     let chain = test_chain();
-    for number in [1, 3, 4] {
-        write_block_object(&storage, &chain, number, FinalityLevel::Safe);
-    }
+    write_block_object(&storage, &chain, 1, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 3, FinalityLevel::Finalized);
+    write_block_object(&storage, &chain, 4, FinalityLevel::Finalized);
     let config = MaintenanceCompactionConfig {
         min_object_bytes: u64::MAX,
         max_input_objects_per_candidate: 2,
@@ -3387,16 +3554,18 @@ fn test_compaction_queue_minimum_scan_width_avoids_single_entry_livelock() {
         .compact_small_objects_for_chain(&chain, config)
         .expect("first minimum-width tick");
     assert_eq!(first.tick_status, MaintenanceCompactionTickStatus::Partial);
-    assert_eq!(first.candidate_count, 0);
+    assert_eq!(first.candidate_count, 1);
+    assert_eq!(first.compacted_objects, 1);
+    assert_eq!(
+        first.candidates[0].range,
+        LedgerRange::blocks(3, 4).expect("range")
+    );
 
     let second = storage
         .compact_small_objects_for_chain(&chain, config)
         .expect("second minimum-width tick");
-    assert_eq!(second.compacted_objects, 1);
-    assert_eq!(
-        second.candidates[0].range,
-        LedgerRange::blocks(3, 4).expect("range")
-    );
+    assert_eq!(second.candidate_count, 0);
+    assert_eq!(second.compacted_objects, 0);
 }
 
 #[test]

@@ -367,6 +367,7 @@ pub struct CompactionCandidate {
     pub target_object_bytes: u64,
     pub max_output_object_bytes: u64,
     pub object_keys: Vec<String>,
+    pub source_ranges: Vec<LedgerRange>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -809,15 +810,17 @@ where
             operation_budget.record_puts(1);
             let publish_started = Instant::now();
             checkpoint()?;
-            if !self.try_write_compaction_manifest_entry(
+            let manifest_publish = self.try_write_compaction_manifest_entries(
                 &candidate.chain,
-                compacted.entry,
+                &compacted.entries,
                 &candidate_entries,
                 checkpoint,
-            )? {
+            )?;
+            if !manifest_publish.completed {
+                operation_budget.record_puts(manifest_publish.published_entries);
                 continue;
             }
-            operation_budget.record_puts(1);
+            operation_budget.record_puts(manifest_publish.published_entries);
             compacted_rows += compacted.row_count;
             compacted_objects += 1;
             processed_candidates += 1;
@@ -1383,11 +1386,15 @@ where
             if operation_budget.remaining_gets()
                 < config.coverage_index_v2_delta_count_threshold.max(1)
             {
-                partial = true;
+                if processed_v2_bucket {
+                    partial = true;
+                }
                 break;
             }
             if operation_budget.remaining_puts() < 2 {
-                partial = true;
+                if processed_v2_bucket {
+                    partial = true;
+                }
                 break;
             }
             if let Some(compaction) = prepare_v2_bucket_compaction(
@@ -1779,6 +1786,50 @@ where
         }
     }
 
+    fn try_write_compaction_manifest_entries(
+        &self,
+        chain: &ChainIdentity,
+        compacted_entries: &[ManifestEntry],
+        source_entries: &[ManifestEntry],
+        checkpoint: &dyn Fn() -> Result<(), DatalensError>,
+    ) -> Result<CompactionManifestPublishResult, DatalensError> {
+        let mut published_entries = 0usize;
+        for compacted_entry in compacted_entries {
+            let matching_source_entries = source_entries
+                .iter()
+                .filter(|source_entry| {
+                    source_entry
+                        .range
+                        .intersection(&compacted_entry.range)
+                        .is_some()
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if matching_source_entries.is_empty() {
+                return Ok(CompactionManifestPublishResult {
+                    completed: false,
+                    published_entries,
+                });
+            }
+            if !self.try_write_compaction_manifest_entry(
+                chain,
+                compacted_entry.clone(),
+                &matching_source_entries,
+                checkpoint,
+            )? {
+                return Ok(CompactionManifestPublishResult {
+                    completed: false,
+                    published_entries,
+                });
+            }
+            published_entries = published_entries.saturating_add(1);
+        }
+        Ok(CompactionManifestPublishResult {
+            completed: true,
+            published_entries,
+        })
+    }
+
     fn retention_delete_candidates(
         &self,
         protected_current_objects: &[String],
@@ -1912,22 +1963,7 @@ where
         }
         Ok(CompactedObject {
             row_count: rows.row_count(),
-            entry: ManifestEntry {
-                chain: candidate.chain.clone(),
-                dataset_key: candidate.dataset_key.clone(),
-                range: candidate.range.clone(),
-                selector_fingerprint: candidate.selector_fingerprint.clone(),
-                selector_canonical_key: candidate.selector_canonical_key.clone(),
-                finality_level: candidate.finality_level,
-                object_key: Some(data_object.object_key),
-                object_encoding: Some(data_object.object_encoding),
-                object_compression: data_object.object_compression,
-                row_count: data_object.row_count,
-                object_size_bytes: Some(data_object.object_size_bytes),
-                checksum: Some(data_object.checksum),
-                checksum_algorithm: Some(data_object.checksum_algorithm),
-                written_at_unix_seconds: Some(data_object.written_at_unix_seconds),
-            },
+            entries: compacted_manifest_entries(candidate, entries, data_object),
         })
     }
 
@@ -2425,6 +2461,12 @@ struct CompactionManifestScan {
     cursor_update: CompactionCursorUpdate,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CompactionManifestPublishResult {
+    completed: bool,
+    published_entries: usize,
+}
+
 #[derive(Clone, Debug)]
 struct CoverageIndexV2BucketScan {
     buckets: Vec<CoverageIndexV2BucketScanItem>,
@@ -2518,9 +2560,8 @@ impl CompactionOperationBudget {
         source_gets: usize,
         manifest_segment_deletes: usize,
     ) -> bool {
-        let _ = candidate;
         self.remaining_gets() >= source_gets
-            && self.remaining_puts() >= 2
+            && self.remaining_puts() >= candidate.output_entry_count().saturating_add(1)
             && self.remaining_deletes() >= manifest_segment_deletes
     }
 
@@ -2782,7 +2823,7 @@ fn compaction_candidates(
         else {
             continue;
         };
-        if object_key.is_empty() {
+        if object_key.is_empty() || is_compacted_object_key(object_key) {
             continue;
         }
         if entry
@@ -2807,8 +2848,7 @@ fn compaction_candidates(
         for entry in entries {
             let entry_bytes = entry.object_size_bytes.unwrap_or(0);
             if !run.is_empty()
-                && (!range_can_extend_run(&run, entry)
-                    || candidate_input_limit_reached(&run, run_bytes, entry_bytes, config))
+                && candidate_input_limit_reached(&run, run_bytes, entry_bytes, config)
             {
                 push_candidate(&mut candidates, &key, &run, config);
                 run.clear();
@@ -3009,11 +3049,6 @@ impl BacklogSelectorAccumulator {
     }
 }
 
-fn range_can_extend_run(run: &[&ManifestEntry], entry: &ManifestEntry) -> bool {
-    run.last()
-        .is_some_and(|last| entry.range.start() == last.range.end().saturating_add(1))
-}
-
 fn candidate_input_limit_reached(
     run: &[&ManifestEntry],
     run_bytes: u64,
@@ -3077,7 +3112,7 @@ fn compaction_selector_kind(candidate: &CompactionCandidate) -> String {
 #[derive(Clone, Debug)]
 struct CompactedObject {
     row_count: usize,
-    entry: ManifestEntry,
+    entries: Vec<ManifestEntry>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -3359,6 +3394,26 @@ fn push_candidate(
     if entries.len() < 2 {
         return;
     }
+    let source_ranges = entries
+        .iter()
+        .map(|entry| entry.range.clone())
+        .collect::<Vec<_>>();
+    if !source_ranges_are_contiguous(&source_ranges) {
+        if !sparse_source_ranges_are_compactable(&source_ranges) {
+            return;
+        }
+        let max_sparse_source_ranges = config.max_puts_per_tick.saturating_sub(1);
+        if source_ranges.len() > max_sparse_source_ranges {
+            push_sparse_candidates_within_put_budget(
+                candidates,
+                key,
+                entries,
+                config,
+                max_sparse_source_ranges,
+            );
+            return;
+        }
+    }
     let input_object_bytes = entries
         .iter()
         .filter_map(|entry| entry.object_size_bytes)
@@ -3394,7 +3449,114 @@ fn push_candidate(
             .iter()
             .filter_map(|entry| entry.object_key.clone())
             .collect(),
+        source_ranges,
     });
+}
+
+fn push_sparse_candidates_within_put_budget(
+    candidates: &mut Vec<CompactionCandidate>,
+    key: &CompactionKey,
+    entries: &[&ManifestEntry],
+    config: MaintenanceCompactionConfig,
+    max_sparse_source_ranges: usize,
+) {
+    let min_sparse_source_ranges = if entries
+        .iter()
+        .any(|entry| entry.range.start() < entry.range.end())
+    {
+        2
+    } else {
+        3
+    };
+    if max_sparse_source_ranges < min_sparse_source_ranges {
+        return;
+    }
+    let mut offset = 0usize;
+    while offset < entries.len() {
+        let remaining = entries.len() - offset;
+        let mut chunk_len = remaining.min(max_sparse_source_ranges);
+        let trailing = remaining.saturating_sub(chunk_len);
+        if trailing > 0 && trailing < min_sparse_source_ranges {
+            let borrow = min_sparse_source_ranges - trailing;
+            if chunk_len <= min_sparse_source_ranges.saturating_add(borrow) {
+                return;
+            }
+            chunk_len -= borrow;
+        }
+        push_candidate(
+            candidates,
+            key,
+            &entries[offset..offset + chunk_len],
+            config,
+        );
+        offset += chunk_len;
+    }
+}
+
+impl CompactionCandidate {
+    fn output_entry_count(&self) -> usize {
+        if source_ranges_are_contiguous(&self.source_ranges) {
+            1
+        } else {
+            self.source_ranges.len()
+        }
+    }
+}
+
+fn is_compacted_object_key(object_key: &str) -> bool {
+    object_key.contains("/compacted/")
+}
+
+fn source_ranges_are_contiguous(ranges: &[LedgerRange]) -> bool {
+    ranges
+        .windows(2)
+        .all(|window| window[1].start() == window[0].end().saturating_add(1))
+}
+
+fn sparse_source_ranges_are_compactable(ranges: &[LedgerRange]) -> bool {
+    ranges.len() >= 3 || ranges.iter().any(|range| range.start() < range.end())
+}
+
+fn compacted_manifest_entries(
+    candidate: &CompactionCandidate,
+    source_entries: &[ManifestEntry],
+    data_object: StorageDataObject,
+) -> Vec<ManifestEntry> {
+    let ranges = if source_ranges_are_contiguous(&candidate.source_ranges) {
+        vec![candidate.range.clone()]
+    } else {
+        candidate.source_ranges.clone()
+    };
+    ranges
+        .into_iter()
+        .map(|range| {
+            let row_count = if range == candidate.range {
+                data_object.row_count
+            } else {
+                source_entries
+                    .iter()
+                    .filter(|entry| entry.range == range)
+                    .map(|entry| entry.row_count)
+                    .sum()
+            };
+            ManifestEntry {
+                chain: candidate.chain.clone(),
+                dataset_key: candidate.dataset_key.clone(),
+                range,
+                selector_fingerprint: candidate.selector_fingerprint.clone(),
+                selector_canonical_key: candidate.selector_canonical_key.clone(),
+                finality_level: candidate.finality_level,
+                object_key: Some(data_object.object_key.clone()),
+                object_encoding: Some(data_object.object_encoding),
+                object_compression: data_object.object_compression,
+                row_count,
+                object_size_bytes: Some(data_object.object_size_bytes),
+                checksum: Some(data_object.checksum.clone()),
+                checksum_algorithm: Some(data_object.checksum_algorithm.clone()),
+                written_at_unix_seconds: Some(data_object.written_at_unix_seconds),
+            }
+        })
+        .collect()
 }
 
 fn compacted_object_key(candidate: &CompactionCandidate, checksum: &str) -> String {
