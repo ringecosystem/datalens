@@ -927,6 +927,150 @@ fn test_validate_config_accepts_s3_compatible_storage_backend() {
 }
 
 #[test]
+fn test_validate_config_accepts_s3_runtime_limits() {
+    let config = toml::from_str::<DatalensConfig>(
+        r#"
+        [server]
+        bind = "127.0.0.1:8080"
+
+        [storage]
+        backend = "s3"
+
+        [storage.s3]
+        bucket = "datalens"
+        prefix = "dev"
+        region = "auto"
+        endpoint_url = "http://localhost:9000"
+        force_path_style = true
+        runtime_worker_threads = 16
+        max_concurrent_operations = 64
+
+        [planner]
+        max_query_range_blocks = 100
+        default_chunk_range_blocks = 10
+
+        [writer]
+        target_object_bytes = 1024
+        min_object_rows = 1
+        record_empty_coverage = true
+
+        [chains.private]
+        kind = "evm"
+        chain_id = 31337
+        rpc_urls = ["http://example.invalid"]
+
+        [chains.private.datasets.blocks]
+        enabled = true
+        max_batch_blocks = 10
+
+        [chains.private.datasets.logs]
+        enabled = true
+        max_get_logs_range_blocks = 10
+        max_addresses_per_query = 2
+        "#,
+    )
+    .expect("config parses");
+
+    validate_config(&config).expect("s3 runtime limits config is valid");
+    let s3 = config.storage.s3.expect("s3 config");
+    assert_eq!(s3.runtime_worker_threads, 16);
+    assert_eq!(s3.max_concurrent_operations, 64);
+}
+
+#[test]
+fn test_validate_config_rejects_zero_s3_runtime_limits() {
+    let config = toml::from_str::<DatalensConfig>(
+        r#"
+        [server]
+        bind = "127.0.0.1:8080"
+
+        [storage]
+        backend = "s3"
+
+        [storage.s3]
+        bucket = "datalens"
+        runtime_worker_threads = 0
+        max_concurrent_operations = 64
+
+        [planner]
+        max_query_range_blocks = 100
+        default_chunk_range_blocks = 10
+
+        [writer]
+        target_object_bytes = 1024
+        min_object_rows = 1
+        record_empty_coverage = true
+
+        [chains.private]
+        kind = "evm"
+        chain_id = 31337
+        rpc_urls = ["http://example.invalid"]
+
+        [chains.private.datasets.blocks]
+        enabled = true
+        max_batch_blocks = 10
+
+        [chains.private.datasets.logs]
+        enabled = true
+        max_get_logs_range_blocks = 10
+        max_addresses_per_query = 2
+        "#,
+    )
+    .expect("config parses");
+
+    let error = validate_config(&config).expect_err("zero runtime workers rejected");
+    assert_eq!(error.kind, DatalensErrorKind::InvalidInput);
+    assert!(error.message.contains("storage.s3.runtime_worker_threads"));
+
+    let config = toml::from_str::<DatalensConfig>(
+        r#"
+        [server]
+        bind = "127.0.0.1:8080"
+
+        [storage]
+        backend = "s3"
+
+        [storage.s3]
+        bucket = "datalens"
+        runtime_worker_threads = 16
+        max_concurrent_operations = 0
+
+        [planner]
+        max_query_range_blocks = 100
+        default_chunk_range_blocks = 10
+
+        [writer]
+        target_object_bytes = 1024
+        min_object_rows = 1
+        record_empty_coverage = true
+
+        [chains.private]
+        kind = "evm"
+        chain_id = 31337
+        rpc_urls = ["http://example.invalid"]
+
+        [chains.private.datasets.blocks]
+        enabled = true
+        max_batch_blocks = 10
+
+        [chains.private.datasets.logs]
+        enabled = true
+        max_get_logs_range_blocks = 10
+        max_addresses_per_query = 2
+        "#,
+    )
+    .expect("config parses");
+
+    let error = validate_config(&config).expect_err("zero max concurrency rejected");
+    assert_eq!(error.kind, DatalensErrorKind::InvalidInput);
+    assert!(
+        error
+            .message
+            .contains("storage.s3.max_concurrent_operations")
+    );
+}
+
+#[test]
 fn test_config_parses_writer_staging_thresholds() {
     let config = toml::from_str::<DatalensConfig>(
         r#"

@@ -761,10 +761,22 @@ pub struct S3ObjectStoreConfig {
     pub endpoint_url: Option<String>,
     #[serde(default)]
     pub force_path_style: bool,
+    #[serde(default = "default_s3_runtime_worker_threads")]
+    pub runtime_worker_threads: usize,
+    #[serde(default = "default_s3_max_concurrent_operations")]
+    pub max_concurrent_operations: usize,
 }
 
 fn default_s3_region() -> String {
     "auto".to_owned()
+}
+
+const fn default_s3_runtime_worker_threads() -> usize {
+    DEFAULT_S3_RUNTIME_WORKER_THREADS
+}
+
+const fn default_s3_max_concurrent_operations() -> usize {
+    DEFAULT_S3_MAX_CONCURRENT_OPERATIONS
 }
 
 #[derive(Clone)]
@@ -779,6 +791,7 @@ const DEFAULT_S3_RUNTIME_WORKER_THREADS: usize = 4;
 const DEFAULT_S3_MAX_CONCURRENT_OPERATIONS: usize = 16;
 const DEFAULT_S3_GET_MAX_ATTEMPTS: usize = 3;
 const DEFAULT_S3_GET_RETRY_BACKOFF_MS: u64 = 100;
+const S3_SLOW_OPERATION_LOG_THRESHOLD_MS: u128 = 1_000;
 
 #[derive(Clone)]
 struct S3Runtime {
@@ -797,10 +810,10 @@ impl std::fmt::Debug for S3Runtime {
 }
 
 impl S3Runtime {
-    fn new() -> Result<Self, DatalensError> {
+    fn new(worker_threads: usize, max_concurrent_operations: usize) -> Result<Self, DatalensError> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
-            .worker_threads(DEFAULT_S3_RUNTIME_WORKER_THREADS)
+            .worker_threads(worker_threads.max(1))
             .thread_name("datalens-s3-runtime")
             .build()
             .map_err(|error| {
@@ -812,7 +825,7 @@ impl S3Runtime {
         Ok(Self {
             inner: Arc::new(S3RuntimeInner {
                 runtime: Mutex::new(Some(runtime)),
-                semaphore: Arc::new(Semaphore::new(DEFAULT_S3_MAX_CONCURRENT_OPERATIONS)),
+                semaphore: Arc::new(Semaphore::new(max_concurrent_operations.max(1))),
             }),
         })
     }
@@ -857,13 +870,27 @@ impl S3Runtime {
             };
             let run_ms = run_started.elapsed().as_millis();
             match &result {
-                Ok(_) => log::debug!(
-                    "s3 operation completed operation={} key={} queue_ms={} run_ms={}",
-                    operation,
-                    key,
-                    queue_ms,
-                    run_ms
-                ),
+                Ok(_)
+                    if queue_ms >= S3_SLOW_OPERATION_LOG_THRESHOLD_MS
+                        || run_ms >= S3_SLOW_OPERATION_LOG_THRESHOLD_MS =>
+                {
+                    log::info!(
+                        "s3 operation completed operation={} key={} queue_ms={} run_ms={}",
+                        operation,
+                        key,
+                        queue_ms,
+                        run_ms
+                    )
+                }
+                Ok(_) => {
+                    log::debug!(
+                        "s3 operation completed operation={} key={} queue_ms={} run_ms={}",
+                        operation,
+                        key,
+                        queue_ms,
+                        run_ms
+                    )
+                }
                 Err(error) => log::warn!(
                     "s3 operation failed operation={} key={} kind={:?} queue_ms={} run_ms={}",
                     operation,
@@ -917,7 +944,10 @@ impl S3ObjectStore {
             ));
         }
         let prefix = normalize_prefix(config.prefix.as_deref())?;
-        let runtime = S3Runtime::new()?;
+        let runtime = S3Runtime::new(
+            config.runtime_worker_threads,
+            config.max_concurrent_operations,
+        )?;
         let region = if config.region.trim().is_empty() {
             "auto".to_owned()
         } else {
@@ -1665,7 +1695,7 @@ mod tests {
 
     #[test]
     fn test_s3_runtime_runs_independent_operations_concurrently() {
-        let runtime = S3Runtime::new().expect("runtime");
+        let runtime = S3Runtime::new(4, 16).expect("runtime");
         let start = Instant::now();
         let mut handles = Vec::new();
 

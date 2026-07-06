@@ -522,6 +522,8 @@ fn test_s3_object_store_builds_from_compatible_backend_config() {
         region: "auto".to_owned(),
         endpoint_url: Some("http://localhost:9000".to_owned()),
         force_path_style: true,
+        runtime_worker_threads: 4,
+        max_concurrent_operations: 16,
     })
     .expect("build S3 object store");
 
@@ -537,6 +539,8 @@ async fn test_s3_object_store_builds_inside_existing_tokio_runtime() {
         region: "auto".to_owned(),
         endpoint_url: Some("http://localhost:9000".to_owned()),
         force_path_style: true,
+        runtime_worker_threads: 4,
+        max_concurrent_operations: 16,
     })
     .expect("build S3 object store");
 
@@ -926,5 +930,7 @@ fn s3_test_config() -> Option<S3ObjectStoreConfig> {
         force_path_style: std::env::var("DATALENS_S3_FORCE_PATH_STYLE")
             .map(|value| value != "0" && value != "false")
             .unwrap_or(true),
+        runtime_worker_threads: 4,
+        max_concurrent_operations: 16,
     })
 }
