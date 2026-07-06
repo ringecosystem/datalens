@@ -612,8 +612,13 @@ where
     ) -> Result<MaintenanceCompactionReconciliationReport, DatalensError> {
         let current_entries = self.manifest_for_chain(chain)?.entries;
         let raw_entries = self.raw_manifest_entries_for_chain(chain)?;
-        let mut report =
-            self.compaction_reconciliation_report(&current_entries, &raw_entries, config, false)?;
+        let mut report = self.compaction_reconciliation_report_for_chain(
+            chain,
+            &current_entries,
+            &raw_entries,
+            config,
+            false,
+        )?;
         let chain_prefix = format!("chains/{}/", chain.key_prefix());
         report
             .orphan_compacted_objects
@@ -1129,12 +1134,49 @@ where
         config: MaintenanceCompactionConfig,
         read_only: bool,
     ) -> Result<MaintenanceCompactionReconciliationReport, DatalensError> {
+        self.compaction_reconciliation_report_with_prefix(
+            current_entries,
+            raw_entries,
+            config,
+            read_only,
+            "chains",
+            "chains",
+        )
+    }
+
+    fn compaction_reconciliation_report_for_chain(
+        &self,
+        chain: &ChainIdentity,
+        current_entries: &[ManifestEntry],
+        raw_entries: &[ManifestEntry],
+        config: MaintenanceCompactionConfig,
+        read_only: bool,
+    ) -> Result<MaintenanceCompactionReconciliationReport, DatalensError> {
+        self.compaction_reconciliation_report_with_prefix(
+            current_entries,
+            raw_entries,
+            config,
+            read_only,
+            &format!("chains/{}/datasets", chain.key_prefix()),
+            &superseded_source_record_prefix(chain),
+        )
+    }
+
+    fn compaction_reconciliation_report_with_prefix(
+        &self,
+        current_entries: &[ManifestEntry],
+        raw_entries: &[ManifestEntry],
+        config: MaintenanceCompactionConfig,
+        read_only: bool,
+        data_object_prefix: &str,
+        superseded_source_prefix: &str,
+    ) -> Result<MaintenanceCompactionReconciliationReport, DatalensError> {
         let current_objects = current_object_keys(current_entries)
             .into_iter()
             .collect::<BTreeSet<_>>();
         let mut orphan_compacted_objects = self
             .object_store()
-            .list("chains")?
+            .list(data_object_prefix)?
             .into_iter()
             .map(|object| object.key)
             .filter(|key| is_data_object(key))
@@ -1145,7 +1187,11 @@ where
         orphan_compacted_objects.dedup();
 
         let mut stale_source_objects = self
-            .superseded_source_records(config.source_delete_grace_ms, false)?
+            .superseded_source_records_from_prefix(
+                superseded_source_prefix,
+                config.source_delete_grace_ms,
+                false,
+            )?
             .into_iter()
             .filter(|(_, record)| !current_objects.contains(&record.object_key))
             .map(|(_, record)| record.object_key)
@@ -1239,22 +1285,22 @@ where
         chain: &ChainIdentity,
         grace_ms: u64,
     ) -> Result<Vec<(String, SupersededCompactionSource)>, DatalensError> {
-        let prefix = superseded_source_record_prefix(chain);
-        Ok(self
-            .superseded_source_records(grace_ms, true)?
-            .into_iter()
-            .filter(|(key, _)| key.starts_with(&prefix))
-            .collect())
+        self.superseded_source_records_from_prefix(
+            &superseded_source_record_prefix(chain),
+            grace_ms,
+            true,
+        )
     }
 
-    fn superseded_source_records(
+    fn superseded_source_records_from_prefix(
         &self,
+        prefix: &str,
         grace_ms: u64,
         eligible_only: bool,
     ) -> Result<Vec<(String, SupersededCompactionSource)>, DatalensError> {
         let now_ms = unix_millis_now()?;
         let mut records = Vec::new();
-        for object in self.object_store().list("chains")? {
+        for object in self.object_store().list(prefix)? {
             if !object
                 .key
                 .contains("/metadata/compaction-superseded-sources/")
