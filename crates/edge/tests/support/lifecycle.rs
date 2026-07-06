@@ -601,6 +601,8 @@ pub(crate) fn s3_test_config() -> Option<S3ObjectStoreConfig> {
         force_path_style: std::env::var("DATALENS_S3_FORCE_PATH_STYLE")
             .map(|value| value != "0" && value != "false")
             .unwrap_or(true),
+        runtime_worker_threads: 4,
+        max_concurrent_operations: 16,
     })
 }
 
