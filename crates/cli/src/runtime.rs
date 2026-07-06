@@ -598,14 +598,14 @@ impl StorageCompactionWorker {
                     let result = if storage_compaction_tick_needs_reconciliation(tick_config) {
                         let reconciliation = match &storage {
                             CompactionStorage::Local(storage) => leader_checkpoint.check().and_then(|()| {
-                                storage.reconcile_compaction_for_chain_with_checkpoint(
+                                storage.cleanup_superseded_sources_for_chain_with_checkpoint(
                                     &chain,
                                     tick_config,
                                     || leader_checkpoint.check(),
                                 )
                             }),
                             CompactionStorage::S3(storage) => leader_checkpoint.check().and_then(|()| {
-                                storage.reconcile_compaction_for_chain_with_checkpoint(
+                                storage.cleanup_superseded_sources_for_chain_with_checkpoint(
                                     &chain,
                                     tick_config,
                                     || leader_checkpoint.check(),
