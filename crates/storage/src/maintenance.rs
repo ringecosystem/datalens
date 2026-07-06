@@ -1795,6 +1795,7 @@ where
         let mut records = Vec::new();
         let mut get_operations = 0usize;
         let mut partial = list_page.has_more;
+        let page_objects = list_page.objects.len();
         for object in &list_page.objects {
             if !object.key.starts_with(&strict_prefix) || !object.key.ends_with(".json") {
                 continue;
@@ -1833,6 +1834,17 @@ where
                 .cmp(&right.record.created_at_unix_ms)
                 .then_with(|| left.key.cmp(&right.key))
         });
+        log::info!(
+            "storage coverage index v2 cleanup scan chain_key={} page_objects={} eligible_records={} max_records={} has_more={} get_operations={} cursor_present={} page_last_key_present={}",
+            chain.key_prefix(),
+            page_objects,
+            records.len(),
+            max_records,
+            list_page.has_more,
+            get_operations,
+            cursor.next_segment_key.is_some(),
+            list_page.objects.last().is_some()
+        );
         Ok(CoverageIndexV2CleanupScan {
             records,
             partial,

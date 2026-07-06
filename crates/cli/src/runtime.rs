@@ -637,8 +637,14 @@ impl StorageCompactionWorker {
                             }
                         })
                     } else {
+                        let skip_reason = if tick_config.cleanup_enabled {
+                            "source_delete_disabled"
+                        } else {
+                            "cleanup_disabled"
+                        };
                         log::info!(
-                            "storage compaction reconciliation skipped reason=cleanup_disabled chain_key={}",
+                            "storage compaction reconciliation skipped reason={} chain_key={}",
+                            skip_reason,
                             chain.key_prefix()
                         );
                         match &storage {
