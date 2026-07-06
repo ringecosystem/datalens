@@ -1469,7 +1469,11 @@ where
             Some(COVERAGE_INDEX_V2_COMPACTION_PRIORITY_ROOT) => CoverageIndexV2ScanPriority::Root,
             _ => CoverageIndexV2ScanPriority::SemanticEvmLogs,
         };
-        let bucket_scan = self.scan_coverage_index_v2_delta_buckets(chain, next_priority)?;
+        let bucket_scan = self.scan_coverage_index_v2_delta_buckets(
+            chain,
+            next_priority,
+            config.coverage_index_v2_delta_count_threshold,
+        )?;
         let mut cursor_advances = BTreeMap::<String, String>::new();
         let mut partial = cleanup_partial || bucket_scan.partial;
         let mut processed_v2_bucket = false;
@@ -1662,6 +1666,7 @@ where
         &self,
         chain: &ChainIdentity,
         priority: CoverageIndexV2ScanPriority,
+        delta_count_threshold: usize,
     ) -> Result<CoverageIndexV2BucketScan, DatalensError> {
         let prefix = format!("chains/{}/coverage-index-v2/deltas", chain.key_prefix());
         let semantic_evm_logs_prefix = format!("{prefix}/semantic/evm.logs");
@@ -1702,6 +1707,7 @@ where
                 )?;
             }
             let mut had_buckets = false;
+            let mut bucket_delta_counts = BTreeMap::<CoverageIndexV2Bucket, usize>::new();
             let mut bucket_last_delta_keys = BTreeMap::<CoverageIndexV2Bucket, String>::new();
             for object in &list_page.objects {
                 if !object.key.starts_with(&strict_prefix) || !object.key.ends_with(".json") {
@@ -1714,10 +1720,17 @@ where
                     continue;
                 }
                 had_buckets = true;
+                *bucket_delta_counts.entry(bucket.clone()).or_default() += 1;
                 bucket_last_delta_keys.insert(bucket, object.key.clone());
             }
+            let mut emitted_buckets = false;
+            let skip_sparse_page_buckets = list_page.has_more;
             for (bucket, last_delta_key) in bucket_last_delta_keys {
-                if seen_buckets.insert(bucket.clone()) {
+                let page_delta_count = bucket_delta_counts.get(&bucket).copied().unwrap_or(0);
+                if (!skip_sparse_page_buckets || page_delta_count >= delta_count_threshold.max(1))
+                    && seen_buckets.insert(bucket.clone())
+                {
+                    emitted_buckets = true;
                     buckets.push(CoverageIndexV2BucketScanItem {
                         cursor_key: cursor_key.clone(),
                         bucket,
@@ -1725,7 +1738,7 @@ where
                     });
                 }
             }
-            if !had_buckets
+            if (!had_buckets || !emitted_buckets)
                 && let Some(next_segment_key) =
                     list_page.objects.last().map(|object| object.key.clone())
             {
