@@ -28,6 +28,8 @@ use crate::{
     unix_seconds_now, verify_manifest_object_metadata,
 };
 
+const MAX_SPARSE_SOURCE_RANGES_PER_CANDIDATE: usize = 3;
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MaintenanceReport {
     pub read_only: bool,
@@ -3433,7 +3435,10 @@ fn push_candidate(
         if !sparse_source_ranges_are_compactable(&source_ranges) {
             return;
         }
-        let max_sparse_source_ranges = config.max_puts_per_tick.saturating_sub(1);
+        let max_sparse_source_ranges = config
+            .max_puts_per_tick
+            .saturating_sub(1)
+            .min(MAX_SPARSE_SOURCE_RANGES_PER_CANDIDATE);
         if source_ranges.len() > max_sparse_source_ranges {
             push_sparse_candidates_within_put_budget(
                 candidates,

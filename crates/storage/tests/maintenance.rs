@@ -986,11 +986,11 @@ fn test_compaction_splits_sparse_candidates_to_fit_put_budget() {
     let first = storage
         .compact_small_objects(config)
         .expect("first sparse compaction tick");
-    assert_eq!(first.candidate_count, 2);
-    assert_eq!(first.processed_candidates, 1);
-    assert_eq!(first.compacted_objects, 1);
+    assert_eq!(first.candidate_count, 3);
+    assert_eq!(first.processed_candidates, 2);
+    assert_eq!(first.compacted_objects, 2);
     assert_eq!(first.compacted_rows, 6);
-    assert_eq!(first.put_operations, 7);
+    assert_eq!(first.put_operations, 8);
     assert_eq!(first.tick_status, MaintenanceCompactionTickStatus::Partial);
 
     let second = storage
@@ -1020,7 +1020,7 @@ fn test_compaction_splits_sparse_candidates_to_fit_put_budget() {
         .iter()
         .map(|entry| entry.object_key.as_deref().expect("object key"))
         .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(compacted_keys.len(), 2);
+    assert_eq!(compacted_keys.len(), 3);
     assert!(
         compacted_keys
             .iter()
