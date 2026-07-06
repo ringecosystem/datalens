@@ -3031,12 +3031,8 @@ fn test_compaction_prioritizes_coverage_index_v2_before_manifest_scan() {
         "coverage-index-v2 bucket scan should run before ordinary manifest compaction"
     );
     assert_eq!(
-        counting_store.list_page_count_for_prefix(&format!(
-            "chains/{}/manifest-segments",
-            chain.key_prefix()
-        )),
-        0,
-        "ordinary manifest segment scan should not run after coverage-index-v2 does useful work"
+        report.compacted_objects, 1,
+        "ordinary dataset compaction should still run when coverage-index-v2 work leaves tick time"
     );
 }
 

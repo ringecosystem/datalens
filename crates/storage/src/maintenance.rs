@@ -593,12 +593,33 @@ where
                     &mut operation_budget,
                 )?;
             if coverage_index_v2_report_has_work(&coverage_index_v2_report) || v2_partial {
-                return Ok(coverage_index_v2_only_compaction_report(
-                    started,
-                    v2_partial,
-                    operation_budget,
+                if started.elapsed() >= Duration::from_millis(config.max_tick_duration_ms.max(1)) {
+                    return Ok(coverage_index_v2_only_compaction_report(
+                        started,
+                        v2_partial,
+                        operation_budget,
+                        coverage_index_v2_report,
+                    ));
+                }
+                let scan = self.scan_compaction_manifest_entries(chain, config, started)?;
+                let mut report =
+                    self.compact_selected_manifest_entries(CompactSelectedManifestEntriesArgs {
+                        entries: scan.entries,
+                        stale_queue_entry_keys: scan.stale_queue_entry_keys,
+                        config,
+                        started,
+                        cursor: Some(scan.cursor_update),
+                        scan_partial: scan.partial || v2_partial,
+                        chain: Some(chain),
+                        checkpoint: &checkpoint,
+                        coverage_index_v2_checked: true,
+                    })?;
+                merge_coverage_index_v2_report(
+                    &mut report,
                     coverage_index_v2_report,
-                ));
+                    operation_budget,
+                );
+                return Ok(report);
             }
         }
         let scan = self.scan_compaction_manifest_entries(chain, config, started)?;
@@ -2816,6 +2837,40 @@ fn coverage_index_v2_only_compaction_report(
         coverage_index_v2_deleted_deltas: coverage_index_v2_report.deleted_deltas,
         coverage_index_v2_delta_delete_failures: coverage_index_v2_report.delete_failures,
     }
+}
+
+fn merge_coverage_index_v2_report(
+    report: &mut MaintenanceCompactionReport,
+    coverage_index_v2_report: CoverageIndexV2CompactionReport,
+    operation_budget: CompactionOperationBudget,
+) {
+    report.get_operations = report
+        .get_operations
+        .saturating_add(operation_budget.used_gets);
+    report.put_operations = report
+        .put_operations
+        .saturating_add(operation_budget.used_puts);
+    report.delete_operations = report
+        .delete_operations
+        .saturating_add(operation_budget.used_deletes);
+    report.coverage_index_v2_compacted_buckets = report
+        .coverage_index_v2_compacted_buckets
+        .saturating_add(coverage_index_v2_report.compacted_buckets);
+    report.coverage_index_v2_compacted_deltas = report
+        .coverage_index_v2_compacted_deltas
+        .saturating_add(coverage_index_v2_report.compacted_deltas);
+    report.coverage_index_v2_input_delta_bytes = report
+        .coverage_index_v2_input_delta_bytes
+        .saturating_add(coverage_index_v2_report.input_delta_bytes);
+    report.coverage_index_v2_cleanup_records = report
+        .coverage_index_v2_cleanup_records
+        .saturating_add(coverage_index_v2_report.cleanup_records);
+    report.coverage_index_v2_deleted_deltas = report
+        .coverage_index_v2_deleted_deltas
+        .saturating_add(coverage_index_v2_report.deleted_deltas);
+    report.coverage_index_v2_delta_delete_failures = report
+        .coverage_index_v2_delta_delete_failures
+        .saturating_add(coverage_index_v2_report.delete_failures);
 }
 
 #[derive(Clone, Debug)]
