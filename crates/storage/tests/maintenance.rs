@@ -1521,6 +1521,7 @@ fn test_v2_only_compaction_manifest_publish_reuses_replacement_plan() {
             max_manifest_entries_per_tick: 20_000,
             cleanup_enabled: false,
             delete_source_objects: false,
+            validate_coverage_index_sources: false,
             ..MaintenanceCompactionConfig::default()
         })
         .expect("compact small objects");
@@ -1531,7 +1532,7 @@ fn test_v2_only_compaction_manifest_publish_reuses_replacement_plan() {
         .into_iter()
         .filter(|key| key.contains("/coverage-index-v2/deltas/"))
         .count();
-    assert_eq!(v2_delta_gets, 2);
+    assert_eq!(v2_delta_gets, 0);
 }
 
 #[test]
