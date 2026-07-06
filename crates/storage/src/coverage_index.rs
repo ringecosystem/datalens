@@ -156,6 +156,7 @@ pub(crate) struct CoverageIndexV2CleanupRecordObject {
 struct CoverageIndexV2BucketReadCacheEntry {
     inserted_at: Instant,
     has_index: bool,
+    delta_objects: Vec<ObjectMetadata>,
     entries: Vec<ManifestEntry>,
 }
 
@@ -391,27 +392,29 @@ where
         None,
         start_after_delta_key,
     )?;
-    let cache_key = coverage_index_v2_bucket_read_cache_key(
-        object_store,
-        bucket,
-        snapshot_head.as_ref(),
-        &delta_objects,
-    );
-    if let Some(cached) = get_cached_v2_bucket_entries(&cache_key) {
-        entries.extend(cached.entries);
-        return Ok(cached.has_index);
-    }
+    let cache_key =
+        coverage_index_v2_bucket_read_cache_key(object_store, bucket, snapshot_head.as_ref());
+    let (mut bucket_entries, remaining_delta_objects) = if let Some(cached) =
+        get_cached_v2_bucket_entries(&cache_key)
+        && object_metadata_prefix_matches(&cached.delta_objects, &delta_objects)
+    {
+        any_bucket_has_index = cached.has_index;
+        (cached.entries, &delta_objects[cached.delta_objects.len()..])
+    } else {
+        let mut bucket_entries = Vec::new();
+        if let Some(head) = snapshot_head.take() {
+            let mut loaded_snapshot = match snapshot {
+                Some(snapshot) => snapshot,
+                None => read_v2_snapshot(object_store, bucket, &head.snapshot_key)?,
+            };
+            bucket_entries.append(&mut loaded_snapshot.entries);
+        }
+        (bucket_entries, delta_objects.as_slice())
+    };
 
-    let mut bucket_entries = Vec::new();
-    if let Some(head) = snapshot_head.take() {
-        let mut loaded_snapshot = match snapshot {
-            Some(snapshot) => snapshot,
-            None => read_v2_snapshot(object_store, bucket, &head.snapshot_key)?,
-        };
-        bucket_entries.append(&mut loaded_snapshot.entries);
-    }
-
-    for object in read_v2_delta_objects_from_metadata(object_store, bucket, &delta_objects)? {
+    for object in
+        read_v2_delta_objects_from_metadata(object_store, bucket, remaining_delta_objects)?
+    {
         let mut delta = object.delta;
         any_bucket_has_index = true;
         if let Some(replacement) = delta.replacement {
@@ -419,7 +422,12 @@ where
         }
         bucket_entries.append(&mut delta.entries);
     }
-    put_cached_v2_bucket_entries(cache_key, any_bucket_has_index, bucket_entries.clone());
+    put_cached_v2_bucket_entries(
+        cache_key,
+        any_bucket_has_index,
+        delta_objects,
+        bucket_entries.clone(),
+    );
     entries.append(&mut bucket_entries);
     Ok(any_bucket_has_index)
 }
@@ -592,7 +600,6 @@ fn coverage_index_v2_bucket_read_cache_key<S>(
     object_store: &S,
     bucket: &CoverageIndexV2Bucket,
     snapshot_head: Option<&CoverageIndexV2SnapshotHead>,
-    delta_objects: &[ObjectMetadata],
 ) -> String
 where
     S: ObjectStore,
@@ -602,11 +609,7 @@ where
     (object_store as *const S as usize).hash(&mut hasher);
     #[cfg(debug_assertions)]
     std::thread::current().id().hash(&mut hasher);
-    for object in delta_objects {
-        object.key.hash(&mut hasher);
-        object.size.hash(&mut hasher);
-    }
-    let delta_fingerprint = hasher.finish();
+    let debug_namespace = hasher.finish();
     let snapshot_key = snapshot_head
         .map(|head| head.snapshot_key.as_str())
         .unwrap_or("");
@@ -614,16 +617,23 @@ where
         .map(|head| head.included_delta_high_watermark.as_str())
         .unwrap_or("");
     format!(
-        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{:016x}",
+        "{}\n{}\n{}\n{}\n{}\n{}\n{:016x}",
         bucket.chain_key,
         bucket.scope,
         bucket.bucket_start,
         bucket.bucket_end,
         snapshot_key,
         snapshot_watermark,
-        delta_objects.len(),
-        delta_fingerprint
+        debug_namespace
     )
+}
+
+fn object_metadata_prefix_matches(prefix: &[ObjectMetadata], objects: &[ObjectMetadata]) -> bool {
+    prefix.len() <= objects.len()
+        && prefix
+            .iter()
+            .zip(objects)
+            .all(|(left, right)| left == right)
 }
 
 fn get_cached_v2_bucket_entries(key: &str) -> Option<CoverageIndexV2BucketReadCacheEntry> {
@@ -643,7 +653,12 @@ fn get_cached_v2_bucket_entries(key: &str) -> Option<CoverageIndexV2BucketReadCa
     }
 }
 
-fn put_cached_v2_bucket_entries(key: String, has_index: bool, entries: Vec<ManifestEntry>) {
+fn put_cached_v2_bucket_entries(
+    key: String,
+    has_index: bool,
+    delta_objects: Vec<ObjectMetadata>,
+    entries: Vec<ManifestEntry>,
+) {
     let Ok(mut cache) = coverage_index_v2_bucket_read_cache().lock() else {
         return;
     };
@@ -664,6 +679,7 @@ fn put_cached_v2_bucket_entries(key: String, has_index: bool, entries: Vec<Manif
         CoverageIndexV2BucketReadCacheEntry {
             inserted_at: now,
             has_index,
+            delta_objects,
             entries,
         },
     );
@@ -2846,7 +2862,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_entries_for_v2_bucket_reuses_cached_bucket_entries() {
+    fn test_read_entries_for_v2_bucket_reuses_cached_bucket_entry_prefix() {
         let object_store =
             DelayedV2DeltaGetObjectStore::new(temp_storage_root("cached-v2-bucket-read"));
         let chain = test_chain();
@@ -2901,6 +2917,32 @@ mod tests {
         assert_eq!(delta_gets_after_first_read, 2);
         assert_eq!(object_store.delta_gets(), delta_gets_after_first_read);
         assert_eq!(second_read_entries, first_read_entries);
+
+        let third = empty_entry(&chain, 41, 42);
+        let third_range = third.range.clone();
+        write_test_v2_delta(
+            &object_store,
+            &chain,
+            &scope,
+            &third_range,
+            "0003",
+            vec![third],
+            None,
+        );
+        let mut third_read_entries = Vec::new();
+        let third_has_index =
+            read_entries_for_v2_bucket(&object_store, &bucket, &mut third_read_entries)
+                .expect("read v2 bucket after appended delta");
+
+        assert!(third_has_index);
+        assert_eq!(object_store.delta_gets(), delta_gets_after_first_read + 1);
+        assert_eq!(
+            third_read_entries
+                .iter()
+                .map(|entry| (entry.range.start(), entry.range.end()))
+                .collect::<Vec<_>>(),
+            vec![(30, 35), (36, 40), (41, 42)]
+        );
     }
 
     #[test]
