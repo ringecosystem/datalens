@@ -4013,6 +4013,53 @@ fn test_compaction_coverage_index_v2_head_without_cleanup_is_retried() {
 }
 
 #[test]
+fn test_compaction_coverage_index_v2_cleanup_deletes_before_new_compaction_work() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-v2-cleanup-priority"));
+    let chain = test_chain();
+    let scope = "exact/evm.blocks/block/all/safe";
+    let stale_delta =
+        write_coverage_index_v2_delta(&storage, &chain, scope, 0, 99_999, "stale-delta");
+    write_coverage_index_v2_delta(&storage, &chain, scope, 0, 99_999, "pending-delta-a");
+    write_coverage_index_v2_delta(&storage, &chain, scope, 0, 99_999, "pending-delta-b");
+    let snapshot_key = write_coverage_index_v2_snapshot(
+        &storage,
+        &chain,
+        "cleanup-snapshot",
+        1,
+        vec![stale_delta.clone()],
+    );
+    write_coverage_index_v2_snapshot_head(&storage, &chain, "cleanup-head", 1, &snapshot_key);
+    write_coverage_index_v2_cleanup_record(
+        &storage,
+        &chain,
+        "cleanup-record",
+        &snapshot_key,
+        vec![stale_delta],
+    );
+
+    let report = storage
+        .compact_small_objects_for_chain_with_checkpoint(
+            &chain,
+            MaintenanceCompactionConfig {
+                cleanup_enabled: true,
+                coverage_index_v2_delete_grace_ms: 0,
+                coverage_index_v2_delta_count_threshold: 2,
+                max_tick_duration_ms: 1,
+                ..MaintenanceCompactionConfig::default()
+            },
+            || {
+                std::thread::sleep(Duration::from_millis(5));
+                Ok(())
+            },
+        )
+        .expect("prioritize mature cleanup records");
+
+    assert_eq!(report.coverage_index_v2_deleted_deltas, 1);
+    assert_eq!(coverage_index_v2_cleanup_count(&storage, &chain), 0);
+    assert_eq!(coverage_index_v2_delta_count(&storage, &chain), 2);
+}
+
+#[test]
 fn test_compaction_coverage_index_v2_recovers_older_head_cleanup_after_new_head() {
     let storage = LocalStorage::new(temp_storage_root("coverage-v2-older-head-cleanup"));
     let chain = test_chain();
