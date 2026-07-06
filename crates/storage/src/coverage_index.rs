@@ -2229,6 +2229,7 @@ fn evm_log_query_semantic_scopes(filter: &EvmLogFilter) -> BTreeSet<String> {
                 .iter()
                 .map(|address| format!("addr/{address}")),
         );
+        return scopes;
     }
 
     scopes.insert("topic/*".to_owned());
@@ -3113,9 +3114,9 @@ mod tests {
     }
 
     #[test]
-    fn test_read_entries_for_query_finds_topic_slot_wildcard_evm_log_coverage() {
+    fn test_read_entries_for_query_with_address_uses_address_semantic_bucket() {
         let object_store =
-            crate::LocalObjectStore::new(temp_storage_root("topic-slot-wildcard-query"));
+            crate::LocalObjectStore::new(temp_storage_root("address-semantic-query"));
         let chain = test_chain();
         let stored =
             evm_logs_selector_with_addresses(vec![address(1)], vec![None, Some(vec![topic(2)])]);
@@ -3126,8 +3127,31 @@ mod tests {
         let entry = evm_logs_entry(&chain, &stored, 10, 20, 1);
 
         write_entry(&object_store, &entry).expect("write wildcard topic slot coverage");
-        delete_semantic_bucket(&object_store, &chain, &format!("addr/{}", address(1)));
         delete_semantic_bucket(&object_store, &chain, &format!("topic/1/{}", topic(2)));
+
+        let entries = read_entries_for_query(
+            &object_store,
+            &chain,
+            &DatasetKey::evm_logs(),
+            &query,
+            &LedgerRange::blocks(10, 20).expect("valid range"),
+        )
+        .expect("read coverage index")
+        .expect("coverage index entries");
+
+        assert_eq!(entries, vec![entry]);
+    }
+
+    #[test]
+    fn test_read_entries_for_query_without_address_uses_topic_semantic_bucket() {
+        let object_store = crate::LocalObjectStore::new(temp_storage_root("topic-semantic-query"));
+        let chain = test_chain();
+        let stored = evm_logs_selector(vec![None, Some(vec![topic(2)])]);
+        let query = evm_logs_selector(vec![Some(vec![topic(1)]), Some(vec![topic(2)])]);
+        let entry = evm_logs_entry(&chain, &stored, 10, 20, 1);
+
+        write_entry(&object_store, &entry).expect("write wildcard topic slot coverage");
+        delete_semantic_bucket(&object_store, &chain, "addr/*");
 
         let entries = read_entries_for_query(
             &object_store,
@@ -3217,5 +3241,22 @@ mod tests {
             .len()
                 <= 32
         );
+    }
+
+    #[test]
+    fn test_evm_log_query_semantic_scopes_skip_topic_scopes_when_addressed() {
+        let DatasetSelector::EvmLogs(filter) = evm_logs_selector_with_addresses(
+            vec![address(1), address(2)],
+            vec![Some(vec![topic(1)]), None],
+        ) else {
+            panic!("evm logs selector");
+        };
+
+        let scopes = evm_log_query_semantic_scopes(&filter);
+
+        assert!(scopes.contains("addr/*"));
+        assert!(scopes.contains(&format!("addr/{}", address(1))));
+        assert!(scopes.contains(&format!("addr/{}", address(2))));
+        assert!(!scopes.iter().any(|scope| scope.starts_with("topic/")));
     }
 }
