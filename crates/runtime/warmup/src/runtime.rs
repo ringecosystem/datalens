@@ -449,7 +449,9 @@ where
                 if task.mode == WarmupTaskMode::FixedRange {
                     self.record_task_metric(&task, WarmupTaskOutcome::Completed);
                 }
-                return self.finish_or_stop(task, WarmupRunResult::default());
+                let result = WarmupRunResult::default();
+                log_run_result(&task, &result, cursor.next, None, "target_noop");
+                return self.finish_or_stop(task, result);
             }
         };
         if target_start != cursor.next {
@@ -460,7 +462,15 @@ where
             if task.mode == WarmupTaskMode::FixedRange {
                 self.record_task_metric(&task, WarmupTaskOutcome::Completed);
             }
-            return self.finish_or_stop(task, WarmupRunResult::default());
+            let result = WarmupRunResult::default();
+            log_run_result(
+                &task,
+                &result,
+                cursor.next,
+                Some(target_end),
+                "cursor_after_target",
+            );
+            return self.finish_or_stop(task, result);
         }
 
         task.state = WarmupTaskState::Running;
@@ -489,6 +499,13 @@ where
                     safe_height.finality,
                 )?;
                 result.status = WarmupRunStatus::Stopped;
+                log_run_result(
+                    &task,
+                    &result,
+                    cursor.next,
+                    Some(target_end),
+                    "stop_requested",
+                );
                 return Ok(result);
             }
 
@@ -613,6 +630,13 @@ where
                 task.touch(unix_seconds_now()?);
                 self.registry.save_task(&task)?;
                 self.registry.save_cursor(&cursor)?;
+                log_run_result(
+                    &task,
+                    &result,
+                    cursor.next,
+                    Some(target_end),
+                    "durable_intent_pending",
+                );
                 return Ok(result);
             }
 
@@ -736,8 +760,22 @@ where
             task.state = WarmupTaskState::Queued;
             result.status = WarmupRunStatus::Partial;
             self.registry.save_task(&task)?;
+            log_run_result(
+                &task,
+                &result,
+                cursor.next,
+                Some(target_end),
+                "partial_progress",
+            );
             return Ok(result);
         }
+        log_run_result(
+            &task,
+            &result,
+            cursor.next,
+            Some(target_end),
+            "target_complete",
+        );
         self.finish_or_stop(task, result)
     }
 
@@ -1714,8 +1752,10 @@ fn log_target_plan(
     let planned_query_distance = query_watermark
         .and_then(|watermark| planned_start.and_then(|start| start.checked_sub(watermark)));
     log::info!(
-        "warmup target plan task_id={} application={} chain={} dataset={} selector_fingerprint={} selector_canonical_key={} cursor_next={} query_watermark={:?} cursor_query_distance={:?} safe_head={} lookahead_blocks={} planned_start={:?} planned_end={:?} planned_query_distance={:?} no_op_reason={:?}",
+        "warmup target plan task_id={} mode={:?} state={:?} application={} chain={} dataset={} selector_fingerprint={} selector_canonical_key={} cursor_next={} query_watermark={:?} cursor_query_distance={:?} safe_head={} lookahead_blocks={} planned_start={:?} planned_end={:?} planned_query_distance={:?} no_op_reason={:?}",
         task.task_id.as_str(),
+        task.mode,
+        task.state,
         task.application_id,
         task.chain.key_prefix(),
         task.dataset_key.as_str(),
@@ -1730,6 +1770,43 @@ fn log_target_plan(
         planned_end,
         planned_query_distance,
         no_op_reason,
+    );
+}
+
+fn log_run_result(
+    task: &WarmupTask,
+    result: &WarmupRunResult,
+    cursor_next: u64,
+    target_end: Option<u64>,
+    reason: &str,
+) {
+    let remaining_to_target = target_end.map(|end| {
+        if cursor_next > end {
+            0
+        } else {
+            end.saturating_sub(cursor_next).saturating_add(1)
+        }
+    });
+    log::info!(
+        "warmup run result task_id={} mode={:?} state={:?} application={} chain={} dataset={} selector_fingerprint={} cursor_next={} target_end={:?} remaining_to_target={:?} status={:?} fetched_ranges={} written_ranges={} empty_ranges={} provider_calls={} rows_fetched={} checkpoints={} reason={}",
+        task.task_id.as_str(),
+        task.mode,
+        task.state,
+        task.application_id,
+        task.chain.key_prefix(),
+        task.dataset_key.as_str(),
+        task.selector.fingerprint(),
+        cursor_next,
+        target_end,
+        remaining_to_target,
+        result.status,
+        result.fetched_ranges,
+        result.written_ranges,
+        result.empty_ranges,
+        result.provider_calls,
+        result.rows_fetched,
+        result.checkpoints.len(),
+        reason,
     );
 }
 
