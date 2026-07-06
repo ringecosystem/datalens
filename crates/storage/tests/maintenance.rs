@@ -4069,6 +4069,41 @@ fn test_compaction_coverage_index_v2_cleanup_deletes_when_no_new_compaction_work
 }
 
 #[test]
+fn test_compaction_coverage_index_v2_cleanup_scan_is_bounded() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-v2-cleanup-scan-bounded"));
+    let chain = test_chain();
+    let snapshot_key =
+        write_coverage_index_v2_snapshot(&storage, &chain, "cleanup-snapshot", 1, Vec::new());
+    write_coverage_index_v2_snapshot_head(&storage, &chain, "cleanup-head", 1, &snapshot_key);
+    for index in 0..40 {
+        write_coverage_index_v2_cleanup_record(
+            &storage,
+            &chain,
+            &format!("cleanup-record-{index:02}"),
+            &snapshot_key,
+            Vec::new(),
+        );
+    }
+
+    let report = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                cleanup_enabled: true,
+                coverage_index_v2_delete_grace_ms: 0,
+                coverage_index_v2_delta_count_threshold: 3,
+                max_gets_per_tick: 128,
+                max_deletes_per_tick: 128,
+                max_puts_per_tick: 16,
+                ..coverage_index_v2_compaction_config(true)
+            },
+        )
+        .expect("cleanup scan should be bounded");
+
+    assert_eq!(report.get_operations, 32);
+}
+
+#[test]
 fn test_compaction_coverage_index_v2_cleanup_record_deletes_in_batches() {
     let storage = LocalStorage::new(temp_storage_root("coverage-v2-cleanup-batches"));
     let chain = test_chain();

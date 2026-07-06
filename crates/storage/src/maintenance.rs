@@ -30,6 +30,7 @@ use crate::{
 
 const MAX_SPARSE_SOURCE_RANGES_PER_CANDIDATE: usize = 3;
 const MAX_SPARSE_CANDIDATE_RANGE_SPAN_BLOCKS: u64 = 100_000;
+const COVERAGE_INDEX_V2_CLEANUP_RECORDS_PER_TICK: usize = 32;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MaintenanceReport {
@@ -1437,7 +1438,8 @@ where
                 remaining_gets - reserved_compaction_gets
             } else {
                 remaining_gets
-            };
+            }
+            .min(COVERAGE_INDEX_V2_CLEANUP_RECORDS_PER_TICK);
             if max_records == 0 {
                 None
             } else {
