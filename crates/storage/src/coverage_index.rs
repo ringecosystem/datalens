@@ -24,7 +24,7 @@ pub(crate) const DEFAULT_COVERAGE_INDEX_BUCKET_SIZE: u64 = 100_000;
 const COVERAGE_INDEX_V2_SCHEMA_VERSION: u32 = 1;
 pub(crate) const COVERAGE_INDEX_V2_LIST_PAGE_SIZE: usize = 1_000;
 const EVM_LOG_SEMANTIC_INDEX_VERSION: &str = "evm-logs-v1";
-const MAX_EVM_LOG_TOPIC_VALUE_SEMANTIC_KEYS: usize = 128;
+const MAX_EVM_LOG_TOPIC_VALUE_SEMANTIC_KEYS: usize = 8;
 const EVM_LOG_LARGE_TOPIC_VALUE_SCOPE: &str = "_large-any-of";
 const MAX_COVERAGE_INDEX_V2_BUCKET_READ_THREADS: usize = 8;
 const MAX_COVERAGE_INDEX_V2_DELTA_GET_THREADS: usize = 8;
@@ -3432,6 +3432,25 @@ mod tests {
             .len()
                 <= 32
         );
+    }
+
+    #[test]
+    fn test_evm_log_semantic_scopes_use_large_scope_for_medium_topic_value_sets() {
+        let topics = (0..21).map(topic).collect::<Vec<_>>();
+        let DatasetSelector::EvmLogs(filter) = evm_logs_selector(vec![Some(topics.clone())]) else {
+            panic!("evm logs selector");
+        };
+
+        let entry_scopes = evm_log_entry_semantic_scopes(&filter);
+        let query_scopes = evm_log_query_semantic_scopes(&filter);
+        let large_scope = format!("topic/0/{EVM_LOG_LARGE_TOPIC_VALUE_SCOPE}");
+
+        assert!(entry_scopes.contains(&large_scope));
+        assert!(query_scopes.contains(&large_scope));
+        for value in topics {
+            assert!(!entry_scopes.contains(&format!("topic/0/{value}")));
+            assert!(!query_scopes.contains(&format!("topic/0/{value}")));
+        }
     }
 
     #[test]
