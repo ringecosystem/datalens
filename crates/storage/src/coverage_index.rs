@@ -1229,6 +1229,25 @@ where
     })
 }
 
+pub(crate) fn replacement_from_replaced_entries(
+    replaced_entries: Vec<ManifestEntry>,
+    entry: &ManifestEntry,
+) -> Result<CoverageIndexReplacement, DatalensError> {
+    let mut replaced_manifest = Manifest {
+        entries: replaced_entries,
+    };
+    replaced_manifest.normalize();
+    let mut published_manifest = Manifest {
+        entries: replacement_published_entries(&replaced_manifest.entries, entry)?,
+    };
+    published_manifest.normalize();
+    Ok(CoverageIndexReplacement {
+        replaced_entries: replaced_manifest.entries,
+        published_entries: published_manifest.entries,
+        bucket_updates: Vec::new(),
+    })
+}
+
 fn replacement_published_entries(
     replaced_entries: &[ManifestEntry],
     entry: &ManifestEntry,
@@ -1309,20 +1328,15 @@ where
     S: ObjectStore,
 {
     if !legacy_write_enabled {
-        let replaced_entries = read_entries_for_replacement_scope(object_store, entry)?;
-        let mut published_manifest = Manifest {
-            entries: replacement_published_entries(&replaced_entries, entry)?,
-        };
-        published_manifest.normalize();
         write_v2_replacement_delta(
             object_store,
             entry,
-            &replaced_entries,
-            &published_manifest.entries,
+            &replacement.replaced_entries,
+            &replacement.published_entries,
         )?;
         return Ok(CoverageIndexReplacementPublish {
-            replaced_entries,
-            published_entries: published_manifest.entries,
+            replaced_entries: replacement.replaced_entries.clone(),
+            published_entries: replacement.published_entries.clone(),
         });
     }
 

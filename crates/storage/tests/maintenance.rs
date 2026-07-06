@@ -1498,6 +1498,43 @@ fn test_v2_only_late_replacement_during_compaction_manifest_publish_wins() {
 }
 
 #[test]
+fn test_v2_only_compaction_manifest_publish_reuses_replacement_plan() {
+    let config = DurableStorageConfig {
+        legacy_coverage_index_write_enabled: false,
+        ..DurableStorageConfig::default()
+    };
+    let root = temp_storage_root("compaction-v2-only-replacement-plan-reuse");
+    let storage = LocalStorage::new_with_config(root.clone(), config);
+    let chain = test_chain();
+    write_block_object(&storage, &chain, 50, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 51, FinalityLevel::Safe);
+    let counting_store = CountingOperationStore::new(root);
+    let compacting_storage =
+        DurableStorage::from_object_store_with_config(counting_store.clone(), config);
+
+    let report = compacting_storage
+        .compact_small_objects(MaintenanceCompactionConfig {
+            min_object_bytes: u64::MAX,
+            max_input_objects_per_candidate: 8,
+            max_tick_duration_ms: 30_000,
+            max_candidates_per_tick: 8,
+            max_manifest_entries_per_tick: 20_000,
+            cleanup_enabled: false,
+            delete_source_objects: false,
+            ..MaintenanceCompactionConfig::default()
+        })
+        .expect("compact small objects");
+
+    assert_eq!(report.processed_candidates, 1);
+    let v2_delta_gets = counting_store
+        .get_keys()
+        .into_iter()
+        .filter(|key| key.contains("/coverage-index-v2/deltas/"))
+        .count();
+    assert_eq!(v2_delta_gets, 2);
+}
+
+#[test]
 fn test_compaction_skips_candidate_when_v2_only_index_has_newer_replacement() {
     let storage = LocalStorage::new_with_config(
         temp_storage_root("compaction-v2-only-index-newer-replacement"),
