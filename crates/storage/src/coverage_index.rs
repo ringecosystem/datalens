@@ -598,6 +598,10 @@ where
     S: ObjectStore,
 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    #[cfg(debug_assertions)]
+    (object_store as *const S as usize).hash(&mut hasher);
+    #[cfg(debug_assertions)]
+    std::thread::current().id().hash(&mut hasher);
     for object in delta_objects {
         object.key.hash(&mut hasher);
         object.size.hash(&mut hasher);
@@ -610,8 +614,7 @@ where
         .map(|head| head.included_delta_high_watermark.as_str())
         .unwrap_or("");
     format!(
-        "{:p}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{:016x}",
-        object_store,
+        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{:016x}",
         bucket.chain_key,
         bucket.scope,
         bucket.bucket_start,
