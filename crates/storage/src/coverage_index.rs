@@ -28,6 +28,7 @@ const MAX_EVM_LOG_TOPIC_VALUE_SEMANTIC_KEYS: usize = 8;
 const EVM_LOG_LARGE_TOPIC_VALUE_SCOPE: &str = "_large-any-of";
 const MAX_COVERAGE_INDEX_V2_BUCKET_READ_THREADS: usize = 8;
 const MAX_COVERAGE_INDEX_V2_DELTA_GET_THREADS: usize = 8;
+const MAX_SEMANTIC_FALLBACK_V2_DELTA_OBJECTS: usize = 128;
 const COVERAGE_INDEX_V2_BUCKET_READ_CACHE_TTL: Duration = Duration::from_secs(300);
 const MAX_COVERAGE_INDEX_V2_BUCKET_READ_CACHE_ENTRIES: usize = 512;
 
@@ -231,8 +232,12 @@ where
             &semantic_scopes,
         );
         any_semantic_has_index |= read_entries_for_keys(object_store, semantic_keys, &mut entries)?;
-        any_semantic_has_index |=
-            read_entries_for_v2_buckets(object_store, semantic_v2_buckets, &mut entries)?;
+        any_semantic_has_index |= read_entries_for_v2_buckets_bounded(
+            object_store,
+            semantic_v2_buckets,
+            &mut entries,
+            Some(MAX_SEMANTIC_FALLBACK_V2_DELTA_OBJECTS),
+        )?;
         let normalized =
             normalized_query_entries(entries.clone(), chain, dataset_key, selector, range);
         let covered = covered_ranges_from_entries(&normalized, chain, dataset_key, selector, range);
@@ -337,6 +342,18 @@ fn read_entries_for_v2_buckets<S>(
 where
     S: ObjectStore,
 {
+    read_entries_for_v2_buckets_bounded(object_store, buckets, entries, None)
+}
+
+fn read_entries_for_v2_buckets_bounded<S>(
+    object_store: &S,
+    buckets: BTreeSet<CoverageIndexV2Bucket>,
+    entries: &mut Vec<ManifestEntry>,
+    max_delta_objects: Option<usize>,
+) -> Result<bool, DatalensError>
+where
+    S: ObjectStore,
+{
     let mut any_bucket_has_index = false;
     let buckets = buckets.into_iter().collect::<Vec<_>>();
     for chunk in buckets.chunks(MAX_COVERAGE_INDEX_V2_BUCKET_READ_THREADS) {
@@ -352,6 +369,7 @@ where
                             &object_store,
                             &bucket,
                             &mut bucket_entries,
+                            max_delta_objects,
                         )?;
                         Ok::<_, DatalensError>((has_index, bucket_entries))
                     })
@@ -381,6 +399,7 @@ fn read_entries_for_v2_bucket<S>(
     object_store: &S,
     bucket: &CoverageIndexV2Bucket,
     entries: &mut Vec<ManifestEntry>,
+    max_delta_objects: Option<usize>,
 ) -> Result<bool, DatalensError>
 where
     S: ObjectStore,
@@ -417,9 +436,23 @@ where
         object_store,
         bucket,
         &compacted_delta_keys,
-        None,
+        max_delta_objects,
         start_after_delta_key,
     )?;
+    if let Some(max_delta_objects) = max_delta_objects
+        && delta_objects.len() >= max_delta_objects
+    {
+        log::warn!(
+            "storage coverage semantic fallback skipped chain_key={} scope={} bucket={}-{} listed_delta_objects={} max_delta_objects={}",
+            bucket.chain_key,
+            bucket.scope,
+            bucket.bucket_start,
+            bucket.bucket_end,
+            delta_objects.len(),
+            max_delta_objects
+        );
+        return Ok(false);
+    }
     let (mut bucket_entries, remaining_delta_objects) = if let Some(cached) =
         get_cached_v2_bucket_entries(&cache_key)
         && !cached.dirty
@@ -3198,7 +3231,7 @@ mod tests {
         );
         let mut entries = Vec::new();
 
-        let has_index = read_entries_for_v2_bucket(&object_store, &bucket, &mut entries)
+        let has_index = read_entries_for_v2_bucket(&object_store, &bucket, &mut entries, None)
             .expect("read v2 bucket");
 
         assert!(has_index);
@@ -3258,14 +3291,14 @@ mod tests {
 
         let mut first_read_entries = Vec::new();
         let first_has_index =
-            read_entries_for_v2_bucket(&object_store, &bucket, &mut first_read_entries)
+            read_entries_for_v2_bucket(&object_store, &bucket, &mut first_read_entries, None)
                 .expect("read v2 bucket first time");
         let delta_gets_after_first_read = object_store.delta_gets();
         let list_pages_after_first_read = object_store.list_pages();
         let delta_list_pages_after_first_read = object_store.delta_list_pages();
         let mut second_read_entries = Vec::new();
         let second_has_index =
-            read_entries_for_v2_bucket(&object_store, &bucket, &mut second_read_entries)
+            read_entries_for_v2_bucket(&object_store, &bucket, &mut second_read_entries, None)
                 .expect("read v2 bucket second time");
 
         assert!(first_has_index);
@@ -3293,7 +3326,7 @@ mod tests {
         let delta_list_pages_after_append = object_store.delta_list_pages();
         let mut third_read_entries = Vec::new();
         let third_has_index =
-            read_entries_for_v2_bucket(&object_store, &bucket, &mut third_read_entries)
+            read_entries_for_v2_bucket(&object_store, &bucket, &mut third_read_entries, None)
                 .expect("read v2 bucket after appended delta");
 
         assert!(third_has_index);
@@ -3309,6 +3342,48 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(30, 35), (36, 40), (41, 42)]
         );
+    }
+
+    #[test]
+    fn test_semantic_v2_fallback_skips_over_delta_budget() {
+        let object_store =
+            DelayedV2DeltaGetObjectStore::new(temp_storage_root("semantic-v2-fallback-budget"));
+        let chain = test_chain();
+        let query_selector =
+            evm_logs_selector_with_addresses(vec![address(1)], vec![Some(vec![topic(1)])]);
+        let broad_selector = evm_logs_selector(vec![]);
+        let range = LedgerRange::blocks(10, 10).expect("valid range");
+        let scope = coverage_index_v2_semantic_scope(
+            &DatasetKey::evm_logs(),
+            &range,
+            ManifestFinalityLevel::Safe,
+            "addr/*",
+        );
+        for index in 0..MAX_SEMANTIC_FALLBACK_V2_DELTA_OBJECTS {
+            let entry = evm_logs_entry(&chain, &broad_selector, 10, 10, index);
+            write_test_v2_delta(
+                &object_store,
+                &chain,
+                &scope,
+                &range,
+                &format!("{index:04}"),
+                vec![entry],
+                None,
+            );
+        }
+
+        let entries = read_entries_for_query(
+            &object_store,
+            &chain,
+            &DatasetKey::evm_logs(),
+            &query_selector,
+            &range,
+        )
+        .expect("read coverage with bounded semantic fallback");
+
+        assert!(entries.is_none());
+        assert_eq!(object_store.delta_gets(), 0);
+        assert!(object_store.delta_list_pages() > 0);
     }
 
     #[test]
