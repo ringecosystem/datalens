@@ -4604,6 +4604,61 @@ fn test_compaction_coverage_index_v2_slow_cleanup_does_not_block_compaction() {
 }
 
 #[test]
+fn test_compaction_coverage_index_v2_cleanup_stops_at_tick_duration() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-v2-cleanup-duration"));
+    let chain = test_chain();
+    let scope = "exact/evm.blocks/block/all/safe";
+    let stale_delta_a =
+        write_coverage_index_v2_delta(&storage, &chain, scope, 0, 99_999, "stale-delta-a");
+    let stale_delta_b =
+        write_coverage_index_v2_delta(&storage, &chain, scope, 0, 99_999, "stale-delta-b");
+    let stale_delta_c =
+        write_coverage_index_v2_delta(&storage, &chain, scope, 0, 99_999, "stale-delta-c");
+    let snapshot_key = write_coverage_index_v2_snapshot(
+        &storage,
+        &chain,
+        "cleanup-snapshot",
+        1,
+        vec![
+            stale_delta_a.clone(),
+            stale_delta_b.clone(),
+            stale_delta_c.clone(),
+        ],
+    );
+    write_coverage_index_v2_snapshot_head(&storage, &chain, "cleanup-head", 1, &snapshot_key);
+    write_coverage_index_v2_cleanup_record(
+        &storage,
+        &chain,
+        "cleanup-record",
+        &snapshot_key,
+        vec![stale_delta_a, stale_delta_b, stale_delta_c],
+    );
+
+    let report = storage
+        .compact_small_objects_for_chain_with_checkpoint(
+            &chain,
+            MaintenanceCompactionConfig {
+                cleanup_enabled: true,
+                coverage_index_v2_delete_grace_ms: 0,
+                coverage_index_v2_delta_count_threshold: 10,
+                max_tick_duration_ms: 50,
+                max_deletes_per_tick: 10,
+                ..MaintenanceCompactionConfig::default()
+            },
+            || {
+                std::thread::sleep(Duration::from_millis(60));
+                Ok(())
+            },
+        )
+        .expect("slow cleanup should stop at the tick duration");
+
+    assert_eq!(report.coverage_index_v2_deleted_deltas, 1);
+    assert_eq!(report.tick_status, MaintenanceCompactionTickStatus::Partial);
+    assert_eq!(coverage_index_v2_cleanup_count(&storage, &chain), 1);
+    assert_eq!(coverage_index_v2_delta_count(&storage, &chain), 2);
+}
+
+#[test]
 fn test_compaction_coverage_index_v2_malformed_cleanup_record_does_not_delete_arbitrary_key() {
     let storage = LocalStorage::new(temp_storage_root("coverage-v2-malformed-cleanup"));
     let chain = test_chain();

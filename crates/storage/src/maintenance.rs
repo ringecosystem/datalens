@@ -1567,14 +1567,20 @@ where
                 .as_ref()
                 .is_some_and(|scan| !scan.records.is_empty())
         {
-            cleanup_partial = self.cleanup_coverage_index_v2_for_chain(
-                chain,
-                checkpoint,
-                operation_budget,
-                cleanup_scan.clone(),
-                reserve_compaction_budget.then_some(reserved_compaction_gets),
-                &mut report,
-            )?;
+            cleanup_partial =
+                self.cleanup_coverage_index_v2_for_chain(CoverageIndexV2CleanupArgs {
+                    chain,
+                    deadline: CoverageIndexV2CleanupDeadline {
+                        tick_started,
+                        max_duration,
+                    },
+                    checkpoint,
+                    operation_budget,
+                    cleanup_scan: cleanup_scan.clone(),
+                    max_delta_deletes: reserve_compaction_budget
+                        .then_some(reserved_compaction_gets),
+                    report: &mut report,
+                })?;
             cleanup_scan = None;
         }
         let priority_cursor_key = coverage_index_v2_compaction_priority_cursor_key(chain);
@@ -1761,14 +1767,19 @@ where
         }
 
         if config.cleanup_enabled && tick_started.elapsed() < max_duration {
-            let cleanup_partial = self.cleanup_coverage_index_v2_for_chain(
-                chain,
-                checkpoint,
-                operation_budget,
-                cleanup_scan,
-                None,
-                &mut report,
-            )?;
+            let cleanup_partial =
+                self.cleanup_coverage_index_v2_for_chain(CoverageIndexV2CleanupArgs {
+                    chain,
+                    deadline: CoverageIndexV2CleanupDeadline {
+                        tick_started,
+                        max_duration,
+                    },
+                    checkpoint,
+                    operation_budget,
+                    cleanup_scan,
+                    max_delta_deletes: None,
+                    report: &mut report,
+                })?;
             partial |= cleanup_partial;
         } else if config.cleanup_enabled {
             partial = true;
@@ -1873,13 +1884,17 @@ where
 
     fn cleanup_coverage_index_v2_for_chain(
         &self,
-        chain: &ChainIdentity,
-        checkpoint: &dyn Fn() -> Result<(), DatalensError>,
-        operation_budget: &mut CompactionOperationBudget,
-        cleanup_scan: Option<CoverageIndexV2CleanupScan>,
-        max_delta_deletes: Option<usize>,
-        report: &mut CoverageIndexV2CompactionReport,
+        args: CoverageIndexV2CleanupArgs<'_>,
     ) -> Result<bool, DatalensError> {
+        let CoverageIndexV2CleanupArgs {
+            chain,
+            deadline,
+            checkpoint,
+            operation_budget,
+            cleanup_scan,
+            max_delta_deletes,
+            report,
+        } = args;
         let cursor_key = coverage_index_v2_cleanup_cursor_key(chain);
         let Some(cleanup_scan) = cleanup_scan else {
             return Ok(true);
@@ -1890,6 +1905,10 @@ where
         let mut remaining_delta_deletes = max_delta_deletes.unwrap_or(usize::MAX);
         let mut latest_delta_key_cache = BTreeMap::new();
         for record in cleanup_scan.records {
+            if deadline.expired() {
+                partial = true;
+                break;
+            }
             if remaining_delta_deletes == 0 {
                 partial = true;
                 break;
@@ -1928,6 +1947,7 @@ where
                 &record,
                 checkpoint,
                 delta_delete_budget,
+                deadline,
             );
             operation_budget.record_deletes(cleanup.deleted_objects);
             remaining_delta_deletes =
@@ -1938,8 +1958,15 @@ where
             report.delete_failures = report
                 .delete_failures
                 .saturating_add(cleanup.delete_failures);
+            if cleanup.partial {
+                partial = true;
+            }
             if cleanup.delete_failures == 0 {
                 if cleanup.deleted_objects >= record.record.compacted_delta_keys.len() {
+                    if deadline.expired() {
+                        partial = true;
+                        break;
+                    }
                     checkpoint()?;
                     self.object_store().delete(&record.key)?;
                     operation_budget.record_deletes(1);
@@ -2071,11 +2098,17 @@ where
         cleanup: &CoverageIndexV2CleanupRecordObject,
         checkpoint: &dyn Fn() -> Result<(), DatalensError>,
         max_deletes: usize,
+        deadline: CoverageIndexV2CleanupDeadline,
     ) -> CoverageIndexV2DeltaCleanup {
         let mut deleted_objects = 0usize;
         let mut delete_failures = 0usize;
         let mut deleted_keys = Vec::new();
+        let mut partial = false;
         for object_key in cleanup.record.compacted_delta_keys.iter().take(max_deletes) {
+            if deadline.expired() {
+                partial = true;
+                break;
+            }
             if let Err(error) = checkpoint() {
                 delete_failures += 1;
                 log::warn!(
@@ -2113,6 +2146,7 @@ where
             deleted_objects,
             delete_failures,
             deleted_keys,
+            partial,
         }
     }
 
@@ -2984,6 +3018,28 @@ struct CoverageIndexV2CleanupScan {
     get_operations: usize,
 }
 
+struct CoverageIndexV2CleanupArgs<'a> {
+    chain: &'a ChainIdentity,
+    deadline: CoverageIndexV2CleanupDeadline,
+    checkpoint: &'a dyn Fn() -> Result<(), DatalensError>,
+    operation_budget: &'a mut CompactionOperationBudget,
+    cleanup_scan: Option<CoverageIndexV2CleanupScan>,
+    max_delta_deletes: Option<usize>,
+    report: &'a mut CoverageIndexV2CompactionReport,
+}
+
+#[derive(Clone, Copy)]
+struct CoverageIndexV2CleanupDeadline {
+    tick_started: Instant,
+    max_duration: Duration,
+}
+
+impl CoverageIndexV2CleanupDeadline {
+    fn expired(self) -> bool {
+        self.tick_started.elapsed() >= self.max_duration
+    }
+}
+
 #[derive(Clone, Debug)]
 struct CompactionCursorUpdate {
     scope_cursor_key: String,
@@ -3615,6 +3671,7 @@ struct CoverageIndexV2DeltaCleanup {
     deleted_objects: usize,
     delete_failures: usize,
     deleted_keys: Vec<String>,
+    partial: bool,
 }
 
 fn coverage_index_v2_fragmentation_report<S>(
