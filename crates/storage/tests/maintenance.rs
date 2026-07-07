@@ -3375,6 +3375,54 @@ fn test_empty_coverage_writes_do_not_enqueue_compaction_work() {
 }
 
 #[test]
+fn test_compaction_cleanup_deletes_legacy_empty_coverage_queue_entries() {
+    let storage = LocalStorage::new(temp_storage_root("legacy-empty-coverage-queue-cleanup"));
+    let chain = test_chain();
+    write_empty_coverage(&storage, &chain, 108, FinalityLevel::Safe);
+    let segment_key = manifest_segment_keys(&storage, &chain)
+        .into_iter()
+        .next()
+        .expect("manifest segment");
+    let segment_bytes = storage
+        .object_store()
+        .get(&segment_key)
+        .expect("manifest segment bytes");
+    let segment: serde_json::Value = serde_json::from_slice(&segment_bytes).expect("manifest json");
+    let queue_key = format!(
+        "chains/{}/metadata/compaction-queue/evm.blocks/block/all/safe/00000000000000000108-00000000000000000108.json",
+        chain.key_prefix()
+    );
+    let queue_entry = serde_json::json!({
+        "schema_version": 1,
+        "segment_key": segment_key,
+        "entry": segment["entries"][0],
+        "enqueued_at_unix_seconds": 0
+    });
+    storage
+        .object_store()
+        .put(
+            &queue_key,
+            &serde_json::to_vec_pretty(&queue_entry).expect("queue entry bytes"),
+        )
+        .expect("write legacy queue entry");
+
+    let report = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                cleanup_enabled: true,
+                delete_source_objects: false,
+                max_deletes_per_tick: 8,
+                ..MaintenanceCompactionConfig::default()
+            },
+        )
+        .expect("queue cleanup");
+
+    assert_eq!(report.processed_candidates, 0);
+    assert_eq!(queue_keys(&storage, &chain), Vec::<String>::new());
+}
+
+#[test]
 fn test_compaction_cleanup_deletes_stale_queue_entries_for_missing_manifest_segments() {
     let storage = LocalStorage::new(temp_storage_root("queue-cleanup-missing-segment"));
     let chain = test_chain();
