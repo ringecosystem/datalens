@@ -1594,6 +1594,10 @@ where
             chain,
             next_priority,
             config.coverage_index_v2_delta_count_threshold,
+            CoverageIndexV2CleanupDeadline {
+                tick_started,
+                max_duration,
+            },
         )?;
         let mut cursor_advances = BTreeMap::<String, String>::new();
         let mut partial = cleanup_partial || bucket_scan.partial;
@@ -1793,6 +1797,7 @@ where
         chain: &ChainIdentity,
         priority: CoverageIndexV2ScanPriority,
         delta_count_threshold: usize,
+        deadline: CoverageIndexV2CleanupDeadline,
     ) -> Result<CoverageIndexV2BucketScan, DatalensError> {
         let prefix = format!("chains/{}/coverage-index-v2/deltas", chain.key_prefix());
         let semantic_evm_logs_prefix = format!("{prefix}/semantic/evm.logs");
@@ -1815,6 +1820,10 @@ where
         let mut empty_cursor_advances = Vec::new();
         let mut partial = false;
         for (scan_prefix, cursor_key, skip_semantic_evm_logs) in scan_prefixes {
+            if deadline.expired() {
+                partial = true;
+                break;
+            }
             let cursor = self.read_compaction_cursor_key(&cursor_key)?;
             let strict_prefix = format!("{scan_prefix}/");
             let mut list_page = self.object_store().list_page(
@@ -1822,6 +1831,10 @@ where
                 cursor.next_segment_key.as_deref(),
                 COVERAGE_INDEX_V2_LIST_PAGE_SIZE,
             )?;
+            if deadline.expired() {
+                partial = true;
+                break;
+            }
             if list_page.objects.is_empty()
                 && cursor.next_segment_key.is_some()
                 && !list_page.has_more
@@ -1831,6 +1844,10 @@ where
                     None,
                     COVERAGE_INDEX_V2_LIST_PAGE_SIZE,
                 )?;
+                if deadline.expired() {
+                    partial = true;
+                    break;
+                }
             }
             let mut had_buckets = false;
             let mut bucket_delta_counts = BTreeMap::<CoverageIndexV2Bucket, usize>::new();

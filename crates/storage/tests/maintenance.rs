@@ -65,6 +65,13 @@ struct CountingOperationStore {
 }
 
 #[derive(Clone, Debug)]
+struct SlowCoverageIndexV2ListPageStore {
+    inner: LocalObjectStore,
+    delay: Duration,
+    list_pages: Arc<AtomicUsize>,
+}
+
+#[derive(Clone, Debug)]
 struct SiblingPrefixListStore {
     inner: LocalObjectStore,
 }
@@ -193,6 +200,20 @@ impl CountingOperationStore {
 
     fn reset_gets(&self) {
         self.gets.lock().expect("gets").clear();
+    }
+}
+
+impl SlowCoverageIndexV2ListPageStore {
+    fn new(root: PathBuf, delay: Duration) -> Self {
+        Self {
+            inner: LocalObjectStore::new(root),
+            delay,
+            list_pages: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn list_page_count(&self) -> usize {
+        self.list_pages.load(Ordering::SeqCst)
     }
 }
 
@@ -610,6 +631,53 @@ impl ObjectStore for CountingOperationStore {
 
     fn delete(&self, key: &str) -> Result<(), DatalensError> {
         self.deletes.lock().expect("deletes").push(key.to_owned());
+        self.inner.delete(key)
+    }
+
+    fn lock_namespace(&self) -> String {
+        self.inner.lock_namespace()
+    }
+}
+
+impl ObjectStore for SlowCoverageIndexV2ListPageStore {
+    fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError> {
+        self.inner.get(key)
+    }
+
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
+        self.inner.put(key, bytes)
+    }
+
+    fn put_if_absent(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<ObjectPutIfAbsentResult, DatalensError> {
+        self.inner.put_if_absent(key, bytes)
+    }
+
+    fn exists(&self, key: &str) -> Result<bool, DatalensError> {
+        self.inner.exists(key)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
+        self.inner.list(prefix)
+    }
+
+    fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ObjectListPage, DatalensError> {
+        if prefix.contains("/coverage-index-v2/deltas") {
+            self.list_pages.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(self.delay);
+        }
+        self.inner.list_page(prefix, start_after, limit)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), DatalensError> {
         self.inner.delete(key)
     }
 
@@ -4637,6 +4705,35 @@ fn test_compaction_coverage_index_v2_budget_carries_into_dataset_compaction() {
     assert_eq!(report.coverage_index_v2_compacted_deltas, 5);
     assert_eq!(report.processed_candidates, 0);
     assert_eq!(report.put_operations, 3);
+    assert_eq!(report.tick_status, MaintenanceCompactionTickStatus::Partial);
+}
+
+#[test]
+fn test_compaction_coverage_index_v2_bucket_scan_stops_at_tick_duration() {
+    let object_store = SlowCoverageIndexV2ListPageStore::new(
+        temp_storage_root("coverage-v2-bucket-scan-duration"),
+        Duration::from_millis(60),
+    );
+    let storage = DurableStorage::from_object_store(object_store.clone());
+    let chain = test_chain();
+    let scope = "exact/evm.blocks/block/all/safe";
+    write_coverage_index_v2_delta(&storage, &chain, scope, 0, 99_999, "delta-a");
+    write_coverage_index_v2_delta(&storage, &chain, scope, 0, 99_999, "delta-b");
+    write_coverage_index_v2_delta(&storage, &chain, scope, 0, 99_999, "delta-c");
+
+    let report = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                cleanup_enabled: false,
+                coverage_index_v2_delta_count_threshold: 3,
+                max_tick_duration_ms: 50,
+                ..MaintenanceCompactionConfig::default()
+            },
+        )
+        .expect("slow bucket scan should stop at tick duration");
+
+    assert_eq!(object_store.list_page_count(), 1);
     assert_eq!(report.tick_status, MaintenanceCompactionTickStatus::Partial);
 }
 
