@@ -1214,6 +1214,7 @@ fn build_tron_service_with_storage(
         .with_durable_writer(service.durable_writer())
         .with_runtime_config(WarmupRuntimeConfig {
             max_fetches_per_task_loop: config.warmup.max_fetches_per_loop,
+            max_durable_intents_per_task_loop: config.warmup.max_durable_intents_per_loop,
             ..WarmupRuntimeConfig::default()
         })
         .with_follow_query_lookahead_blocks(config.warmup.follow_query_lookahead_blocks)
