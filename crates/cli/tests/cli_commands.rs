@@ -1160,6 +1160,7 @@ fn test_config_parses_warmup_follow_query_lookahead() {
         max_per_chain_tasks = 1
         max_fetches_per_loop = 1
         max_durable_intents_per_loop = 3
+        max_pending_warmup_durable_intents_per_chain = 7
         follow_query_lookahead_blocks = 2048
         follow_query_start_offset_blocks = 512
         follow_query_start_offset_tiers_blocks = [5000, 3000, 1000]
@@ -1195,6 +1196,10 @@ fn test_config_parses_warmup_follow_query_lookahead() {
 
     assert_eq!(config.warmup.follow_query_lookahead_blocks, 2048);
     assert_eq!(config.warmup.max_durable_intents_per_loop, 3);
+    assert_eq!(
+        config.warmup.max_pending_warmup_durable_intents_per_chain,
+        Some(7)
+    );
     assert_eq!(config.warmup.follow_query_start_offset_blocks, Some(512));
     assert_eq!(
         config.warmup.follow_query_start_offset_tiers_blocks,
@@ -1251,6 +1256,65 @@ fn test_config_parses_warmup_follow_query_lookahead() {
         Some(60)
     );
     validate_config(&config).expect("warmup follow-query config is valid");
+}
+
+#[test]
+fn test_validate_config_rejects_zero_warmup_pending_durable_intents_per_chain() {
+    let config = toml::from_str::<DatalensConfig>(
+        r#"
+        [server]
+        bind = "127.0.0.1:0"
+
+        [storage]
+        backend = "local"
+
+        [storage.local]
+        root = ".tmp/datalens-cli-test"
+
+        [planner]
+        max_query_range_blocks = 100
+        default_chunk_range_blocks = 10
+
+        [writer]
+        target_object_bytes = 1024
+        min_object_rows = 1
+        record_empty_coverage = true
+
+        [warmup]
+        enabled = true
+        registry_path = ".tmp/datalens-warmup"
+        scheduler_interval_ms = 1000
+        max_global_tasks = 1
+        max_per_chain_tasks = 1
+        max_fetches_per_loop = 1
+        max_durable_intents_per_loop = 1
+        max_pending_warmup_durable_intents_per_chain = 0
+
+        [chains.ethereum]
+        kind = "evm"
+        chain_id = 1
+        rpc_urls = ["http://example.invalid"]
+
+        [chains.ethereum.datasets.blocks]
+        enabled = true
+        max_batch_blocks = 10
+
+        [chains.ethereum.datasets.logs]
+        enabled = true
+        max_get_logs_range_blocks = 10
+        max_addresses_per_query = 2
+        "#,
+    )
+    .expect("config parses");
+
+    let error = validate_config(&config).expect_err("zero pending warmup durable intents rejected");
+
+    assert_eq!(error.kind, DatalensErrorKind::InvalidInput);
+    assert!(
+        error
+            .message
+            .contains("warmup.max_pending_warmup_durable_intents_per_chain")
+    );
 }
 
 #[test]

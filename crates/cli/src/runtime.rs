@@ -1018,11 +1018,7 @@ fn build_evm_service_with_storage(
             durable_writer_config(&config.writer),
         )
         .with_durable_writer(service.durable_writer())
-        .with_runtime_config(WarmupRuntimeConfig {
-            max_fetches_per_task_loop: config.warmup.max_fetches_per_loop,
-            max_durable_intents_per_task_loop: config.warmup.max_durable_intents_per_loop,
-            ..WarmupRuntimeConfig::default()
-        })
+        .with_runtime_config(warmup_runtime_config(config))
         .with_follow_query_lookahead_blocks(config.warmup.follow_query_lookahead_blocks)
         .with_follow_query_start_offset_blocks(
             chain
@@ -1212,11 +1208,7 @@ fn build_tron_service_with_storage(
             durable_writer_config(&config.writer),
         )
         .with_durable_writer(service.durable_writer())
-        .with_runtime_config(WarmupRuntimeConfig {
-            max_fetches_per_task_loop: config.warmup.max_fetches_per_loop,
-            max_durable_intents_per_task_loop: config.warmup.max_durable_intents_per_loop,
-            ..WarmupRuntimeConfig::default()
-        })
+        .with_runtime_config(warmup_runtime_config(config))
         .with_follow_query_lookahead_blocks(config.warmup.follow_query_lookahead_blocks)
         .with_follow_query_start_offset_blocks(
             chain
@@ -1701,6 +1693,16 @@ fn cache_repair_runtime_config(config: &DatalensConfig) -> CacheRepairRuntimeCon
     }
 }
 
+fn warmup_runtime_config(config: &DatalensConfig) -> WarmupRuntimeConfig {
+    WarmupRuntimeConfig {
+        max_fetches_per_task_loop: config.warmup.max_fetches_per_loop,
+        max_durable_intents_per_task_loop: config.warmup.max_durable_intents_per_loop,
+        max_pending_warmup_durable_intents_per_chain: config
+            .warmup
+            .max_pending_warmup_durable_intents_per_chain,
+    }
+}
+
 fn follow_query_idle_threshold_blocks(config: &DatalensConfig, chain: &ChainConfig) -> Option<u64> {
     chain
         .warmup
@@ -1984,6 +1986,61 @@ mod tests {
         assert_eq!(
             compaction_lock_renew_interval(Duration::from_millis(90)),
             Duration::from_millis(30)
+        );
+    }
+
+    #[test]
+    fn warmup_runtime_config_uses_pending_durable_intent_limit() {
+        let config: DatalensConfig = toml::from_str(
+            r#"
+            [server]
+            bind = "127.0.0.1:0"
+
+            [storage]
+            backend = "local"
+
+            [storage.local]
+            root = ".tmp/datalens-cli-test"
+
+            [planner]
+            max_query_range_blocks = 1000
+            default_chunk_range_blocks = 100
+
+            [writer]
+            target_object_bytes = 1024
+            min_object_rows = 1
+            record_empty_coverage = true
+
+            [warmup]
+            enabled = true
+            max_fetches_per_loop = 2
+            max_durable_intents_per_loop = 3
+            max_pending_warmup_durable_intents_per_chain = 5
+
+            [chains.ethereum]
+            kind = "evm"
+            chain_id = 1
+            rpc_urls = ["http://example.invalid"]
+
+            [chains.ethereum.datasets.blocks]
+            enabled = true
+            max_batch_blocks = 10
+
+            [chains.ethereum.datasets.logs]
+            enabled = true
+            max_get_logs_range_blocks = 10
+            max_addresses_per_query = 2
+            "#,
+        )
+        .expect("config parses");
+
+        let runtime_config = warmup_runtime_config(&config);
+
+        assert_eq!(runtime_config.max_fetches_per_task_loop, 2);
+        assert_eq!(runtime_config.max_durable_intents_per_task_loop, 3);
+        assert_eq!(
+            runtime_config.max_pending_warmup_durable_intents_per_chain,
+            Some(5)
         );
     }
 
