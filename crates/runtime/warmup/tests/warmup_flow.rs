@@ -22,8 +22,9 @@ use datalens_solana::{SolanaAdapter, solana_all_selector};
 use datalens_storage::{
     CreateDurablePromotionIntent, DurablePromotionIntent, DurablePromotionIntentCreateOutcome,
     DurablePromotionIntentRepository, DurablePromotionIntentStatus, LocalObjectStore, LocalStorage,
-    ObjectStore, QueryActivity, QueryActivityKey, QueryActivityRepository, QueryActivityStore,
-    QueryWatermark, QueryWatermarkKey, QueryWatermarkRepository, QueryWatermarkStore,
+    Manifest, ObjectStore, QueryActivity, QueryActivityKey, QueryActivityRepository,
+    QueryActivityStore, QueryWatermark, QueryWatermarkKey, QueryWatermarkRepository,
+    QueryWatermarkStore, StorageRepository, StorageWriteOutcome, StorageWriteRequest,
 };
 use datalens_tron::{TronAdapter, tron_all_selector};
 use datalens_warmup::{
@@ -2758,6 +2759,33 @@ fn test_fetch_loop_bound_leaves_fixed_task_partial_until_next_run() {
     assert_eq!(second.status, WarmupRunStatus::Completed);
 }
 
+#[test]
+fn test_fixed_range_status_does_not_scan_full_target_range() {
+    let storage = RecordingStorage::new(LocalStorage::new(temp_root(
+        "fixed-range-status-bounded-storage",
+    )));
+    let registry = LocalWarmupRegistry::new(object_store("fixed-range-status-bounded-registry"));
+    let adapter = FixtureAdapter::new(100_000).with_max_range_len(10);
+    let runtime = WarmupRuntime::new(adapter, storage.clone(), registry.clone(), writer_config())
+        .with_runtime_config(WarmupRuntimeConfig {
+            max_fetches_per_task_loop: 1,
+        });
+    let task_id = registry
+        .submit(submit_request(Some(100_000), WarmupTaskMode::FixedRange))
+        .unwrap()
+        .task_id;
+
+    let result = runtime.run_task_once(&task_id).expect("warmup run");
+
+    assert_eq!(result.status, WarmupRunStatus::Partial);
+    let covered_ranges = storage.covered_range_requests();
+    assert!(!covered_ranges.is_empty());
+    assert!(
+        covered_ranges.iter().all(|range| range.len() <= 10),
+        "fixed range status should not scan beyond chunk size: {covered_ranges:?}"
+    );
+}
+
 fn runtime(
     adapter: FixtureAdapter,
     storage: LocalStorage,
@@ -3162,6 +3190,63 @@ struct RecordingIntentRepository {
 #[derive(Clone)]
 struct ExistingIntentRepository {
     status: DurablePromotionIntentStatus,
+}
+
+#[derive(Clone)]
+struct RecordingStorage {
+    inner: LocalStorage,
+    covered_range_requests: Arc<Mutex<Vec<LedgerRange>>>,
+}
+
+impl RecordingStorage {
+    fn new(inner: LocalStorage) -> Self {
+        Self {
+            inner,
+            covered_range_requests: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn covered_range_requests(&self) -> Vec<LedgerRange> {
+        self.covered_range_requests.lock().unwrap().clone()
+    }
+}
+
+impl StorageRepository for RecordingStorage {
+    fn manifest(&self) -> Result<Manifest, DatalensError> {
+        self.inner.manifest()
+    }
+
+    fn covered_ranges(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+    ) -> Result<Vec<LedgerRange>, DatalensError> {
+        self.covered_range_requests
+            .lock()
+            .unwrap()
+            .push(range.clone());
+        self.inner
+            .covered_ranges(chain, dataset_key, selector, range)
+    }
+
+    fn read_rows(
+        &self,
+        chain: &ChainIdentity,
+        dataset_key: &DatasetKey,
+        selector: &DatasetSelector,
+        range: LedgerRange,
+    ) -> Result<DatasetRows, DatalensError> {
+        self.inner.read_rows(chain, dataset_key, selector, range)
+    }
+
+    fn write_rows(
+        &self,
+        request: StorageWriteRequest<'_>,
+    ) -> Result<StorageWriteOutcome, DatalensError> {
+        self.inner.write_rows(request)
+    }
 }
 
 #[derive(Clone)]

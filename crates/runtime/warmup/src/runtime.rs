@@ -1477,8 +1477,8 @@ where
             PlannedWarmupTarget::Range { start, end } => (Some(*start), Some(*end), None),
             PlannedWarmupTarget::Noop(reason) => (None, None, Some((*reason).to_owned())),
         };
-        let published_coverage_end = match (planned_start, planned_end) {
-            (Some(start), Some(end)) => {
+        let published_coverage_end = match (task.mode, planned_start, planned_end) {
+            (WarmupTaskMode::FollowQuery, Some(start), Some(end)) => {
                 let range = LedgerRange::try_new(task.range_kind.clone(), start, end)?;
                 self.storage
                     .covered_ranges(&task.chain, &task.dataset_key, &task.selector, range)?
