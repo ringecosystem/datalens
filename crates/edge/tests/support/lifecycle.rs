@@ -429,6 +429,7 @@ fn warmup_pool_inner(
     )
     .with_runtime_config(WarmupRuntimeConfig {
         max_fetches_per_task_loop,
+        ..WarmupRuntimeConfig::default()
     });
     if let Some(recorder) = recorder {
         runtime = runtime.with_metrics(recorder);
@@ -464,6 +465,7 @@ where
     )
     .with_runtime_config(WarmupRuntimeConfig {
         max_fetches_per_task_loop: 4,
+        ..WarmupRuntimeConfig::default()
     });
     WarmupTaskPool::new(
         runtime,

@@ -43,6 +43,8 @@ pub const DEFAULT_WARMUP_STALE_RUNNING_TTL_MS: u64 = 30 * 60 * 1_000;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WarmupRuntimeConfig {
     pub max_fetches_per_task_loop: u64,
+    pub max_durable_intents_per_task_loop: u64,
+    pub max_pending_warmup_durable_intents_per_chain: Option<usize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -64,6 +66,8 @@ impl Default for WarmupRuntimeConfig {
     fn default() -> Self {
         Self {
             max_fetches_per_task_loop: u64::MAX,
+            max_durable_intents_per_task_loop: 1,
+            max_pending_warmup_durable_intents_per_chain: None,
         }
     }
 }
@@ -446,6 +450,17 @@ where
         let (target_start, target_end) = match target_plan {
             PlannedWarmupTarget::Range { start, end } => (start, end),
             PlannedWarmupTarget::Noop(_) => {
+                if task.mode == WarmupTaskMode::FixedRange
+                    && self.durable_intents.is_some()
+                    && !self.fixed_range_target_durable_covered(&task, safe_height.value)?
+                {
+                    return self.keep_fixed_range_durable_pending(
+                        task,
+                        &mut cursor,
+                        WarmupRunResult::default(),
+                        safe_height.value,
+                    );
+                }
                 if task.mode == WarmupTaskMode::FixedRange {
                     self.record_task_metric(&task, WarmupTaskOutcome::Completed);
                 }
@@ -459,6 +474,17 @@ where
             self.registry.save_cursor(&cursor)?;
         }
         if cursor.next > target_end {
+            if task.mode == WarmupTaskMode::FixedRange
+                && self.durable_intents.is_some()
+                && !self.fixed_range_target_durable_covered(&task, safe_height.value)?
+            {
+                return self.keep_fixed_range_durable_pending(
+                    task,
+                    &mut cursor,
+                    WarmupRunResult::default(),
+                    safe_height.value,
+                );
+            }
             if task.mode == WarmupTaskMode::FixedRange {
                 self.record_task_metric(&task, WarmupTaskOutcome::Completed);
             }
@@ -485,9 +511,12 @@ where
         let mut next = cursor.next;
         let mut uncommitted_staged_coverage_seen = false;
         let mut external_staged_coverage_seen = false;
+        let mut durable_intents_submitted = 0u64;
+        let durable_intent_budget = self.durable_intent_budget(&task);
 
         while next <= target_end
             && result.fetched_ranges < self.runtime_config.max_fetches_per_task_loop.max(1)
+            && (self.durable_intents.is_none() || durable_intents_submitted < durable_intent_budget)
         {
             if self.should_stop(task_id)? {
                 self.flush_pending_commits(
@@ -578,6 +607,9 @@ where
             }
 
             if self.durable_intents.is_some() {
+                if !self.can_submit_warmup_durable_intent(&task)? {
+                    break;
+                }
                 match self.submit_durable_intent(&task, &missing, safe_height.finality) {
                     Ok(DurableIntentSubmissionOutcome::AlreadyCompleted(_)) => {
                         if !uncommitted_staged_coverage_seen
@@ -611,11 +643,22 @@ where
                             });
                             continue;
                         }
+                        result.status = WarmupRunStatus::Partial;
+                        break;
                     }
                     Ok(
                         DurableIntentSubmissionOutcome::Submitted(_)
                         | DurableIntentSubmissionOutcome::AlreadyPending(_),
-                    ) => {}
+                    ) => {
+                        durable_intents_submitted += 1;
+                        result.status = WarmupRunStatus::Partial;
+                        if task.mode == WarmupTaskMode::FixedRange {
+                            cursor.mark_scheduled(chunk.clone(), unix_seconds_now()?);
+                            next = cursor.next;
+                        } else {
+                            next = chunk.end().saturating_add(1);
+                        }
+                    }
                     Ok(DurableIntentSubmissionOutcome::Failed(error)) | Err(error) => {
                         if error.is_retryable() {
                             self.mark_retryable_failure(&mut task, &mut cursor, chunk, &error)?;
@@ -625,19 +668,7 @@ where
                         return Err(error);
                     }
                 }
-                result.status = WarmupRunStatus::Partial;
-                task.state = WarmupTaskState::Queued;
-                task.touch(unix_seconds_now()?);
-                self.registry.save_task(&task)?;
-                self.registry.save_cursor(&cursor)?;
-                log_run_result(
-                    &task,
-                    &result,
-                    cursor.next,
-                    Some(target_end),
-                    "durable_intent_pending",
-                );
-                return Ok(result);
+                continue;
             }
 
             let fetched = match self.fetch_missing(&task, &missing) {
@@ -756,10 +787,11 @@ where
         task.stats.provider_calls += result.provider_calls;
         task.stats.rows_fetched += result.rows_fetched;
         task.touch(unix_seconds_now()?);
-        if uncommitted_staged_coverage_seen || next <= target_end {
+        if uncommitted_staged_coverage_seen || next <= target_end || durable_intents_submitted > 0 {
             task.state = WarmupTaskState::Queued;
             result.status = WarmupRunStatus::Partial;
             self.registry.save_task(&task)?;
+            self.registry.save_cursor(&cursor)?;
             log_run_result(
                 &task,
                 &result,
@@ -777,6 +809,94 @@ where
             "target_complete",
         );
         self.finish_or_stop(task, result)
+    }
+
+    fn keep_fixed_range_durable_pending(
+        &self,
+        mut task: WarmupTask,
+        cursor: &mut WarmupCursor,
+        mut result: WarmupRunResult,
+        safe_head: u64,
+    ) -> Result<WarmupRunResult, DatalensError> {
+        if let Some(first_missing) =
+            self.first_missing_fixed_range_durable_range(&task, safe_head)?
+        {
+            cursor.realign(first_missing.start(), unix_seconds_now()?);
+        }
+        task.state = WarmupTaskState::Queued;
+        task.touch(unix_seconds_now()?);
+        result.status = WarmupRunStatus::Partial;
+        self.registry.save_task(&task)?;
+        self.registry.save_cursor(cursor)?;
+        Ok(result)
+    }
+
+    fn first_missing_fixed_range_durable_range(
+        &self,
+        task: &WarmupTask,
+        safe_head: u64,
+    ) -> Result<Option<LedgerRange>, DatalensError> {
+        if task.mode != WarmupTaskMode::FixedRange {
+            return Ok(None);
+        }
+        let target_end = task.end.unwrap_or(task.start).min(safe_head);
+        if task.start > target_end {
+            return Ok(None);
+        }
+        let target = LedgerRange::try_new(task.range_kind.clone(), task.start, target_end)?;
+        let covered = self.storage.covered_ranges(
+            &task.chain,
+            &task.dataset_key,
+            &task.selector,
+            target.clone(),
+        )?;
+        Ok(missing_ranges(target, &covered).into_iter().next())
+    }
+
+    fn fixed_range_target_durable_covered(
+        &self,
+        task: &WarmupTask,
+        safe_head: u64,
+    ) -> Result<bool, DatalensError> {
+        if task.mode != WarmupTaskMode::FixedRange {
+            return Ok(false);
+        }
+        let target_end = task.end.unwrap_or(task.start).min(safe_head);
+        if task.start > target_end {
+            return Ok(true);
+        }
+        self.is_durable_covered(
+            task,
+            LedgerRange::try_new(task.range_kind.clone(), task.start, target_end)?,
+        )
+    }
+
+    fn durable_intent_budget(&self, task: &WarmupTask) -> u64 {
+        match task.mode {
+            WarmupTaskMode::FixedRange => {
+                self.runtime_config.max_durable_intents_per_task_loop.max(1)
+            }
+            WarmupTaskMode::FollowSafeHeight | WarmupTaskMode::FollowQuery => 1,
+        }
+    }
+
+    fn can_submit_warmup_durable_intent(&self, task: &WarmupTask) -> Result<bool, DatalensError> {
+        let Some(limit) = self
+            .runtime_config
+            .max_pending_warmup_durable_intents_per_chain
+        else {
+            return Ok(true);
+        };
+        let Some(repository) = &self.durable_intents else {
+            return Ok(true);
+        };
+        let backlog = repository.pending_backlog_for_chain(&task.chain, unix_seconds_now()?)?;
+        let pending = backlog
+            .into_iter()
+            .filter(|entry| entry.source == DurablePromotionIntentSource::Warmup)
+            .map(|entry| entry.pending_total)
+            .sum::<usize>();
+        Ok(pending < limit)
     }
 
     fn submit_durable_intent(

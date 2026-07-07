@@ -21,10 +21,11 @@ use datalens_planner::{FieldSelection, NativePlannerConfig, NativeQueryInput};
 use datalens_solana::{SolanaAdapter, solana_all_selector};
 use datalens_storage::{
     CreateDurablePromotionIntent, DurablePromotionIntent, DurablePromotionIntentCreateOutcome,
-    DurablePromotionIntentRepository, DurablePromotionIntentStatus, LocalObjectStore, LocalStorage,
-    Manifest, ObjectStore, QueryActivity, QueryActivityKey, QueryActivityRepository,
-    QueryActivityStore, QueryWatermark, QueryWatermarkKey, QueryWatermarkRepository,
-    QueryWatermarkStore, StorageRepository, StorageWriteOutcome, StorageWriteRequest,
+    DurablePromotionIntentRepository, DurablePromotionIntentStatus, DurablePromotionIntentStore,
+    LocalObjectStore, LocalStorage, Manifest, ObjectStore, QueryActivity, QueryActivityKey,
+    QueryActivityRepository, QueryActivityStore, QueryWatermark, QueryWatermarkKey,
+    QueryWatermarkRepository, QueryWatermarkStore, StorageRepository, StorageWriteOutcome,
+    StorageWriteRequest,
 };
 use datalens_tron::{TronAdapter, tron_all_selector};
 use datalens_warmup::{
@@ -526,7 +527,7 @@ fn test_warmup_fetches_evm_logs_in_chunks_and_writes_durable_cache() {
 }
 
 #[test]
-fn test_warmup_with_durable_intents_schedules_without_fetching_or_advancing_cursor() {
+fn test_warmup_with_durable_intents_schedules_without_fetching() {
     let adapter = FixtureAdapter::new(10).with_logs(vec![log_record(1, 0)]);
     let storage = LocalStorage::new(temp_root("intent-warmup-storage"));
     let registry = LocalWarmupRegistry::new(object_store("intent-warmup-registry"));
@@ -545,7 +546,7 @@ fn test_warmup_with_durable_intents_schedules_without_fetching_or_advancing_curs
         .load_cursor(&task_id)
         .expect("load cursor")
         .expect("cursor exists");
-    assert_eq!(cursor.next, 1);
+    assert_eq!(cursor.next, 4);
     let task = registry.get(&task_id).expect("load task").expect("task");
     assert_eq!(task.state, WarmupTaskState::Queued);
     let recorded = recorded.lock().expect("recorded intents");
@@ -611,6 +612,199 @@ fn test_warmup_with_completed_durable_intent_waits_for_visible_coverage() {
     assert_eq!(cursor.next, 1);
     let task = registry.get(&task_id).expect("load task").expect("task");
     assert_eq!(task.state, WarmupTaskState::Queued);
+}
+
+#[test]
+fn test_fixed_range_durable_intents_resume_after_scheduled_chunks() {
+    let adapter = FixtureAdapter::new(6).with_max_range_len(2);
+    let storage = LocalStorage::new(temp_root("intent-budget-storage"));
+    let registry = LocalWarmupRegistry::new(object_store("intent-budget-registry"));
+    let intents = RecordingIntentRepository::default();
+    let recorded = intents.recorded.clone();
+    let runtime = WarmupRuntime::new(adapter.clone(), storage, registry.clone(), writer_config())
+        .with_durable_intents(intents)
+        .with_runtime_config(WarmupRuntimeConfig {
+            max_durable_intents_per_task_loop: 2,
+            ..WarmupRuntimeConfig::default()
+        });
+    let task_id = registry
+        .submit(submit_request(Some(6), WarmupTaskMode::FixedRange))
+        .expect("submit")
+        .task_id;
+
+    let first = runtime.run_task_once(&task_id).expect("first warmup run");
+
+    assert_eq!(first.status, WarmupRunStatus::Partial);
+    assert!(adapter.fetches().is_empty());
+    assert_eq!(registry.load_cursor(&task_id).unwrap().unwrap().next, 5);
+    assert_eq!(
+        registry.get(&task_id).unwrap().unwrap().state,
+        WarmupTaskState::Queued
+    );
+    let second = runtime.run_task_once(&task_id).expect("second warmup run");
+
+    assert_eq!(second.status, WarmupRunStatus::Partial);
+    assert!(adapter.fetches().is_empty());
+    assert_eq!(registry.load_cursor(&task_id).unwrap().unwrap().next, 7);
+    assert_eq!(
+        registry.get(&task_id).unwrap().unwrap().state,
+        WarmupTaskState::Queued
+    );
+    let recorded = recorded.lock().expect("recorded intents");
+    assert_eq!(recorded.len(), 3);
+    assert_eq!(recorded[0].ranges, vec![blocks(1, 2)]);
+    assert_eq!(recorded[1].ranges, vec![blocks(3, 4)]);
+    assert_eq!(recorded[2].ranges, vec![blocks(5, 6)]);
+}
+
+#[test]
+fn test_fixed_range_durable_intents_do_not_complete_when_cursor_passed_target_without_coverage() {
+    let adapter = FixtureAdapter::new(4).with_max_range_len(2);
+    let storage = LocalStorage::new(temp_root("intent-full-budget-storage"));
+    let registry = LocalWarmupRegistry::new(object_store("intent-full-budget-registry"));
+    let intents = RecordingIntentRepository::default();
+    let recorded = intents.recorded.clone();
+    let runtime = WarmupRuntime::new(adapter.clone(), storage, registry.clone(), writer_config())
+        .with_durable_intents(intents)
+        .with_runtime_config(WarmupRuntimeConfig {
+            max_durable_intents_per_task_loop: 2,
+            ..WarmupRuntimeConfig::default()
+        });
+    let task_id = registry
+        .submit(submit_request(Some(4), WarmupTaskMode::FixedRange))
+        .expect("submit")
+        .task_id;
+
+    let first = runtime.run_task_once(&task_id).expect("first warmup run");
+
+    assert_eq!(first.status, WarmupRunStatus::Partial);
+    assert!(adapter.fetches().is_empty());
+    assert_eq!(registry.load_cursor(&task_id).unwrap().unwrap().next, 5);
+    let second = runtime.run_task_once(&task_id).expect("second warmup run");
+
+    assert_eq!(second.status, WarmupRunStatus::Partial);
+    assert!(adapter.fetches().is_empty());
+    assert_eq!(registry.load_cursor(&task_id).unwrap().unwrap().next, 1);
+    assert_eq!(
+        registry.get(&task_id).unwrap().unwrap().state,
+        WarmupTaskState::Queued
+    );
+    let recorded = recorded.lock().expect("recorded intents");
+    assert_eq!(recorded.len(), 2);
+    assert_eq!(recorded[0].ranges, vec![blocks(1, 2)]);
+    assert_eq!(recorded[1].ranges, vec![blocks(3, 4)]);
+}
+
+#[test]
+fn test_fixed_range_durable_intents_retry_uncovered_scheduled_gap_and_surface_terminal_failure() {
+    let adapter = FixtureAdapter::new(4).with_max_range_len(2);
+    let storage = LocalStorage::new(temp_root("intent-terminal-failure-storage"));
+    let registry = LocalWarmupRegistry::new(object_store("intent-terminal-failure-registry"));
+    let intents = DurablePromotionIntentStore::new(object_store("intent-terminal-failure-intents"));
+    let runtime = WarmupRuntime::new(adapter.clone(), storage, registry.clone(), writer_config())
+        .with_durable_intents(intents.clone())
+        .with_runtime_config(WarmupRuntimeConfig {
+            max_durable_intents_per_task_loop: 2,
+            ..WarmupRuntimeConfig::default()
+        });
+    let task_id = registry
+        .submit(submit_request(Some(4), WarmupTaskMode::FixedRange))
+        .expect("submit")
+        .task_id;
+
+    runtime.run_task_once(&task_id).expect("first warmup run");
+    assert_eq!(registry.load_cursor(&task_id).unwrap().unwrap().next, 5);
+    let first_intent = intents
+        .list_pending(u64::MAX, 10)
+        .expect("list pending")
+        .into_iter()
+        .find(|intent| intent.ranges == vec![blocks(1, 2)])
+        .expect("first range intent");
+    intents
+        .mark_terminal_failure(
+            &first_intent.intent_id,
+            "provider rejected historical range",
+            100,
+        )
+        .expect("mark terminal failure");
+
+    let waiting = runtime
+        .run_task_once(&task_id)
+        .expect("realign to missing range");
+    assert_eq!(waiting.status, WarmupRunStatus::Partial);
+    assert_eq!(registry.load_cursor(&task_id).unwrap().unwrap().next, 1);
+
+    let error = runtime
+        .run_task_once(&task_id)
+        .expect_err("terminal durable intent failure is surfaced");
+
+    assert_eq!(error.kind, DatalensErrorKind::Internal);
+    let task = registry.get(&task_id).unwrap().unwrap();
+    assert_eq!(task.state, WarmupTaskState::Failed);
+    assert_eq!(registry.load_cursor(&task_id).unwrap().unwrap().next, 1);
+}
+
+#[test]
+fn test_follow_query_durable_intents_remain_single_intent_per_run() {
+    let root = temp_root("follow-query-intent-budget-storage");
+    let storage = LocalStorage::new(&root);
+    let watermarks = QueryWatermarkStore::new(LocalObjectStore::new(&root));
+    let registry = LocalWarmupRegistry::new(object_store("follow-query-intent-budget-registry"));
+    let adapter = FixtureAdapter::new(1_010).with_max_range_len(1);
+    let intents = RecordingIntentRepository::default();
+    let recorded = intents.recorded.clone();
+    let runtime = WarmupRuntime::new(adapter.clone(), storage, registry.clone(), writer_config())
+        .with_durable_intents(intents)
+        .with_query_watermarks(watermarks.clone())
+        .with_follow_query_start_offset_blocks(Some(1))
+        .with_follow_query_lookahead_blocks(2)
+        .with_runtime_config(WarmupRuntimeConfig {
+            max_durable_intents_per_task_loop: 2,
+            ..WarmupRuntimeConfig::default()
+        });
+    let task_id = registry
+        .submit(follow_query_request())
+        .expect("submit follow query")
+        .task_id;
+    save_query_watermark(&watermarks, 1_000);
+
+    let result = runtime.run_task_once(&task_id).expect("warmup run");
+
+    assert_eq!(result.status, WarmupRunStatus::Partial);
+    assert!(adapter.fetches().is_empty());
+    assert_eq!(registry.load_cursor(&task_id).unwrap().unwrap().next, 1_001);
+    let recorded = recorded.lock().expect("recorded intents");
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].ranges, vec![blocks(1_001, 1_001)]);
+}
+
+#[test]
+fn test_follow_safe_height_durable_intents_remain_single_intent_per_run() {
+    let adapter = FixtureAdapter::new(4).with_max_range_len(1);
+    let storage = LocalStorage::new(temp_root("follow-safe-height-intent-budget-storage"));
+    let registry =
+        LocalWarmupRegistry::new(object_store("follow-safe-height-intent-budget-registry"));
+    let intents = RecordingIntentRepository::default();
+    let recorded = intents.recorded.clone();
+    let runtime = WarmupRuntime::new(adapter.clone(), storage, registry.clone(), writer_config())
+        .with_durable_intents(intents)
+        .with_runtime_config(WarmupRuntimeConfig {
+            max_durable_intents_per_task_loop: 2,
+            ..WarmupRuntimeConfig::default()
+        });
+    let task_id = registry
+        .submit(submit_request(None, WarmupTaskMode::FollowSafeHeight))
+        .expect("submit follow safe height")
+        .task_id;
+
+    let result = runtime.run_task_once(&task_id).expect("warmup run");
+
+    assert_eq!(result.status, WarmupRunStatus::Partial);
+    assert!(adapter.fetches().is_empty());
+    assert_eq!(registry.load_cursor(&task_id).unwrap().unwrap().next, 1);
+    let recorded = recorded.lock().expect("recorded intents");
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].ranges, vec![blocks(1, 1)]);
 }
 
 #[test]
@@ -1061,6 +1255,7 @@ fn test_query_watermark_does_not_directly_update_warmup_cursor() {
         .with_follow_query_lookahead_blocks(0)
         .with_runtime_config(WarmupRuntimeConfig {
             max_fetches_per_task_loop: 1,
+            ..WarmupRuntimeConfig::default()
         });
     let task_id = registry
         .submit(follow_query_request())
@@ -1121,6 +1316,7 @@ fn test_repeated_query_progress_moves_follow_query_target_forward() {
         .with_follow_query_lookahead_blocks(0)
         .with_runtime_config(WarmupRuntimeConfig {
             max_fetches_per_task_loop: 10,
+            ..WarmupRuntimeConfig::default()
         });
     let task_id = registry
         .submit(follow_query_request())
@@ -1168,6 +1364,7 @@ fn test_follow_query_at_watermark_uses_adaptive_lookahead_frontier() {
         .with_follow_query_lookahead_blocks(3)
         .with_runtime_config(WarmupRuntimeConfig {
             max_fetches_per_task_loop: 1,
+            ..WarmupRuntimeConfig::default()
         });
     let task_id = registry
         .submit(follow_query_request())
@@ -1210,6 +1407,7 @@ fn test_follow_query_cursor_behind_watermark_reanchors_to_adaptive_offset() {
         .with_follow_query_lookahead_blocks(3)
         .with_runtime_config(WarmupRuntimeConfig {
             max_fetches_per_task_loop: 1,
+            ..WarmupRuntimeConfig::default()
         });
     let task_id = registry
         .submit(follow_query_request())
@@ -1252,6 +1450,7 @@ fn test_follow_query_large_lookahead_fetches_past_next_runner_batch() {
         .with_follow_query_lookahead_blocks(100_000)
         .with_runtime_config(WarmupRuntimeConfig {
             max_fetches_per_task_loop: 1,
+            ..WarmupRuntimeConfig::default()
         });
     let mut request = follow_query_request();
     request.chunk_policy.max_range_len = 10_000;
@@ -1294,6 +1493,7 @@ fn test_follow_query_jumps_forward_when_query_nears_current_cursor() {
         .with_follow_query_lookahead_blocks(3)
         .with_runtime_config(WarmupRuntimeConfig {
             max_fetches_per_task_loop: 1,
+            ..WarmupRuntimeConfig::default()
         });
     let task_id = registry
         .submit(follow_query_request())
@@ -1335,6 +1535,7 @@ fn test_follow_query_keeps_healthy_cursor_ahead_when_query_is_outside_catchup_th
         .with_follow_query_lookahead_blocks(3)
         .with_runtime_config(WarmupRuntimeConfig {
             max_fetches_per_task_loop: 1,
+            ..WarmupRuntimeConfig::default()
         });
     let task_id = registry
         .submit(follow_query_request())
@@ -1376,6 +1577,7 @@ fn test_follow_query_reanchors_far_ahead_cursor_to_adaptive_offset() {
         .with_follow_query_lookahead_blocks(3)
         .with_runtime_config(WarmupRuntimeConfig {
             max_fetches_per_task_loop: 1,
+            ..WarmupRuntimeConfig::default()
         });
     let task_id = registry
         .submit(follow_query_request())
@@ -1437,6 +1639,7 @@ fn test_follow_query_skips_existing_coverage_inside_lookahead_range() {
         .with_follow_query_lookahead_blocks(3)
         .with_runtime_config(WarmupRuntimeConfig {
             max_fetches_per_task_loop: 1,
+            ..WarmupRuntimeConfig::default()
         });
     let task_id = registry
         .submit(follow_query_request())
@@ -1473,6 +1676,7 @@ fn test_follow_query_fills_exact_missing_tail_before_watermark() {
         .with_follow_query_lookahead_blocks(1)
         .with_runtime_config(WarmupRuntimeConfig {
             max_fetches_per_task_loop: 1,
+            ..WarmupRuntimeConfig::default()
         });
     let mut request = follow_query_request();
     request.start = 11_123_762;
@@ -1527,6 +1731,7 @@ fn test_follow_query_uses_fresh_query_activity_before_monotonic_watermark() {
         .with_follow_query_lookahead_blocks(3)
         .with_runtime_config(WarmupRuntimeConfig {
             max_fetches_per_task_loop: 1,
+            ..WarmupRuntimeConfig::default()
         });
     let task_id = registry
         .submit(follow_query_request())
@@ -1562,6 +1767,7 @@ fn test_follow_query_falls_back_to_watermark_when_query_activity_is_stale() {
         .with_follow_query_lookahead_blocks(3)
         .with_runtime_config(WarmupRuntimeConfig {
             max_fetches_per_task_loop: 1,
+            ..WarmupRuntimeConfig::default()
         });
     let task_id = registry
         .submit(follow_query_request())
@@ -1833,6 +2039,7 @@ fn test_task_pool_prioritizes_active_follow_query_watermark() {
             .with_follow_query_lookahead_blocks(1)
             .with_runtime_config(WarmupRuntimeConfig {
                 max_fetches_per_task_loop: 1,
+                ..WarmupRuntimeConfig::default()
             }),
         WarmupSchedulerConfig {
             max_global_concurrent_tasks: 1,
@@ -1871,6 +2078,7 @@ fn test_task_pool_cancels_failed_duplicate_when_healthy_follow_query_exists() {
             .with_follow_query_lookahead_blocks(1)
             .with_runtime_config(WarmupRuntimeConfig {
                 max_fetches_per_task_loop: 1,
+                ..WarmupRuntimeConfig::default()
             }),
         WarmupSchedulerConfig {
             max_global_concurrent_tasks: 2,
@@ -1968,6 +2176,7 @@ fn test_task_pool_cancels_duplicate_follow_query_tasks() {
             .with_follow_query_lookahead_blocks(1)
             .with_runtime_config(WarmupRuntimeConfig {
                 max_fetches_per_task_loop: 1,
+                ..WarmupRuntimeConfig::default()
             }),
         WarmupSchedulerConfig {
             max_global_concurrent_tasks: 2,
@@ -2015,6 +2224,7 @@ fn test_task_pool_keeps_runnable_keeper_over_higher_cursor_paused_duplicate() {
             .with_follow_query_lookahead_blocks(1)
             .with_runtime_config(WarmupRuntimeConfig {
                 max_fetches_per_task_loop: 1,
+                ..WarmupRuntimeConfig::default()
             }),
         WarmupSchedulerConfig {
             max_global_concurrent_tasks: 2,
@@ -2068,6 +2278,7 @@ fn test_task_pool_does_not_reconcile_other_selectors_with_different_fingerprints
             .with_follow_query_lookahead_blocks(1)
             .with_runtime_config(WarmupRuntimeConfig {
                 max_fetches_per_task_loop: 1,
+                ..WarmupRuntimeConfig::default()
             }),
         WarmupSchedulerConfig {
             max_global_concurrent_tasks: 2,
@@ -2128,6 +2339,7 @@ fn test_ensure_keeps_cancelled_duplicate_from_replacing_keeper() {
             .with_follow_query_lookahead_blocks(1)
             .with_runtime_config(WarmupRuntimeConfig {
                 max_fetches_per_task_loop: 1,
+                ..WarmupRuntimeConfig::default()
             }),
         WarmupSchedulerConfig {
             max_global_concurrent_tasks: 2,
@@ -2256,6 +2468,7 @@ fn test_follow_query_near_head_moves_to_idle_without_provider_fetch() {
             .with_follow_query_lookahead_blocks(1)
             .with_runtime_config(WarmupRuntimeConfig {
                 max_fetches_per_task_loop: 1,
+                ..WarmupRuntimeConfig::default()
             }),
         WarmupSchedulerConfig {
             max_global_concurrent_tasks: 1,
@@ -2303,6 +2516,7 @@ fn test_follow_query_near_head_activity_does_not_idle_historical_backfill() {
             .with_follow_query_lookahead_blocks(1)
             .with_runtime_config(WarmupRuntimeConfig {
                 max_fetches_per_task_loop: 1,
+                ..WarmupRuntimeConfig::default()
             }),
         WarmupSchedulerConfig {
             max_global_concurrent_tasks: 1,
@@ -2373,6 +2587,7 @@ fn test_follow_query_near_head_activity_without_backfill_cursor_can_idle() {
             .with_follow_query_lookahead_blocks(1)
             .with_runtime_config(WarmupRuntimeConfig {
                 max_fetches_per_task_loop: 1,
+                ..WarmupRuntimeConfig::default()
             }),
         WarmupSchedulerConfig {
             max_global_concurrent_tasks: 1,
@@ -2412,6 +2627,7 @@ fn test_direct_idle_follow_query_below_resume_threshold_stops_without_fetch() {
         .with_follow_query_lookahead_blocks(1)
         .with_runtime_config(WarmupRuntimeConfig {
             max_fetches_per_task_loop: 1,
+            ..WarmupRuntimeConfig::default()
         });
     let task_id = registry
         .submit(follow_query_request())
@@ -2448,6 +2664,7 @@ fn test_direct_idle_follow_query_resumes_when_query_gap_grows() {
         .with_follow_query_lookahead_blocks(1)
         .with_runtime_config(WarmupRuntimeConfig {
             max_fetches_per_task_loop: 1,
+            ..WarmupRuntimeConfig::default()
         });
     let task_id = registry
         .submit(follow_query_request())
@@ -2484,6 +2701,7 @@ fn test_idle_follow_query_resumes_when_query_gap_grows() {
             .with_follow_query_lookahead_blocks(1)
             .with_runtime_config(WarmupRuntimeConfig {
                 max_fetches_per_task_loop: 1,
+                ..WarmupRuntimeConfig::default()
             }),
         WarmupSchedulerConfig {
             max_global_concurrent_tasks: 1,
@@ -2524,6 +2742,7 @@ fn test_task_pool_prioritizes_old_backfill_follow_query_before_near_head() {
             .with_follow_query_lookahead_blocks(1)
             .with_runtime_config(WarmupRuntimeConfig {
                 max_fetches_per_task_loop: 1,
+                ..WarmupRuntimeConfig::default()
             }),
         WarmupSchedulerConfig {
             max_global_concurrent_tasks: 1,
@@ -2651,6 +2870,7 @@ fn test_task_pool_rotates_between_low_lead_follow_query_tasks() {
             .with_follow_query_lookahead_blocks(1)
             .with_runtime_config(WarmupRuntimeConfig {
                 max_fetches_per_task_loop: 1,
+                ..WarmupRuntimeConfig::default()
             }),
         WarmupSchedulerConfig {
             max_global_concurrent_tasks: 1,
@@ -2737,6 +2957,7 @@ fn test_fetch_loop_bound_leaves_fixed_task_partial_until_next_run() {
     let runtime =
         runtime(adapter, storage, registry.clone()).with_runtime_config(WarmupRuntimeConfig {
             max_fetches_per_task_loop: 1,
+            ..WarmupRuntimeConfig::default()
         });
     let task_id = registry
         .submit(submit_request(Some(4), WarmupTaskMode::FixedRange))
@@ -2769,6 +2990,7 @@ fn test_fixed_range_status_does_not_scan_full_target_range() {
     let runtime = WarmupRuntime::new(adapter, storage.clone(), registry.clone(), writer_config())
         .with_runtime_config(WarmupRuntimeConfig {
             max_fetches_per_task_loop: 1,
+            ..WarmupRuntimeConfig::default()
         });
     let task_id = registry
         .submit(submit_request(Some(100_000), WarmupTaskMode::FixedRange))
