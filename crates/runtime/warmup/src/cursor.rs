@@ -39,6 +39,14 @@ impl WarmupCursor {
         self.updated_at = now;
     }
 
+    pub(crate) fn mark_scheduled(&mut self, range: LedgerRange, now: u64) {
+        self.next = range.end().saturating_add(1);
+        self.current_attempt = 0;
+        self.last_processed_range = Some(range);
+        self.last_error = None;
+        self.updated_at = now;
+    }
+
     pub(crate) fn realign(&mut self, next: u64, now: u64) {
         self.next = next;
         self.last_committed = None;

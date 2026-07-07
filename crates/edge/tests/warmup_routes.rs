@@ -236,6 +236,7 @@ async fn test_api_warmup_list_exposes_follow_query_status() {
             .with_follow_query_lookahead_blocks(3)
             .with_runtime_config(WarmupRuntimeConfig {
                 max_fetches_per_task_loop: 1,
+                ..WarmupRuntimeConfig::default()
             }),
             WarmupSchedulerConfig {
                 max_global_concurrent_tasks: 1,
@@ -347,6 +348,7 @@ async fn test_api_warmup_list_exposes_idle_follow_query_reason() {
             .with_follow_query_lookahead_blocks(3)
             .with_runtime_config(WarmupRuntimeConfig {
                 max_fetches_per_task_loop: 1,
+                ..WarmupRuntimeConfig::default()
             }),
             WarmupSchedulerConfig {
                 max_global_concurrent_tasks: 1,
@@ -1159,6 +1161,7 @@ fn shared_registry_warmup_pool(
         )
         .with_runtime_config(WarmupRuntimeConfig {
             max_fetches_per_task_loop: 4,
+            ..WarmupRuntimeConfig::default()
         }),
         WarmupSchedulerConfig {
             max_global_concurrent_tasks: 1,

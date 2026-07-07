@@ -217,6 +217,7 @@ pub(crate) fn warmup_pool_with_max_fetches(
     )
     .with_runtime_config(WarmupRuntimeConfig {
         max_fetches_per_task_loop,
+        ..WarmupRuntimeConfig::default()
     });
     WarmupTaskPool::new(
         runtime,

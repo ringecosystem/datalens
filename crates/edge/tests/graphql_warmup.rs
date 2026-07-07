@@ -304,6 +304,7 @@ async fn test_graphql_warmup_task_exposes_idle_follow_query_reason() {
             .with_follow_query_lookahead_blocks(3)
             .with_runtime_config(WarmupRuntimeConfig {
                 max_fetches_per_task_loop: 1,
+                ..WarmupRuntimeConfig::default()
             }),
             WarmupSchedulerConfig {
                 max_global_concurrent_tasks: 1,

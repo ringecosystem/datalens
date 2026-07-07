@@ -278,6 +278,7 @@ async fn test_service_wires_query_watermarks_into_follow_query_warmup() {
     .with_follow_query_lookahead_blocks(config.warmup.follow_query_lookahead_blocks)
     .with_runtime_config(WarmupRuntimeConfig {
         max_fetches_per_task_loop: 1,
+        ..WarmupRuntimeConfig::default()
     });
     let query = logs_request(20, 21);
 
@@ -556,6 +557,7 @@ fn warmup_pool(
     )
     .with_runtime_config(WarmupRuntimeConfig {
         max_fetches_per_task_loop: 4,
+        ..WarmupRuntimeConfig::default()
     });
     if let Some(metrics) = metrics {
         runtime = runtime.with_metrics(metrics);
