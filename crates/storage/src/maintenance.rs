@@ -2737,6 +2737,10 @@ where
             let manifest = decode_manifest_object(&queue_entry.segment_key, &segment_bytes)?;
             scanned_entries += manifest.entries.len();
             for entry in manifest.entries {
+                if entry.object_key.is_none() {
+                    stale_queue_entry_keys.push(object.key.clone());
+                    continue;
+                }
                 if base_entries
                     .iter()
                     .any(|base_entry| base_entry.shadows_segment(&entry))
