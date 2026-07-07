@@ -675,7 +675,7 @@ impl StorageCompactionWorker {
                             consecutive_failures = 0;
                             record_compaction_metrics(&metrics_recorders, &chain, &report);
                             log::info!(
-                                "storage compaction tick completed chain_key={} candidate_count={} candidate_backlog={} processed_candidates={} input_objects={} output_objects={} compacted_objects={} compacted_rows={} deleted_source_objects={} deleted_manifest_segments={} source_delete_failures={} pause_reason={} tick_status={} duration_ms={}",
+                                "storage compaction tick completed chain_key={} candidate_count={} candidate_backlog={} processed_candidates={} input_objects={} output_objects={} compacted_objects={} compacted_rows={} deleted_source_objects={} deleted_manifest_segments={} source_delete_failures={} coverage_index_v2_compacted_buckets={} coverage_index_v2_compacted_deltas={} coverage_index_v2_cleanup_records={} coverage_index_v2_deleted_deltas={} coverage_index_v2_delta_delete_failures={} pause_reason={} tick_status={} duration_ms={}",
                                 chain.key_prefix(),
                                 report.candidate_count,
                                 report.candidate_backlog,
@@ -687,6 +687,11 @@ impl StorageCompactionWorker {
                                 report.deleted_source_objects,
                                 report.tick_summary.deleted_manifest_segments,
                                 report.source_delete_failures,
+                                report.coverage_index_v2_compacted_buckets,
+                                report.coverage_index_v2_compacted_deltas,
+                                report.coverage_index_v2_cleanup_records,
+                                report.coverage_index_v2_deleted_deltas,
+                                report.coverage_index_v2_delta_delete_failures,
                                 report.pause_reason.as_deref().unwrap_or("none"),
                                 report.tick_status.as_str(),
                                 started.elapsed().as_millis()

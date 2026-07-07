@@ -4189,12 +4189,20 @@ fn test_compaction_coverage_index_v2_cleanup_scan_is_bounded() {
         write_coverage_index_v2_snapshot(&storage, &chain, "cleanup-snapshot", 1, Vec::new());
     write_coverage_index_v2_snapshot_head(&storage, &chain, "cleanup-head", 1, &snapshot_key);
     for index in 0..40 {
+        let delta = write_coverage_index_v2_delta(
+            &storage,
+            &chain,
+            "exact/evm.blocks/block/all/safe",
+            0,
+            99_999,
+            &format!("cleanup-delta-{index:02}"),
+        );
         write_coverage_index_v2_cleanup_record(
             &storage,
             &chain,
             &format!("cleanup-record-{index:02}"),
             &snapshot_key,
-            Vec::new(),
+            vec![delta],
         );
     }
 
@@ -4206,14 +4214,60 @@ fn test_compaction_coverage_index_v2_cleanup_scan_is_bounded() {
                 coverage_index_v2_delete_grace_ms: 0,
                 coverage_index_v2_delta_count_threshold: 3,
                 max_gets_per_tick: 128,
-                max_deletes_per_tick: 128,
+                max_deletes_per_tick: 256,
                 max_puts_per_tick: 16,
                 ..coverage_index_v2_compaction_config(true)
             },
         )
         .expect("cleanup scan should be bounded");
 
-    assert_eq!(report.get_operations, 32);
+    assert_eq!(report.get_operations, 80);
+    assert_eq!(report.coverage_index_v2_deleted_deltas, 40);
+}
+
+#[test]
+fn test_compaction_coverage_index_v2_cleanup_scan_uses_available_get_budget() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-v2-cleanup-scan-budget"));
+    let chain = test_chain();
+    let snapshot_key =
+        write_coverage_index_v2_snapshot(&storage, &chain, "cleanup-snapshot", 1, Vec::new());
+    write_coverage_index_v2_snapshot_head(&storage, &chain, "cleanup-head", 1, &snapshot_key);
+    for index in 0..80 {
+        let delta = write_coverage_index_v2_delta(
+            &storage,
+            &chain,
+            "exact/evm.blocks/block/all/safe",
+            0,
+            99_999,
+            &format!("cleanup-delta-{index:02}"),
+        );
+        write_coverage_index_v2_cleanup_record(
+            &storage,
+            &chain,
+            &format!("cleanup-record-{index:02}"),
+            &snapshot_key,
+            vec![delta],
+        );
+    }
+
+    let report = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                cleanup_enabled: true,
+                coverage_index_v2_delete_grace_ms: 0,
+                coverage_index_v2_delta_count_threshold: 3,
+                max_gets_per_tick: 256,
+                max_deletes_per_tick: 256,
+                max_puts_per_tick: 16,
+                ..coverage_index_v2_compaction_config(true)
+            },
+        )
+        .expect("cleanup scan should use available get budget");
+
+    assert_eq!(report.get_operations, 160);
+    assert_eq!(report.coverage_index_v2_deleted_deltas, 80);
+    assert_eq!(coverage_index_v2_cleanup_count(&storage, &chain), 0);
 }
 
 #[test]
