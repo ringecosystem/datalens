@@ -558,6 +558,7 @@ where
             chain: None,
             checkpoint: &|| Ok(()),
             coverage_index_v2_checked: false,
+            operation_budget: None,
         })
     }
 
@@ -614,12 +615,9 @@ where
                         chain: Some(chain),
                         checkpoint: &checkpoint,
                         coverage_index_v2_checked: true,
+                        operation_budget: Some(operation_budget),
                     })?;
-                merge_coverage_index_v2_report(
-                    &mut report,
-                    coverage_index_v2_report,
-                    operation_budget,
-                );
+                merge_coverage_index_v2_report(&mut report, coverage_index_v2_report);
                 return Ok(report);
             }
         }
@@ -635,6 +633,7 @@ where
                 chain: Some(chain),
                 checkpoint: &checkpoint,
                 coverage_index_v2_checked: true,
+                operation_budget: None,
             })?;
         Ok(report)
     }
@@ -889,6 +888,7 @@ where
             chain,
             checkpoint,
             coverage_index_v2_checked,
+            operation_budget,
         } = args;
         let build_started = Instant::now();
         let manifest_entries = entries
@@ -954,7 +954,8 @@ where
         let max_duration = Duration::from_millis(config.max_tick_duration_ms.max(1));
         let mut partial = scan_partial;
         let mut cleanup_incomplete = false;
-        let mut operation_budget = CompactionOperationBudget::new(config);
+        let mut operation_budget =
+            operation_budget.unwrap_or_else(|| CompactionOperationBudget::new(config));
         let mut coverage_index_v2_report = CoverageIndexV2CompactionReport::default();
 
         for candidate in &candidates {
@@ -2853,6 +2854,7 @@ struct CompactSelectedManifestEntriesArgs<'a> {
     chain: Option<&'a ChainIdentity>,
     checkpoint: &'a dyn Fn() -> Result<(), DatalensError>,
     coverage_index_v2_checked: bool,
+    operation_budget: Option<CompactionOperationBudget>,
 }
 
 #[derive(Clone, Debug)]
@@ -2979,17 +2981,7 @@ fn coverage_index_v2_only_compaction_report(
 fn merge_coverage_index_v2_report(
     report: &mut MaintenanceCompactionReport,
     coverage_index_v2_report: CoverageIndexV2CompactionReport,
-    operation_budget: CompactionOperationBudget,
 ) {
-    report.get_operations = report
-        .get_operations
-        .saturating_add(operation_budget.used_gets);
-    report.put_operations = report
-        .put_operations
-        .saturating_add(operation_budget.used_puts);
-    report.delete_operations = report
-        .delete_operations
-        .saturating_add(operation_budget.used_deletes);
     report.coverage_index_v2_compacted_buckets = report
         .coverage_index_v2_compacted_buckets
         .saturating_add(coverage_index_v2_report.compacted_buckets);

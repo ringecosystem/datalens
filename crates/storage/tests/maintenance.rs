@@ -4604,6 +4604,43 @@ fn test_compaction_coverage_index_v2_slow_cleanup_does_not_block_compaction() {
 }
 
 #[test]
+fn test_compaction_coverage_index_v2_budget_carries_into_dataset_compaction() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-v2-budget-carries-into-dataset"));
+    let chain = test_chain();
+    let scope = "exact/evm.blocks/block/all/safe";
+    write_coverage_index_v2_delta(&storage, &chain, scope, 0, 99_999, "delta-a");
+    write_coverage_index_v2_delta(&storage, &chain, scope, 0, 99_999, "delta-b");
+    write_coverage_index_v2_delta(&storage, &chain, scope, 0, 99_999, "delta-c");
+    write_block_object(&storage, &chain, 10, FinalityLevel::Safe);
+    write_block_object(&storage, &chain, 11, FinalityLevel::Safe);
+
+    let report = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                min_object_bytes: u64::MAX,
+                max_input_objects_per_candidate: 8,
+                max_tick_duration_ms: 30_000,
+                max_candidates_per_tick: 8,
+                max_manifest_entries_per_tick: 20_000,
+                cleanup_enabled: true,
+                coverage_index_v2_delete_grace_ms: 0,
+                coverage_index_v2_delta_count_threshold: 3,
+                max_gets_per_tick: 16,
+                max_puts_per_tick: 4,
+                ..MaintenanceCompactionConfig::default()
+            },
+        )
+        .expect("compact coverage v2 before dataset work");
+
+    assert_eq!(report.coverage_index_v2_compacted_buckets, 1);
+    assert_eq!(report.coverage_index_v2_compacted_deltas, 5);
+    assert_eq!(report.processed_candidates, 0);
+    assert_eq!(report.put_operations, 3);
+    assert_eq!(report.tick_status, MaintenanceCompactionTickStatus::Partial);
+}
+
+#[test]
 fn test_compaction_coverage_index_v2_cleanup_stops_at_tick_duration() {
     let storage = LocalStorage::new(temp_storage_root("coverage-v2-cleanup-duration"));
     let chain = test_chain();
