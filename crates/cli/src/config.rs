@@ -462,6 +462,16 @@ fn validate_warmup_config(config: &DatalensConfig) -> Result<(), DatalensError> 
             "warmup.max_durable_intents_per_loop must be greater than zero",
         ));
     }
+    if config
+        .warmup
+        .max_pending_warmup_durable_intents_per_chain
+        .is_some_and(|limit| limit == 0)
+    {
+        return Err(DatalensError::new(
+            DatalensErrorKind::InvalidInput,
+            "warmup.max_pending_warmup_durable_intents_per_chain must be greater than zero when set",
+        ));
+    }
     if config.warmup.query_activity_ttl_seconds == 0 {
         return Err(DatalensError::new(
             DatalensErrorKind::InvalidInput,
