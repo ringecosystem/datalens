@@ -157,6 +157,7 @@ struct CoverageIndexV2BucketReadCacheEntry {
     inserted_at: Instant,
     dirty: bool,
     has_index: bool,
+    snapshot_head_key: Option<String>,
     delta_objects: Vec<ObjectMetadata>,
     entries: Vec<ManifestEntry>,
 }
@@ -385,16 +386,18 @@ where
     S: ObjectStore,
 {
     let cache_key = coverage_index_v2_bucket_read_cache_key(object_store, bucket);
-    if let Some(cached) = get_fresh_cached_v2_bucket_entries(&cache_key) {
+    if let Some(cached) = get_fresh_cached_v2_bucket_entries(&cache_key)
+        && cached_v2_bucket_entries_are_present(object_store, &cached)?
+    {
         entries.extend(cached.entries);
         return Ok(cached.has_index);
     }
     let mut any_bucket_has_index = false;
     let mut compacted_delta_keys = BTreeSet::new();
     let mut start_after_delta_key = None;
-    let mut snapshot_head = latest_v2_snapshot_head(object_store, bucket)?;
+    let mut snapshot_head = latest_v2_snapshot_head_object(object_store, bucket)?;
     let mut snapshot = None;
-    if let Some(head) = snapshot_head.as_ref() {
+    if let Some((_, head)) = snapshot_head.as_ref() {
         // Snapshot heads written by the v2 compactor use this as a compacted
         // prefix watermark: all delta objects at or below the key are already
         // represented in the snapshot. Older heads left it empty, which keeps
@@ -408,6 +411,7 @@ where
         }
         any_bucket_has_index = true;
     }
+    let snapshot_head_key = snapshot_head.as_ref().map(|(key, _)| key.clone());
 
     let delta_objects = list_v2_delta_object_metadata_for_bucket(
         object_store,
@@ -418,13 +422,14 @@ where
     )?;
     let (mut bucket_entries, remaining_delta_objects) = if let Some(cached) =
         get_cached_v2_bucket_entries(&cache_key)
+        && !cached.dirty
         && object_metadata_prefix_matches(&cached.delta_objects, &delta_objects)
     {
         any_bucket_has_index = cached.has_index;
         (cached.entries, &delta_objects[cached.delta_objects.len()..])
     } else {
         let mut bucket_entries = Vec::new();
-        if let Some(head) = snapshot_head.take() {
+        if let Some((_, head)) = snapshot_head.take() {
             let mut loaded_snapshot = match snapshot {
                 Some(snapshot) => snapshot,
                 None => read_v2_snapshot(object_store, bucket, &head.snapshot_key)?,
@@ -447,6 +452,7 @@ where
     put_cached_v2_bucket_entries(
         cache_key,
         any_bucket_has_index,
+        snapshot_head_key,
         delta_objects,
         bucket_entries.clone(),
     );
@@ -667,9 +673,23 @@ fn get_fresh_cached_v2_bucket_entries(key: &str) -> Option<CoverageIndexV2Bucket
     (!cached.dirty).then_some(cached)
 }
 
+fn cached_v2_bucket_entries_are_present<S>(
+    object_store: &S,
+    cached: &CoverageIndexV2BucketReadCacheEntry,
+) -> Result<bool, DatalensError>
+where
+    S: ObjectStore,
+{
+    let Some(last_delta_object) = cached.delta_objects.last() else {
+        return Ok(true);
+    };
+    object_store.exists(&last_delta_object.key)
+}
+
 fn put_cached_v2_bucket_entries(
     key: String,
     has_index: bool,
+    snapshot_head_key: Option<String>,
     delta_objects: Vec<ObjectMetadata>,
     entries: Vec<ManifestEntry>,
 ) {
@@ -694,10 +714,121 @@ fn put_cached_v2_bucket_entries(
             inserted_at: now,
             dirty: false,
             has_index,
+            snapshot_head_key,
             delta_objects,
             entries,
         },
     );
+}
+
+fn append_cached_v2_bucket_delta<S>(
+    object_store: &S,
+    bucket: &CoverageIndexV2Bucket,
+    delta_key: String,
+    delta: &CoverageIndexV2Delta,
+) where
+    S: ObjectStore,
+{
+    let key = coverage_index_v2_bucket_read_cache_key(object_store, bucket);
+    if !bucket.scope.contains("evm.logs") || delta.replacement.is_some() {
+        mark_cached_v2_bucket_entries_dirty(object_store, bucket);
+        return;
+    }
+    let now = Instant::now();
+    let (snapshot_head_key, last_cached_delta_key) = {
+        let Ok(mut cache) = coverage_index_v2_bucket_read_cache().lock() else {
+            return;
+        };
+        let Some(entry) = cache.get_mut(&key) else {
+            return;
+        };
+        if now.duration_since(entry.inserted_at) > COVERAGE_INDEX_V2_BUCKET_READ_CACHE_TTL {
+            cache.remove(&key);
+            return;
+        }
+        if !entry.has_index {
+            entry.dirty = true;
+            return;
+        }
+        let Some(last_cached_delta) = entry.delta_objects.last() else {
+            entry.dirty = true;
+            return;
+        };
+        (
+            entry.snapshot_head_key.clone(),
+            last_cached_delta.key.clone(),
+        )
+    };
+    let latest_snapshot_head_key = match latest_v2_snapshot_head_object(object_store, bucket) {
+        Ok(head) => head.map(|(key, _)| key),
+        Err(_) => {
+            mark_cached_v2_bucket_entries_dirty(object_store, bucket);
+            return;
+        }
+    };
+    if snapshot_head_key != latest_snapshot_head_key {
+        mark_cached_v2_bucket_entries_dirty(object_store, bucket);
+        return;
+    }
+    match object_store.exists(&last_cached_delta_key) {
+        Ok(true) => {}
+        Ok(false) | Err(_) => {
+            mark_cached_v2_bucket_entries_dirty(object_store, bucket);
+            return;
+        }
+    }
+    let new_delta_objects = match list_v2_delta_object_metadata_for_bucket(
+        object_store,
+        bucket,
+        &BTreeSet::new(),
+        Some(2),
+        Some(&last_cached_delta_key),
+    ) {
+        Ok(objects) => objects,
+        Err(_) => {
+            mark_cached_v2_bucket_entries_dirty(object_store, bucket);
+            return;
+        }
+    };
+    let [new_delta_object] = new_delta_objects.as_slice() else {
+        mark_cached_v2_bucket_entries_dirty(object_store, bucket);
+        return;
+    };
+    if new_delta_object.key != delta_key {
+        mark_cached_v2_bucket_entries_dirty(object_store, bucket);
+        return;
+    }
+    let Ok(mut cache) = coverage_index_v2_bucket_read_cache().lock() else {
+        return;
+    };
+    let Some(entry) = cache.get_mut(&key) else {
+        return;
+    };
+    if now.duration_since(entry.inserted_at) > COVERAGE_INDEX_V2_BUCKET_READ_CACHE_TTL {
+        cache.remove(&key);
+        return;
+    }
+    if entry.dirty
+        || !entry.has_index
+        || entry.snapshot_head_key != snapshot_head_key
+        || entry
+            .delta_objects
+            .last()
+            .is_none_or(|object| object.key != last_cached_delta_key)
+    {
+        entry.dirty = true;
+        return;
+    }
+    entry.entries.extend(delta.entries.iter().cloned());
+    entry.delta_objects.push(new_delta_object.clone());
+    entry
+        .delta_objects
+        .sort_by(|left, right| left.key.cmp(&right.key));
+    entry
+        .delta_objects
+        .dedup_by(|left, right| left.key == right.key);
+    entry.has_index = true;
+    entry.dirty = false;
 }
 
 fn mark_cached_v2_bucket_entries_dirty<S>(object_store: &S, bucket: &CoverageIndexV2Bucket)
@@ -840,10 +971,19 @@ pub(crate) fn latest_v2_snapshot_head<S>(
 where
     S: ObjectStore,
 {
+    Ok(latest_v2_snapshot_head_object(object_store, bucket)?.map(|(_, head)| head))
+}
+
+fn latest_v2_snapshot_head_object<S>(
+    object_store: &S,
+    bucket: &CoverageIndexV2Bucket,
+) -> Result<Option<(String, CoverageIndexV2SnapshotHead)>, DatalensError>
+where
+    S: ObjectStore,
+{
     Ok(list_v2_snapshot_heads_for_bucket(object_store, bucket)?
         .into_iter()
-        .last()
-        .map(|(_, head)| head))
+        .last())
 }
 
 fn list_v2_snapshot_heads_for_bucket<S>(
@@ -1184,7 +1324,7 @@ where
                 format!("write coverage index v2 delta {key}: {}", error.message),
             )
         })?;
-        mark_cached_v2_bucket_entries_dirty(object_store, &bucket);
+        append_cached_v2_bucket_delta(object_store, &bucket, key, &delta);
     }
     Ok(())
 }
@@ -2605,6 +2745,7 @@ mod tests {
         max_in_flight: Arc<std::sync::atomic::AtomicUsize>,
         delta_gets: Arc<std::sync::atomic::AtomicUsize>,
         list_pages: Arc<std::sync::atomic::AtomicUsize>,
+        delta_list_pages: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl DelayedV2DeltaGetObjectStore {
@@ -2615,6 +2756,7 @@ mod tests {
                 max_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 delta_gets: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 list_pages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                delta_list_pages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             }
         }
 
@@ -2628,6 +2770,11 @@ mod tests {
 
         fn list_pages(&self) -> usize {
             self.list_pages.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn delta_list_pages(&self) -> usize {
+            self.delta_list_pages
+                .load(std::sync::atomic::Ordering::SeqCst)
         }
 
         fn delay_v2_delta_get(&self, key: &str) {
@@ -2752,6 +2899,10 @@ mod tests {
         ) -> Result<crate::ObjectListPage, DatalensError> {
             if prefix.contains("/coverage-index-v2/") {
                 self.list_pages
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            if prefix.contains("/coverage-index-v2/deltas/") {
+                self.delta_list_pages
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
             self.inner.list_page(prefix, start_after, limit)
@@ -2911,7 +3062,7 @@ mod tests {
         };
         let bytes = serde_json::to_vec_pretty(&delta).expect("encode test delta");
         object_store.put(&key, &bytes).expect("write test delta");
-        mark_cached_v2_bucket_entries_dirty(
+        append_cached_v2_bucket_delta(
             object_store,
             &CoverageIndexV2Bucket {
                 chain_key: chain.key_prefix(),
@@ -2919,6 +3070,8 @@ mod tests {
                 bucket_start,
                 bucket_end,
             },
+            key.clone(),
+            &delta,
         );
         key
     }
@@ -3063,13 +3216,13 @@ mod tests {
     }
 
     #[test]
-    fn test_read_entries_for_v2_bucket_reuses_cached_bucket_entry_prefix() {
+    fn test_read_entries_for_v2_bucket_appends_cached_bucket_entry() {
         let object_store =
             DelayedV2DeltaGetObjectStore::new(temp_storage_root("cached-v2-bucket-read"));
         let chain = test_chain();
-        let selector = DatasetSelector::all();
+        let selector = evm_logs_selector(vec![]);
         let scope = coverage_index_v2_exact_scope(
-            &DatasetKey::evm_blocks(),
+            &DatasetKey::evm_logs(),
             &LedgerRange::blocks(30, 40).expect("valid range"),
             &selector.fingerprint(),
             ManifestFinalityLevel::Safe,
@@ -3080,8 +3233,8 @@ mod tests {
             bucket_start: 0,
             bucket_end: DEFAULT_COVERAGE_INDEX_BUCKET_SIZE - 1,
         };
-        let first = empty_entry(&chain, 30, 35);
-        let second = empty_entry(&chain, 36, 40);
+        let first = evm_logs_entry(&chain, &selector, 30, 35, 0);
+        let second = evm_logs_entry(&chain, &selector, 36, 40, 0);
         let first_range = first.range.clone();
         let second_range = second.range.clone();
         write_test_v2_delta(
@@ -3109,6 +3262,7 @@ mod tests {
                 .expect("read v2 bucket first time");
         let delta_gets_after_first_read = object_store.delta_gets();
         let list_pages_after_first_read = object_store.list_pages();
+        let delta_list_pages_after_first_read = object_store.delta_list_pages();
         let mut second_read_entries = Vec::new();
         let second_has_index =
             read_entries_for_v2_bucket(&object_store, &bucket, &mut second_read_entries)
@@ -3119,9 +3273,13 @@ mod tests {
         assert_eq!(delta_gets_after_first_read, 2);
         assert_eq!(object_store.delta_gets(), delta_gets_after_first_read);
         assert_eq!(object_store.list_pages(), list_pages_after_first_read);
+        assert_eq!(
+            object_store.delta_list_pages(),
+            delta_list_pages_after_first_read
+        );
         assert_eq!(second_read_entries, first_read_entries);
 
-        let third = empty_entry(&chain, 41, 42);
+        let third = evm_logs_entry(&chain, &selector, 41, 42, 0);
         let third_range = third.range.clone();
         write_test_v2_delta(
             &object_store,
@@ -3132,14 +3290,18 @@ mod tests {
             vec![third],
             None,
         );
+        let delta_list_pages_after_append = object_store.delta_list_pages();
         let mut third_read_entries = Vec::new();
         let third_has_index =
             read_entries_for_v2_bucket(&object_store, &bucket, &mut third_read_entries)
                 .expect("read v2 bucket after appended delta");
 
         assert!(third_has_index);
-        assert_eq!(object_store.delta_gets(), delta_gets_after_first_read + 1);
-        assert!(object_store.list_pages() > list_pages_after_first_read);
+        assert_eq!(object_store.delta_gets(), delta_gets_after_first_read);
+        assert_eq!(
+            object_store.delta_list_pages(),
+            delta_list_pages_after_append
+        );
         assert_eq!(
             third_read_entries
                 .iter()
