@@ -72,6 +72,12 @@ struct SlowCoverageIndexV2ListPageStore {
 }
 
 #[derive(Clone, Debug)]
+struct SlowCoverageIndexV2CleanupGetStore {
+    inner: LocalObjectStore,
+    delay: Duration,
+}
+
+#[derive(Clone, Debug)]
 struct SiblingPrefixListStore {
     inner: LocalObjectStore,
 }
@@ -214,6 +220,15 @@ impl SlowCoverageIndexV2ListPageStore {
 
     fn list_page_count(&self) -> usize {
         self.list_pages.load(Ordering::SeqCst)
+    }
+}
+
+impl SlowCoverageIndexV2CleanupGetStore {
+    fn new(root: PathBuf, delay: Duration) -> Self {
+        Self {
+            inner: LocalObjectStore::new(root),
+            delay,
+        }
     }
 }
 
@@ -674,6 +689,52 @@ impl ObjectStore for SlowCoverageIndexV2ListPageStore {
             self.list_pages.fetch_add(1, Ordering::SeqCst);
             std::thread::sleep(self.delay);
         }
+        self.inner.list_page(prefix, start_after, limit)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), DatalensError> {
+        self.inner.delete(key)
+    }
+
+    fn lock_namespace(&self) -> String {
+        self.inner.lock_namespace()
+    }
+}
+
+impl ObjectStore for SlowCoverageIndexV2CleanupGetStore {
+    fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError> {
+        if key.contains("/coverage-index-v2/cleanup/") {
+            std::thread::sleep(self.delay);
+        }
+        self.inner.get(key)
+    }
+
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
+        self.inner.put(key, bytes)
+    }
+
+    fn put_if_absent(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<ObjectPutIfAbsentResult, DatalensError> {
+        self.inner.put_if_absent(key, bytes)
+    }
+
+    fn exists(&self, key: &str) -> Result<bool, DatalensError> {
+        self.inner.exists(key)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
+        self.inner.list(prefix)
+    }
+
+    fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ObjectListPage, DatalensError> {
         self.inner.list_page(prefix, start_after, limit)
     }
 
@@ -4691,6 +4752,63 @@ fn test_compaction_coverage_index_v2_cleanup_reserves_get_budget_for_compaction(
     assert_eq!(report.coverage_index_v2_deleted_deltas, 6);
     assert_eq!(report.coverage_index_v2_compacted_buckets, 1);
     assert_eq!(report.coverage_index_v2_compacted_deltas, 3);
+}
+
+#[test]
+fn test_compaction_coverage_index_v2_slow_cleanup_scan_does_not_block_hot_bucket_compaction() {
+    let object_store = SlowCoverageIndexV2CleanupGetStore::new(
+        temp_storage_root("coverage-v2-slow-cleanup-scan-does-not-block"),
+        Duration::from_millis(10),
+    );
+    let storage = DurableStorage::from_object_store(object_store);
+    let chain = test_chain();
+    let hot_scope = "exact/evm.blocks/block/all/safe";
+    let stale_scope = "exact/evm.logs/block/all/safe";
+    let snapshot_key =
+        write_coverage_index_v2_snapshot(&storage, &chain, "cleanup-snapshot", 1, Vec::new());
+    write_coverage_index_v2_snapshot_head(&storage, &chain, "cleanup-head", 1, &snapshot_key);
+    for index in 0..32 {
+        write_coverage_index_v2_cleanup_record(
+            &storage,
+            &chain,
+            &format!("cleanup-record-{index:020}"),
+            &snapshot_key,
+            vec![format!(
+                "chains/{}/coverage-index-v2/deltas/{stale_scope}/00000000000000000000-00000000000000099999/stale-delta-{index}.json",
+                chain.key_prefix()
+            )],
+        );
+    }
+    for index in 0..3 {
+        write_coverage_index_v2_delta(
+            &storage,
+            &chain,
+            hot_scope,
+            0,
+            99_999,
+            &format!("hot-delta-{index}"),
+        );
+    }
+
+    let report = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                cleanup_enabled: true,
+                coverage_index_v2_delete_grace_ms: 0,
+                coverage_index_v2_delta_count_threshold: 3,
+                max_tick_duration_ms: 50,
+                max_gets_per_tick: 128,
+                max_deletes_per_tick: 128,
+                max_puts_per_tick: 128,
+                ..coverage_index_v2_compaction_config(true)
+            },
+        )
+        .expect("slow cleanup scan should not block hot bucket compaction");
+
+    assert_eq!(report.coverage_index_v2_compacted_buckets, 1);
+    assert_eq!(report.coverage_index_v2_compacted_deltas, 3);
+    assert_eq!(coverage_index_v2_snapshot_head_count(&storage, &chain), 2);
 }
 
 #[test]
