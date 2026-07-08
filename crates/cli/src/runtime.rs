@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     sync::{
         Arc, Mutex, Once,
         atomic::{AtomicBool, Ordering},
@@ -305,6 +306,18 @@ impl CompactionStorage {
             CompactionStorage::S3(storage) => storage.object_store().lock_namespace(),
         }
     }
+
+    fn has_coverage_index_v2_compaction_queue(
+        &self,
+        chain: &ChainIdentity,
+    ) -> Result<bool, DatalensError> {
+        let prefix = coverage_index_v2_compaction_queue_prefix(chain);
+        let page = match self {
+            CompactionStorage::Local(storage) => storage.object_store().list_page(&prefix, None, 1),
+            CompactionStorage::S3(storage) => storage.object_store().list_page(&prefix, None, 1),
+        }?;
+        Ok(!page.objects.is_empty())
+    }
 }
 
 impl CompactionLeaderLock {
@@ -554,9 +567,15 @@ impl StorageCompactionWorker {
                         }
                         pause_until = None;
                     }
-                    for chain_index in
-                        compaction_chain_batch_indexes(&mut next_chain_index, chains.len())
-                    {
+                    let chain_indexes =
+                        compaction_chain_batch_indexes(&mut next_chain_index, chains.len());
+                    let queued_chain_indexes =
+                        queued_compaction_chain_indexes(&storage, &chains, &chain_indexes);
+                    let chain_indexes = prioritize_compaction_chain_batch_indexes(
+                        chain_indexes,
+                        &queued_chain_indexes,
+                    );
+                    for chain_index in chain_indexes {
                         if worker_stop.load(Ordering::Relaxed) {
                             break;
                         }
@@ -777,12 +796,71 @@ fn compaction_sleep_duration(interval: Duration, consecutive_failures: u32) -> D
 }
 
 fn compaction_chain_batch_indexes(next_chain_index: &mut usize, chain_count: usize) -> Vec<usize> {
-    let mut indexes = Vec::with_capacity(chain_count);
-    for _ in 0..chain_count {
-        indexes.push(*next_chain_index % chain_count);
-        *next_chain_index = next_chain_index.saturating_add(1);
+    if chain_count == 0 {
+        return Vec::new();
     }
+    let mut indexes = Vec::with_capacity(chain_count);
+    let start = *next_chain_index % chain_count;
+    for offset in 0..chain_count {
+        indexes.push((start + offset) % chain_count);
+    }
+    *next_chain_index = (start + 1) % chain_count;
     indexes
+}
+
+fn queued_compaction_chain_indexes(
+    storage: &CompactionStorage,
+    chains: &[ChainIdentity],
+    chain_indexes: &[usize],
+) -> BTreeSet<usize> {
+    let mut queued = BTreeSet::new();
+    for &chain_index in chain_indexes {
+        let Some(chain) = chains.get(chain_index) else {
+            continue;
+        };
+        match storage.has_coverage_index_v2_compaction_queue(chain) {
+            Ok(true) => {
+                queued.insert(chain_index);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                log::warn!(
+                    "storage compaction queue priority check failed chain_key={} kind={:?} message={}",
+                    chain.key_prefix(),
+                    error.kind,
+                    error.message
+                );
+            }
+        }
+    }
+    queued
+}
+
+fn prioritize_compaction_chain_batch_indexes(
+    chain_indexes: Vec<usize>,
+    queued_chain_indexes: &BTreeSet<usize>,
+) -> Vec<usize> {
+    if queued_chain_indexes.is_empty() {
+        return chain_indexes;
+    }
+    let mut queued = Vec::with_capacity(chain_indexes.len());
+    let mut normal = Vec::with_capacity(chain_indexes.len());
+    for chain_index in chain_indexes {
+        if queued_chain_indexes.contains(&chain_index) {
+            queued.push(chain_index);
+        } else {
+            normal.push(chain_index);
+        }
+    }
+    queued.extend(normal);
+    queued
+}
+
+fn coverage_index_v2_compaction_queue_prefix(chain: &ChainIdentity) -> String {
+    format!(
+        "chains/{}/coverage-index-v2/compaction-queue",
+        chain.key_prefix()
+    )
 }
 
 fn compaction_lock_renew_interval(ttl: Duration) -> Duration {
@@ -2000,24 +2078,45 @@ mod tests {
     }
 
     #[test]
-    fn storage_compaction_chain_batch_covers_all_chains_per_wake() {
+    fn storage_compaction_chain_batch_rotates_start_each_wake() {
         let mut next_chain_index = 0;
 
         assert_eq!(
             compaction_chain_batch_indexes(&mut next_chain_index, 3),
             vec![0, 1, 2]
         );
-        assert_eq!(next_chain_index, 3);
+        assert_eq!(next_chain_index, 1);
         assert_eq!(
             compaction_chain_batch_indexes(&mut next_chain_index, 3),
-            vec![0, 1, 2]
+            vec![1, 2, 0]
         );
-        assert_eq!(next_chain_index, 6);
+        assert_eq!(next_chain_index, 2);
+        assert_eq!(
+            compaction_chain_batch_indexes(&mut next_chain_index, 3),
+            vec![2, 0, 1]
+        );
+        assert_eq!(next_chain_index, 0);
 
         next_chain_index = 2;
         assert_eq!(
             compaction_chain_batch_indexes(&mut next_chain_index, 3),
             vec![2, 0, 1]
+        );
+    }
+
+    #[test]
+    fn storage_compaction_chain_batch_prioritizes_queued_chains() {
+        let mut queued = BTreeSet::new();
+        queued.insert(3);
+        queued.insert(1);
+
+        assert_eq!(
+            prioritize_compaction_chain_batch_indexes(vec![2, 3, 0, 1], &queued),
+            vec![3, 1, 2, 0]
+        );
+        assert_eq!(
+            prioritize_compaction_chain_batch_indexes(vec![2, 0], &BTreeSet::new()),
+            vec![2, 0]
         );
     }
 
