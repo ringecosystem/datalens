@@ -2809,6 +2809,7 @@ where
             .filter(|object| object.key.ends_with(".json"))
             .collect::<Vec<_>>();
         queue_objects.sort_by(|left, right| left.key.cmp(&right.key));
+        let mut timed_out = false;
         if queue_objects.is_empty() {
             log::info!(
                 "storage compaction manifest load chain_key={} source=compaction_queue listed_object_count=0 scanned_object_count=0 scanned_entry_count=0 selected_entry_count=0 partial=false duration_ms={}",
@@ -2834,15 +2835,23 @@ where
         let mut active_scope_prefix = None;
         let mut active_scope_cursor = None;
         for object in &queue_objects {
+            if load_started.elapsed().as_millis() >= config.max_tick_duration_ms.max(1) as u128 {
+                timed_out = true;
+                break;
+            }
             let Some(bytes) = self.object_store().get_optional(&object.key)? else {
                 cursor_advance_key = Some(object.key.clone());
                 continue;
             };
+            if load_started.elapsed().as_millis() >= config.max_tick_duration_ms.max(1) as u128 {
+                timed_out = true;
+                break;
+            }
             let queue_entry = compaction_queue::decode_entry(&object.key, &bytes)?;
             active_scope_prefix = manifest_segment_scope_prefix(&queue_entry.segment_key);
             break;
         }
-        if let Some(active_scope_prefix) = active_scope_prefix.as_deref() {
+        if !timed_out && let Some(active_scope_prefix) = active_scope_prefix.as_deref() {
             let scope_cursor_key = compaction_scope_cursor_key(active_scope_prefix);
             let scope_cursor = self.read_compaction_cursor_key(&scope_cursor_key)?;
             let scope_queue_cursor = scope_cursor
@@ -2873,7 +2882,12 @@ where
         let base_entries = if self.object_store().exists(&manifest_key(chain))? {
             let key = manifest_key(chain);
             let bytes = self.object_store().get(&key)?;
-            decode_manifest_object(&key, &bytes)?.entries
+            if load_started.elapsed().as_millis() >= config.max_tick_duration_ms.max(1) as u128 {
+                timed_out = true;
+                Vec::new()
+            } else {
+                decode_manifest_object(&key, &bytes)?.entries
+            }
         } else {
             Vec::new()
         };
@@ -2886,80 +2900,97 @@ where
         let mut drained_queue_cursor_advance_key = None;
         let mut stopped_at_next_scope = false;
         let mut stale_queue_entry_keys = Vec::new();
-        for object in &queue_objects {
-            if entries.len() + scope_entries.len() >= max_entries {
-                break;
-            }
-            if load_started.elapsed().as_millis() >= config.max_tick_duration_ms.max(1) as u128 {
-                break;
-            }
-            let Some(bytes) = self.object_store().get_optional(&object.key)? else {
-                cursor_advance_key = Some(object.key.clone());
-                continue;
-            };
-            let queue_entry = compaction_queue::decode_entry(&object.key, &bytes)?;
-            let object_scope_prefix = manifest_segment_scope_prefix(&queue_entry.segment_key);
-            if active_scope_prefix.is_none() {
-                active_scope_prefix = object_scope_prefix.clone();
-            } else if active_scope_prefix != object_scope_prefix {
-                if compaction_candidates(
-                    &scope_entries
-                        .iter()
-                        .map(|entry: &SelectedManifestEntry| entry.entry.clone())
-                        .collect::<Vec<_>>(),
-                    config,
-                )
-                .is_empty()
-                {
-                    drained_queue_cursor_advance_key = cursor_advance_key.clone();
-                    scope_entries.clear();
-                    active_scope_prefix = object_scope_prefix.clone();
-                    active_scope_cursor = active_scope_prefix
-                        .as_deref()
-                        .map(compaction_scope_cursor_key)
-                        .map(|key| self.read_compaction_cursor_key(&key))
-                        .transpose()?;
-                } else {
-                    stopped_at_next_scope = true;
-                    break;
-                }
-            }
-            scanned_objects += 1;
-            scope_cursor_overlap_key = cursor_advance_key.clone();
-            cursor_advance_key = Some(object.key.clone());
-            scope_cursor_advance_key = Some(object.key.clone());
-            let Some(segment_bytes) = self.object_store().get_optional(&queue_entry.segment_key)?
-            else {
-                stale_queue_entry_keys.push(object.key.clone());
-                continue;
-            };
-            let manifest = decode_manifest_object(&queue_entry.segment_key, &segment_bytes)?;
-            scanned_entries += manifest.entries.len();
-            for entry in manifest.entries {
-                if entry.object_key.is_none() {
-                    stale_queue_entry_keys.push(object.key.clone());
-                    continue;
-                }
-                if base_entries
-                    .iter()
-                    .any(|base_entry| base_entry.shadows_segment(&entry))
-                {
-                    continue;
-                }
-                scope_entries.push(SelectedManifestEntry {
-                    segment_key: Some(queue_entry.segment_key.clone()),
-                    cursor_key: Some(object.key.clone()),
-                    entry,
-                });
+        if !timed_out {
+            for object in &queue_objects {
                 if entries.len() + scope_entries.len() >= max_entries {
                     break;
+                }
+                if load_started.elapsed().as_millis() >= config.max_tick_duration_ms.max(1) as u128
+                {
+                    timed_out = true;
+                    break;
+                }
+                let Some(bytes) = self.object_store().get_optional(&object.key)? else {
+                    cursor_advance_key = Some(object.key.clone());
+                    continue;
+                };
+                if load_started.elapsed().as_millis() >= config.max_tick_duration_ms.max(1) as u128
+                {
+                    timed_out = true;
+                    break;
+                }
+                let queue_entry = compaction_queue::decode_entry(&object.key, &bytes)?;
+                let object_scope_prefix = manifest_segment_scope_prefix(&queue_entry.segment_key);
+                if active_scope_prefix.is_none() {
+                    active_scope_prefix = object_scope_prefix.clone();
+                } else if active_scope_prefix != object_scope_prefix {
+                    if compaction_candidates(
+                        &scope_entries
+                            .iter()
+                            .map(|entry: &SelectedManifestEntry| entry.entry.clone())
+                            .collect::<Vec<_>>(),
+                        config,
+                    )
+                    .is_empty()
+                    {
+                        drained_queue_cursor_advance_key = cursor_advance_key.clone();
+                        scope_entries.clear();
+                        active_scope_prefix = object_scope_prefix.clone();
+                        active_scope_cursor = active_scope_prefix
+                            .as_deref()
+                            .map(compaction_scope_cursor_key)
+                            .map(|key| self.read_compaction_cursor_key(&key))
+                            .transpose()?;
+                    } else {
+                        stopped_at_next_scope = true;
+                        break;
+                    }
+                }
+                scanned_objects += 1;
+                scope_cursor_overlap_key = cursor_advance_key.clone();
+                cursor_advance_key = Some(object.key.clone());
+                scope_cursor_advance_key = Some(object.key.clone());
+                let Some(segment_bytes) =
+                    self.object_store().get_optional(&queue_entry.segment_key)?
+                else {
+                    stale_queue_entry_keys.push(object.key.clone());
+                    continue;
+                };
+                if load_started.elapsed().as_millis() >= config.max_tick_duration_ms.max(1) as u128
+                {
+                    timed_out = true;
+                    break;
+                }
+                let manifest = decode_manifest_object(&queue_entry.segment_key, &segment_bytes)?;
+                scanned_entries += manifest.entries.len();
+                for entry in manifest.entries {
+                    if entry.object_key.is_none() {
+                        stale_queue_entry_keys.push(object.key.clone());
+                        continue;
+                    }
+                    if base_entries
+                        .iter()
+                        .any(|base_entry| base_entry.shadows_segment(&entry))
+                    {
+                        continue;
+                    }
+                    scope_entries.push(SelectedManifestEntry {
+                        segment_key: Some(queue_entry.segment_key.clone()),
+                        cursor_key: Some(object.key.clone()),
+                        entry,
+                    });
+                    if entries.len() + scope_entries.len() >= max_entries {
+                        break;
+                    }
                 }
             }
         }
         entries.extend(scope_entries);
-        let scope_partial =
-            !stopped_at_next_scope && (scanned_objects < queue_objects.len() || list_page.has_more);
-        let partial = !entries.is_empty() && (scope_partial || stopped_at_next_scope);
+        let scope_partial = timed_out
+            || (!stopped_at_next_scope
+                && (scanned_objects < queue_objects.len() || list_page.has_more));
+        let partial =
+            timed_out || (!entries.is_empty() && (scope_partial || stopped_at_next_scope));
         let cursor_advance = scope_cursor_advance_key
             .or(cursor_advance_key)
             .map(segment_compaction_cursor);
