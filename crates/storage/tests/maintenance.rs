@@ -4386,6 +4386,77 @@ fn test_compaction_coverage_index_v2_cleanup_record_deletes_in_batches() {
 }
 
 #[test]
+fn test_compaction_coverage_index_v2_snapshot_and_cleanup_keys_stay_bounded() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-v2-compaction-keys-bounded"));
+    let chain = test_chain();
+    for number in 60..=62 {
+        write_block_object(&storage, &chain, number, FinalityLevel::Safe);
+    }
+    clear_coverage_index_v1(&storage, &chain);
+
+    let first = storage
+        .compact_small_objects_for_chain(&chain, coverage_index_v2_compaction_config(false))
+        .expect("first coverage index v2 compaction");
+    assert_eq!(first.coverage_index_v2_compacted_deltas, 3);
+
+    for number in 63..=65 {
+        write_block_object(&storage, &chain, number, FinalityLevel::Safe);
+    }
+    clear_coverage_index_v1(&storage, &chain);
+
+    let mut write_cleanup_only_config = coverage_index_v2_compaction_config(true);
+    write_cleanup_only_config.max_deletes_per_tick = 0;
+    let second = storage
+        .compact_small_objects_for_chain(&chain, write_cleanup_only_config)
+        .expect("second coverage index v2 compaction");
+    assert_eq!(second.coverage_index_v2_compacted_deltas, 3);
+    assert_eq!(second.coverage_index_v2_cleanup_records, 2);
+
+    let snapshots = read_coverage_index_v2_snapshots(&storage, &chain);
+    assert_eq!(snapshots.len(), 2);
+    assert!(
+        snapshots
+            .iter()
+            .all(|snapshot| snapshot["compacted_delta_keys"]
+                .as_array()
+                .expect("keys")
+                .len()
+                == 3),
+        "snapshots should store only the delta batch folded by that snapshot"
+    );
+    let cleanup_records = read_coverage_index_v2_cleanup_records(&storage, &chain);
+    assert_eq!(cleanup_records.len(), 2);
+    assert!(
+        cleanup_records
+            .iter()
+            .all(|record| record["compacted_delta_keys"]
+                .as_array()
+                .expect("cleanup keys")
+                .len()
+                == 3),
+        "cleanup records should not repeat historical compacted delta keys"
+    );
+
+    let cleanup = storage
+        .compact_small_objects_for_chain(&chain, coverage_index_v2_compaction_config(true))
+        .expect("cleanup bounded coverage index v2 deltas");
+    assert_eq!(cleanup.coverage_index_v2_deleted_deltas, 6);
+    assert_eq!(coverage_index_v2_delta_count(&storage, &chain), 0);
+    assert_eq!(coverage_index_v2_cleanup_count(&storage, &chain), 0);
+    assert_block_numbers(
+        storage
+            .read_rows(
+                &chain,
+                &DatasetKey::evm_blocks(),
+                &DatasetSelector::all(),
+                LedgerRange::blocks(60, 65).expect("range"),
+            )
+            .expect("read rows after bounded cleanup"),
+        &[60, 61, 62, 63, 64, 65],
+    );
+}
+
+#[test]
 fn test_compaction_coverage_index_v2_recovers_older_head_cleanup_after_new_head() {
     let storage = LocalStorage::new(temp_storage_root("coverage-v2-older-head-cleanup"));
     let chain = test_chain();
@@ -6208,6 +6279,39 @@ fn coverage_index_v2_cleanup_count<S: ObjectStore>(
         &format!("chains/{}/coverage-index-v2/cleanup", chain.key_prefix()),
     )
     .len()
+}
+
+fn read_coverage_index_v2_snapshots<S: ObjectStore>(
+    storage: &DurableStorage<S>,
+    chain: &ChainIdentity,
+) -> Vec<serde_json::Value> {
+    read_json_objects_with_prefix(
+        storage,
+        &format!("chains/{}/coverage-index-v2/snapshots", chain.key_prefix()),
+    )
+}
+
+fn read_coverage_index_v2_cleanup_records<S: ObjectStore>(
+    storage: &DurableStorage<S>,
+    chain: &ChainIdentity,
+) -> Vec<serde_json::Value> {
+    read_json_objects_with_prefix(
+        storage,
+        &format!("chains/{}/coverage-index-v2/cleanup", chain.key_prefix()),
+    )
+}
+
+fn read_json_objects_with_prefix<S: ObjectStore>(
+    storage: &DurableStorage<S>,
+    prefix: &str,
+) -> Vec<serde_json::Value> {
+    list_prefix(storage, prefix)
+        .into_iter()
+        .map(|key| {
+            let bytes = storage.object_store().get(&key).expect("read json object");
+            serde_json::from_slice(&bytes).expect("decode json object")
+        })
+        .collect()
 }
 
 fn first_coverage_index_v2_delta_key<S: ObjectStore>(

@@ -105,6 +105,16 @@ pub(crate) struct CoverageIndexV2Snapshot {
     pub(crate) compacted_delta_keys: Vec<String>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize)]
+struct CoverageIndexV2SnapshotCompactedDeltaKeys {
+    schema_version: u32,
+    scope: String,
+    bucket_start: u64,
+    bucket_end: u64,
+    #[serde(default)]
+    compacted_delta_keys: Vec<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CoverageIndexV2SnapshotHead {
@@ -151,6 +161,15 @@ pub(crate) struct CoverageIndexV2BucketCompaction {
 pub(crate) struct CoverageIndexV2CleanupRecordObject {
     pub(crate) key: String,
     pub(crate) record: CoverageIndexV2CleanupRecord,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum CoverageIndexV2CompactedDeltaProof {
+    Explicit(BTreeSet<String>),
+    HighWatermark {
+        included_delta_high_watermark: String,
+        compacted_delta_keys: BTreeSet<String>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -513,11 +532,12 @@ where
     let mut start_after_delta_key = None;
     if let Some(head) = latest_v2_snapshot_head(object_store, bucket)? {
         let snapshot = read_v2_snapshot(object_store, bucket, &head.snapshot_key)?;
-        previous_compacted_delta_keys.extend(snapshot.compacted_delta_keys);
         // See read_entries_for_v2_bucket: non-empty watermarks are only
         // published by compaction after folding the listed delta prefix.
         if !head.included_delta_high_watermark.is_empty() {
             start_after_delta_key = Some(head.included_delta_high_watermark);
+        } else {
+            previous_compacted_delta_keys.extend(snapshot.compacted_delta_keys);
         }
         entries.extend(snapshot.entries);
     }
@@ -1120,11 +1140,44 @@ where
     Ok(snapshot)
 }
 
+fn read_v2_snapshot_compacted_delta_keys<S>(
+    object_store: &S,
+    bucket: &CoverageIndexV2Bucket,
+    snapshot_key: &str,
+) -> Result<BTreeSet<String>, DatalensError>
+where
+    S: ObjectStore,
+{
+    let snapshot_bytes = object_store.get(snapshot_key)?;
+    let snapshot: CoverageIndexV2SnapshotCompactedDeltaKeys =
+        serde_json::from_slice(&snapshot_bytes).map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::StorageReadFailure,
+                format!(
+                    "decode coverage index v2 snapshot compacted delta keys {snapshot_key}: {error}"
+                ),
+            )
+        })?;
+    validate_v2_record_scope(
+        "snapshot",
+        snapshot_key,
+        snapshot.schema_version,
+        &snapshot.scope,
+        snapshot.bucket_start,
+        snapshot.bucket_end,
+        bucket,
+    )?;
+    Ok(snapshot.compacted_delta_keys.into_iter().collect())
+}
+
 pub(crate) fn v2_cleanup_record_is_safe_to_delete_with_cache<S>(
     object_store: &S,
     chain: &ChainIdentity,
     cleanup: &CoverageIndexV2CleanupRecordObject,
-    latest_delta_key_cache: &mut BTreeMap<CoverageIndexV2Bucket, Option<BTreeSet<String>>>,
+    latest_delta_key_cache: &mut BTreeMap<
+        CoverageIndexV2Bucket,
+        Option<CoverageIndexV2CompactedDeltaProof>,
+    >,
 ) -> Result<bool, DatalensError>
 where
     S: ObjectStore,
@@ -1171,29 +1224,52 @@ where
     if !latest_delta_key_cache.contains_key(&bucket) {
         let latest_delta_keys = match latest_v2_snapshot_head(object_store, &bucket)? {
             Some(latest_head) => {
-                let latest_snapshot =
-                    read_v2_snapshot(object_store, &bucket, &latest_head.snapshot_key)?;
-                Some(
-                    latest_snapshot
-                        .compacted_delta_keys
-                        .into_iter()
-                        .collect::<BTreeSet<_>>(),
-                )
+                if !object_store.exists(&latest_head.snapshot_key)? {
+                    None
+                } else if latest_head.included_delta_high_watermark.is_empty() {
+                    let latest_snapshot =
+                        read_v2_snapshot(object_store, &bucket, &latest_head.snapshot_key)?;
+                    Some(CoverageIndexV2CompactedDeltaProof::Explicit(
+                        latest_snapshot
+                            .compacted_delta_keys
+                            .into_iter()
+                            .collect::<BTreeSet<_>>(),
+                    ))
+                } else {
+                    let compacted_delta_keys = read_v2_snapshot_compacted_delta_keys(
+                        object_store,
+                        &bucket,
+                        &latest_head.snapshot_key,
+                    )?;
+                    Some(CoverageIndexV2CompactedDeltaProof::HighWatermark {
+                        included_delta_high_watermark: latest_head.included_delta_high_watermark,
+                        compacted_delta_keys,
+                    })
+                }
             }
             None => None,
         };
         latest_delta_key_cache.insert(bucket.clone(), latest_delta_keys);
     }
-    let Some(latest_delta_keys) = latest_delta_key_cache
+    let Some(latest_delta_proof) = latest_delta_key_cache
         .get(&bucket)
-        .and_then(|keys| keys.as_ref())
+        .and_then(|proof| proof.as_ref())
     else {
         return Ok(false);
     };
-    Ok(record
-        .compacted_delta_keys
-        .iter()
-        .all(|key| latest_delta_keys.contains(key)))
+    match latest_delta_proof {
+        CoverageIndexV2CompactedDeltaProof::Explicit(latest_delta_keys) => Ok(record
+            .compacted_delta_keys
+            .iter()
+            .all(|key| latest_delta_keys.contains(key))),
+        CoverageIndexV2CompactedDeltaProof::HighWatermark {
+            included_delta_high_watermark,
+            compacted_delta_keys,
+        } => Ok(record.compacted_delta_keys.iter().all(|key| {
+            compacted_delta_keys.contains(key)
+                || key.as_str() <= included_delta_high_watermark.as_str()
+        })),
+    }
 }
 
 fn cleanup_record_key_matches_bucket(
