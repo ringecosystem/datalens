@@ -34,6 +34,7 @@ const MAX_SPARSE_SOURCE_RANGES_PER_CANDIDATE: usize = 3;
 const MAX_SPARSE_CANDIDATE_RANGE_SPAN_BLOCKS: u64 = 100_000;
 const COVERAGE_INDEX_V2_CLEANUP_RECORDS_PER_TICK: usize = 32;
 const COVERAGE_INDEX_V2_BUCKET_SCAN_PAGES_PER_TICK: usize = 8;
+const COVERAGE_INDEX_V2_QUEUE_RECORDS_PER_SCAN: usize = 8;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MaintenanceReport {
@@ -2005,10 +2006,12 @@ where
                 });
             }
             let queue_cursor = self.read_compaction_cursor_key(&queue_cursor_key)?;
+            let queue_page_size =
+                delta_count_threshold.clamp(1, COVERAGE_INDEX_V2_QUEUE_RECORDS_PER_SCAN);
             let mut queue_page = self.object_store().list_page(
                 queue_scan_prefix,
                 queue_cursor.next_segment_key.as_deref(),
-                delta_count_threshold.max(1),
+                queue_page_size,
             )?;
             scan_pages += 1;
             if queue_page.objects.is_empty()
@@ -2023,11 +2026,9 @@ where
                         priority,
                     });
                 }
-                queue_page = self.object_store().list_page(
-                    queue_scan_prefix,
-                    None,
-                    delta_count_threshold.max(1),
-                )?;
+                queue_page =
+                    self.object_store()
+                        .list_page(queue_scan_prefix, None, queue_page_size)?;
                 scan_pages += 1;
             }
             let mut queued_buckets = Vec::new();
