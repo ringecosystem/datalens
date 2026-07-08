@@ -5931,6 +5931,63 @@ fn test_compaction_coverage_index_v2_queue_scan_is_bounded() {
 }
 
 #[test]
+fn test_compaction_coverage_index_v2_queued_bucket_skips_pre_cleanup_scan() {
+    let object_store = SlowCoverageIndexV2ListPageStore::new(
+        temp_storage_root("coverage-v2-queued-skip-pre-cleanup"),
+        Duration::from_millis(20),
+    );
+    let storage = DurableStorage::from_object_store(object_store);
+    let chain = test_chain();
+    let scope = "semantic/evm.logs/block/finalized/evm-logs-v1/addr/0x0000000000000000000000000000000000000001";
+    let snapshot_key = write_coverage_index_v2_snapshot_for_scope(
+        &storage,
+        &chain,
+        scope,
+        "old-snapshot",
+        1,
+        Vec::new(),
+    );
+    write_coverage_index_v2_snapshot_head_for_scope(
+        &storage,
+        &chain,
+        scope,
+        "old-head",
+        1,
+        &snapshot_key,
+        "",
+    );
+    for index in 0..6 {
+        write_coverage_index_v2_delta(
+            &storage,
+            &chain,
+            scope,
+            25_400_000,
+            25_499_999,
+            &format!("hot-{index:020}"),
+        );
+    }
+    write_coverage_index_v2_compaction_queue_record(
+        &storage, &chain, scope, 25_400_000, 25_499_999,
+    );
+
+    let report = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                coverage_index_v2_delta_count_threshold: 3,
+                max_tick_duration_ms: 30,
+                cleanup_enabled: true,
+                delete_source_objects: false,
+                ..coverage_index_v2_compaction_config(true)
+            },
+        )
+        .expect("queued bucket should compact before old cleanup scan");
+
+    assert_eq!(report.coverage_index_v2_compacted_buckets, 1);
+    assert_eq!(report.coverage_index_v2_compacted_deltas, 6);
+}
+
+#[test]
 fn test_compaction_coverage_index_v2_queue_rotates_after_partial_hot_bucket() {
     let storage = LocalStorage::new(temp_storage_root(
         "coverage-v2-queue-rotates-partial-hot-bucket",
