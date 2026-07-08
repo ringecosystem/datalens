@@ -5184,6 +5184,50 @@ fn test_compaction_coverage_index_v2_delta_cursor_skips_sibling_prefix_page() {
 }
 
 #[test]
+fn test_compaction_coverage_index_v2_partial_scan_defers_manifest_compaction() {
+    let object_store = SlowCoverageIndexV2ListPageStore::new(
+        temp_storage_root("coverage-v2-partial-defers-manifest"),
+        Duration::from_millis(60),
+    );
+    let storage = DurableStorage::from_object_store(object_store);
+    let chain = test_chain();
+    let scope = "exact/evm.blocks/block/all/safe";
+    write_block_object_to_storage(&storage, &chain, 120, FinalityLevel::Safe);
+    write_block_object_to_storage(&storage, &chain, 121, FinalityLevel::Safe);
+    clear_coverage_index_v1(&storage, &chain);
+    write_coverage_index_v2_delta(&storage, &chain, scope, 0, 99_999, "delta-a");
+    write_coverage_index_v2_delta(&storage, &chain, scope, 0, 99_999, "delta-b");
+    write_coverage_index_v2_delta(&storage, &chain, scope, 0, 99_999, "delta-c");
+
+    let report = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                coverage_index_v2_delta_count_threshold: 3,
+                max_tick_duration_ms: 50,
+                max_gets_per_tick: 128,
+                ..coverage_index_v2_compaction_config(false)
+            },
+        )
+        .expect("partial coverage index v2 scan");
+
+    assert_eq!(report.tick_status, MaintenanceCompactionTickStatus::Partial);
+    assert_eq!(report.coverage_index_v2_compacted_buckets, 1);
+    assert_eq!(report.coverage_index_v2_compacted_deltas, 5);
+    assert_eq!(report.candidate_count, 0);
+    assert_eq!(report.processed_candidates, 0);
+    assert_eq!(
+        storage
+            .maintenance_report()
+            .expect("maintenance report")
+            .compaction_backlog
+            .small_object_count,
+        2,
+        "manifest compaction must wait for a later tick when coverage-index-v2 scan is partial"
+    );
+}
+
+#[test]
 fn test_compaction_coverage_index_v2_compacts_semantic_evm_logs_behind_exact_page() {
     let storage = LocalStorage::new(temp_storage_root("coverage-v2-semantic-behind-exact"));
     let chain = test_chain();
