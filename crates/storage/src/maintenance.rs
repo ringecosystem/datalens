@@ -1970,20 +1970,32 @@ where
         max_scan_pages: usize,
     ) -> Result<CoverageIndexV2BucketScan, DatalensError> {
         let prefix = format!("chains/{}/coverage-index-v2/deltas", chain.key_prefix());
-        let queue_prefix = coverage_index_v2_compaction_queue_prefix(&chain.key_prefix());
-        let queue_cursor_key = coverage_index_v2_compaction_queue_cursor_key(chain);
         let mut scan_pages = 0usize;
-        let queue_cursor = self.read_compaction_cursor_key(&queue_cursor_key)?;
-        let mut queue_page = self.object_store().list_page(
-            &queue_prefix,
-            queue_cursor.next_segment_key.as_deref(),
-            delta_count_threshold.max(1),
-        )?;
-        scan_pages += 1;
-        if queue_page.objects.is_empty()
-            && queue_cursor.next_segment_key.is_some()
-            && !queue_page.has_more
-        {
+        let queue_prefix = coverage_index_v2_compaction_queue_prefix(&chain.key_prefix());
+        let semantic_queue_prefix = format!("{queue_prefix}/semantic/evm.logs");
+        let semantic_queue_scan = (
+            semantic_queue_prefix.as_str(),
+            coverage_index_v2_semantic_evm_logs_compaction_queue_cursor_key(chain),
+            false,
+        );
+        let root_queue_scan = (
+            queue_prefix.as_str(),
+            coverage_index_v2_compaction_queue_cursor_key(chain),
+            true,
+        );
+        let mut queue_scan_prefixes = vec![semantic_queue_scan];
+        if max_scan_pages > 3 {
+            queue_scan_prefixes.push(root_queue_scan);
+        }
+        for (queue_scan_prefix, queue_cursor_key, skip_semantic_evm_logs) in queue_scan_prefixes {
+            if deadline.expired() {
+                return Ok(CoverageIndexV2BucketScan {
+                    buckets: Vec::new(),
+                    empty_cursor_advances: Vec::new(),
+                    partial: true,
+                    priority,
+                });
+            }
             if scan_pages >= max_scan_pages {
                 return Ok(CoverageIndexV2BucketScan {
                     buckets: Vec::new(),
@@ -1992,71 +2004,96 @@ where
                     priority,
                 });
             }
-            queue_page =
-                self.object_store()
-                    .list_page(&queue_prefix, None, delta_count_threshold.max(1))?;
+            let queue_cursor = self.read_compaction_cursor_key(&queue_cursor_key)?;
+            let mut queue_page = self.object_store().list_page(
+                queue_scan_prefix,
+                queue_cursor.next_segment_key.as_deref(),
+                delta_count_threshold.max(1),
+            )?;
             scan_pages += 1;
-        }
-        let mut queued_buckets = Vec::new();
-        let mut seen_buckets = BTreeSet::<CoverageIndexV2Bucket>::new();
-        for object in queue_page.objects {
-            if deadline.expired() {
+            if queue_page.objects.is_empty()
+                && queue_cursor.next_segment_key.is_some()
+                && !queue_page.has_more
+            {
+                if scan_pages >= max_scan_pages {
+                    return Ok(CoverageIndexV2BucketScan {
+                        buckets: Vec::new(),
+                        empty_cursor_advances: Vec::new(),
+                        partial: true,
+                        priority,
+                    });
+                }
+                queue_page = self.object_store().list_page(
+                    queue_scan_prefix,
+                    None,
+                    delta_count_threshold.max(1),
+                )?;
+                scan_pages += 1;
+            }
+            let mut queued_buckets = Vec::new();
+            let mut seen_buckets = BTreeSet::<CoverageIndexV2Bucket>::new();
+            for object in queue_page.objects {
+                if deadline.expired() {
+                    return Ok(CoverageIndexV2BucketScan {
+                        buckets: queued_buckets,
+                        empty_cursor_advances: Vec::new(),
+                        partial: true,
+                        priority,
+                    });
+                }
+                if !object.key.ends_with(".json") {
+                    continue;
+                }
+                let bytes = match self.object_store().get(&object.key) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        log::warn!(
+                            "storage coverage index v2 compaction queue read failed chain_key={} object_key={} kind={:?} message={}",
+                            chain.key_prefix(),
+                            object.key,
+                            error.kind,
+                            error.message
+                        );
+                        continue;
+                    }
+                };
+                let bucket = match decode_v2_compaction_queue_record(
+                    &chain.key_prefix(),
+                    &object.key,
+                    &bytes,
+                ) {
+                    Ok(bucket) => bucket,
+                    Err(error) => {
+                        log::warn!(
+                            "storage coverage index v2 compaction queue record skipped chain_key={} object_key={} kind={:?} message={}",
+                            chain.key_prefix(),
+                            object.key,
+                            error.kind,
+                            error.message
+                        );
+                        continue;
+                    }
+                };
+                if skip_semantic_evm_logs && bucket.scope.starts_with("semantic/evm.logs/") {
+                    continue;
+                }
+                if seen_buckets.insert(bucket.clone()) {
+                    queued_buckets.push(CoverageIndexV2BucketScanItem {
+                        cursor_key: queue_cursor_key.clone(),
+                        bucket,
+                        last_delta_key: Some(object.key.clone()),
+                        queue_key: Some(object.key),
+                    });
+                }
+            }
+            if !queued_buckets.is_empty() {
                 return Ok(CoverageIndexV2BucketScan {
                     buckets: queued_buckets,
                     empty_cursor_advances: Vec::new(),
-                    partial: true,
+                    partial: queue_page.has_more,
                     priority,
                 });
             }
-            if !object.key.ends_with(".json") {
-                continue;
-            }
-            let bytes = match self.object_store().get(&object.key) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    log::warn!(
-                        "storage coverage index v2 compaction queue read failed chain_key={} object_key={} kind={:?} message={}",
-                        chain.key_prefix(),
-                        object.key,
-                        error.kind,
-                        error.message
-                    );
-                    continue;
-                }
-            };
-            let bucket = match decode_v2_compaction_queue_record(
-                &chain.key_prefix(),
-                &object.key,
-                &bytes,
-            ) {
-                Ok(bucket) => bucket,
-                Err(error) => {
-                    log::warn!(
-                        "storage coverage index v2 compaction queue record skipped chain_key={} object_key={} kind={:?} message={}",
-                        chain.key_prefix(),
-                        object.key,
-                        error.kind,
-                        error.message
-                    );
-                    continue;
-                }
-            };
-            if seen_buckets.insert(bucket.clone()) {
-                queued_buckets.push(CoverageIndexV2BucketScanItem {
-                    cursor_key: queue_cursor_key.clone(),
-                    bucket,
-                    last_delta_key: Some(object.key.clone()),
-                    queue_key: Some(object.key),
-                });
-            }
-        }
-        if !queued_buckets.is_empty() {
-            return Ok(CoverageIndexV2BucketScan {
-                buckets: queued_buckets,
-                empty_cursor_advances: Vec::new(),
-                partial: queue_page.has_more,
-                priority,
-            });
         }
         let semantic_evm_logs_prefix = format!("{prefix}/semantic/evm.logs");
         let semantic_scan = (
@@ -3494,6 +3531,15 @@ fn coverage_index_v2_compaction_priority_cursor_key(chain: &ChainIdentity) -> St
 fn coverage_index_v2_compaction_queue_cursor_key(chain: &ChainIdentity) -> String {
     format!(
         "chains/{}/metadata/coverage-index-v2-compaction-queue-cursor.json",
+        chain.key_prefix()
+    )
+}
+
+fn coverage_index_v2_semantic_evm_logs_compaction_queue_cursor_key(
+    chain: &ChainIdentity,
+) -> String {
+    format!(
+        "chains/{}/metadata/coverage-index-v2-compaction-semantic-evm-logs-queue-cursor.json",
         chain.key_prefix()
     )
 }
