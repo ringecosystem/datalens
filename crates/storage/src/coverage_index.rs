@@ -31,12 +31,18 @@ const MAX_COVERAGE_INDEX_V2_DELTA_GET_THREADS: usize = 8;
 const MAX_SEMANTIC_FALLBACK_V2_DELTA_OBJECTS: usize = 128;
 const COVERAGE_INDEX_V2_BUCKET_READ_CACHE_TTL: Duration = Duration::from_secs(300);
 const MAX_COVERAGE_INDEX_V2_BUCKET_READ_CACHE_ENTRIES: usize = 512;
+const COVERAGE_INDEX_V2_RECENT_DELTA_TTL: Duration = Duration::from_secs(600);
+const MAX_COVERAGE_INDEX_V2_RECENT_BUCKETS: usize = 2_048;
+const MAX_COVERAGE_INDEX_V2_RECENT_ENTRIES_PER_BUCKET: usize = 256;
 
 static COVERAGE_INDEX_UPDATE_LOCKS: OnceLock<Mutex<BTreeMap<String, Weak<Mutex<()>>>>> =
     OnceLock::new();
 static COVERAGE_INDEX_V2_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 static COVERAGE_INDEX_V2_BUCKET_READ_CACHE: OnceLock<
     Mutex<BTreeMap<String, CoverageIndexV2BucketReadCacheEntry>>,
+> = OnceLock::new();
+static COVERAGE_INDEX_V2_RECENT_BUCKET_ENTRIES: OnceLock<
+    Mutex<BTreeMap<String, Vec<CoverageIndexV2RecentBucketEntry>>>,
 > = OnceLock::new();
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -189,6 +195,12 @@ struct CoverageIndexV2BucketReadCacheEntry {
     has_index: bool,
     snapshot_head_key: Option<String>,
     delta_objects: Vec<ObjectMetadata>,
+    entries: Vec<ManifestEntry>,
+}
+
+#[derive(Clone, Debug)]
+struct CoverageIndexV2RecentBucketEntry {
+    inserted_at: Instant,
     entries: Vec<ManifestEntry>,
 }
 
@@ -509,6 +521,7 @@ where
             max_delta_objects.unwrap_or_default(),
             bucket_entries.len()
         );
+        append_recent_v2_bucket_entries(object_store, bucket, &mut bucket_entries);
         entries.append(&mut bucket_entries);
         return Ok(any_bucket_has_index);
     }
@@ -921,6 +934,102 @@ where
 fn coverage_index_v2_bucket_read_cache()
 -> &'static Mutex<BTreeMap<String, CoverageIndexV2BucketReadCacheEntry>> {
     COVERAGE_INDEX_V2_BUCKET_READ_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn append_recent_v2_bucket_delta<S>(
+    object_store: &S,
+    bucket: &CoverageIndexV2Bucket,
+    delta: &CoverageIndexV2Delta,
+) where
+    S: ObjectStore,
+{
+    if delta.entries.is_empty() || delta.replacement.is_some() {
+        return;
+    }
+    let key = coverage_index_v2_bucket_recent_key(object_store, bucket);
+    let Ok(mut recent) = coverage_index_v2_recent_bucket_entries().lock() else {
+        return;
+    };
+    let now = Instant::now();
+    recent.retain(|_, entries| retain_fresh_recent_v2_entries(entries, now));
+    if recent.len() >= MAX_COVERAGE_INDEX_V2_RECENT_BUCKETS
+        && !recent.contains_key(&key)
+        && let Some(oldest_key) = recent
+            .iter()
+            .filter_map(|(key, entries)| entries.first().map(|entry| (key, entry.inserted_at)))
+            .min_by_key(|(_, inserted_at)| *inserted_at)
+            .map(|(key, _)| key.clone())
+    {
+        recent.remove(&oldest_key);
+    }
+    let entries = recent.entry(key).or_default();
+    entries.push(CoverageIndexV2RecentBucketEntry {
+        inserted_at: now,
+        entries: delta.entries.clone(),
+    });
+    retain_fresh_recent_v2_entries(entries, now);
+    if entries.len() > MAX_COVERAGE_INDEX_V2_RECENT_ENTRIES_PER_BUCKET {
+        let remove_count = entries.len() - MAX_COVERAGE_INDEX_V2_RECENT_ENTRIES_PER_BUCKET;
+        entries.drain(0..remove_count);
+    }
+}
+
+fn append_recent_v2_bucket_entries<S>(
+    object_store: &S,
+    bucket: &CoverageIndexV2Bucket,
+    entries: &mut Vec<ManifestEntry>,
+) where
+    S: ObjectStore,
+{
+    let key = coverage_index_v2_bucket_recent_key(object_store, bucket);
+    let Ok(mut recent) = coverage_index_v2_recent_bucket_entries().lock() else {
+        return;
+    };
+    let now = Instant::now();
+    let Some(recent_entries) = recent.get_mut(&key) else {
+        return;
+    };
+    if !retain_fresh_recent_v2_entries(recent_entries, now) {
+        recent.remove(&key);
+        return;
+    }
+    entries.extend(
+        recent_entries
+            .iter()
+            .flat_map(|entry| entry.entries.iter().cloned()),
+    );
+}
+
+fn retain_fresh_recent_v2_entries(
+    entries: &mut Vec<CoverageIndexV2RecentBucketEntry>,
+    now: Instant,
+) -> bool {
+    entries.retain(|entry| {
+        now.duration_since(entry.inserted_at) <= COVERAGE_INDEX_V2_RECENT_DELTA_TTL
+    });
+    !entries.is_empty()
+}
+
+fn coverage_index_v2_recent_bucket_entries()
+-> &'static Mutex<BTreeMap<String, Vec<CoverageIndexV2RecentBucketEntry>>> {
+    COVERAGE_INDEX_V2_RECENT_BUCKET_ENTRIES.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn coverage_index_v2_bucket_recent_key<S>(
+    object_store: &S,
+    bucket: &CoverageIndexV2Bucket,
+) -> String
+where
+    S: ObjectStore,
+{
+    format!(
+        "{}\n{}\n{}\n{}\n{}",
+        object_store.lock_namespace(),
+        bucket.chain_key,
+        bucket.scope,
+        bucket.bucket_start,
+        bucket.bucket_end
+    )
 }
 
 fn read_v2_delta_object<S>(
@@ -1472,6 +1581,7 @@ where
                 error.message
             );
         }
+        append_recent_v2_bucket_delta(object_store, &bucket, &delta);
         append_cached_v2_bucket_delta(object_store, &bucket, key, &delta);
     }
     Ok(())
@@ -3098,6 +3208,10 @@ mod tests {
         fn delete(&self, key: &str) -> Result<(), DatalensError> {
             self.inner.delete(key)
         }
+
+        fn lock_namespace(&self) -> String {
+            self.inner.lock_namespace()
+        }
     }
 
     impl ObjectStore for DelayedV2DeltaGetObjectStore {
@@ -3145,6 +3259,10 @@ mod tests {
 
         fn delete(&self, key: &str) -> Result<(), DatalensError> {
             self.inner.delete(key)
+        }
+
+        fn lock_namespace(&self) -> String {
+            self.inner.lock_namespace()
         }
     }
 
@@ -3650,6 +3768,57 @@ mod tests {
 
         assert!(entries.is_none());
         assert_eq!(object_store.delta_gets(), 0);
+        assert!(object_store.delta_list_pages() > 0);
+    }
+
+    #[test]
+    fn test_semantic_v2_fallback_includes_recent_delta_when_over_budget() {
+        let object_store = DelayedV2DeltaGetObjectStore::new(temp_storage_root(
+            "semantic-v2-fallback-budget-recent-delta",
+        ));
+        let chain = test_chain();
+        let query_selector =
+            evm_logs_selector_with_addresses(vec![address(1)], vec![Some(vec![topic(1)])]);
+        let broad_selector = evm_logs_selector(vec![]);
+        let range = LedgerRange::blocks(10, 10).expect("valid range");
+        let scope = coverage_index_v2_semantic_scope(
+            &DatasetKey::evm_logs(),
+            &range,
+            ManifestFinalityLevel::Safe,
+            "addr/*",
+        );
+        for index in 0..MAX_SEMANTIC_FALLBACK_V2_DELTA_OBJECTS {
+            let entry = evm_logs_entry(&chain, &broad_selector, 10, 10, index);
+            write_test_v2_delta(
+                &object_store,
+                &chain,
+                &scope,
+                &range,
+                &format!("{index:04}"),
+                vec![entry],
+                None,
+            );
+        }
+        let recent_entry = evm_logs_entry(
+            &chain,
+            &broad_selector,
+            10,
+            10,
+            MAX_SEMANTIC_FALLBACK_V2_DELTA_OBJECTS + 1,
+        );
+        write_entry(&object_store, &recent_entry).expect("write recent coverage");
+
+        let entries = read_entries_for_query(
+            &object_store,
+            &chain,
+            &DatasetKey::evm_logs(),
+            &query_selector,
+            &range,
+        )
+        .expect("read coverage with bounded semantic fallback")
+        .expect("recent coverage");
+
+        assert_eq!(entries, vec![recent_entry]);
         assert!(object_store.delta_list_pages() > 0);
     }
 
