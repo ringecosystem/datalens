@@ -335,6 +335,42 @@ fn test_read_through_cache_disabled_preserves_object_fetches() {
 }
 
 #[test]
+fn test_read_through_cache_skips_object_larger_than_byte_budget() {
+    let root = temp_storage_root("byte-budget");
+    let store = CountingObjectStore::new(root);
+    let storage = DurableStorage::from_object_store_with_read_through_cache_config(
+        store.clone(),
+        ReadThroughCacheConfig::enabled_with_byte_budget(16, 1),
+    );
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let range = LedgerRange::blocks(1, 1).expect("valid range");
+    let rows = block_rows(&[1]);
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &selector,
+            range: range.clone(),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write rows");
+    let object_key = first_data_object_key(&storage);
+
+    storage
+        .read_rows(&chain, &DatasetKey::evm_blocks(), &selector, range.clone())
+        .expect("first read");
+    storage
+        .read_rows(&chain, &DatasetKey::evm_blocks(), &selector, range)
+        .expect("second read");
+
+    assert_eq!(store.read_count(&object_key), 2);
+}
+
+#[test]
 fn test_storage_read_plan_skips_empty_coverage_object_fetches() {
     let root = temp_storage_root("empty-coverage-no-get");
     let store = CountingObjectStore::new(root);
