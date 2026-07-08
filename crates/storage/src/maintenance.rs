@@ -20,8 +20,9 @@ use crate::{
     coverage_index::{
         COVERAGE_INDEX_V2_LIST_PAGE_SIZE, CoverageIndexV2Bucket, CoverageIndexV2CleanupRecord,
         CoverageIndexV2CleanupRecordObject, coverage_index_v2_compaction_queue_prefix,
-        decode_v2_compaction_queue_record, parse_v2_bucket_from_object_key,
-        prepare_v2_bucket_compaction, unix_ms_now as coverage_index_v2_unix_ms_now,
+        decode_v2_compaction_queue_record, latest_v2_snapshot_head,
+        parse_v2_bucket_from_object_key, prepare_v2_bucket_compaction,
+        unix_ms_now as coverage_index_v2_unix_ms_now,
         v2_cleanup_record_is_safe_to_delete_with_cache, v2_snapshot_cleanup_records_for_bucket,
         write_v2_cleanup_record, write_v2_snapshot, write_v2_snapshot_head,
     },
@@ -1707,6 +1708,26 @@ where
                 break;
             }
             let bucket = bucket_scan_item.bucket;
+            if bucket_scan_item.queue_key.is_some()
+                && bucket.scope.starts_with("exact/evm.logs/")
+                && latest_v2_snapshot_head(self.object_store(), &bucket)?
+                    .is_some_and(|head| !head.included_delta_high_watermark.is_empty())
+            {
+                if operation_budget.remaining_deletes() == 0 {
+                    partial = true;
+                    break;
+                }
+                if let Some(queue_key) = bucket_scan_item.queue_key.as_deref() {
+                    self.object_store().delete(queue_key)?;
+                    operation_budget.record_deletes(1);
+                }
+                if let Some(last_delta_key) = bucket_scan_item.last_delta_key
+                    && !bucket_scan_item.cursor_key.is_empty()
+                {
+                    cursor_advances.insert(bucket_scan_item.cursor_key, last_delta_key);
+                }
+                continue;
+            }
             if config.cleanup_enabled && operation_budget.remaining_puts() > 0 {
                 for mut record in
                     v2_snapshot_cleanup_records_for_bucket(self.object_store(), &bucket)?

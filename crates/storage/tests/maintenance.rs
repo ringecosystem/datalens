@@ -5468,6 +5468,66 @@ fn test_compaction_coverage_index_v2_skips_exact_evm_logs_fallback_for_semantic_
 }
 
 #[test]
+fn test_compaction_coverage_index_v2_deletes_stale_exact_evm_logs_queue_without_bucket_scan() {
+    let object_store =
+        CountingListStore::new(temp_storage_root("coverage-v2-stale-exact-logs-queue"));
+    let storage = DurableStorage::from_object_store(object_store.clone());
+    let chain = test_chain();
+    let exact_scope =
+        "exact/evm.logs/block/evm-logs/addr-topic-950f2df7839a18cd4223dc171046b408/finalized";
+    let stale_delta_key =
+        write_coverage_index_v2_delta(&storage, &chain, exact_scope, 0, 99_999, "stale");
+    let snapshot_key = write_coverage_index_v2_snapshot_for_scope(
+        &storage,
+        &chain,
+        exact_scope,
+        "compacted",
+        1,
+        vec![stale_delta_key.clone()],
+    );
+    write_coverage_index_v2_snapshot_head_for_scope(
+        &storage,
+        &chain,
+        exact_scope,
+        "compacted-head",
+        1,
+        &snapshot_key,
+        &stale_delta_key,
+    );
+    let queue_key = write_coverage_index_v2_queue_record(&storage, &chain, exact_scope, 0, 99_999);
+
+    let report = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                coverage_index_v2_delta_count_threshold: 3,
+                max_deletes_per_tick: 1,
+                cleanup_enabled: false,
+                delete_source_objects: false,
+                ..coverage_index_v2_compaction_config(false)
+            },
+        )
+        .expect("compact stale exact evm logs queue");
+
+    assert_eq!(report.coverage_index_v2_compacted_buckets, 0);
+    assert!(
+        !storage
+            .object_store()
+            .exists(&queue_key)
+            .expect("queue exists")
+    );
+    let delta_bucket_prefix = format!(
+        "chains/{}/coverage-index-v2/deltas/{exact_scope}/00000000000000000000-00000000000000099999",
+        chain.key_prefix()
+    );
+    assert_eq!(
+        object_store.list_page_count_for_prefix(&delta_bucket_prefix),
+        0,
+        "stale exact evm.logs queue should not list the large delta bucket"
+    );
+}
+
+#[test]
 fn test_compaction_coverage_index_v2_cleanup_scan_respects_get_budget() {
     let storage = LocalStorage::new(temp_storage_root("coverage-v2-cleanup-get-budget"));
     let chain = test_chain();
@@ -6957,6 +7017,32 @@ fn write_coverage_index_v2_snapshot_head_for_scope<S: ObjectStore>(
         .object_store()
         .put(&key, &bytes)
         .expect("write snapshot head");
+    key
+}
+
+fn write_coverage_index_v2_queue_record<S: ObjectStore>(
+    storage: &DurableStorage<S>,
+    chain: &ChainIdentity,
+    scope: &str,
+    bucket_start: u64,
+    bucket_end: u64,
+) -> String {
+    let key = format!(
+        "chains/{}/coverage-index-v2/compaction-queue/{scope}/{bucket_start:020}-{bucket_end:020}.json",
+        chain.key_prefix()
+    );
+    let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+        "schema_version": 1,
+        "scope": scope,
+        "bucket_start": bucket_start,
+        "bucket_end": bucket_end,
+        "enqueued_at_unix_ms": 1,
+    }))
+    .expect("queue record bytes");
+    storage
+        .object_store()
+        .put(&key, &bytes)
+        .expect("write queue record");
     key
 }
 
