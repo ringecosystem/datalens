@@ -20,9 +20,8 @@ use crate::{
     coverage_index::{
         COVERAGE_INDEX_V2_LIST_PAGE_SIZE, CoverageIndexV2Bucket, CoverageIndexV2CleanupRecord,
         CoverageIndexV2CleanupRecordObject, coverage_index_v2_compaction_queue_prefix,
-        decode_v2_compaction_queue_record, latest_v2_snapshot_head,
-        parse_v2_bucket_from_object_key, prepare_v2_bucket_compaction,
-        unix_ms_now as coverage_index_v2_unix_ms_now,
+        decode_v2_compaction_queue_record, parse_v2_bucket_from_object_key,
+        prepare_v2_bucket_compaction, unix_ms_now as coverage_index_v2_unix_ms_now,
         v2_cleanup_record_is_safe_to_delete_with_cache, v2_snapshot_cleanup_records_for_bucket,
         write_v2_cleanup_record, write_v2_snapshot, write_v2_snapshot_head,
     },
@@ -1762,10 +1761,7 @@ where
                 break;
             }
             let mut compacted_v2_bucket = false;
-            if bucket_scan_item.queue_key.is_none()
-                && bucket.scope.starts_with("exact/evm.logs/")
-                && coverage_index_v2_bucket_has_legacy_snapshot_head(self.object_store(), &bucket)?
-            {
+            if bucket_scan_item.queue_key.is_none() && bucket.scope.starts_with("exact/evm.logs/") {
                 partial = true;
                 if let Some(last_delta_key) = bucket_scan_item.last_delta_key
                     && !bucket_scan_item.cursor_key.is_empty()
@@ -3514,17 +3510,6 @@ fn duration_millis(started: Instant) -> u64 {
 
 fn duration_millis_value(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX - 1)
-}
-
-fn coverage_index_v2_bucket_has_legacy_snapshot_head<S>(
-    object_store: &S,
-    bucket: &CoverageIndexV2Bucket,
-) -> Result<bool, DatalensError>
-where
-    S: ObjectStore,
-{
-    Ok(latest_v2_snapshot_head(object_store, bucket)?
-        .is_some_and(|head| head.included_delta_high_watermark.is_empty()))
 }
 
 fn unix_millis_now() -> Result<u64, DatalensError> {
