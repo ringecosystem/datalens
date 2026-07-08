@@ -32,6 +32,7 @@ use crate::{
 const MAX_SPARSE_SOURCE_RANGES_PER_CANDIDATE: usize = 3;
 const MAX_SPARSE_CANDIDATE_RANGE_SPAN_BLOCKS: u64 = 100_000;
 const COVERAGE_INDEX_V2_CLEANUP_RECORDS_PER_TICK: usize = 128;
+const COVERAGE_INDEX_V2_BUCKET_SCAN_PAGES_PER_TICK: usize = 8;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MaintenanceReport {
@@ -1608,6 +1609,9 @@ where
                 tick_started,
                 max_duration,
             },
+            operation_budget
+                .remaining_gets()
+                .clamp(1, COVERAGE_INDEX_V2_BUCKET_SCAN_PAGES_PER_TICK),
         )?;
         let mut cursor_advances = BTreeMap::<String, String>::new();
         let mut partial = cleanup_partial || bucket_scan.partial;
@@ -1825,27 +1829,47 @@ where
         priority: CoverageIndexV2ScanPriority,
         delta_count_threshold: usize,
         deadline: CoverageIndexV2CleanupDeadline,
+        max_scan_pages: usize,
     ) -> Result<CoverageIndexV2BucketScan, DatalensError> {
         let prefix = format!("chains/{}/coverage-index-v2/deltas", chain.key_prefix());
         let queue_prefix = coverage_index_v2_compaction_queue_prefix(&chain.key_prefix());
         let queue_cursor_key = coverage_index_v2_compaction_queue_cursor_key(chain);
+        let mut scan_pages = 0usize;
         let queue_cursor = self.read_compaction_cursor_key(&queue_cursor_key)?;
         let mut queue_page = self.object_store().list_page(
             &queue_prefix,
             queue_cursor.next_segment_key.as_deref(),
             delta_count_threshold.max(1),
         )?;
+        scan_pages += 1;
         if queue_page.objects.is_empty()
             && queue_cursor.next_segment_key.is_some()
             && !queue_page.has_more
         {
+            if scan_pages >= max_scan_pages {
+                return Ok(CoverageIndexV2BucketScan {
+                    buckets: Vec::new(),
+                    empty_cursor_advances: Vec::new(),
+                    partial: true,
+                    priority,
+                });
+            }
             queue_page =
                 self.object_store()
                     .list_page(&queue_prefix, None, delta_count_threshold.max(1))?;
+            scan_pages += 1;
         }
         let mut queued_buckets = Vec::new();
         let mut seen_buckets = BTreeSet::<CoverageIndexV2Bucket>::new();
         for object in queue_page.objects {
+            if deadline.expired() {
+                return Ok(CoverageIndexV2BucketScan {
+                    buckets: queued_buckets,
+                    empty_cursor_advances: Vec::new(),
+                    partial: true,
+                    priority,
+                });
+            }
             if !object.key.ends_with(".json") {
                 continue;
             }
@@ -1932,12 +1956,16 @@ where
                     partial = true;
                     break;
                 }
-                let resumed_from_cursor = page_start_after.is_some();
+                if scan_pages >= max_scan_pages {
+                    partial = true;
+                    break;
+                }
                 let list_page = self.object_store().list_page(
                     scan_prefix,
                     page_start_after.as_deref(),
                     COVERAGE_INDEX_V2_LIST_PAGE_SIZE,
                 )?;
+                scan_pages += 1;
                 if deadline.expired() {
                     partial = true;
                     break;
@@ -1975,8 +2003,7 @@ where
                         .get(bucket)
                         .copied()
                         .unwrap_or(0);
-                    if (delta_count >= delta_count_threshold.max(1)
-                        || (!list_page.has_more && resumed_from_cursor))
+                    if delta_count >= delta_count_threshold.max(1)
                         && seen_buckets.insert(bucket.clone())
                     {
                         emitted_buckets = true;
