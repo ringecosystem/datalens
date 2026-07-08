@@ -5897,6 +5897,40 @@ fn test_compaction_coverage_index_v2_queue_prioritizes_semantic_hot_bucket() {
 }
 
 #[test]
+fn test_compaction_coverage_index_v2_queue_scan_is_bounded() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-v2-queue-scan-bounded"));
+    let chain = test_chain();
+    for index in 0..20 {
+        let scope = format!("semantic/evm.logs/block/finalized/evm-logs-v1/addr/0x{index:040x}");
+        write_coverage_index_v2_compaction_queue_record(
+            &storage, &chain, &scope, 25_400_000, 25_499_999,
+        );
+    }
+    let counting_store = CountingOperationStore::new(storage.root().into());
+    let counting_storage = DurableStorage::from_object_store(counting_store.clone());
+
+    counting_storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                coverage_index_v2_delta_count_threshold: 64,
+                max_gets_per_tick: 128,
+                cleanup_enabled: false,
+                delete_source_objects: false,
+                ..coverage_index_v2_compaction_config(false)
+            },
+        )
+        .expect("bounded queue scan");
+    let queue_gets = counting_store
+        .get_keys()
+        .into_iter()
+        .filter(|key| key.contains("/coverage-index-v2/compaction-queue/"))
+        .count();
+
+    assert_eq!(queue_gets, 8);
+}
+
+#[test]
 fn test_compaction_coverage_index_v2_queue_rotates_after_partial_hot_bucket() {
     let storage = LocalStorage::new(temp_storage_root(
         "coverage-v2-queue-rotates-partial-hot-bucket",
