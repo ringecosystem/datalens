@@ -88,12 +88,13 @@ impl ReadThroughCache {
         let Some(key) = cache_key(object_key, entry, encoding) else {
             return;
         };
-        let Some(byte_len) = entry
+        let Some(object_byte_len) = entry
             .object_size_bytes
             .and_then(|value| usize::try_from(value).ok())
         else {
             return;
         };
+        let byte_len = estimated_cached_rows_bytes(&rows, object_byte_len);
         let Some(inner) = &self.inner else {
             return;
         };
@@ -178,4 +179,33 @@ fn cache_key(
         checksum_algorithm,
         written_at_unix_seconds: entry.written_at_unix_seconds,
     })
+}
+
+fn estimated_cached_rows_bytes(rows: &DatasetRows, object_byte_len: usize) -> usize {
+    serde_json::to_vec(rows)
+        .map(|bytes| bytes.len().max(object_byte_len))
+        .unwrap_or(object_byte_len)
+}
+
+#[cfg(test)]
+mod tests {
+    use datalens_core::{BlockHeader, DatasetKey, QueryRows};
+
+    use super::*;
+
+    #[test]
+    fn test_estimated_cached_rows_bytes_uses_decoded_rows_size() {
+        let rows = DatasetRows::new(
+            DatasetKey::evm_blocks(),
+            QueryRows::EvmBlocks(vec![BlockHeader {
+                number: 1,
+                hash: "0xblock".repeat(32),
+                parent_hash: "0xparent".repeat(32),
+                timestamp: 1,
+            }]),
+        )
+        .expect("dataset rows");
+
+        assert!(estimated_cached_rows_bytes(&rows, 1) > 1);
+    }
 }
