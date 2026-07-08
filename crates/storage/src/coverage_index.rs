@@ -461,13 +461,19 @@ where
     }
     let snapshot_head_key = snapshot_head.as_ref().map(|(key, _)| key.clone());
 
-    let delta_objects = list_v2_delta_object_metadata_for_bucket(
-        object_store,
-        bucket,
-        &compacted_delta_keys,
-        max_delta_objects,
-        start_after_delta_key,
-    )?;
+    let skip_legacy_exact_evm_logs_tail =
+        bucket.scope.starts_with("exact/evm.logs/") && start_after_delta_key.is_some();
+    let delta_objects = if skip_legacy_exact_evm_logs_tail {
+        Vec::new()
+    } else {
+        list_v2_delta_object_metadata_for_bucket(
+            object_store,
+            bucket,
+            &compacted_delta_keys,
+            max_delta_objects,
+            start_after_delta_key,
+        )?
+    };
     let skip_pending_deltas = if let Some(max_delta_objects) = max_delta_objects {
         delta_objects.len() >= max_delta_objects
     } else {
@@ -3537,6 +3543,71 @@ mod tests {
                 .map(|entry| (entry.range.start(), entry.range.end()))
                 .collect::<Vec<_>>(),
             vec![(30, 35), (36, 40), (41, 42)]
+        );
+    }
+
+    #[test]
+    fn test_read_entries_for_exact_evm_logs_snapshot_skips_tail_delta_list() {
+        let object_store =
+            DelayedV2DeltaGetObjectStore::new(temp_storage_root("exact-v2-watermark-no-tail-list"));
+        let chain = test_chain();
+        let selector = evm_logs_selector(vec![]);
+        let range = LedgerRange::blocks(30, 40).expect("valid range");
+        let scope = coverage_index_v2_exact_scope(
+            &DatasetKey::evm_logs(),
+            &range,
+            &selector.fingerprint(),
+            ManifestFinalityLevel::Safe,
+        );
+        let bucket = CoverageIndexV2Bucket {
+            chain_key: chain.key_prefix(),
+            scope: scope.clone(),
+            bucket_start: 0,
+            bucket_end: DEFAULT_COVERAGE_INDEX_BUCKET_SIZE - 1,
+        };
+        let entry = evm_logs_entry(&chain, &selector, 30, 40, 0);
+        let compacted_delta_key = write_test_v2_delta(
+            &object_store,
+            &chain,
+            &scope,
+            &range,
+            "0001",
+            vec![entry.clone()],
+            None,
+        );
+        let snapshot_key = write_v2_snapshot(
+            &object_store,
+            &chain,
+            &scope,
+            0,
+            DEFAULT_COVERAGE_INDEX_BUCKET_SIZE - 1,
+            vec![entry],
+            vec![compacted_delta_key.clone()],
+        )
+        .expect("write snapshot");
+        write_v2_snapshot_head(
+            &object_store,
+            &chain,
+            &scope,
+            0,
+            DEFAULT_COVERAGE_INDEX_BUCKET_SIZE - 1,
+            snapshot_key,
+            compacted_delta_key,
+        )
+        .expect("write snapshot head");
+        mark_cached_v2_bucket_entries_dirty(&object_store, &bucket);
+        let delta_list_pages_before = object_store.delta_list_pages();
+        let mut entries = Vec::new();
+
+        let has_index = read_entries_for_v2_bucket(&object_store, &bucket, &mut entries, None)
+            .expect("read exact evm logs bucket");
+
+        assert!(has_index);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            object_store.delta_list_pages(),
+            delta_list_pages_before,
+            "compacted exact evm.logs buckets should use the snapshot without listing the delta tail"
         );
     }
 
