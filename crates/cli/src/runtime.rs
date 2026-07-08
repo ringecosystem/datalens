@@ -315,13 +315,37 @@ impl CompactionStorage {
         chain: &ChainIdentity,
         max_records: usize,
     ) -> Result<usize, DatalensError> {
-        let prefix = coverage_index_v2_compaction_queue_prefix(chain);
+        self.coverage_index_v2_compaction_queue_prefix_size_hint(
+            &coverage_index_v2_compaction_queue_prefix(chain),
+            max_records,
+        )
+    }
+
+    fn coverage_index_v2_semantic_compaction_queue_size_hint(
+        &self,
+        chain: &ChainIdentity,
+        max_records: usize,
+    ) -> Result<usize, DatalensError> {
+        self.coverage_index_v2_compaction_queue_prefix_size_hint(
+            &format!(
+                "{}/semantic/evm.logs",
+                coverage_index_v2_compaction_queue_prefix(chain)
+            ),
+            max_records,
+        )
+    }
+
+    fn coverage_index_v2_compaction_queue_prefix_size_hint(
+        &self,
+        prefix: &str,
+        max_records: usize,
+    ) -> Result<usize, DatalensError> {
         let page = match self {
             CompactionStorage::Local(storage) => {
-                storage.object_store().list_page(&prefix, None, max_records)
+                storage.object_store().list_page(prefix, None, max_records)
             }
             CompactionStorage::S3(storage) => {
-                storage.object_store().list_page(&prefix, None, max_records)
+                storage.object_store().list_page(prefix, None, max_records)
             }
         }?;
         Ok(page
@@ -822,6 +846,7 @@ fn compaction_chain_batch_indexes(next_chain_index: &mut usize, chain_count: usi
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct QueuedCompactionChain {
     chain_index: usize,
+    semantic_queued_objects: usize,
     queued_objects: usize,
     batch_order: usize,
 }
@@ -836,6 +861,22 @@ fn queued_compaction_chain_indexes(
         let Some(chain) = chains.get(chain_index) else {
             continue;
         };
+        let semantic_queued_objects = match storage
+            .coverage_index_v2_semantic_compaction_queue_size_hint(
+                chain,
+                COVERAGE_INDEX_V2_CHAIN_QUEUE_PRIORITY_SCAN_LIMIT,
+            ) {
+            Ok(queued_objects) => queued_objects,
+            Err(error) => {
+                log::warn!(
+                    "storage semantic compaction queue priority check failed chain_key={} kind={:?} message={}",
+                    chain.key_prefix(),
+                    error.kind,
+                    error.message
+                );
+                0
+            }
+        };
         match storage.coverage_index_v2_compaction_queue_size_hint(
             chain,
             COVERAGE_INDEX_V2_CHAIN_QUEUE_PRIORITY_SCAN_LIMIT,
@@ -843,6 +884,7 @@ fn queued_compaction_chain_indexes(
             Ok(queued_objects) if queued_objects > 0 => {
                 queued.push(QueuedCompactionChain {
                     chain_index,
+                    semantic_queued_objects,
                     queued_objects,
                     batch_order,
                 });
@@ -860,11 +902,22 @@ fn queued_compaction_chain_indexes(
     }
     queued.sort_by(|left, right| {
         right
-            .queued_objects
-            .cmp(&left.queued_objects)
+            .semantic_queued_objects
+            .cmp(&left.semantic_queued_objects)
+            .then_with(|| right.queued_objects.cmp(&left.queued_objects))
             .then_with(|| left.batch_order.cmp(&right.batch_order))
     });
     queued
+}
+
+fn sort_queued_compaction_chains(queued: &mut [QueuedCompactionChain]) {
+    queued.sort_by(|left, right| {
+        right
+            .semantic_queued_objects
+            .cmp(&left.semantic_queued_objects)
+            .then_with(|| right.queued_objects.cmp(&left.queued_objects))
+            .then_with(|| left.batch_order.cmp(&right.batch_order))
+    });
 }
 
 fn prioritize_compaction_chain_batch_indexes(
@@ -875,12 +928,7 @@ fn prioritize_compaction_chain_batch_indexes(
         return chain_indexes;
     }
     let mut queued = queued_chain_indexes.to_vec();
-    queued.sort_by(|left, right| {
-        right
-            .queued_objects
-            .cmp(&left.queued_objects)
-            .then_with(|| left.batch_order.cmp(&right.batch_order))
-    });
+    sort_queued_compaction_chains(&mut queued);
     let mut selected = queued
         .iter()
         .take(HIGH_BACKLOG_COMPACTION_CHAINS_PER_WAKE)
@@ -2174,11 +2222,13 @@ mod tests {
         let queued = vec![
             QueuedCompactionChain {
                 chain_index: 3,
+                semantic_queued_objects: 0,
                 queued_objects: 8,
                 batch_order: 1,
             },
             QueuedCompactionChain {
                 chain_index: 1,
+                semantic_queued_objects: 0,
                 queued_objects: 24,
                 batch_order: 3,
             },
@@ -2199,21 +2249,25 @@ mod tests {
         let queued = vec![
             QueuedCompactionChain {
                 chain_index: 0,
+                semantic_queued_objects: 0,
                 queued_objects: 65,
                 batch_order: 0,
             },
             QueuedCompactionChain {
                 chain_index: 1,
+                semantic_queued_objects: 0,
                 queued_objects: 64,
                 batch_order: 1,
             },
             QueuedCompactionChain {
                 chain_index: 2,
+                semantic_queued_objects: 0,
                 queued_objects: 32,
                 batch_order: 2,
             },
             QueuedCompactionChain {
                 chain_index: 3,
+                semantic_queued_objects: 0,
                 queued_objects: 16,
                 batch_order: 3,
             },
@@ -2234,31 +2288,37 @@ mod tests {
         let queued = vec![
             QueuedCompactionChain {
                 chain_index: 0,
+                semantic_queued_objects: 0,
                 queued_objects: 65,
                 batch_order: 5,
             },
             QueuedCompactionChain {
                 chain_index: 1,
+                semantic_queued_objects: 0,
                 queued_objects: 64,
                 batch_order: 4,
             },
             QueuedCompactionChain {
                 chain_index: 2,
+                semantic_queued_objects: 0,
                 queued_objects: 63,
                 batch_order: 3,
             },
             QueuedCompactionChain {
                 chain_index: 3,
+                semantic_queued_objects: 0,
                 queued_objects: 32,
                 batch_order: 2,
             },
             QueuedCompactionChain {
                 chain_index: 4,
+                semantic_queued_objects: 0,
                 queued_objects: 31,
                 batch_order: 1,
             },
             QueuedCompactionChain {
                 chain_index: 5,
+                semantic_queued_objects: 0,
                 queued_objects: 30,
                 batch_order: 0,
             },
@@ -2267,6 +2327,41 @@ mod tests {
         assert_eq!(
             prioritize_compaction_chain_batch_indexes(vec![5, 4, 3, 2, 1, 0], &queued),
             vec![0, 1, 2, 5, 4]
+        );
+    }
+
+    #[test]
+    fn storage_compaction_chain_batch_prioritizes_semantic_coverage_queues() {
+        let queued = vec![
+            QueuedCompactionChain {
+                chain_index: 0,
+                semantic_queued_objects: 2,
+                queued_objects: 64,
+                batch_order: 0,
+            },
+            QueuedCompactionChain {
+                chain_index: 1,
+                semantic_queued_objects: 26,
+                queued_objects: 42,
+                batch_order: 1,
+            },
+            QueuedCompactionChain {
+                chain_index: 2,
+                semantic_queued_objects: 6,
+                queued_objects: 64,
+                batch_order: 2,
+            },
+            QueuedCompactionChain {
+                chain_index: 3,
+                semantic_queued_objects: 30,
+                queued_objects: 32,
+                batch_order: 3,
+            },
+        ];
+
+        assert_eq!(
+            prioritize_compaction_chain_batch_indexes(vec![0, 1, 2, 3], &queued),
+            vec![3, 1, 2, 0]
         );
     }
 
