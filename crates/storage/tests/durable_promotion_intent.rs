@@ -422,6 +422,51 @@ fn test_list_pending_for_chain_and_source_is_fair_across_applications() {
 }
 
 #[test]
+fn test_list_pending_for_chain_and_source_uses_paged_application_index() {
+    let root = temp_storage_root("source-application-paged");
+    let object_store = CountingObjectStore::new(root);
+    let store = DurablePromotionIntentStore::new(object_store.clone());
+    let ethereum = test_chain();
+    for index in 0..40 {
+        store
+            .create_or_get(datalens_storage::CreateDurablePromotionIntent {
+                source: DurablePromotionIntentSource::Warmup,
+                application: format!("warmup-app-{}", index % 4),
+                chain: ethereum.clone(),
+                dataset_key: DatasetKey::evm_blocks(),
+                selector: DatasetSelector::all(),
+                selector_fingerprint: "all".to_owned(),
+                selector_canonical_key: "all".to_owned(),
+                finality: "safe".to_owned(),
+                ranges: vec![
+                    LedgerRange::blocks(1_000 + index, 1_000 + index).expect("valid range"),
+                ],
+                request_id: None,
+                task_id: Some(format!("warmup-task-{index}")),
+                now_unix_seconds: 100 + index,
+            })
+            .expect("create warmup intent");
+    }
+    object_store.clear_lists();
+
+    let pending = store
+        .list_pending_for_chain_and_source(&ethereum, DurablePromotionIntentSource::Warmup, 300, 8)
+        .expect("list source pending");
+
+    assert_eq!(pending.len(), 8);
+    assert!(object_store.list_prefixes().is_empty());
+    assert!(
+        object_store
+            .list_page_calls()
+            .into_iter()
+            .any(|(prefix, _, limit)| prefix
+                .starts_with("durable-promotion-intents/v1/index/status=pending-by-application")
+                && limit > 0),
+        "expected paged pending-by-application scan"
+    );
+}
+
+#[test]
 fn test_pending_backlog_for_chain_uses_pending_index_without_canonical_reads() {
     let root = temp_storage_root("pending-backlog-index");
     let object_store = CountingObjectStore::new(root);
@@ -470,7 +515,11 @@ fn test_pending_backlog_for_chain_uses_pending_index_without_canonical_reads() {
         "backlog metrics must not read canonical intent JSON"
     );
     assert_eq!(
-        object_store.list_prefixes(),
+        object_store
+            .list_page_calls()
+            .into_iter()
+            .map(|(prefix, _, _)| prefix)
+            .collect::<Vec<_>>(),
         vec![
             format!(
                 "durable-promotion-intents/v1/index/status=pending/chain={}/source=query",

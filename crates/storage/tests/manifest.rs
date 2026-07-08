@@ -4243,6 +4243,7 @@ fn test_partial_coverage_index_does_not_load_legacy_manifest() {
             record_empty_coverage: true,
         })
         .expect("write second range");
+    clear_coverage_index_v2(&storage, &chain);
 
     let manifest = storage.manifest().expect("manifest");
     let index = serde_json::json!({

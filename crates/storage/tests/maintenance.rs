@@ -5211,6 +5211,101 @@ fn test_compaction_coverage_index_v2_skips_sparse_buckets_on_partial_scan_page()
 }
 
 #[test]
+fn test_compaction_coverage_index_v2_scans_past_sparse_pages_to_hot_bucket() {
+    let object_store = CountingListStore::new(temp_storage_root("coverage-v2-hot-after-sparse"));
+    let storage = DurableStorage::from_object_store(object_store.clone());
+    let chain = test_chain();
+    let scope = "exact/evm.blocks/block/all/safe";
+    for index in 0..1000 {
+        write_coverage_index_v2_delta(
+            &storage,
+            &chain,
+            scope,
+            index * 100_000,
+            index * 100_000 + 99_999,
+            "sparse",
+        );
+    }
+    for id in ["hot-a", "hot-b", "hot-c"] {
+        write_coverage_index_v2_delta(
+            &storage,
+            &chain,
+            scope,
+            1000 * 100_000,
+            1000 * 100_000 + 99_999,
+            id,
+        );
+    }
+
+    let report = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                coverage_index_v2_delta_count_threshold: 3,
+                ..coverage_index_v2_compaction_config(false)
+            },
+        )
+        .expect("scan past sparse page");
+
+    assert_eq!(report.coverage_index_v2_compacted_buckets, 1);
+    assert_eq!(report.coverage_index_v2_compacted_deltas, 3);
+    assert_eq!(coverage_index_v2_snapshot_head_count(&storage, &chain), 1);
+}
+
+#[test]
+fn test_compaction_coverage_index_v2_compacts_hot_bucket_split_across_scan_pages() {
+    let object_store = CountingListStore::new(temp_storage_root("coverage-v2-split-hot-bucket"));
+    let storage = DurableStorage::from_object_store(object_store.clone());
+    let chain = test_chain();
+    let scope = "exact/evm.blocks/block/all/safe";
+    for index in 0..899 {
+        write_coverage_index_v2_delta(
+            &storage,
+            &chain,
+            scope,
+            index * 100_000,
+            index * 100_000 + 99_999,
+            "sparse",
+        );
+    }
+    for index in 0..129 {
+        write_coverage_index_v2_delta(
+            &storage,
+            &chain,
+            scope,
+            899 * 100_000,
+            899 * 100_000 + 99_999,
+            &format!("hot-{index:03}"),
+        );
+    }
+    for index in 900..1900 {
+        write_coverage_index_v2_delta(
+            &storage,
+            &chain,
+            scope,
+            index * 100_000,
+            index * 100_000 + 99_999,
+            "sparse",
+        );
+    }
+
+    let report = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                coverage_index_v2_delta_count_threshold: 128,
+                max_gets_per_tick: 256,
+                ..coverage_index_v2_compaction_config(false)
+            },
+        )
+        .expect("compact split hot bucket");
+
+    assert_eq!(report.coverage_index_v2_compacted_buckets, 1);
+    assert_eq!(report.coverage_index_v2_compacted_deltas, 129);
+    assert_eq!(coverage_index_v2_snapshot_head_count(&storage, &chain), 1);
+}
+
+#[test]
 fn test_compaction_coverage_index_v2_snapshot_head_writes_stay_within_overwrite_budget() {
     let object_store = CountingObjectStore::new(LocalObjectStore::new(temp_storage_root(
         "coverage-v2-head-overwrite-budget",

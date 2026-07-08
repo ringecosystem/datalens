@@ -439,20 +439,11 @@ where
         max_delta_objects,
         start_after_delta_key,
     )?;
-    if let Some(max_delta_objects) = max_delta_objects
-        && delta_objects.len() >= max_delta_objects
-    {
-        log::warn!(
-            "storage coverage semantic fallback skipped chain_key={} scope={} bucket={}-{} listed_delta_objects={} max_delta_objects={}",
-            bucket.chain_key,
-            bucket.scope,
-            bucket.bucket_start,
-            bucket.bucket_end,
-            delta_objects.len(),
-            max_delta_objects
-        );
-        return Ok(false);
-    }
+    let skip_pending_deltas = if let Some(max_delta_objects) = max_delta_objects {
+        delta_objects.len() >= max_delta_objects
+    } else {
+        false
+    };
     let (mut bucket_entries, remaining_delta_objects) = if let Some(cached) =
         get_cached_v2_bucket_entries(&cache_key)
         && !cached.dirty
@@ -472,13 +463,28 @@ where
         (bucket_entries, delta_objects.as_slice())
     };
 
+    if skip_pending_deltas {
+        log::warn!(
+            "storage coverage semantic fallback skipped pending deltas chain_key={} scope={} bucket={}-{} listed_delta_objects={} max_delta_objects={} snapshot_entries={}",
+            bucket.chain_key,
+            bucket.scope,
+            bucket.bucket_start,
+            bucket.bucket_end,
+            delta_objects.len(),
+            max_delta_objects.unwrap_or_default(),
+            bucket_entries.len()
+        );
+        entries.append(&mut bucket_entries);
+        return Ok(any_bucket_has_index);
+    }
+
     for object in
         read_v2_delta_objects_from_metadata(object_store, bucket, remaining_delta_objects)?
     {
         let mut delta = object.delta;
         any_bucket_has_index = true;
         if let Some(replacement) = delta.replacement {
-            apply_v2_replacement(&mut bucket_entries, &replacement.entry)?;
+            apply_v2_replacement(&mut bucket_entries, bucket, &replacement.entry)?;
         }
         bucket_entries.append(&mut delta.entries);
     }
@@ -537,7 +543,7 @@ where
         .collect::<Vec<_>>();
     for object in deltas {
         if let Some(replacement) = object.delta.replacement {
-            apply_v2_replacement(&mut entries, &replacement.entry)?;
+            apply_v2_replacement(&mut entries, bucket, &replacement.entry)?;
         }
         entries.extend(object.delta.entries);
     }
@@ -975,8 +981,14 @@ where
 
 fn apply_v2_replacement(
     entries: &mut Vec<ManifestEntry>,
+    bucket: &CoverageIndexV2Bucket,
     replacement_entry: &ManifestEntry,
 ) -> Result<(), DatalensError> {
+    let bucket_range = LedgerRange::try_new(
+        replacement_entry.range.kind(),
+        bucket.bucket_start,
+        bucket.bucket_end,
+    )?;
     let mut retained = Vec::new();
     for existing_entry in entries.drain(..) {
         if replacement_scope_matches(&existing_entry, replacement_entry)
@@ -985,10 +997,11 @@ fn apply_v2_replacement(
                 .intersection(&replacement_entry.range)
                 .is_some()
         {
-            retained.extend(split_entry_around_range(
-                existing_entry,
-                &replacement_entry.range,
-            )?);
+            retained.extend(
+                split_entry_around_range(existing_entry, &replacement_entry.range)?
+                    .into_iter()
+                    .filter(|split_entry| split_entry.range.intersection(&bucket_range).is_some()),
+            );
         } else {
             retained.push(existing_entry);
         }
@@ -1883,6 +1896,7 @@ where
             started.elapsed().as_millis()
         );
     }
+    actual_replaced_entries.extend(replacement.replaced_entries.iter().cloned());
     let mut replaced_manifest = Manifest {
         entries: actual_replaced_entries,
     };
@@ -3382,6 +3396,93 @@ mod tests {
         .expect("read coverage with bounded semantic fallback");
 
         assert!(entries.is_none());
+        assert_eq!(object_store.delta_gets(), 0);
+        assert!(object_store.delta_list_pages() > 0);
+    }
+
+    #[test]
+    fn test_semantic_v2_fallback_uses_snapshot_when_pending_deltas_exceed_budget() {
+        let object_store = DelayedV2DeltaGetObjectStore::new(temp_storage_root(
+            "semantic-v2-fallback-budget-snapshot",
+        ));
+        let chain = test_chain();
+        let query_selector =
+            evm_logs_selector_with_addresses(vec![address(1)], vec![Some(vec![topic(1)])]);
+        let broad_selector = evm_logs_selector(vec![]);
+        let range = LedgerRange::blocks(10, 10).expect("valid range");
+        let scope = coverage_index_v2_semantic_scope(
+            &DatasetKey::evm_logs(),
+            &range,
+            ManifestFinalityLevel::Safe,
+            "addr/*",
+        );
+        let snapshot_entry = evm_logs_entry(&chain, &broad_selector, 10, 10, 1);
+        let compacted_delta_key = write_test_v2_delta(
+            &object_store,
+            &chain,
+            &scope,
+            &range,
+            "0000",
+            vec![snapshot_entry.clone()],
+            None,
+        );
+        let snapshot_key = write_v2_snapshot(
+            &object_store,
+            &chain,
+            &scope,
+            0,
+            DEFAULT_COVERAGE_INDEX_BUCKET_SIZE - 1,
+            vec![snapshot_entry.clone()],
+            vec![compacted_delta_key.clone()],
+        )
+        .expect("write snapshot");
+        write_v2_snapshot_head(
+            &object_store,
+            &chain,
+            &scope,
+            0,
+            DEFAULT_COVERAGE_INDEX_BUCKET_SIZE - 1,
+            snapshot_key,
+            compacted_delta_key,
+        )
+        .expect("write snapshot head");
+        let bucket = CoverageIndexV2Bucket {
+            chain_key: chain.key_prefix(),
+            scope: scope.clone(),
+            bucket_start: 0,
+            bucket_end: DEFAULT_COVERAGE_INDEX_BUCKET_SIZE - 1,
+        };
+        mark_cached_v2_bucket_entries_dirty(&object_store, &bucket);
+        for index in 0..MAX_SEMANTIC_FALLBACK_V2_DELTA_OBJECTS {
+            let entry = evm_logs_entry(&chain, &broad_selector, 10, 10, index + 2);
+            write_test_v2_delta(
+                &object_store,
+                &chain,
+                &scope,
+                &range,
+                &format!("1{index:04}"),
+                vec![entry],
+                None,
+            );
+        }
+
+        let entries = read_entries_for_query(
+            &object_store,
+            &chain,
+            &DatasetKey::evm_logs(),
+            &query_selector,
+            &range,
+        )
+        .expect("read coverage with bounded semantic fallback")
+        .expect("snapshot coverage");
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| (entry.range.start(), entry.range.end(), entry.row_count))
+                .collect::<Vec<_>>(),
+            vec![(10, 10, 1)]
+        );
         assert_eq!(object_store.delta_gets(), 0);
         assert!(object_store.delta_list_pages() > 0);
     }

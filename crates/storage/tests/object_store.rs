@@ -729,6 +729,62 @@ fn test_s3_compaction_cleans_fragmentation_without_read_regression() {
     cleanup.cleanup();
 }
 
+#[test]
+fn test_s3_coverage_index_v2_compaction_handles_hot_bucket() {
+    let Some(config) = s3_test_config() else {
+        return;
+    };
+    let chain = s3_compaction_test_chain();
+    let selector = DatasetSelector::all();
+    let store = S3ObjectStore::from_config(config).expect("build S3 object store");
+    let mut cleanup = S3PrefixCleanup::new(store.clone(), ["chains"]);
+    let storage = DurableStorage::from_object_store(store);
+    let blocks = (20_000..20_129).collect::<Vec<_>>();
+    let expected_blocks = expected_block_headers(&blocks);
+
+    for block in &expected_blocks {
+        write_block_object_to_storage(&storage, &chain, &selector, block, FinalityLevel::Safe);
+    }
+    assert_read_block_headers(&storage, &chain, &selector, &expected_blocks);
+
+    let report = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                coverage_index_v2_delta_count_threshold: 128,
+                max_gets_per_tick: 256,
+                ..s3_compaction_config(false)
+            },
+        )
+        .expect("s3 coverage index v2 compaction");
+    assert_eq!(report.coverage_index_v2_compacted_buckets, 1);
+    assert_eq!(report.coverage_index_v2_compacted_deltas, blocks.len());
+    assert_eq!(
+        list_prefix(
+            &storage,
+            &format!(
+                "chains/{}/coverage-index-v2/snapshot-heads",
+                chain.key_prefix()
+            )
+        )
+        .len(),
+        1
+    );
+    assert_read_block_headers(&storage, &chain, &selector, &expected_blocks);
+
+    println!(
+        "{}",
+        serde_json::json!({
+            "test": "test_s3_coverage_index_v2_compaction_handles_hot_bucket",
+            "chain": chain.key_prefix(),
+            "blocks": blocks.len(),
+            "coverage_index_v2_compacted_buckets": report.coverage_index_v2_compacted_buckets,
+            "coverage_index_v2_compacted_deltas": report.coverage_index_v2_compacted_deltas,
+        })
+    );
+    cleanup.cleanup();
+}
+
 fn s3_compaction_config(cleanup_enabled: bool) -> MaintenanceCompactionConfig {
     MaintenanceCompactionConfig {
         min_object_bytes: u64::MAX,
