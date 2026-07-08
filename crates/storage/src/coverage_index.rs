@@ -163,6 +163,16 @@ pub(crate) struct CoverageIndexV2CleanupRecordObject {
     pub(crate) record: CoverageIndexV2CleanupRecord,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CoverageIndexV2CompactionQueueRecord {
+    pub(crate) schema_version: u32,
+    pub(crate) scope: String,
+    pub(crate) bucket_start: u64,
+    pub(crate) bucket_end: u64,
+    pub(crate) enqueued_at_unix_ms: u64,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum CoverageIndexV2CompactedDeltaProof {
     Explicit(BTreeSet<String>),
@@ -1446,6 +1456,16 @@ where
                 format!("write coverage index v2 delta {key}: {}", error.message),
             )
         })?;
+        if let Err(error) = write_v2_compaction_queue_record(object_store, &bucket) {
+            log::warn!(
+                "coverage index v2 compaction queue write failed bucket_scope={} bucket_start={} bucket_end={} kind={:?} message={}",
+                bucket.scope,
+                bucket.bucket_start,
+                bucket.bucket_end,
+                error.kind,
+                error.message
+            );
+        }
         append_cached_v2_bucket_delta(object_store, &bucket, key, &delta);
     }
     Ok(())
@@ -1506,6 +1526,16 @@ where
                 ),
             )
         })?;
+        if let Err(error) = write_v2_compaction_queue_record(object_store, &bucket) {
+            log::warn!(
+                "coverage index v2 compaction queue write failed bucket_scope={} bucket_start={} bucket_end={} kind={:?} message={}",
+                bucket.scope,
+                bucket.bucket_start,
+                bucket.bucket_end,
+                error.kind,
+                error.message
+            );
+        }
         mark_cached_v2_bucket_entries_dirty(object_store, &bucket);
     }
     Ok(())
@@ -2211,6 +2241,82 @@ fn coverage_index_v2_snapshot_head_prefix(
 
 fn coverage_index_v2_cleanup_prefix(chain_key: &str) -> String {
     format!("chains/{chain_key}/coverage-index-v2/cleanup")
+}
+
+pub(crate) fn coverage_index_v2_compaction_queue_prefix(chain_key: &str) -> String {
+    format!("chains/{chain_key}/coverage-index-v2/compaction-queue")
+}
+
+pub(crate) fn coverage_index_v2_compaction_queue_key(bucket: &CoverageIndexV2Bucket) -> String {
+    format!(
+        "{}/{}/{:020}-{:020}.json",
+        coverage_index_v2_compaction_queue_prefix(&bucket.chain_key),
+        bucket.scope,
+        bucket.bucket_start,
+        bucket.bucket_end
+    )
+}
+
+pub(crate) fn write_v2_compaction_queue_record<S>(
+    object_store: &S,
+    bucket: &CoverageIndexV2Bucket,
+) -> Result<String, DatalensError>
+where
+    S: ObjectStore,
+{
+    let key = coverage_index_v2_compaction_queue_key(bucket);
+    let record = CoverageIndexV2CompactionQueueRecord {
+        schema_version: COVERAGE_INDEX_V2_SCHEMA_VERSION,
+        scope: bucket.scope.clone(),
+        bucket_start: bucket.bucket_start,
+        bucket_end: bucket.bucket_end,
+        enqueued_at_unix_ms: unix_ms_now()?,
+    };
+    let bytes = serde_json::to_vec_pretty(&record).map_err(|error| {
+        DatalensError::new(
+            DatalensErrorKind::Internal,
+            format!("encode coverage index v2 compaction queue record: {error}"),
+        )
+    })?;
+    object_store.put_if_absent(&key, &bytes).map_err(|error| {
+        DatalensError::new(
+            DatalensErrorKind::ManifestUpdateFailure,
+            format!(
+                "write coverage index v2 compaction queue record {key}: {}",
+                error.message
+            ),
+        )
+    })?;
+    Ok(key)
+}
+
+pub(crate) fn decode_v2_compaction_queue_record(
+    chain_key: &str,
+    key: &str,
+    bytes: &[u8],
+) -> Result<CoverageIndexV2Bucket, DatalensError> {
+    let record: CoverageIndexV2CompactionQueueRecord =
+        serde_json::from_slice(bytes).map_err(|error| {
+            DatalensError::new(
+                DatalensErrorKind::StorageReadFailure,
+                format!("decode coverage index v2 compaction queue record {key}: {error}"),
+            )
+        })?;
+    if record.schema_version != COVERAGE_INDEX_V2_SCHEMA_VERSION {
+        return Err(DatalensError::new(
+            DatalensErrorKind::StorageReadFailure,
+            format!(
+                "unsupported coverage index v2 compaction queue record schema {} at {key}",
+                record.schema_version
+            ),
+        ));
+    }
+    Ok(CoverageIndexV2Bucket {
+        chain_key: chain_key.to_owned(),
+        scope: record.scope,
+        bucket_start: record.bucket_start,
+        bucket_end: record.bucket_end,
+    })
 }
 
 pub(crate) fn parse_v2_bucket_from_object_key(
