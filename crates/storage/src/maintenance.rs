@@ -596,7 +596,10 @@ where
                     &mut operation_budget,
                 )?;
             if coverage_index_v2_report_has_work(&coverage_index_v2_report) || v2_partial {
-                if started.elapsed() >= Duration::from_millis(config.max_tick_duration_ms.max(1)) {
+                if v2_partial
+                    || started.elapsed()
+                        >= Duration::from_millis(config.max_tick_duration_ms.max(1))
+                {
                     return Ok(coverage_index_v2_only_compaction_report(
                         started,
                         v2_partial,
@@ -1757,6 +1760,10 @@ where
                 && !bucket_scan_item.cursor_key.is_empty()
             {
                 cursor_advances.insert(bucket_scan_item.cursor_key, last_delta_key);
+            }
+            if tick_started.elapsed() >= max_duration {
+                partial = true;
+                break;
             }
         }
         for cursor_advance in bucket_scan.empty_cursor_advances {
