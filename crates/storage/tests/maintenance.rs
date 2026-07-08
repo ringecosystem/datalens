@@ -4349,12 +4349,12 @@ fn test_compaction_coverage_index_v2_cleanup_scan_is_bounded() {
         )
         .expect("cleanup scan should be bounded");
 
-    assert_eq!(report.get_operations, 80);
+    assert_eq!(report.get_operations, 72);
     assert_eq!(report.coverage_index_v2_deleted_deltas, 40);
 }
 
 #[test]
-fn test_compaction_coverage_index_v2_cleanup_scan_uses_available_get_budget() {
+fn test_compaction_coverage_index_v2_cleanup_scan_uses_capped_get_budget() {
     let storage = LocalStorage::new(temp_storage_root("coverage-v2-cleanup-scan-budget"));
     let chain = test_chain();
     let snapshot_key =
@@ -4393,9 +4393,9 @@ fn test_compaction_coverage_index_v2_cleanup_scan_uses_available_get_budget() {
         )
         .expect("cleanup scan should use available get budget");
 
-    assert_eq!(report.get_operations, 160);
+    assert_eq!(report.get_operations, 112);
     assert_eq!(report.coverage_index_v2_deleted_deltas, 80);
-    assert_eq!(coverage_index_v2_cleanup_count(&storage, &chain), 0);
+    assert_eq!(coverage_index_v2_cleanup_count(&storage, &chain), 48);
 }
 
 #[test]

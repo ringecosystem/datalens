@@ -31,7 +31,7 @@ use crate::{
 
 const MAX_SPARSE_SOURCE_RANGES_PER_CANDIDATE: usize = 3;
 const MAX_SPARSE_CANDIDATE_RANGE_SPAN_BLOCKS: u64 = 100_000;
-const COVERAGE_INDEX_V2_CLEANUP_RECORDS_PER_TICK: usize = 128;
+const COVERAGE_INDEX_V2_CLEANUP_RECORDS_PER_TICK: usize = 32;
 const COVERAGE_INDEX_V2_BUCKET_SCAN_PAGES_PER_TICK: usize = 8;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
