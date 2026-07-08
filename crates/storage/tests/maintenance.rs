@@ -5375,7 +5375,7 @@ fn test_compaction_coverage_index_v2_alternates_semantic_and_root_priority() {
 }
 
 #[test]
-fn test_compaction_coverage_index_v2_skips_legacy_root_snapshot_for_semantic_work() {
+fn test_compaction_coverage_index_v2_skips_exact_evm_logs_fallback_for_semantic_work() {
     let storage = LocalStorage::new(temp_storage_root("coverage-v2-skip-legacy-root"));
     let chain = test_chain();
     let config = MaintenanceCompactionConfig {
