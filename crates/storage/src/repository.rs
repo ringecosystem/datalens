@@ -1790,7 +1790,10 @@ where
         Ok(replaced_entries_count)
     }
 
-    fn cached_manifest(&self, chain: &ChainIdentity) -> Result<Option<Manifest>, DatalensError> {
+    pub(crate) fn cached_manifest(
+        &self,
+        chain: &ChainIdentity,
+    ) -> Result<Option<Manifest>, DatalensError> {
         let chain_key = chain.key_prefix();
         let current_version = self.manifest_version(chain)?;
         let cache = self

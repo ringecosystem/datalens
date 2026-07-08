@@ -814,7 +814,18 @@ where
             .take(config.max_deletes_per_tick)
         {
             checkpoint()?;
-            if self.compaction_source_is_current(chain, &record.object_key)? {
+            let Some(source_is_current) =
+                self.compaction_source_is_current_cached(chain, &record.object_key)?
+            else {
+                log::info!(
+                    "storage compaction source delete deferred reason=manifest_cache_miss chain_key={} object_key={} record_key={}",
+                    chain.key_prefix(),
+                    record.object_key,
+                    record_key
+                );
+                continue;
+            };
+            if source_is_current {
                 log::info!(
                     "storage compaction source delete skipped current manifest object chain_key={} object_key={} record_key={}",
                     chain.key_prefix(),
@@ -869,6 +880,18 @@ where
             }
         }
         Ok(report)
+    }
+
+    fn compaction_source_is_current_cached(
+        &self,
+        chain: &ChainIdentity,
+        object_key: &str,
+    ) -> Result<Option<bool>, DatalensError> {
+        Ok(self.cached_manifest(chain)?.map(|manifest| {
+            current_object_keys(&manifest.entries)
+                .iter()
+                .any(|current_key| current_key == object_key)
+        }))
     }
 
     fn compaction_source_is_current(
