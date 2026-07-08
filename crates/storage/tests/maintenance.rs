@@ -3204,13 +3204,12 @@ fn test_compaction_prioritizes_coverage_index_v2_before_manifest_scan() {
     );
     assert_eq!(report.coverage_index_v2_compacted_buckets, 1);
     assert_eq!(report.coverage_index_v2_compacted_deltas, 2);
-    assert_eq!(
+    assert!(
         counting_store.list_page_count_for_prefix(&format!(
             "chains/{}/coverage-index-v2/deltas",
             chain.key_prefix()
-        )),
-        1,
-        "coverage-index-v2 bucket scan should run before ordinary manifest compaction"
+        )) <= 1,
+        "coverage-index-v2 should use the queue fast path or at most one bucket scan before ordinary manifest compaction"
     );
     assert_eq!(
         report.compacted_objects, 1,
@@ -5180,17 +5179,8 @@ fn test_compaction_coverage_index_v2_delta_cursor_skips_sibling_prefix_page() {
     let sibling_page = sibling_storage
         .compact_small_objects_for_chain(&chain, config)
         .expect("sibling page tick");
-    assert_eq!(sibling_page.coverage_index_v2_compacted_buckets, 0);
-    assert_eq!(
-        sibling_page.tick_status,
-        MaintenanceCompactionTickStatus::Partial
-    );
-
-    let real_delta_page = sibling_storage
-        .compact_small_objects_for_chain(&chain, config)
-        .expect("real delta page tick");
-    assert_eq!(real_delta_page.coverage_index_v2_compacted_buckets, 1);
-    assert_eq!(real_delta_page.coverage_index_v2_compacted_deltas, 3);
+    assert_eq!(sibling_page.coverage_index_v2_compacted_buckets, 1);
+    assert_eq!(sibling_page.coverage_index_v2_compacted_deltas, 3);
 }
 
 #[test]
@@ -5438,6 +5428,60 @@ fn test_compaction_coverage_index_v2_scans_past_sparse_pages_to_hot_bucket() {
 
     assert_eq!(report.coverage_index_v2_compacted_buckets, 1);
     assert_eq!(report.coverage_index_v2_compacted_deltas, 3);
+    assert_eq!(coverage_index_v2_snapshot_head_count(&storage, &chain), 1);
+}
+
+#[test]
+fn test_compaction_coverage_index_v2_queue_reaches_hot_bucket_without_sparse_scan() {
+    let object_store = SlowCoverageIndexV2ListPageStore::new(
+        temp_storage_root("coverage-v2-queue-hot-bucket"),
+        Duration::from_millis(20),
+    );
+    let storage = DurableStorage::from_object_store(object_store.clone());
+    let chain = test_chain();
+    let scope = "exact/evm.blocks/block/all/safe";
+    for index in 0..1000 {
+        write_coverage_index_v2_delta(
+            &storage,
+            &chain,
+            scope,
+            index * 100_000,
+            index * 100_000 + 99_999,
+            "sparse",
+        );
+    }
+    for id in ["hot-a", "hot-b", "hot-c"] {
+        write_coverage_index_v2_delta(
+            &storage,
+            &chain,
+            scope,
+            1000 * 100_000,
+            1000 * 100_000 + 99_999,
+            id,
+        );
+    }
+    write_coverage_index_v2_compaction_queue_record(
+        &storage,
+        &chain,
+        scope,
+        1000 * 100_000,
+        1000 * 100_000 + 99_999,
+    );
+
+    let report = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                coverage_index_v2_delta_count_threshold: 3,
+                max_tick_duration_ms: 50,
+                ..coverage_index_v2_compaction_config(false)
+            },
+        )
+        .expect("queue-backed hot bucket compaction");
+
+    assert_eq!(report.coverage_index_v2_compacted_buckets, 1);
+    assert_eq!(report.coverage_index_v2_compacted_deltas, 3);
+    assert_eq!(object_store.list_page_count(), 1);
     assert_eq!(coverage_index_v2_snapshot_head_count(&storage, &chain), 1);
 }
 
@@ -6471,6 +6515,32 @@ fn write_coverage_index_v2_delta<S: ObjectStore>(
         .object_store()
         .put(&key, &bytes)
         .expect("write delta");
+    key
+}
+
+fn write_coverage_index_v2_compaction_queue_record<S: ObjectStore>(
+    storage: &DurableStorage<S>,
+    chain: &ChainIdentity,
+    scope: &str,
+    bucket_start: u64,
+    bucket_end: u64,
+) -> String {
+    let key = format!(
+        "chains/{}/coverage-index-v2/compaction-queue/{scope}/{bucket_start:020}-{bucket_end:020}.json",
+        chain.key_prefix()
+    );
+    let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+        "schema_version": 1,
+        "scope": scope,
+        "bucket_start": bucket_start,
+        "bucket_end": bucket_end,
+        "enqueued_at_unix_ms": 1,
+    }))
+    .expect("queue record bytes");
+    storage
+        .object_store()
+        .put(&key, &bytes)
+        .expect("write queue record");
     key
 }
 

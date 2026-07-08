@@ -19,7 +19,8 @@ use crate::{
     compaction_queue,
     coverage_index::{
         COVERAGE_INDEX_V2_LIST_PAGE_SIZE, CoverageIndexV2Bucket, CoverageIndexV2CleanupRecord,
-        CoverageIndexV2CleanupRecordObject, parse_v2_bucket_from_object_key,
+        CoverageIndexV2CleanupRecordObject, coverage_index_v2_compaction_queue_prefix,
+        decode_v2_compaction_queue_record, parse_v2_bucket_from_object_key,
         prepare_v2_bucket_compaction, unix_ms_now as coverage_index_v2_unix_ms_now,
         v2_cleanup_record_is_safe_to_delete_with_cache, v2_snapshot_cleanup_records_for_bucket,
         write_v2_cleanup_record, write_v2_snapshot, write_v2_snapshot_head,
@@ -1668,6 +1669,7 @@ where
                 }
                 break;
             }
+            let mut compacted_v2_bucket = false;
             if let Some(compaction) = prepare_v2_bucket_compaction(
                 self.object_store(),
                 &bucket,
@@ -1703,6 +1705,7 @@ where
                     .input_delta_bytes
                     .saturating_add(compaction.input_delta_bytes);
                 processed_v2_bucket = true;
+                compacted_v2_bucket = true;
                 if config.cleanup_enabled && operation_budget.remaining_puts() > 0 {
                     let mut compacted_delta_keys = compaction.compacted_delta_keys;
                     compacted_delta_keys.retain(|key| !cleanup_delta_keys.contains(key));
@@ -1741,7 +1744,19 @@ where
                     report.cleanup_records += 1;
                 }
             }
-            if let Some(last_delta_key) = bucket_scan_item.last_delta_key {
+            if let Some(queue_key) = bucket_scan_item.queue_key.as_deref()
+                && !compacted_v2_bucket
+            {
+                if operation_budget.remaining_deletes() == 0 {
+                    partial = true;
+                    break;
+                }
+                self.object_store().delete(queue_key)?;
+                operation_budget.record_deletes(1);
+            }
+            if let Some(last_delta_key) = bucket_scan_item.last_delta_key
+                && !bucket_scan_item.cursor_key.is_empty()
+            {
                 cursor_advances.insert(bucket_scan_item.cursor_key, last_delta_key);
             }
         }
@@ -1806,6 +1821,63 @@ where
         deadline: CoverageIndexV2CleanupDeadline,
     ) -> Result<CoverageIndexV2BucketScan, DatalensError> {
         let prefix = format!("chains/{}/coverage-index-v2/deltas", chain.key_prefix());
+        let queue_prefix = coverage_index_v2_compaction_queue_prefix(&chain.key_prefix());
+        let queue_page =
+            self.object_store()
+                .list_page(&queue_prefix, None, delta_count_threshold.max(1))?;
+        let mut queued_buckets = Vec::new();
+        let mut seen_buckets = BTreeSet::<CoverageIndexV2Bucket>::new();
+        for object in queue_page.objects {
+            if !object.key.ends_with(".json") {
+                continue;
+            }
+            let bytes = match self.object_store().get(&object.key) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    log::warn!(
+                        "storage coverage index v2 compaction queue read failed chain_key={} object_key={} kind={:?} message={}",
+                        chain.key_prefix(),
+                        object.key,
+                        error.kind,
+                        error.message
+                    );
+                    continue;
+                }
+            };
+            let bucket = match decode_v2_compaction_queue_record(
+                &chain.key_prefix(),
+                &object.key,
+                &bytes,
+            ) {
+                Ok(bucket) => bucket,
+                Err(error) => {
+                    log::warn!(
+                        "storage coverage index v2 compaction queue record skipped chain_key={} object_key={} kind={:?} message={}",
+                        chain.key_prefix(),
+                        object.key,
+                        error.kind,
+                        error.message
+                    );
+                    continue;
+                }
+            };
+            if seen_buckets.insert(bucket.clone()) {
+                queued_buckets.push(CoverageIndexV2BucketScanItem {
+                    cursor_key: String::new(),
+                    bucket,
+                    last_delta_key: None,
+                    queue_key: Some(object.key),
+                });
+            }
+        }
+        if !queued_buckets.is_empty() {
+            return Ok(CoverageIndexV2BucketScan {
+                buckets: queued_buckets,
+                empty_cursor_advances: Vec::new(),
+                partial: queue_page.has_more,
+                priority,
+            });
+        }
         let semantic_evm_logs_prefix = format!("{prefix}/semantic/evm.logs");
         let semantic_scan = (
             semantic_evm_logs_prefix.as_str(),
@@ -1894,6 +1966,7 @@ where
                             cursor_key: cursor_key.clone(),
                             bucket: bucket.clone(),
                             last_delta_key: Some(last_delta_key.clone()),
+                            queue_key: None,
                         });
                     }
                 }
@@ -2930,6 +3003,7 @@ struct CoverageIndexV2BucketScanItem {
     cursor_key: String,
     bucket: CoverageIndexV2Bucket,
     last_delta_key: Option<String>,
+    queue_key: Option<String>,
 }
 
 #[derive(Clone, Debug)]
