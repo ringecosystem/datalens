@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeSet,
     sync::{
         Arc, Mutex, Once,
         atomic::{AtomicBool, Ordering},
@@ -40,6 +39,9 @@ use datalens_warmup::{
 use serde::Serialize;
 
 use crate::chain_identity;
+
+const COVERAGE_INDEX_V2_CHAIN_QUEUE_PRIORITY_SCAN_LIMIT: usize = 64;
+const MAX_QUEUED_COMPACTION_CHAINS_PER_WAKE: usize = 3;
 
 #[derive(Clone)]
 struct QueryRuntimeStores {
@@ -307,16 +309,24 @@ impl CompactionStorage {
         }
     }
 
-    fn has_coverage_index_v2_compaction_queue(
+    fn coverage_index_v2_compaction_queue_size_hint(
         &self,
         chain: &ChainIdentity,
-    ) -> Result<bool, DatalensError> {
+        max_records: usize,
+    ) -> Result<usize, DatalensError> {
         let prefix = coverage_index_v2_compaction_queue_prefix(chain);
         let page = match self {
-            CompactionStorage::Local(storage) => storage.object_store().list_page(&prefix, None, 1),
-            CompactionStorage::S3(storage) => storage.object_store().list_page(&prefix, None, 1),
+            CompactionStorage::Local(storage) => {
+                storage.object_store().list_page(&prefix, None, max_records)
+            }
+            CompactionStorage::S3(storage) => {
+                storage.object_store().list_page(&prefix, None, max_records)
+            }
         }?;
-        Ok(!page.objects.is_empty())
+        Ok(page
+            .objects
+            .len()
+            .saturating_add(usize::from(page.has_more)))
     }
 }
 
@@ -808,21 +818,35 @@ fn compaction_chain_batch_indexes(next_chain_index: &mut usize, chain_count: usi
     indexes
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct QueuedCompactionChain {
+    chain_index: usize,
+    queued_objects: usize,
+    batch_order: usize,
+}
+
 fn queued_compaction_chain_indexes(
     storage: &CompactionStorage,
     chains: &[ChainIdentity],
     chain_indexes: &[usize],
-) -> BTreeSet<usize> {
-    let mut queued = BTreeSet::new();
-    for &chain_index in chain_indexes {
+) -> Vec<QueuedCompactionChain> {
+    let mut queued = Vec::new();
+    for (batch_order, &chain_index) in chain_indexes.iter().enumerate() {
         let Some(chain) = chains.get(chain_index) else {
             continue;
         };
-        match storage.has_coverage_index_v2_compaction_queue(chain) {
-            Ok(true) => {
-                queued.insert(chain_index);
+        match storage.coverage_index_v2_compaction_queue_size_hint(
+            chain,
+            COVERAGE_INDEX_V2_CHAIN_QUEUE_PRIORITY_SCAN_LIMIT,
+        ) {
+            Ok(queued_objects) if queued_objects > 0 => {
+                queued.push(QueuedCompactionChain {
+                    chain_index,
+                    queued_objects,
+                    batch_order,
+                });
             }
-            Ok(false) => {}
+            Ok(_) => {}
             Err(error) => {
                 log::warn!(
                     "storage compaction queue priority check failed chain_key={} kind={:?} message={}",
@@ -833,27 +857,34 @@ fn queued_compaction_chain_indexes(
             }
         }
     }
+    queued.sort_by(|left, right| {
+        right
+            .queued_objects
+            .cmp(&left.queued_objects)
+            .then_with(|| left.batch_order.cmp(&right.batch_order))
+    });
     queued
 }
 
 fn prioritize_compaction_chain_batch_indexes(
     chain_indexes: Vec<usize>,
-    queued_chain_indexes: &BTreeSet<usize>,
+    queued_chain_indexes: &[QueuedCompactionChain],
 ) -> Vec<usize> {
     if queued_chain_indexes.is_empty() {
         return chain_indexes;
     }
-    let mut queued = Vec::with_capacity(chain_indexes.len());
-    let mut normal = Vec::with_capacity(chain_indexes.len());
-    for chain_index in chain_indexes {
-        if queued_chain_indexes.contains(&chain_index) {
-            queued.push(chain_index);
-        } else {
-            normal.push(chain_index);
-        }
-    }
-    queued.extend(normal);
+    let mut queued = queued_chain_indexes.to_vec();
+    queued.sort_by(|left, right| {
+        right
+            .queued_objects
+            .cmp(&left.queued_objects)
+            .then_with(|| left.batch_order.cmp(&right.batch_order))
+    });
     queued
+        .iter()
+        .take(MAX_QUEUED_COMPACTION_CHAINS_PER_WAKE)
+        .map(|queued| queued.chain_index)
+        .collect()
 }
 
 fn coverage_index_v2_compaction_queue_prefix(chain: &ChainIdentity) -> String {
@@ -2123,18 +2154,58 @@ mod tests {
     }
 
     #[test]
-    fn storage_compaction_chain_batch_prioritizes_queued_chains() {
-        let mut queued = BTreeSet::new();
-        queued.insert(3);
-        queued.insert(1);
+    fn storage_compaction_chain_batch_prioritizes_largest_queued_chains() {
+        let queued = vec![
+            QueuedCompactionChain {
+                chain_index: 3,
+                queued_objects: 8,
+                batch_order: 1,
+            },
+            QueuedCompactionChain {
+                chain_index: 1,
+                queued_objects: 24,
+                batch_order: 3,
+            },
+        ];
 
         assert_eq!(
             prioritize_compaction_chain_batch_indexes(vec![2, 3, 0, 1], &queued),
-            vec![3, 1, 2, 0]
+            vec![1, 3]
         );
         assert_eq!(
-            prioritize_compaction_chain_batch_indexes(vec![2, 0], &BTreeSet::new()),
+            prioritize_compaction_chain_batch_indexes(vec![2, 0], &[]),
             vec![2, 0]
+        );
+    }
+
+    #[test]
+    fn storage_compaction_chain_batch_limits_queued_chains_per_wake() {
+        let queued = vec![
+            QueuedCompactionChain {
+                chain_index: 0,
+                queued_objects: 65,
+                batch_order: 0,
+            },
+            QueuedCompactionChain {
+                chain_index: 1,
+                queued_objects: 64,
+                batch_order: 1,
+            },
+            QueuedCompactionChain {
+                chain_index: 2,
+                queued_objects: 32,
+                batch_order: 2,
+            },
+            QueuedCompactionChain {
+                chain_index: 3,
+                queued_objects: 16,
+                batch_order: 3,
+            },
+        ];
+
+        assert_eq!(
+            prioritize_compaction_chain_batch_indexes(vec![0, 1, 2, 3], &queued),
+            vec![0, 1, 2]
         );
     }
 
