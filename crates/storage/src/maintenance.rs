@@ -1826,71 +1826,89 @@ where
             }
             let cursor = self.read_compaction_cursor_key(&cursor_key)?;
             let strict_prefix = format!("{scan_prefix}/");
-            let mut list_page = self.object_store().list_page(
-                scan_prefix,
-                cursor.next_segment_key.as_deref(),
-                COVERAGE_INDEX_V2_LIST_PAGE_SIZE,
-            )?;
-            if deadline.expired() {
-                partial = true;
-                break;
-            }
-            if list_page.objects.is_empty()
-                && cursor.next_segment_key.is_some()
-                && !list_page.has_more
-            {
-                list_page = self.object_store().list_page(
+            let mut page_start_after = cursor.next_segment_key;
+            let mut wrapped = false;
+            let mut accumulated_bucket_delta_counts =
+                BTreeMap::<CoverageIndexV2Bucket, usize>::new();
+            let mut bucket_last_delta_keys = BTreeMap::<CoverageIndexV2Bucket, String>::new();
+            loop {
+                if deadline.expired() {
+                    partial = true;
+                    break;
+                }
+                let resumed_from_cursor = page_start_after.is_some();
+                let list_page = self.object_store().list_page(
                     scan_prefix,
-                    None,
+                    page_start_after.as_deref(),
                     COVERAGE_INDEX_V2_LIST_PAGE_SIZE,
                 )?;
                 if deadline.expired() {
                     partial = true;
                     break;
                 }
-            }
-            let mut had_buckets = false;
-            let mut bucket_delta_counts = BTreeMap::<CoverageIndexV2Bucket, usize>::new();
-            let mut bucket_last_delta_keys = BTreeMap::<CoverageIndexV2Bucket, String>::new();
-            for object in &list_page.objects {
-                if !object.key.starts_with(&strict_prefix) || !object.key.ends_with(".json") {
-                    continue;
-                }
-                let Some(bucket) = parse_v2_bucket_from_object_key(&prefix, &object.key)? else {
-                    continue;
-                };
-                if skip_semantic_evm_logs && bucket.scope.starts_with("semantic/evm.logs/") {
-                    continue;
-                }
-                had_buckets = true;
-                *bucket_delta_counts.entry(bucket.clone()).or_default() += 1;
-                bucket_last_delta_keys.insert(bucket, object.key.clone());
-            }
-            let mut emitted_buckets = false;
-            let skip_sparse_page_buckets = list_page.has_more;
-            for (bucket, last_delta_key) in bucket_last_delta_keys {
-                let page_delta_count = bucket_delta_counts.get(&bucket).copied().unwrap_or(0);
-                if (!skip_sparse_page_buckets || page_delta_count >= delta_count_threshold.max(1))
-                    && seen_buckets.insert(bucket.clone())
+                if list_page.objects.is_empty()
+                    && page_start_after.is_some()
+                    && !list_page.has_more
+                    && !wrapped
                 {
-                    emitted_buckets = true;
-                    buckets.push(CoverageIndexV2BucketScanItem {
+                    page_start_after = None;
+                    wrapped = true;
+                    continue;
+                }
+                let mut had_buckets = false;
+                for object in &list_page.objects {
+                    if !object.key.starts_with(&strict_prefix) || !object.key.ends_with(".json") {
+                        continue;
+                    }
+                    let Some(bucket) = parse_v2_bucket_from_object_key(&prefix, &object.key)?
+                    else {
+                        continue;
+                    };
+                    if skip_semantic_evm_logs && bucket.scope.starts_with("semantic/evm.logs/") {
+                        continue;
+                    }
+                    had_buckets = true;
+                    *accumulated_bucket_delta_counts
+                        .entry(bucket.clone())
+                        .or_default() += 1;
+                    bucket_last_delta_keys.insert(bucket, object.key.clone());
+                }
+                let mut emitted_buckets = false;
+                for (bucket, last_delta_key) in &bucket_last_delta_keys {
+                    let delta_count = accumulated_bucket_delta_counts
+                        .get(bucket)
+                        .copied()
+                        .unwrap_or(0);
+                    if (delta_count >= delta_count_threshold.max(1)
+                        || (!list_page.has_more && resumed_from_cursor))
+                        && seen_buckets.insert(bucket.clone())
+                    {
+                        emitted_buckets = true;
+                        buckets.push(CoverageIndexV2BucketScanItem {
+                            cursor_key: cursor_key.clone(),
+                            bucket: bucket.clone(),
+                            last_delta_key: Some(last_delta_key.clone()),
+                        });
+                    }
+                }
+                if (!had_buckets || !emitted_buckets)
+                    && let Some(next_segment_key) =
+                        list_page.objects.last().map(|object| object.key.clone())
+                {
+                    empty_cursor_advances.push(CoverageIndexV2CursorAdvance {
                         cursor_key: cursor_key.clone(),
-                        bucket,
-                        last_delta_key: Some(last_delta_key),
+                        next_segment_key: next_segment_key.clone(),
                     });
+                    page_start_after = Some(next_segment_key);
+                }
+                partial |= list_page.has_more;
+                if !had_buckets {
+                    break;
+                }
+                if emitted_buckets || !list_page.has_more {
+                    break;
                 }
             }
-            if (!had_buckets || !emitted_buckets)
-                && let Some(next_segment_key) =
-                    list_page.objects.last().map(|object| object.key.clone())
-            {
-                empty_cursor_advances.push(CoverageIndexV2CursorAdvance {
-                    cursor_key,
-                    next_segment_key,
-                });
-            }
-            partial |= list_page.has_more;
         }
         Ok(CoverageIndexV2BucketScan {
             buckets,

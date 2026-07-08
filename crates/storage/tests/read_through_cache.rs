@@ -191,6 +191,7 @@ fn test_read_through_cache_checksum_change_invalidates_entry() {
             b"changed",
         )
         .expect("write manifest version");
+    clear_coverage_index_v2(&store, &chain);
     write_coverage_index(
         &store,
         &chain,
@@ -441,4 +442,18 @@ fn write_coverage_index<S>(
             &serde_json::to_vec_pretty(manifest).expect("coverage index bytes"),
         )
         .expect("write coverage index");
+}
+
+fn clear_coverage_index_v2<S>(store: &S, chain: &ChainIdentity)
+where
+    S: ObjectStore,
+{
+    for object in store
+        .list(&format!("chains/{}/coverage-index-v2", chain.key_prefix()))
+        .expect("coverage index v2 list")
+    {
+        store
+            .delete(&object.key)
+            .expect("delete coverage index v2 object");
+    }
 }

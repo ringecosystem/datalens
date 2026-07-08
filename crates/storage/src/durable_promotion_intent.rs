@@ -20,6 +20,8 @@ const PENDING_APPLICATION_INDEX_PREFIX: &str =
     "durable-promotion-intents/v1/index/status=pending-by-application";
 const QUERY_SOURCE_KEY: &str = "query";
 const WARMUP_SOURCE_KEY: &str = "warmup";
+const PENDING_INDEX_LIST_PAGE_SIZE: usize = 1024;
+const PENDING_APPLICATION_INDEX_SCAN_MULTIPLIER: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -494,44 +496,55 @@ where
         Ok(intents)
     }
 
-    fn pending_index_entries_for_chain(
-        &self,
-        chain: &ChainIdentity,
-        now_unix_seconds: u64,
-    ) -> Result<Vec<PendingIndexEntry>, DatalensError> {
-        let mut entries = Vec::new();
-        for source in [QUERY_SOURCE_KEY, WARMUP_SOURCE_KEY] {
-            entries.extend(self.pending_index_entries_for_chain_and_source(
-                chain,
-                source,
-                now_unix_seconds,
-            )?);
-        }
-        entries.sort_by_key(|entry| {
-            (
-                entry.due_at_unix_seconds,
-                entry.intent_id.clone(),
-                entry.key.clone(),
-            )
-        });
-        Ok(entries)
-    }
-
     fn pending_index_entries_for_chain_and_source(
         &self,
         chain: &ChainIdentity,
         source: &str,
         now_unix_seconds: u64,
+        limit: Option<usize>,
     ) -> Result<Vec<PendingIndexEntry>, DatalensError> {
-        let mut entries = Vec::new();
+        let mut entries: Vec<PendingIndexEntry> = Vec::new();
         let prefix = pending_index_prefix(chain, source);
-        for object in self.object_store.list(&prefix)? {
-            let Some(entry) = parse_pending_index_entry(&object.key) else {
-                continue;
-            };
-            if entry.due_at_unix_seconds <= now_unix_seconds {
+        let mut start_after = None;
+        loop {
+            let page = self.object_store.list_page(
+                &prefix,
+                start_after.as_deref(),
+                PENDING_INDEX_LIST_PAGE_SIZE,
+            )?;
+            for object in &page.objects {
+                if !object.key.starts_with(&prefix) {
+                    continue;
+                }
+                let Some(entry) = parse_pending_index_entry(&object.key) else {
+                    continue;
+                };
+                if entry.due_at_unix_seconds > now_unix_seconds {
+                    entries.sort_by_key(|entry| {
+                        (
+                            entry.due_at_unix_seconds,
+                            entry.intent_id.clone(),
+                            entry.key.clone(),
+                        )
+                    });
+                    return Ok(entries);
+                }
                 entries.push(entry);
+                if limit.is_some_and(|limit| entries.len() >= limit) {
+                    entries.sort_by_key(|entry| {
+                        (
+                            entry.due_at_unix_seconds,
+                            entry.intent_id.clone(),
+                            entry.key.clone(),
+                        )
+                    });
+                    return Ok(entries);
+                }
             }
+            if !page.has_more {
+                break;
+            }
+            start_after = page.objects.last().map(|object| object.key.clone());
         }
         entries.sort_by_key(|entry| {
             (
@@ -548,24 +561,51 @@ where
         chain: &ChainIdentity,
         source: &str,
         now_unix_seconds: u64,
+        limit: usize,
     ) -> Result<Vec<PendingIndexEntry>, DatalensError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let scan_limit = limit
+            .saturating_mul(PENDING_APPLICATION_INDEX_SCAN_MULTIPLIER)
+            .max(PENDING_INDEX_LIST_PAGE_SIZE);
+        let mut scanned = 0usize;
         let mut entries_by_application: BTreeMap<String, VecDeque<PendingIndexEntry>> =
             BTreeMap::new();
         let prefix = pending_application_index_prefix(chain, source);
-        for object in self.object_store.list(&prefix)? {
-            let Some(entry) = parse_pending_index_entry(&object.key) else {
-                continue;
-            };
-            if entry.due_at_unix_seconds > now_unix_seconds {
-                continue;
+        let mut start_after = None;
+        'scan: loop {
+            let page = self.object_store.list_page(
+                &prefix,
+                start_after.as_deref(),
+                PENDING_INDEX_LIST_PAGE_SIZE,
+            )?;
+            for object in &page.objects {
+                if !object.key.starts_with(&prefix) {
+                    continue;
+                }
+                scanned += 1;
+                if scanned > scan_limit {
+                    break 'scan;
+                }
+                let Some(entry) = parse_pending_index_entry(&object.key) else {
+                    continue;
+                };
+                if entry.due_at_unix_seconds > now_unix_seconds {
+                    continue;
+                }
+                let Some(application_key) = entry.application_key.clone() else {
+                    continue;
+                };
+                entries_by_application
+                    .entry(application_key)
+                    .or_default()
+                    .push_back(entry);
             }
-            let Some(application_key) = entry.application_key.clone() else {
-                continue;
-            };
-            entries_by_application
-                .entry(application_key)
-                .or_default()
-                .push_back(entry);
+            if !page.has_more {
+                break;
+            }
+            start_after = page.objects.last().map(|object| object.key.clone());
         }
         for entries in entries_by_application.values_mut() {
             let mut sorted = entries.drain(..).collect::<Vec<_>>();
@@ -587,6 +627,9 @@ where
             for group in entries_by_application.values_mut() {
                 if let Some(entry) = group.pop_front() {
                     entries.push(entry);
+                    if entries.len() >= limit {
+                        return Ok(entries);
+                    }
                 }
             }
         }
@@ -602,19 +645,41 @@ where
         let prefix = pending_index_prefix(chain, source_key(source));
         let mut pending_total = 0;
         let mut oldest_due_at_unix_seconds = None;
-        for object in self.object_store.list(&prefix)? {
-            let Some(entry) = parse_pending_index_entry(&object.key) else {
-                continue;
-            };
-            if entry.due_at_unix_seconds > now_unix_seconds {
-                continue;
+        let mut start_after = None;
+        loop {
+            let page = self.object_store.list_page(
+                &prefix,
+                start_after.as_deref(),
+                PENDING_INDEX_LIST_PAGE_SIZE,
+            )?;
+            for object in &page.objects {
+                if !object.key.starts_with(&prefix) {
+                    continue;
+                }
+                let Some(entry) = parse_pending_index_entry(&object.key) else {
+                    continue;
+                };
+                if entry.due_at_unix_seconds > now_unix_seconds {
+                    return Ok(DurablePromotionIntentBacklog {
+                        chain: chain.clone(),
+                        source,
+                        pending_total,
+                        oldest_pending_age_seconds: oldest_due_at_unix_seconds
+                            .map(|oldest| now_unix_seconds.saturating_sub(oldest))
+                            .unwrap_or(0),
+                    });
+                }
+                pending_total += 1;
+                oldest_due_at_unix_seconds = Some(
+                    oldest_due_at_unix_seconds
+                        .unwrap_or(entry.due_at_unix_seconds)
+                        .min(entry.due_at_unix_seconds),
+                );
             }
-            pending_total += 1;
-            oldest_due_at_unix_seconds = Some(
-                oldest_due_at_unix_seconds
-                    .unwrap_or(entry.due_at_unix_seconds)
-                    .min(entry.due_at_unix_seconds),
-            );
+            if !page.has_more {
+                break;
+            }
+            start_after = page.objects.last().map(|object| object.key.clone());
         }
         Ok(DurablePromotionIntentBacklog {
             chain: chain.clone(),
@@ -764,8 +829,28 @@ where
         if limit == 0 {
             return Ok(Vec::new());
         }
+        let mut entries = self.pending_index_entries_for_chain_and_source(
+            chain,
+            QUERY_SOURCE_KEY,
+            now_unix_seconds,
+            Some(limit),
+        )?;
+        entries.extend(self.pending_index_entries_for_chain_and_source(
+            chain,
+            WARMUP_SOURCE_KEY,
+            now_unix_seconds,
+            Some(limit),
+        )?);
+        entries.sort_by_key(|entry| {
+            (
+                entry.due_at_unix_seconds,
+                entry.intent_id.clone(),
+                entry.key.clone(),
+            )
+        });
+        entries.truncate(limit);
         let mut pending = Vec::new();
-        for entry in self.pending_index_entries_for_chain(chain, now_unix_seconds)? {
+        for entry in entries {
             let Some(intent) = self.get(&entry.intent_id)? else {
                 let _ = self.object_store.delete(&entry.key);
                 continue;
@@ -797,12 +882,14 @@ where
             chain,
             source_key(source),
             now_unix_seconds,
+            limit,
         )?;
         if entries.is_empty() {
             entries = self.pending_index_entries_for_chain_and_source(
                 chain,
                 source_key(source),
                 now_unix_seconds,
+                Some(limit),
             )?;
         }
         for entry in entries {
