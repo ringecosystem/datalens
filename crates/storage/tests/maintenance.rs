@@ -3043,6 +3043,19 @@ fn test_compaction_source_cleanup_avoids_dataset_object_reconciliation_scan() {
         counting_store.list_count_for_prefix(&format!("chains/{}/datasets", chain.key_prefix())),
         0
     );
+    assert_eq!(
+        counting_store.list_count_for_prefix(&format!(
+            "chains/{}/metadata/compaction-superseded-sources",
+            chain.key_prefix()
+        )),
+        0
+    );
+    assert!(
+        counting_store.list_page_count_for_prefix(&format!(
+            "chains/{}/metadata/compaction-superseded-sources",
+            chain.key_prefix()
+        )) > 0
+    );
 }
 
 #[test]
@@ -5362,6 +5375,99 @@ fn test_compaction_coverage_index_v2_alternates_semantic_and_root_priority() {
 }
 
 #[test]
+fn test_compaction_coverage_index_v2_skips_legacy_root_snapshot_for_semantic_work() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-v2-skip-legacy-root"));
+    let chain = test_chain();
+    let config = MaintenanceCompactionConfig {
+        coverage_index_v2_delta_count_threshold: 3,
+        max_gets_per_tick: 3,
+        max_puts_per_tick: 2,
+        cleanup_enabled: false,
+        delete_source_objects: false,
+        ..coverage_index_v2_compaction_config(false)
+    };
+    let first_semantic_scope =
+        "semantic/evm.logs/block/safe/evm-logs-v1/addr/0x1111111111111111111111111111111111111111";
+    for index in 0..3 {
+        write_coverage_index_v2_delta(
+            &storage,
+            &chain,
+            first_semantic_scope,
+            0,
+            99_999,
+            &format!("semantic-a-{index}"),
+        );
+    }
+    let first = storage
+        .compact_small_objects_for_chain(&chain, config)
+        .expect("first semantic tick");
+    assert_eq!(first.coverage_index_v2_compacted_buckets, 1);
+
+    let exact_scope = "exact/evm.blocks/block/all/safe";
+    let compacted_delta_keys = (0..3)
+        .map(|index| {
+            write_coverage_index_v2_delta(
+                &storage,
+                &chain,
+                exact_scope,
+                0,
+                99_999,
+                &format!("exact-legacy-{index}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let snapshot_key = write_coverage_index_v2_snapshot_for_scope(
+        &storage,
+        &chain,
+        exact_scope,
+        "legacy",
+        1,
+        compacted_delta_keys,
+    );
+    write_coverage_index_v2_snapshot_head_for_scope(
+        &storage,
+        &chain,
+        exact_scope,
+        "legacy-head",
+        1,
+        &snapshot_key,
+        "",
+    );
+
+    let second_semantic_scope =
+        "semantic/evm.logs/block/safe/evm-logs-v1/addr/0x2222222222222222222222222222222222222222";
+    for index in 0..3 {
+        write_coverage_index_v2_delta(
+            &storage,
+            &chain,
+            second_semantic_scope,
+            0,
+            99_999,
+            &format!("semantic-b-{index}"),
+        );
+    }
+
+    let second = storage
+        .compact_small_objects_for_chain(&chain, config)
+        .expect("second semantic tick");
+
+    assert_eq!(second.coverage_index_v2_compacted_buckets, 1);
+    assert_eq!(second.coverage_index_v2_compacted_deltas, 3);
+    assert_eq!(
+        list_prefix(
+            &storage,
+            &format!(
+                "chains/{}/coverage-index-v2/snapshot-heads/{second_semantic_scope}",
+                chain.key_prefix()
+            ),
+        )
+        .len(),
+        1,
+        "legacy exact fallback bucket should not block semantic compaction"
+    );
+}
+
+#[test]
 fn test_compaction_coverage_index_v2_cleanup_scan_respects_get_budget() {
     let storage = LocalStorage::new(temp_storage_root("coverage-v2-cleanup-get-budget"));
     let chain = test_chain();
@@ -6767,14 +6873,32 @@ fn write_coverage_index_v2_snapshot<S: ObjectStore>(
     created_at_unix_ms: u64,
     compacted_delta_keys: Vec<String>,
 ) -> String {
+    write_coverage_index_v2_snapshot_for_scope(
+        storage,
+        chain,
+        "exact/evm.blocks/block/all/safe",
+        id,
+        created_at_unix_ms,
+        compacted_delta_keys,
+    )
+}
+
+fn write_coverage_index_v2_snapshot_for_scope<S: ObjectStore>(
+    storage: &DurableStorage<S>,
+    chain: &ChainIdentity,
+    scope: &str,
+    id: &str,
+    created_at_unix_ms: u64,
+    compacted_delta_keys: Vec<String>,
+) -> String {
     let key = format!(
-        "chains/{}/coverage-index-v2/snapshots/exact/evm.blocks/block/all/safe/00000000000000000000-00000000000000099999/{id}.json",
+        "chains/{}/coverage-index-v2/snapshots/{scope}/00000000000000000000-00000000000000099999/{id}.json",
         chain.key_prefix()
     );
     let bytes = serde_json::to_vec_pretty(&serde_json::json!({
         "schema_version": 1,
         "created_at_unix_ms": created_at_unix_ms,
-        "scope": "exact/evm.blocks/block/all/safe",
+        "scope": scope,
         "bucket_start": 0,
         "bucket_end": 99_999,
         "entries": [],
@@ -6795,18 +6919,38 @@ fn write_coverage_index_v2_snapshot_head<S: ObjectStore>(
     created_at_unix_ms: u64,
     snapshot_key: &str,
 ) -> String {
+    write_coverage_index_v2_snapshot_head_for_scope(
+        storage,
+        chain,
+        "exact/evm.blocks/block/all/safe",
+        id,
+        created_at_unix_ms,
+        snapshot_key,
+        "",
+    )
+}
+
+fn write_coverage_index_v2_snapshot_head_for_scope<S: ObjectStore>(
+    storage: &DurableStorage<S>,
+    chain: &ChainIdentity,
+    scope: &str,
+    id: &str,
+    created_at_unix_ms: u64,
+    snapshot_key: &str,
+    included_delta_high_watermark: &str,
+) -> String {
     let key = format!(
-        "chains/{}/coverage-index-v2/snapshot-heads/exact/evm.blocks/block/all/safe/00000000000000000000-00000000000000099999/{id}.json",
+        "chains/{}/coverage-index-v2/snapshot-heads/{scope}/00000000000000000000-00000000000000099999/{id}.json",
         chain.key_prefix()
     );
     let bytes = serde_json::to_vec_pretty(&serde_json::json!({
         "schema_version": 1,
         "created_at_unix_ms": created_at_unix_ms,
-        "scope": "exact/evm.blocks/block/all/safe",
+        "scope": scope,
         "bucket_start": 0,
         "bucket_end": 99_999,
         "snapshot_key": snapshot_key,
-        "included_delta_high_watermark": "",
+        "included_delta_high_watermark": included_delta_high_watermark,
     }))
     .expect("snapshot head bytes");
     storage

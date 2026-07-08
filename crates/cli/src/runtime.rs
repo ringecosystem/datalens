@@ -1015,6 +1015,16 @@ fn storage_compaction_tick_needs_reconciliation(config: MaintenanceCompactionCon
 
 fn storage_compaction_should_defer_source_cleanup(report: &MaintenanceCompactionReport) -> bool {
     report.tick_status != MaintenanceCompactionTickStatus::Completed
+        || !storage_compaction_report_has_source_cleanup_work(report)
+}
+
+fn storage_compaction_report_has_source_cleanup_work(report: &MaintenanceCompactionReport) -> bool {
+    report.tick_summary.output_objects > 0
+        || report.tick_summary.deleted_manifest_segments > 0
+        || report.compacted_objects > 0
+        || report.compacted_rows > 0
+        || report.deleted_source_objects > 0
+        || report.source_delete_failures > 0
 }
 
 fn build_evm_service_with_storage(
@@ -2020,9 +2030,17 @@ mod tests {
 
     #[test]
     fn storage_compaction_source_cleanup_runs_after_completed_ticks() {
-        let report = compaction_report_with_status(MaintenanceCompactionTickStatus::Completed);
+        let mut report = compaction_report_with_status(MaintenanceCompactionTickStatus::Completed);
+        report.tick_summary.output_objects = 1;
 
         assert!(!storage_compaction_should_defer_source_cleanup(&report));
+    }
+
+    #[test]
+    fn storage_compaction_source_cleanup_is_deferred_without_source_work() {
+        let report = compaction_report_with_status(MaintenanceCompactionTickStatus::Completed);
+
+        assert!(storage_compaction_should_defer_source_cleanup(&report));
     }
 
     #[test]

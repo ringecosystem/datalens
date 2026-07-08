@@ -20,8 +20,9 @@ use crate::{
     coverage_index::{
         COVERAGE_INDEX_V2_LIST_PAGE_SIZE, CoverageIndexV2Bucket, CoverageIndexV2CleanupRecord,
         CoverageIndexV2CleanupRecordObject, coverage_index_v2_compaction_queue_prefix,
-        decode_v2_compaction_queue_record, parse_v2_bucket_from_object_key,
-        prepare_v2_bucket_compaction, unix_ms_now as coverage_index_v2_unix_ms_now,
+        decode_v2_compaction_queue_record, latest_v2_snapshot_head,
+        parse_v2_bucket_from_object_key, prepare_v2_bucket_compaction,
+        unix_ms_now as coverage_index_v2_unix_ms_now,
         v2_cleanup_record_is_safe_to_delete_with_cache, v2_snapshot_cleanup_records_for_bucket,
         write_v2_cleanup_record, write_v2_snapshot, write_v2_snapshot_head,
     },
@@ -803,8 +804,11 @@ where
         if !config.cleanup_enabled || !config.delete_source_objects {
             return Ok(report);
         }
-        let eligible_records =
-            self.superseded_source_records_for_chain(chain, config.source_delete_grace_ms)?;
+        let eligible_records = self.superseded_source_records_for_chain_bounded(
+            chain,
+            config.source_delete_grace_ms,
+            config.max_deletes_per_tick,
+        )?;
         for (record_key, record) in eligible_records
             .into_iter()
             .take(config.max_deletes_per_tick)
@@ -1435,6 +1439,20 @@ where
         )
     }
 
+    fn superseded_source_records_for_chain_bounded(
+        &self,
+        chain: &ChainIdentity,
+        grace_ms: u64,
+        max_records: usize,
+    ) -> Result<Vec<(String, SupersededCompactionSource)>, DatalensError> {
+        self.superseded_source_records_from_prefix_bounded(
+            &superseded_source_record_prefix(chain),
+            grace_ms,
+            true,
+            max_records,
+        )
+    }
+
     fn superseded_source_records_from_prefix(
         &self,
         prefix: &str,
@@ -1468,6 +1486,73 @@ where
             if !eligible_only || record.delete_after_unix_ms <= now_ms {
                 records.push((object.key, record));
             }
+        }
+        records.sort_by(|left, right| {
+            left.1
+                .delete_after_unix_ms
+                .cmp(&right.1.delete_after_unix_ms)
+                .then_with(|| left.1.object_key.cmp(&right.1.object_key))
+        });
+        Ok(records)
+    }
+
+    fn superseded_source_records_from_prefix_bounded(
+        &self,
+        prefix: &str,
+        grace_ms: u64,
+        eligible_only: bool,
+        max_records: usize,
+    ) -> Result<Vec<(String, SupersededCompactionSource)>, DatalensError> {
+        if max_records == 0 {
+            return Ok(Vec::new());
+        }
+        let now_ms = unix_millis_now()?;
+        let mut records = Vec::new();
+        let page_size = max_records.saturating_mul(2).clamp(1, 1_000);
+        let mut start_after = None;
+        loop {
+            let page = self
+                .object_store()
+                .list_page(prefix, start_after.as_deref(), page_size)?;
+            for object in &page.objects {
+                if !object
+                    .key
+                    .contains("/metadata/compaction-superseded-sources/")
+                    || !object.key.ends_with(".json")
+                {
+                    continue;
+                }
+                let bytes = self.object_store().get(&object.key)?;
+                let mut record = serde_json::from_slice::<SupersededCompactionSource>(&bytes)
+                    .map_err(|error| {
+                        DatalensError::new(
+                            DatalensErrorKind::StorageReadFailure,
+                            format!(
+                                "decode compaction superseded source record {}: {error}",
+                                object.key
+                            ),
+                        )
+                    })?;
+                record.delete_after_unix_ms = record
+                    .delete_after_unix_ms
+                    .max(record.superseded_at_unix_ms.saturating_add(grace_ms));
+                if !eligible_only || record.delete_after_unix_ms <= now_ms {
+                    records.push((object.key.clone(), record));
+                    if records.len() >= max_records {
+                        records.sort_by(|left, right| {
+                            left.1
+                                .delete_after_unix_ms
+                                .cmp(&right.1.delete_after_unix_ms)
+                                .then_with(|| left.1.object_key.cmp(&right.1.object_key))
+                        });
+                        return Ok(records);
+                    }
+                }
+            }
+            if !page.has_more {
+                break;
+            }
+            start_after = page.objects.last().map(|object| object.key.clone());
         }
         records.sort_by(|left, right| {
             left.1
@@ -1677,6 +1762,18 @@ where
                 break;
             }
             let mut compacted_v2_bucket = false;
+            if bucket_scan_item.queue_key.is_none()
+                && bucket.scope.starts_with("exact/evm.logs/")
+                && coverage_index_v2_bucket_has_legacy_snapshot_head(self.object_store(), &bucket)?
+            {
+                partial = true;
+                if let Some(last_delta_key) = bucket_scan_item.last_delta_key
+                    && !bucket_scan_item.cursor_key.is_empty()
+                {
+                    cursor_advances.insert(bucket_scan_item.cursor_key, last_delta_key);
+                }
+                continue;
+            }
             if let Some(compaction) = prepare_v2_bucket_compaction(
                 self.object_store(),
                 &bucket,
@@ -3417,6 +3514,17 @@ fn duration_millis(started: Instant) -> u64 {
 
 fn duration_millis_value(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX - 1)
+}
+
+fn coverage_index_v2_bucket_has_legacy_snapshot_head<S>(
+    object_store: &S,
+    bucket: &CoverageIndexV2Bucket,
+) -> Result<bool, DatalensError>
+where
+    S: ObjectStore,
+{
+    Ok(latest_v2_snapshot_head(object_store, bucket)?
+        .is_some_and(|head| head.included_delta_high_watermark.is_empty()))
 }
 
 fn unix_millis_now() -> Result<u64, DatalensError> {
