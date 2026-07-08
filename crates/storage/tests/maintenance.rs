@@ -5823,6 +5823,80 @@ fn test_compaction_coverage_index_v2_queue_reaches_hot_bucket_without_sparse_sca
 }
 
 #[test]
+fn test_compaction_coverage_index_v2_queue_prioritizes_semantic_hot_bucket() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-v2-queue-semantic-priority"));
+    let chain = test_chain();
+    let exact_scope =
+        "exact/evm.logs/block/evm-logs/addr-topic-00000000000000000000000000000000/finalized";
+    let semantic_scope = "semantic/evm.logs/block/finalized/evm-logs-v1/addr/0x0000000000000000000000000000000000000001";
+    for index in 0..32 {
+        let scope = format!("{exact_scope}-{index:020}");
+        write_coverage_index_v2_delta(&storage, &chain, &scope, 25_400_000, 25_499_999, "stale");
+        let snapshot_key = write_coverage_index_v2_snapshot_for_scope(
+            &storage,
+            &chain,
+            &scope,
+            &format!("snapshot-{index:020}"),
+            1,
+            Vec::new(),
+        );
+        write_coverage_index_v2_snapshot_head_for_scope(
+            &storage,
+            &chain,
+            &scope,
+            &format!("head-{index:020}"),
+            1,
+            &snapshot_key,
+            "chains/test/coverage-index-v2/deltas/high-watermark.json",
+        );
+        write_coverage_index_v2_compaction_queue_record(
+            &storage, &chain, &scope, 25_400_000, 25_499_999,
+        );
+    }
+    for index in 0..6 {
+        write_coverage_index_v2_delta(
+            &storage,
+            &chain,
+            semantic_scope,
+            25_400_000,
+            25_499_999,
+            &format!("hot-{index:020}"),
+        );
+    }
+    write_coverage_index_v2_compaction_queue_record(
+        &storage,
+        &chain,
+        semantic_scope,
+        25_400_000,
+        25_499_999,
+    );
+
+    let report = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                coverage_index_v2_delta_count_threshold: 3,
+                max_gets_per_tick: 16,
+                ..coverage_index_v2_compaction_config(false)
+            },
+        )
+        .expect("semantic queue compaction");
+
+    assert_eq!(report.coverage_index_v2_compacted_buckets, 1);
+    assert_eq!(report.coverage_index_v2_compacted_deltas, 6);
+    assert_eq!(
+        coverage_index_v2_snapshot_head_count_for_bucket(
+            &storage,
+            &chain,
+            semantic_scope,
+            25_400_000,
+            25_499_999,
+        ),
+        1
+    );
+}
+
+#[test]
 fn test_compaction_coverage_index_v2_queue_rotates_after_partial_hot_bucket() {
     let storage = LocalStorage::new(temp_storage_root(
         "coverage-v2-queue-rotates-partial-hot-bucket",
