@@ -42,6 +42,7 @@ use crate::chain_identity;
 
 const COVERAGE_INDEX_V2_CHAIN_QUEUE_PRIORITY_SCAN_LIMIT: usize = 64;
 const MAX_QUEUED_COMPACTION_CHAINS_PER_WAKE: usize = 3;
+const HIGH_BACKLOG_COMPACTION_CHAINS_PER_WAKE: usize = 2;
 
 #[derive(Clone)]
 struct QueryRuntimeStores {
@@ -880,11 +881,26 @@ fn prioritize_compaction_chain_batch_indexes(
             .cmp(&left.queued_objects)
             .then_with(|| left.batch_order.cmp(&right.batch_order))
     });
-    queued
+    let mut selected = queued
         .iter()
-        .take(MAX_QUEUED_COMPACTION_CHAINS_PER_WAKE)
+        .take(HIGH_BACKLOG_COMPACTION_CHAINS_PER_WAKE)
         .map(|queued| queued.chain_index)
-        .collect()
+        .collect::<Vec<_>>();
+    for chain_index in chain_indexes {
+        if selected.len() >= MAX_QUEUED_COMPACTION_CHAINS_PER_WAKE {
+            break;
+        }
+        if selected.contains(&chain_index) {
+            continue;
+        }
+        if queued
+            .iter()
+            .any(|queued| queued.chain_index == chain_index)
+        {
+            selected.push(chain_index);
+        }
+    }
+    selected
 }
 
 fn coverage_index_v2_compaction_queue_prefix(chain: &ChainIdentity) -> String {
@@ -2206,6 +2222,10 @@ mod tests {
         assert_eq!(
             prioritize_compaction_chain_batch_indexes(vec![0, 1, 2, 3], &queued),
             vec![0, 1, 2]
+        );
+        assert_eq!(
+            prioritize_compaction_chain_batch_indexes(vec![3, 2, 1, 0], &queued),
+            vec![0, 1, 3]
         );
     }
 
