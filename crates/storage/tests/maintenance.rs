@@ -5486,6 +5486,88 @@ fn test_compaction_coverage_index_v2_queue_reaches_hot_bucket_without_sparse_sca
 }
 
 #[test]
+fn test_compaction_coverage_index_v2_queue_rotates_after_partial_hot_bucket() {
+    let storage = LocalStorage::new(temp_storage_root(
+        "coverage-v2-queue-rotates-partial-hot-bucket",
+    ));
+    let chain = test_chain();
+    let scope = "exact/evm.blocks/block/all/safe";
+    let first_start = 1000 * 100_000;
+    let first_end = first_start + 99_999;
+    let second_start = 1001 * 100_000;
+    let second_end = second_start + 99_999;
+    for index in 0..6 {
+        write_coverage_index_v2_delta(
+            &storage,
+            &chain,
+            scope,
+            first_start,
+            first_end,
+            &format!("first-{index:03}"),
+        );
+        write_coverage_index_v2_delta(
+            &storage,
+            &chain,
+            scope,
+            second_start,
+            second_end,
+            &format!("second-{index:03}"),
+        );
+    }
+    write_coverage_index_v2_compaction_queue_record(
+        &storage,
+        &chain,
+        scope,
+        first_start,
+        first_end,
+    );
+    write_coverage_index_v2_compaction_queue_record(
+        &storage,
+        &chain,
+        scope,
+        second_start,
+        second_end,
+    );
+    let config = MaintenanceCompactionConfig {
+        coverage_index_v2_delta_count_threshold: 3,
+        max_gets_per_tick: 3,
+        ..coverage_index_v2_compaction_config(false)
+    };
+
+    let first_report = storage
+        .compact_small_objects_for_chain(&chain, config)
+        .expect("first queued hot bucket compaction");
+    let second_report = storage
+        .compact_small_objects_for_chain(&chain, config)
+        .expect("second queued hot bucket compaction");
+
+    assert_eq!(first_report.coverage_index_v2_compacted_buckets, 1);
+    assert_eq!(first_report.coverage_index_v2_compacted_deltas, 3);
+    assert_eq!(second_report.coverage_index_v2_compacted_buckets, 1);
+    assert_eq!(second_report.coverage_index_v2_compacted_deltas, 3);
+    assert_eq!(
+        coverage_index_v2_snapshot_head_count_for_bucket(
+            &storage,
+            &chain,
+            scope,
+            first_start,
+            first_end,
+        ),
+        1
+    );
+    assert_eq!(
+        coverage_index_v2_snapshot_head_count_for_bucket(
+            &storage,
+            &chain,
+            scope,
+            second_start,
+            second_end,
+        ),
+        1
+    );
+}
+
+#[test]
 fn test_compaction_coverage_index_v2_compacts_hot_bucket_split_across_scan_pages() {
     let object_store = CountingListStore::new(temp_storage_root("coverage-v2-split-hot-bucket"));
     let storage = DurableStorage::from_object_store(object_store.clone());
@@ -6426,6 +6508,23 @@ fn coverage_index_v2_snapshot_head_count<S: ObjectStore>(
         storage,
         &format!(
             "chains/{}/coverage-index-v2/snapshot-heads",
+            chain.key_prefix()
+        ),
+    )
+    .len()
+}
+
+fn coverage_index_v2_snapshot_head_count_for_bucket<S: ObjectStore>(
+    storage: &DurableStorage<S>,
+    chain: &ChainIdentity,
+    scope: &str,
+    bucket_start: u64,
+    bucket_end: u64,
+) -> usize {
+    list_prefix(
+        storage,
+        &format!(
+            "chains/{}/coverage-index-v2/snapshot-heads/{scope}/{bucket_start:020}-{bucket_end:020}",
             chain.key_prefix()
         ),
     )

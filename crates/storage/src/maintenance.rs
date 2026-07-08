@@ -1709,39 +1709,38 @@ where
                 if config.cleanup_enabled && operation_budget.remaining_puts() > 0 {
                     let mut compacted_delta_keys = compaction.compacted_delta_keys;
                     compacted_delta_keys.retain(|key| !cleanup_delta_keys.contains(key));
-                    if compacted_delta_keys.is_empty() {
-                        continue;
+                    if !compacted_delta_keys.is_empty() {
+                        checkpoint()?;
+                        cleanup_delta_keys.extend(compacted_delta_keys.iter().cloned());
+                        let record = CoverageIndexV2CleanupRecord {
+                            schema_version: 1,
+                            created_at_unix_ms: coverage_index_v2_unix_ms_now()?,
+                            scope: compaction.bucket.scope,
+                            bucket_start: compaction.bucket.bucket_start,
+                            bucket_end: compaction.bucket.bucket_end,
+                            compaction_id: snapshot_key
+                                .rsplit('/')
+                                .next()
+                                .unwrap_or("")
+                                .trim_end_matches(".json")
+                                .to_owned(),
+                            snapshot_key: snapshot_key.clone(),
+                            compacted_delta_keys,
+                        };
+                        let record_key =
+                            write_v2_cleanup_record(self.object_store(), chain, record.clone())?;
+                        operation_budget.record_puts(1);
+                        cleanup_snapshot_keys.insert(snapshot_key);
+                        if let Some(cleanup_scan) = cleanup_scan.as_mut() {
+                            cleanup_scan
+                                .records
+                                .push(CoverageIndexV2CleanupRecordObject {
+                                    key: record_key,
+                                    record,
+                                });
+                        }
+                        report.cleanup_records += 1;
                     }
-                    checkpoint()?;
-                    cleanup_delta_keys.extend(compacted_delta_keys.iter().cloned());
-                    let record = CoverageIndexV2CleanupRecord {
-                        schema_version: 1,
-                        created_at_unix_ms: coverage_index_v2_unix_ms_now()?,
-                        scope: compaction.bucket.scope,
-                        bucket_start: compaction.bucket.bucket_start,
-                        bucket_end: compaction.bucket.bucket_end,
-                        compaction_id: snapshot_key
-                            .rsplit('/')
-                            .next()
-                            .unwrap_or("")
-                            .trim_end_matches(".json")
-                            .to_owned(),
-                        snapshot_key: snapshot_key.clone(),
-                        compacted_delta_keys,
-                    };
-                    let record_key =
-                        write_v2_cleanup_record(self.object_store(), chain, record.clone())?;
-                    operation_budget.record_puts(1);
-                    cleanup_snapshot_keys.insert(snapshot_key);
-                    if let Some(cleanup_scan) = cleanup_scan.as_mut() {
-                        cleanup_scan
-                            .records
-                            .push(CoverageIndexV2CleanupRecordObject {
-                                key: record_key,
-                                record,
-                            });
-                    }
-                    report.cleanup_records += 1;
                 }
             }
             if let Some(queue_key) = bucket_scan_item.queue_key.as_deref()
@@ -1822,9 +1821,21 @@ where
     ) -> Result<CoverageIndexV2BucketScan, DatalensError> {
         let prefix = format!("chains/{}/coverage-index-v2/deltas", chain.key_prefix());
         let queue_prefix = coverage_index_v2_compaction_queue_prefix(&chain.key_prefix());
-        let queue_page =
-            self.object_store()
-                .list_page(&queue_prefix, None, delta_count_threshold.max(1))?;
+        let queue_cursor_key = coverage_index_v2_compaction_queue_cursor_key(chain);
+        let queue_cursor = self.read_compaction_cursor_key(&queue_cursor_key)?;
+        let mut queue_page = self.object_store().list_page(
+            &queue_prefix,
+            queue_cursor.next_segment_key.as_deref(),
+            delta_count_threshold.max(1),
+        )?;
+        if queue_page.objects.is_empty()
+            && queue_cursor.next_segment_key.is_some()
+            && !queue_page.has_more
+        {
+            queue_page =
+                self.object_store()
+                    .list_page(&queue_prefix, None, delta_count_threshold.max(1))?;
+        }
         let mut queued_buckets = Vec::new();
         let mut seen_buckets = BTreeSet::<CoverageIndexV2Bucket>::new();
         for object in queue_page.objects {
@@ -1863,9 +1874,9 @@ where
             };
             if seen_buckets.insert(bucket.clone()) {
                 queued_buckets.push(CoverageIndexV2BucketScanItem {
-                    cursor_key: String::new(),
+                    cursor_key: queue_cursor_key.clone(),
                     bucket,
-                    last_delta_key: None,
+                    last_delta_key: Some(object.key.clone()),
                     queue_key: Some(object.key),
                 });
             }
@@ -3262,6 +3273,13 @@ fn coverage_index_v2_semantic_evm_logs_compaction_cursor_key(chain: &ChainIdenti
 fn coverage_index_v2_compaction_priority_cursor_key(chain: &ChainIdentity) -> String {
     format!(
         "chains/{}/metadata/coverage-index-v2-compaction-priority-cursor.json",
+        chain.key_prefix()
+    )
+}
+
+fn coverage_index_v2_compaction_queue_cursor_key(chain: &ChainIdentity) -> String {
+    format!(
+        "chains/{}/metadata/coverage-index-v2-compaction-queue-cursor.json",
         chain.key_prefix()
     )
 }
