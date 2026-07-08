@@ -1524,6 +1524,8 @@ where
         let reserved_compaction_gets = config.coverage_index_v2_delta_count_threshold.max(1);
         let reserve_compaction_budget =
             operation_budget.remaining_gets() > reserved_compaction_gets;
+        let cleanup_scan_max_duration =
+            Duration::from_millis((config.max_tick_duration_ms.max(1) / 2).max(1));
         let mut cleanup_scan = if config.cleanup_enabled {
             let remaining_gets = operation_budget.remaining_gets();
             let max_records = if remaining_gets > reserved_compaction_gets {
@@ -1542,6 +1544,10 @@ where
                     config,
                     &cursor,
                     max_records,
+                    Some(CoverageIndexV2CleanupDeadline {
+                        tick_started,
+                        max_duration: cleanup_scan_max_duration,
+                    }),
                 )?;
                 operation_budget.record_gets(cleanup_scan.get_operations);
                 Some(cleanup_scan)
@@ -2052,6 +2058,7 @@ where
         config: MaintenanceCompactionConfig,
         cursor: &CompactionCursor,
         max_records: usize,
+        deadline: Option<CoverageIndexV2CleanupDeadline>,
     ) -> Result<CoverageIndexV2CleanupScan, DatalensError> {
         let now_ms = coverage_index_v2_unix_ms_now()?;
         let prefix = format!("chains/{}/coverage-index-v2/cleanup", chain.key_prefix());
@@ -2074,6 +2081,10 @@ where
         for object in &list_page.objects {
             if !object.key.starts_with(&strict_prefix) || !object.key.ends_with(".json") {
                 continue;
+            }
+            if deadline.is_some_and(|deadline| deadline.expired()) {
+                partial = true;
+                break;
             }
             if records.len() >= max_records {
                 partial = true;
