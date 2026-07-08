@@ -1634,9 +1634,10 @@ where
         };
         let max_duration = Duration::from_millis(config.max_tick_duration_ms.max(1));
         let mut report = CoverageIndexV2CompactionReport::default();
-        let reserved_compaction_gets = config.coverage_index_v2_delta_count_threshold.max(1);
-        let reserve_compaction_budget =
-            operation_budget.remaining_gets() > reserved_compaction_gets;
+        let reserved_compaction_gets =
+            coverage_index_v2_reserved_compaction_gets(config, operation_budget.remaining_gets());
+        let reserve_compaction_budget = reserved_compaction_gets > 0
+            && operation_budget.remaining_gets() > reserved_compaction_gets;
         let cleanup_scan_max_duration =
             Duration::from_millis((config.max_tick_duration_ms.max(1) / 2).max(1));
         let mut cleanup_scan = if config.cleanup_enabled {
@@ -3333,6 +3334,17 @@ fn merge_coverage_index_v2_report(
     report.coverage_index_v2_delta_delete_failures = report
         .coverage_index_v2_delta_delete_failures
         .saturating_add(coverage_index_v2_report.delete_failures);
+}
+
+fn coverage_index_v2_reserved_compaction_gets(
+    config: MaintenanceCompactionConfig,
+    remaining_gets: usize,
+) -> usize {
+    let threshold = config.coverage_index_v2_delta_count_threshold.max(1);
+    if remaining_gets <= threshold {
+        return 0;
+    }
+    (remaining_gets.saturating_mul(3).saturating_add(3) / 4).clamp(threshold, remaining_gets)
 }
 
 #[derive(Clone, Debug)]

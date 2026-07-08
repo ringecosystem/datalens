@@ -5642,6 +5642,61 @@ fn test_compaction_coverage_index_v2_cleanup_scan_respects_get_budget() {
 }
 
 #[test]
+fn test_compaction_coverage_index_v2_cleanup_scan_preserves_hot_bucket_budget() {
+    let storage = LocalStorage::new(temp_storage_root(
+        "coverage-v2-cleanup-preserves-hot-budget",
+    ));
+    let chain = test_chain();
+    let scope = "semantic/evm.logs/block/finalized/evm-logs-v1/addr/0x0000000000000000000000000000000000000001";
+    for index in 0..100 {
+        write_coverage_index_v2_cleanup_record(
+            &storage,
+            &chain,
+            &format!("cleanup-{index:020}"),
+            "chains/test/coverage-index-v2/snapshots/missing.json",
+            vec![format!(
+                "chains/{}/coverage-index-v2/deltas/evm.blocks/all/block/safe/00000000000000000000-00000000000000100000/{index:020}.json",
+                chain.key_prefix()
+            )],
+        );
+        write_coverage_index_v2_delta(
+            &storage,
+            &chain,
+            scope,
+            25_400_000,
+            25_499_999,
+            &format!("hot-{index:020}"),
+        );
+    }
+    write_coverage_index_v2_compaction_queue_record(
+        &storage, &chain, scope, 25_400_000, 25_499_999,
+    );
+
+    let report = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                coverage_index_v2_delta_count_threshold: 64,
+                max_gets_per_tick: 128,
+                max_deletes_per_tick: 0,
+                coverage_index_v2_delete_grace_ms: 0,
+                ..coverage_index_v2_compaction_config(true)
+            },
+        )
+        .expect("cleanup should not starve hot bucket compaction");
+
+    assert_eq!(report.coverage_index_v2_compacted_buckets, 1);
+    assert_eq!(report.coverage_index_v2_compacted_deltas, 96);
+    assert_eq!(report.get_operations, 128);
+    assert_eq!(
+        coverage_index_v2_snapshot_head_count_for_bucket(
+            &storage, &chain, scope, 25_400_000, 25_499_999,
+        ),
+        1
+    );
+}
+
+#[test]
 fn test_compaction_coverage_index_v2_skips_sparse_buckets_on_partial_scan_page() {
     let object_store = CountingListStore::new(temp_storage_root("coverage-v2-sparse-page"));
     let storage = DurableStorage::from_object_store(object_store.clone());
