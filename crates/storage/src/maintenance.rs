@@ -1753,7 +1753,10 @@ where
                 }
                 continue;
             }
-            if config.cleanup_enabled && operation_budget.remaining_puts() > 0 {
+            if config.cleanup_enabled
+                && operation_budget.remaining_puts() > 0
+                && bucket_scan_item.queue_key.is_none()
+            {
                 for mut record in
                     v2_snapshot_cleanup_records_for_bucket(self.object_store(), &bucket)?
                 {
@@ -1887,6 +1890,45 @@ where
                         }
                         report.cleanup_records += 1;
                     }
+                }
+            }
+            if bucket_scan_item.queue_key.is_some()
+                && config.cleanup_enabled
+                && operation_budget.remaining_puts() > 0
+                && tick_started.elapsed() < max_duration
+            {
+                for mut record in
+                    v2_snapshot_cleanup_records_for_bucket(self.object_store(), &bucket)?
+                {
+                    if tick_started.elapsed() >= max_duration {
+                        partial = true;
+                        break;
+                    }
+                    record
+                        .compacted_delta_keys
+                        .retain(|key| !cleanup_delta_keys.contains(key));
+                    if record.compacted_delta_keys.is_empty()
+                        || cleanup_snapshot_keys.contains(&record.snapshot_key)
+                        || operation_budget.remaining_puts() == 0
+                    {
+                        continue;
+                    }
+                    checkpoint()?;
+                    let snapshot_key = record.snapshot_key.clone();
+                    cleanup_delta_keys.extend(record.compacted_delta_keys.iter().cloned());
+                    let record_key =
+                        write_v2_cleanup_record(self.object_store(), chain, record.clone())?;
+                    operation_budget.record_puts(1);
+                    cleanup_snapshot_keys.insert(snapshot_key);
+                    if let Some(cleanup_scan) = cleanup_scan.as_mut() {
+                        cleanup_scan
+                            .records
+                            .push(CoverageIndexV2CleanupRecordObject {
+                                key: record_key,
+                                record,
+                            });
+                    }
+                    report.cleanup_records += 1;
                 }
             }
             if let Some(queue_key) = bucket_scan_item.queue_key.as_deref()
