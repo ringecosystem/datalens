@@ -41,8 +41,8 @@ use serde::Serialize;
 use crate::chain_identity;
 
 const COVERAGE_INDEX_V2_CHAIN_QUEUE_PRIORITY_SCAN_LIMIT: usize = 64;
-const MAX_QUEUED_COMPACTION_CHAINS_PER_WAKE: usize = 3;
-const HIGH_BACKLOG_COMPACTION_CHAINS_PER_WAKE: usize = 2;
+const MAX_QUEUED_COMPACTION_CHAINS_PER_WAKE: usize = 5;
+const HIGH_BACKLOG_COMPACTION_CHAINS_PER_WAKE: usize = 3;
 
 #[derive(Clone)]
 struct QueryRuntimeStores {
@@ -2221,11 +2221,52 @@ mod tests {
 
         assert_eq!(
             prioritize_compaction_chain_batch_indexes(vec![0, 1, 2, 3], &queued),
-            vec![0, 1, 2]
+            vec![0, 1, 2, 3]
         );
         assert_eq!(
             prioritize_compaction_chain_batch_indexes(vec![3, 2, 1, 0], &queued),
-            vec![0, 1, 3]
+            vec![0, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn storage_compaction_chain_batch_keeps_room_for_rotating_queued_chains() {
+        let queued = vec![
+            QueuedCompactionChain {
+                chain_index: 0,
+                queued_objects: 65,
+                batch_order: 5,
+            },
+            QueuedCompactionChain {
+                chain_index: 1,
+                queued_objects: 64,
+                batch_order: 4,
+            },
+            QueuedCompactionChain {
+                chain_index: 2,
+                queued_objects: 63,
+                batch_order: 3,
+            },
+            QueuedCompactionChain {
+                chain_index: 3,
+                queued_objects: 32,
+                batch_order: 2,
+            },
+            QueuedCompactionChain {
+                chain_index: 4,
+                queued_objects: 31,
+                batch_order: 1,
+            },
+            QueuedCompactionChain {
+                chain_index: 5,
+                queued_objects: 30,
+                batch_order: 0,
+            },
+        ];
+
+        assert_eq!(
+            prioritize_compaction_chain_batch_indexes(vec![5, 4, 3, 2, 1, 0], &queued),
+            vec![0, 1, 2, 5, 4]
         );
     }
 
