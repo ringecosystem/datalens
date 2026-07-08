@@ -5665,6 +5665,50 @@ fn test_compaction_coverage_index_v2_compacts_hot_bucket_split_across_scan_pages
 }
 
 #[test]
+fn test_compaction_coverage_index_v2_bucket_scan_stops_at_page_budget() {
+    let object_store = SlowCoverageIndexV2ListPageStore::new(
+        temp_storage_root("coverage-v2-bucket-scan-page-budget"),
+        Duration::ZERO,
+    );
+    let storage = DurableStorage::from_object_store(object_store.clone());
+    let chain = test_chain();
+    let scope = "exact/evm.blocks/block/all/safe";
+    for index in 0..1500 {
+        write_coverage_index_v2_delta(
+            &storage,
+            &chain,
+            scope,
+            index * 100_000,
+            index * 100_000 + 99_999,
+            "sparse",
+        );
+    }
+    let list_pages_before = object_store.list_page_count();
+
+    let report = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                coverage_index_v2_delta_count_threshold: 64,
+                max_tick_duration_ms: 30_000,
+                ..coverage_index_v2_compaction_config(false)
+            },
+        )
+        .expect("sparse bucket scan should stop at page budget");
+
+    assert_eq!(report.coverage_index_v2_compacted_buckets, 0);
+    assert_eq!(report.tick_status, MaintenanceCompactionTickStatus::Partial);
+    let compaction_list_pages = object_store
+        .list_page_count()
+        .saturating_sub(list_pages_before);
+    assert!(
+        compaction_list_pages <= 7,
+        "the queue scan consumes one page from the shared page budget, count={}",
+        compaction_list_pages
+    );
+}
+
+#[test]
 fn test_compaction_coverage_index_v2_snapshot_head_writes_stay_within_overwrite_budget() {
     let object_store = CountingObjectStore::new(LocalObjectStore::new(temp_storage_root(
         "coverage-v2-head-overwrite-budget",
