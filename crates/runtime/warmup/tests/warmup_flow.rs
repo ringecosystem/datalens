@@ -2063,6 +2063,167 @@ fn test_task_pool_prioritizes_active_follow_query_watermark() {
 }
 
 #[test]
+fn test_task_pool_runs_older_fixed_range_before_live_follow_query() {
+    let storage = LocalStorage::new(temp_root("pool-older-fixed-before-live-follow-storage"));
+    let registry =
+        LocalWarmupRegistry::new(object_store("pool-older-fixed-before-live-follow-registry"));
+    let watermarks = QueryWatermarkStore::new(object_store(
+        "pool-older-fixed-before-live-follow-watermarks",
+    ));
+    let adapter = FixtureAdapter::new(2_000).with_max_range_len(1);
+    let pool = WarmupTaskPool::new(
+        runtime(adapter.clone(), storage, registry.clone())
+            .with_query_watermarks(watermarks.clone())
+            .with_follow_query_start_offset_blocks(Some(1))
+            .with_follow_query_lookahead_blocks(1)
+            .with_runtime_config(WarmupRuntimeConfig {
+                max_fetches_per_task_loop: 1,
+                ..WarmupRuntimeConfig::default()
+            }),
+        WarmupSchedulerConfig {
+            max_global_concurrent_tasks: 1,
+            max_concurrent_tasks_per_chain: 1,
+        },
+    );
+    let fixed = registry
+        .submit(submit_request(Some(1), WarmupTaskMode::FixedRange))
+        .expect("fixed range")
+        .task_id;
+    let follow = registry
+        .submit(follow_query_request())
+        .expect("live follow query")
+        .task_id;
+    save_query_watermark_for(&watermarks, "app-a", &selector(), 1_000);
+    save_warmup_cursor(&registry, &fixed, 1, 1);
+    save_warmup_cursor(&registry, &follow, 1_000, 2);
+    let mut fixed_task = registry.get(&fixed).unwrap().unwrap();
+    fixed_task.updated_at = 1;
+    registry
+        .save_task(&fixed_task)
+        .expect("save older fixed task");
+    let mut follow_task = registry.get(&follow).unwrap().unwrap();
+    follow_task.updated_at = 2;
+    registry
+        .save_task(&follow_task)
+        .expect("save newer follow task");
+
+    let results = pool.run_available_once().expect("run older fixed range");
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(adapter.fetches(), vec![blocks(1, 1)]);
+    assert_eq!(registry.load_cursor(&fixed).unwrap().unwrap().next, 2);
+    assert_eq!(registry.load_cursor(&follow).unwrap().unwrap().next, 1_000);
+}
+
+#[test]
+fn test_task_pool_runs_older_live_follow_query_before_fixed_range() {
+    let storage = LocalStorage::new(temp_root("pool-older-live-follow-before-fixed-storage"));
+    let registry =
+        LocalWarmupRegistry::new(object_store("pool-older-live-follow-before-fixed-registry"));
+    let watermarks = QueryWatermarkStore::new(object_store(
+        "pool-older-live-follow-before-fixed-watermarks",
+    ));
+    let adapter = FixtureAdapter::new(2_000).with_max_range_len(1);
+    let pool = WarmupTaskPool::new(
+        runtime(adapter.clone(), storage, registry.clone())
+            .with_query_watermarks(watermarks.clone())
+            .with_follow_query_start_offset_blocks(Some(1))
+            .with_follow_query_lookahead_blocks(1)
+            .with_runtime_config(WarmupRuntimeConfig {
+                max_fetches_per_task_loop: 1,
+                ..WarmupRuntimeConfig::default()
+            }),
+        WarmupSchedulerConfig {
+            max_global_concurrent_tasks: 1,
+            max_concurrent_tasks_per_chain: 1,
+        },
+    );
+    let fixed = registry
+        .submit(submit_request(Some(1), WarmupTaskMode::FixedRange))
+        .expect("fixed range")
+        .task_id;
+    let follow = registry
+        .submit(follow_query_request())
+        .expect("live follow query")
+        .task_id;
+    save_query_watermark_for(&watermarks, "app-a", &selector(), 1_000);
+    save_warmup_cursor(&registry, &fixed, 1, 2);
+    save_warmup_cursor(&registry, &follow, 1_000, 1);
+    let mut follow_task = registry.get(&follow).unwrap().unwrap();
+    follow_task.updated_at = 1;
+    registry
+        .save_task(&follow_task)
+        .expect("save older follow task");
+    let mut fixed_task = registry.get(&fixed).unwrap().unwrap();
+    fixed_task.updated_at = 2;
+    registry
+        .save_task(&fixed_task)
+        .expect("save newer fixed task");
+
+    let results = pool.run_available_once().expect("run older live follow");
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(adapter.fetches(), vec![blocks(1_001, 1_001)]);
+    assert_eq!(registry.load_cursor(&fixed).unwrap().unwrap().next, 1);
+    assert_eq!(registry.load_cursor(&follow).unwrap().unwrap().next, 1_002);
+}
+
+#[test]
+fn test_task_pool_rotates_between_partial_fixed_range_and_live_follow_query() {
+    let storage = LocalStorage::new(temp_root("pool-rotate-fixed-live-follow-storage"));
+    let registry = LocalWarmupRegistry::new(object_store("pool-rotate-fixed-live-follow-registry"));
+    let watermarks =
+        QueryWatermarkStore::new(object_store("pool-rotate-fixed-live-follow-watermarks"));
+    let adapter = FixtureAdapter::new(2_000).with_max_range_len(1);
+    let pool = WarmupTaskPool::new(
+        runtime(adapter.clone(), storage, registry.clone())
+            .with_query_watermarks(watermarks.clone())
+            .with_follow_query_start_offset_blocks(Some(1))
+            .with_follow_query_lookahead_blocks(1)
+            .with_runtime_config(WarmupRuntimeConfig {
+                max_fetches_per_task_loop: 1,
+                ..WarmupRuntimeConfig::default()
+            }),
+        WarmupSchedulerConfig {
+            max_global_concurrent_tasks: 1,
+            max_concurrent_tasks_per_chain: 1,
+        },
+    );
+    let mut fixed_request = submit_request(Some(2), WarmupTaskMode::FixedRange);
+    fixed_request.chunk_policy.max_range_len = 1;
+    let fixed = registry
+        .submit(fixed_request)
+        .expect("partial fixed range")
+        .task_id;
+    let follow = registry
+        .submit(follow_query_request())
+        .expect("live follow query")
+        .task_id;
+    save_query_watermark_for(&watermarks, "app-a", &selector(), 1_000);
+    save_warmup_cursor(&registry, &fixed, 1, 1);
+    save_warmup_cursor(&registry, &follow, 1_000, 2);
+    let mut fixed_task = registry.get(&fixed).unwrap().unwrap();
+    fixed_task.updated_at = 1;
+    registry
+        .save_task(&fixed_task)
+        .expect("save older fixed task");
+    let mut follow_task = registry.get(&follow).unwrap().unwrap();
+    follow_task.updated_at = 2;
+    registry
+        .save_task(&follow_task)
+        .expect("save newer follow task");
+
+    let first_tick = pool.run_available_once().expect("run partial fixed range");
+    let second_tick = pool.run_available_once().expect("run live follow query");
+
+    assert_eq!(first_tick.len(), 1);
+    assert_eq!(second_tick.len(), 1);
+    assert_eq!(adapter.fetches(), vec![blocks(1, 1), blocks(1_001, 1_001)]);
+    assert_eq!(registry.load_cursor(&fixed).unwrap().unwrap().next, 2);
+    assert_eq!(registry.load_cursor(&follow).unwrap().unwrap().next, 1_002);
+}
+
+#[test]
 fn test_task_pool_cancels_failed_duplicate_when_healthy_follow_query_exists() {
     let storage = LocalStorage::new(temp_root("pool-follow-query-failed-duplicate-storage"));
     let registry =
