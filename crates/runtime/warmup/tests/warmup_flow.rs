@@ -2000,6 +2000,7 @@ fn test_task_pool_runs_available_tasks_with_global_bound() {
         WarmupSchedulerConfig {
             max_global_concurrent_tasks: 1,
             max_concurrent_tasks_per_chain: 1,
+            fixed_range_min_tasks_per_tick: 0,
         },
     );
     let first = registry
@@ -2044,6 +2045,7 @@ fn test_task_pool_prioritizes_active_follow_query_watermark() {
         WarmupSchedulerConfig {
             max_global_concurrent_tasks: 1,
             max_concurrent_tasks_per_chain: 1,
+            fixed_range_min_tasks_per_tick: 0,
         },
     );
     let active = registry
@@ -2083,6 +2085,7 @@ fn test_task_pool_runs_older_fixed_range_before_live_follow_query() {
         WarmupSchedulerConfig {
             max_global_concurrent_tasks: 1,
             max_concurrent_tasks_per_chain: 1,
+            fixed_range_min_tasks_per_tick: 0,
         },
     );
     let fixed = registry
@@ -2136,6 +2139,7 @@ fn test_task_pool_runs_older_live_follow_query_before_fixed_range() {
         WarmupSchedulerConfig {
             max_global_concurrent_tasks: 1,
             max_concurrent_tasks_per_chain: 1,
+            fixed_range_min_tasks_per_tick: 0,
         },
     );
     let fixed = registry
@@ -2187,6 +2191,7 @@ fn test_task_pool_rotates_between_partial_fixed_range_and_live_follow_query() {
         WarmupSchedulerConfig {
             max_global_concurrent_tasks: 1,
             max_concurrent_tasks_per_chain: 1,
+            fixed_range_min_tasks_per_tick: 0,
         },
     );
     let mut fixed_request = submit_request(Some(2), WarmupTaskMode::FixedRange);
@@ -2244,6 +2249,7 @@ fn test_task_pool_cancels_failed_duplicate_when_healthy_follow_query_exists() {
         WarmupSchedulerConfig {
             max_global_concurrent_tasks: 2,
             max_concurrent_tasks_per_chain: 2,
+            fixed_range_min_tasks_per_tick: 0,
         },
     );
     let keeper = registry
@@ -2342,6 +2348,7 @@ fn test_task_pool_cancels_duplicate_follow_query_tasks() {
         WarmupSchedulerConfig {
             max_global_concurrent_tasks: 2,
             max_concurrent_tasks_per_chain: 2,
+            fixed_range_min_tasks_per_tick: 0,
         },
     );
     let keeper = registry
@@ -2390,6 +2397,7 @@ fn test_task_pool_keeps_runnable_keeper_over_higher_cursor_paused_duplicate() {
         WarmupSchedulerConfig {
             max_global_concurrent_tasks: 2,
             max_concurrent_tasks_per_chain: 2,
+            fixed_range_min_tasks_per_tick: 0,
         },
     );
     let keeper = registry
@@ -2444,6 +2452,7 @@ fn test_task_pool_does_not_reconcile_other_selectors_with_different_fingerprints
         WarmupSchedulerConfig {
             max_global_concurrent_tasks: 2,
             max_concurrent_tasks_per_chain: 2,
+            fixed_range_min_tasks_per_tick: 0,
         },
     );
     let mut first_request = follow_query_request();
@@ -2505,6 +2514,7 @@ fn test_ensure_keeps_cancelled_duplicate_from_replacing_keeper() {
         WarmupSchedulerConfig {
             max_global_concurrent_tasks: 2,
             max_concurrent_tasks_per_chain: 2,
+            fixed_range_min_tasks_per_tick: 0,
         },
     );
     let keeper = registry
@@ -2634,6 +2644,7 @@ fn test_follow_query_near_head_moves_to_idle_without_provider_fetch() {
         WarmupSchedulerConfig {
             max_global_concurrent_tasks: 1,
             max_concurrent_tasks_per_chain: 1,
+            fixed_range_min_tasks_per_tick: 0,
         },
     );
     let task_id = registry
@@ -2682,6 +2693,7 @@ fn test_follow_query_near_head_activity_does_not_idle_historical_backfill() {
         WarmupSchedulerConfig {
             max_global_concurrent_tasks: 1,
             max_concurrent_tasks_per_chain: 1,
+            fixed_range_min_tasks_per_tick: 0,
         },
     );
     let task_id = registry
@@ -2753,6 +2765,7 @@ fn test_follow_query_near_head_activity_without_backfill_cursor_can_idle() {
         WarmupSchedulerConfig {
             max_global_concurrent_tasks: 1,
             max_concurrent_tasks_per_chain: 1,
+            fixed_range_min_tasks_per_tick: 0,
         },
     );
     let task_id = registry
@@ -2867,6 +2880,7 @@ fn test_idle_follow_query_resumes_when_query_gap_grows() {
         WarmupSchedulerConfig {
             max_global_concurrent_tasks: 1,
             max_concurrent_tasks_per_chain: 1,
+            fixed_range_min_tasks_per_tick: 0,
         },
     );
     let task_id = registry
@@ -2908,6 +2922,7 @@ fn test_task_pool_prioritizes_old_backfill_follow_query_before_near_head() {
         WarmupSchedulerConfig {
             max_global_concurrent_tasks: 1,
             max_concurrent_tasks_per_chain: 1,
+            fixed_range_min_tasks_per_tick: 0,
         },
     );
     let mut backfill_request = follow_query_request();
@@ -2973,6 +2988,148 @@ fn test_task_pool_prioritizes_old_backfill_follow_query_before_near_head() {
 }
 
 #[test]
+fn test_task_pool_reserves_fixed_range_slot_without_starving_follow_query() {
+    let storage = LocalStorage::new(temp_root("pool-fixed-range-reserve-storage"));
+    let registry = LocalWarmupRegistry::new(object_store("pool-fixed-range-reserve-registry"));
+    let watermarks = QueryWatermarkStore::new(object_store("pool-fixed-range-reserve-watermarks"));
+    let adapter = FixtureAdapter::new(10_000).with_max_range_len(1);
+    let pool = WarmupTaskPool::new(
+        runtime(adapter.clone(), storage, registry.clone())
+            .with_query_watermarks(watermarks.clone())
+            .with_follow_query_lookahead_blocks(1)
+            .with_runtime_config(WarmupRuntimeConfig {
+                max_fetches_per_task_loop: 1,
+                ..WarmupRuntimeConfig::default()
+            }),
+        WarmupSchedulerConfig {
+            max_global_concurrent_tasks: 2,
+            max_concurrent_tasks_per_chain: 2,
+            fixed_range_min_tasks_per_tick: 1,
+        },
+    );
+    let fixed = registry
+        .submit(submit_request(Some(50), WarmupTaskMode::FixedRange))
+        .expect("fixed range")
+        .task_id;
+    let follow = registry
+        .submit(follow_query_request())
+        .expect("follow query")
+        .task_id;
+    let mut second_follow_request = follow_query_request();
+    second_follow_request.application_id = "degov".to_owned();
+    second_follow_request.selector = second_selector();
+    let second_follow = registry
+        .submit(second_follow_request)
+        .expect("second follow query")
+        .task_id;
+    save_query_watermark(&watermarks, 1_000);
+    save_query_watermark_for(&watermarks, "degov", &second_selector(), 1_000);
+    save_warmup_cursor(&registry, &follow, 1_000, 1);
+    save_warmup_cursor(&registry, &second_follow, 1_000, 1);
+
+    let results = pool.run_available_once().expect("run reserved tick");
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(adapter.fetches(), vec![blocks(1, 1), blocks(2_000, 2_000)]);
+    assert_eq!(registry.load_cursor(&fixed).unwrap().unwrap().next, 2);
+    let follow_next = registry.load_cursor(&follow).unwrap().unwrap().next;
+    let second_follow_next = registry.load_cursor(&second_follow).unwrap().unwrap().next;
+    assert_eq!(
+        [follow_next > 1_000, second_follow_next > 1_000]
+            .into_iter()
+            .filter(|advanced| *advanced)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn test_task_pool_fixed_range_reserve_picks_largest_remaining_backlog() {
+    let storage = LocalStorage::new(temp_root("pool-fixed-range-largest-backlog-storage"));
+    let registry =
+        LocalWarmupRegistry::new(object_store("pool-fixed-range-largest-backlog-registry"));
+    let adapter = FixtureAdapter::new(10_000).with_max_range_len(1);
+    let pool = WarmupTaskPool::new(
+        runtime(adapter.clone(), storage, registry.clone()).with_runtime_config(
+            WarmupRuntimeConfig {
+                max_fetches_per_task_loop: 1,
+                ..WarmupRuntimeConfig::default()
+            },
+        ),
+        WarmupSchedulerConfig {
+            max_global_concurrent_tasks: 1,
+            max_concurrent_tasks_per_chain: 1,
+            fixed_range_min_tasks_per_tick: 1,
+        },
+    );
+    let smaller = registry
+        .submit(submit_request(Some(20), WarmupTaskMode::FixedRange))
+        .expect("smaller fixed range")
+        .task_id;
+    let mut larger_request = submit_request(Some(100), WarmupTaskMode::FixedRange);
+    larger_request.application_id = "degov".to_owned();
+    larger_request.selector = second_selector();
+    let larger = registry
+        .submit(larger_request)
+        .expect("larger fixed range")
+        .task_id;
+    save_warmup_cursor(&registry, &smaller, 19, 1);
+    save_warmup_cursor(&registry, &larger, 50, 2);
+    let mut smaller_task = registry.get(&smaller).unwrap().unwrap();
+    smaller_task.updated_at = 1;
+    registry
+        .save_task(&smaller_task)
+        .expect("save older smaller task");
+    let mut larger_task = registry.get(&larger).unwrap().unwrap();
+    larger_task.updated_at = 2;
+    registry
+        .save_task(&larger_task)
+        .expect("save newer larger task");
+
+    let results = pool.run_available_once().expect("run reserved fixed range");
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(adapter.fetches(), vec![blocks(50, 50)]);
+    assert_eq!(registry.load_cursor(&larger).unwrap().unwrap().next, 51);
+    assert_eq!(registry.load_cursor(&smaller).unwrap().unwrap().next, 19);
+}
+
+#[test]
+fn test_task_pool_fixed_range_reserve_handles_full_span_backlog() {
+    let storage = LocalStorage::new(temp_root("pool-fixed-range-full-span-backlog-storage"));
+    let registry =
+        LocalWarmupRegistry::new(object_store("pool-fixed-range-full-span-backlog-registry"));
+    let adapter = FixtureAdapter::new(10_000).with_max_range_len(1);
+    let pool = WarmupTaskPool::new(
+        runtime(adapter.clone(), storage, registry.clone()).with_runtime_config(
+            WarmupRuntimeConfig {
+                max_fetches_per_task_loop: 1,
+                ..WarmupRuntimeConfig::default()
+            },
+        ),
+        WarmupSchedulerConfig {
+            max_global_concurrent_tasks: 1,
+            max_concurrent_tasks_per_chain: 1,
+            fixed_range_min_tasks_per_tick: 1,
+        },
+    );
+    let mut request = submit_request(Some(u64::MAX), WarmupTaskMode::FixedRange);
+    request.start = 0;
+    let task_id = registry
+        .submit(request)
+        .expect("full span fixed range")
+        .task_id;
+
+    let results = pool
+        .run_available_once()
+        .expect("run full span fixed range");
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(adapter.fetches(), vec![blocks(0, 0)]);
+    assert_eq!(registry.load_cursor(&task_id).unwrap().unwrap().next, 1);
+}
+
+#[test]
 fn test_task_pool_get_and_list_return_live_follow_query_status() {
     let storage = LocalStorage::new(temp_root("pool-follow-query-live-status-storage"));
     let registry = LocalWarmupRegistry::new(object_store("pool-follow-query-live-status-registry"));
@@ -2985,6 +3142,7 @@ fn test_task_pool_get_and_list_return_live_follow_query_status() {
         WarmupSchedulerConfig {
             max_global_concurrent_tasks: 1,
             max_concurrent_tasks_per_chain: 1,
+            fixed_range_min_tasks_per_tick: 0,
         },
     );
     let task_id = registry
@@ -3036,6 +3194,7 @@ fn test_task_pool_rotates_between_low_lead_follow_query_tasks() {
         WarmupSchedulerConfig {
             max_global_concurrent_tasks: 1,
             max_concurrent_tasks_per_chain: 1,
+            fixed_range_min_tasks_per_tick: 0,
         },
     );
     let first = registry
@@ -3076,6 +3235,7 @@ fn test_task_pool_scopes_shared_registry_to_adapter_chain() {
         WarmupSchedulerConfig {
             max_global_concurrent_tasks: 10,
             max_concurrent_tasks_per_chain: 10,
+            fixed_range_min_tasks_per_tick: 0,
         },
     );
     let ethereum = registry

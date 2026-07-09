@@ -224,6 +224,7 @@ pub(crate) fn warmup_pool_with_max_fetches(
         WarmupSchedulerConfig {
             max_global_concurrent_tasks: 1,
             max_concurrent_tasks_per_chain: 1,
+            fixed_range_min_tasks_per_tick: 0,
         },
     )
 }

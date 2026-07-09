@@ -309,6 +309,7 @@ async fn test_graphql_warmup_task_exposes_idle_follow_query_reason() {
             WarmupSchedulerConfig {
                 max_global_concurrent_tasks: 1,
                 max_concurrent_tasks_per_chain: 1,
+                fixed_range_min_tasks_per_tick: 0,
             },
         ));
     let registry = QueryServiceRegistry::new()
