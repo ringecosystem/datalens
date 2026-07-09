@@ -2080,6 +2080,7 @@ fn follow_query_gap(task: &WarmupTask) -> Option<u64> {
 
 fn warmup_priority_key(task: &WarmupTask) -> (u8, u64, u64, u64, String, String, String) {
     let rank = match (task.mode, task.follow_query_status.as_ref()) {
+        (WarmupTaskMode::FixedRange, _) => 0,
         (WarmupTaskMode::FollowQuery, Some(status))
             if status.query_watermark.is_some() && status.planned_start.is_some() =>
         {
