@@ -2096,6 +2096,16 @@ fn test_task_pool_runs_older_fixed_range_before_live_follow_query() {
     save_query_watermark_for(&watermarks, "app-a", &selector(), 1_000);
     save_warmup_cursor(&registry, &fixed, 1, 1);
     save_warmup_cursor(&registry, &follow, 1_000, 2);
+    let mut fixed_task = registry.get(&fixed).unwrap().unwrap();
+    fixed_task.updated_at = 1;
+    registry
+        .save_task(&fixed_task)
+        .expect("save older fixed task");
+    let mut follow_task = registry.get(&follow).unwrap().unwrap();
+    follow_task.updated_at = 2;
+    registry
+        .save_task(&follow_task)
+        .expect("save newer follow task");
 
     let results = pool.run_available_once().expect("run older fixed range");
 
@@ -2139,6 +2149,16 @@ fn test_task_pool_runs_older_live_follow_query_before_fixed_range() {
     save_query_watermark_for(&watermarks, "app-a", &selector(), 1_000);
     save_warmup_cursor(&registry, &fixed, 1, 2);
     save_warmup_cursor(&registry, &follow, 1_000, 1);
+    let mut follow_task = registry.get(&follow).unwrap().unwrap();
+    follow_task.updated_at = 1;
+    registry
+        .save_task(&follow_task)
+        .expect("save older follow task");
+    let mut fixed_task = registry.get(&fixed).unwrap().unwrap();
+    fixed_task.updated_at = 2;
+    registry
+        .save_task(&fixed_task)
+        .expect("save newer fixed task");
 
     let results = pool.run_available_once().expect("run older live follow");
 
@@ -2182,6 +2202,16 @@ fn test_task_pool_rotates_between_partial_fixed_range_and_live_follow_query() {
     save_query_watermark_for(&watermarks, "app-a", &selector(), 1_000);
     save_warmup_cursor(&registry, &fixed, 1, 1);
     save_warmup_cursor(&registry, &follow, 1_000, 2);
+    let mut fixed_task = registry.get(&fixed).unwrap().unwrap();
+    fixed_task.updated_at = 1;
+    registry
+        .save_task(&fixed_task)
+        .expect("save older fixed task");
+    let mut follow_task = registry.get(&follow).unwrap().unwrap();
+    follow_task.updated_at = 2;
+    registry
+        .save_task(&follow_task)
+        .expect("save newer follow task");
 
     let first_tick = pool.run_available_once().expect("run partial fixed range");
     let second_tick = pool.run_available_once().expect("run live follow query");
