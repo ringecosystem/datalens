@@ -439,6 +439,7 @@ fn warmup_pool_inner(
         WarmupSchedulerConfig {
             max_global_concurrent_tasks: 1,
             max_concurrent_tasks_per_chain: 1,
+            fixed_range_min_tasks_per_tick: 0,
         },
     )
 }
@@ -472,6 +473,7 @@ where
         WarmupSchedulerConfig {
             max_global_concurrent_tasks: 1,
             max_concurrent_tasks_per_chain: 1,
+            fixed_range_min_tasks_per_tick: 0,
         },
     )
 }

@@ -1242,6 +1242,7 @@ fn build_evm_service_with_storage(
             WarmupSchedulerConfig {
                 max_global_concurrent_tasks: config.warmup.max_global_tasks,
                 max_concurrent_tasks_per_chain: config.warmup.max_per_chain_tasks,
+                fixed_range_min_tasks_per_tick: config.warmup.fixed_range_min_tasks_per_tick,
             },
         ));
     }
@@ -1432,6 +1433,7 @@ fn build_tron_service_with_storage(
             WarmupSchedulerConfig {
                 max_global_concurrent_tasks: config.warmup.max_global_tasks,
                 max_concurrent_tasks_per_chain: config.warmup.max_per_chain_tasks,
+                fixed_range_min_tasks_per_tick: config.warmup.fixed_range_min_tasks_per_tick,
             },
         ));
     }

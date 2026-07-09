@@ -1161,6 +1161,7 @@ fn test_config_parses_warmup_follow_query_lookahead() {
         max_fetches_per_loop = 1
         max_durable_intents_per_loop = 3
         max_pending_warmup_durable_intents_per_chain = 7
+        fixed_range_min_tasks_per_tick = 2
         follow_query_lookahead_blocks = 2048
         follow_query_start_offset_blocks = 512
         follow_query_start_offset_tiers_blocks = [5000, 3000, 1000]
@@ -1200,6 +1201,7 @@ fn test_config_parses_warmup_follow_query_lookahead() {
         config.warmup.max_pending_warmup_durable_intents_per_chain,
         Some(7)
     );
+    assert_eq!(config.warmup.fixed_range_min_tasks_per_tick, 2);
     assert_eq!(config.warmup.follow_query_start_offset_blocks, Some(512));
     assert_eq!(
         config.warmup.follow_query_start_offset_tiers_blocks,

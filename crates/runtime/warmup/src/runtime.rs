@@ -51,6 +51,7 @@ pub struct WarmupRuntimeConfig {
 pub struct WarmupSchedulerConfig {
     pub max_global_concurrent_tasks: usize,
     pub max_concurrent_tasks_per_chain: usize,
+    pub fixed_range_min_tasks_per_tick: usize,
 }
 
 impl Default for WarmupSchedulerConfig {
@@ -58,6 +59,7 @@ impl Default for WarmupSchedulerConfig {
         Self {
             max_global_concurrent_tasks: 1,
             max_concurrent_tasks_per_chain: 1,
+            fixed_range_min_tasks_per_tick: 0,
         }
     }
 }
@@ -208,26 +210,88 @@ where
         let max_global = self.config.max_global_concurrent_tasks.max(1);
         let max_per_chain = self.config.max_concurrent_tasks_per_chain.max(1);
         let mut chain_counts: HashMap<String, usize> = HashMap::new();
+        let mut selected_task_ids: HashSet<WarmupTaskId> = HashSet::new();
+        let mut selected_tasks: Vec<WarmupTask> = Vec::new();
         let mut tasks = self.runtime.reconcile_follow_query_tasks(
             self.list(crate::WarmupTaskFilter::default())?
                 .into_iter()
                 .collect(),
         )?;
         tasks.retain(is_runnable_task);
+
+        if self.config.fixed_range_min_tasks_per_tick > 0 {
+            let fixed_range_limit = self.config.fixed_range_min_tasks_per_tick.min(max_global);
+            let mut fixed_range_tasks = tasks
+                .iter()
+                .filter(|task| task.mode == WarmupTaskMode::FixedRange)
+                .map(|task| {
+                    self.fixed_range_remaining_backlog(task)
+                        .map(|backlog| (task.clone(), backlog))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            fixed_range_tasks.retain(|(_, backlog)| *backlog > 0);
+            fixed_range_tasks.sort_by_key(|(task, backlog)| {
+                (
+                    Reverse(*backlog),
+                    task.updated_at,
+                    task.chain.key_prefix(),
+                    task.selector.fingerprint(),
+                    task.task_id.as_str().to_owned(),
+                )
+            });
+
+            for (task, _) in fixed_range_tasks {
+                if selected_tasks.len() >= max_global || selected_tasks.len() >= fixed_range_limit {
+                    break;
+                }
+                select_warmup_task(
+                    task,
+                    max_per_chain,
+                    &mut chain_counts,
+                    &mut selected_task_ids,
+                    &mut selected_tasks,
+                );
+            }
+        }
+
         tasks.sort_by_key(warmup_priority_key);
         for task in tasks {
-            if results.len() >= max_global {
+            if selected_tasks.len() >= max_global {
                 break;
             }
-            let chain_key = task.chain.key_prefix();
-            let count = chain_counts.entry(chain_key).or_default();
-            if *count >= max_per_chain {
+            if selected_task_ids.contains(&task.task_id) {
                 continue;
             }
-            *count += 1;
+            select_warmup_task(
+                task,
+                max_per_chain,
+                &mut chain_counts,
+                &mut selected_task_ids,
+                &mut selected_tasks,
+            );
+        }
+
+        for task in selected_tasks {
             results.push(self.runtime.run_task_once(&task.task_id)?);
         }
         Ok(results)
+    }
+
+    fn fixed_range_remaining_backlog(&self, task: &WarmupTask) -> Result<u128, DatalensError> {
+        let Some(end) = task.end else {
+            return Ok(0);
+        };
+        let next = self
+            .runtime
+            .registry
+            .load_cursor(&task.task_id)?
+            .map(|cursor| cursor.next)
+            .unwrap_or(task.start);
+        if next > end {
+            Ok(0)
+        } else {
+            Ok(u128::from(end) - u128::from(next) + 1)
+        }
     }
 
     pub fn run_task_once(&self, task_id: &WarmupTaskId) -> Result<WarmupRunResult, DatalensError> {
@@ -2118,6 +2182,23 @@ fn warmup_priority_key(task: &WarmupTask) -> (u8, u64, u64, u64, String, String,
         task.selector.fingerprint(),
         task.task_id.as_str().to_owned(),
     )
+}
+
+fn select_warmup_task(
+    task: WarmupTask,
+    max_per_chain: usize,
+    chain_counts: &mut HashMap<String, usize>,
+    selected_task_ids: &mut HashSet<WarmupTaskId>,
+    selected_tasks: &mut Vec<WarmupTask>,
+) {
+    let chain_key = task.chain.key_prefix();
+    let count = chain_counts.entry(chain_key).or_default();
+    if *count >= max_per_chain {
+        return;
+    }
+    *count += 1;
+    selected_task_ids.insert(task.task_id.clone());
+    selected_tasks.push(task);
 }
 
 fn missing_task(task_id: &WarmupTaskId) -> DatalensError {

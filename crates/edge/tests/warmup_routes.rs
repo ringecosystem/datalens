@@ -241,6 +241,7 @@ async fn test_api_warmup_list_exposes_follow_query_status() {
             WarmupSchedulerConfig {
                 max_global_concurrent_tasks: 1,
                 max_concurrent_tasks_per_chain: 1,
+                fixed_range_min_tasks_per_tick: 0,
             },
         ));
     let registry = QueryServiceRegistry::new()
@@ -353,6 +354,7 @@ async fn test_api_warmup_list_exposes_idle_follow_query_reason() {
             WarmupSchedulerConfig {
                 max_global_concurrent_tasks: 1,
                 max_concurrent_tasks_per_chain: 1,
+                fixed_range_min_tasks_per_tick: 0,
             },
         ));
     let registry = QueryServiceRegistry::new()
@@ -1166,6 +1168,7 @@ fn shared_registry_warmup_pool(
         WarmupSchedulerConfig {
             max_global_concurrent_tasks: 1,
             max_concurrent_tasks_per_chain: 1,
+            fixed_range_min_tasks_per_tick: 0,
         },
     )
 }
