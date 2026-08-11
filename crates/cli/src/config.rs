@@ -78,6 +78,18 @@ pub fn validate_config(config: &DatalensConfig) -> Result<(), DatalensError> {
                     "storage.s3.max_concurrent_operations must be greater than zero",
                 ));
             }
+            if s3.background_runtime_worker_threads == 0 {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::InvalidInput,
+                    "storage.s3.background_runtime_worker_threads must be greater than zero",
+                ));
+            }
+            if s3.background_max_concurrent_operations == 0 {
+                return Err(DatalensError::new(
+                    DatalensErrorKind::InvalidInput,
+                    "storage.s3.background_max_concurrent_operations must be greater than zero",
+                ));
+            }
         }
         _ => unreachable!("storage backend validated"),
     }

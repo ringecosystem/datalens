@@ -524,11 +524,64 @@ fn test_s3_object_store_builds_from_compatible_backend_config() {
         force_path_style: true,
         runtime_worker_threads: 4,
         max_concurrent_operations: 16,
+        background_runtime_worker_threads: 4,
+        background_max_concurrent_operations: 16,
     })
     .expect("build S3 object store");
 
     assert_eq!(store.bucket(), "datalens");
     assert_eq!(store.prefix(), Some("dev/cache"));
+}
+
+#[test]
+fn test_s3_object_store_builds_background_runtime_from_config() {
+    let store = S3ObjectStore::background_from_config(S3ObjectStoreConfig {
+        bucket: "datalens".to_owned(),
+        prefix: Some("dev/cache".to_owned()),
+        region: "auto".to_owned(),
+        endpoint_url: Some("http://localhost:9000".to_owned()),
+        force_path_style: true,
+        runtime_worker_threads: 4,
+        max_concurrent_operations: 16,
+        background_runtime_worker_threads: 2,
+        background_max_concurrent_operations: 8,
+    })
+    .expect("build background S3 object store");
+
+    assert_eq!(store.bucket(), "datalens");
+    assert_eq!(store.prefix(), Some("dev/cache"));
+    assert!(format!("{store:?}").contains("background"));
+}
+
+#[test]
+fn test_s3_object_store_rejects_zero_runtime_limits() {
+    let error = S3ObjectStore::from_config(S3ObjectStoreConfig {
+        bucket: "datalens".to_owned(),
+        prefix: Some("dev/cache".to_owned()),
+        region: "auto".to_owned(),
+        endpoint_url: Some("http://localhost:9000".to_owned()),
+        force_path_style: true,
+        runtime_worker_threads: 0,
+        max_concurrent_operations: 16,
+        background_runtime_worker_threads: 4,
+        background_max_concurrent_operations: 16,
+    })
+    .expect_err("zero foreground runtime workers rejected");
+    assert!(error.message.contains("worker_threads"));
+
+    let error = S3ObjectStore::background_from_config(S3ObjectStoreConfig {
+        bucket: "datalens".to_owned(),
+        prefix: Some("dev/cache".to_owned()),
+        region: "auto".to_owned(),
+        endpoint_url: Some("http://localhost:9000".to_owned()),
+        force_path_style: true,
+        runtime_worker_threads: 4,
+        max_concurrent_operations: 16,
+        background_runtime_worker_threads: 4,
+        background_max_concurrent_operations: 0,
+    })
+    .expect_err("zero background max concurrency rejected");
+    assert!(error.message.contains("max_concurrent_operations"));
 }
 
 #[tokio::test]
@@ -541,6 +594,8 @@ async fn test_s3_object_store_builds_inside_existing_tokio_runtime() {
         force_path_style: true,
         runtime_worker_threads: 4,
         max_concurrent_operations: 16,
+        background_runtime_worker_threads: 4,
+        background_max_concurrent_operations: 16,
     })
     .expect("build S3 object store");
 
@@ -988,5 +1043,7 @@ fn s3_test_config() -> Option<S3ObjectStoreConfig> {
             .unwrap_or(true),
         runtime_worker_threads: 4,
         max_concurrent_operations: 16,
+        background_runtime_worker_threads: 4,
+        background_max_concurrent_operations: 16,
     })
 }
