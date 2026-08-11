@@ -4937,6 +4937,37 @@ fn test_coverage_index_v2_empty_deltas_coalesce_adjacent_ranges() {
 }
 
 #[test]
+fn test_empty_coverage_write_coalesces_adjacent_manifest_segments() {
+    let storage = LocalStorage::new(temp_storage_root("empty-coverage-segment-coalesce"));
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let rows = DatasetRows::new(DatasetKey::evm_blocks(), QueryRows::EvmBlocks(Vec::new()))
+        .expect("dataset rows");
+
+    for block in [10, 11] {
+        storage
+            .write_rows(StorageWriteRequest {
+                chain: &chain,
+                dataset_key: DatasetKey::evm_blocks(),
+                selector: &selector,
+                range: LedgerRange::blocks(block, block).expect("valid range"),
+                rows: &rows,
+                finality_level: FinalityLevel::Safe,
+                record_empty_coverage: true,
+            })
+            .expect("write empty coverage");
+    }
+
+    let manifest = storage.manifest().expect("manifest");
+    assert_eq!(manifest.entries.len(), 1);
+    assert_eq!(
+        manifest.entries[0].range,
+        LedgerRange::blocks(10, 11).expect("valid range")
+    );
+    assert_eq!(manifest_segment_keys(&storage, &chain).len(), 1);
+}
+
+#[test]
 fn test_coverage_index_v2_partial_exact_coverage_falls_back_to_semantic_logs() {
     let storage = LocalStorage::new(temp_storage_root("coverage-index-v2-exact-semantic-gap"));
     let chain = test_chain();
@@ -6891,7 +6922,7 @@ fn test_cloned_storage_serializes_concurrent_manifest_updates() {
 
     let manifest = storage.manifest().expect("manifest");
     assert_eq!(manifest.entries.len(), 1);
-    assert_eq!(manifest_segment_keys(&storage, &chain).len(), 2);
+    assert_eq!(manifest_segment_keys(&storage, &chain).len(), 1);
     assert!(manifest.entries.iter().any(|entry| {
         entry.range == LedgerRange::blocks(10, 11).expect("valid range")
             && entry.object_key.is_none()
@@ -7283,10 +7314,7 @@ fn test_cold_narrow_coverage_lookup_does_not_scan_all_empty_manifest_segments() 
             })
             .expect("write empty coverage");
     }
-    assert_eq!(
-        manifest_segment_keys(&writer, &chain).len(),
-        segment_count as usize
-    );
+    assert_eq!(manifest_segment_keys(&writer, &chain).len(), 1);
 
     let store = ManifestAccessCountingStore::new(root);
     let storage = DurableStorage::from_object_store(store.clone());

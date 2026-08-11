@@ -207,6 +207,14 @@ fn replacement_scope_matches(existing: &ManifestEntry, replacement: &ManifestEnt
         && existing.range.kind() == replacement.range.kind()
 }
 
+fn can_merge_empty_coverage(left: &ManifestEntry, right: &ManifestEntry) -> bool {
+    left.object_key.is_none()
+        && right.object_key.is_none()
+        && replacement_scope_matches(left, right)
+        && left.range.end().saturating_add(1) >= right.range.start()
+        && right.range.end().saturating_add(1) >= left.range.start()
+}
+
 fn split_entry_around_range(
     entry: ManifestEntry,
     replacement_range: &LedgerRange,
@@ -1347,7 +1355,49 @@ where
                 format!("manifest entry object not found {object_key}"),
             ));
         }
+        if entry.object_key.is_none()
+            && let Some(coalesced_entry) = self.coalesced_empty_coverage_entry(&entry)?
+        {
+            return self.publish_replacement_entry_unlocked(chain, coalesced_entry, started);
+        }
         self.publish_manifest_segment_unlocked(chain, entry, started)
+    }
+
+    fn coalesced_empty_coverage_entry(
+        &self,
+        entry: &ManifestEntry,
+    ) -> Result<Option<ManifestEntry>, DatalensError> {
+        let probe_start = entry.range.start().saturating_sub(1);
+        let probe_end = entry.range.end().saturating_add(1);
+        let mut probe = entry.clone();
+        probe.range = LedgerRange::try_new(entry.range.kind(), probe_start, probe_end)?;
+        let mut coalesced = entry.clone();
+        let mut found_neighbor = false;
+        for existing in
+            coverage_index::read_entries_for_replacement_scope(&self.object_store, &probe)?
+        {
+            if can_merge_empty_coverage(&coalesced, &existing) {
+                coalesced.range = LedgerRange::try_new(
+                    coalesced.range.kind(),
+                    coalesced.range.start().min(existing.range.start()),
+                    coalesced.range.end().max(existing.range.end()),
+                )?;
+                found_neighbor = true;
+            }
+        }
+        if !found_neighbor {
+            return Ok(None);
+        }
+        let current_entries =
+            coverage_index::read_entries_for_replacement_scope(&self.object_store, &coalesced)?;
+        if current_entries.iter().any(|existing| {
+            replacement_scope_matches(existing, &coalesced)
+                && existing.range.intersection(&coalesced.range).is_some()
+                && existing.object_key.is_some()
+        }) {
+            return Ok(None);
+        }
+        Ok(Some(coalesced))
     }
 
     pub(crate) fn try_write_compaction_manifest_entry(
