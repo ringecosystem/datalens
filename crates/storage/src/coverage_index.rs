@@ -28,12 +28,14 @@ const MAX_EVM_LOG_TOPIC_VALUE_SEMANTIC_KEYS: usize = 8;
 const EVM_LOG_LARGE_TOPIC_VALUE_SCOPE: &str = "_large-any-of";
 const MAX_COVERAGE_INDEX_V2_BUCKET_READ_THREADS: usize = 8;
 const MAX_COVERAGE_INDEX_V2_DELTA_GET_THREADS: usize = 8;
+const MAX_EXACT_EVM_LOGS_V2_DELTA_OBJECTS: usize = 128;
 const MAX_SEMANTIC_FALLBACK_V2_DELTA_OBJECTS: usize = 128;
 const COVERAGE_INDEX_V2_BUCKET_READ_CACHE_TTL: Duration = Duration::from_secs(300);
 const MAX_COVERAGE_INDEX_V2_BUCKET_READ_CACHE_ENTRIES: usize = 512;
 const COVERAGE_INDEX_V2_RECENT_DELTA_TTL: Duration = Duration::from_secs(600);
 const MAX_COVERAGE_INDEX_V2_RECENT_BUCKETS: usize = 2_048;
 const MAX_COVERAGE_INDEX_V2_RECENT_ENTRIES_PER_BUCKET: usize = 256;
+const COVERAGE_INDEX_V2_OVER_BUDGET_QUEUE_THROTTLE_TTL: Duration = Duration::from_secs(60);
 
 static COVERAGE_INDEX_UPDATE_LOCKS: OnceLock<Mutex<BTreeMap<String, Weak<Mutex<()>>>>> =
     OnceLock::new();
@@ -44,6 +46,8 @@ static COVERAGE_INDEX_V2_BUCKET_READ_CACHE: OnceLock<
 static COVERAGE_INDEX_V2_RECENT_BUCKET_ENTRIES: OnceLock<
     Mutex<BTreeMap<String, Vec<CoverageIndexV2RecentBucketEntry>>>,
 > = OnceLock::new();
+static COVERAGE_INDEX_V2_OVER_BUDGET_QUEUE_ATTEMPTS: OnceLock<Mutex<BTreeMap<String, Instant>>> =
+    OnceLock::new();
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -243,8 +247,19 @@ where
         std::slice::from_ref(range),
     );
     let exact_has_index = read_entries_for_keys(object_store, exact_keys, &mut exact_entries)?;
-    let exact_has_v2_index =
-        read_entries_for_v2_buckets(object_store, exact_v2_buckets, &mut exact_entries)?;
+    let exact_has_v2_index = if *dataset_key == DatasetKey::evm_logs()
+        && matches!(selector, DatasetSelector::EvmLogs(_))
+    {
+        read_entries_for_v2_buckets_bounded(
+            object_store,
+            exact_v2_buckets,
+            &mut exact_entries,
+            Some(MAX_EXACT_EVM_LOGS_V2_DELTA_OBJECTS),
+            CoverageIndexV2BudgetMode::ConservativeMiss,
+        )?
+    } else {
+        read_entries_for_v2_buckets(object_store, exact_v2_buckets, &mut exact_entries)?
+    };
     let exact_entries =
         normalized_query_entries(exact_entries, chain, dataset_key, selector, range);
     let exact_covered =
@@ -278,6 +293,7 @@ where
             semantic_v2_buckets,
             &mut entries,
             Some(MAX_SEMANTIC_FALLBACK_V2_DELTA_OBJECTS),
+            CoverageIndexV2BudgetMode::AppendAvailableEntries,
         )?;
         let normalized =
             normalized_query_entries(entries.clone(), chain, dataset_key, selector, range);
@@ -383,7 +399,19 @@ fn read_entries_for_v2_buckets<S>(
 where
     S: ObjectStore,
 {
-    read_entries_for_v2_buckets_bounded(object_store, buckets, entries, None)
+    read_entries_for_v2_buckets_bounded(
+        object_store,
+        buckets,
+        entries,
+        None,
+        CoverageIndexV2BudgetMode::AppendAvailableEntries,
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CoverageIndexV2BudgetMode {
+    AppendAvailableEntries,
+    ConservativeMiss,
 }
 
 fn read_entries_for_v2_buckets_bounded<S>(
@@ -391,6 +419,7 @@ fn read_entries_for_v2_buckets_bounded<S>(
     buckets: BTreeSet<CoverageIndexV2Bucket>,
     entries: &mut Vec<ManifestEntry>,
     max_delta_objects: Option<usize>,
+    budget_mode: CoverageIndexV2BudgetMode,
 ) -> Result<bool, DatalensError>
 where
     S: ObjectStore,
@@ -411,6 +440,7 @@ where
                             &bucket,
                             &mut bucket_entries,
                             max_delta_objects,
+                            budget_mode,
                         )?;
                         Ok::<_, DatalensError>((has_index, bucket_entries))
                     })
@@ -441,6 +471,7 @@ fn read_entries_for_v2_bucket<S>(
     bucket: &CoverageIndexV2Bucket,
     entries: &mut Vec<ManifestEntry>,
     max_delta_objects: Option<usize>,
+    budget_mode: CoverageIndexV2BudgetMode,
 ) -> Result<bool, DatalensError>
 where
     S: ObjectStore,
@@ -482,12 +513,12 @@ where
             object_store,
             bucket,
             &compacted_delta_keys,
-            max_delta_objects,
+            max_delta_objects.and_then(|max| max.checked_add(1)),
             start_after_delta_key,
         )?
     };
     let skip_pending_deltas = if let Some(max_delta_objects) = max_delta_objects {
-        delta_objects.len() >= max_delta_objects
+        delta_objects.len() > max_delta_objects
     } else {
         false
     };
@@ -511,6 +542,20 @@ where
     };
 
     if skip_pending_deltas {
+        enqueue_v2_compaction_for_over_budget_bucket(object_store, bucket);
+        if budget_mode == CoverageIndexV2BudgetMode::ConservativeMiss {
+            log::warn!(
+                "storage coverage exact lookup skipped pending deltas conservatively chain_key={} scope={} bucket={}-{} listed_delta_objects={} max_delta_objects={} snapshot_entries={}",
+                bucket.chain_key,
+                bucket.scope,
+                bucket.bucket_start,
+                bucket.bucket_end,
+                delta_objects.len(),
+                max_delta_objects.unwrap_or_default(),
+                bucket_entries.len()
+            );
+            return Ok(false);
+        }
         log::warn!(
             "storage coverage semantic fallback skipped pending deltas chain_key={} scope={} bucket={}-{} listed_delta_objects={} max_delta_objects={} snapshot_entries={}",
             bucket.chain_key,
@@ -545,6 +590,45 @@ where
     );
     entries.append(&mut bucket_entries);
     Ok(any_bucket_has_index)
+}
+
+fn enqueue_v2_compaction_for_over_budget_bucket<S>(object_store: &S, bucket: &CoverageIndexV2Bucket)
+where
+    S: ObjectStore,
+{
+    let throttle_key = coverage_index_v2_bucket_recent_key(object_store, bucket);
+    if !reserve_over_budget_queue_attempt(throttle_key) {
+        return;
+    }
+    if let Err(error) = write_v2_compaction_queue_record(object_store, bucket) {
+        log::warn!(
+            "coverage index v2 compaction queue write failed after over-budget read bucket_scope={} bucket_start={} bucket_end={} kind={:?} message={}",
+            bucket.scope,
+            bucket.bucket_start,
+            bucket.bucket_end,
+            error.kind,
+            error.message
+        );
+    }
+}
+
+fn reserve_over_budget_queue_attempt(key: String) -> bool {
+    let Ok(mut attempts) = coverage_index_v2_over_budget_queue_attempts().lock() else {
+        return true;
+    };
+    let now = Instant::now();
+    attempts.retain(|_, attempted_at| {
+        now.duration_since(*attempted_at) <= COVERAGE_INDEX_V2_OVER_BUDGET_QUEUE_THROTTLE_TTL
+    });
+    if attempts.contains_key(&key) {
+        return false;
+    }
+    attempts.insert(key, now);
+    true
+}
+
+fn coverage_index_v2_over_budget_queue_attempts() -> &'static Mutex<BTreeMap<String, Instant>> {
+    COVERAGE_INDEX_V2_OVER_BUDGET_QUEUE_ATTEMPTS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
 pub(crate) fn prepare_v2_bucket_compaction<S>(
@@ -3551,8 +3635,14 @@ mod tests {
         );
         let mut entries = Vec::new();
 
-        let has_index = read_entries_for_v2_bucket(&object_store, &bucket, &mut entries, None)
-            .expect("read v2 bucket");
+        let has_index = read_entries_for_v2_bucket(
+            &object_store,
+            &bucket,
+            &mut entries,
+            None,
+            CoverageIndexV2BudgetMode::AppendAvailableEntries,
+        )
+        .expect("read v2 bucket");
 
         assert!(has_index);
         assert!(
@@ -3610,16 +3700,26 @@ mod tests {
         );
 
         let mut first_read_entries = Vec::new();
-        let first_has_index =
-            read_entries_for_v2_bucket(&object_store, &bucket, &mut first_read_entries, None)
-                .expect("read v2 bucket first time");
+        let first_has_index = read_entries_for_v2_bucket(
+            &object_store,
+            &bucket,
+            &mut first_read_entries,
+            None,
+            CoverageIndexV2BudgetMode::AppendAvailableEntries,
+        )
+        .expect("read v2 bucket first time");
         let delta_gets_after_first_read = object_store.delta_gets();
         let list_pages_after_first_read = object_store.list_pages();
         let delta_list_pages_after_first_read = object_store.delta_list_pages();
         let mut second_read_entries = Vec::new();
-        let second_has_index =
-            read_entries_for_v2_bucket(&object_store, &bucket, &mut second_read_entries, None)
-                .expect("read v2 bucket second time");
+        let second_has_index = read_entries_for_v2_bucket(
+            &object_store,
+            &bucket,
+            &mut second_read_entries,
+            None,
+            CoverageIndexV2BudgetMode::AppendAvailableEntries,
+        )
+        .expect("read v2 bucket second time");
 
         assert!(first_has_index);
         assert!(second_has_index);
@@ -3645,9 +3745,14 @@ mod tests {
         );
         let delta_list_pages_after_append = object_store.delta_list_pages();
         let mut third_read_entries = Vec::new();
-        let third_has_index =
-            read_entries_for_v2_bucket(&object_store, &bucket, &mut third_read_entries, None)
-                .expect("read v2 bucket after appended delta");
+        let third_has_index = read_entries_for_v2_bucket(
+            &object_store,
+            &bucket,
+            &mut third_read_entries,
+            None,
+            CoverageIndexV2BudgetMode::AppendAvailableEntries,
+        )
+        .expect("read v2 bucket after appended delta");
 
         assert!(third_has_index);
         assert_eq!(object_store.delta_gets(), delta_gets_after_first_read);
@@ -3717,8 +3822,14 @@ mod tests {
         let delta_list_pages_before = object_store.delta_list_pages();
         let mut entries = Vec::new();
 
-        let has_index = read_entries_for_v2_bucket(&object_store, &bucket, &mut entries, None)
-            .expect("read exact evm logs bucket");
+        let has_index = read_entries_for_v2_bucket(
+            &object_store,
+            &bucket,
+            &mut entries,
+            None,
+            CoverageIndexV2BudgetMode::AppendAvailableEntries,
+        )
+        .expect("read exact evm logs bucket");
 
         assert!(has_index);
         assert_eq!(entries.len(), 1);
@@ -3726,6 +3837,100 @@ mod tests {
             object_store.delta_list_pages(),
             delta_list_pages_before,
             "compacted exact evm.logs buckets should use the snapshot without listing the delta tail"
+        );
+    }
+
+    #[test]
+    fn test_exact_evm_logs_v2_lookup_skips_over_delta_budget_conservatively() {
+        let object_store =
+            DelayedV2DeltaGetObjectStore::new(temp_storage_root("exact-v2-budget-conservative"));
+        let chain = test_chain();
+        let selector = evm_logs_selector(vec![]);
+        let range = LedgerRange::blocks(10, 10).expect("valid range");
+        let scope = coverage_index_v2_exact_scope(
+            &DatasetKey::evm_logs(),
+            &range,
+            &selector.fingerprint(),
+            ManifestFinalityLevel::Safe,
+        );
+        let bucket = CoverageIndexV2Bucket {
+            chain_key: chain.key_prefix(),
+            scope: scope.clone(),
+            bucket_start: 0,
+            bucket_end: DEFAULT_COVERAGE_INDEX_BUCKET_SIZE - 1,
+        };
+        for index in 0..=MAX_EXACT_EVM_LOGS_V2_DELTA_OBJECTS {
+            let entry = evm_logs_entry(&chain, &selector, 10, 10, index);
+            write_test_v2_delta(
+                &object_store,
+                &chain,
+                &scope,
+                &range,
+                &format!("{index:04}"),
+                vec![entry],
+                None,
+            );
+        }
+
+        let entries = read_entries_for_query(
+            &object_store,
+            &chain,
+            &DatasetKey::evm_logs(),
+            &selector,
+            &range,
+        )
+        .expect("read coverage with bounded exact lookup");
+
+        assert_eq!(entries, None);
+        assert_eq!(object_store.delta_gets(), 0);
+        assert!(object_store.delta_list_pages() > 0);
+        assert!(
+            object_store
+                .exists(&coverage_index_v2_compaction_queue_key(&bucket))
+                .expect("check compaction queue")
+        );
+    }
+
+    #[test]
+    fn test_exact_evm_logs_v2_lookup_reads_at_delta_budget_boundary() {
+        let object_store =
+            DelayedV2DeltaGetObjectStore::new(temp_storage_root("exact-v2-budget-boundary"));
+        let chain = test_chain();
+        let selector = evm_logs_selector(vec![]);
+        let range = LedgerRange::blocks(10, 10).expect("valid range");
+        let scope = coverage_index_v2_exact_scope(
+            &DatasetKey::evm_logs(),
+            &range,
+            &selector.fingerprint(),
+            ManifestFinalityLevel::Safe,
+        );
+        for index in 0..MAX_EXACT_EVM_LOGS_V2_DELTA_OBJECTS {
+            let entry = evm_logs_entry(&chain, &selector, 10, 10, index);
+            write_test_v2_delta(
+                &object_store,
+                &chain,
+                &scope,
+                &range,
+                &format!("{index:04}"),
+                vec![entry],
+                None,
+            );
+        }
+
+        let entries = read_entries_for_query(
+            &object_store,
+            &chain,
+            &DatasetKey::evm_logs(),
+            &selector,
+            &range,
+        )
+        .expect("read coverage at exact budget boundary")
+        .expect("coverage from exact index");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            object_store.delta_gets(),
+            MAX_EXACT_EVM_LOGS_V2_DELTA_OBJECTS
         );
     }
 
@@ -3744,7 +3949,7 @@ mod tests {
             ManifestFinalityLevel::Safe,
             "addr/*",
         );
-        for index in 0..MAX_SEMANTIC_FALLBACK_V2_DELTA_OBJECTS {
+        for index in 0..=MAX_SEMANTIC_FALLBACK_V2_DELTA_OBJECTS {
             let entry = evm_logs_entry(&chain, &broad_selector, 10, 10, index);
             write_test_v2_delta(
                 &object_store,
@@ -3787,7 +3992,7 @@ mod tests {
             ManifestFinalityLevel::Safe,
             "addr/*",
         );
-        for index in 0..MAX_SEMANTIC_FALLBACK_V2_DELTA_OBJECTS {
+        for index in 0..=MAX_SEMANTIC_FALLBACK_V2_DELTA_OBJECTS {
             let entry = evm_logs_entry(&chain, &broad_selector, 10, 10, index);
             write_test_v2_delta(
                 &object_store,
@@ -3875,7 +4080,7 @@ mod tests {
             bucket_end: DEFAULT_COVERAGE_INDEX_BUCKET_SIZE - 1,
         };
         mark_cached_v2_bucket_entries_dirty(&object_store, &bucket);
-        for index in 0..MAX_SEMANTIC_FALLBACK_V2_DELTA_OBJECTS {
+        for index in 0..=MAX_SEMANTIC_FALLBACK_V2_DELTA_OBJECTS {
             let entry = evm_logs_entry(&chain, &broad_selector, 10, 10, index + 2);
             write_test_v2_delta(
                 &object_store,

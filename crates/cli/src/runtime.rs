@@ -195,7 +195,7 @@ pub(crate) fn start_storage_compaction_worker(
                 )
             })?;
             CompactionStorage::S3(DurableStorage::from_object_store_with_config(
-                S3ObjectStore::from_config(s3)?,
+                S3ObjectStore::background_from_config(s3)?,
                 (&config.storage).into(),
             ))
         }

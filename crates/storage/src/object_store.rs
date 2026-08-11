@@ -765,6 +765,10 @@ pub struct S3ObjectStoreConfig {
     pub runtime_worker_threads: usize,
     #[serde(default = "default_s3_max_concurrent_operations")]
     pub max_concurrent_operations: usize,
+    #[serde(default = "default_s3_background_runtime_worker_threads")]
+    pub background_runtime_worker_threads: usize,
+    #[serde(default = "default_s3_background_max_concurrent_operations")]
+    pub background_max_concurrent_operations: usize,
 }
 
 fn default_s3_region() -> String {
@@ -779,19 +783,45 @@ const fn default_s3_max_concurrent_operations() -> usize {
     DEFAULT_S3_MAX_CONCURRENT_OPERATIONS
 }
 
+const fn default_s3_background_runtime_worker_threads() -> usize {
+    DEFAULT_S3_BACKGROUND_RUNTIME_WORKER_THREADS
+}
+
+const fn default_s3_background_max_concurrent_operations() -> usize {
+    DEFAULT_S3_BACKGROUND_MAX_CONCURRENT_OPERATIONS
+}
+
 #[derive(Clone)]
 pub struct S3ObjectStore {
     client: Client,
     bucket: String,
     prefix: Option<String>,
     runtime: S3Runtime,
+    operation_class: S3OperationClass,
 }
 
 const DEFAULT_S3_RUNTIME_WORKER_THREADS: usize = 4;
 const DEFAULT_S3_MAX_CONCURRENT_OPERATIONS: usize = 16;
+const DEFAULT_S3_BACKGROUND_RUNTIME_WORKER_THREADS: usize = 4;
+const DEFAULT_S3_BACKGROUND_MAX_CONCURRENT_OPERATIONS: usize = 16;
 const DEFAULT_S3_GET_MAX_ATTEMPTS: usize = 3;
 const DEFAULT_S3_GET_RETRY_BACKOFF_MS: u64 = 100;
 const S3_SLOW_OPERATION_LOG_THRESHOLD_MS: u128 = 1_000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum S3OperationClass {
+    Foreground,
+    Background,
+}
+
+impl S3OperationClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Foreground => "foreground",
+            Self::Background => "background",
+        }
+    }
+}
 
 #[derive(Clone)]
 struct S3Runtime {
@@ -811,9 +841,21 @@ impl std::fmt::Debug for S3Runtime {
 
 impl S3Runtime {
     fn new(worker_threads: usize, max_concurrent_operations: usize) -> Result<Self, DatalensError> {
+        if worker_threads == 0 {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                "S3 runtime worker_threads must be greater than zero",
+            ));
+        }
+        if max_concurrent_operations == 0 {
+            return Err(DatalensError::new(
+                DatalensErrorKind::InvalidInput,
+                "S3 runtime max_concurrent_operations must be greater than zero",
+            ));
+        }
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
-            .worker_threads(worker_threads.max(1))
+            .worker_threads(worker_threads)
             .thread_name("datalens-s3-runtime")
             .build()
             .map_err(|error| {
@@ -825,13 +867,14 @@ impl S3Runtime {
         Ok(Self {
             inner: Arc::new(S3RuntimeInner {
                 runtime: Mutex::new(Some(runtime)),
-                semaphore: Arc::new(Semaphore::new(max_concurrent_operations.max(1))),
+                semaphore: Arc::new(Semaphore::new(max_concurrent_operations)),
             }),
         })
     }
 
     fn block_on_operation<F, T>(
         &self,
+        operation_class: S3OperationClass,
         operation: &'static str,
         key: String,
         future: F,
@@ -875,7 +918,8 @@ impl S3Runtime {
                         || run_ms >= S3_SLOW_OPERATION_LOG_THRESHOLD_MS =>
                 {
                     log::info!(
-                        "s3 operation completed operation={} key={} queue_ms={} run_ms={}",
+                        "s3 operation completed class={} operation={} key={} queue_ms={} run_ms={}",
+                        operation_class.as_str(),
                         operation,
                         key,
                         queue_ms,
@@ -884,7 +928,8 @@ impl S3Runtime {
                 }
                 Ok(_) => {
                     log::debug!(
-                        "s3 operation completed operation={} key={} queue_ms={} run_ms={}",
+                        "s3 operation completed class={} operation={} key={} queue_ms={} run_ms={}",
+                        operation_class.as_str(),
                         operation,
                         key,
                         queue_ms,
@@ -892,7 +937,8 @@ impl S3Runtime {
                     )
                 }
                 Err(error) => log::warn!(
-                    "s3 operation failed operation={} key={} kind={:?} queue_ms={} run_ms={}",
+                    "s3 operation failed class={} operation={} key={} kind={:?} queue_ms={} run_ms={}",
+                    operation_class.as_str(),
                     operation,
                     key,
                     error.kind,
@@ -931,12 +977,24 @@ impl std::fmt::Debug for S3ObjectStore {
         f.debug_struct("S3ObjectStore")
             .field("bucket", &self.bucket)
             .field("prefix", &self.prefix)
+            .field("operation_class", &self.operation_class.as_str())
             .finish_non_exhaustive()
     }
 }
 
 impl S3ObjectStore {
     pub fn from_config(config: S3ObjectStoreConfig) -> Result<Self, DatalensError> {
+        Self::from_config_with_operation_class(config, S3OperationClass::Foreground)
+    }
+
+    pub fn background_from_config(config: S3ObjectStoreConfig) -> Result<Self, DatalensError> {
+        Self::from_config_with_operation_class(config, S3OperationClass::Background)
+    }
+
+    fn from_config_with_operation_class(
+        config: S3ObjectStoreConfig,
+        operation_class: S3OperationClass,
+    ) -> Result<Self, DatalensError> {
         if config.bucket.trim().is_empty() {
             return Err(DatalensError::new(
                 DatalensErrorKind::InvalidInput,
@@ -944,10 +1002,17 @@ impl S3ObjectStore {
             ));
         }
         let prefix = normalize_prefix(config.prefix.as_deref())?;
-        let runtime = S3Runtime::new(
-            config.runtime_worker_threads,
-            config.max_concurrent_operations,
-        )?;
+        let (worker_threads, max_concurrent_operations) = match operation_class {
+            S3OperationClass::Foreground => (
+                config.runtime_worker_threads,
+                config.max_concurrent_operations,
+            ),
+            S3OperationClass::Background => (
+                config.background_runtime_worker_threads,
+                config.background_max_concurrent_operations,
+            ),
+        };
+        let runtime = S3Runtime::new(worker_threads, max_concurrent_operations)?;
         let region = if config.region.trim().is_empty() {
             "auto".to_owned()
         } else {
@@ -955,8 +1020,11 @@ impl S3ObjectStore {
         };
         let endpoint_url = config.endpoint_url;
         let force_path_style = config.force_path_style;
-        let client =
-            runtime.block_on_operation("config_load", config.bucket.clone(), async move {
+        let client = runtime.block_on_operation(
+            operation_class,
+            "config_load",
+            config.bucket.clone(),
+            async move {
                 let mut loader =
                     aws_config::defaults(BehaviorVersion::latest()).region(Region::new(region));
                 if let Some(endpoint_url) = endpoint_url.as_ref() {
@@ -973,12 +1041,14 @@ impl S3ObjectStore {
                     .force_path_style(force_path_style)
                     .build();
                 Ok(Client::from_conf(conf))
-            })?;
+            },
+        )?;
         Ok(Self {
             client,
             bucket: config.bucket,
             prefix,
             runtime,
+            operation_class,
         })
     }
 
@@ -997,6 +1067,10 @@ impl S3ObjectStore {
             None => key.to_owned(),
         })
     }
+
+    fn runtime(&self) -> &S3Runtime {
+        &self.runtime
+    }
 }
 
 impl ObjectStore for S3ObjectStore {
@@ -1005,7 +1079,7 @@ impl ObjectStore for S3ObjectStore {
         let log_key = key.clone();
         let client = self.client.clone();
         let bucket = self.bucket.clone();
-        self.runtime.block_on_operation("get", log_key, async move {
+        self.runtime().block_on_operation(self.operation_class, "get", log_key, async move {
             for attempt in 1..=DEFAULT_S3_GET_MAX_ATTEMPTS {
                 let object = match client.get_object().bucket(&bucket).key(&key).send().await {
                     Ok(object) => object,
@@ -1066,8 +1140,8 @@ impl ObjectStore for S3ObjectStore {
         let log_key = key.clone();
         let client = self.client.clone();
         let bucket = self.bucket.clone();
-        self.runtime
-            .block_on_operation("get_optional", log_key, async move {
+        self.runtime()
+            .block_on_operation(self.operation_class, "get_optional", log_key, async move {
                 for attempt in 1..=DEFAULT_S3_GET_MAX_ATTEMPTS {
                     let object = match client.get_object().bucket(&bucket).key(&key).send().await {
                         Ok(object) => object,
@@ -1126,22 +1200,23 @@ impl ObjectStore for S3ObjectStore {
         let bytes = bytes.to_vec();
         let client = self.client.clone();
         let bucket = self.bucket.clone();
-        self.runtime.block_on_operation("put", log_key, async move {
-            client
-                .put_object()
-                .bucket(&bucket)
-                .key(&key)
-                .body(ByteStream::from(bytes))
-                .send()
-                .await
-                .map_err(|error| {
-                    DatalensError::new(
-                        DatalensErrorKind::StorageWriteFailure,
-                        format!("S3 put object {key}: {error}"),
-                    )
-                })?;
-            Ok(())
-        })
+        self.runtime()
+            .block_on_operation(self.operation_class, "put", log_key, async move {
+                client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .body(ByteStream::from(bytes))
+                    .send()
+                    .await
+                    .map_err(|error| {
+                        DatalensError::new(
+                            DatalensErrorKind::StorageWriteFailure,
+                            format!("S3 put object {key}: {error}"),
+                        )
+                    })?;
+                Ok(())
+            })
     }
 
     fn put_if_absent(
@@ -1154,8 +1229,11 @@ impl ObjectStore for S3ObjectStore {
         let bytes = bytes.to_vec();
         let client = self.client.clone();
         let bucket = self.bucket.clone();
-        self.runtime
-            .block_on_operation("put_if_absent", log_key, async move {
+        self.runtime().block_on_operation(
+            self.operation_class,
+            "put_if_absent",
+            log_key,
+            async move {
                 match client
                     .put_object()
                     .bucket(&bucket)
@@ -1174,7 +1252,8 @@ impl ObjectStore for S3ObjectStore {
                         format!("S3 put object if absent {key}: {error}"),
                     )),
                 }
-            })
+            },
+        )
     }
 
     fn exists(&self, key: &str) -> Result<bool, DatalensError> {
@@ -1182,8 +1261,8 @@ impl ObjectStore for S3ObjectStore {
         let log_key = key.clone();
         let client = self.client.clone();
         let bucket = self.bucket.clone();
-        self.runtime
-            .block_on_operation("exists", log_key, async move {
+        self.runtime()
+            .block_on_operation(self.operation_class, "exists", log_key, async move {
                 match client.head_object().bucket(&bucket).key(&key).send().await {
                     Ok(_) => Ok(true),
                     Err(error) if service_error_code(&error).is_some_and(is_not_found_code) => {
@@ -1203,8 +1282,8 @@ impl ObjectStore for S3ObjectStore {
         let strip_prefix = self.prefix.clone().map(|prefix| format!("{prefix}/"));
         let client = self.client.clone();
         let bucket = self.bucket.clone();
-        self.runtime
-            .block_on_operation("list", log_key, async move {
+        self.runtime()
+            .block_on_operation(self.operation_class, "list", log_key, async move {
                 let mut continuation = None;
                 let mut objects = Vec::new();
                 loop {
@@ -1263,8 +1342,8 @@ impl ObjectStore for S3ObjectStore {
         let strip_prefix = self.prefix.clone().map(|prefix| format!("{prefix}/"));
         let client = self.client.clone();
         let bucket = self.bucket.clone();
-        self.runtime
-            .block_on_operation("list_page", log_key, async move {
+        self.runtime()
+            .block_on_operation(self.operation_class, "list_page", log_key, async move {
                 let response = client
                     .list_objects_v2()
                     .bucket(&bucket)
@@ -1305,8 +1384,8 @@ impl ObjectStore for S3ObjectStore {
         let log_key = key.clone();
         let client = self.client.clone();
         let bucket = self.bucket.clone();
-        self.runtime
-            .block_on_operation("delete", log_key, async move {
+        self.runtime()
+            .block_on_operation(self.operation_class, "delete", log_key, async move {
                 client
                     .delete_object()
                     .bucket(&bucket)
@@ -1334,30 +1413,31 @@ impl ObjectStore for S3ObjectStore {
         let lease_owner = owner.clone();
         let client = self.client.clone();
         let bucket = self.bucket.clone();
-        let acquired =
-            self.runtime
-                .block_on_operation("try_acquire_lock", log_key, async move {
-                    match client
-                        .put_object()
-                        .bucket(&bucket)
-                        .key(&object_key)
-                        .if_none_match("*")
-                        .body(ByteStream::from(owner))
-                        .send()
-                        .await
-                    {
-                        Ok(_) => Ok(true),
-                        Err(error)
-                            if service_error_code(&error).is_some_and(is_precondition_code) =>
-                        {
-                            Ok(false)
-                        }
-                        Err(error) => Err(DatalensError::new(
-                            DatalensErrorKind::StorageWriteFailure,
-                            format!("S3 acquire lock {object_key}: {error}"),
-                        )),
+        let acquired = self.runtime().block_on_operation(
+            self.operation_class,
+            "try_acquire_lock",
+            log_key,
+            async move {
+                match client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(&object_key)
+                    .if_none_match("*")
+                    .body(ByteStream::from(owner))
+                    .send()
+                    .await
+                {
+                    Ok(_) => Ok(true),
+                    Err(error) if service_error_code(&error).is_some_and(is_precondition_code) => {
+                        Ok(false)
                     }
-                })?;
+                    Err(error) => Err(DatalensError::new(
+                        DatalensErrorKind::StorageWriteFailure,
+                        format!("S3 acquire lock {object_key}: {error}"),
+                    )),
+                }
+            },
+        )?;
         Ok(acquired.then_some(ObjectLockLease {
             key: key.to_owned(),
             owner: lease_owner,
@@ -1370,8 +1450,11 @@ impl ObjectStore for S3ObjectStore {
         let lease_owner = lease.owner;
         let client = self.client.clone();
         let bucket = self.bucket.clone();
-        self.runtime
-            .block_on_operation("release_lock", log_key, async move {
+        self.runtime().block_on_operation(
+            self.operation_class,
+            "release_lock",
+            log_key,
+            async move {
                 let object = match client
                     .get_object()
                     .bucket(&bucket)
@@ -1420,7 +1503,8 @@ impl ObjectStore for S3ObjectStore {
                         format!("S3 release lock {object_key}: {error}"),
                     )),
                 }
-            })
+            },
+        )
     }
 
     fn renew_lock(
@@ -1435,9 +1519,11 @@ impl ObjectStore for S3ObjectStore {
         let s3_renewed_owner = renewed_owner.clone();
         let client = self.client.clone();
         let bucket = self.bucket.clone();
-        let renewed = self
-            .runtime
-            .block_on_operation("renew_lock", log_key, async move {
+        let renewed = self.runtime().block_on_operation(
+            self.operation_class,
+            "renew_lock",
+            log_key,
+            async move {
                 let object = match client
                     .get_object()
                     .bucket(&bucket)
@@ -1489,7 +1575,8 @@ impl ObjectStore for S3ObjectStore {
                         format!("S3 renew lock {object_key}: {error}"),
                     )),
                 }
-            })?;
+            },
+        )?;
         if renewed {
             lease.owner = renewed_owner;
         }
@@ -1512,64 +1599,65 @@ impl ObjectStore for S3ObjectStore {
         let log_key = object_key.clone();
         let client = self.client.clone();
         let bucket = self.bucket.clone();
-        let deleted =
-            self.runtime
-                .block_on_operation("takeover_expired_lock", log_key, async move {
-                    let object = match client
-                        .get_object()
-                        .bucket(&bucket)
-                        .key(&object_key)
-                        .send()
-                        .await
-                    {
-                        Ok(object) => object,
-                        Err(error) if service_error_code(&error).is_some_and(is_not_found_code) => {
-                            return Ok(true);
-                        }
-                        Err(error) => {
-                            return Err(DatalensError::new(
-                                DatalensErrorKind::StorageReadFailure,
-                                format!("S3 get lock {object_key}: {error}"),
-                            ));
-                        }
-                    };
-                    let etag = object
-                        .e_tag()
-                        .map(ToOwned::to_owned)
-                        .ok_or_else(|| unsupported_lock_cas("take over expired", &object_key))?;
-                    let current = object.body.collect().await.map_err(|error| {
-                        DatalensError::new(
+        let deleted = self.runtime().block_on_operation(
+            self.operation_class,
+            "takeover_expired_lock",
+            log_key,
+            async move {
+                let object = match client
+                    .get_object()
+                    .bucket(&bucket)
+                    .key(&object_key)
+                    .send()
+                    .await
+                {
+                    Ok(object) => object,
+                    Err(error) if service_error_code(&error).is_some_and(is_not_found_code) => {
+                        return Ok(true);
+                    }
+                    Err(error) => {
+                        return Err(DatalensError::new(
                             DatalensErrorKind::StorageReadFailure,
-                            format!("S3 read lock body {object_key}: {error}"),
-                        )
-                    })?;
-                    let current = current.into_bytes();
-                    let Ok(record) = serde_json::from_slice::<ObjectLockRecord>(&current) else {
-                        return Ok(false);
-                    };
-                    if !object_lock_record_is_expired(&record, ttl)? {
-                        return Ok(false);
+                            format!("S3 get lock {object_key}: {error}"),
+                        ));
                     }
-                    match client
-                        .delete_object()
-                        .bucket(&bucket)
-                        .key(&object_key)
-                        .if_match(etag)
-                        .send()
-                        .await
-                    {
-                        Ok(_) => Ok(true),
-                        Err(error)
-                            if service_error_code(&error).is_some_and(is_precondition_code) =>
-                        {
-                            Ok(false)
-                        }
-                        Err(error) => Err(DatalensError::new(
-                            DatalensErrorKind::StorageWriteFailure,
-                            format!("S3 take over expired lock {object_key}: {error}"),
-                        )),
-                    }
+                };
+                let etag = object
+                    .e_tag()
+                    .map(ToOwned::to_owned)
+                    .ok_or_else(|| unsupported_lock_cas("take over expired", &object_key))?;
+                let current = object.body.collect().await.map_err(|error| {
+                    DatalensError::new(
+                        DatalensErrorKind::StorageReadFailure,
+                        format!("S3 read lock body {object_key}: {error}"),
+                    )
                 })?;
+                let current = current.into_bytes();
+                let Ok(record) = serde_json::from_slice::<ObjectLockRecord>(&current) else {
+                    return Ok(false);
+                };
+                if !object_lock_record_is_expired(&record, ttl)? {
+                    return Ok(false);
+                }
+                match client
+                    .delete_object()
+                    .bucket(&bucket)
+                    .key(&object_key)
+                    .if_match(etag)
+                    .send()
+                    .await
+                {
+                    Ok(_) => Ok(true),
+                    Err(error) if service_error_code(&error).is_some_and(is_precondition_code) => {
+                        Ok(false)
+                    }
+                    Err(error) => Err(DatalensError::new(
+                        DatalensErrorKind::StorageWriteFailure,
+                        format!("S3 take over expired lock {object_key}: {error}"),
+                    )),
+                }
+            },
+        )?;
         if deleted {
             return self.try_acquire_lock(key, owner);
         }
@@ -1691,7 +1779,10 @@ mod tests {
 
     use datalens_core::DatalensError;
 
-    use super::{DEFAULT_S3_GET_MAX_ATTEMPTS, S3Runtime, s3_get_retry_delay, should_retry_s3_get};
+    use super::{
+        DEFAULT_S3_GET_MAX_ATTEMPTS, S3OperationClass, S3Runtime, s3_get_retry_delay,
+        should_retry_s3_get,
+    };
 
     #[test]
     fn test_s3_runtime_runs_independent_operations_concurrently() {
@@ -1702,10 +1793,15 @@ mod tests {
         for _ in 0..4 {
             let runtime = runtime.clone();
             handles.push(thread::spawn(move || {
-                runtime.block_on_operation("test", "delay".to_owned(), async {
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                    Ok::<(), DatalensError>(())
-                })
+                runtime.block_on_operation(
+                    S3OperationClass::Foreground,
+                    "test",
+                    "delay".to_owned(),
+                    async {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        Ok::<(), DatalensError>(())
+                    },
+                )
             }));
         }
 

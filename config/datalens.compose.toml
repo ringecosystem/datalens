@@ -10,6 +10,10 @@ prefix = "${DATALENS_S3_PREFIX}"
 region = "${DATALENS_S3_REGION}"
 endpoint_url = "${DATALENS_S3_ENDPOINT_URL}"
 force_path_style = true
+runtime_worker_threads = 4
+max_concurrent_operations = 16
+background_runtime_worker_threads = 4
+background_max_concurrent_operations = 16
 
 [storage.parquet]
 compression = "zstd"

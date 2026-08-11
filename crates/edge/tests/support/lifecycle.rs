@@ -607,6 +607,8 @@ pub(crate) fn s3_test_config() -> Option<S3ObjectStoreConfig> {
             .unwrap_or(true),
         runtime_worker_threads: 4,
         max_concurrent_operations: 16,
+        background_runtime_worker_threads: 4,
+        background_max_concurrent_operations: 16,
     })
 }
 

@@ -944,6 +944,8 @@ fn test_validate_config_accepts_s3_runtime_limits() {
         force_path_style = true
         runtime_worker_threads = 16
         max_concurrent_operations = 64
+        background_runtime_worker_threads = 4
+        background_max_concurrent_operations = 16
 
         [planner]
         max_query_range_blocks = 100
@@ -975,6 +977,8 @@ fn test_validate_config_accepts_s3_runtime_limits() {
     let s3 = config.storage.s3.expect("s3 config");
     assert_eq!(s3.runtime_worker_threads, 16);
     assert_eq!(s3.max_concurrent_operations, 64);
+    assert_eq!(s3.background_runtime_worker_threads, 4);
+    assert_eq!(s3.background_max_concurrent_operations, 16);
 }
 
 #[test]
@@ -1067,6 +1071,29 @@ fn test_validate_config_rejects_zero_s3_runtime_limits() {
         error
             .message
             .contains("storage.s3.max_concurrent_operations")
+    );
+
+    let mut config = config;
+    let s3 = config.storage.s3.as_mut().expect("s3 config");
+    s3.max_concurrent_operations = 64;
+    s3.background_runtime_worker_threads = 0;
+    let error = validate_config(&config).expect_err("zero background runtime workers rejected");
+    assert_eq!(error.kind, DatalensErrorKind::InvalidInput);
+    assert!(
+        error
+            .message
+            .contains("storage.s3.background_runtime_worker_threads")
+    );
+
+    let s3 = config.storage.s3.as_mut().expect("s3 config");
+    s3.background_runtime_worker_threads = 4;
+    s3.background_max_concurrent_operations = 0;
+    let error = validate_config(&config).expect_err("zero background max concurrency rejected");
+    assert_eq!(error.kind, DatalensErrorKind::InvalidInput);
+    assert!(
+        error
+            .message
+            .contains("storage.s3.background_max_concurrent_operations")
     );
 }
 
