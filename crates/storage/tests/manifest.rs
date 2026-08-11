@@ -4937,6 +4937,59 @@ fn test_coverage_index_v2_empty_deltas_coalesce_adjacent_ranges() {
 }
 
 #[test]
+fn test_empty_coverage_write_appends_adjacent_manifest_segments() {
+    let object_store = CountingObjectStore::new(LocalObjectStore::new(temp_storage_root(
+        "empty-coverage-segment-append",
+    )));
+    let storage = DurableStorage::from_object_store(object_store.clone());
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let rows = DatasetRows::new(DatasetKey::evm_blocks(), QueryRows::EvmBlocks(Vec::new()))
+        .expect("dataset rows");
+
+    for block in [10, 11] {
+        storage
+            .write_rows(StorageWriteRequest {
+                chain: &chain,
+                dataset_key: DatasetKey::evm_blocks(),
+                selector: &selector,
+                range: LedgerRange::blocks(block, block).expect("valid range"),
+                rows: &rows,
+                finality_level: FinalityLevel::Safe,
+                record_empty_coverage: true,
+            })
+            .expect("write empty coverage");
+    }
+
+    let manifest_key = format!("chains/{}/manifest.json", chain.key_prefix());
+    assert_eq!(object_store.put_count(&manifest_key), 0);
+    assert_eq!(manifest_segment_keys(&storage, &chain).len(), 2);
+    assert_eq!(
+        storage
+            .covered_ranges(
+                &chain,
+                &DatasetKey::evm_blocks(),
+                &selector,
+                LedgerRange::blocks(10, 11).expect("valid range")
+            )
+            .expect("covered ranges"),
+        vec![LedgerRange::blocks(10, 11).expect("valid range")]
+    );
+    assert_eq!(
+        storage
+            .read_rows(
+                &chain,
+                &DatasetKey::evm_blocks(),
+                &selector,
+                LedgerRange::blocks(10, 11).expect("valid range"),
+            )
+            .expect("read empty coverage")
+            .row_count(),
+        0
+    );
+}
+
+#[test]
 fn test_coverage_index_v2_partial_exact_coverage_falls_back_to_semantic_logs() {
     let storage = LocalStorage::new(temp_storage_root("coverage-index-v2-exact-semantic-gap"));
     let chain = test_chain();
@@ -6962,7 +7015,7 @@ fn test_independent_storage_instances_serialize_same_bucket_coverage_index_write
     let second_storage = DurableStorage::from_object_store(store.clone());
     let reader = DurableStorage::from_object_store(store);
     let chain = test_chain();
-    let selector = DatasetSelector::all();
+    let selector = evm_log_selector(Vec::new(), Vec::new());
     let first_range = LedgerRange::blocks(10, 10).expect("valid range");
     let second_range = LedgerRange::blocks(11, 11).expect("valid range");
     let expected_range = LedgerRange::blocks(10, 11).expect("valid range");

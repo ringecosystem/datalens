@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet, hash_map::RandomState},
     hash::{BuildHasher, Hash, Hasher},
+    mem::size_of,
     process,
     sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex, MutexGuard, OnceLock, Weak},
@@ -32,9 +33,11 @@ const MAX_EXACT_EVM_LOGS_V2_DELTA_OBJECTS: usize = 128;
 const MAX_SEMANTIC_FALLBACK_V2_DELTA_OBJECTS: usize = 128;
 const COVERAGE_INDEX_V2_BUCKET_READ_CACHE_TTL: Duration = Duration::from_secs(300);
 const MAX_COVERAGE_INDEX_V2_BUCKET_READ_CACHE_ENTRIES: usize = 512;
+const MAX_COVERAGE_INDEX_V2_BUCKET_READ_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const COVERAGE_INDEX_V2_RECENT_DELTA_TTL: Duration = Duration::from_secs(600);
 const MAX_COVERAGE_INDEX_V2_RECENT_BUCKETS: usize = 2_048;
 const MAX_COVERAGE_INDEX_V2_RECENT_ENTRIES_PER_BUCKET: usize = 256;
+const MAX_COVERAGE_INDEX_V2_RECENT_CACHE_BYTES: usize = 128 * 1024 * 1024;
 const COVERAGE_INDEX_V2_OVER_BUDGET_QUEUE_THROTTLE_TTL: Duration = Duration::from_secs(60);
 
 static COVERAGE_INDEX_UPDATE_LOCKS: OnceLock<Mutex<BTreeMap<String, Weak<Mutex<()>>>>> =
@@ -200,6 +203,7 @@ struct CoverageIndexV2BucketReadCacheEntry {
     snapshot_head_key: Option<String>,
     delta_objects: Vec<ObjectMetadata>,
     entries: Vec<ManifestEntry>,
+    byte_len: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -865,6 +869,10 @@ fn put_cached_v2_bucket_entries(
     delta_objects: Vec<ObjectMetadata>,
     entries: Vec<ManifestEntry>,
 ) {
+    let byte_len = estimate_cached_v2_bucket_bytes(&snapshot_head_key, &delta_objects, &entries);
+    if byte_len > MAX_COVERAGE_INDEX_V2_BUCKET_READ_CACHE_BYTES {
+        return;
+    }
     let Ok(mut cache) = coverage_index_v2_bucket_read_cache().lock() else {
         return;
     };
@@ -872,14 +880,7 @@ fn put_cached_v2_bucket_entries(
     cache.retain(|_, entry| {
         now.duration_since(entry.inserted_at) <= COVERAGE_INDEX_V2_BUCKET_READ_CACHE_TTL
     });
-    if cache.len() >= MAX_COVERAGE_INDEX_V2_BUCKET_READ_CACHE_ENTRIES
-        && let Some(oldest_key) = cache
-            .iter()
-            .min_by_key(|(_, entry)| entry.inserted_at)
-            .map(|(key, _)| key.clone())
-    {
-        cache.remove(&oldest_key);
-    }
+    cache.remove(&key);
     cache.insert(
         key,
         CoverageIndexV2BucketReadCacheEntry {
@@ -889,8 +890,10 @@ fn put_cached_v2_bucket_entries(
             snapshot_head_key,
             delta_objects,
             entries,
+            byte_len,
         },
     );
+    trim_cached_v2_bucket_entries(&mut cache);
 }
 
 fn append_cached_v2_bucket_delta<S>(
@@ -999,8 +1002,14 @@ fn append_cached_v2_bucket_delta<S>(
     entry
         .delta_objects
         .dedup_by(|left, right| left.key == right.key);
+    entry.byte_len = estimate_cached_v2_bucket_bytes(
+        &entry.snapshot_head_key,
+        &entry.delta_objects,
+        &entry.entries,
+    );
     entry.has_index = true;
     entry.dirty = false;
+    trim_cached_v2_bucket_entries(&mut cache);
 }
 
 fn mark_cached_v2_bucket_entries_dirty<S>(object_store: &S, bucket: &CoverageIndexV2Bucket)
@@ -1056,6 +1065,7 @@ fn append_recent_v2_bucket_delta<S>(
         let remove_count = entries.len() - MAX_COVERAGE_INDEX_V2_RECENT_ENTRIES_PER_BUCKET;
         entries.drain(0..remove_count);
     }
+    trim_recent_v2_bucket_entries(&mut recent);
 }
 
 fn append_recent_v2_bucket_entries<S>(
@@ -1114,6 +1124,114 @@ where
         bucket.bucket_start,
         bucket.bucket_end
     )
+}
+
+fn trim_cached_v2_bucket_entries(
+    cache: &mut BTreeMap<String, CoverageIndexV2BucketReadCacheEntry>,
+) {
+    while cache.len() > MAX_COVERAGE_INDEX_V2_BUCKET_READ_CACHE_ENTRIES
+        || cached_v2_bucket_entries_bytes(cache) > MAX_COVERAGE_INDEX_V2_BUCKET_READ_CACHE_BYTES
+    {
+        let Some(oldest_key) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.inserted_at)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        cache.remove(&oldest_key);
+    }
+}
+
+fn cached_v2_bucket_entries_bytes(
+    cache: &BTreeMap<String, CoverageIndexV2BucketReadCacheEntry>,
+) -> usize {
+    cache
+        .iter()
+        .map(|(key, entry)| key.len().saturating_add(entry.byte_len))
+        .sum()
+}
+
+fn trim_recent_v2_bucket_entries(
+    recent: &mut BTreeMap<String, Vec<CoverageIndexV2RecentBucketEntry>>,
+) {
+    while recent_v2_bucket_entries_bytes(recent) > MAX_COVERAGE_INDEX_V2_RECENT_CACHE_BYTES {
+        let Some(oldest_key) = recent
+            .iter()
+            .filter_map(|(key, entries)| entries.first().map(|entry| (key, entry.inserted_at)))
+            .min_by_key(|(_, inserted_at)| *inserted_at)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        recent.remove(&oldest_key);
+    }
+}
+
+fn recent_v2_bucket_entries_bytes(
+    recent: &BTreeMap<String, Vec<CoverageIndexV2RecentBucketEntry>>,
+) -> usize {
+    recent
+        .iter()
+        .map(|(key, entries)| {
+            key.len().saturating_add(
+                entries
+                    .iter()
+                    .map(|entry| estimate_manifest_entries_bytes(&entry.entries))
+                    .sum::<usize>(),
+            )
+        })
+        .sum()
+}
+
+fn estimate_cached_v2_bucket_bytes(
+    snapshot_head_key: &Option<String>,
+    delta_objects: &[ObjectMetadata],
+    entries: &[ManifestEntry],
+) -> usize {
+    size_of::<CoverageIndexV2BucketReadCacheEntry>()
+        .saturating_add(snapshot_head_key.as_ref().map(|key| key.len()).unwrap_or(0))
+        .saturating_add(
+            delta_objects
+                .iter()
+                .map(|object| size_of::<ObjectMetadata>().saturating_add(object.key.len()))
+                .sum::<usize>(),
+        )
+        .saturating_add(estimate_manifest_entries_bytes(entries))
+}
+
+fn estimate_manifest_entries_bytes(entries: &[ManifestEntry]) -> usize {
+    entries
+        .iter()
+        .map(|entry| {
+            size_of::<ManifestEntry>()
+                .saturating_add(entry.chain.key_prefix().len())
+                .saturating_add(entry.dataset_key.as_str().len())
+                .saturating_add(entry.selector_fingerprint.len())
+                .saturating_add(entry.selector_canonical_key.len())
+                .saturating_add(
+                    entry
+                        .object_key
+                        .as_ref()
+                        .map(|value| value.len())
+                        .unwrap_or(0),
+                )
+                .saturating_add(
+                    entry
+                        .checksum
+                        .as_ref()
+                        .map(|value| value.len())
+                        .unwrap_or(0),
+                )
+                .saturating_add(
+                    entry
+                        .checksum_algorithm
+                        .as_ref()
+                        .map(|value| value.len())
+                        .unwrap_or(0),
+                )
+        })
+        .sum()
 }
 
 fn read_v2_delta_object<S>(
@@ -3036,6 +3154,55 @@ mod tests {
 
     fn test_chain() -> ChainIdentity {
         ChainIdentity::expect_with_network_id(ChainFamily::Evm, "ethereum", NetworkId::numeric(1))
+    }
+
+    fn clear_v2_memory_caches() {
+        if let Some(cache) = COVERAGE_INDEX_V2_BUCKET_READ_CACHE.get() {
+            cache.lock().expect("bucket read cache").clear();
+        }
+        if let Some(recent) = COVERAGE_INDEX_V2_RECENT_BUCKET_ENTRIES.get() {
+            recent.lock().expect("recent bucket entries").clear();
+        }
+    }
+
+    fn cache_entry(inserted_at: Instant, byte_len: usize) -> CoverageIndexV2BucketReadCacheEntry {
+        CoverageIndexV2BucketReadCacheEntry {
+            inserted_at,
+            dirty: false,
+            has_index: true,
+            snapshot_head_key: None,
+            delta_objects: Vec::new(),
+            entries: Vec::new(),
+            byte_len,
+        }
+    }
+
+    #[test]
+    fn test_v2_bucket_read_cache_trims_by_byte_budget() {
+        clear_v2_memory_caches();
+        let now = Instant::now();
+        let mut cache = BTreeMap::new();
+        cache.insert(
+            "old".to_owned(),
+            cache_entry(now - Duration::from_secs(3), 160 * 1024 * 1024),
+        );
+        cache.insert(
+            "middle".to_owned(),
+            cache_entry(now - Duration::from_secs(2), 80 * 1024 * 1024),
+        );
+        cache.insert(
+            "new".to_owned(),
+            cache_entry(now - Duration::from_secs(1), 80 * 1024 * 1024),
+        );
+
+        trim_cached_v2_bucket_entries(&mut cache);
+
+        assert!(
+            cached_v2_bucket_entries_bytes(&cache) <= MAX_COVERAGE_INDEX_V2_BUCKET_READ_CACHE_BYTES
+        );
+        assert!(!cache.contains_key("old"));
+        assert!(cache.contains_key("middle"));
+        assert!(cache.contains_key("new"));
     }
 
     #[derive(Clone, Debug)]
