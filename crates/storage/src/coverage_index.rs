@@ -651,7 +651,7 @@ where
     if !reserve_over_budget_queue_attempt(throttle_key) {
         return;
     }
-    if let Err(error) = write_v2_compaction_queue_record(object_store, bucket) {
+    if let Err(error) = write_v2_hot_compaction_queue_record(object_store, bucket) {
         log::warn!(
             "coverage index v2 compaction queue write failed after over-budget read bucket_scope={} bucket_start={} bucket_end={} kind={:?} message={}",
             bucket.scope,
@@ -3072,10 +3072,24 @@ pub(crate) fn coverage_index_v2_compaction_queue_prefix(chain_key: &str) -> Stri
     format!("chains/{chain_key}/coverage-index-v2/compaction-queue")
 }
 
+pub(crate) fn coverage_index_v2_hot_compaction_queue_prefix(chain_key: &str) -> String {
+    format!("chains/{chain_key}/coverage-index-v2/compaction-queue-hot")
+}
+
 pub(crate) fn coverage_index_v2_compaction_queue_key(bucket: &CoverageIndexV2Bucket) -> String {
     format!(
         "{}/{}/{:020}-{:020}.json",
         coverage_index_v2_compaction_queue_prefix(&bucket.chain_key),
+        bucket.scope,
+        bucket.bucket_start,
+        bucket.bucket_end
+    )
+}
+
+pub(crate) fn coverage_index_v2_hot_compaction_queue_key(bucket: &CoverageIndexV2Bucket) -> String {
+    format!(
+        "{}/{}/{:020}-{:020}.json",
+        coverage_index_v2_hot_compaction_queue_prefix(&bucket.chain_key),
         bucket.scope,
         bucket.bucket_start,
         bucket.bucket_end
@@ -3108,6 +3122,39 @@ where
             DatalensErrorKind::ManifestUpdateFailure,
             format!(
                 "write coverage index v2 compaction queue record {key}: {}",
+                error.message
+            ),
+        )
+    })?;
+    Ok(key)
+}
+
+fn write_v2_hot_compaction_queue_record<S>(
+    object_store: &S,
+    bucket: &CoverageIndexV2Bucket,
+) -> Result<String, DatalensError>
+where
+    S: ObjectStore,
+{
+    let key = coverage_index_v2_hot_compaction_queue_key(bucket);
+    let record = CoverageIndexV2CompactionQueueRecord {
+        schema_version: COVERAGE_INDEX_V2_SCHEMA_VERSION,
+        scope: bucket.scope.clone(),
+        bucket_start: bucket.bucket_start,
+        bucket_end: bucket.bucket_end,
+        enqueued_at_unix_ms: unix_ms_now()?,
+    };
+    let bytes = serde_json::to_vec_pretty(&record).map_err(|error| {
+        DatalensError::new(
+            DatalensErrorKind::Internal,
+            format!("encode coverage index v2 hot compaction queue record: {error}"),
+        )
+    })?;
+    object_store.put_if_absent(&key, &bytes).map_err(|error| {
+        DatalensError::new(
+            DatalensErrorKind::ManifestUpdateFailure,
+            format!(
+                "write coverage index v2 hot compaction queue record {key}: {}",
                 error.message
             ),
         )
@@ -4566,8 +4613,8 @@ mod tests {
         assert!(object_store.delta_list_pages() > 0);
         assert!(
             object_store
-                .exists(&coverage_index_v2_compaction_queue_key(&bucket))
-                .expect("check compaction queue")
+                .exists(&coverage_index_v2_hot_compaction_queue_key(&bucket))
+                .expect("check hot compaction queue")
         );
     }
 
