@@ -813,6 +813,7 @@ const DEFAULT_S3_MAX_CONCURRENT_OPERATIONS: usize = 16;
 const DEFAULT_S3_BACKGROUND_RUNTIME_WORKER_THREADS: usize = 4;
 const DEFAULT_S3_BACKGROUND_MAX_CONCURRENT_OPERATIONS: usize = 16;
 const DEFAULT_S3_OPERATION_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_S3_BACKGROUND_OPERATION_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_S3_GET_MAX_ATTEMPTS: usize = 3;
 const DEFAULT_S3_GET_RETRY_BACKOFF_MS: u64 = 100;
 const S3_SLOW_OPERATION_LOG_THRESHOLD_MS: u128 = 1_000;
@@ -828,6 +829,13 @@ impl S3OperationClass {
         match self {
             Self::Foreground => "foreground",
             Self::Background => "background",
+        }
+    }
+
+    fn operation_timeout(self) -> Duration {
+        match self {
+            Self::Foreground => Duration::from_millis(DEFAULT_S3_OPERATION_TIMEOUT_MS),
+            Self::Background => Duration::from_millis(DEFAULT_S3_BACKGROUND_OPERATION_TIMEOUT_MS),
         }
     }
 }
@@ -1056,7 +1064,7 @@ impl S3ObjectStore {
             operation_class,
             "config_load",
             config.bucket.clone(),
-            Duration::from_millis(DEFAULT_S3_OPERATION_TIMEOUT_MS),
+            operation_class.operation_timeout(),
             async move {
                 let mut loader =
                     aws_config::defaults(BehaviorVersion::latest()).region(Region::new(region));
@@ -1112,7 +1120,7 @@ impl ObjectStore for S3ObjectStore {
         let log_key = key.clone();
         let client = self.client.clone();
         let bucket = self.bucket.clone();
-        self.runtime().block_on_operation(self.operation_class, "get", log_key, Duration::from_millis(DEFAULT_S3_OPERATION_TIMEOUT_MS), async move {
+        self.runtime().block_on_operation(self.operation_class, "get", log_key, self.operation_class.operation_timeout(), async move {
             for attempt in 1..=DEFAULT_S3_GET_MAX_ATTEMPTS {
                 let object = match client.get_object().bucket(&bucket).key(&key).send().await {
                     Ok(object) => object,
@@ -1174,7 +1182,7 @@ impl ObjectStore for S3ObjectStore {
         let client = self.client.clone();
         let bucket = self.bucket.clone();
         self.runtime()
-            .block_on_operation(self.operation_class, "get_optional", log_key, Duration::from_millis(DEFAULT_S3_OPERATION_TIMEOUT_MS), async move {
+            .block_on_operation(self.operation_class, "get_optional", log_key, self.operation_class.operation_timeout(), async move {
                 for attempt in 1..=DEFAULT_S3_GET_MAX_ATTEMPTS {
                     let object = match client.get_object().bucket(&bucket).key(&key).send().await {
                         Ok(object) => object,
@@ -1237,7 +1245,7 @@ impl ObjectStore for S3ObjectStore {
             self.operation_class,
             "put",
             log_key,
-            Duration::from_millis(DEFAULT_S3_OPERATION_TIMEOUT_MS),
+            self.operation_class.operation_timeout(),
             async move {
                 client
                     .put_object()
@@ -1271,7 +1279,7 @@ impl ObjectStore for S3ObjectStore {
             self.operation_class,
             "put_if_absent",
             log_key,
-            Duration::from_millis(DEFAULT_S3_OPERATION_TIMEOUT_MS),
+            self.operation_class.operation_timeout(),
             async move {
                 match client
                     .put_object()
@@ -1304,7 +1312,7 @@ impl ObjectStore for S3ObjectStore {
             self.operation_class,
             "exists",
             log_key,
-            Duration::from_millis(DEFAULT_S3_OPERATION_TIMEOUT_MS),
+            self.operation_class.operation_timeout(),
             async move {
                 match client.head_object().bucket(&bucket).key(&key).send().await {
                     Ok(_) => Ok(true),
@@ -1327,7 +1335,7 @@ impl ObjectStore for S3ObjectStore {
         let client = self.client.clone();
         let bucket = self.bucket.clone();
         self.runtime()
-            .block_on_operation(self.operation_class, "list", log_key, Duration::from_millis(DEFAULT_S3_OPERATION_TIMEOUT_MS), async move {
+            .block_on_operation(self.operation_class, "list", log_key, self.operation_class.operation_timeout(), async move {
                 let mut continuation = None;
                 let mut objects = Vec::new();
                 loop {
@@ -1414,7 +1422,7 @@ impl ObjectStore for S3ObjectStore {
         let client = self.client.clone();
         let bucket = self.bucket.clone();
         self.runtime()
-            .block_on_operation(self.operation_class, "list_page", log_key, Duration::from_millis(DEFAULT_S3_OPERATION_TIMEOUT_MS), async move {
+            .block_on_operation(self.operation_class, "list_page", log_key, self.operation_class.operation_timeout(), async move {
                 let mut response = None;
                 for attempt in 1..=DEFAULT_S3_GET_MAX_ATTEMPTS {
                     match client
@@ -1484,7 +1492,7 @@ impl ObjectStore for S3ObjectStore {
             self.operation_class,
             "delete",
             log_key,
-            Duration::from_millis(DEFAULT_S3_OPERATION_TIMEOUT_MS),
+            self.operation_class.operation_timeout(),
             async move {
                 client
                     .delete_object()
@@ -1518,7 +1526,7 @@ impl ObjectStore for S3ObjectStore {
             self.operation_class,
             "try_acquire_lock",
             log_key,
-            Duration::from_millis(DEFAULT_S3_OPERATION_TIMEOUT_MS),
+            self.operation_class.operation_timeout(),
             async move {
                 match client
                     .put_object()
@@ -1556,7 +1564,7 @@ impl ObjectStore for S3ObjectStore {
             self.operation_class,
             "release_lock",
             log_key,
-            Duration::from_millis(DEFAULT_S3_OPERATION_TIMEOUT_MS),
+            self.operation_class.operation_timeout(),
             async move {
                 let object = match client
                     .get_object()
@@ -1626,7 +1634,7 @@ impl ObjectStore for S3ObjectStore {
             self.operation_class,
             "renew_lock",
             log_key,
-            Duration::from_millis(DEFAULT_S3_OPERATION_TIMEOUT_MS),
+            self.operation_class.operation_timeout(),
             async move {
                 let object = match client
                     .get_object()
@@ -1707,7 +1715,7 @@ impl ObjectStore for S3ObjectStore {
             self.operation_class,
             "takeover_expired_lock",
             log_key,
-            Duration::from_millis(DEFAULT_S3_OPERATION_TIMEOUT_MS),
+            self.operation_class.operation_timeout(),
             async move {
                 let object = match client
                     .get_object()
@@ -1945,6 +1953,18 @@ mod tests {
 
         assert_eq!(error.kind, DatalensErrorKind::StorageReadFailure);
         assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn test_s3_background_operations_have_shorter_timeout() {
+        assert_eq!(
+            S3OperationClass::Foreground.operation_timeout(),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            S3OperationClass::Background.operation_timeout(),
+            Duration::from_secs(5)
+        );
     }
 
     #[test]
