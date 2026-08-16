@@ -39,6 +39,7 @@ const MAX_COVERAGE_INDEX_V2_RECENT_BUCKETS: usize = 2_048;
 const MAX_COVERAGE_INDEX_V2_RECENT_ENTRIES_PER_BUCKET: usize = 256;
 const MAX_COVERAGE_INDEX_V2_RECENT_CACHE_BYTES: usize = 128 * 1024 * 1024;
 const COVERAGE_INDEX_V2_OVER_BUDGET_QUEUE_THROTTLE_TTL: Duration = Duration::from_secs(60);
+const COVERAGE_INDEX_V2_OVER_BUDGET_READ_THROTTLE_TTL: Duration = Duration::from_secs(60);
 
 static COVERAGE_INDEX_UPDATE_LOCKS: OnceLock<Mutex<BTreeMap<String, Weak<Mutex<()>>>>> =
     OnceLock::new();
@@ -50,6 +51,8 @@ static COVERAGE_INDEX_V2_RECENT_BUCKET_ENTRIES: OnceLock<
     Mutex<BTreeMap<String, Vec<CoverageIndexV2RecentBucketEntry>>>,
 > = OnceLock::new();
 static COVERAGE_INDEX_V2_OVER_BUDGET_QUEUE_ATTEMPTS: OnceLock<Mutex<BTreeMap<String, Instant>>> =
+    OnceLock::new();
+static COVERAGE_INDEX_V2_OVER_BUDGET_READS: OnceLock<Mutex<BTreeMap<String, Instant>>> =
     OnceLock::new();
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -507,6 +510,43 @@ where
         any_bucket_has_index = true;
     }
     let snapshot_head_key = snapshot_head.as_ref().map(|(key, _)| key.clone());
+    let over_budget_key = coverage_index_v2_bucket_recent_key(object_store, bucket);
+
+    if max_delta_objects.is_some() && is_recent_over_budget_v2_read(&over_budget_key) {
+        let mut bucket_entries = Vec::new();
+        if let Some((_, head)) = snapshot_head.take() {
+            let mut loaded_snapshot = match snapshot {
+                Some(snapshot) => snapshot,
+                None => read_v2_snapshot(object_store, bucket, &head.snapshot_key)?,
+            };
+            bucket_entries.append(&mut loaded_snapshot.entries);
+        }
+        enqueue_v2_compaction_for_over_budget_bucket(object_store, bucket);
+        if budget_mode == CoverageIndexV2BudgetMode::ConservativeMiss {
+            log::warn!(
+                "storage coverage exact lookup skipped cached over-budget pending deltas chain_key={} scope={} bucket={}-{} max_delta_objects={} snapshot_entries={}",
+                bucket.chain_key,
+                bucket.scope,
+                bucket.bucket_start,
+                bucket.bucket_end,
+                max_delta_objects.unwrap_or_default(),
+                bucket_entries.len()
+            );
+            return Ok(false);
+        }
+        log::warn!(
+            "storage coverage semantic fallback skipped cached over-budget pending deltas chain_key={} scope={} bucket={}-{} max_delta_objects={} snapshot_entries={}",
+            bucket.chain_key,
+            bucket.scope,
+            bucket.bucket_start,
+            bucket.bucket_end,
+            max_delta_objects.unwrap_or_default(),
+            bucket_entries.len()
+        );
+        append_recent_v2_bucket_entries(object_store, bucket, &mut bucket_entries);
+        entries.append(&mut bucket_entries);
+        return Ok(any_bucket_has_index);
+    }
 
     let skip_legacy_exact_evm_logs_tail =
         bucket.scope.starts_with("exact/evm.logs/") && start_after_delta_key.is_some();
@@ -546,6 +586,7 @@ where
     };
 
     if skip_pending_deltas {
+        mark_recent_over_budget_v2_read(over_budget_key);
         enqueue_v2_compaction_for_over_budget_bucket(object_store, bucket);
         if budget_mode == CoverageIndexV2BudgetMode::ConservativeMiss {
             log::warn!(
@@ -633,6 +674,32 @@ fn reserve_over_budget_queue_attempt(key: String) -> bool {
 
 fn coverage_index_v2_over_budget_queue_attempts() -> &'static Mutex<BTreeMap<String, Instant>> {
     COVERAGE_INDEX_V2_OVER_BUDGET_QUEUE_ATTEMPTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn is_recent_over_budget_v2_read(key: &str) -> bool {
+    let Ok(mut reads) = coverage_index_v2_over_budget_reads().lock() else {
+        return false;
+    };
+    let now = Instant::now();
+    reads.retain(|_, read_at| {
+        now.duration_since(*read_at) <= COVERAGE_INDEX_V2_OVER_BUDGET_READ_THROTTLE_TTL
+    });
+    reads.contains_key(key)
+}
+
+fn mark_recent_over_budget_v2_read(key: String) {
+    let Ok(mut reads) = coverage_index_v2_over_budget_reads().lock() else {
+        return;
+    };
+    let now = Instant::now();
+    reads.retain(|_, read_at| {
+        now.duration_since(*read_at) <= COVERAGE_INDEX_V2_OVER_BUDGET_READ_THROTTLE_TTL
+    });
+    reads.insert(key, now);
+}
+
+fn coverage_index_v2_over_budget_reads() -> &'static Mutex<BTreeMap<String, Instant>> {
+    COVERAGE_INDEX_V2_OVER_BUDGET_READS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
 pub(crate) fn prepare_v2_bucket_compaction<S>(
@@ -3163,6 +3230,9 @@ mod tests {
         if let Some(recent) = COVERAGE_INDEX_V2_RECENT_BUCKET_ENTRIES.get() {
             recent.lock().expect("recent bucket entries").clear();
         }
+        if let Some(reads) = COVERAGE_INDEX_V2_OVER_BUDGET_READS.get() {
+            reads.lock().expect("over-budget reads").clear();
+        }
     }
 
     fn cache_entry(inserted_at: Instant, byte_len: usize) -> CoverageIndexV2BucketReadCacheEntry {
@@ -4009,6 +4079,7 @@ mod tests {
 
     #[test]
     fn test_exact_evm_logs_v2_lookup_skips_over_delta_budget_conservatively() {
+        clear_v2_memory_caches();
         let object_store =
             DelayedV2DeltaGetObjectStore::new(temp_storage_root("exact-v2-budget-conservative"));
         let chain = test_chain();
@@ -4059,7 +4130,73 @@ mod tests {
     }
 
     #[test]
+    fn test_exact_evm_logs_v2_over_budget_read_is_throttled() {
+        clear_v2_memory_caches();
+        let object_store =
+            DelayedV2DeltaGetObjectStore::new(temp_storage_root("exact-v2-budget-throttled"));
+        let chain = test_chain();
+        let selector = evm_logs_selector(vec![]);
+        let range = LedgerRange::blocks(10, 10).expect("valid range");
+        let scope = coverage_index_v2_exact_scope(
+            &DatasetKey::evm_logs(),
+            &range,
+            &selector.fingerprint(),
+            ManifestFinalityLevel::Safe,
+        );
+        for index in 0..=MAX_EXACT_EVM_LOGS_V2_DELTA_OBJECTS {
+            let entry = evm_logs_entry(&chain, &selector, 10, 10, index);
+            write_test_v2_delta(
+                &object_store,
+                &chain,
+                &scope,
+                &range,
+                &format!("{index:04}"),
+                vec![entry],
+                None,
+            );
+        }
+
+        let bucket = CoverageIndexV2Bucket {
+            chain_key: chain.key_prefix(),
+            scope,
+            bucket_start: 0,
+            bucket_end: DEFAULT_COVERAGE_INDEX_BUCKET_SIZE - 1,
+        };
+        let mut first_entries = Vec::new();
+        let first = read_entries_for_v2_bucket(
+            &object_store,
+            &bucket,
+            &mut first_entries,
+            Some(MAX_EXACT_EVM_LOGS_V2_DELTA_OBJECTS),
+            CoverageIndexV2BudgetMode::ConservativeMiss,
+        )
+        .expect("first over-budget read");
+        let delta_list_pages_after_first = object_store.delta_list_pages();
+        let mut second_entries = Vec::new();
+        let second = read_entries_for_v2_bucket(
+            &object_store,
+            &bucket,
+            &mut second_entries,
+            Some(MAX_EXACT_EVM_LOGS_V2_DELTA_OBJECTS),
+            CoverageIndexV2BudgetMode::ConservativeMiss,
+        )
+        .expect("second over-budget read");
+
+        assert!(!first);
+        assert!(!second);
+        assert!(first_entries.is_empty());
+        assert!(second_entries.is_empty());
+        assert!(delta_list_pages_after_first > 0);
+        assert_eq!(
+            object_store.delta_list_pages(),
+            delta_list_pages_after_first,
+            "recent over-budget buckets should not list the same delta prefix again"
+        );
+    }
+
+    #[test]
     fn test_exact_evm_logs_v2_lookup_reads_at_delta_budget_boundary() {
+        clear_v2_memory_caches();
         let object_store =
             DelayedV2DeltaGetObjectStore::new(temp_storage_root("exact-v2-budget-boundary"));
         let chain = test_chain();
