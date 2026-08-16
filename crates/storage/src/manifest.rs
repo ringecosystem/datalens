@@ -47,7 +47,15 @@ impl Manifest {
     pub(crate) fn normalize(&mut self) {
         let mut entries = BTreeMap::new();
         for entry in self.entries.drain(..) {
-            entries.insert(entry.logical_key(), entry);
+            let key = entry.logical_key();
+            if entries
+                .get(&key)
+                .is_some_and(|existing: &ManifestEntry| existing.object_key.is_some())
+                && entry.object_key.is_none()
+            {
+                continue;
+            }
+            entries.insert(key, entry);
         }
         self.entries =
             coalesce_empty_entries(filter_shadowed_entries(entries.into_values().collect()));

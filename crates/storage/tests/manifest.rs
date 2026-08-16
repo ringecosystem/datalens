@@ -4392,8 +4392,6 @@ fn test_coverage_index_v2_hot_writes_same_bucket_use_distinct_delta_keys() {
     let storage = DurableStorage::from_object_store(object_store.clone());
     let chain = test_chain();
     let selector = DatasetSelector::all();
-    let rows = DatasetRows::new(DatasetKey::evm_blocks(), QueryRows::EvmBlocks(Vec::new()))
-        .expect("dataset rows");
 
     for block in [10, 11] {
         storage
@@ -4402,7 +4400,7 @@ fn test_coverage_index_v2_hot_writes_same_bucket_use_distinct_delta_keys() {
                 dataset_key: DatasetKey::evm_blocks(),
                 selector: &selector,
                 range: LedgerRange::blocks(block, block).expect("valid range"),
-                rows: &rows,
+                rows: &single_block_rows(block),
                 finality_level: FinalityLevel::Safe,
                 record_empty_coverage: true,
             })
@@ -4889,7 +4887,10 @@ fn test_coverage_index_v2_semantic_evm_log_delta_matches_v1_coverage() {
 
 #[test]
 fn test_coverage_index_v2_empty_deltas_coalesce_adjacent_ranges() {
-    let storage = LocalStorage::new(temp_storage_root("coverage-index-v2-empty-coalesce"));
+    let object_store = CountingObjectStore::new(LocalObjectStore::new(temp_storage_root(
+        "coverage-index-v2-empty-coalesce",
+    )));
+    let storage = DurableStorage::from_object_store(object_store.clone());
     let chain = test_chain();
     let selector = DatasetSelector::all();
     let rows = DatasetRows::new(DatasetKey::evm_blocks(), QueryRows::EvmBlocks(Vec::new()))
@@ -4909,6 +4910,27 @@ fn test_coverage_index_v2_empty_deltas_coalesce_adjacent_ranges() {
             .expect("write empty coverage");
     }
     clear_coverage_index_v1(&storage, &chain);
+
+    let scope = coverage_index_v2_exact_scope(
+        &DatasetKey::evm_blocks(),
+        "block",
+        &selector,
+        ManifestFinalityLevel::Safe,
+    );
+    let delta_prefix = coverage_index_v2_delta_prefix(
+        &chain,
+        &scope,
+        &LedgerRange::blocks(10, 10).expect("valid range"),
+    );
+    assert_eq!(
+        storage
+            .object_store()
+            .list(&delta_prefix)
+            .expect("coverage index v2 delta list")
+            .len(),
+        1,
+        "adjacent empty coverage should leave one pending replacement delta"
+    );
 
     assert_eq!(
         storage
@@ -4986,6 +5008,192 @@ fn test_empty_coverage_write_appends_adjacent_manifest_segments() {
             .expect("read empty coverage")
             .row_count(),
         0
+    );
+}
+
+#[test]
+fn test_coverage_index_v2_many_empty_deltas_coalesce_to_one_pending_delta() {
+    let object_store = CountingObjectStore::new(LocalObjectStore::new(temp_storage_root(
+        "coverage-index-v2-many-empty-coalesce",
+    )));
+    let storage = DurableStorage::from_object_store(object_store.clone());
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let rows = DatasetRows::new(DatasetKey::evm_blocks(), QueryRows::EvmBlocks(Vec::new()))
+        .expect("dataset rows");
+
+    for block in 1..=200 {
+        storage
+            .write_rows(StorageWriteRequest {
+                chain: &chain,
+                dataset_key: DatasetKey::evm_blocks(),
+                selector: &selector,
+                range: LedgerRange::blocks(block, block).expect("valid range"),
+                rows: &rows,
+                finality_level: FinalityLevel::Safe,
+                record_empty_coverage: true,
+            })
+            .expect("write empty coverage");
+    }
+
+    let scope = coverage_index_v2_exact_scope(
+        &DatasetKey::evm_blocks(),
+        "block",
+        &selector,
+        ManifestFinalityLevel::Safe,
+    );
+    let delta_prefix = coverage_index_v2_delta_prefix(
+        &chain,
+        &scope,
+        &LedgerRange::blocks(1, 1).expect("valid range"),
+    );
+    assert_eq!(
+        storage
+            .object_store()
+            .list(&delta_prefix)
+            .expect("coverage index v2 delta list")
+            .len(),
+        1,
+        "continuous empty coverage must not leave 200 pending deltas"
+    );
+    assert_eq!(manifest_segment_keys(&storage, &chain).len(), 200);
+    assert_eq!(
+        storage
+            .covered_ranges(
+                &chain,
+                &DatasetKey::evm_blocks(),
+                &selector,
+                LedgerRange::blocks(1, 200).expect("valid range"),
+            )
+            .expect("covered ranges"),
+        vec![LedgerRange::blocks(1, 200).expect("valid range")]
+    );
+    assert_eq!(
+        storage
+            .read_rows(
+                &chain,
+                &DatasetKey::evm_blocks(),
+                &selector,
+                LedgerRange::blocks(1, 200).expect("valid range"),
+            )
+            .expect("read empty coverage")
+            .row_count(),
+        0
+    );
+}
+
+#[test]
+fn test_empty_coverage_does_not_coalesce_over_real_data_object() {
+    let object_store = CountingObjectStore::new(LocalObjectStore::new(temp_storage_root(
+        "empty-coverage-no-data-coalesce",
+    )));
+    let storage = DurableStorage::from_object_store(object_store.clone());
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let empty_rows = DatasetRows::new(DatasetKey::evm_blocks(), QueryRows::EvmBlocks(Vec::new()))
+        .expect("empty rows");
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &selector,
+            range: LedgerRange::blocks(11, 11).expect("valid range"),
+            rows: &single_block_rows(11),
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write data coverage");
+    for block in [10, 11] {
+        storage
+            .write_rows(StorageWriteRequest {
+                chain: &chain,
+                dataset_key: DatasetKey::evm_blocks(),
+                selector: &selector,
+                range: LedgerRange::blocks(block, block).expect("valid range"),
+                rows: &empty_rows,
+                finality_level: FinalityLevel::Safe,
+                record_empty_coverage: true,
+            })
+            .expect("write empty coverage");
+    }
+
+    let scope = coverage_index_v2_exact_scope(
+        &DatasetKey::evm_blocks(),
+        "block",
+        &selector,
+        ManifestFinalityLevel::Safe,
+    );
+    let delta_prefix = coverage_index_v2_delta_prefix(
+        &chain,
+        &scope,
+        &LedgerRange::blocks(10, 10).expect("valid range"),
+    );
+    assert_eq!(
+        storage
+            .object_store()
+            .list(&delta_prefix)
+            .expect("coverage index v2 delta list")
+            .len(),
+        3,
+        "an empty write touching data must use ordinary append semantics"
+    );
+    assert_eq!(
+        storage
+            .read_rows(
+                &chain,
+                &DatasetKey::evm_blocks(),
+                &selector,
+                LedgerRange::blocks(11, 11).expect("valid range"),
+            )
+            .expect("read data coverage"),
+        single_block_rows(11)
+    );
+}
+
+#[test]
+fn test_data_written_after_empty_replacement_remains_visible() {
+    let storage = LocalStorage::new(temp_storage_root("data-after-empty-replacement"));
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let empty_rows = DatasetRows::new(DatasetKey::evm_blocks(), QueryRows::EvmBlocks(Vec::new()))
+        .expect("empty rows");
+
+    for block in [10, 11] {
+        storage
+            .write_rows(StorageWriteRequest {
+                chain: &chain,
+                dataset_key: DatasetKey::evm_blocks(),
+                selector: &selector,
+                range: LedgerRange::blocks(block, block).expect("valid range"),
+                rows: &empty_rows,
+                finality_level: FinalityLevel::Safe,
+                record_empty_coverage: true,
+            })
+            .expect("write empty coverage");
+    }
+    storage
+        .write_rows_replacing_existing(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &selector,
+            range: LedgerRange::blocks(11, 11).expect("valid range"),
+            rows: &single_block_rows(11),
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write data coverage");
+
+    assert_eq!(
+        storage
+            .read_rows(
+                &chain,
+                &DatasetKey::evm_blocks(),
+                &selector,
+                LedgerRange::blocks(11, 11).expect("valid range"),
+            )
+            .expect("read data coverage"),
+        single_block_rows(11)
     );
 }
 
