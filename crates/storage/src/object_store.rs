@@ -132,6 +132,10 @@ pub trait ObjectStore: Clone + Send + Sync {
     fn lock_namespace(&self) -> String {
         std::any::type_name::<Self>().to_owned()
     }
+
+    fn supports_owner_conditional_locks(&self) -> bool {
+        false
+    }
 }
 
 fn object_lock_record_is_expired(
@@ -613,6 +617,10 @@ impl ObjectStore for LocalObjectStore {
             .canonicalize()
             .unwrap_or_else(|_| self.root.clone());
         format!("local:{}", root.display())
+    }
+
+    fn supports_owner_conditional_locks(&self) -> bool {
+        true
     }
 }
 
@@ -1670,6 +1678,10 @@ impl ObjectStore for S3ObjectStore {
             self.bucket,
             self.prefix.as_deref().unwrap_or_default()
         )
+    }
+
+    fn supports_owner_conditional_locks(&self) -> bool {
+        true
     }
 }
 

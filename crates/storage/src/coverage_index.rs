@@ -17,8 +17,8 @@ use std::{
 
 use crate::selector_coverage::{parse_evm_log_canonical_key, selector_coverage_candidates};
 use crate::{
-    Manifest, ManifestEntry, ManifestFinalityLevel, ObjectMetadata, ObjectStore, range_kind_key,
-    validate_object_key,
+    Manifest, ManifestEntry, ManifestFinalityLevel, ObjectLockLease, ObjectMetadata, ObjectStore,
+    encode_object_lock_owner, range_kind_key, validate_object_key,
 };
 
 pub(crate) const DEFAULT_COVERAGE_INDEX_BUCKET_SIZE: u64 = 100_000;
@@ -39,6 +39,9 @@ const MAX_COVERAGE_INDEX_V2_RECENT_BUCKETS: usize = 2_048;
 const MAX_COVERAGE_INDEX_V2_RECENT_ENTRIES_PER_BUCKET: usize = 256;
 const MAX_COVERAGE_INDEX_V2_RECENT_CACHE_BYTES: usize = 128 * 1024 * 1024;
 const COVERAGE_INDEX_V2_OVER_BUDGET_QUEUE_THROTTLE_TTL: Duration = Duration::from_secs(60);
+const COVERAGE_INDEX_V2_BUCKET_LOCK_TTL: Duration = Duration::from_secs(300);
+const COVERAGE_INDEX_V2_BUCKET_LOCK_MAX_WAIT: Duration = Duration::from_secs(30);
+const COVERAGE_INDEX_V2_BUCKET_LOCK_RETRY: Duration = Duration::from_millis(10);
 
 static COVERAGE_INDEX_UPDATE_LOCKS: OnceLock<Mutex<BTreeMap<String, Weak<Mutex<()>>>>> =
     OnceLock::new();
@@ -1219,6 +1222,79 @@ where
     )
 }
 
+pub(crate) fn with_coverage_index_v2_bucket_locks<S, T, F>(
+    object_store: &S,
+    buckets: &BTreeSet<CoverageIndexV2Bucket>,
+    operation: F,
+) -> Result<T, DatalensError>
+where
+    S: ObjectStore,
+    F: FnOnce() -> Result<T, DatalensError>,
+{
+    let buckets = buckets.iter().cloned().collect::<Vec<_>>();
+    with_coverage_index_v2_bucket_locks_from(object_store, &buckets, operation)
+}
+
+fn with_coverage_index_v2_bucket_locks_from<S, T, F>(
+    object_store: &S,
+    buckets: &[CoverageIndexV2Bucket],
+    operation: F,
+) -> Result<T, DatalensError>
+where
+    S: ObjectStore,
+    F: FnOnce() -> Result<T, DatalensError>,
+{
+    let Some(bucket) = buckets.first() else {
+        return operation();
+    };
+    let lock =
+        coverage_index_update_lock(object_store, &coverage_index_v2_bucket_lock_key(bucket))?;
+    let _local_guard = lock_coverage_index_update(&lock)?;
+    let distributed_lease = acquire_coverage_index_v2_bucket_lock(object_store, bucket)?;
+    let result = with_coverage_index_v2_bucket_locks_from(object_store, &buckets[1..], operation);
+    let release_result = distributed_lease.map(|lease| object_store.release_lock(lease));
+    match (result, release_result) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Some(Err(error))) => Err(error),
+        (Ok(value), _) => Ok(value),
+    }
+}
+
+fn acquire_coverage_index_v2_bucket_lock<S>(
+    object_store: &S,
+    bucket: &CoverageIndexV2Bucket,
+) -> Result<Option<ObjectLockLease>, DatalensError>
+where
+    S: ObjectStore,
+{
+    if !object_store.supports_owner_conditional_locks() {
+        return Ok(None);
+    }
+    let owner = encode_object_lock_owner(&format!(
+        "coverage-index-v2:{}:{}",
+        process::id(),
+        coverage_index_v2_immutable_id()?
+    ))?;
+    let key = coverage_index_v2_bucket_lock_key(bucket);
+    let started = Instant::now();
+    loop {
+        if let Some(lease) = object_store.try_acquire_lock_with_ttl(
+            &key,
+            &owner,
+            COVERAGE_INDEX_V2_BUCKET_LOCK_TTL,
+        )? {
+            return Ok(Some(lease));
+        }
+        if started.elapsed() >= COVERAGE_INDEX_V2_BUCKET_LOCK_MAX_WAIT {
+            return Err(DatalensError::new(
+                DatalensErrorKind::StorageWriteFailure,
+                format!("coverage index v2 bucket lock busy: {key}"),
+            ));
+        }
+        thread::sleep(COVERAGE_INDEX_V2_BUCKET_LOCK_RETRY);
+    }
+}
+
 fn trim_cached_v2_bucket_entries(
     cache: &mut BTreeMap<String, CoverageIndexV2BucketReadCacheEntry>,
 ) {
@@ -1761,10 +1837,11 @@ pub(crate) fn write_entry_with_legacy_index<S>(
 where
     S: ObjectStore,
 {
-    let coalesced_empty_entry = if entry.object_key.is_none() {
-        coalesced_empty_v2_entry(object_store, entry)?
+    let preexisting_empty_scope_entries = if entry.object_key.is_none() {
+        let probe = empty_coverage_coalescing_probe(entry)?;
+        read_legacy_entries_for_replacement_scope(object_store, &probe)?
     } else {
-        None
+        Vec::new()
     };
     if legacy_write_enabled {
         for (bucket_start, bucket_end) in
@@ -1812,28 +1889,37 @@ where
             }
         }
     }
-    if let Some((coalesced_entry, replaced_entries, superseded_delta_keys)) = coalesced_empty_entry
-    {
-        write_v2_replacement_delta(
-            object_store,
-            &coalesced_entry,
-            &replaced_entries,
-            std::slice::from_ref(&coalesced_entry),
-        )?;
-        delete_superseded_empty_v2_delta_objects(object_store, superseded_delta_keys);
-    } else {
-        write_v2_entry_delta(object_store, entry)?;
-    }
+    let buckets = coverage_index_v2_entry_buckets(entry);
+    with_coverage_index_v2_bucket_locks(object_store, &buckets, || {
+        let coalesced_empty_entry = if entry.object_key.is_none() {
+            coalesced_empty_v2_entry(
+                object_store,
+                entry,
+                &buckets,
+                &preexisting_empty_scope_entries,
+            )?
+        } else {
+            None
+        };
+        if let Some((coalesced_entry, replaced_entries, superseded_delta_keys)) =
+            coalesced_empty_entry
+        {
+            write_v2_replacement_delta(
+                object_store,
+                &coalesced_entry,
+                &replaced_entries,
+                std::slice::from_ref(&coalesced_entry),
+            )?;
+            delete_superseded_empty_v2_delta_objects(object_store, superseded_delta_keys);
+        } else {
+            write_v2_entry_delta(object_store, entry)?;
+        }
+        Ok(())
+    })?;
     Ok(())
 }
 
-fn coalesced_empty_v2_entry<S>(
-    object_store: &S,
-    entry: &ManifestEntry,
-) -> Result<Option<CoalescedEmptyV2Entry>, DatalensError>
-where
-    S: ObjectStore,
-{
+fn empty_coverage_coalescing_probe(entry: &ManifestEntry) -> Result<ManifestEntry, DatalensError> {
     let mut probe = entry.clone();
     probe.range = LedgerRange::try_new(
         entry.range.kind(),
@@ -1846,7 +1932,37 @@ where
             .end()
             .saturating_add(DEFAULT_COVERAGE_INDEX_BUCKET_SIZE),
     )?;
-    let existing_entries = read_entries_for_replacement_scope(object_store, &probe)?;
+    Ok(probe)
+}
+
+fn coalesced_empty_v2_entry<S>(
+    object_store: &S,
+    entry: &ManifestEntry,
+    locked_buckets: &BTreeSet<CoverageIndexV2Bucket>,
+    preexisting_entries: &[ManifestEntry],
+) -> Result<Option<CoalescedEmptyV2Entry>, DatalensError>
+where
+    S: ObjectStore,
+{
+    let probe = empty_coverage_coalescing_probe(entry)?;
+    let mut existing_entries = preexisting_entries.to_vec();
+    read_entries_for_v2_buckets(
+        object_store,
+        coverage_index_v2_entry_buckets(&probe),
+        &mut existing_entries,
+    )?;
+    let mut existing_manifest = Manifest {
+        entries: existing_entries,
+    };
+    existing_manifest.normalize();
+    let existing_entries = existing_manifest
+        .entries
+        .into_iter()
+        .filter(|existing| {
+            replacement_scope_matches(existing, &probe)
+                && existing.range.intersection(&probe.range).is_some()
+        })
+        .collect::<Vec<_>>();
     let mut coalesced = entry.clone();
     let mut found_empty_entry = false;
     loop {
@@ -1860,6 +1976,16 @@ where
                 coalesced.range.start().min(existing.range.start()),
                 coalesced.range.end().max(existing.range.end()),
             )?;
+            let merged_entry = ManifestEntry {
+                range: merged_range.clone(),
+                ..coalesced.clone()
+            };
+            if !coverage_index_v2_entry_buckets(&merged_entry)
+                .iter()
+                .all(|bucket| locked_buckets.contains(bucket))
+            {
+                continue;
+            }
             changed |= merged_range != coalesced.range;
             coalesced.range = merged_range;
             found_empty_entry = true;
@@ -1885,6 +2011,9 @@ where
             existing.object_key.is_none()
                 && replacement_scope_matches(existing, &coalesced)
                 && existing.range.intersection(&coalesced.range).is_some()
+                && coverage_index_v2_entry_buckets(existing)
+                    .iter()
+                    .all(|bucket| locked_buckets.contains(bucket))
         })
         .collect::<Vec<_>>();
     if replaced_entries.is_empty() {
@@ -2044,6 +2173,30 @@ where
     Ok(())
 }
 
+fn write_v2_replacement_delta_with_bucket_locks<S>(
+    object_store: &S,
+    replacement_entry: &ManifestEntry,
+    replaced_entries: &[ManifestEntry],
+    published_entries: &[ManifestEntry],
+) -> Result<(), DatalensError>
+where
+    S: ObjectStore,
+{
+    let buckets = coverage_index_v2_replacement_buckets(
+        replacement_entry,
+        replaced_entries,
+        published_entries,
+    );
+    with_coverage_index_v2_bucket_locks(object_store, &buckets, || {
+        write_v2_replacement_delta(
+            object_store,
+            replacement_entry,
+            replaced_entries,
+            published_entries,
+        )
+    })
+}
+
 fn write_v2_replacement_delta<S>(
     object_store: &S,
     replacement_entry: &ManifestEntry,
@@ -2053,10 +2206,11 @@ fn write_v2_replacement_delta<S>(
 where
     S: ObjectStore,
 {
-    let mut buckets = coverage_index_v2_entry_buckets(replacement_entry);
-    for entry in replaced_entries.iter().chain(published_entries) {
-        buckets.extend(coverage_index_v2_entry_buckets(entry));
-    }
+    let buckets = coverage_index_v2_replacement_buckets(
+        replacement_entry,
+        replaced_entries,
+        published_entries,
+    );
     for bucket in buckets {
         let entries = published_entries
             .iter()
@@ -2113,6 +2267,18 @@ where
         clear_recent_v2_bucket_entries(object_store, &bucket);
     }
     Ok(())
+}
+
+fn coverage_index_v2_replacement_buckets(
+    replacement_entry: &ManifestEntry,
+    replaced_entries: &[ManifestEntry],
+    published_entries: &[ManifestEntry],
+) -> BTreeSet<CoverageIndexV2Bucket> {
+    let mut buckets = coverage_index_v2_entry_buckets(replacement_entry);
+    for entry in replaced_entries.iter().chain(published_entries) {
+        buckets.extend(coverage_index_v2_entry_buckets(entry));
+    }
+    buckets
 }
 
 pub(crate) fn write_v2_snapshot<S>(
@@ -2409,6 +2575,29 @@ pub(crate) fn read_entries_for_replacement_scope<S>(
 where
     S: ObjectStore,
 {
+    let mut entries = read_legacy_entries_for_replacement_scope(object_store, entry)?;
+    let mut v2_entries = Vec::new();
+    read_entries_for_v2_buckets(
+        object_store,
+        coverage_index_v2_entry_buckets(entry),
+        &mut v2_entries,
+    )?;
+    entries.extend(v2_entries.into_iter().filter(|existing_entry| {
+        replacement_scope_matches(existing_entry, entry)
+            && existing_entry.range.intersection(&entry.range).is_some()
+    }));
+    let mut manifest = Manifest { entries };
+    manifest.normalize();
+    Ok(manifest.entries)
+}
+
+fn read_legacy_entries_for_replacement_scope<S>(
+    object_store: &S,
+    entry: &ManifestEntry,
+) -> Result<Vec<ManifestEntry>, DatalensError>
+where
+    S: ObjectStore,
+{
     let mut entries = Vec::new();
     for (bucket_start, bucket_end) in
         bucket_ranges(&entry.range, DEFAULT_COVERAGE_INDEX_BUCKET_SIZE)
@@ -2430,19 +2619,7 @@ where
                 && existing_entry.range.intersection(&entry.range).is_some()
         }));
     }
-    let mut v2_entries = Vec::new();
-    read_entries_for_v2_buckets(
-        object_store,
-        coverage_index_v2_entry_buckets(entry),
-        &mut v2_entries,
-    )?;
-    entries.extend(v2_entries.into_iter().filter(|existing_entry| {
-        replacement_scope_matches(existing_entry, entry)
-            && existing_entry.range.intersection(&entry.range).is_some()
-    }));
-    let mut manifest = Manifest { entries };
-    manifest.normalize();
-    Ok(manifest.entries)
+    Ok(entries)
 }
 
 #[allow(dead_code)]
@@ -2467,7 +2644,7 @@ where
     S: ObjectStore,
 {
     if !legacy_write_enabled {
-        write_v2_replacement_delta(
+        write_v2_replacement_delta_with_bucket_locks(
             object_store,
             entry,
             &replacement.replaced_entries,
@@ -2585,7 +2762,7 @@ where
         entries: replacement_published_entries(&replaced_manifest.entries, entry)?,
     };
     published_manifest.normalize();
-    write_v2_replacement_delta(
+    write_v2_replacement_delta_with_bucket_locks(
         object_store,
         entry,
         &replaced_manifest.entries,
@@ -2810,6 +2987,13 @@ fn coverage_index_v2_snapshot_head_prefix(
 ) -> String {
     format!(
         "chains/{chain_key}/coverage-index-v2/snapshot-heads/{scope}/{bucket_start:020}-{bucket_end:020}"
+    )
+}
+
+fn coverage_index_v2_bucket_lock_key(bucket: &CoverageIndexV2Bucket) -> String {
+    format!(
+        "chains/{}/coverage-index-v2/locks/{}/{:020}-{:020}.json",
+        bucket.chain_key, bucket.scope, bucket.bucket_start, bucket.bucket_end
     )
 }
 

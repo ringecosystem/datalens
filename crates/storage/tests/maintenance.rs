@@ -1,4 +1,7 @@
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use datalens_chain::{AdapterKey, DatasetSelector, FinalityLevel};
 use datalens_core::{
@@ -16,7 +19,7 @@ use parquet::{
     file::reader::{FileReader, SerializedFileReader},
 };
 use std::sync::{
-    Arc, Mutex,
+    Arc, Condvar, Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
@@ -75,6 +78,19 @@ struct SlowCoverageIndexV2ListPageStore {
 struct SlowCoverageIndexV2CleanupGetStore {
     inner: LocalObjectStore,
     delay: Duration,
+}
+
+#[derive(Clone, Debug)]
+struct PausedCoverageIndexV2SnapshotPutStore {
+    inner: LocalObjectStore,
+    snapshot_put: Arc<(Mutex<SnapshotPutState>, Condvar)>,
+    delta_put_started: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Default)]
+struct SnapshotPutState {
+    started: bool,
+    released: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -237,6 +253,38 @@ impl SlowCoverageIndexV2CleanupGetStore {
             inner: LocalObjectStore::new(root),
             delay,
         }
+    }
+}
+
+impl PausedCoverageIndexV2SnapshotPutStore {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            inner: LocalObjectStore::new(root),
+            snapshot_put: Arc::new((Mutex::new(SnapshotPutState::default()), Condvar::new())),
+            delta_put_started: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn wait_for_snapshot_put(&self) {
+        let (state, ready) = &*self.snapshot_put;
+        let mut state = state.lock().expect("snapshot put state");
+        while !state.started {
+            state = ready.wait(state).expect("snapshot put start");
+        }
+    }
+
+    fn release_snapshot_put(&self) {
+        let (state, ready) = &*self.snapshot_put;
+        state.lock().expect("snapshot put state").released = true;
+        ready.notify_all();
+    }
+
+    fn delta_put_started(&self) -> bool {
+        self.delta_put_started.load(Ordering::SeqCst)
+    }
+
+    fn reset_delta_put_started(&self) {
+        self.delta_put_started.store(false, Ordering::SeqCst);
     }
 }
 
@@ -697,6 +745,61 @@ impl ObjectStore for SlowCoverageIndexV2ListPageStore {
             self.list_pages.fetch_add(1, Ordering::SeqCst);
             std::thread::sleep(self.delay);
         }
+        self.inner.list_page(prefix, start_after, limit)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), DatalensError> {
+        self.inner.delete(key)
+    }
+
+    fn lock_namespace(&self) -> String {
+        self.inner.lock_namespace()
+    }
+}
+
+impl ObjectStore for PausedCoverageIndexV2SnapshotPutStore {
+    fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError> {
+        self.inner.get(key)
+    }
+
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
+        if key.contains("/coverage-index-v2/snapshots/") {
+            let (state, ready) = &*self.snapshot_put;
+            let mut state = state.lock().expect("snapshot put state");
+            state.started = true;
+            ready.notify_all();
+            while !state.released {
+                state = ready.wait(state).expect("snapshot put release");
+            }
+        }
+        if key.contains("/coverage-index-v2/deltas/") {
+            self.delta_put_started.store(true, Ordering::SeqCst);
+        }
+        self.inner.put(key, bytes)
+    }
+
+    fn put_if_absent(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<ObjectPutIfAbsentResult, DatalensError> {
+        self.inner.put_if_absent(key, bytes)
+    }
+
+    fn exists(&self, key: &str) -> Result<bool, DatalensError> {
+        self.inner.exists(key)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
+        self.inner.list(prefix)
+    }
+
+    fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ObjectListPage, DatalensError> {
         self.inner.list_page(prefix, start_after, limit)
     }
 
@@ -5243,6 +5346,89 @@ fn test_compaction_coverage_index_v2_delta_count_threshold_triggers_compaction()
             )
             .expect("read rows after threshold compaction"),
         &[100, 101, 102],
+    );
+}
+
+#[test]
+fn test_compaction_coverage_index_v2_bucket_lock_blocks_writer_until_snapshot_head() {
+    let store = PausedCoverageIndexV2SnapshotPutStore::new(temp_storage_root(
+        "coverage-v2-compaction-writer-lock",
+    ));
+    let storage = DurableStorage::from_object_store_with_config(
+        store.clone(),
+        DurableStorageConfig {
+            legacy_coverage_index_write_enabled: false,
+            ..DurableStorageConfig::default()
+        },
+    );
+    let chain = test_chain();
+    let scope = "exact/evm.blocks/block/all/safe";
+    for id in [
+        "00000000000000000000-0000000000-00000000000000000001-a",
+        "00000000000000000000-0000000000-00000000000000000002-b",
+        "00000000000000000000-0000000000-00000000000000000003-c",
+    ] {
+        write_coverage_index_v2_delta(&storage, &chain, scope, 0, 99_999, id);
+    }
+    write_coverage_index_v2_compaction_queue_record(&storage, &chain, scope, 0, 99_999);
+    store.reset_delta_put_started();
+
+    let compaction_storage = storage.clone();
+    let compaction_chain = chain.clone();
+    let compaction = std::thread::spawn(move || {
+        compaction_storage.compact_small_objects_for_chain(
+            &compaction_chain,
+            MaintenanceCompactionConfig {
+                coverage_index_v2_delta_count_threshold: 3,
+                cleanup_enabled: false,
+                ..coverage_index_v2_compaction_config(false)
+            },
+        )
+    });
+    store.wait_for_snapshot_put();
+
+    let writer_storage = storage.clone();
+    let writer_chain = chain.clone();
+    let writer_started = Arc::new(AtomicBool::new(false));
+    let writer_started_for_thread = writer_started.clone();
+    let writer = std::thread::spawn(move || {
+        writer_started_for_thread.store(true, Ordering::SeqCst);
+        write_block_object_to_storage(&writer_storage, &writer_chain, 200, FinalityLevel::Safe)
+    });
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !writer_started.load(Ordering::SeqCst) && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert!(
+        writer_started.load(Ordering::SeqCst),
+        "writer thread must start"
+    );
+    while !store.delta_put_started() && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert!(
+        !store.delta_put_started(),
+        "writer must not publish a V2 delta before the compaction snapshot head"
+    );
+
+    store.release_snapshot_put();
+    let report = compaction
+        .join()
+        .expect("compaction thread")
+        .expect("compaction");
+    writer.join().expect("writer thread");
+
+    assert_eq!(report.coverage_index_v2_compacted_buckets, 1);
+    assert_block_numbers(
+        storage
+            .read_rows(
+                &chain,
+                &DatasetKey::evm_blocks(),
+                &DatasetSelector::all(),
+                LedgerRange::blocks(200, 200).expect("range"),
+            )
+            .expect("read writer data after compaction"),
+        &[200],
     );
 }
 
