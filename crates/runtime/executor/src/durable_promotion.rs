@@ -1097,6 +1097,7 @@ where
         .any(|covered_range| covered_range.intersection(range) == Some(range.clone())))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn claim_pending_intents(
     repository: &dyn DurablePromotionIntentRepository,
     chain: &ChainIdentity,
@@ -1188,6 +1189,7 @@ fn claim_pending_intents(
     claimed
 }
 
+#[allow(clippy::too_many_arguments)]
 fn claim_pending_intent(
     repository: &dyn DurablePromotionIntentRepository,
     chain: &ChainIdentity,
