@@ -1094,6 +1094,16 @@ fn append_recent_v2_bucket_entries<S>(
     );
 }
 
+fn clear_recent_v2_bucket_entries<S>(object_store: &S, bucket: &CoverageIndexV2Bucket)
+where
+    S: ObjectStore,
+{
+    let key = coverage_index_v2_bucket_recent_key(object_store, bucket);
+    if let Ok(mut recent) = coverage_index_v2_recent_bucket_entries().lock() {
+        recent.remove(&key);
+    }
+}
+
 fn retain_fresh_recent_v2_entries(
     entries: &mut Vec<CoverageIndexV2RecentBucketEntry>,
     now: Instant,
@@ -1687,6 +1697,11 @@ pub(crate) fn write_entry_with_legacy_index<S>(
 where
     S: ObjectStore,
 {
+    let coalesced_empty_entry = if entry.object_key.is_none() {
+        coalesced_empty_v2_entry(object_store, entry)?
+    } else {
+        None
+    };
     if legacy_write_enabled {
         for (bucket_start, bucket_end) in
             bucket_ranges(&entry.range, DEFAULT_COVERAGE_INDEX_BUCKET_SIZE)
@@ -1733,8 +1748,184 @@ where
             }
         }
     }
-    write_v2_entry_delta(object_store, entry)?;
+    if let Some((coalesced_entry, replaced_entries, superseded_delta_keys)) = coalesced_empty_entry
+    {
+        write_v2_replacement_delta(
+            object_store,
+            &coalesced_entry,
+            &replaced_entries,
+            std::slice::from_ref(&coalesced_entry),
+        )?;
+        delete_superseded_empty_v2_delta_objects(object_store, superseded_delta_keys);
+    } else {
+        write_v2_entry_delta(object_store, entry)?;
+    }
     Ok(())
+}
+
+fn coalesced_empty_v2_entry<S>(
+    object_store: &S,
+    entry: &ManifestEntry,
+) -> Result<Option<CoalescedEmptyV2Entry>, DatalensError>
+where
+    S: ObjectStore,
+{
+    let mut probe = entry.clone();
+    probe.range = LedgerRange::try_new(
+        entry.range.kind(),
+        entry
+            .range
+            .start()
+            .saturating_sub(DEFAULT_COVERAGE_INDEX_BUCKET_SIZE),
+        entry
+            .range
+            .end()
+            .saturating_add(DEFAULT_COVERAGE_INDEX_BUCKET_SIZE),
+    )?;
+    let existing_entries = read_entries_for_replacement_scope(object_store, &probe)?;
+    let mut coalesced = entry.clone();
+    let mut found_empty_entry = false;
+    loop {
+        let mut changed = false;
+        for existing in &existing_entries {
+            if !can_merge_empty_coverage(&coalesced, existing) {
+                continue;
+            }
+            let merged_range = LedgerRange::try_new(
+                coalesced.range.kind(),
+                coalesced.range.start().min(existing.range.start()),
+                coalesced.range.end().max(existing.range.end()),
+            )?;
+            changed |= merged_range != coalesced.range;
+            coalesced.range = merged_range;
+            found_empty_entry = true;
+        }
+        if !changed {
+            break;
+        }
+    }
+    if !found_empty_entry {
+        return Ok(None);
+    }
+    if existing_entries.iter().any(|existing| {
+        replacement_scope_matches(existing, &coalesced)
+            && existing.object_key.is_some()
+            && existing.range.intersection(&coalesced.range).is_some()
+    }) {
+        return Ok(None);
+    }
+
+    let replaced_entries = existing_entries
+        .into_iter()
+        .filter(|existing| {
+            existing.object_key.is_none()
+                && replacement_scope_matches(existing, &coalesced)
+                && existing.range.intersection(&coalesced.range).is_some()
+        })
+        .collect::<Vec<_>>();
+    if replaced_entries.is_empty() {
+        return Ok(None);
+    }
+    let superseded_delta_keys = superseded_empty_v2_delta_keys(object_store, &coalesced)?;
+    Ok(Some((coalesced, replaced_entries, superseded_delta_keys)))
+}
+
+type CoalescedEmptyV2Entry = (ManifestEntry, Vec<ManifestEntry>, BTreeSet<String>);
+
+fn can_merge_empty_coverage(left: &ManifestEntry, right: &ManifestEntry) -> bool {
+    left.object_key.is_none()
+        && right.object_key.is_none()
+        && replacement_scope_matches(left, right)
+        && left.range.end().saturating_add(1) >= right.range.start()
+        && right.range.end().saturating_add(1) >= left.range.start()
+}
+
+fn superseded_empty_v2_delta_keys<S>(
+    object_store: &S,
+    replacement_entry: &ManifestEntry,
+) -> Result<BTreeSet<String>, DatalensError>
+where
+    S: ObjectStore,
+{
+    let mut keys = BTreeSet::new();
+    for bucket in coverage_index_v2_entry_buckets(replacement_entry) {
+        for object in pending_v2_delta_objects_for_bucket(object_store, &bucket)? {
+            if v2_delta_is_superseded_empty(&object.delta, replacement_entry) {
+                keys.insert(object.key);
+            }
+        }
+    }
+    Ok(keys)
+}
+
+fn v2_delta_is_superseded_empty(
+    delta: &CoverageIndexV2Delta,
+    replacement_entry: &ManifestEntry,
+) -> bool {
+    let mut saw_entry = false;
+    if let Some(replacement) = &delta.replacement {
+        if !is_empty_entry_inside(&replacement.entry, replacement_entry) {
+            return false;
+        }
+        saw_entry = true;
+    }
+    for entry in &delta.entries {
+        if !is_empty_entry_inside(entry, replacement_entry) {
+            return false;
+        }
+        saw_entry = true;
+    }
+    saw_entry
+}
+
+fn is_empty_entry_inside(entry: &ManifestEntry, outer: &ManifestEntry) -> bool {
+    entry.object_key.is_none()
+        && replacement_scope_matches(entry, outer)
+        && entry.range.start() >= outer.range.start()
+        && entry.range.end() <= outer.range.end()
+}
+
+fn pending_v2_delta_objects_for_bucket<S>(
+    object_store: &S,
+    bucket: &CoverageIndexV2Bucket,
+) -> Result<Vec<CoverageIndexV2DeltaObject>, DatalensError>
+where
+    S: ObjectStore,
+{
+    let mut compacted_delta_keys = BTreeSet::new();
+    let mut start_after_delta_key = None;
+    if let Some((_, head)) = latest_v2_snapshot_head_object(object_store, bucket)? {
+        if !head.included_delta_high_watermark.is_empty() {
+            start_after_delta_key = Some(head.included_delta_high_watermark);
+        } else {
+            let snapshot = read_v2_snapshot(object_store, bucket, &head.snapshot_key)?;
+            compacted_delta_keys.extend(snapshot.compacted_delta_keys);
+        }
+    }
+    let objects = list_v2_delta_object_metadata_for_bucket(
+        object_store,
+        bucket,
+        &compacted_delta_keys,
+        None,
+        start_after_delta_key.as_deref(),
+    )?;
+    read_v2_delta_objects_from_metadata(object_store, bucket, &objects)
+}
+
+fn delete_superseded_empty_v2_delta_objects<S>(object_store: &S, keys: BTreeSet<String>)
+where
+    S: ObjectStore,
+{
+    for key in keys {
+        if let Err(error) = object_store.delete(&key) {
+            log::warn!(
+                "storage coverage index v2 empty delta cleanup failed key={} kind={:?} message={}",
+                key,
+                error.kind,
+                error.message
+            );
+        }
+    }
 }
 
 fn write_v2_entry_delta<S>(object_store: &S, entry: &ManifestEntry) -> Result<(), DatalensError>
@@ -1855,6 +2046,7 @@ where
             );
         }
         mark_cached_v2_bucket_entries_dirty(object_store, &bucket);
+        clear_recent_v2_bucket_entries(object_store, &bucket);
     }
     Ok(())
 }

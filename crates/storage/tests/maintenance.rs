@@ -6212,7 +6212,7 @@ fn test_compaction_coverage_index_v2_snapshot_head_writes_stay_within_overwrite_
 }
 
 #[test]
-fn test_compaction_coverage_index_v2_default_config_compacts_at_get_budget() {
+fn test_compaction_coverage_index_v2_default_config_skips_coalesced_empty_deltas() {
     let storage = LocalStorage::new(temp_storage_root("coverage-v2-default-budget"));
     let chain = test_chain();
     for number in 0..64 {
@@ -6224,10 +6224,10 @@ fn test_compaction_coverage_index_v2_default_config_compacts_at_get_budget() {
         .compact_small_objects_for_chain(&chain, MaintenanceCompactionConfig::default())
         .expect("default coverage index v2 compaction");
 
-    assert_eq!(report.coverage_index_v2_compacted_buckets, 1);
-    assert_eq!(report.coverage_index_v2_compacted_deltas, 64);
-    assert_eq!(report.get_operations, 64);
-    assert_eq!(coverage_index_v2_snapshot_head_count(&storage, &chain), 1);
+    assert_eq!(report.coverage_index_v2_compacted_buckets, 0);
+    assert_eq!(report.coverage_index_v2_compacted_deltas, 0);
+    assert_eq!(coverage_index_v2_delta_count(&storage, &chain), 1);
+    assert_eq!(coverage_index_v2_snapshot_head_count(&storage, &chain), 0);
 }
 
 #[test]
