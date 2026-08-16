@@ -35,6 +35,7 @@ use crate::{
 const MAX_SPARSE_SOURCE_RANGES_PER_CANDIDATE: usize = 3;
 const MAX_SPARSE_CANDIDATE_RANGE_SPAN_BLOCKS: u64 = 100_000;
 const COVERAGE_INDEX_V2_CLEANUP_RECORDS_PER_TICK: usize = 4;
+const COVERAGE_INDEX_V2_SNAPSHOT_CLEANUP_RECORDS_PER_BUCKET: usize = 2;
 const COVERAGE_INDEX_V2_BUCKET_SCAN_PAGES_PER_TICK: usize = 8;
 const COVERAGE_INDEX_V2_QUEUE_RECORDS_PER_SCAN: usize = 8;
 
@@ -1759,9 +1760,14 @@ where
                 && operation_budget.remaining_puts() > 0
                 && bucket_scan_item.queue_key.is_none()
             {
-                for mut record in
-                    v2_snapshot_cleanup_records_for_bucket(self.object_store(), &bucket)?
-                {
+                let max_snapshot_cleanup_records = operation_budget
+                    .remaining_puts()
+                    .min(COVERAGE_INDEX_V2_SNAPSHOT_CLEANUP_RECORDS_PER_BUCKET);
+                for mut record in v2_snapshot_cleanup_records_for_bucket(
+                    self.object_store(),
+                    &bucket,
+                    max_snapshot_cleanup_records,
+                )? {
                     if tick_started.elapsed() >= max_duration {
                         partial = true;
                         break;
@@ -1956,9 +1962,14 @@ where
                 && operation_budget.remaining_puts() > 0
                 && tick_started.elapsed() < max_duration
             {
-                for mut record in
-                    v2_snapshot_cleanup_records_for_bucket(self.object_store(), &bucket)?
-                {
+                let max_snapshot_cleanup_records = operation_budget
+                    .remaining_puts()
+                    .min(COVERAGE_INDEX_V2_SNAPSHOT_CLEANUP_RECORDS_PER_BUCKET);
+                for mut record in v2_snapshot_cleanup_records_for_bucket(
+                    self.object_store(),
+                    &bucket,
+                    max_snapshot_cleanup_records,
+                )? {
                     if tick_started.elapsed() >= max_duration {
                         partial = true;
                         break;

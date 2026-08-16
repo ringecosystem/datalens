@@ -847,10 +847,14 @@ where
 pub(crate) fn v2_snapshot_cleanup_records_for_bucket<S>(
     object_store: &S,
     bucket: &CoverageIndexV2Bucket,
+    max_records: usize,
 ) -> Result<Vec<CoverageIndexV2CleanupRecord>, DatalensError>
 where
     S: ObjectStore,
 {
+    if max_records == 0 {
+        return Ok(Vec::new());
+    }
     let delta_prefix = coverage_index_v2_delta_prefix(
         &bucket.chain_key,
         &bucket.scope,
@@ -866,7 +870,7 @@ where
         .map(|object| object.key)
         .collect::<BTreeSet<_>>();
     let mut records = Vec::new();
-    for (_, head) in list_v2_snapshot_heads_for_bucket(object_store, bucket)? {
+    for (_, head) in list_v2_snapshot_heads_for_bucket(object_store, bucket, Some(max_records))? {
         let snapshot = read_v2_snapshot(object_store, bucket, &head.snapshot_key)?;
         let compacted_delta_keys = snapshot
             .compacted_delta_keys
@@ -892,6 +896,9 @@ where
             snapshot_key: head.snapshot_key,
             compacted_delta_keys,
         });
+        if records.len() >= max_records {
+            break;
+        }
     }
     Ok(records)
 }
@@ -1591,14 +1598,17 @@ fn latest_v2_snapshot_head_object<S>(
 where
     S: ObjectStore,
 {
-    Ok(list_v2_snapshot_heads_for_bucket(object_store, bucket)?
-        .into_iter()
-        .last())
+    Ok(
+        list_v2_snapshot_heads_for_bucket(object_store, bucket, None)?
+            .into_iter()
+            .last(),
+    )
 }
 
 fn list_v2_snapshot_heads_for_bucket<S>(
     object_store: &S,
     bucket: &CoverageIndexV2Bucket,
+    max_heads: Option<usize>,
 ) -> Result<Vec<(String, CoverageIndexV2SnapshotHead)>, DatalensError>
 where
     S: ObjectStore,
@@ -1643,6 +1653,12 @@ where
                 bucket,
             )?;
             heads.push((object.key.clone(), head));
+            if max_heads.is_some_and(|max_heads| heads.len() >= max_heads) {
+                break;
+            }
+        }
+        if max_heads.is_some_and(|max_heads| heads.len() >= max_heads) {
+            break;
         }
         if !page.has_more {
             break;
