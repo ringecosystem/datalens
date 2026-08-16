@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     hash::{DefaultHasher, Hash, Hasher},
     sync::{
         Arc, Condvar, Mutex, Once,
@@ -34,6 +34,7 @@ const DEFAULT_PROMOTION_WORKERS: usize = 4;
 const DEFAULT_PROMOTION_QUEUE_CAPACITY: usize = 1024;
 const DEFAULT_INTENT_WORKERS: usize = 2;
 const DEFAULT_INTENT_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const DEFAULT_INTENT_EMPTY_CLAIM_THROTTLE: Duration = Duration::from_secs(5);
 const DEFAULT_INTENT_CLAIM_BATCH_SIZE: usize = 16;
 const DEFAULT_INTENT_BACKLOG_METRIC_INTERVAL: Duration = Duration::from_secs(10);
 const DEFAULT_INTENT_RETRY_BASE_DELAY_SECONDS: u64 = 60;
@@ -93,11 +94,13 @@ where
         config: DurablePromotionIntentWorkerConfig,
     ) -> Result<Self, DatalensError> {
         let claim_lock = Arc::new(Mutex::new(()));
+        let empty_claims = Arc::new(Mutex::new(BTreeMap::new()));
         let shared = IntentWorkerShared {
             repository,
             metrics,
             provider_ranges,
             claim_lock,
+            empty_claims,
             startup_maintenance_once,
             claim_batch_size: config.claim_batch_size,
             terminal_retention_seconds: config.terminal_retention_seconds,
@@ -126,6 +129,7 @@ struct IntentWorkerShared {
     metrics: Option<Arc<MetricsRecorder>>,
     provider_ranges: ProviderRangeController,
     claim_lock: Arc<Mutex<()>>,
+    empty_claims: Arc<Mutex<BTreeMap<String, Instant>>>,
     startup_maintenance_once: Arc<Once>,
     claim_batch_size: usize,
     terminal_retention_seconds: Option<u64>,
@@ -458,9 +462,10 @@ where
             let mut last_backlog_metric_sample: Option<Instant> = None;
             loop {
                 let now = unix_seconds_now();
-                let record_backlog_metrics = last_backlog_metric_sample.is_none_or(|sampled| {
-                    sampled.elapsed() >= DEFAULT_INTENT_BACKLOG_METRIC_INTERVAL
-                });
+                let record_backlog_metrics = worker_index == 0
+                    && last_backlog_metric_sample.is_none_or(|sampled| {
+                        sampled.elapsed() >= DEFAULT_INTENT_BACKLOG_METRIC_INTERVAL
+                    });
                 let intents = {
                     let _claim = match shared.claim_lock.lock() {
                         Ok(claim) => claim,
@@ -474,6 +479,7 @@ where
                         worker_index,
                         record_backlog_metrics,
                         shared.claim_batch_size,
+                        shared.empty_claims.as_ref(),
                     )
                 };
                 if record_backlog_metrics {
@@ -1099,6 +1105,7 @@ fn claim_pending_intents(
     worker_index: usize,
     record_backlog_metrics: bool,
     claim_batch_size: usize,
+    empty_claims: &Mutex<BTreeMap<String, Instant>>,
 ) -> Vec<DurablePromotionIntent> {
     let Some(first) = claim_pending_intent(
         repository,
@@ -1108,6 +1115,7 @@ fn claim_pending_intents(
         worker_index,
         record_backlog_metrics,
         claim_batch_size,
+        empty_claims,
     ) else {
         return Vec::new();
     };
@@ -1188,6 +1196,7 @@ fn claim_pending_intent(
     worker_index: usize,
     record_backlog_metrics: bool,
     claim_batch_size: usize,
+    empty_claims: &Mutex<BTreeMap<String, Instant>>,
 ) -> Option<DurablePromotionIntent> {
     if record_backlog_metrics {
         match repository.pending_backlog_for_chain(chain, now) {
@@ -1204,6 +1213,10 @@ fn claim_pending_intent(
     }
     for source in intent_claim_source_order(worker_index) {
         let source_label = intent_source_label(source);
+        let empty_claim_key = empty_intent_claim_key(chain, source_label);
+        if recently_empty_intent_claim(empty_claims, &empty_claim_key) {
+            continue;
+        }
         let list_started = Instant::now();
         let pending = match repository.list_pending_for_chain_and_source(
             chain,
@@ -1218,8 +1231,10 @@ fn claim_pending_intent(
                     MetricsDurableIntentClaimOutcome::Claimed
                 };
                 if pending.is_empty() {
+                    mark_empty_intent_claim(empty_claims, empty_claim_key.clone());
                     record_intent_claim_metric(metrics, chain, source_label, outcome, list_started);
                 } else {
+                    clear_empty_intent_claim(empty_claims, &empty_claim_key);
                     observe_intent_claim_duration_metric(
                         metrics,
                         chain,
@@ -1291,6 +1306,39 @@ fn claim_pending_intent(
         }
     }
     None
+}
+
+fn empty_intent_claim_key(chain: &ChainIdentity, source: &str) -> String {
+    format!("{}|{source}", chain.key_prefix())
+}
+
+fn recently_empty_intent_claim(claims: &Mutex<BTreeMap<String, Instant>>, key: &str) -> bool {
+    let Ok(mut claims) = claims.lock() else {
+        return false;
+    };
+    let now = Instant::now();
+    claims.retain(|_, claimed_at| {
+        now.duration_since(*claimed_at) <= DEFAULT_INTENT_EMPTY_CLAIM_THROTTLE
+    });
+    claims.contains_key(key)
+}
+
+fn mark_empty_intent_claim(claims: &Mutex<BTreeMap<String, Instant>>, key: String) {
+    let Ok(mut claims) = claims.lock() else {
+        return;
+    };
+    let now = Instant::now();
+    claims.retain(|_, claimed_at| {
+        now.duration_since(*claimed_at) <= DEFAULT_INTENT_EMPTY_CLAIM_THROTTLE
+    });
+    claims.insert(key, now);
+}
+
+fn clear_empty_intent_claim(claims: &Mutex<BTreeMap<String, Instant>>, key: &str) {
+    let Ok(mut claims) = claims.lock() else {
+        return;
+    };
+    claims.remove(key);
 }
 
 fn intent_claim_source_order(worker_index: usize) -> [DurablePromotionIntentSource; 2] {
@@ -1720,6 +1768,7 @@ mod tests {
         marked_terminal: Mutex<Vec<String>>,
         cleanup_calls: Mutex<Vec<(u64, usize, usize)>>,
         last_limit: AtomicUsize,
+        source_list_calls: AtomicUsize,
     }
 
     #[derive(Clone)]
@@ -1992,6 +2041,7 @@ mod tests {
             _now_unix_seconds: u64,
             limit: usize,
         ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+            self.source_list_calls.fetch_add(1, Ordering::SeqCst);
             self.last_limit.store(limit, Ordering::SeqCst);
             let intents = self.intents.lock().expect("sample intent repository lock");
             Ok(intents
@@ -2144,6 +2194,7 @@ mod tests {
         let repository = FailingListIntentRepository::default();
         let metrics = Arc::new(MetricsRecorder::new().expect("metrics recorder"));
         metrics.set_durable_intent_backlog_for_scope(&ethereum_chain(), "query", 7, 30);
+        let empty_claims = test_empty_claims();
 
         let claimed = claim_pending_intent(
             &repository,
@@ -2153,6 +2204,7 @@ mod tests {
             0,
             true,
             DEFAULT_INTENT_CLAIM_BATCH_SIZE,
+            &empty_claims,
         );
 
         assert!(claimed.is_none());
@@ -2182,6 +2234,7 @@ mod tests {
             last_limit: AtomicUsize::new(0),
         };
         let metrics = Arc::new(MetricsRecorder::new().expect("metrics recorder"));
+        let empty_claims = test_empty_claims();
 
         let claimed = claim_pending_intent(
             &repository,
@@ -2191,6 +2244,7 @@ mod tests {
             0,
             true,
             DEFAULT_INTENT_CLAIM_BATCH_SIZE,
+            &empty_claims,
         );
 
         assert!(claimed.is_none());
@@ -2211,11 +2265,56 @@ mod tests {
             intent: test_intent_with_created_at(100),
             last_limit: AtomicUsize::new(0),
         };
+        let empty_claims = test_empty_claims();
 
-        let claimed = claim_pending_intent(&repository, &ethereum_chain(), None, 130, 0, true, 64);
+        let claimed = claim_pending_intent(
+            &repository,
+            &ethereum_chain(),
+            None,
+            130,
+            0,
+            true,
+            64,
+            &empty_claims,
+        );
 
         assert!(claimed.is_none());
         assert_eq!(repository.last_limit.load(Ordering::SeqCst), 64);
+    }
+
+    #[test]
+    fn test_empty_claim_is_throttled_per_chain_source() {
+        let empty_claims = test_empty_claims();
+        let repository = sample_repository(Vec::new());
+
+        let first = claim_pending_intent(
+            &repository,
+            &ethereum_chain(),
+            None,
+            130,
+            1,
+            false,
+            DEFAULT_INTENT_CLAIM_BATCH_SIZE,
+            &empty_claims,
+        );
+        let second = claim_pending_intent(
+            &repository,
+            &ethereum_chain(),
+            None,
+            131,
+            1,
+            false,
+            DEFAULT_INTENT_CLAIM_BATCH_SIZE,
+            &empty_claims,
+        );
+
+        assert!(first.is_none());
+        assert!(second.is_none());
+        assert_eq!(
+            repository.source_list_calls.load(Ordering::SeqCst),
+            2,
+            "first claim lists query and warmup once; second claim is throttled"
+        );
     }
 
     #[test]
@@ -2223,6 +2322,7 @@ mod tests {
         let ethereum = ethereum_chain();
         let lisk = lisk_chain();
         let repository = sample_repository(vec![test_intent_with_chain("intent-lisk", lisk, 100)]);
+        let empty_claims = test_empty_claims();
 
         let claimed = claim_pending_intent(
             &repository,
@@ -2232,6 +2332,7 @@ mod tests {
             0,
             true,
             DEFAULT_INTENT_CLAIM_BATCH_SIZE,
+            &empty_claims,
         );
 
         assert!(claimed.is_none());
@@ -2253,6 +2354,7 @@ mod tests {
         let ethereum = ethereum_chain();
         let lisk = lisk_chain();
         let repository = sample_repository(vec![test_intent_with_chain("intent-lisk", lisk, 100)]);
+        let empty_claims = test_empty_claims();
 
         let claimed = claim_pending_intent(
             &repository,
@@ -2262,6 +2364,7 @@ mod tests {
             0,
             true,
             DEFAULT_INTENT_CLAIM_BATCH_SIZE,
+            &empty_claims,
         );
 
         assert!(claimed.is_none());
@@ -2282,6 +2385,7 @@ mod tests {
             test_intent_with_chain("intent-lisk", lisk, 100),
             test_intent_with_chain("intent-ethereum", ethereum.clone(), 105),
         ]);
+        let empty_claims = test_empty_claims();
 
         let claimed = claim_pending_intent(
             &repository,
@@ -2291,6 +2395,7 @@ mod tests {
             0,
             true,
             DEFAULT_INTENT_CLAIM_BATCH_SIZE,
+            &empty_claims,
         );
 
         assert_eq!(
@@ -2325,6 +2430,7 @@ mod tests {
             100 + DEFAULT_INTENT_CLAIM_BATCH_SIZE as u64,
         ));
         let repository = sample_repository(intents);
+        let empty_claims = test_empty_claims();
 
         let claimed = claim_pending_intent(
             &repository,
@@ -2334,6 +2440,7 @@ mod tests {
             0,
             true,
             DEFAULT_INTENT_CLAIM_BATCH_SIZE,
+            &empty_claims,
         );
 
         assert_eq!(
@@ -2361,6 +2468,7 @@ mod tests {
         warmup.source = DurablePromotionIntentSource::Warmup;
         intents.push(warmup);
         let repository = sample_repository(intents);
+        let empty_claims = test_empty_claims();
 
         let claimed = claim_pending_intent(
             &repository,
@@ -2370,6 +2478,7 @@ mod tests {
             0,
             true,
             DEFAULT_INTENT_CLAIM_BATCH_SIZE,
+            &empty_claims,
         );
 
         assert_eq!(
@@ -2519,7 +2628,12 @@ mod tests {
             marked_terminal: Mutex::new(Vec::new()),
             cleanup_calls: Mutex::new(Vec::new()),
             last_limit: AtomicUsize::new(0),
+            source_list_calls: AtomicUsize::new(0),
         }
+    }
+
+    fn test_empty_claims() -> Mutex<BTreeMap<String, Instant>> {
+        Mutex::new(BTreeMap::new())
     }
 
     fn test_intent_with_created_at(created_at_unix_seconds: u64) -> DurablePromotionIntent {
