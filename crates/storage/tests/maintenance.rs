@@ -5472,6 +5472,75 @@ fn test_compaction_coverage_index_v2_skips_transient_bucket_list_failure() {
 }
 
 #[test]
+fn test_compaction_coverage_index_v2_prioritizes_hot_over_budget_queue() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-v2-hot-queue-priority"));
+    let chain = test_chain();
+    let old_scope = "semantic/evm.logs/block/finalized/evm-logs-v1/addr/0xold";
+    let hot_scope = "semantic/evm.logs/block/finalized/evm-logs-v1/addr/0xhot";
+    for index in 0..3 {
+        write_coverage_index_v2_delta(
+            &storage,
+            &chain,
+            old_scope,
+            0,
+            99_999,
+            &format!("old-{index}"),
+        );
+        write_coverage_index_v2_delta(
+            &storage,
+            &chain,
+            hot_scope,
+            100_000,
+            199_999,
+            &format!("hot-{index}"),
+        );
+    }
+    let old_queue_key =
+        write_coverage_index_v2_compaction_queue_record(&storage, &chain, old_scope, 0, 99_999);
+    let hot_queue_key = write_coverage_index_v2_hot_compaction_queue_record(
+        &storage, &chain, hot_scope, 100_000, 199_999,
+    );
+
+    let report = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                coverage_index_v2_delta_count_threshold: 3,
+                cleanup_enabled: false,
+                max_gets_per_tick: 3,
+                max_puts_per_tick: 2,
+                max_deletes_per_tick: 1,
+                ..coverage_index_v2_compaction_config(false)
+            },
+        )
+        .expect("hot queue compaction");
+
+    assert_eq!(report.coverage_index_v2_compacted_buckets, 1);
+    assert_eq!(
+        coverage_index_v2_snapshot_head_count_for_bucket(
+            &storage, &chain, hot_scope, 100_000, 199_999,
+        ),
+        1
+    );
+    assert_eq!(
+        coverage_index_v2_snapshot_head_count_for_bucket(&storage, &chain, old_scope, 0, 99_999),
+        0
+    );
+    assert!(
+        !storage
+            .object_store()
+            .exists(&hot_queue_key)
+            .expect("hot queue key exists check")
+    );
+    assert!(
+        storage
+            .object_store()
+            .exists(&old_queue_key)
+            .expect("old queue key exists check")
+    );
+}
+
+#[test]
 fn test_compaction_coverage_index_v2_bucket_lock_blocks_writer_until_snapshot_head() {
     let store = PausedCoverageIndexV2SnapshotPutStore::new(temp_storage_root(
         "coverage-v2-compaction-writer-lock",
@@ -7555,6 +7624,32 @@ fn write_coverage_index_v2_compaction_queue_record<S: ObjectStore>(
         .object_store()
         .put(&key, &bytes)
         .expect("write queue record");
+    key
+}
+
+fn write_coverage_index_v2_hot_compaction_queue_record<S: ObjectStore>(
+    storage: &DurableStorage<S>,
+    chain: &ChainIdentity,
+    scope: &str,
+    bucket_start: u64,
+    bucket_end: u64,
+) -> String {
+    let key = format!(
+        "chains/{}/coverage-index-v2/compaction-queue-hot/{scope}/{bucket_start:020}-{bucket_end:020}.json",
+        chain.key_prefix()
+    );
+    let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+        "schema_version": 1,
+        "scope": scope,
+        "bucket_start": bucket_start,
+        "bucket_end": bucket_end,
+        "enqueued_at_unix_ms": 1,
+    }))
+    .expect("hot queue record bytes");
+    storage
+        .object_store()
+        .put(&key, &bytes)
+        .expect("write hot queue record");
     key
 }
 

@@ -20,8 +20,9 @@ use crate::{
     coverage_index::{
         COVERAGE_INDEX_V2_LIST_PAGE_SIZE, CoverageIndexV2Bucket, CoverageIndexV2BucketCompaction,
         CoverageIndexV2CleanupRecord, CoverageIndexV2CleanupRecordObject,
-        coverage_index_v2_compaction_queue_prefix, decode_v2_compaction_queue_record,
-        latest_v2_snapshot_head, parse_v2_bucket_from_object_key, prepare_v2_bucket_compaction,
+        coverage_index_v2_compaction_queue_prefix, coverage_index_v2_hot_compaction_queue_prefix,
+        decode_v2_compaction_queue_record, latest_v2_snapshot_head,
+        parse_v2_bucket_from_object_key, prepare_v2_bucket_compaction,
         unix_ms_now as coverage_index_v2_unix_ms_now,
         v2_cleanup_record_is_safe_to_delete_with_cache, v2_snapshot_cleanup_records_for_bucket,
         with_coverage_index_v2_bucket_locks, write_v2_cleanup_record, write_v2_snapshot,
@@ -1939,6 +1940,17 @@ where
                     }
                 }
             }
+            if let Some(queue_key) = bucket_scan_item.queue_key.as_deref()
+                && compacted_v2_bucket
+                && queue_key.contains("/coverage-index-v2/compaction-queue-hot/")
+            {
+                if operation_budget.remaining_deletes() == 0 {
+                    partial = true;
+                    break;
+                }
+                self.object_store().delete(queue_key)?;
+                operation_budget.record_deletes(1);
+            }
             if bucket_scan_item.queue_key.is_some()
                 && config.cleanup_enabled
                 && operation_budget.remaining_puts() > 0
@@ -2062,22 +2074,41 @@ where
         let prefix = format!("chains/{}/coverage-index-v2/deltas", chain.key_prefix());
         let mut scan_pages = 0usize;
         let queue_prefix = coverage_index_v2_compaction_queue_prefix(&chain.key_prefix());
+        let hot_queue_prefix = coverage_index_v2_hot_compaction_queue_prefix(&chain.key_prefix());
+        let hot_semantic_queue_prefix = format!("{hot_queue_prefix}/semantic/evm.logs");
+        let hot_semantic_queue_scan = (
+            hot_semantic_queue_prefix.as_str(),
+            coverage_index_v2_hot_semantic_evm_logs_compaction_queue_cursor_key(chain),
+            false,
+            true,
+        );
+        let hot_root_queue_scan = (
+            hot_queue_prefix.as_str(),
+            coverage_index_v2_hot_compaction_queue_cursor_key(chain),
+            true,
+            true,
+        );
         let semantic_queue_prefix = format!("{queue_prefix}/semantic/evm.logs");
         let semantic_queue_scan = (
             semantic_queue_prefix.as_str(),
             coverage_index_v2_semantic_evm_logs_compaction_queue_cursor_key(chain),
+            false,
             false,
         );
         let root_queue_scan = (
             queue_prefix.as_str(),
             coverage_index_v2_compaction_queue_cursor_key(chain),
             true,
+            false,
         );
-        let mut queue_scan_prefixes = vec![semantic_queue_scan];
+        let mut queue_scan_prefixes = vec![hot_semantic_queue_scan, semantic_queue_scan];
         if max_scan_pages > 3 {
+            queue_scan_prefixes.push(hot_root_queue_scan);
             queue_scan_prefixes.push(root_queue_scan);
         }
-        for (queue_scan_prefix, queue_cursor_key, skip_semantic_evm_logs) in queue_scan_prefixes {
+        for (queue_scan_prefix, queue_cursor_key, skip_semantic_evm_logs, is_hot_queue) in
+            queue_scan_prefixes
+        {
             if deadline.expired() {
                 return Ok(CoverageIndexV2BucketScan {
                     buckets: Vec::new(),
@@ -2086,7 +2117,7 @@ where
                     priority,
                 });
             }
-            if scan_pages >= max_scan_pages {
+            if !is_hot_queue && scan_pages >= max_scan_pages {
                 return Ok(CoverageIndexV2BucketScan {
                     buckets: Vec::new(),
                     empty_cursor_advances: Vec::new(),
@@ -2102,12 +2133,14 @@ where
                 queue_cursor.next_segment_key.as_deref(),
                 queue_page_size,
             )?;
-            scan_pages += 1;
+            if !is_hot_queue {
+                scan_pages += 1;
+            }
             if queue_page.objects.is_empty()
                 && queue_cursor.next_segment_key.is_some()
                 && !queue_page.has_more
             {
-                if scan_pages >= max_scan_pages {
+                if !is_hot_queue && scan_pages >= max_scan_pages {
                     return Ok(CoverageIndexV2BucketScan {
                         buckets: Vec::new(),
                         empty_cursor_advances: Vec::new(),
@@ -2118,7 +2151,9 @@ where
                 queue_page =
                     self.object_store()
                         .list_page(queue_scan_prefix, None, queue_page_size)?;
-                scan_pages += 1;
+                if !is_hot_queue {
+                    scan_pages += 1;
+                }
             }
             let mut queued_buckets = Vec::new();
             let mut seen_buckets = BTreeSet::<CoverageIndexV2Bucket>::new();
@@ -3625,6 +3660,13 @@ fn coverage_index_v2_compaction_queue_cursor_key(chain: &ChainIdentity) -> Strin
     )
 }
 
+fn coverage_index_v2_hot_compaction_queue_cursor_key(chain: &ChainIdentity) -> String {
+    format!(
+        "chains/{}/metadata/coverage-index-v2-compaction-hot-queue-cursor.json",
+        chain.key_prefix()
+    )
+}
+
 fn coverage_index_v2_semantic_evm_logs_compaction_queue_cursor_key(
     chain: &ChainIdentity,
 ) -> String {
@@ -3637,6 +3679,15 @@ fn coverage_index_v2_semantic_evm_logs_compaction_queue_cursor_key(
 fn coverage_index_v2_cleanup_cursor_key(chain: &ChainIdentity) -> String {
     format!(
         "chains/{}/metadata/coverage-index-v2-cleanup-cursor.json",
+        chain.key_prefix()
+    )
+}
+
+fn coverage_index_v2_hot_semantic_evm_logs_compaction_queue_cursor_key(
+    chain: &ChainIdentity,
+) -> String {
+    format!(
+        "chains/{}/metadata/coverage-index-v2-compaction-hot-semantic-evm-logs-queue-cursor.json",
         chain.key_prefix()
     )
 }
