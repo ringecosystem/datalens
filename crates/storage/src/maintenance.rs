@@ -1820,7 +1820,7 @@ where
                 }
                 continue;
             }
-            let compaction_result = with_coverage_index_v2_bucket_locks(
+            let compaction_result = match with_coverage_index_v2_bucket_locks(
                 self.object_store(),
                 &std::iter::once(bucket.clone()).collect::<BTreeSet<_>>(),
                 || {
@@ -1872,7 +1872,23 @@ where
                         snapshot_key,
                     )))
                 },
-            )?;
+            ) {
+                Ok(result) => result,
+                Err(error) if error.kind == DatalensErrorKind::StorageReadFailure => {
+                    log::warn!(
+                        "storage coverage index v2 bucket compaction skipped chain_key={} scope={} bucket={}-{} kind={:?} message={}",
+                        chain.key_prefix(),
+                        bucket.scope,
+                        bucket.bucket_start,
+                        bucket.bucket_end,
+                        error.kind,
+                        error.message
+                    );
+                    partial = true;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             if let Some((
                 compacted_bucket,
                 mut compacted_delta_keys,

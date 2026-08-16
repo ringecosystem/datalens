@@ -43,6 +43,12 @@ struct FailingCoverageIndexV2DeltaDeleteStore {
 }
 
 #[derive(Clone, Debug)]
+struct FailingCoverageIndexV2DeltaListPageStore {
+    inner: LocalObjectStore,
+    failing_prefix: String,
+}
+
+#[derive(Clone, Debug)]
 struct FailingCompactionQueueDeleteStore {
     inner: LocalObjectStore,
 }
@@ -138,6 +144,15 @@ impl FailingCoverageIndexV2DeltaDeleteStore {
     fn new(root: PathBuf) -> Self {
         Self {
             inner: LocalObjectStore::new(root),
+        }
+    }
+}
+
+impl FailingCoverageIndexV2DeltaListPageStore {
+    fn new(root: PathBuf, failing_prefix: String) -> Self {
+        Self {
+            inner: LocalObjectStore::new(root),
+            failing_prefix,
         }
     }
 }
@@ -506,6 +521,55 @@ impl ObjectStore for FailingCoverageIndexV2DeltaDeleteStore {
                 "injected coverage index v2 delta delete failure",
             ));
         }
+        self.inner.delete(key)
+    }
+
+    fn lock_namespace(&self) -> String {
+        self.inner.lock_namespace()
+    }
+}
+
+impl ObjectStore for FailingCoverageIndexV2DeltaListPageStore {
+    fn get(&self, key: &str) -> Result<Vec<u8>, DatalensError> {
+        self.inner.get(key)
+    }
+
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), DatalensError> {
+        self.inner.put(key, bytes)
+    }
+
+    fn put_if_absent(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> Result<ObjectPutIfAbsentResult, DatalensError> {
+        self.inner.put_if_absent(key, bytes)
+    }
+
+    fn exists(&self, key: &str) -> Result<bool, DatalensError> {
+        self.inner.exists(key)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<ObjectMetadata>, DatalensError> {
+        self.inner.list(prefix)
+    }
+
+    fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ObjectListPage, DatalensError> {
+        if prefix == self.failing_prefix {
+            return Err(DatalensError::new(
+                DatalensErrorKind::StorageReadFailure,
+                "injected coverage index v2 delta list failure",
+            ));
+        }
+        self.inner.list_page(prefix, start_after, limit)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), DatalensError> {
         self.inner.delete(key)
     }
 
@@ -5346,6 +5410,64 @@ fn test_compaction_coverage_index_v2_delta_count_threshold_triggers_compaction()
             )
             .expect("read rows after threshold compaction"),
         &[100, 101, 102],
+    );
+}
+
+#[test]
+fn test_compaction_coverage_index_v2_skips_transient_bucket_list_failure() {
+    let root = temp_storage_root("coverage-v2-skip-transient-list-failure");
+    let chain = test_chain();
+    let bad_scope = "exact/evm.blocks/block/all/safe";
+    let good_scope = "semantic/evm.blocks/block/safe/all";
+    let bad_prefix = format!(
+        "chains/{}/coverage-index-v2/deltas/{bad_scope}/00000000000000000000-00000000000000099999",
+        chain.key_prefix()
+    );
+    let store = FailingCoverageIndexV2DeltaListPageStore::new(root, bad_prefix);
+    let storage = DurableStorage::from_object_store(store);
+    for index in 0..3 {
+        write_coverage_index_v2_delta(
+            &storage,
+            &chain,
+            bad_scope,
+            0,
+            99_999,
+            &format!("bad-{index}"),
+        );
+        write_coverage_index_v2_delta(
+            &storage,
+            &chain,
+            good_scope,
+            0,
+            99_999,
+            &format!("good-{index}"),
+        );
+    }
+    let bad_queue_key =
+        write_coverage_index_v2_compaction_queue_record(&storage, &chain, bad_scope, 0, 99_999);
+    write_coverage_index_v2_compaction_queue_record(&storage, &chain, good_scope, 0, 99_999);
+
+    let report = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                coverage_index_v2_delta_count_threshold: 3,
+                cleanup_enabled: false,
+                ..coverage_index_v2_compaction_config(false)
+            },
+        )
+        .expect("compaction skips transient bucket list failure");
+
+    assert_eq!(report.tick_status, MaintenanceCompactionTickStatus::Partial);
+    assert_eq!(report.coverage_index_v2_compacted_buckets, 1);
+    assert_eq!(report.coverage_index_v2_compacted_deltas, 3);
+    assert_eq!(coverage_index_v2_snapshot_head_count(&storage, &chain), 1);
+    assert!(
+        storage
+            .object_store()
+            .exists(&bad_queue_key)
+            .expect("bad queue key exists"),
+        "failed bucket must stay queued for a later retry"
     );
 }
 
