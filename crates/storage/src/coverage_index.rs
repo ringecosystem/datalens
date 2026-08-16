@@ -498,6 +498,9 @@ where
         // represented in the snapshot. Older heads left it empty, which keeps
         // the conservative full-bucket scan.
         if !head.included_delta_high_watermark.is_empty() {
+            let loaded_snapshot = read_v2_snapshot(object_store, bucket, &head.snapshot_key)?;
+            compacted_delta_keys.extend(loaded_snapshot.compacted_delta_keys.iter().cloned());
+            snapshot = Some(loaded_snapshot);
             start_after_delta_key = Some(head.included_delta_high_watermark.as_str());
         } else {
             let loaded_snapshot = read_v2_snapshot(object_store, bucket, &head.snapshot_key)?;
@@ -647,32 +650,60 @@ where
     let mut entries = Vec::new();
     let mut previous_compacted_delta_keys = BTreeSet::new();
     let mut start_after_delta_key = None;
+    let mut legacy_snapshot_head = false;
     if let Some(head) = latest_v2_snapshot_head(object_store, bucket)? {
         let snapshot = read_v2_snapshot(object_store, bucket, &head.snapshot_key)?;
+        let snapshot_compacted_delta_keys = snapshot.compacted_delta_keys;
         // See read_entries_for_v2_bucket: non-empty watermarks are only
         // published by compaction after folding the listed delta prefix.
         if !head.included_delta_high_watermark.is_empty() {
+            legacy_snapshot_head = snapshot_compacted_delta_keys
+                .iter()
+                .any(|key| key.as_str() > head.included_delta_high_watermark.as_str());
             start_after_delta_key = Some(head.included_delta_high_watermark);
         } else {
-            previous_compacted_delta_keys.extend(snapshot.compacted_delta_keys);
+            legacy_snapshot_head = true;
+        }
+        if legacy_snapshot_head {
+            previous_compacted_delta_keys.extend(snapshot_compacted_delta_keys);
         }
         entries.extend(snapshot.entries);
     }
 
-    let deltas = list_v2_delta_objects_for_bucket(
-        object_store,
-        bucket,
-        &previous_compacted_delta_keys,
-        Some(max_delta_objects),
-        start_after_delta_key.as_deref(),
-    )?;
-    if deltas.len() < delta_count_threshold.max(1) {
+    let (deltas, legacy_high_watermark) = if legacy_snapshot_head {
+        let (metadata, high_watermark) = list_legacy_v2_delta_metadata_for_compaction(
+            object_store,
+            bucket,
+            &previous_compacted_delta_keys,
+            max_delta_objects,
+            start_after_delta_key.as_deref(),
+        )?;
+        (
+            read_v2_delta_objects_from_metadata(object_store, bucket, &metadata)?,
+            high_watermark,
+        )
+    } else {
+        (
+            list_v2_delta_objects_for_bucket(
+                object_store,
+                bucket,
+                &previous_compacted_delta_keys,
+                Some(max_delta_objects),
+                start_after_delta_key.as_deref(),
+            )?,
+            None,
+        )
+    };
+    if legacy_snapshot_head {
+        if legacy_high_watermark.is_none() {
+            return Ok(None);
+        }
+    } else if deltas.len() < delta_count_threshold.max(1) {
         return Ok(None);
     }
     let input_delta_bytes = deltas.iter().map(|object| object.size).sum();
-    let included_delta_high_watermark = deltas
-        .last()
-        .map(|object| object.key.clone())
+    let included_delta_high_watermark = legacy_high_watermark
+        .or_else(|| deltas.last().map(|object| object.key.clone()))
         .unwrap_or_default();
     let newly_compacted_delta_keys = deltas
         .iter()
@@ -686,14 +717,12 @@ where
     }
     let mut index = CoverageIndex { entries };
     index.normalize();
-    let mut compacted_delta_keys = previous_compacted_delta_keys
+    let compacted_delta_keys = previous_compacted_delta_keys
         .into_iter()
         .chain(newly_compacted_delta_keys.iter().cloned())
         .collect::<BTreeSet<_>>()
         .into_iter()
-        .collect::<Vec<_>>();
-    compacted_delta_keys.sort();
-    compacted_delta_keys.dedup();
+        .collect();
     Ok(Some(CoverageIndexV2BucketCompaction {
         bucket: bucket.clone(),
         entries: index.entries,
@@ -704,6 +733,47 @@ where
     }))
 }
 
+fn list_legacy_v2_delta_metadata_for_compaction<S>(
+    object_store: &S,
+    bucket: &CoverageIndexV2Bucket,
+    skip_delta_keys: &BTreeSet<String>,
+    max_objects: usize,
+    start_after_delta_key: Option<&str>,
+) -> Result<(Vec<ObjectMetadata>, Option<String>), DatalensError>
+where
+    S: ObjectStore,
+{
+    let delta_prefix = coverage_index_v2_delta_prefix(
+        &bucket.chain_key,
+        &bucket.scope,
+        bucket.bucket_start,
+        bucket.bucket_end,
+    );
+    let strict_prefix = format!("{delta_prefix}/");
+    let page = object_store.list_page(
+        &delta_prefix,
+        start_after_delta_key,
+        COVERAGE_INDEX_V2_LIST_PAGE_SIZE,
+    )?;
+    let max_objects = max_objects.max(1);
+    let mut objects = Vec::new();
+    let mut high_watermark = None;
+    for object in page.objects {
+        if !object.key.starts_with(&strict_prefix) {
+            continue;
+        }
+        if !skip_delta_keys.contains(&object.key) {
+            objects.push(object.clone());
+            if objects.len() >= max_objects {
+                high_watermark = Some(object.key);
+                break;
+            }
+        }
+        high_watermark = Some(object.key);
+    }
+    Ok((objects, high_watermark))
+}
+
 pub(crate) fn v2_snapshot_cleanup_records_for_bucket<S>(
     object_store: &S,
     bucket: &CoverageIndexV2Bucket,
@@ -711,7 +781,20 @@ pub(crate) fn v2_snapshot_cleanup_records_for_bucket<S>(
 where
     S: ObjectStore,
 {
-    let existing_delta_keys = list_v2_delta_object_keys_for_bucket(object_store, bucket)?;
+    let delta_prefix = coverage_index_v2_delta_prefix(
+        &bucket.chain_key,
+        &bucket.scope,
+        bucket.bucket_start,
+        bucket.bucket_end,
+    );
+    let strict_delta_prefix = format!("{delta_prefix}/");
+    let existing_delta_keys = object_store
+        .list_page(&delta_prefix, None, COVERAGE_INDEX_V2_LIST_PAGE_SIZE)?
+        .objects
+        .into_iter()
+        .filter(|object| object.key.starts_with(&strict_delta_prefix))
+        .map(|object| object.key)
+        .collect::<BTreeSet<_>>();
     let mut records = Vec::new();
     for (_, head) in list_v2_snapshot_heads_for_bucket(object_store, bucket)? {
         let snapshot = read_v2_snapshot(object_store, bucket, &head.snapshot_key)?;
@@ -1273,25 +1356,6 @@ where
         size: object.size,
         delta,
     })
-}
-
-fn list_v2_delta_object_keys_for_bucket<S>(
-    object_store: &S,
-    bucket: &CoverageIndexV2Bucket,
-) -> Result<BTreeSet<String>, DatalensError>
-where
-    S: ObjectStore,
-{
-    Ok(list_v2_delta_object_metadata_for_bucket(
-        object_store,
-        bucket,
-        &BTreeSet::new(),
-        None,
-        None,
-    )?
-    .into_iter()
-    .map(|object| object.key)
-    .collect())
 }
 
 fn list_v2_delta_object_metadata_for_bucket<S>(

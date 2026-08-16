@@ -5247,6 +5247,67 @@ fn test_compaction_coverage_index_v2_delta_count_threshold_triggers_compaction()
 }
 
 #[test]
+fn test_compaction_coverage_index_v2_legacy_snapshot_migration_is_page_bounded() {
+    let object_store =
+        CountingListStore::new(temp_storage_root("coverage-v2-legacy-snapshot-migration"));
+    let storage = DurableStorage::from_object_store(object_store.clone());
+    let chain = test_chain();
+    let scope = "exact/evm.blocks/block/all/safe";
+    let compacted_delta_keys = (0..1_000)
+        .map(|index| {
+            write_coverage_index_v2_delta(
+                &storage,
+                &chain,
+                scope,
+                0,
+                99_999,
+                &format!("legacy-{index:04}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    write_coverage_index_v2_delta(&storage, &chain, scope, 0, 99_999, "pending-0000");
+    let snapshot_key = write_coverage_index_v2_snapshot_for_scope(
+        &storage,
+        &chain,
+        scope,
+        "legacy",
+        1,
+        compacted_delta_keys,
+    );
+    write_coverage_index_v2_snapshot_head_for_scope(
+        &storage,
+        &chain,
+        scope,
+        "legacy-head",
+        1,
+        &snapshot_key,
+        "",
+    );
+    write_coverage_index_v2_compaction_queue_record(&storage, &chain, scope, 0, 99_999);
+    object_store.reset_counts();
+
+    let report = storage
+        .compact_small_objects_for_chain(&chain, coverage_index_v2_compaction_config(false))
+        .expect("legacy snapshot migration");
+
+    let delta_prefix = format!(
+        "chains/{}/coverage-index-v2/deltas/{scope}/00000000000000000000-00000000000000099999",
+        chain.key_prefix()
+    );
+    assert_eq!(
+        object_store.list_page_count_for_prefix(&delta_prefix),
+        1,
+        "legacy migration must inspect one delta page per tick"
+    );
+    assert_eq!(report.coverage_index_v2_compacted_buckets, 1);
+    assert_eq!(report.coverage_index_v2_compacted_deltas, 0);
+    assert_eq!(
+        coverage_index_v2_snapshot_head_count_for_bucket(&storage, &chain, scope, 0, 99_999,),
+        2
+    );
+}
+
+#[test]
 fn test_compaction_coverage_index_v2_delta_cursor_skips_sibling_prefix_page() {
     let storage = LocalStorage::new(temp_storage_root("coverage-v2-sibling-prefix-page"));
     let chain = test_chain();
