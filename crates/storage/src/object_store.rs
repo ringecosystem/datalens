@@ -1295,19 +1295,46 @@ impl ObjectStore for S3ObjectStore {
                 let mut continuation = None;
                 let mut objects = Vec::new();
                 loop {
-                    let response = client
-                        .list_objects_v2()
-                        .bucket(&bucket)
-                        .prefix(&prefix_key)
-                        .set_continuation_token(continuation)
-                        .send()
-                        .await
-                        .map_err(|error| {
+                    let response = {
+                        let mut response = None;
+                        for attempt in 1..=DEFAULT_S3_GET_MAX_ATTEMPTS {
+                            match client
+                                .list_objects_v2()
+                                .bucket(&bucket)
+                                .prefix(&prefix_key)
+                                .set_continuation_token(continuation.clone())
+                                .send()
+                                .await
+                            {
+                                Ok(page) => {
+                                    response = Some(page);
+                                    break;
+                                }
+                                Err(error) if should_retry_s3_get(attempt) => {
+                                    log::warn!(
+                                        "s3 list retry scheduled key={} attempt={} max_attempts={} error={}",
+                                        prefix_key,
+                                        attempt + 1,
+                                        DEFAULT_S3_GET_MAX_ATTEMPTS,
+                                        error
+                                    );
+                                    tokio::time::sleep(s3_get_retry_delay(attempt)).await;
+                                }
+                                Err(error) => {
+                                    return Err(DatalensError::new(
+                                        DatalensErrorKind::StorageReadFailure,
+                                        format!("S3 list objects {prefix_key}: {error}"),
+                                    ));
+                                }
+                            }
+                        }
+                        response.ok_or_else(|| {
                             DatalensError::new(
                                 DatalensErrorKind::StorageReadFailure,
-                                format!("S3 list objects {prefix_key}: {error}"),
+                                format!("S3 list objects {prefix_key}: retry attempts exhausted"),
                             )
-                        })?;
+                        })?
+                    };
                     for object in response.contents() {
                         let Some(key) = object.key() else {
                             continue;
@@ -1352,20 +1379,45 @@ impl ObjectStore for S3ObjectStore {
         let bucket = self.bucket.clone();
         self.runtime()
             .block_on_operation(self.operation_class, "list_page", log_key, async move {
-                let response = client
-                    .list_objects_v2()
-                    .bucket(&bucket)
-                    .prefix(&prefix_key)
-                    .set_start_after(start_after_key)
-                    .max_keys(limit.saturating_add(1).min(i32::MAX as usize) as i32)
-                    .send()
-                    .await
-                    .map_err(|error| {
-                        DatalensError::new(
-                            DatalensErrorKind::StorageReadFailure,
-                            format!("S3 list objects {prefix_key}: {error}"),
-                        )
-                    })?;
+                let mut response = None;
+                for attempt in 1..=DEFAULT_S3_GET_MAX_ATTEMPTS {
+                    match client
+                        .list_objects_v2()
+                        .bucket(&bucket)
+                        .prefix(&prefix_key)
+                        .set_start_after(start_after_key.clone())
+                        .max_keys(limit.saturating_add(1).min(i32::MAX as usize) as i32)
+                        .send()
+                        .await
+                    {
+                        Ok(page) => {
+                            response = Some(page);
+                            break;
+                        }
+                        Err(error) if should_retry_s3_get(attempt) => {
+                            log::warn!(
+                                "s3 list_page retry scheduled key={} attempt={} max_attempts={} error={}",
+                                prefix_key,
+                                attempt + 1,
+                                DEFAULT_S3_GET_MAX_ATTEMPTS,
+                                error
+                            );
+                            tokio::time::sleep(s3_get_retry_delay(attempt)).await;
+                        }
+                        Err(error) => {
+                            return Err(DatalensError::new(
+                                DatalensErrorKind::StorageReadFailure,
+                                format!("S3 list objects {prefix_key}: {error}"),
+                            ));
+                        }
+                    }
+                }
+                let response = response.ok_or_else(|| {
+                    DatalensError::new(
+                        DatalensErrorKind::StorageReadFailure,
+                        format!("S3 list objects {prefix_key}: retry attempts exhausted"),
+                    )
+                })?;
                 let mut objects = Vec::new();
                 for object in response.contents() {
                     let Some(key) = object.key() else {
