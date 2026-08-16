@@ -5083,6 +5083,78 @@ fn test_coverage_index_v2_many_empty_deltas_coalesce_to_one_pending_delta() {
 }
 
 #[test]
+fn test_coverage_index_v2_empty_coalesce_skips_over_budget_bucket() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-index-v2-empty-over-budget"));
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let rows = DatasetRows::new(DatasetKey::evm_blocks(), QueryRows::EvmBlocks(Vec::new()))
+        .expect("dataset rows");
+    let scope = coverage_index_v2_exact_scope(
+        &DatasetKey::evm_blocks(),
+        "block",
+        &selector,
+        ManifestFinalityLevel::Safe,
+    );
+
+    for block in 1..=129 {
+        let range = LedgerRange::blocks(block, block).expect("valid range");
+        let entry = empty_manifest_entry(
+            &chain,
+            DatasetKey::evm_blocks(),
+            &selector,
+            range.clone(),
+            ManifestFinalityLevel::Safe,
+        );
+        write_coverage_index_v2_delta(
+            &storage,
+            &chain,
+            &scope,
+            &range,
+            &format!("{block:04}"),
+            vec![entry],
+        );
+    }
+
+    storage
+        .write_rows(StorageWriteRequest {
+            chain: &chain,
+            dataset_key: DatasetKey::evm_blocks(),
+            selector: &selector,
+            range: LedgerRange::blocks(130, 130).expect("valid range"),
+            rows: &rows,
+            finality_level: FinalityLevel::Safe,
+            record_empty_coverage: true,
+        })
+        .expect("write empty coverage");
+
+    let delta_prefix = coverage_index_v2_delta_prefix(
+        &chain,
+        &scope,
+        &LedgerRange::blocks(1, 1).expect("valid range"),
+    );
+    assert_eq!(
+        storage
+            .object_store()
+            .list(&delta_prefix)
+            .expect("coverage index v2 delta list")
+            .len(),
+        130,
+        "over-budget foreground write should append instead of coalescing the hot bucket"
+    );
+    assert_eq!(
+        storage
+            .covered_ranges(
+                &chain,
+                &DatasetKey::evm_blocks(),
+                &selector,
+                LedgerRange::blocks(1, 130).expect("valid range"),
+            )
+            .expect("covered ranges"),
+        vec![LedgerRange::blocks(1, 130).expect("valid range")]
+    );
+}
+
+#[test]
 fn test_empty_coverage_does_not_coalesce_over_real_data_object() {
     let object_store = CountingObjectStore::new(LocalObjectStore::new(temp_storage_root(
         "empty-coverage-no-data-coalesce",

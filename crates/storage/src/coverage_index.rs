@@ -31,6 +31,7 @@ const MAX_COVERAGE_INDEX_V2_BUCKET_READ_THREADS: usize = 8;
 const MAX_COVERAGE_INDEX_V2_DELTA_GET_THREADS: usize = 8;
 const MAX_EXACT_EVM_LOGS_V2_DELTA_OBJECTS: usize = 128;
 const MAX_SEMANTIC_FALLBACK_V2_DELTA_OBJECTS: usize = 128;
+const MAX_EMPTY_COVERAGE_COALESCE_V2_DELTA_OBJECTS: usize = 128;
 const COVERAGE_INDEX_V2_BUCKET_READ_CACHE_TTL: Duration = Duration::from_secs(300);
 const MAX_COVERAGE_INDEX_V2_BUCKET_READ_CACHE_ENTRIES: usize = 512;
 const MAX_COVERAGE_INDEX_V2_BUCKET_READ_CACHE_BYTES: usize = 256 * 1024 * 1024;
@@ -2028,12 +2029,12 @@ where
     S: ObjectStore,
 {
     let probe = empty_coverage_coalescing_probe(entry)?;
+    let probe_buckets = coverage_index_v2_entry_buckets(&probe);
+    if empty_coverage_coalescing_over_budget(object_store, &probe_buckets)? {
+        return Ok(None);
+    }
     let mut existing_entries = preexisting_entries.to_vec();
-    read_entries_for_v2_buckets(
-        object_store,
-        coverage_index_v2_entry_buckets(&probe),
-        &mut existing_entries,
-    )?;
+    read_entries_for_v2_buckets(object_store, probe_buckets, &mut existing_entries)?;
     let mut existing_manifest = Manifest {
         entries: existing_entries,
     };
@@ -2107,6 +2108,69 @@ where
 }
 
 type CoalescedEmptyV2Entry = (ManifestEntry, Vec<ManifestEntry>, BTreeSet<String>);
+
+fn empty_coverage_coalescing_over_budget<S>(
+    object_store: &S,
+    buckets: &BTreeSet<CoverageIndexV2Bucket>,
+) -> Result<bool, DatalensError>
+where
+    S: ObjectStore,
+{
+    for bucket in buckets {
+        let over_budget_key = coverage_index_v2_bucket_recent_key(object_store, bucket);
+        if is_recent_over_budget_v2_read(&over_budget_key) {
+            enqueue_v2_compaction_for_over_budget_bucket(object_store, bucket);
+            return Ok(true);
+        }
+        if v2_bucket_pending_delta_count_over_budget(
+            object_store,
+            bucket,
+            MAX_EMPTY_COVERAGE_COALESCE_V2_DELTA_OBJECTS,
+        )? {
+            mark_recent_over_budget_v2_read(over_budget_key);
+            enqueue_v2_compaction_for_over_budget_bucket(object_store, bucket);
+            log::warn!(
+                "storage coverage index v2 empty coalesce skipped over-budget bucket chain_key={} scope={} bucket={}-{} max_delta_objects={}",
+                bucket.chain_key,
+                bucket.scope,
+                bucket.bucket_start,
+                bucket.bucket_end,
+                MAX_EMPTY_COVERAGE_COALESCE_V2_DELTA_OBJECTS
+            );
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn v2_bucket_pending_delta_count_over_budget<S>(
+    object_store: &S,
+    bucket: &CoverageIndexV2Bucket,
+    max_delta_objects: usize,
+) -> Result<bool, DatalensError>
+where
+    S: ObjectStore,
+{
+    let mut compacted_delta_keys = BTreeSet::new();
+    let mut start_after_delta_key = None;
+    if let Some((_, head)) = latest_v2_snapshot_head_object(object_store, bucket)? {
+        if !head.included_delta_high_watermark.is_empty() {
+            start_after_delta_key = Some(head.included_delta_high_watermark);
+        } else {
+            let snapshot = read_v2_snapshot(object_store, bucket, &head.snapshot_key)?;
+            compacted_delta_keys.extend(snapshot.compacted_delta_keys);
+        }
+    }
+    Ok(list_v2_delta_object_metadata_for_bucket(
+        object_store,
+        bucket,
+        &compacted_delta_keys,
+        max_delta_objects.checked_add(1),
+        start_after_delta_key.as_deref(),
+    )?
+    .len()
+        > max_delta_objects)
+}
 
 fn can_merge_empty_coverage(left: &ManifestEntry, right: &ManifestEntry) -> bool {
     left.object_key.is_none()
