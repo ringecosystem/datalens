@@ -883,6 +883,10 @@ struct QueuedCompactionChain {
 }
 
 impl QueuedCompactionChain {
+    fn has_hot_queue(&self) -> bool {
+        self.hot_queued_objects > 0
+    }
+
     fn cmp_priority(&self, other: &Self) -> std::cmp::Ordering {
         other
             .hot_semantic_queued_objects
@@ -1002,6 +1006,21 @@ fn prioritize_compaction_chain_batch_indexes(
         .take(HIGH_BACKLOG_COMPACTION_CHAINS_PER_WAKE)
         .map(|queued| queued.chain_index)
         .collect::<Vec<_>>();
+    if queued.iter().any(QueuedCompactionChain::has_hot_queue) {
+        while selected.len() < MAX_QUEUED_COMPACTION_CHAINS_PER_WAKE {
+            let before_len = selected.len();
+            for queued in queued.iter().filter(|queued| queued.has_hot_queue()) {
+                if selected.len() >= MAX_QUEUED_COMPACTION_CHAINS_PER_WAKE {
+                    break;
+                }
+                selected.push(queued.chain_index);
+            }
+            if selected.len() == before_len {
+                break;
+            }
+        }
+        return selected;
+    }
     for chain_index in chain_indexes {
         if selected.len() >= MAX_QUEUED_COMPACTION_CHAINS_PER_WAKE {
             break;
@@ -2423,7 +2442,21 @@ mod tests {
 
         assert_eq!(
             prioritize_compaction_chain_batch_indexes(vec![0, 1, 2, 3], &queued),
-            vec![1, 2, 0, 3]
+            vec![1, 2, 0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn storage_compaction_chain_batch_repeats_single_hot_queue() {
+        let queued = vec![
+            hot_queued_chain(0, 0, 4, 1, 4, 0),
+            queued_chain(1, 60, 96, 1),
+            queued_chain(2, 50, 80, 2),
+        ];
+
+        assert_eq!(
+            prioritize_compaction_chain_batch_indexes(vec![0, 1, 2], &queued),
+            vec![0, 1, 2, 0, 0]
         );
     }
 
