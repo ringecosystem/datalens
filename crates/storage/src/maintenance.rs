@@ -1827,6 +1827,12 @@ where
                 }
                 continue;
             }
+            let max_delta_objects = operation_budget.remaining_gets().min(
+                config
+                    .coverage_index_v2_delta_count_threshold
+                    .max(1)
+                    .saturating_mul(2),
+            );
             let compaction_result = match with_coverage_index_v2_bucket_locks(
                 self.object_store(),
                 &std::iter::once(bucket.clone()).collect::<BTreeSet<_>>(),
@@ -1835,7 +1841,7 @@ where
                         self.object_store(),
                         &bucket,
                         config.coverage_index_v2_delta_count_threshold,
-                        operation_budget.remaining_gets(),
+                        max_delta_objects,
                     )?
                     else {
                         return Ok(None);
