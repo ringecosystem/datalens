@@ -51,6 +51,7 @@ struct QueryRuntimeStores {
     query_watermarks: Arc<dyn QueryWatermarkRepository>,
     query_activity: Arc<dyn QueryActivityRepository>,
     durable_intents: Arc<dyn DurablePromotionIntentRepository>,
+    durable_intent_workers: Arc<dyn DurablePromotionIntentRepository>,
     warmup_registry: Option<LocalWarmupRegistry<WarmupRegistryObjectStore>>,
     cache_repair_registry: Option<LocalCacheRepairRegistry<WarmupRegistryObjectStore>>,
     durable_intent_startup_maintenance: Arc<Once>,
@@ -75,10 +76,12 @@ impl QueryRuntimeStores {
         let query_activity = Arc::from(build_query_activity(config)?);
         let durable_intents: Arc<dyn DurablePromotionIntentRepository> =
             Arc::from(build_durable_intents(config)?);
+        let durable_intent_workers: Arc<dyn DurablePromotionIntentRepository> =
+            Arc::from(build_durable_intent_workers(config)?);
         let durable_intent_startup_maintenance = Arc::new(Once::new());
         if !config.query.durable_intents.enabled {
             spawn_durable_intent_terminal_cleanup_once(
-                durable_intents.clone(),
+                durable_intent_workers.clone(),
                 durable_intent_startup_maintenance.clone(),
                 config.query.durable_intents,
             );
@@ -89,6 +92,7 @@ impl QueryRuntimeStores {
             query_watermarks,
             query_activity,
             durable_intents,
+            durable_intent_workers,
             warmup_registry,
             cache_repair_registry,
             durable_intent_startup_maintenance,
@@ -1172,8 +1176,9 @@ fn build_evm_service_with_storage(
         stores.query_activity.clone(),
         ApplicationIdentity::named(config.metrics.default_application.clone()),
     )
-    .with_durable_intents_configured(
+    .with_durable_intent_submit_and_worker_repositories_configured(
         stores.durable_intents.clone(),
+        stores.durable_intent_workers.clone(),
         config.query.durable_intents,
         stores.durable_intent_startup_maintenance.clone(),
     )
@@ -1232,7 +1237,7 @@ fn build_evm_service_with_storage(
         .with_query_activity(stores.query_activity)
         .with_query_watermarks(stores.query_watermarks);
         if config.query.durable_intents.enabled {
-            runtime = runtime.with_durable_intents(stores.durable_intents);
+            runtime = runtime.with_durable_intents(stores.durable_intent_workers);
         }
         if let Some(recorder) = service.metrics_recorder() {
             runtime = runtime.with_metrics(recorder);
@@ -1295,8 +1300,9 @@ fn build_solana_service_with_storage(
         stores.query_activity,
         ApplicationIdentity::named(config.metrics.default_application.clone()),
     )
-    .with_durable_intents_configured(
+    .with_durable_intent_submit_and_worker_repositories_configured(
         stores.durable_intents,
+        stores.durable_intent_workers.clone(),
         config.query.durable_intents,
         stores.durable_intent_startup_maintenance,
     )
@@ -1363,8 +1369,9 @@ fn build_tron_service_with_storage(
         stores.query_activity.clone(),
         ApplicationIdentity::named(config.metrics.default_application.clone()),
     )
-    .with_durable_intents_configured(
+    .with_durable_intent_submit_and_worker_repositories_configured(
         stores.durable_intents.clone(),
+        stores.durable_intent_workers.clone(),
         config.query.durable_intents,
         stores.durable_intent_startup_maintenance.clone(),
     )
@@ -1423,7 +1430,7 @@ fn build_tron_service_with_storage(
         .with_query_activity(stores.query_activity)
         .with_query_watermarks(stores.query_watermarks);
         if config.query.durable_intents.enabled {
-            runtime = runtime.with_durable_intents(stores.durable_intents);
+            runtime = runtime.with_durable_intents(stores.durable_intent_workers);
         }
         if let Some(recorder) = service.metrics_recorder() {
             runtime = runtime.with_metrics(recorder);
@@ -1629,6 +1636,19 @@ pub fn build_query_activity(
 pub fn build_durable_intents(
     config: &DatalensConfig,
 ) -> Result<Box<dyn DurablePromotionIntentRepository>, DatalensError> {
+    build_durable_intents_with_s3_background(config, false)
+}
+
+pub fn build_durable_intent_workers(
+    config: &DatalensConfig,
+) -> Result<Box<dyn DurablePromotionIntentRepository>, DatalensError> {
+    build_durable_intents_with_s3_background(config, true)
+}
+
+fn build_durable_intents_with_s3_background(
+    config: &DatalensConfig,
+    use_s3_background: bool,
+) -> Result<Box<dyn DurablePromotionIntentRepository>, DatalensError> {
     match config.storage.backend.as_str() {
         "local" => {
             let local = config.storage.local.as_ref().ok_or_else(|| {
@@ -1648,9 +1668,12 @@ pub fn build_durable_intents(
                     "storage.s3 must be set when storage.backend is s3",
                 )
             })?;
-            Ok(Box::new(DurablePromotionIntentStore::new(
-                S3ObjectStore::from_config(s3)?,
-            )))
+            let object_store = if use_s3_background {
+                S3ObjectStore::background_from_config(s3)?
+            } else {
+                S3ObjectStore::from_config(s3)?
+            };
+            Ok(Box::new(DurablePromotionIntentStore::new(object_store)))
         }
         _ => Err(DatalensError::new(
             DatalensErrorKind::UnsupportedDataset,
@@ -2440,6 +2463,14 @@ mod tests {
 
         assert!(!source.contains(concat!("record_fragmentation", "_metrics(")));
         assert!(!source.contains(concat!("record_fragmentation", "_report_metrics(")));
+    }
+
+    #[test]
+    fn durable_intent_worker_store_uses_s3_background_runtime() {
+        let source = include_str!("runtime.rs");
+
+        assert!(source.contains("build_durable_intents_with_s3_background(config, true)"));
+        assert!(source.contains("S3ObjectStore::background_from_config(s3)?"));
     }
 
     #[test]

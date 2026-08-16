@@ -237,6 +237,46 @@ fn test_executor_miss_submits_durable_intent_when_configured() {
 }
 
 #[test]
+fn test_durable_intent_submit_and_worker_repositories_are_separate() {
+    let storage = LocalStorage::new(temp_storage_root("executor-intent-split-repos"));
+    let source = MockSource::default().with_blocks(vec![block(1, "0x01")]);
+    let submit_repository = RecordingIntentRepository::default();
+    let submitted = submit_repository.recorded.clone();
+    let worker_repository = RecordingIntentRepository::default();
+    let worker_recorded = worker_repository.recorded.clone();
+    let worker_list_pending = worker_repository.list_pending_calls.clone();
+    let executor = executor(storage, source).with_durable_intent_submit_and_worker_repositories(
+        Arc::new(submit_repository),
+        Arc::new(worker_repository),
+        Arc::new(Once::new()),
+    );
+
+    let result = executor.execute(blocks_input(1, 1)).expect("query result");
+
+    assert_eq!(result.rows.row_count(), 1);
+    assert_eq!(
+        submitted.lock().expect("submitted intents lock").len(),
+        1,
+        "query submission should use the submit repository"
+    );
+    assert!(
+        worker_recorded
+            .lock()
+            .expect("worker recorded intents lock")
+            .is_empty(),
+        "worker repository must not receive query submissions"
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while worker_list_pending.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        worker_list_pending.load(Ordering::SeqCst) > 0,
+        "durable intent worker should poll the worker repository"
+    );
+}
+
+#[test]
 fn test_durable_intent_startup_maintenance_does_not_block_executor_configuration() {
     let storage = LocalStorage::new(temp_storage_root("executor-intent-nonblocking-startup"));
     let source = MockSource::default();
@@ -1870,6 +1910,7 @@ impl ObjectStore for CountingObjectStore {
 #[derive(Clone, Default)]
 struct RecordingIntentRepository {
     recorded: Arc<Mutex<Vec<CreateDurablePromotionIntent>>>,
+    list_pending_calls: Arc<AtomicUsize>,
 }
 
 #[derive(Clone)]
@@ -1923,6 +1964,7 @@ impl DurablePromotionIntentRepository for RecordingIntentRepository {
         _now_unix_seconds: u64,
         _limit: usize,
     ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+        self.list_pending_calls.fetch_add(1, Ordering::SeqCst);
         Ok(Vec::new())
     }
 
@@ -1932,6 +1974,7 @@ impl DurablePromotionIntentRepository for RecordingIntentRepository {
         _now_unix_seconds: u64,
         _limit: usize,
     ) -> Result<Vec<DurablePromotionIntent>, DatalensError> {
+        self.list_pending_calls.fetch_add(1, Ordering::SeqCst);
         Ok(Vec::new())
     }
 

@@ -317,6 +317,28 @@ where
         }
     }
 
+    pub fn with_durable_intent_submit_and_worker_repositories_configured(
+        mut self,
+        submit_repository: Arc<dyn DurablePromotionIntentRepository>,
+        worker_repository: Arc<dyn DurablePromotionIntentRepository>,
+        config: QueryDurableIntentConfig,
+        startup_maintenance_once: Arc<Once>,
+    ) -> Self {
+        if config.enabled {
+            self.executor = self
+                .executor
+                .with_durable_intent_submit_and_worker_repositories(
+                    submit_repository,
+                    worker_repository,
+                    startup_maintenance_once,
+                );
+            self
+        } else {
+            log::info!("query durable intents disabled");
+            self
+        }
+    }
+
     pub fn with_warmup_pool<P>(mut self, pool: P) -> Self
     where
         P: RegisteredWarmupService + 'static,

@@ -276,9 +276,23 @@ where
         startup_maintenance_once: Arc<Once>,
     ) -> Self {
         let repository: Arc<dyn DurablePromotionIntentRepository> = Arc::new(repository);
+        self = self.with_durable_intent_submit_and_worker_repositories(
+            repository.clone(),
+            repository,
+            startup_maintenance_once,
+        );
+        self
+    }
+
+    pub fn with_durable_intent_submit_and_worker_repositories(
+        mut self,
+        submit_repository: Arc<dyn DurablePromotionIntentRepository>,
+        worker_repository: Arc<dyn DurablePromotionIntentRepository>,
+        startup_maintenance_once: Arc<Once>,
+    ) -> Self {
         self.durable_intent_worker = Some(
             DurablePromotionIntentWorker::start_with_startup_maintenance_once(
-                repository.clone(),
+                worker_repository,
                 self.writer.clone(),
                 self.source.clone(),
                 self.metrics
@@ -290,7 +304,7 @@ where
             )
             .expect("durable intent workers start"),
         );
-        self.durable_intents = Some(repository);
+        self.durable_intents = Some(submit_repository);
         self
     }
 
