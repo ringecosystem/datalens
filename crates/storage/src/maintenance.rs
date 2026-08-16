@@ -18,13 +18,14 @@ use crate::{
     ObjectPutIfAbsentResult, ObjectStore, ParquetCompression, StorageDataObject, checksum_hex,
     compaction_queue,
     coverage_index::{
-        COVERAGE_INDEX_V2_LIST_PAGE_SIZE, CoverageIndexV2Bucket, CoverageIndexV2CleanupRecord,
-        CoverageIndexV2CleanupRecordObject, coverage_index_v2_compaction_queue_prefix,
-        decode_v2_compaction_queue_record, latest_v2_snapshot_head,
-        parse_v2_bucket_from_object_key, prepare_v2_bucket_compaction,
+        COVERAGE_INDEX_V2_LIST_PAGE_SIZE, CoverageIndexV2Bucket, CoverageIndexV2BucketCompaction,
+        CoverageIndexV2CleanupRecord, CoverageIndexV2CleanupRecordObject,
+        coverage_index_v2_compaction_queue_prefix, decode_v2_compaction_queue_record,
+        latest_v2_snapshot_head, parse_v2_bucket_from_object_key, prepare_v2_bucket_compaction,
         unix_ms_now as coverage_index_v2_unix_ms_now,
         v2_cleanup_record_is_safe_to_delete_with_cache, v2_snapshot_cleanup_records_for_bucket,
-        write_v2_cleanup_record, write_v2_snapshot, write_v2_snapshot_head,
+        with_coverage_index_v2_bucket_locks, write_v2_cleanup_record, write_v2_snapshot,
+        write_v2_snapshot_head,
     },
     decode_object_rows, encode_object_rows, manifest_key, manifest_segment_prefix, range_kind_key,
     unix_seconds_now, verify_manifest_object_metadata,
@@ -1819,44 +1820,74 @@ where
                 }
                 continue;
             }
-            if let Some(compaction) = prepare_v2_bucket_compaction(
+            let compaction_result = with_coverage_index_v2_bucket_locks(
                 self.object_store(),
-                &bucket,
-                config.coverage_index_v2_delta_count_threshold,
-                operation_budget.remaining_gets(),
-            )? {
-                checkpoint()?;
-                let snapshot_key = write_v2_snapshot(
-                    self.object_store(),
-                    chain,
-                    &compaction.bucket.scope,
-                    compaction.bucket.bucket_start,
-                    compaction.bucket.bucket_end,
-                    compaction.entries,
-                    compaction.compacted_delta_keys.clone(),
-                )?;
-                operation_budget.record_puts(1);
-                operation_budget.record_gets(compaction.newly_compacted_delta_keys.len());
-                checkpoint()?;
-                write_v2_snapshot_head(
-                    self.object_store(),
-                    chain,
-                    &compaction.bucket.scope,
-                    compaction.bucket.bucket_start,
-                    compaction.bucket.bucket_end,
-                    snapshot_key.clone(),
-                    compaction.included_delta_high_watermark,
-                )?;
-                operation_budget.record_puts(1);
+                &std::iter::once(bucket.clone()).collect::<BTreeSet<_>>(),
+                || {
+                    let Some(compaction) = prepare_v2_bucket_compaction(
+                        self.object_store(),
+                        &bucket,
+                        config.coverage_index_v2_delta_count_threshold,
+                        operation_budget.remaining_gets(),
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    let CoverageIndexV2BucketCompaction {
+                        bucket: compacted_bucket,
+                        entries,
+                        compacted_delta_keys,
+                        newly_compacted_delta_keys,
+                        included_delta_high_watermark,
+                        input_delta_bytes,
+                    } = compaction;
+                    checkpoint()?;
+                    let snapshot_key = write_v2_snapshot(
+                        self.object_store(),
+                        chain,
+                        &compacted_bucket.scope,
+                        compacted_bucket.bucket_start,
+                        compacted_bucket.bucket_end,
+                        entries,
+                        compacted_delta_keys.clone(),
+                    )?;
+                    operation_budget.record_puts(1);
+                    operation_budget.record_gets(newly_compacted_delta_keys.len());
+                    checkpoint()?;
+                    write_v2_snapshot_head(
+                        self.object_store(),
+                        chain,
+                        &compacted_bucket.scope,
+                        compacted_bucket.bucket_start,
+                        compacted_bucket.bucket_end,
+                        snapshot_key.clone(),
+                        included_delta_high_watermark,
+                    )?;
+                    operation_budget.record_puts(1);
+                    Ok(Some((
+                        compacted_bucket,
+                        compacted_delta_keys,
+                        newly_compacted_delta_keys,
+                        input_delta_bytes,
+                        snapshot_key,
+                    )))
+                },
+            )?;
+            if let Some((
+                compacted_bucket,
+                mut compacted_delta_keys,
+                newly_compacted_delta_keys,
+                input_delta_bytes,
+                snapshot_key,
+            )) = compaction_result
+            {
                 report.compacted_buckets += 1;
-                report.compacted_deltas += compaction.newly_compacted_delta_keys.len();
-                report.input_delta_bytes = report
-                    .input_delta_bytes
-                    .saturating_add(compaction.input_delta_bytes);
+                report.compacted_deltas += newly_compacted_delta_keys.len();
+                report.input_delta_bytes =
+                    report.input_delta_bytes.saturating_add(input_delta_bytes);
                 processed_v2_bucket = true;
                 compacted_v2_bucket = true;
                 if config.cleanup_enabled && operation_budget.remaining_puts() > 0 {
-                    let mut compacted_delta_keys = compaction.compacted_delta_keys;
                     compacted_delta_keys.retain(|key| !cleanup_delta_keys.contains(key));
                     if !compacted_delta_keys.is_empty() {
                         checkpoint()?;
@@ -1864,9 +1895,9 @@ where
                         let record = CoverageIndexV2CleanupRecord {
                             schema_version: 1,
                             created_at_unix_ms: coverage_index_v2_unix_ms_now()?,
-                            scope: compaction.bucket.scope,
-                            bucket_start: compaction.bucket.bucket_start,
-                            bucket_end: compaction.bucket.bucket_end,
+                            scope: compacted_bucket.scope,
+                            bucket_start: compacted_bucket.bucket_start,
+                            bucket_end: compacted_bucket.bucket_end,
                             compaction_id: snapshot_key
                                 .rsplit('/')
                                 .next()

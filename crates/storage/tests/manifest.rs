@@ -5638,6 +5638,84 @@ fn test_coverage_index_v2_snapshot_lists_only_deltas_after_high_watermark() {
 }
 
 #[test]
+fn test_coverage_index_v2_partial_high_watermark_skips_legacy_snapshot_deltas() {
+    let object_store = CountingObjectStore::new(LocalObjectStore::new(temp_storage_root(
+        "coverage-index-v2-partial-high-watermark",
+    )));
+    let storage = DurableStorage::from_object_store(object_store.clone());
+    let chain = test_chain();
+    let selector = DatasetSelector::all();
+    let query_range = LedgerRange::blocks(10, 11).expect("valid range");
+    let old_delta_range = LedgerRange::blocks(10, 10).expect("valid range");
+    let scope = coverage_index_v2_exact_scope(
+        &DatasetKey::evm_blocks(),
+        "block",
+        &selector,
+        ManifestFinalityLevel::Safe,
+    );
+    let first_delta_key = write_coverage_index_v2_delta(
+        &storage,
+        &chain,
+        &scope,
+        &old_delta_range,
+        "0001-compacted",
+        vec![empty_manifest_entry(
+            &chain,
+            DatasetKey::evm_blocks(),
+            &selector,
+            old_delta_range.clone(),
+            ManifestFinalityLevel::Safe,
+        )],
+    );
+    let second_delta_key = write_coverage_index_v2_delta(
+        &storage,
+        &chain,
+        &scope,
+        &old_delta_range,
+        "0002-compacted",
+        vec![empty_manifest_entry(
+            &chain,
+            DatasetKey::evm_blocks(),
+            &selector,
+            old_delta_range.clone(),
+            ManifestFinalityLevel::Safe,
+        )],
+    );
+    let snapshot_key = write_coverage_index_v2_snapshot(
+        &storage,
+        &chain,
+        &scope,
+        &query_range,
+        "partial-migration",
+        vec![empty_manifest_entry(
+            &chain,
+            DatasetKey::evm_blocks(),
+            &selector,
+            query_range.clone(),
+            ManifestFinalityLevel::Safe,
+        )],
+        vec![first_delta_key.clone(), second_delta_key.clone()],
+    );
+    write_coverage_index_v2_snapshot_head(
+        &storage,
+        &chain,
+        &scope,
+        &query_range,
+        "partial-migration",
+        &snapshot_key,
+        &first_delta_key,
+    );
+
+    assert_eq!(
+        storage
+            .covered_ranges(&chain, &DatasetKey::evm_blocks(), &selector, query_range,)
+            .expect("snapshot coverage"),
+        vec![LedgerRange::blocks(10, 11).expect("valid range")]
+    );
+    assert_eq!(object_store.get_count(&second_delta_key), 0);
+}
+
+#[test]
 fn test_coverage_index_v2_snapshot_empty_high_watermark_keeps_lower_pending_delta() {
     let object_store = CountingObjectStore::new(LocalObjectStore::new(temp_storage_root(
         "coverage-index-v2-snapshot-empty-high-watermark",
