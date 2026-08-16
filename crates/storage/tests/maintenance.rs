@@ -4601,7 +4601,7 @@ fn test_compaction_coverage_index_v2_cleanup_scan_is_bounded() {
         )
         .expect("cleanup scan should be bounded");
 
-    assert_eq!(report.get_operations, 72);
+    assert_eq!(report.get_operations, 44);
     assert_eq!(report.coverage_index_v2_deleted_deltas, 40);
 }
 
@@ -4645,9 +4645,9 @@ fn test_compaction_coverage_index_v2_cleanup_scan_uses_capped_get_budget() {
         )
         .expect("cleanup scan should use available get budget");
 
-    assert_eq!(report.get_operations, 112);
+    assert_eq!(report.get_operations, 84);
     assert_eq!(report.coverage_index_v2_deleted_deltas, 80);
-    assert_eq!(coverage_index_v2_cleanup_count(&storage, &chain), 48);
+    assert_eq!(coverage_index_v2_cleanup_count(&storage, &chain), 76);
 }
 
 #[test]
@@ -6124,8 +6124,8 @@ fn test_compaction_coverage_index_v2_cleanup_scan_preserves_hot_bucket_budget() 
         .expect("cleanup should not starve hot bucket compaction");
 
     assert_eq!(report.coverage_index_v2_compacted_buckets, 1);
-    assert_eq!(report.coverage_index_v2_compacted_deltas, 96);
-    assert_eq!(report.get_operations, 128);
+    assert_eq!(report.coverage_index_v2_compacted_deltas, 100);
+    assert_eq!(report.get_operations, 104);
     assert_eq!(
         coverage_index_v2_snapshot_head_count_for_bucket(
             &storage, &chain, scope, 25_400_000, 25_499_999,
