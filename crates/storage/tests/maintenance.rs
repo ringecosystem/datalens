@@ -4601,8 +4601,9 @@ fn test_compaction_coverage_index_v2_cleanup_scan_is_bounded() {
         )
         .expect("cleanup scan should be bounded");
 
-    assert_eq!(report.get_operations, 44);
-    assert_eq!(report.coverage_index_v2_deleted_deltas, 40);
+    assert_eq!(report.get_operations, 10);
+    assert_eq!(report.coverage_index_v2_deleted_deltas, 6);
+    assert_eq!(coverage_index_v2_cleanup_count(&storage, &chain), 36);
 }
 
 #[test]
@@ -4645,8 +4646,8 @@ fn test_compaction_coverage_index_v2_cleanup_scan_uses_capped_get_budget() {
         )
         .expect("cleanup scan should use available get budget");
 
-    assert_eq!(report.get_operations, 84);
-    assert_eq!(report.coverage_index_v2_deleted_deltas, 80);
+    assert_eq!(report.get_operations, 10);
+    assert_eq!(report.coverage_index_v2_deleted_deltas, 6);
     assert_eq!(coverage_index_v2_cleanup_count(&storage, &chain), 76);
 }
 
@@ -6558,6 +6559,62 @@ fn test_compaction_coverage_index_v2_compacts_hot_bucket_split_across_scan_pages
     assert_eq!(report.coverage_index_v2_compacted_buckets, 1);
     assert_eq!(report.coverage_index_v2_compacted_deltas, 129);
     assert_eq!(coverage_index_v2_snapshot_head_count(&storage, &chain), 1);
+}
+
+#[test]
+fn test_compaction_coverage_index_v2_large_bucket_compacts_in_batches() {
+    let storage = LocalStorage::new(temp_storage_root("coverage-v2-large-bucket-batched"));
+    let chain = test_chain();
+    let scope = "semantic/evm.logs/block/finalized/evm-logs-v1/addr/0x0000000000000000000000000000000000000001";
+    for index in 0..1532 {
+        write_coverage_index_v2_delta(
+            &storage,
+            &chain,
+            scope,
+            494_500_000,
+            494_599_999,
+            &format!("hot-{index:04}"),
+        );
+    }
+    write_coverage_index_v2_compaction_queue_record(
+        &storage,
+        &chain,
+        scope,
+        494_500_000,
+        494_599_999,
+    );
+
+    let first = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                coverage_index_v2_delta_count_threshold: 64,
+                max_gets_per_tick: 1536,
+                cleanup_enabled: false,
+                delete_source_objects: false,
+                ..coverage_index_v2_compaction_config(false)
+            },
+        )
+        .expect("first batched compaction");
+    let second = storage
+        .compact_small_objects_for_chain(
+            &chain,
+            MaintenanceCompactionConfig {
+                coverage_index_v2_delta_count_threshold: 64,
+                max_gets_per_tick: 1536,
+                cleanup_enabled: false,
+                delete_source_objects: false,
+                ..coverage_index_v2_compaction_config(false)
+            },
+        )
+        .expect("second batched compaction");
+
+    assert_eq!(first.coverage_index_v2_compacted_buckets, 1);
+    assert_eq!(first.coverage_index_v2_compacted_deltas, 128);
+    assert_eq!(second.coverage_index_v2_compacted_buckets, 1);
+    assert_eq!(second.coverage_index_v2_compacted_deltas, 128);
+    assert_eq!(coverage_index_v2_delta_count(&storage, &chain), 1532);
+    assert_eq!(coverage_index_v2_snapshot_head_count(&storage, &chain), 2);
 }
 
 #[test]
