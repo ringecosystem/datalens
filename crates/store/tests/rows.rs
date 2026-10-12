@@ -210,11 +210,18 @@ async fn senders_fill_missing_hashes_and_drop_from_a_block(pool: PgPool) {
 
     let mut tx = pool.begin().await.unwrap();
     store
-        .insert_senders(&mut tx, chain, &[(h1, 5, sender), (h2, 10, sender)])
+        .insert_senders(
+            &mut tx,
+            chain,
+            &[
+                (h1, 5, sender, Finality::Unsafe),
+                (h2, 10, sender, Finality::Unsafe),
+            ],
+        )
         .await
         .unwrap();
     store
-        .insert_senders(&mut tx, chain, &[(h1, 5, sender)])
+        .insert_senders(&mut tx, chain, &[(h1, 5, sender, Finality::Unsafe)])
         .await
         .unwrap();
     tx.commit().await.unwrap();
@@ -228,7 +235,10 @@ async fn senders_fill_missing_hashes_and_drop_from_a_block(pool: PgPool) {
     );
 
     let mut tx = pool.begin().await.unwrap();
-    store.delete_senders_from(&mut tx, chain, 10).await.unwrap();
+    store
+        .delete_unsafe_senders_from(&mut tx, chain, 10)
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
     assert_eq!(
         store.missing_hashes(chain, &[h1, h2]).await.unwrap(),
