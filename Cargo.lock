@@ -943,6 +943,20 @@ dependencies = [
 [[package]]
 name = "datalens-engine"
 version = "0.1.0"
+dependencies = [
+ "chrono",
+ "datalens-core",
+ "datalens-evm",
+ "datalens-provider",
+ "datalens-store",
+ "hex",
+ "prometheus",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "datalens-evm"
