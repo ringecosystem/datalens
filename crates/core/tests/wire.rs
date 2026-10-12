@@ -1,6 +1,6 @@
 use datalens_core::wire::{
-    Anchor, BlockRecord, ErrorBody, FollowInfo, IncompleteReason, LogRecord, PageInfo,
-    QueryRequest, QueryResponse, Segment, SegmentSource, WatchRequest,
+    Anchor, BlockRecord, ErrorBody, FollowInfo, FollowResumeRequest, IncompleteReason, LogRecord,
+    PageInfo, QueryRequest, QueryResponse, Segment, SegmentSource, WatchRequest,
 };
 use datalens_core::{
     Address, B256, BlockRange, BlockRow, Bytes, ChainName, Dataset, Error, Finality, LogRow,
@@ -203,5 +203,21 @@ fn follow_info_before_the_first_fetch_has_null_heads() {
     assert_eq!(
         serde_json::to_value(&info).unwrap(),
         json!({"from_block": 101, "head_block": null, "head_hash": null, "promoted_to": null})
+    );
+}
+
+#[test]
+fn below_safe_and_follow_resume_round_trip() {
+    assert_eq!(
+        serde_json::to_value(IncompleteReason::BelowSafe).unwrap(),
+        json!("below_safe")
+    );
+    assert_eq!(IncompleteReason::BelowSafe.as_str(), "below_safe");
+    let request: FollowResumeRequest =
+        serde_json::from_value(json!({"chain": "ethereum"})).unwrap();
+    assert_eq!(request.chain.as_str(), "ethereum");
+    assert!(
+        serde_json::from_value::<FollowResumeRequest>(json!({"chain": "ethereum", "x": 1}))
+            .is_err()
     );
 }
