@@ -1,23 +1,28 @@
 use std::fmt;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use datalens_core::{ChainName, Dataset};
 use serde_json::{Value, json};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::time::Instant;
 
 use crate::ProviderError;
-use crate::budget::{Budget, Parked};
+use crate::budget::{AcquireFail, Budget, Parked};
 use crate::clock::{Clock, SystemClock};
-use crate::error::{BuildError, classify_rpc_message, parse_retry_after};
+use crate::error::{BuildError, RETRY_AFTER_CAP, classify_rpc_message, parse_retry_after};
 use crate::metrics::ProviderMetrics;
-use crate::purpose::Purpose;
+use crate::purpose::{Purpose, TokenWait};
 use crate::range::RangeBook;
 
 const ATTEMPTS: u32 = 3;
 
-/// Per-chain gateway settings. `url` may embed an API key, so [`Debug`] redacts it.
+/// Per-chain gateway settings.
+///
+/// `rps`, `burst`, and `daily_calls` apply to this process only. Each replica
+/// and each role process spends the full configured budget, and `daily_calls`
+/// resets when the process restarts. `url` may embed an API key, so [`Debug`] redacts it.
 pub struct ProviderConfig {
     pub url: String,
     pub rps: NonZeroU32,
@@ -81,7 +86,7 @@ impl Gateway {
             config.rps.get(),
             config.burst.get(),
             config.daily_calls.map(NonZeroU64::get),
-            Instant::now(),
+            tokio::time::Instant::now(),
         );
         metrics.set_tokens(chain.as_str(), budget.tokens());
         let inner = Arc::new(Inner {
@@ -112,8 +117,8 @@ impl Gateway {
         self.lock_ranges().record_success(dataset);
     }
 
-    pub fn record_limit(&self, dataset: Dataset) -> Result<u64, ProviderError> {
-        self.lock_ranges().record_limit(dataset)
+    pub fn record_limit(&self, dataset: Dataset, failed_blocks: u64) -> Result<u64, ProviderError> {
+        self.lock_ranges().record_limit(dataset, failed_blocks)
     }
 
     pub async fn call(
@@ -122,6 +127,7 @@ impl Gateway {
         params: Value,
         purpose: Purpose,
         application: Option<&str>,
+        wait: TokenWait,
     ) -> Result<Value, ProviderError> {
         let app = application_label(application);
         let body = json!({
@@ -131,33 +137,25 @@ impl Gateway {
             "params": params,
         });
         for attempt in 1..=ATTEMPTS {
-            if let Err(error) = self.acquire(purpose).await {
-                self.count(method, purpose, app, error.kind());
-                return Err(error);
-            }
-            let outcome = self.dispatch(method, &body).await;
-            match outcome {
+            self.acquire(purpose, wait).await?;
+            match self.dispatch(method, &body, purpose).await {
                 Ok(value) => match interpret_object(value) {
                     Ok(result) => {
                         self.count(method, purpose, app, "ok");
                         return Ok(result);
                     }
-                    Err(error) if error.retryable(false) && attempt < ATTEMPTS => {
-                        self.count(method, purpose, app, error.kind());
-                        tokio::time::sleep(error.retry_delay(attempt)).await;
-                    }
                     Err(error) => {
                         self.count(method, purpose, app, error.kind());
-                        return Err(error);
+                        if !self.consider_retry(&error, attempt).await {
+                            return Err(error);
+                        }
                     }
                 },
-                Err(error) if error.retryable(false) && attempt < ATTEMPTS => {
-                    self.count(method, purpose, app, error.kind());
-                    tokio::time::sleep(error.retry_delay(attempt)).await;
-                }
                 Err(error) => {
                     self.count(method, purpose, app, error.kind());
-                    return Err(error);
+                    if !self.consider_retry(&error, attempt).await {
+                        return Err(error);
+                    }
                 }
             }
         }
@@ -169,6 +167,7 @@ impl Gateway {
         requests: Vec<(String, Value)>,
         purpose: Purpose,
         application: Option<&str>,
+        wait: TokenWait,
     ) -> Result<Vec<Result<Value, ProviderError>>, ProviderError> {
         if requests.is_empty() {
             return Ok(Vec::new());
@@ -191,13 +190,8 @@ impl Gateway {
                 .collect(),
         );
         for attempt in 1..=ATTEMPTS {
-            if let Err(error) = self.acquire(purpose).await {
-                for method in &methods {
-                    self.count(method, purpose, app, error.kind());
-                }
-                return Err(error);
-            }
-            match self.dispatch(duration_method, &body).await {
+            self.acquire(purpose, wait).await?;
+            match self.dispatch(duration_method, &body, purpose).await {
                 Ok(value) => {
                     let results = interpret_batch(value, methods.len())?;
                     for (method, result) in methods.iter().zip(&results) {
@@ -209,47 +203,58 @@ impl Gateway {
                     }
                     return Ok(results);
                 }
-                Err(error) if error.retryable(true) && attempt < ATTEMPTS => {
-                    for method in &methods {
-                        self.count(method, purpose, app, error.kind());
-                    }
-                    tokio::time::sleep(error.retry_delay(attempt)).await;
-                }
                 Err(error) => {
                     for method in &methods {
                         self.count(method, purpose, app, error.kind());
                     }
-                    return Err(error);
+                    if !self.consider_retry(&error, attempt).await {
+                        return Err(error);
+                    }
                 }
             }
         }
         Err(ProviderError::fatal("retry loop ended without a result"))
     }
 
-    async fn acquire(&self, purpose: Purpose) -> Result<(), ProviderError> {
+    async fn acquire(&self, purpose: Purpose, wait: TokenWait) -> Result<(), ProviderError> {
         let started = Instant::now();
+        let deadline = match wait {
+            TokenWait::UntilToken => None,
+            TokenWait::For(limit) => Some(started + limit),
+        };
         let mut prefer = false;
         loop {
+            let now = Instant::now();
+            let hold = self.lock_budget().hold_delay(now);
+            if let Some(delay) = hold {
+                tokio::time::sleep(delay).await;
+                continue;
+            }
             let use_prefer = prefer;
             let parked = {
                 let today = self.today();
                 let mut budget = self.lock_budget();
                 budget.refill(Instant::now());
-                match budget.try_acquire(purpose, started, today, use_prefer) {
-                    Err(()) => {
+                match budget.try_acquire(purpose, deadline, Instant::now(), today, use_prefer) {
+                    Err(fail) => {
                         let tokens = budget.tokens();
                         drop(budget);
-                        self.inner
-                            .metrics
-                            .set_tokens(self.inner.chain.as_str(), tokens);
-                        return Err(ProviderError::BudgetExhausted);
+                        self.reject(purpose, tokens);
+                        return Err(match fail {
+                            AcquireFail::Daily => ProviderError::BudgetExhausted,
+                            AcquireFail::Throttled => ProviderError::Throttled,
+                        });
                     }
                     Ok(None) => {
+                        let delay = budget.arm_delay();
                         let tokens = budget.tokens();
                         drop(budget);
                         self.inner
                             .metrics
                             .set_tokens(self.inner.chain.as_str(), tokens);
+                        if let Some(delay) = delay {
+                            self.spawn_refill(delay);
+                        }
                         return Ok(());
                     }
                     Ok(Some(parked)) => {
@@ -262,33 +267,76 @@ impl Gateway {
             if let Some(delay) = parked.1 {
                 self.spawn_refill(delay);
             }
-            if !self.wait_turn(purpose, parked.0).await? {
-                prefer = true;
-            } else {
-                return Err(ProviderError::BudgetExhausted);
+            if self.wait_turn(purpose, parked.0).await {
+                let tokens = self.lock_budget().tokens();
+                self.reject(purpose, tokens);
+                return Err(ProviderError::Throttled);
+            }
+            prefer = true;
+        }
+    }
+
+    /// `true` when the deadline elapsed.
+    async fn wait_turn(&self, purpose: Purpose, parked: Parked) -> bool {
+        let Parked { id, rx, deadline } = parked;
+        let timed_out = async {
+            match deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            biased;
+            received = rx => {
+                let _ = received;
+                false
+            }
+            _ = timed_out => {
+                let still_queued = self.lock_budget().remove(purpose, id);
+                if !still_queued {
+                    let mut budget = self.lock_budget();
+                    budget.wake_highest();
+                    let delay = budget.arm_delay();
+                    drop(budget);
+                    if let Some(delay) = delay {
+                        self.spawn_refill(delay);
+                    }
+                }
+                true
             }
         }
     }
 
-    /// `Ok(true)` means the short wait expired. `Ok(false)` means this caller was signaled.
-    async fn wait_turn(&self, purpose: Purpose, parked: Parked) -> Result<bool, ProviderError> {
-        let Parked { id, rx, timeout } = parked;
-        if let Some(timeout) = timeout {
-            tokio::select! {
-                biased;
-                received = rx => {
-                    let _ = received;
-                    Ok(false)
-                }
-                _ = tokio::time::sleep(timeout) => {
-                    self.lock_budget().remove(purpose, id);
-                    Ok(true)
-                }
+    /// `true` when the attempt should be repeated.
+    async fn consider_retry(&self, error: &ProviderError, attempt: u32) -> bool {
+        if let ProviderError::RateLimited { retry_after } = error {
+            self.hold_for(*retry_after);
+            if *retry_after > RETRY_AFTER_CAP {
+                return false;
             }
-        } else {
-            let _ = rx.await;
-            Ok(false)
         }
+        if error.retryable() && attempt < ATTEMPTS {
+            tokio::time::sleep(error.retry_delay(attempt)).await;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn hold_for(&self, delay: Duration) {
+        if delay.is_zero() {
+            return;
+        }
+        self.lock_budget().hold_until(Instant::now() + delay);
+    }
+
+    fn reject(&self, purpose: Purpose, tokens: f64) {
+        self.inner
+            .metrics
+            .set_tokens(self.inner.chain.as_str(), tokens);
+        self.inner
+            .metrics
+            .record_rejection(self.inner.chain.as_str(), purpose.as_str());
     }
 
     fn spawn_refill(&self, delay: Duration) {
@@ -297,7 +345,7 @@ impl Gateway {
             tokio::time::sleep(delay).await;
             let mut next = {
                 let mut budget = lock_mutex(&inner.budget);
-                budget.refill_fired(Instant::now())
+                budget.refill_fired(tokio::time::Instant::now())
             };
             inner
                 .metrics
@@ -306,7 +354,7 @@ impl Gateway {
                 tokio::time::sleep(delay).await;
                 next = {
                     let mut budget = lock_mutex(&inner.budget);
-                    let delay = budget.refill_fired(Instant::now());
+                    let delay = budget.refill_fired(tokio::time::Instant::now());
                     inner
                         .metrics
                         .set_tokens(inner.chain.as_str(), budget.tokens());
@@ -316,14 +364,20 @@ impl Gateway {
         });
     }
 
-    async fn dispatch(&self, method: &str, body: &Value) -> Result<Value, ProviderError> {
+    async fn dispatch(
+        &self,
+        method: &str,
+        body: &Value,
+        purpose: Purpose,
+    ) -> Result<Value, ProviderError> {
         let permit = self.permit().await;
-        let started = Instant::now();
+        let started = std::time::Instant::now();
         let result = self.post(body).await;
         drop(permit);
         self.inner.metrics.observe_duration(
             self.inner.chain.as_str(),
             method,
+            purpose.as_str(),
             started.elapsed().as_secs_f64(),
         );
         result
@@ -348,6 +402,9 @@ impl Gateway {
             .await
             .map_err(|_| ProviderError::Transient { status: None })?;
         let status = response.status();
+        if status.as_u16() == 413 {
+            return Err(ProviderError::BatchTooLarge);
+        }
         if status.as_u16() == 429 {
             let retry_after = response
                 .headers()
@@ -445,7 +502,7 @@ fn interpret_batch(
             "json-rpc batch response is not an array",
         ));
     };
-    let mut ordered = vec![Err(ProviderError::fatal("missing batch item")); expected];
+    let mut ordered = vec![None; expected];
     for item in items {
         let id = item
             .get("id")
@@ -455,9 +512,15 @@ fn interpret_batch(
         let Some(id) = id else {
             return Err(ProviderError::fatal("batch response id is out of range"));
         };
-        ordered[id - 1] = interpret_object(item);
+        if ordered[id - 1].is_some() {
+            return Err(ProviderError::fatal("duplicate batch response id"));
+        }
+        ordered[id - 1] = Some(interpret_object(item));
     }
-    Ok(ordered)
+    Ok(ordered
+        .into_iter()
+        .map(|slot| slot.unwrap_or_else(|| Err(ProviderError::fatal("missing batch item"))))
+        .collect())
 }
 
 fn classify_error_value(error: &Value) -> ProviderError {

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 /// Why a call is spending provider budget. Lower [`Purpose::rank`] is served first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Purpose {
@@ -28,10 +30,13 @@ impl Purpose {
             Self::Backfill => 4,
         }
     }
+}
 
-    /// Head and reorg wait for a token. Lower priorities give up quickly so they
-    /// cannot sit on the next token ahead of a head check.
-    pub(crate) fn fails_fast(self) -> bool {
-        !matches!(self, Self::Head | Self::Reorg)
-    }
+/// How long [`crate::Gateway`] may park a call that does not yet have a token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenWait {
+    /// Head, reorg, and follow park until a token is free or the daily cap is hit.
+    UntilToken,
+    /// Query fill and backfill park until `limit`, then [`crate::ProviderError::Throttled`].
+    For(Duration),
 }

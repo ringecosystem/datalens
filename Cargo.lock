@@ -962,6 +962,7 @@ name = "datalens-provider"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "chrono",
  "datalens-core",
  "prometheus",
  "reqwest",
@@ -998,7 +999,7 @@ dependencies = [
  "futures",
  "serde_json",
  "sqlx",
- "thiserror",
+ "thiserror 2.0.21",
  "tokio",
 ]
 

@@ -1,4 +1,4 @@
-use datalens_provider::Purpose;
+use datalens_provider::{Purpose, TokenWait};
 use prometheus::{Encoder, TextEncoder};
 use serde_json::json;
 
@@ -19,6 +19,7 @@ async fn batch_items_increment_calls_total_individually() {
             ],
             Purpose::Follow,
             Some("ormp"),
+            TokenWait::UntilToken,
         )
         .await
         .unwrap();
@@ -43,7 +44,7 @@ async fn batch_items_increment_calls_total_individually() {
     );
     assert!(
         text.contains(
-            "datalens_provider_call_duration_seconds_count{chain=\"arbitrum\",method=\"eth_getBlockByNumber\"} 1"
+            "datalens_provider_call_duration_seconds_count{chain=\"arbitrum\",method=\"eth_getBlockByNumber\",purpose=\"follow\"} 1"
         ),
         "{text}"
     );

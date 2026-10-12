@@ -4,6 +4,7 @@ use prometheus::{GaugeVec, HistogramOpts, HistogramVec, IntCounterVec, Opts, Reg
 #[derive(Clone)]
 pub struct ProviderMetrics {
     calls: IntCounterVec,
+    rejections: IntCounterVec,
     duration: HistogramVec,
     tokens: GaugeVec,
 }
@@ -17,12 +18,19 @@ impl ProviderMetrics {
             ),
             &["chain", "method", "purpose", "application", "outcome"],
         )?;
+        let rejections = IntCounterVec::new(
+            Opts::new(
+                "datalens_provider_budget_rejections_total",
+                "Calls that never reached the provider because the budget would not grant a token",
+            ),
+            &["chain", "purpose"],
+        )?;
         let duration = HistogramVec::new(
             HistogramOpts::new(
                 "datalens_provider_call_duration_seconds",
                 "HTTP duration of a provider call",
             ),
-            &["chain", "method"],
+            &["chain", "method", "purpose"],
         )?;
         let tokens = GaugeVec::new(
             Opts::new(
@@ -32,10 +40,12 @@ impl ProviderMetrics {
             &["chain"],
         )?;
         registry.register(Box::new(calls.clone()))?;
+        registry.register(Box::new(rejections.clone()))?;
         registry.register(Box::new(duration.clone()))?;
         registry.register(Box::new(tokens.clone()))?;
         Ok(Self {
             calls,
+            rejections,
             duration,
             tokens,
         })
@@ -54,9 +64,13 @@ impl ProviderMetrics {
             .inc();
     }
 
-    pub(crate) fn observe_duration(&self, chain: &str, method: &str, seconds: f64) {
+    pub(crate) fn record_rejection(&self, chain: &str, purpose: &str) {
+        self.rejections.with_label_values(&[chain, purpose]).inc();
+    }
+
+    pub(crate) fn observe_duration(&self, chain: &str, method: &str, purpose: &str, seconds: f64) {
         self.duration
-            .with_label_values(&[chain, method])
+            .with_label_values(&[chain, method, purpose])
             .observe(seconds);
     }
 

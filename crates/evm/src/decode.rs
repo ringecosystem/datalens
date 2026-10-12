@@ -52,7 +52,15 @@ pub(crate) fn parse_block(value: &Value, finality: Finality) -> Result<BlockRow,
     let parent_hash = parse_b256(required_str(value, "parentHash")?, "parentHash")?;
     let timestamp = parse_quantity(required_str(value, "timestamp")?, "timestamp")?;
     let mut header = object.clone();
-    for field in ["number", "hash", "parentHash", "timestamp"] {
+    for field in [
+        "number",
+        "hash",
+        "parentHash",
+        "timestamp",
+        "transactions",
+        "uncles",
+        "withdrawals",
+    ] {
         header.remove(field);
     }
     Ok(BlockRow {
@@ -65,11 +73,24 @@ pub(crate) fn parse_block(value: &Value, finality: Finality) -> Result<BlockRow,
     })
 }
 
-pub(crate) fn parse_sender(value: &Value) -> Result<Option<Address>, ProviderError> {
+pub(crate) struct ParsedTx {
+    pub(crate) address: Address,
+    pub(crate) block_number: u64,
+    pub(crate) block_hash: B256,
+}
+
+pub(crate) fn parse_tx(value: &Value) -> Result<Option<ParsedTx>, ProviderError> {
     if value.is_null() {
         return Ok(None);
     }
-    Ok(Some(parse_address(required_str(value, "from")?)?))
+    if value.get("blockNumber").is_some_and(Value::is_null) {
+        return Ok(None);
+    }
+    Ok(Some(ParsedTx {
+        address: parse_address(required_str(value, "from")?)?,
+        block_number: parse_quantity(required_str(value, "blockNumber")?, "blockNumber")?,
+        block_hash: parse_b256(required_str(value, "blockHash")?, "blockHash")?,
+    }))
 }
 
 fn required_str<'a>(value: &'a Value, field: &str) -> Result<&'a str, ProviderError> {
@@ -82,7 +103,7 @@ fn required_str<'a>(value: &'a Value, field: &str) -> Result<&'a str, ProviderEr
 fn parse_quantity(text: &str, field: &str) -> Result<u64, ProviderError> {
     let hex = text.strip_prefix("0x").unwrap_or(text);
     if hex.is_empty() {
-        return Ok(0);
+        return Err(ProviderError::fatal(format!("invalid {field}")));
     }
     u64::from_str_radix(hex, 16).map_err(|_| ProviderError::fatal(format!("invalid {field}")))
 }

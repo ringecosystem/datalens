@@ -1,11 +1,26 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use datalens_core::{Address, B256, BlockRange, BlockRow, Finality};
-use datalens_provider::{ProviderError, Purpose};
+use datalens_provider::{ProviderError, Purpose, TokenWait};
 use serde_json::{Value, json};
 
 use crate::client::{BlockRef, EvmClient};
-use crate::decode::{parse_block, parse_sender};
+use crate::decode::{parse_block, parse_tx};
+
+/// Sender of a mined transaction, with the block the provider reported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TxSender {
+    pub address: Address,
+    pub block_number: u64,
+    pub block_hash: B256,
+}
+
+/// Resolved senders, plus hashes that still failed after one retry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SenderLookup {
+    pub senders: HashMap<B256, TxSender>,
+    pub failed: Vec<B256>,
+}
 
 impl EvmClient {
     pub async fn block_headers(
@@ -13,6 +28,7 @@ impl EvmClient {
         range: BlockRange,
         purpose: Purpose,
         application: Option<&str>,
+        wait: TokenWait,
         finality: Finality,
     ) -> Result<Vec<BlockRow>, ProviderError> {
         let numbers: Vec<u64> = (range.start()..=range.end()).collect();
@@ -20,13 +36,22 @@ impl EvmClient {
             &numbers,
             purpose,
             application,
+            wait,
             &|number| {
                 (
                     "eth_getBlockByNumber".to_owned(),
                     json!([format!("0x{number:x}"), false]),
                 )
             },
-            &|_, value| parse_block(&value, finality),
+            &|number, value| {
+                let row = parse_block(&value, finality)?;
+                if row.number != *number {
+                    return Err(ProviderError::fatal(
+                        "block number does not match the request",
+                    ));
+                }
+                Ok(row)
+            },
         )
         .await
     }
@@ -36,6 +61,7 @@ impl EvmClient {
         block: BlockRef,
         purpose: Purpose,
         application: Option<&str>,
+        wait: TokenWait,
         finality: Finality,
     ) -> Result<Option<BlockRow>, ProviderError> {
         let value = self
@@ -45,12 +71,21 @@ impl EvmClient {
                 json!([block.param(), false]),
                 purpose,
                 application,
+                wait,
             )
             .await?;
         if value.is_null() {
             return Ok(None);
         }
-        Ok(Some(parse_block(&value, finality)?))
+        let row = parse_block(&value, finality)?;
+        if let BlockRef::Number(expected) = block
+            && row.number != expected
+        {
+            return Err(ProviderError::fatal(
+                "block number does not match the request",
+            ));
+        }
+        Ok(Some(row))
     }
 
     pub async fn transaction_senders(
@@ -58,53 +93,85 @@ impl EvmClient {
         hashes: &[B256],
         purpose: Purpose,
         application: Option<&str>,
-    ) -> Result<HashMap<B256, Address>, ProviderError> {
-        let pairs = self
-            .batch_resilient(
-                hashes,
-                purpose,
-                application,
-                &|hash| {
-                    (
-                        "eth_getTransactionByHash".to_owned(),
-                        json!([format!("{hash:#x}")]),
-                    )
-                },
-                &|hash, value| Ok((*hash, parse_sender(&value)?)),
-            )
+        wait: TokenWait,
+    ) -> Result<SenderLookup, ProviderError> {
+        let unique = deduped(hashes);
+        let first = self
+            .sender_batch(&unique, purpose, application, wait)
             .await?;
-        Ok(pairs
-            .into_iter()
-            .filter_map(|(hash, sender)| sender.map(|address| (hash, address)))
-            .collect())
+        let (mut senders, mut failed) = fold_senders(first);
+        if !failed.is_empty()
+            && let Ok(again) = self.sender_batch(&failed, purpose, application, wait).await
+        {
+            let (retried, still_failed) = fold_senders(again);
+            senders.extend(retried);
+            failed = still_failed;
+        }
+        Ok(SenderLookup { senders, failed })
     }
 
-    /// A JSON-RPC batch that comes back HTTP 5xx is split in half and tried again.
-    /// Halving stops at one call. The old client fell through to one request per block.
+    async fn sender_batch(
+        &self,
+        hashes: &[B256],
+        purpose: Purpose,
+        application: Option<&str>,
+        wait: TokenWait,
+    ) -> Result<Vec<(B256, Result<Value, ProviderError>)>, ProviderError> {
+        let results = self
+            .batch_chunks(hashes, purpose, application, wait, &|hash| {
+                (
+                    "eth_getTransactionByHash".to_owned(),
+                    json!([format!("{hash:#x}")]),
+                )
+            })
+            .await?;
+        Ok(hashes.iter().copied().zip(results).collect())
+    }
+
     async fn batch_resilient<T, R>(
         &self,
         items: &[T],
         purpose: Purpose,
         application: Option<&str>,
+        wait: TokenWait,
         build: &impl Fn(&T) -> (String, Value),
         parse: &impl Fn(&T, Value) -> Result<R, ProviderError>,
     ) -> Result<Vec<R>, ProviderError> {
+        let results = self
+            .batch_chunks(items, purpose, application, wait, build)
+            .await?;
+        let mut out = Vec::with_capacity(items.len());
+        for (item, result) in items.iter().zip(results) {
+            out.push(parse(item, result?)?);
+        }
+        Ok(out)
+    }
+
+    /// Halves only when the provider rejects the batch as too large.
+    async fn batch_chunks<T>(
+        &self,
+        items: &[T],
+        purpose: Purpose,
+        application: Option<&str>,
+        wait: TokenWait,
+        build: &impl Fn(&T) -> (String, Value),
+    ) -> Result<Vec<Result<Value, ProviderError>>, ProviderError> {
         let mut out = Vec::with_capacity(items.len());
         let mut queue: VecDeque<&[T]> = items.chunks(self.rpc_batch).collect();
         while let Some(chunk) = queue.pop_front() {
             let requests: Vec<(String, Value)> = chunk.iter().map(build).collect();
-            match self.gateway.batch(requests, purpose, application).await {
+            match self
+                .gateway
+                .batch(requests, purpose, application, wait)
+                .await
+            {
                 Ok(results) => {
                     if results.len() != chunk.len() {
                         return Err(ProviderError::fatal("batch result length mismatch"));
                     }
-                    for (item, result) in chunk.iter().zip(results) {
-                        out.push(parse(item, result?)?);
-                    }
+                    out.extend(results);
                 }
-                Err(ProviderError::Transient { status: Some(code) })
-                    if (500..600).contains(&code) && chunk.len() > 1 =>
-                {
+                Err(ProviderError::BatchTooLarge) if chunk.len() > 1 => {
                     let mid = chunk.len() / 2;
                     queue.push_front(&chunk[mid..]);
                     queue.push_front(&chunk[..mid]);
@@ -114,4 +181,42 @@ impl EvmClient {
         }
         Ok(out)
     }
+}
+
+fn deduped(hashes: &[B256]) -> Vec<B256> {
+    let mut seen = HashSet::with_capacity(hashes.len());
+    let mut unique = Vec::with_capacity(hashes.len());
+    for hash in hashes {
+        if seen.insert(*hash) {
+            unique.push(*hash);
+        }
+    }
+    unique
+}
+
+fn fold_senders(
+    results: Vec<(B256, Result<Value, ProviderError>)>,
+) -> (HashMap<B256, TxSender>, Vec<B256>) {
+    let mut senders = HashMap::new();
+    let mut failed = Vec::new();
+    for (hash, result) in results {
+        match result {
+            Ok(value) => match parse_tx(&value) {
+                Ok(Some(parsed)) => {
+                    senders.insert(
+                        hash,
+                        TxSender {
+                            address: parsed.address,
+                            block_number: parsed.block_number,
+                            block_hash: parsed.block_hash,
+                        },
+                    );
+                }
+                Ok(None) => {}
+                Err(_) => failed.push(hash),
+            },
+            Err(_) => failed.push(hash),
+        }
+    }
+    (senders, failed)
 }

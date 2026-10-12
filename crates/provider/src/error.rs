@@ -7,9 +7,21 @@ const LIMIT_PHRASES: &[&str] = &[
     "block range too large",
     "exceed maximum block range",
     "range is too large",
-    "limit exceeded",
+    "block range is too wide",
+    "eth_getlogs is limited to",
+    "maximum block range",
     "response size exceeded",
     "log size exceeded",
+];
+
+const BATCH_PHRASES: &[&str] = &["batch limit", "batch size"];
+
+const QUOTA_PHRASES: &[&str] = &[
+    "capacity",
+    "quota",
+    "daily request",
+    "compute units",
+    "credits",
 ];
 
 const NOT_READY_PHRASES: &[&str] = &["header not found", "block not available", "unknown block"];
@@ -23,6 +35,10 @@ const RATE_PHRASES: &[&str] = &[
 
 const BACKOFF_MS: u64 = 100;
 
+/// In-call sleep cap. A longer `Retry-After` is returned to the caller and
+/// still pauses every other caller on the chain.
+pub(crate) const RETRY_AFTER_CAP: Duration = Duration::from_secs(5);
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ProviderError {
     #[error("provider result is too large")]
@@ -35,8 +51,12 @@ pub enum ProviderError {
     Transient { status: Option<u16> },
     #[error("fatal provider failure: {message}")]
     Fatal { message: String },
-    #[error("provider budget exhausted")]
+    #[error("provider daily budget exhausted")]
     BudgetExhausted,
+    #[error("provider token was not available before the deadline")]
+    Throttled,
+    #[error("provider batch is too large")]
+    BatchTooLarge,
 }
 
 impl ProviderError {
@@ -48,6 +68,8 @@ impl ProviderError {
             Self::Transient { .. } => "transient",
             Self::Fatal { .. } => "fatal",
             Self::BudgetExhausted => "budget_exhausted",
+            Self::Throttled => "throttled",
+            Self::BatchTooLarge => "batch_too_large",
         }
     }
 
@@ -63,8 +85,12 @@ impl ProviderError {
         Self::Fatal { message }
     }
 
-    pub(crate) fn retryable(&self, _batch: bool) -> bool {
-        matches!(self, Self::RateLimited { .. } | Self::Transient { .. })
+    pub(crate) fn retryable(&self) -> bool {
+        match self {
+            Self::RateLimited { retry_after } => *retry_after <= RETRY_AFTER_CAP,
+            Self::Transient { .. } => true,
+            _ => false,
+        }
     }
 
     pub(crate) fn retry_delay(&self, failed_attempt: u32) -> Duration {
@@ -77,7 +103,7 @@ impl ProviderError {
     }
 }
 
-/// Classifies a JSON-RPC error object. Rate phrases win over `limit exceeded`,
+/// Classifies a JSON-RPC error object. Rate phrases win over size phrases,
 /// because "rate limit exceeded" is not an oversized `eth_getLogs`.
 pub fn classify_rpc_message(code: i64, message: &str) -> ProviderError {
     let lower = message.to_ascii_lowercase();
@@ -88,6 +114,14 @@ pub fn classify_rpc_message(code: i64, message: &str) -> ProviderError {
         return ProviderError::NotReady;
     }
     if RATE_PHRASES.iter().any(|phrase| lower.contains(phrase)) || code == 429 {
+        return ProviderError::RateLimited {
+            retry_after: Duration::ZERO,
+        };
+    }
+    if BATCH_PHRASES.iter().any(|phrase| lower.contains(phrase)) {
+        return ProviderError::BatchTooLarge;
+    }
+    if QUOTA_PHRASES.iter().any(|phrase| lower.contains(phrase)) {
         return ProviderError::RateLimited {
             retry_after: Duration::ZERO,
         };
@@ -114,9 +148,20 @@ pub enum BuildError {
 }
 
 pub(crate) fn parse_retry_after(value: &str) -> Duration {
-    value
-        .trim()
-        .parse::<u64>()
-        .map(Duration::from_secs)
-        .unwrap_or(Duration::ZERO)
+    let text = value.trim();
+    if let Ok(seconds) = text.parse::<u64>() {
+        return Duration::from_secs(seconds);
+    }
+    http_date_delay(text).unwrap_or(RETRY_AFTER_CAP)
+}
+
+fn http_date_delay(value: &str) -> Option<Duration> {
+    let parsed = chrono::NaiveDateTime::parse_from_str(value, "%a, %d %b %Y %H:%M:%S GMT").ok()?;
+    let target = parsed.and_utc();
+    let delta = target.signed_duration_since(chrono::Utc::now());
+    let millis = delta.num_milliseconds();
+    if millis <= 0 {
+        return Some(Duration::ZERO);
+    }
+    u64::try_from(millis).ok().map(Duration::from_millis)
 }

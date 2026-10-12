@@ -1,12 +1,12 @@
 use std::collections::VecDeque;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::sync::oneshot;
+use tokio::time::Instant;
 
 use crate::Purpose;
 
 const SCALE: u64 = 1_000_000;
-const LOW_PRIORITY_WAIT: Duration = Duration::from_millis(50);
 const RANKS: usize = 5;
 
 struct Waiter {
@@ -14,11 +14,17 @@ struct Waiter {
     tx: oneshot::Sender<()>,
 }
 
+pub(crate) enum AcquireFail {
+    Daily,
+    Throttled,
+}
+
 pub(crate) struct Budget {
     balance: u64,
     burst: u64,
     rps: u32,
     updated: Instant,
+    not_before: Instant,
     daily_limit: Option<u64>,
     daily_used: u64,
     daily_day: u64,
@@ -30,7 +36,7 @@ pub(crate) struct Budget {
 pub(crate) struct Parked {
     pub(crate) id: u64,
     pub(crate) rx: oneshot::Receiver<()>,
-    pub(crate) timeout: Option<Duration>,
+    pub(crate) deadline: Option<Instant>,
 }
 
 impl Budget {
@@ -40,6 +46,7 @@ impl Budget {
             burst: u64::from(burst) * SCALE,
             rps,
             updated: now,
+            not_before: now,
             daily_limit,
             daily_used: 0,
             daily_day: 0,
@@ -51,6 +58,17 @@ impl Budget {
 
     pub(crate) fn tokens(&self) -> f64 {
         self.balance as f64 / SCALE as f64
+    }
+
+    pub(crate) fn hold_until(&mut self, until: Instant) {
+        if until > self.not_before {
+            self.not_before = until;
+        }
+    }
+
+    pub(crate) fn hold_delay(&self, now: Instant) -> Option<Duration> {
+        let delay = self.not_before.saturating_duration_since(now);
+        if delay.is_zero() { None } else { Some(delay) }
     }
 
     pub(crate) fn refill(&mut self, now: Instant) {
@@ -82,13 +100,14 @@ impl Budget {
     pub(crate) fn try_acquire(
         &mut self,
         purpose: Purpose,
-        started: Instant,
+        deadline: Option<Instant>,
+        now: Instant,
         today: u64,
         woken: bool,
-    ) -> Result<Option<Parked>, ()> {
+    ) -> Result<Option<Parked>, AcquireFail> {
         self.roll_day(today);
         if self.daily_exhausted() {
-            return Err(());
+            return Err(AcquireFail::Daily);
         }
         let higher = self.has_higher(purpose);
         let same = self.has_same(purpose);
@@ -103,18 +122,24 @@ impl Budget {
             }
             return Ok(None);
         }
-        if purpose.fails_fast() && started.elapsed() >= LOW_PRIORITY_WAIT {
-            return Err(());
+        if deadline.is_some_and(|deadline| now >= deadline) {
+            return Err(AcquireFail::Throttled);
         }
-        Ok(Some(self.enqueue(purpose, started)))
+        Ok(Some(self.enqueue(purpose, deadline)))
     }
 
-    pub(crate) fn remove(&mut self, purpose: Purpose, id: u64) {
-        self.waiters[purpose.rank()].retain(|waiter| waiter.id != id);
+    /// `true` when this id was still queued.
+    pub(crate) fn remove(&mut self, purpose: Purpose, id: u64) -> bool {
+        let queue = &mut self.waiters[purpose.rank()];
+        let before = queue.len();
+        queue.retain(|waiter| waiter.id != id);
+        queue.len() != before
     }
 
+    /// Keeps a timer running for whoever is still queued. The token that woke
+    /// the first waiter may be gone before the next waiter is polled.
     pub(crate) fn arm_delay(&mut self) -> Option<Duration> {
-        if self.refill_armed || !self.has_waiters() || self.balance >= SCALE {
+        if self.refill_armed || !self.has_waiters() {
             return None;
         }
         self.refill_armed = true;
@@ -126,6 +151,16 @@ impl Budget {
         self.refill(now);
         self.wake_highest();
         self.arm_delay()
+    }
+
+    pub(crate) fn wake_highest(&mut self) {
+        for queue in &mut self.waiters {
+            while let Some(waiter) = queue.pop_front() {
+                if waiter.tx.send(()).is_ok() {
+                    return;
+                }
+            }
+        }
     }
 
     fn roll_day(&mut self, today: u64) {
@@ -154,35 +189,23 @@ impl Budget {
         self.waiters.iter().any(|queue| !queue.is_empty())
     }
 
-    fn enqueue(&mut self, purpose: Purpose, started: Instant) -> Parked {
+    fn enqueue(&mut self, purpose: Purpose, deadline: Option<Instant>) -> Parked {
         let (tx, rx) = oneshot::channel();
         let id = self.next_id;
         self.next_id += 1;
         self.waiters[purpose.rank()].push_back(Waiter { id, tx });
-        let timeout = purpose.fails_fast().then(|| {
-            LOW_PRIORITY_WAIT
-                .checked_sub(started.elapsed())
-                .unwrap_or(Duration::ZERO)
-        });
-        Parked { id, rx, timeout }
-    }
-
-    fn wake_highest(&mut self) {
-        for queue in &mut self.waiters {
-            while let Some(waiter) = queue.pop_front() {
-                if waiter.tx.send(()).is_ok() {
-                    return;
-                }
-            }
-        }
+        Parked { id, rx, deadline }
     }
 
     fn delay_until_token(&self) -> Duration {
-        if self.balance >= SCALE {
+        let need = if self.balance >= SCALE.saturating_mul(2) {
             return Duration::from_millis(1);
-        }
-        let need = u128::from(SCALE - self.balance);
-        let ns = need * 1_000_000_000 / (u128::from(self.rps) * u128::from(SCALE));
+        } else if self.balance >= SCALE {
+            SCALE
+        } else {
+            SCALE - self.balance
+        };
+        let ns = u128::from(need) * 1_000_000_000 / (u128::from(self.rps) * u128::from(SCALE));
         Duration::from_nanos(u64::try_from(ns.max(1_000_000)).unwrap_or(u64::MAX))
     }
 }

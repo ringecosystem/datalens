@@ -3,7 +3,7 @@ use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 
 use datalens_core::{BlockRange, ChainName, Finality, LogSelector};
 use datalens_evm::{EvmClient, HeadMode};
-use datalens_provider::{Gateway, ProviderConfig, ProviderMetrics, Purpose};
+use datalens_provider::{Gateway, ProviderConfig, ProviderMetrics, Purpose, TokenWait};
 use prometheus::Registry;
 
 #[tokio::test]
@@ -25,9 +25,9 @@ async fn publicnode_heads_and_ten_block_logs() {
         metrics,
     )
     .unwrap();
-    let evm = EvmClient::new(gateway, NonZeroUsize::new(1).unwrap(), 20);
+    let evm = EvmClient::new(gateway, NonZeroUsize::new(1).unwrap(), 20).unwrap();
     let heads = evm
-        .heads(HeadMode::Tags, Purpose::Head, None)
+        .heads(HeadMode::Tags, Purpose::Head, None, TokenWait::UntilToken)
         .await
         .unwrap();
     assert!(heads.latest > 1_000_000);
@@ -41,10 +41,18 @@ async fn publicnode_heads_and_ten_block_logs() {
             .unwrap()]),
         topics: Default::default(),
     };
-    let rows = evm
-        .get_logs(&selector, range, Purpose::Follow, None, Finality::Unsafe)
+    let page = evm
+        .get_logs(
+            &selector,
+            range,
+            Purpose::Follow,
+            None,
+            TokenWait::UntilToken,
+            Finality::Unsafe,
+        )
         .await
         .unwrap();
-    assert!(rows.iter().all(|row| range.contains(row.block_number)));
-    assert!(rows.len() < 100);
+    assert_eq!(page.fetched_to, Some(range.end()));
+    assert!(page.rows.iter().all(|row| range.contains(row.block_number)));
+    assert!(page.rows.len() < 100);
 }
