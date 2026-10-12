@@ -173,6 +173,28 @@ impl Store {
         )))
     }
 
+    /// The pending or running job for exactly this chunk, if any.
+    pub async fn active_job(
+        &self,
+        chain: ChainId,
+        dataset: Dataset,
+        selector_id: SelectorId,
+        blocks: BlockRange,
+    ) -> Result<Option<JobId>, StoreError> {
+        let id: Option<i64> = sqlx::query_scalar(
+            "select id from fill_jobs
+             where chain_id = $1 and dataset = $2 and selector_id = $3 and blocks = $4
+               and status in ('pending', 'running')",
+        )
+        .bind(chain.get())
+        .bind(dataset.as_str())
+        .bind(selector_id.get())
+        .bind(block_range_to_pg(blocks))
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(id.map(JobId::from_raw))
+    }
+
     /// Claims pending jobs whose `next_run_at` has arrived, and running jobs whose lease expired.
     /// `query` jobs go first, because a caller is waiting on them.
     pub async fn claim(
