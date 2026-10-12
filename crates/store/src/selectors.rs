@@ -1,6 +1,8 @@
-use datalens_core::{ChainId, LogSelector, Selector};
+use datalens_core::{ChainId, Dataset, LogSelector, Selector};
 
-use crate::codec::{addresses_from_db, addresses_to_db, topics_from_db, topics_to_db};
+use crate::codec::{
+    addresses_from_db, addresses_to_db, dataset_from_db, topics_from_db, topics_to_db,
+};
 use crate::ids::SelectorId;
 use crate::{Store, StoreError};
 
@@ -67,6 +69,38 @@ impl Store {
             }
         };
         Ok(SelectorId::from_raw(id))
+    }
+
+    /// Selectors in input order. Unknown ids are skipped.
+    pub async fn selectors_by_id(
+        &self,
+        ids: &[SelectorId],
+    ) -> Result<Vec<(SelectorId, Selector)>, StoreError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let raw: Vec<i64> = ids.iter().map(|id| id.get()).collect();
+        let rows: Vec<(i64, String, Vec<Vec<u8>>, serde_json::Value)> = sqlx::query_as(
+            "select id, dataset, addresses, topics from selectors where id = any($1)",
+        )
+        .bind(&raw)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut by_id = std::collections::HashMap::with_capacity(rows.len());
+        for (id, dataset, addresses, topics) in rows {
+            let selector = match dataset_from_db(&dataset)? {
+                Dataset::EvmLogs => Selector::Logs(LogSelector {
+                    addresses: addresses_from_db(addresses)?,
+                    topics: topics_from_db(topics)?,
+                }),
+                Dataset::EvmBlocks => Selector::Blocks,
+            };
+            by_id.insert(id, selector);
+        }
+        Ok(ids
+            .iter()
+            .filter_map(|id| by_id.remove(&id.get()).map(|selector| (*id, selector)))
+            .collect())
     }
 
     /// GIN prefilter, then [`LogSelector::covers`] for topic position and address subset.

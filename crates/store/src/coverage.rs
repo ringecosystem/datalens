@@ -88,6 +88,30 @@ impl Store {
         Ok(())
     }
 
+    /// This selector's own coverage rows in block order.
+    pub async fn coverage_spans(
+        &self,
+        chain: ChainId,
+        dataset: Dataset,
+        selector_id: SelectorId,
+    ) -> Result<Vec<(BlockRange, Finality)>, StoreError> {
+        let rows: Vec<(PgRange<i64>, i16)> = sqlx::query_as(
+            "select blocks, finality from coverage
+             where chain_id = $1 and dataset = $2 and selector_id = $3
+             order by blocks",
+        )
+        .bind(chain.get())
+        .bind(dataset.as_str())
+        .bind(selector_id.get())
+        .fetch_all(&self.pool)
+        .await?;
+        let mut spans = Vec::with_capacity(rows.len());
+        for (blocks, finality) in rows {
+            spans.push((block_range_from_pg(blocks)?, finality_from_db(finality)?));
+        }
+        Ok(spans)
+    }
+
     pub async fn covered(
         &self,
         chain: ChainId,

@@ -49,7 +49,7 @@ pub struct JobState {
 }
 
 impl JobPurpose {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Query => "query",
             Self::Backfill => "backfill",
@@ -66,8 +66,19 @@ impl JobPurpose {
 }
 
 impl JobStatus {
+    pub const ALL: [JobStatus; 4] = [Self::Pending, Self::Running, Self::Done, Self::Failed];
+
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Done | Self::Failed)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Done => "done",
+            Self::Failed => "failed",
+        }
     }
 
     fn parse(value: &str) -> Result<Self, StoreError> {
@@ -416,6 +427,49 @@ impl Store {
             )
             .await?;
         done.ok_or_else(|| StoreError::Timeout(format!("fill jobs {job_ids:?} not done")))
+    }
+
+    /// Most recently updated first, with each job's `last_error`.
+    pub async fn list_jobs(
+        &self,
+        status: Option<JobStatus>,
+        limit: u32,
+    ) -> Result<Vec<(Job, Option<serde_json::Value>)>, StoreError> {
+        let rows = sqlx::query(
+            "select id, chain_id, dataset, selector_id, blocks, purpose, application_id,
+                    status, attempts, worker_id, lease_until, last_error
+             from fill_jobs
+             where $1::text is null or status = $1
+             order by updated_at desc, id desc
+             limit $2",
+        )
+        .bind(status.map(JobStatus::as_str))
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        let mut jobs = Vec::with_capacity(rows.len());
+        for row in &rows {
+            use sqlx::Row;
+            jobs.push((job_from_row(row)?, row.try_get("last_error")?));
+        }
+        Ok(jobs)
+    }
+
+    /// Job count per status. Statuses with no jobs are reported as zero.
+    pub async fn job_counts(&self) -> Result<Vec<(JobStatus, i64)>, StoreError> {
+        let rows: Vec<(String, i64)> =
+            sqlx::query_as("select status, count(*) from fill_jobs group by status")
+                .fetch_all(&self.pool)
+                .await?;
+        let mut counts: Vec<(JobStatus, i64)> =
+            JobStatus::ALL.iter().map(|status| (*status, 0)).collect();
+        for (status, count) in rows {
+            let status = JobStatus::parse(&status)?;
+            if let Some(slot) = counts.iter_mut().find(|(known, _)| *known == status) {
+                slot.1 = count;
+            }
+        }
+        Ok(counts)
     }
 
     pub async fn prune_done(&self, older_than: Duration) -> Result<u64, StoreError> {
