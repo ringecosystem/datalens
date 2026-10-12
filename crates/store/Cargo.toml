@@ -1,0 +1,13 @@
+[package]
+name = "datalens-store"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+datalens-core.workspace = true
+sqlx.workspace = true
+
+[dev-dependencies]
+futures.workspace = true
+tokio.workspace = true
