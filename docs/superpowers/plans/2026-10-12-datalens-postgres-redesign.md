@@ -377,9 +377,12 @@ api/worker 进程内聚合，每 10 秒批量 upsert。Prometheus 指标并行�
 
 - 检测：每 tick 用 1 次 `eth_getBlockByNumber(head_block)` 校验各链最旧的未转正 follow 头的 hash；新拉的 logs 的
   `blockHash` 与已存同高度行不一致也视为 reorg。
-- 处理：向下二分找分叉点 F（最多 `reorg_window_blocks`，超过则告警并停止该链 follow）；一个事务删除
-  `block_number >= F` 且 `finality = unsafe` 的行（logs、blocks、tx_senders），回退相关 `follow_progress`；下一 tick 重拉。
+- 处理：向下二分找分叉点 F（先在 `reorg_window_blocks` 内找，整个窗口都不在主链时扩到全部未转正高度）；一个事务删除
+  `block_number >= F` 且 `finality = unsafe` 的行（logs、blocks、tx_senders），回退相关 `follow_progress`
+  （`promoted_to` 不回退）；下一 tick 重拉。
 - durable 行（≤ safe）永不回滚；如果 reorg 深于 safe，记 finality violation 并告警（保持现有规范）。
+- 分叉深于窗口或 ≤ safe 时先回滚再停止该链 follow；停止状态写入 `chains.follow_halted_at`，重启后仍停止，
+  由管理员 `POST /v1/admin/follow/resume` 恢复。
 
 ### 6.5 稳态 RPC 估算
 
@@ -439,10 +442,12 @@ api/worker 进程内聚合，每 10 秒批量 upsert。Prometheus 指标并行�
 ```
 
 - `served` 永远是从 `requested.start` 开始的连续前缀；`next_start` 为 `null` 表示全部完成。
-- `incomplete_reason`：`pending`、`provider_error`、`budget_exhausted`、`not_followed_yet`。
+- `incomplete_reason`：`pending`、`provider_error`、`budget_exhausted`、`not_followed_yet`、`below_safe`。
 - 不可恢复错误使用稳定的 `error.kind`：`unauthorized`、`forbidden`、`invalid_input`、`quota_exceeded`、
   `unsupported`、`internal`。
-- `latest_only` 只返回 hot 段（`(safe, head_block]` 与请求区间的交集）。
+- `latest_only` 只返回 hot 段（`(safe, head_block]` 与请求区间的交集），`served.start = safe + 1`。请求区间有
+  ≤ safe 的部分时，hot 段完整后 `next_start = null` 且 `incomplete_reason = below_safe`（这些块不会返回，
+  需要时改用 `safe_to_latest`）；hot 段未完成时 `pending` / `not_followed_yet` 优先。
 
 ### 8.2 其他接口
 
@@ -454,6 +459,7 @@ api/worker 进程内聚合，每 10 秒批量 upsert。Prometheus 指标并行�
 | `POST /v1/admin/backfill` | 提交历史补齐（`purpose = backfill`） |
 | `GET /v1/admin/coverage` | 查看 selector 覆盖与缺口 |
 | `GET /v1/admin/jobs` | 查看任务与失败原因 |
+| `POST /v1/admin/follow/resume` | `{chain}`，清除该链持久化的 follow 停止状态 |
 | `GET /metrics`、`/health`、`/ready` | 运维（metrics 需 bearer token） |
 
 ### 8.3 application 与 quota

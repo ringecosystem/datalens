@@ -1,8 +1,9 @@
 //! Typed REST client over [`datalens_core::wire`].
 
 use datalens_core::wire::{
-    BackfillRequest, BackfillResponse, ChainHeads, CoverageResponse, ErrorBody, HeadsResponse,
-    JobsResponse, QueryRequest, QueryResponse, WatchRequest, WatchResponse,
+    BackfillRequest, BackfillResponse, ChainHeads, CoverageResponse, ErrorBody,
+    FollowResumeRequest, FollowResumeResponse, HeadsResponse, JobsResponse, QueryRequest,
+    QueryResponse, WatchRequest, WatchResponse,
 };
 use datalens_core::{BlockRange, ChainName, Dataset, LogSelector};
 use reqwest::{RequestBuilder, Response};
@@ -154,6 +155,18 @@ impl Client {
         request: &BackfillRequest,
     ) -> Result<BackfillResponse, ClientError> {
         self.send(self.post("/v1/admin/backfill").json(request))
+            .await
+    }
+
+    /// Clears a follow halt. `halt_reason` is `None` when follow was not halted.
+    pub async fn resume_follow(
+        &self,
+        chain: &ChainName,
+    ) -> Result<FollowResumeResponse, ClientError> {
+        let request = FollowResumeRequest {
+            chain: chain.clone(),
+        };
+        self.send(self.post("/v1/admin/follow/resume").json(&request))
             .await
     }
 
