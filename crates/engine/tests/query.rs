@@ -313,6 +313,63 @@ async fn pages_walk_the_served_prefix_with_cursors(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+async fn pages_stop_at_the_served_end_while_the_next_cell_is_failed(pool: PgPool) {
+    let mock = MockChain::spawn().await;
+    let engine = engine(&pool, &mock).await;
+    let _workers = spawn_workers(&engine, 1);
+    let stored_past_served = engine
+        .query(
+            &caller(),
+            logs_request(selector(&[0xa1], &[]), range(0, 19_999)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stored_past_served.served, Some(range(0, 19_999)));
+    mock.fail_logs_from(10_000);
+    let wanted = selector(&[0xa1, 0xa2, 0xa3], &[]);
+    let mut collected = Vec::new();
+    let mut cursor = None;
+    let mut pages = 0;
+    loop {
+        let mut request = logs_request(wanted.clone(), range(0, 19_999));
+        request.page = Some(PageRequest {
+            limit: Some(6),
+            cursor: cursor.clone(),
+        });
+        let response = engine.query(&caller(), request).await.unwrap();
+        pages += 1;
+        assert_eq!(response.served, Some(range(0, 9_999)));
+        assert_eq!(response.next_start, Some(10_000));
+        collected.extend(response.rows);
+        cursor = response.page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert_eq!(pages, 4);
+    assert_eq!(collected, expected(&wanted, range(0, 9_999)));
+}
+
+#[sqlx::test(migrations = false)]
+async fn latest_only_serves_nothing_and_enqueues_nothing_until_followed(pool: PgPool) {
+    let mock = MockChain::spawn().await;
+    let engine = engine(&pool, &mock).await;
+    let mut request = logs_request(selector(&[0xa1], &[]), range(98_500, 99_050));
+    request.finality = QueryFinality::LatestOnly;
+    let response = engine.query(&caller(), request).await.unwrap();
+    assert_eq!(response.served, None);
+    assert_eq!(response.next_start, Some(98_500));
+    assert_eq!(
+        response.incomplete_reason,
+        Some(IncompleteReason::NotFollowedYet)
+    );
+    assert_eq!(response.segments, Vec::new());
+    assert_eq!(response.rows, Vec::<Value>::new());
+    assert_eq!(engine.jobs(None, 10).await.unwrap().jobs.len(), 0);
+    assert_eq!(mock.total(), 0);
+}
+
+#[sqlx::test(migrations = false)]
 async fn query_handling_never_asks_for_heights(pool: PgPool) {
     let mock = MockChain::spawn().await;
     let engine: QueryEngine = engine(&pool, &mock).await;

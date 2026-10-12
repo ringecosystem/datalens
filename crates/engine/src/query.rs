@@ -48,6 +48,9 @@ impl QueryEngine {
             .unwrap_or(settings.max_wait)
             .min(settings.max_wait);
         let range = request.range;
+        if request.finality == QueryFinality::LatestOnly {
+            return Ok(self.latest_only(caller, &chain, request));
+        }
 
         let heads = self.heads(&chain).await?;
         if request.finality == QueryFinality::DurableOnly && range.end() > heads.safe {
@@ -137,6 +140,36 @@ impl QueryEngine {
         })
     }
 
+    /// `latest_only` reads only the hot segment, which no follower serves yet. It never fills.
+    fn latest_only(
+        &self,
+        caller: &Caller<'_>,
+        chain: &Chain,
+        request: QueryRequest,
+    ) -> QueryResponse {
+        self.inner.usage.record(
+            caller.application,
+            chain.id(),
+            request.dataset,
+            UsageCounts {
+                queries: 1,
+                ..UsageCounts::default()
+            },
+        );
+        QueryResponse {
+            chain: request.chain,
+            dataset: request.dataset,
+            requested: request.range,
+            served: None,
+            next_start: Some(request.range.start()),
+            incomplete_reason: Some(IncompleteReason::NotFollowedYet),
+            incomplete_detail: None,
+            segments: Vec::new(),
+            rows: Vec::new(),
+            page: PageInfo { next_cursor: None },
+        }
+    }
+
     /// Covered prefix of `durable`, after enqueuing and waiting for fills of its gaps.
     #[allow(clippy::too_many_arguments)]
     async fn fill_durable(
@@ -164,12 +197,20 @@ impl QueryEngine {
         let mut jobs: Vec<(JobId, BlockRange)> = Vec::new();
         let mut over_budget = false;
         for chunk in fill_chunks(span, &covered, chunk, heads.safe) {
-            if caller
-                .fill_budget
-                .is_some_and(|budget| !budget.try_take(chunk.len()))
-            {
-                over_budget = true;
-                break;
+            // The budget pays for new fills only. A poll of a chunk already in flight joins it,
+            // and once a charge is refused, later chunks are only joined, never created.
+            if let Some(budget) = caller.fill_budget {
+                if let Some(id) = store
+                    .active_job(chain.id(), selector.dataset(), selector_id, chunk)
+                    .await?
+                {
+                    jobs.push((id, chunk));
+                    continue;
+                }
+                if over_budget || !budget.try_take(chunk.len()) {
+                    over_budget = true;
+                    continue;
+                }
             }
             let id = store
                 .enqueue(

@@ -180,3 +180,26 @@ async fn fill_budget_stops_enqueuing_and_reports_budget_exhausted(pool: PgPool) 
     );
     assert_eq!(mock.count("eth_getLogs"), 1);
 }
+
+#[sqlx::test(migrations = false)]
+async fn a_poll_of_an_in_flight_fill_waits_on_it_without_spending_budget(pool: PgPool) {
+    let mock = MockChain::spawn_slow(Duration::from_millis(500));
+    let engine = engine(&pool, &mock).await;
+    let budget = FillBudget::new(15_000);
+    let caller = Caller {
+        application: "degov",
+        fill_budget: Some(&budget),
+    };
+    let mut request = logs_request(selector(&[0xa1], &[]), range(0, 9_999));
+    request.wait_ms = Some(0);
+    let first = engine.query(&caller, request.clone()).await.unwrap();
+    assert_eq!(first.incomplete_reason, Some(IncompleteReason::Pending));
+
+    let _workers = spawn_workers(&engine, 1);
+    request.wait_ms = None;
+    let second = engine.query(&caller, request).await.unwrap();
+    assert_eq!(second.served, Some(range(0, 9_999)));
+    assert_eq!(second.incomplete_reason, None);
+    assert!(budget.try_take(5_000));
+    assert_eq!(mock.count("eth_getLogs"), 1);
+}
