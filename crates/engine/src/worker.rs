@@ -1,7 +1,9 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use datalens_core::{BlockRow, Dataset, Error, Finality, LogRow, LogSelector, Selector};
+use datalens_core::{
+    BlockRange, BlockRow, Dataset, Error, Finality, LogRow, LogSelector, Selector,
+};
 use datalens_provider::{ProviderError, Purpose, TokenWait};
 use datalens_store::{Job, JobId, JobPurpose, SelectorId, StoreError};
 use serde_json::json;
@@ -10,10 +12,13 @@ use tracing::warn;
 
 use crate::chain::Chain;
 use crate::engine::QueryEngine;
-use crate::plan::fill_finality;
+use crate::plan::{fill_finality, uncovered};
 use crate::usage::UsageCounts;
 
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
+/// An internal error that repeats this often is deterministic, so the job fails and its
+/// waiters see `provider_error` instead of `pending` forever.
+const INTERNAL_ATTEMPTS: i32 = 3;
 
 struct Failure {
     label: &'static str,
@@ -47,9 +52,37 @@ impl From<Error> for FillError {
     }
 }
 
-enum Fetched {
-    Logs(Vec<LogRow>),
-    Blocks(Vec<BlockRow>),
+/// Batch members that lack the same parts of the cell.
+struct Gaps {
+    missing: Vec<BlockRange>,
+    members: Vec<(SelectorId, Selector)>,
+}
+
+/// One provider fetch for a group of members over one gap.
+struct Fetch {
+    members: Vec<SelectorId>,
+    /// The fetched prefix of the gap. `None` when nothing was fetched.
+    blocks: Option<BlockRange>,
+    calls: i64,
+}
+
+impl Fetch {
+    fn held_members(&self, held: &HashSet<SelectorId>) -> Vec<SelectorId> {
+        self.members
+            .iter()
+            .filter(|id| held.contains(id))
+            .copied()
+            .collect()
+    }
+}
+
+#[derive(Default)]
+struct Fetched {
+    logs: Vec<LogRow>,
+    blocks: Vec<BlockRow>,
+    fetches: Vec<Fetch>,
+    /// Why fetching stopped early. The prefixes in `fetches` are committed regardless.
+    error: Option<FillError>,
 }
 
 impl QueryEngine {
@@ -109,17 +142,15 @@ impl QueryEngine {
         let Some(leader) = store.claim(worker_id, lease, 1, None).await?.pop() else {
             return Ok(None);
         };
-        let siblings = match leader.dataset {
-            Dataset::EvmLogs => {
-                let max = self
-                    .chain_by_id(leader.chain_id)?
-                    .settings
-                    .max_addresses_per_query
-                    .get();
+        // An unconfigured chain claims no siblings. Its leader still runs, so the failure is
+        // recorded on the job instead of leaving it running until the lease expires.
+        let siblings = match (leader.dataset, self.chain_by_id(leader.chain_id)) {
+            (Dataset::EvmLogs, Ok(chain)) => {
+                let max = chain.settings.max_addresses_per_query.get();
                 let limit = u32::try_from(max.saturating_sub(1)).unwrap_or(u32::MAX);
                 store.claim_batch_siblings(&leader, limit).await?
             }
-            Dataset::EvmBlocks => Vec::new(),
+            _ => Vec::new(),
         };
         let mut jobs = vec![leader];
         jobs.extend(siblings);
@@ -168,7 +199,7 @@ impl QueryEngine {
             Err(FillError::Internal(error)) => Some(Failure {
                 label: "internal",
                 body: json!({"kind": "internal", "message": error.to_string()}),
-                retryable: true,
+                retryable: leader.attempts < INTERNAL_ATTEMPTS,
                 retry_after: Duration::ZERO,
             }),
         };
@@ -211,6 +242,8 @@ impl QueryEngine {
         }
     }
 
+    /// Fetches what each member's coverage lacks inside the cell, then commits rows, coverage
+    /// of every fetched prefix, and (when nothing failed) completion, for still-held jobs only.
     async fn fill(&self, worker_id: &str, jobs: &[Job]) -> Result<(), FillError> {
         let store = &self.inner.store;
         let leader = &jobs[0];
@@ -220,129 +253,214 @@ impl QueryEngine {
         let ids: Vec<_> = jobs.iter().map(|job| job.selector_id).collect();
         let mut members = store.selectors_by_id(&ids).await?;
         members.sort_by_key(|(id, _)| *id);
-        // A job enqueued from a coverage read that raced another fill's commit finds its
-        // chunk already covered. It completes without spending RPC.
-        let mut uncovered = Vec::with_capacity(members.len());
+        // Members with the same uncovered parts share fetches. A retry after a partial failure
+        // only asks for what the committed prefix left, and a job whose cell another fill
+        // already covered completes without spending RPC.
+        let mut gaps: Vec<Gaps> = Vec::new();
         for (selector_id, selector) in members {
             let covered = self
                 .covered(&chain, &selector, selector_id, leader.blocks)
                 .await?;
-            if covered.first() != Some(&leader.blocks) {
-                uncovered.push((selector_id, selector));
+            let missing = uncovered(leader.blocks, &covered);
+            if missing.is_empty() {
+                continue;
+            }
+            match gaps.iter_mut().find(|gaps| gaps.missing == missing) {
+                Some(gaps) => gaps.members.push((selector_id, selector)),
+                None => gaps.push(Gaps {
+                    missing,
+                    members: vec![(selector_id, selector)],
+                }),
             }
         }
-        let members = uncovered;
 
-        let (fetched, calls) = match leader.dataset {
-            _ if members.is_empty() => (None, 0),
-            Dataset::EvmLogs => {
-                let selectors: Vec<LogSelector> = members
-                    .iter()
-                    .filter_map(|(_, selector)| match selector {
-                        Selector::Logs(logs) => Some(logs.clone()),
-                        Selector::Blocks => None,
-                    })
-                    .collect();
-                let (rows, calls) = self
-                    .fetch_logs(&chain, leader, &selectors, finality)
-                    .await?;
-                (Some(Fetched::Logs(rows)), calls)
+        let fetched = match leader.dataset {
+            Dataset::EvmLogs => self.fetch_logs(&chain, leader, gaps, finality).await,
+            Dataset::EvmBlocks => self.fetch_blocks(&chain, leader, gaps, finality).await,
+        };
+
+        // A fresh lease outlasts the short write transaction, so a job held here cannot be
+        // reclaimed before the commit.
+        let job_ids: Vec<JobId> = jobs.iter().map(|job| job.id).collect();
+        let held = store
+            .extend_lease(worker_id, &job_ids, self.inner.settings.lease)
+            .await?;
+        if held.len() < job_ids.len() {
+            warn!(
+                worker_id,
+                held = held.len(),
+                claimed = job_ids.len(),
+                "another worker reclaimed part of the batch"
+            );
+        }
+        let held_selectors: HashSet<SelectorId> = jobs
+            .iter()
+            .filter(|job| held.contains(&job.id))
+            .map(|job| job.selector_id)
+            .collect();
+
+        let mut tx = store.pool().begin().await.map_err(StoreError::from)?;
+        store
+            .insert_logs(&mut tx, chain.id(), &fetched.logs)
+            .await?;
+        store
+            .insert_blocks(&mut tx, chain.id(), &fetched.blocks)
+            .await?;
+        for fetch in &fetched.fetches {
+            let Some(blocks) = fetch.blocks else {
+                continue;
+            };
+            let ids = fetch.held_members(&held_selectors);
+            if ids.is_empty() {
+                continue;
             }
-            Dataset::EvmBlocks => {
-                let blocks = chain
+            store
+                .add_coverage_many(&mut tx, chain.id(), leader.dataset, &ids, blocks, finality)
+                .await?;
+        }
+        if fetched.error.is_none() {
+            store.complete_jobs(&mut tx, worker_id, &held).await?;
+        }
+        tx.commit().await.map_err(StoreError::from)?;
+
+        self.record_fill_usage(&chain, jobs, &fetched.fetches, &held_selectors);
+        fetched.error.map_or(Ok(()), Err)
+    }
+
+    /// Each fetch's calls are split across its held members. Blocks count what was fetched.
+    fn record_fill_usage(
+        &self,
+        chain: &Chain,
+        jobs: &[Job],
+        fetches: &[Fetch],
+        held: &HashSet<SelectorId>,
+    ) {
+        let mut counts: HashMap<SelectorId, UsageCounts> = HashMap::new();
+        for fetch in fetches {
+            let members = fetch.held_members(held);
+            let n = members.len() as i64;
+            for (index, id) in members.into_iter().enumerate() {
+                let entry = counts.entry(id).or_default();
+                entry.provider_calls +=
+                    fetch.calls / n + i64::from((index as i64) < fetch.calls % n);
+                entry.blocks_filled += fetch.blocks.map_or(0, |blocks| blocks.len() as i64);
+            }
+        }
+        for job in jobs {
+            if let Some(add) = counts.remove(&job.selector_id) {
+                self.inner
+                    .usage
+                    .record(&job.application_id, chain.id(), job.dataset, add);
+            }
+        }
+    }
+
+    /// One `get_logs` per batch group and gap, re-filtered so each row matches some member.
+    /// Stops at the first failure, keeping the prefix that call fetched.
+    async fn fetch_logs(
+        &self,
+        chain: &Chain,
+        leader: &Job,
+        gaps: Vec<Gaps>,
+        finality: Finality,
+    ) -> Fetched {
+        let max = chain.settings.max_addresses_per_query.get();
+        let mut rows: BTreeMap<(u64, u32), LogRow> = BTreeMap::new();
+        let mut fetched = Fetched::default();
+        'gaps: for Gaps { missing, members } in gaps {
+            let members: Vec<(SelectorId, LogSelector)> = members
+                .into_iter()
+                .filter_map(|(id, selector)| match selector {
+                    Selector::Logs(logs) => Some((id, logs)),
+                    Selector::Blocks => None,
+                })
+                .collect();
+            for group in batch_groups(&members, max) {
+                let selectors: Vec<LogSelector> =
+                    group.iter().map(|(_, selector)| selector.clone()).collect();
+                let query =
+                    LogSelector::batch(&selectors, max).unwrap_or_else(|| selectors[0].clone());
+                for gap in &missing {
+                    let (page, error) = match chain
+                        .evm
+                        .get_logs(
+                            &query,
+                            *gap,
+                            purpose(leader),
+                            Some(leader.application_id.as_str()),
+                            TokenWait::For(self.inner.settings.token_wait),
+                            finality,
+                        )
+                        .await
+                    {
+                        Ok(page) => (page, None),
+                        Err(failure) => (failure.page, Some(failure.error)),
+                    };
+                    for row in page.rows {
+                        if selectors.iter().any(|member| member.matches(&row)) {
+                            rows.insert((row.block_number, row.log_index), row);
+                        }
+                    }
+                    fetched.fetches.push(Fetch {
+                        members: group.iter().map(|(id, _)| *id).collect(),
+                        blocks: page
+                            .fetched_to
+                            .and_then(|end| BlockRange::new(gap.start(), end).ok()),
+                        calls: 1,
+                    });
+                    if let Some(error) = error {
+                        fetched.error = Some(FillError::Provider(error));
+                        break 'gaps;
+                    }
+                }
+            }
+        }
+        fetched.logs = rows.into_values().collect();
+        fetched
+    }
+
+    /// `evm.blocks` has one selector, so `gaps` holds at most one entry.
+    async fn fetch_blocks(
+        &self,
+        chain: &Chain,
+        leader: &Job,
+        gaps: Vec<Gaps>,
+        finality: Finality,
+    ) -> Fetched {
+        let mut fetched = Fetched::default();
+        for Gaps { missing, members } in gaps {
+            for gap in missing {
+                let result = chain
                     .evm
                     .block_headers(
-                        leader.blocks,
+                        gap,
                         purpose(leader),
                         Some(leader.application_id.as_str()),
                         TokenWait::For(self.inner.settings.token_wait),
                         finality,
                     )
-                    .await
-                    .map_err(FillError::Provider)?;
-                (Some(Fetched::Blocks(blocks)), 1)
-            }
-        };
-
-        let mut tx = store.pool().begin().await.map_err(StoreError::from)?;
-        match &fetched {
-            None => {}
-            Some(Fetched::Logs(rows)) => store.insert_logs(&mut tx, chain.id(), rows).await?,
-            Some(Fetched::Blocks(blocks)) => {
-                store.insert_blocks(&mut tx, chain.id(), blocks).await?
-            }
-        }
-        let selector_ids: Vec<SelectorId> = members.iter().map(|(id, _)| *id).collect();
-        store
-            .add_coverage_many(
-                &mut tx,
-                chain.id(),
-                leader.dataset,
-                &selector_ids,
-                leader.blocks,
-                finality,
-            )
-            .await?;
-        let job_ids: Vec<JobId> = jobs.iter().map(|job| job.id).collect();
-        let done = store.complete_jobs(&mut tx, worker_id, &job_ids).await?;
-        tx.commit().await.map_err(StoreError::from)?;
-        if done.len() < job_ids.len() {
-            warn!(
-                worker_id,
-                held = done.len(),
-                claimed = job_ids.len(),
-                "another worker reclaimed part of the batch"
-            );
-        }
-
-        for job in jobs {
-            self.inner.usage.record(
-                &job.application_id,
-                chain.id(),
-                job.dataset,
-                UsageCounts {
-                    blocks_filled: job.blocks.len() as i64,
-                    provider_calls: if job.id == leader.id { calls } else { 0 },
-                    ..UsageCounts::default()
-                },
-            );
-        }
-        Ok(())
-    }
-
-    /// One `eth_getLogs` per batch group, re-filtered so each row matches some member.
-    async fn fetch_logs(
-        &self,
-        chain: &Chain,
-        leader: &Job,
-        selectors: &[LogSelector],
-        finality: Finality,
-    ) -> Result<(Vec<LogRow>, i64), FillError> {
-        let max = chain.settings.max_addresses_per_query.get();
-        let mut rows: BTreeMap<(u64, u32), LogRow> = BTreeMap::new();
-        let mut calls = 0_i64;
-        for group in batch_groups(selectors, max) {
-            let query = LogSelector::batch(&group, max).unwrap_or_else(|| group[0].clone());
-            let page = chain
-                .evm
-                .get_logs(
-                    &query,
-                    leader.blocks,
-                    purpose(leader),
-                    Some(leader.application_id.as_str()),
-                    TokenWait::For(self.inner.settings.token_wait),
-                    finality,
-                )
-                .await
-                .map_err(|failure| FillError::Provider(failure.error))?;
-            calls += 1;
-            for row in page.rows {
-                if group.iter().any(|member| member.matches(&row)) {
-                    rows.insert((row.block_number, row.log_index), row);
+                    .await;
+                let blocks = match result {
+                    Ok(blocks) => {
+                        fetched.blocks.extend(blocks);
+                        Some(gap)
+                    }
+                    Err(error) => {
+                        fetched.error = Some(FillError::Provider(error));
+                        None
+                    }
+                };
+                fetched.fetches.push(Fetch {
+                    members: members.iter().map(|(id, _)| *id).collect(),
+                    blocks,
+                    calls: 1,
+                });
+                if fetched.error.is_some() {
+                    return fetched;
                 }
             }
         }
-        Ok((rows.into_values().collect(), calls))
+        fetched
     }
 
     async fn release(&self, worker_id: &str, ids: &[JobId]) {
@@ -368,17 +486,22 @@ fn purpose(job: &Job) -> Purpose {
 }
 
 /// Greedy groups that each fit one batched `eth_getLogs`.
-fn batch_groups(selectors: &[LogSelector], max_addresses: usize) -> Vec<Vec<LogSelector>> {
-    let mut groups: Vec<Vec<LogSelector>> = Vec::new();
-    for selector in selectors {
+fn batch_groups(
+    members: &[(SelectorId, LogSelector)],
+    max_addresses: usize,
+) -> Vec<Vec<(SelectorId, LogSelector)>> {
+    let mut groups: Vec<Vec<(SelectorId, LogSelector)>> = Vec::new();
+    for member in members {
         if let Some(group) = groups.last_mut() {
-            group.push(selector.clone());
-            if LogSelector::batch(group, max_addresses).is_some() {
+            group.push(member.clone());
+            let selectors: Vec<LogSelector> =
+                group.iter().map(|(_, selector)| selector.clone()).collect();
+            if LogSelector::batch(&selectors, max_addresses).is_some() {
                 continue;
             }
             group.pop();
         }
-        groups.push(vec![selector.clone()]);
+        groups.push(vec![member.clone()]);
     }
     groups
 }
