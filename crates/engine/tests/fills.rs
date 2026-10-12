@@ -179,6 +179,7 @@ async fn a_batch_member_reclaimed_mid_fetch_gets_no_coverage_or_usage_from_the_o
         let who = Caller {
             application,
             fill_budget: None,
+            max_subscriptions: None,
         };
         engine.query(&who, request).await.unwrap();
     }
@@ -279,6 +280,7 @@ async fn batched_provider_calls_are_split_across_member_applications(pool: PgPoo
         let who = Caller {
             application,
             fill_budget: None,
+            max_subscriptions: None,
         };
         engine.query(&who, request).await.unwrap();
     }

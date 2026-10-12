@@ -3,9 +3,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use datalens_core::wire::ChainHeads;
-use datalens_core::{ChainId, ChainName, Error, Heads};
+use datalens_core::{ChainId, ChainName, Dataset, Error, Heads};
 use datalens_provider::ProviderError;
-use datalens_store::Store;
+use datalens_store::{SelectorId, Store};
 use prometheus::Registry;
 use tokio::sync::Notify;
 
@@ -13,7 +13,7 @@ use crate::chain::{Chain, EngineSettings};
 use crate::metrics::EngineMetrics;
 use crate::usage::UsageBook;
 
-/// Query planner, fill worker, and head tracker over one store. Clone shares everything.
+/// Query planner, fill worker, and chain leader over one store. Clone shares everything.
 #[derive(Clone)]
 pub struct QueryEngine {
     pub(crate) inner: Arc<Inner>,
@@ -29,7 +29,12 @@ pub(crate) struct Inner {
     pub(crate) metrics: EngineMetrics,
     /// Wakes this process's idle fill workers right after a local enqueue.
     pub(crate) enqueued: Notify,
+    /// When this process last wrote each auto subscription, so a polling client renews it
+    /// at most once a minute.
+    pub(crate) touched: Mutex<HashMap<SubscriptionKey, Instant>>,
 }
+
+pub(crate) type SubscriptionKey = (ChainId, Dataset, SelectorId, String);
 
 impl QueryEngine {
     pub fn new(
@@ -58,6 +63,7 @@ impl QueryEngine {
                 usage: UsageBook::default(),
                 metrics,
                 enqueued: Notify::new(),
+                touched: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -103,6 +109,11 @@ impl QueryEngine {
         {
             return Ok(heads);
         }
+        self.fresh_heads(chain).await
+    }
+
+    /// `chain_heads` now, bypassing and refreshing the in-process copy.
+    pub(crate) async fn fresh_heads(&self, chain: &Chain) -> Result<Heads, Error> {
         let heads = self.inner.store.heads(chain.id()).await?.ok_or_else(|| {
             Error::InvalidInput(format!("chain {} has no head yet", chain.name()))
         })?;

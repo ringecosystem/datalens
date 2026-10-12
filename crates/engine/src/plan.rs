@@ -100,6 +100,17 @@ pub(crate) fn fill_finality(blocks: BlockRange, heads: &Heads) -> Finality {
     }
 }
 
+/// Finality of a row at `block` given the current heads.
+pub(crate) fn row_finality(block: u64, heads: &Heads) -> Finality {
+    if block <= heads.finalized {
+        Finality::Finalized
+    } else if block <= heads.safe {
+        Finality::Safe
+    } else {
+        Finality::Unsafe
+    }
+}
+
 /// Opaque page position. Logs order by `(block_number, log_index)`, blocks by number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Cursor {

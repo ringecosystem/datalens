@@ -1,7 +1,9 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use datalens_core::wire::{IncompleteReason, PageRequest, QueryResponse, Segment, SegmentSource};
+use datalens_core::wire::{
+    FollowInfo, IncompleteReason, PageRequest, QueryResponse, Segment, SegmentSource,
+};
 use datalens_core::{Dataset, Finality, QueryFinality};
 use datalens_engine::QueryEngine;
 use serde_json::Value;
@@ -9,7 +11,8 @@ use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 
 use common::{
-    MockChain, caller, engine, expected, logs_request, range, selector, sender_of, spawn_workers,
+    MockChain, SAFE, caller, chain_name, engine, expected, logs_request, range, selector,
+    sender_of, spawn_workers,
 };
 
 fn finalized_segment(start: u64, end: u64) -> Vec<Segment> {
@@ -379,19 +382,50 @@ async fn pages_stop_at_the_served_end_while_the_next_cell_is_failed(pool: PgPool
 }
 
 #[sqlx::test(migrations = false)]
-async fn latest_only_serves_nothing_and_enqueues_nothing_until_followed(pool: PgPool) {
+async fn latest_only_subscribes_but_serves_and_enqueues_nothing_before_the_first_follow_tick(
+    pool: PgPool,
+) {
     let mock = MockChain::spawn().await;
     let engine = engine(&pool, &mock).await;
-    let mut request = logs_request(selector(&[0xa1], &[]), range(98_500, 99_050));
+    let wanted = selector(&[0xa1], &[]);
+    let mut request = logs_request(wanted.clone(), range(98_500, 99_050));
     request.finality = QueryFinality::LatestOnly;
     let response = engine.query(&caller(), request).await.unwrap();
     assert_eq!(response.served, None);
-    assert_eq!(response.next_start, Some(98_500));
+    assert_eq!(response.next_start, Some(SAFE + 1));
     assert_eq!(
         response.incomplete_reason,
         Some(IncompleteReason::NotFollowedYet)
     );
     assert_eq!(response.segments, Vec::new());
+    assert_eq!(response.rows, Vec::<Value>::new());
+    assert_eq!(engine.jobs(None, 10).await.unwrap().jobs.len(), 0);
+    assert_eq!(mock.total(), 0);
+    let coverage = engine
+        .coverage(&chain_name(), Dataset::EvmLogs, Some(wanted), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        coverage.follow,
+        Some(FollowInfo {
+            from_block: SAFE + 1,
+            head_block: None,
+            head_hash: None,
+            promoted_to: None,
+        })
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn latest_only_entirely_at_or_below_safe_has_nothing_to_serve(pool: PgPool) {
+    let mock = MockChain::spawn().await;
+    let engine = engine(&pool, &mock).await;
+    let mut request = logs_request(selector(&[0xa1], &[]), range(98_500, SAFE));
+    request.finality = QueryFinality::LatestOnly;
+    let response = engine.query(&caller(), request).await.unwrap();
+    assert_eq!(response.served, None);
+    assert_eq!(response.next_start, None);
+    assert_eq!(response.incomplete_reason, None);
     assert_eq!(response.rows, Vec::<Value>::new());
     assert_eq!(engine.jobs(None, 10).await.unwrap().jobs.len(), 0);
     assert_eq!(mock.total(), 0);

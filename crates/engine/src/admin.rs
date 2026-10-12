@@ -1,8 +1,9 @@
 use datalens_core::wire::{
-    BackfillRequest, BackfillResponse, CoverageResponse, CoverageSpan, JobInfo, JobsResponse,
+    BackfillRequest, BackfillResponse, CoverageResponse, CoverageSpan, FollowInfo, JobInfo,
+    JobsResponse,
 };
 use datalens_core::{BlockRange, ChainName, Dataset, Error, LogSelector};
-use datalens_store::{JobPurpose, JobStatus};
+use datalens_store::{FollowProgress, JobPurpose, JobStatus};
 
 use crate::engine::QueryEngine;
 use crate::plan::{fill_chunks, grid_span, uncovered};
@@ -82,6 +83,12 @@ impl QueryEngine {
             }
             None => (Vec::new(), Vec::new()),
         };
+        let follow = store
+            .list_follow(runtime.id())
+            .await?
+            .into_iter()
+            .find(|progress| progress.dataset == dataset && progress.selector_id == selector_id)
+            .map(|progress| follow_info(&progress));
         Ok(CoverageResponse {
             chain: chain.clone(),
             dataset,
@@ -89,6 +96,7 @@ impl QueryEngine {
             spans,
             covered,
             missing,
+            follow,
         })
     }
 
@@ -113,5 +121,20 @@ impl QueryEngine {
             })
             .collect();
         Ok(JobsResponse { jobs })
+    }
+}
+
+pub(crate) fn follow_info(progress: &FollowProgress) -> FollowInfo {
+    let reached = |block: i64| {
+        u64::try_from(block)
+            .ok()
+            .filter(|block| *block >= progress.from_block)
+    };
+    let head_block = reached(progress.head_block);
+    FollowInfo {
+        from_block: progress.from_block,
+        head_block,
+        head_hash: head_block.map(|_| progress.head_hash),
+        promoted_to: reached(progress.promoted_to),
     }
 }

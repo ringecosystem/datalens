@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::chain::Chain;
 use crate::engine::{QueryEngine, provider_error};
-use crate::plan::{Cursor, fill_finality};
+use crate::plan::{Cursor, row_finality};
 
 const LOG_FIELDS: [&str; 9] = [
     "block_number",
@@ -224,11 +224,7 @@ impl QueryEngine {
                     blocks.get(hash) == Some(&(sender.block_number, sender.block_hash))
                 })
                 .map(|(hash, sender)| {
-                    let finality = if sender.block_number <= heads.finalized {
-                        Finality::Finalized
-                    } else {
-                        Finality::Safe
-                    };
+                    let finality = row_finality(sender.block_number, heads);
                     (hash, sender.block_number, sender.address, finality)
                 })
                 .collect();
@@ -271,8 +267,12 @@ impl QueryEngine {
             .filter(|number| !stamps.contains_key(number))
             .collect();
         if !missing.is_empty() {
+            let hashes: HashMap<u64, B256> = records
+                .iter()
+                .map(|record| (record.block_number, record.block_hash))
+                .collect();
             let mut fetched = Vec::new();
-            for run in consecutive_runs(&missing) {
+            for run in finality_runs(&missing, heads) {
                 fetched.extend(
                     chain
                         .evm
@@ -281,15 +281,21 @@ impl QueryEngine {
                             Purpose::QueryFill,
                             Some(application),
                             TokenWait::For(self.inner.settings.token_wait),
-                            fill_finality(run, heads),
+                            row_finality(run.end(), heads),
                         )
                         .await
                         .map_err(provider_error)?,
                 );
             }
+            // A header off the log's fork carries the wrong timestamp, and storing it would
+            // contradict the log.
+            fetched.retain(|block| hashes.get(&block.number) == Some(&block.hash));
             let mut tx = store.pool().begin().await.map_err(StoreError::from)?;
-            store.insert_blocks(&mut tx, chain.id(), &fetched).await?;
-            tx.commit().await.map_err(StoreError::from)?;
+            match store.insert_blocks(&mut tx, chain.id(), &fetched).await {
+                Ok(_) => tx.commit().await.map_err(StoreError::from)?,
+                Err(StoreError::Reorg { .. }) => {}
+                Err(error) => return Err(error.into()),
+            }
             stamps.extend(fetched.iter().map(|block| (block.number, block.timestamp)));
         }
         for record in records {
@@ -311,11 +317,15 @@ fn project(
     Ok(value)
 }
 
-fn consecutive_runs(sorted: &[u64]) -> Vec<BlockRange> {
+/// Consecutive runs of `sorted` that each hold one finality.
+fn finality_runs(sorted: &[u64], heads: &Heads) -> Vec<BlockRange> {
     let mut runs: Vec<BlockRange> = Vec::new();
     for &number in sorted {
         match runs.last_mut() {
-            Some(last) if last.end() + 1 == number => {
+            Some(last)
+                if last.end() + 1 == number
+                    && row_finality(last.end(), heads) == row_finality(number, heads) =>
+            {
                 *last = BlockRange::new(last.start(), number).expect("run grows upward");
             }
             _ => runs.extend(BlockRange::new(number, number).ok()),

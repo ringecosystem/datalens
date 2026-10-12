@@ -1,9 +1,12 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use datalens_core::wire::{IncompleteReason, PageInfo, QueryRequest, QueryResponse};
-use datalens_core::{BlockRange, Dataset, Error, Heads, QueryFinality, Selector};
+use datalens_core::wire::{
+    Anchor, IncompleteReason, PageInfo, QueryRequest, QueryResponse, Segment, SegmentSource,
+};
+use datalens_core::{B256, BlockRange, Dataset, Error, Finality, Heads, QueryFinality, Selector};
 use datalens_store::{
-    JobId, JobPurpose, JobStatus, SelectorId, StoreError, longest_covered_prefix,
+    FollowProgress, HeadKind, JobId, JobPurpose, JobStatus, SelectorId, StoreError,
+    SubscriptionSource, longest_covered_prefix,
 };
 use serde_json::Value;
 use tracing::warn;
@@ -13,18 +16,36 @@ use crate::chain::Chain;
 use crate::engine::QueryEngine;
 use crate::plan::{Cursor, durable_part, durable_segments, fill_chunks, grid_span};
 use crate::rows::{Page, Target};
+use crate::subscribe::subscription_quota;
 use crate::usage::UsageCounts;
 
-/// Who is asking. `application` attributes jobs and usage. It is never part of a cache key.
+/// Who is asking. `application` attributes jobs, usage, and subscriptions. It is never part
+/// of a cache key.
 pub struct Caller<'a> {
     pub application: &'a str,
     pub fill_budget: Option<&'a FillBudget>,
+    /// `None` means no limit.
+    pub max_subscriptions: Option<u32>,
 }
 
-/// How far the durable path got, and why it stopped short.
+type Blocker = (IncompleteReason, Option<String>);
+
+/// How far one part of a query got, and why it stopped short.
 struct Progress {
     served: Option<BlockRange>,
-    blocker: Option<(IncompleteReason, Option<String>)>,
+    blocker: Option<Blocker>,
+}
+
+impl Progress {
+    fn reaches(&self, end: u64) -> bool {
+        self.served.is_some_and(|served| served.end() == end)
+    }
+}
+
+/// The followed tail read from unsafe rows.
+struct Hot {
+    progress: Progress,
+    segment: Option<Segment>,
 }
 
 impl QueryEngine {
@@ -47,13 +68,15 @@ impl QueryEngine {
             .map(Duration::from_millis)
             .unwrap_or(settings.max_wait)
             .min(settings.max_wait);
+        let deadline = Instant::now() + wait;
         let range = request.range;
-        if request.finality == QueryFinality::LatestOnly {
-            return Ok(self.latest_only(caller, &chain, request));
-        }
+        let finality = request.finality;
 
-        let heads = self.heads(&chain).await?;
-        if request.finality == QueryFinality::DurableOnly && range.end() > heads.safe {
+        let mut heads = self.heads(&chain).await?;
+        if finality == QueryFinality::DurableOnly && range.end() > heads.safe {
+            heads = self.fresh_heads(&chain).await?;
+        }
+        if finality == QueryFinality::DurableOnly && range.end() > heads.safe {
             return Err(Error::InvalidInput(format!(
                 "block range end {} is above the safe head {}",
                 range.end(),
@@ -61,13 +84,37 @@ impl QueryEngine {
             )));
         }
         let selector = target.selector();
+        let dataset = selector.dataset();
         let selector_id = self
             .inner
             .store
             .upsert_selector(chain.id(), &selector)
             .await?;
-        let progress = match durable_part(range, heads.safe) {
-            Some(durable) => {
+        let follow = if self.follows(finality, range, &heads) {
+            let attached = self
+                .attach(
+                    caller,
+                    &chain,
+                    dataset,
+                    selector_id,
+                    heads.safe,
+                    SubscriptionSource::Auto,
+                )
+                .await?;
+            if attached.is_none() && finality != QueryFinality::DurableOnly {
+                return Err(subscription_quota(caller));
+            }
+            attached
+        } else {
+            None
+        };
+
+        let durable = match finality {
+            QueryFinality::LatestOnly => None,
+            _ => durable_part(range, heads.safe),
+        };
+        let durable_progress = match durable {
+            Some(durable) => Some(
                 self.fill_durable(
                     caller,
                     &chain,
@@ -75,26 +122,63 @@ impl QueryEngine {
                     selector_id,
                     durable,
                     &heads,
-                    wait,
+                    deadline,
+                    follow.as_ref(),
                 )
-                .await?
+                .await?,
+            ),
+            None => None,
+        };
+        let durable_done = match (durable, &durable_progress) {
+            (Some(durable), Some(progress)) => progress.reaches(durable.end()),
+            _ => true,
+        };
+        let hot_range = (finality != QueryFinality::DurableOnly && range.end() > heads.safe)
+            .then(|| BlockRange::new(range.start().max(heads.safe + 1), range.end()))
+            .transpose()?;
+        let hot = match hot_range {
+            Some(wanted) if durable_done => {
+                Some(self.hot(&chain, dataset, selector_id, wanted).await?)
             }
-            None => Progress {
-                served: None,
-                blocker: None,
-            },
+            _ => None,
         };
 
-        let next_start = match progress.served {
-            None => Some(range.start()),
+        let (served, blocker) = match (&durable_progress, &hot) {
+            (None, None) => (None, None),
+            (Some(durable), None) => (durable.served, durable.blocker.clone()),
+            (None, Some(hot)) => (hot.progress.served, hot.progress.blocker.clone()),
+            (Some(durable), Some(hot)) => match (durable.served, hot.progress.served) {
+                (Some(low), Some(high)) => (
+                    Some(BlockRange::new(low.start(), high.end())?),
+                    hot.progress.blocker.clone(),
+                ),
+                _ => (durable.served, hot.progress.blocker.clone()),
+            },
+        };
+        let scope_start = hot_range
+            .filter(|_| finality == QueryFinality::LatestOnly)
+            .map_or(range.start(), |hot| hot.start());
+        let in_scope = finality != QueryFinality::LatestOnly || hot_range.is_some();
+        let next_start = match served {
+            None => in_scope.then_some(scope_start),
             Some(served) => (served.end() < range.end()).then(|| served.end() + 1),
         };
-        let (incomplete_reason, incomplete_detail) = match (next_start, progress.blocker) {
+        let (incomplete_reason, incomplete_detail) = match (next_start, blocker) {
             (None, _) => (None, None),
             (Some(_), Some((reason, detail))) => (Some(reason), detail),
             (Some(_), None) => (Some(IncompleteReason::NotFollowedYet), None),
         };
-        let (rows, next_cursor) = match progress.served {
+
+        let mut segments = durable_progress
+            .as_ref()
+            .and_then(|durable| durable.served)
+            .map(|served| durable_segments(served, &heads))
+            .unwrap_or_default();
+        if durable_done {
+            segments.extend(hot.as_ref().and_then(|hot| hot.segment));
+        }
+
+        let (rows, next_cursor) = match served {
             Some(served) => {
                 self.read_rows(
                     caller.application,
@@ -119,7 +203,7 @@ impl QueryEngine {
             UsageCounts {
                 queries: 1,
                 rows_returned: rows.len() as i64,
-                blocks_served: progress.served.map_or(0, |served| served.len() as i64),
+                blocks_served: served.map_or(0, |served| served.len() as i64),
                 ..UsageCounts::default()
             },
         );
@@ -127,50 +211,32 @@ impl QueryEngine {
             chain: request.chain,
             dataset: request.dataset,
             requested: range,
-            served: progress.served,
+            served,
             next_start,
             incomplete_reason,
             incomplete_detail,
-            segments: progress
-                .served
-                .map(|served| durable_segments(served, &heads))
-                .unwrap_or_default(),
+            segments,
             rows,
             page: PageInfo { next_cursor },
         })
     }
 
-    /// `latest_only` reads only the hot segment, which no follower serves yet. It never fills.
-    fn latest_only(
-        &self,
-        caller: &Caller<'_>,
-        chain: &Chain,
-        request: QueryRequest,
-    ) -> QueryResponse {
-        self.inner.usage.record(
-            caller.application,
-            chain.id(),
-            request.dataset,
-            UsageCounts {
-                queries: 1,
-                ..UsageCounts::default()
-            },
-        );
-        QueryResponse {
-            chain: request.chain,
-            dataset: request.dataset,
-            requested: request.range,
-            served: None,
-            next_start: Some(request.range.start()),
-            incomplete_reason: Some(IncompleteReason::NotFollowedYet),
-            incomplete_detail: None,
-            segments: Vec::new(),
-            rows: Vec::new(),
-            page: PageInfo { next_cursor: None },
+    /// Head-tail queries subscribe their selector, and so does a `durable_only` query ending
+    /// within `follow_attach_blocks` of safe, such as an indexer chasing the safe head.
+    fn follows(&self, finality: QueryFinality, range: BlockRange, heads: &Heads) -> bool {
+        match finality {
+            QueryFinality::SafeToLatest | QueryFinality::LatestOnly => true,
+            QueryFinality::DurableOnly => {
+                range
+                    .end()
+                    .saturating_add(self.inner.settings.follow_attach_blocks)
+                    >= heads.safe
+            }
         }
     }
 
-    /// Covered prefix of `durable`, after enqueuing and waiting for fills of its gaps.
+    /// Covered prefix of `durable`. Gaps below the follow region are filled by jobs. Gaps in
+    /// it belong to the finalizer, so the query waits for promotion instead of fetching.
     #[allow(clippy::too_many_arguments)]
     async fn fill_durable(
         &self,
@@ -180,11 +246,25 @@ impl QueryEngine {
         selector_id: SelectorId,
         durable: BlockRange,
         heads: &Heads,
-        wait: Duration,
+        deadline: Instant,
+        follow: Option<&FollowProgress>,
     ) -> Result<Progress, Error> {
         let store = &self.inner.store;
+        let fill_end = match follow {
+            Some(follow) => follow
+                .from_block
+                .checked_sub(1)
+                .map(|end| end.min(heads.safe)),
+            None => Some(heads.safe),
+        };
         let chunk = chain.settings.chunk(selector.dataset());
-        let span = grid_span(durable, chunk, heads.safe).unwrap_or(durable);
+        let fill_span = fill_end
+            .filter(|end| durable.start() <= *end)
+            .and_then(|end| grid_span(durable, chunk, end));
+        let span = match fill_span {
+            Some(fill) => BlockRange::new(fill.start(), fill.end().max(durable.end()))?,
+            None => durable,
+        };
         let covered = self.covered(chain, selector, selector_id, span).await?;
         let served = longest_covered_prefix(&covered, durable);
         if served.is_some_and(|served| served.end() == durable.end()) {
@@ -196,7 +276,11 @@ impl QueryEngine {
 
         let mut jobs: Vec<(JobId, BlockRange)> = Vec::new();
         let mut over_budget = false;
-        for chunk in fill_chunks(span, &covered, chunk, heads.safe) {
+        let planned = match (fill_span, fill_end) {
+            (Some(fill), Some(end)) => fill_chunks(fill, &covered, chunk, end),
+            _ => Vec::new(),
+        };
+        for chunk in planned {
             // The budget pays for new fills only. A poll of a chunk already in flight joins it,
             // and once a charge is refused, later chunks are only joined, never created.
             if let Some(budget) = caller.fill_budget {
@@ -226,6 +310,7 @@ impl QueryEngine {
         }
         self.inner.enqueued.notify_waiters();
 
+        let wait = deadline.saturating_duration_since(Instant::now());
         if !wait.is_zero() && !jobs.is_empty() {
             let ids: Vec<JobId> = jobs.iter().map(|(id, _)| *id).collect();
             match store.wait_done(&ids, wait).await {
@@ -234,19 +319,113 @@ impl QueryEngine {
             }
         }
 
-        let covered = self.covered(chain, selector, selector_id, durable).await?;
-        let served = longest_covered_prefix(&covered, durable);
+        let mut served = self.served(chain, selector, selector_id, durable).await?;
+        let first_missing =
+            |served: Option<BlockRange>| served.map_or(durable.start(), |served| served.end() + 1);
         if served.is_some_and(|served| served.end() == durable.end()) {
             return Ok(Progress {
                 served,
                 blocker: None,
             });
         }
-        let first_missing = served.map_or(durable.start(), |served| served.end() + 1);
-        let blocker = self.blocker(&jobs, first_missing, over_budget).await?;
+        if fill_end.is_none_or(|end| first_missing(served) > end) {
+            let mut after = heads.latest;
+            loop {
+                let wait = deadline.saturating_duration_since(Instant::now());
+                if wait.is_zero() {
+                    break;
+                }
+                match store
+                    .wait_head_change(chain.id(), after, HeadKind::Latest, wait)
+                    .await
+                {
+                    Ok(next) => after = next.latest,
+                    Err(StoreError::Timeout(_)) => {}
+                    Err(error) => {
+                        warn!(%error, "waiting for promotion failed");
+                        break;
+                    }
+                }
+                served = self.served(chain, selector, selector_id, durable).await?;
+                if served.is_some_and(|served| served.end() == durable.end()) {
+                    return Ok(Progress {
+                        served,
+                        blocker: None,
+                    });
+                }
+            }
+            return Ok(Progress {
+                served,
+                blocker: Some((IncompleteReason::NotFollowedYet, None)),
+            });
+        }
+        let blocker = self
+            .blocker(&jobs, first_missing(served), over_budget)
+            .await?;
         Ok(Progress {
             served,
             blocker: Some(blocker),
+        })
+    }
+
+    async fn served(
+        &self,
+        chain: &Chain,
+        selector: &Selector,
+        selector_id: SelectorId,
+        durable: BlockRange,
+    ) -> Result<Option<BlockRange>, Error> {
+        let covered = self.covered(chain, selector, selector_id, durable).await?;
+        Ok(longest_covered_prefix(&covered, durable))
+    }
+
+    /// `wanted ∩ (safe, head_block]` from unsafe rows, anchored at the follow head.
+    async fn hot(
+        &self,
+        chain: &Chain,
+        dataset: Dataset,
+        selector_id: SelectorId,
+        wanted: BlockRange,
+    ) -> Result<Hot, Error> {
+        let follow = self
+            .inner
+            .store
+            .follow_get_or_init(
+                chain.id(),
+                dataset,
+                selector_id,
+                wanted.start(),
+                &B256::ZERO,
+            )
+            .await?;
+        let head = u64::try_from(follow.head_block).ok();
+        let Some(head) =
+            head.filter(|head| *head >= wanted.start() && follow.from_block <= wanted.start())
+        else {
+            return Ok(Hot {
+                progress: Progress {
+                    served: None,
+                    blocker: Some((IncompleteReason::NotFollowedYet, None)),
+                },
+                segment: None,
+            });
+        };
+        let served = BlockRange::new(wanted.start(), wanted.end().min(head))?;
+        Ok(Hot {
+            progress: Progress {
+                served: Some(served),
+                blocker: (served.end() < wanted.end()).then_some((IncompleteReason::Pending, None)),
+            },
+            segment: Some(Segment {
+                start: served.start(),
+                end: served.end(),
+                source: SegmentSource::Hot,
+                finality: Finality::Unsafe,
+                anchor: Some(Anchor {
+                    number: head,
+                    hash: follow.head_hash,
+                }),
+            }),
         })
     }
 
@@ -274,7 +453,7 @@ impl QueryEngine {
         jobs: &[(JobId, BlockRange)],
         block: u64,
         over_budget: bool,
-    ) -> Result<(IncompleteReason, Option<String>), Error> {
+    ) -> Result<Blocker, Error> {
         let Some((id, _)) = jobs.iter().find(|(_, chunk)| chunk.contains(block)) else {
             let reason = if over_budget {
                 IncompleteReason::BudgetExhausted
