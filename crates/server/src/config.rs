@@ -58,6 +58,8 @@ pub struct Config {
     pub query: QueryConfig,
     #[serde(default)]
     pub follow: FollowConfig,
+    #[serde(default)]
+    pub fill: FillConfig,
     pub metrics: MetricsConfig,
     pub chains: BTreeMap<ChainName, ChainConfig>,
     #[serde(default)]
@@ -120,6 +122,26 @@ impl Default for FollowConfig {
     }
 }
 
+/// Fill workers per process. A replica with the worker role runs `workers`; an api-only
+/// replica runs `inline_workers` so its own cold queries make progress without a worker.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct FillConfig {
+    pub workers: NonZeroUsize,
+    pub inline_workers: usize,
+    pub lease_s: NonZeroU64,
+}
+
+impl Default for FillConfig {
+    fn default() -> Self {
+        Self {
+            workers: NonZeroUsize::new(4).unwrap(),
+            inline_workers: 2,
+            lease_s: NonZeroU64::new(120).unwrap(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetricsConfig {
@@ -137,6 +159,9 @@ pub struct ChainConfig {
     #[serde(default = "default_reorg_window_blocks")]
     pub reorg_window_blocks: NonZeroU64,
     pub chunk_blocks: NonZeroU64,
+    /// `evm.blocks` fill grid. Each header is one RPC item, so it is finer than `chunk_blocks`.
+    #[serde(default = "default_header_chunk_blocks")]
+    pub header_chunk_blocks: NonZeroU64,
     pub max_get_logs_range_blocks: NonZeroU64,
     pub max_addresses_per_query: NonZeroUsize,
     pub provider: ProviderConfig,
@@ -174,6 +199,9 @@ pub struct ApplicationConfig {
     pub chains: BTreeSet<ChainName>,
     pub datasets: BTreeSet<Dataset>,
     pub quota: QuotaConfig,
+    /// Grants `/v1/admin/*`.
+    #[serde(default)]
+    pub admin: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -198,6 +226,10 @@ fn default_tick_ms() -> NonZeroU64 {
 
 fn default_reorg_window_blocks() -> NonZeroU64 {
     NonZeroU64::new(512).unwrap()
+}
+
+fn default_header_chunk_blocks() -> NonZeroU64 {
+    NonZeroU64::new(100).unwrap()
 }
 
 fn default_min_range_blocks() -> NonZeroU64 {

@@ -17,6 +17,11 @@ follow_attach_blocks = 1000
 subscription_ttl_s = 900
 unsafe_retention_s = 86400
 
+[fill]
+workers = 4
+inline_workers = 2
+lease_s = 120
+
 [metrics]
 bearer_token = "${DATALENS_METRICS_TOKEN}"
 
@@ -90,6 +95,7 @@ finality = { mode = "lag", safe_lag_blocks = 64, finalized_lag_blocks = 256 }
 tick_ms = 2000
 reorg_window_blocks = 512
 chunk_blocks = 10000
+header_chunk_blocks = 100
 max_get_logs_range_blocks = 10000
 max_addresses_per_query = 32
 provider = { rps = 20, burst = 40, daily_calls = 2000000, max_in_flight = 8, min_range_blocks = 16 }
@@ -121,3 +127,11 @@ token = "${DATALENS_ORMP_TOKEN}"
 chains = ["ethereum", "darwinia", "polygon", "arbitrum"]
 datasets = ["evm.logs", "evm.blocks"]
 quota = { max_range_blocks = 200000, max_requests_per_minute = 1800, max_concurrent_requests = 32, max_subscriptions = 50 }
+
+[[applications]]
+id = "ops"
+token = "${DATALENS_OPS_TOKEN}"
+chains = ["ethereum", "optimism", "darwinia", "bsc", "base", "arbitrum", "lisk", "polygon"]
+datasets = ["evm.logs", "evm.blocks"]
+quota = { max_range_blocks = 1000000, max_requests_per_minute = 60, max_concurrent_requests = 4, max_subscriptions = 1 }
+admin = true
