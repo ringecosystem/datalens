@@ -915,9 +915,12 @@ dependencies = [
 name = "datalens-store"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "datalens-core",
  "futures",
+ "serde_json",
  "sqlx",
+ "thiserror",
  "tokio",
 ]
 
