@@ -1,12 +1,10 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use datalens_core::{ChainId, Heads};
-use sqlx::postgres::PgListener;
 
 use crate::codec::{b256_from_db, chain_from_db, i64_to_u64, u64_to_i64};
+use crate::notify::HEADS;
 use crate::{Store, StoreError};
-
-const HEADS: &str = "heads";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HeadKind {
@@ -27,6 +25,7 @@ impl HeadKind {
 
 impl Store {
     pub async fn upsert_heads(&self, chain: ChainId, heads: &Heads) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
         let changed: Option<i32> = sqlx::query_scalar(
             "insert into chain_heads (chain_id, latest, latest_hash, safe, finalized, updated_at)
              values ($1, $2, $3, $4, $5, now())
@@ -47,15 +46,16 @@ impl Store {
         .bind(heads.latest_hash.as_slice())
         .bind(u64_to_i64(heads.safe, "safe")?)
         .bind(u64_to_i64(heads.finalized, "finalized")?)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
         if changed.is_some() {
             sqlx::query("select pg_notify($1, $2)")
                 .bind(HEADS)
                 .bind(chain.get().to_string())
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await?;
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -86,7 +86,8 @@ impl Store {
         Ok(out)
     }
 
-    /// Returns when `kind` is strictly above `after`. Rechecks after `LISTEN` so a notify is not lost.
+    /// Returns when `kind` is strictly above `after`. Rereads on each `heads` notify for this
+    /// chain and at least once a second.
     pub async fn wait_head_change(
         &self,
         chain: ChainId,
@@ -94,24 +95,21 @@ impl Store {
         kind: HeadKind,
         timeout: Duration,
     ) -> Result<Heads, StoreError> {
-        let mut listener = PgListener::connect_with(&self.pool).await?;
-        listener.listen(HEADS).await?;
-        let deadline = Instant::now() + timeout;
-        loop {
-            if let Some(heads) = self.heads(chain).await?
-                && kind.value(&heads) > after
-            {
-                return Ok(heads);
-            }
-            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                return Err(StoreError::Timeout(format!("chain {chain} head")));
-            };
-            match tokio::time::timeout(remaining, listener.recv()).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(err)) => return Err(err.into()),
-                Err(_) => return Err(StoreError::Timeout(format!("chain {chain} head"))),
-            }
-        }
+        let chain_key = chain.get().to_string();
+        let store = self;
+        let heads = self
+            .wait_until(
+                timeout,
+                |channel, payload| channel == HEADS && payload == chain_key,
+                move || async move {
+                    Ok(store
+                        .heads(chain)
+                        .await?
+                        .filter(|heads| kind.value(heads) > after))
+                },
+            )
+            .await?;
+        heads.ok_or_else(|| StoreError::Timeout(format!("chain {chain} head")))
     }
 }
 
