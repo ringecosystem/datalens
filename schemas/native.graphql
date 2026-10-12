@@ -1,11 +1,13 @@
 type Anchor {
-	number: Int!
+	number: BigInt!
 	hash: String!
 }
 
+scalar BigInt
+
 type BlockRange {
-	start: Int!
-	end: Int!
+	start: BigInt!
+	end: BigInt!
 }
 
 """
@@ -22,7 +24,7 @@ type QueryResult {
 	dataset: String!
 	requested: BlockRange!
 	served: BlockRange
-	nextStart: Int
+	nextStart: BigInt
 	incompleteReason: String
 	incompleteDetail: String
 	segments: [Segment!]!
@@ -38,8 +40,8 @@ type QueryRoot {
 }
 
 type Segment {
-	start: Int!
-	end: Int!
+	start: BigInt!
+	end: BigInt!
 	source: String!
 	finality: String!
 	anchor: Anchor

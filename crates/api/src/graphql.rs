@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use async_graphql::{
-    Context, EmptyMutation, EmptySubscription, ErrorExtensions, Json as GqlJson, Object, Schema,
-    SimpleObject,
+    Context, EmptyMutation, EmptySubscription, ErrorExtensions, InputValueError, InputValueResult,
+    Json as GqlJson, Object, Scalar, ScalarType, Schema, SimpleObject, Value as GqlValue,
 };
 use axum::Json;
 use axum::body::Bytes;
@@ -65,25 +65,46 @@ pub(crate) async fn handle(
     Ok(Json(response).into_response())
 }
 
+/// A block number as a decimal string. GraphQL `Int` is 32-bit and block numbers are not.
+struct BigInt(u64);
+
+#[Scalar(name = "BigInt")]
+impl ScalarType for BigInt {
+    fn parse(value: GqlValue) -> InputValueResult<Self> {
+        match &value {
+            GqlValue::String(text) => text.parse().map(Self).map_err(InputValueError::custom),
+            GqlValue::Number(number) => number
+                .as_u64()
+                .map(Self)
+                .ok_or_else(|| InputValueError::expected_type(value.clone())),
+            _ => Err(InputValueError::expected_type(value)),
+        }
+    }
+
+    fn to_value(&self) -> GqlValue {
+        GqlValue::String(self.0.to_string())
+    }
+}
+
 #[derive(SimpleObject)]
 #[graphql(name = "BlockRange")]
 struct GqlRange {
-    start: u64,
-    end: u64,
+    start: BigInt,
+    end: BigInt,
 }
 
 #[derive(SimpleObject)]
 #[graphql(name = "Anchor")]
 struct GqlAnchor {
-    number: u64,
+    number: BigInt,
     hash: String,
 }
 
 #[derive(SimpleObject)]
 #[graphql(name = "Segment")]
 struct GqlSegment {
-    start: u64,
-    end: u64,
+    start: BigInt,
+    end: BigInt,
     source: String,
     finality: String,
     anchor: Option<GqlAnchor>,
@@ -101,7 +122,7 @@ pub(crate) struct QueryResult {
     dataset: String,
     requested: GqlRange,
     served: Option<GqlRange>,
-    next_start: Option<u64>,
+    next_start: Option<BigInt>,
     incomplete_reason: Option<String>,
     incomplete_detail: Option<String>,
     segments: Vec<GqlSegment>,
@@ -112,15 +133,15 @@ pub(crate) struct QueryResult {
 impl From<QueryResponse> for QueryResult {
     fn from(response: QueryResponse) -> Self {
         let range = |range: datalens_core::BlockRange| GqlRange {
-            start: range.start(),
-            end: range.end(),
+            start: BigInt(range.start()),
+            end: BigInt(range.end()),
         };
         Self {
             chain: response.chain.to_string(),
             dataset: response.dataset.to_string(),
             requested: range(response.requested),
             served: response.served.map(range),
-            next_start: response.next_start,
+            next_start: response.next_start.map(BigInt),
             incomplete_reason: response
                 .incomplete_reason
                 .map(|reason| reason.as_str().to_owned()),
@@ -136,12 +157,12 @@ impl From<QueryResponse> for QueryResult {
 
 fn segment(segment: Segment) -> GqlSegment {
     GqlSegment {
-        start: segment.start,
-        end: segment.end,
+        start: BigInt(segment.start),
+        end: BigInt(segment.end),
         source: serde_name(&segment.source),
         finality: serde_name(&segment.finality),
         anchor: segment.anchor.map(|anchor| GqlAnchor {
-            number: anchor.number,
+            number: BigInt(anchor.number),
             hash: format!("{:#x}", anchor.hash),
         }),
     }

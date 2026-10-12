@@ -220,7 +220,10 @@ async fn graphql_returns_the_same_rows_as_rest(pool: PgPool) {
         .unwrap();
     assert_eq!(data["query"]["rows"], Value::Array(rest.rows.clone()));
     assert_eq!(rest.rows.len(), 10);
-    assert_eq!(data["query"]["served"], json!({"start": 0, "end": 9_999}));
+    assert_eq!(
+        data["query"]["served"],
+        json!({"start": "0", "end": "9999"})
+    );
     assert_eq!(data["query"]["nextStart"], Value::Null);
     assert_eq!(data["query"]["incompleteReason"], Value::Null);
     assert_eq!(
@@ -236,6 +239,56 @@ async fn graphql_returns_the_same_rows_as_rest(pool: PgPool) {
         .await
         .unwrap_err();
     assert_eq!(error.kind(), Some("invalid_input"));
+    server.stop().await;
+}
+
+#[sqlx::test(migrations = false)]
+async fn graphql_block_numbers_above_i32_max_are_bigint_strings(pool: PgPool) {
+    const TALL: u64 = 3_000_000_100;
+    let rpc = datalens_evm::mock::MockRpc::spawn().await;
+    rpc.set_handler(|item| {
+        let result = match item["method"].as_str() {
+            Some("eth_getBlockByNumber") => {
+                let number = match item["params"][0].as_str() {
+                    Some("latest") | None => TALL,
+                    Some(hex) => u64::from_str_radix(hex.trim_start_matches("0x"), 16).unwrap(),
+                };
+                json!({
+                    "number": format!("0x{number:x}"),
+                    "hash": format!("{:#x}", B256::left_padding_from(&number.to_be_bytes())),
+                    "parentHash": format!("{:#x}", B256::left_padding_from(&(number - 1).to_be_bytes())),
+                    "timestamp": "0x1",
+                })
+            }
+            Some("eth_getLogs") => json!([]),
+            _ => Value::Null,
+        };
+        datalens_evm::mock::ItemOutcome::Result(result)
+    });
+    let server = boot_mock(pool, &rpc).await;
+    let request = logs_request(
+        ethereum(),
+        selector(&[0xa1]),
+        range(3_000_000_000, 3_000_000_009),
+    );
+
+    let data = server
+        .degov()
+        .graphql_query(
+            &request,
+            "requested { start end } served { start end } nextStart segments { start end }",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        data["query"],
+        json!({
+            "requested": {"start": "3000000000", "end": "3000000009"},
+            "served": {"start": "3000000000", "end": "3000000009"},
+            "nextStart": null,
+            "segments": [{"start": "3000000000", "end": "3000000009"}],
+        })
+    );
     server.stop().await;
 }
 
