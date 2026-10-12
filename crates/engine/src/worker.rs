@@ -406,7 +406,7 @@ impl QueryEngine {
                         blocks: page
                             .fetched_to
                             .and_then(|end| BlockRange::new(gap.start(), end).ok()),
-                        calls: 1,
+                        calls: i64::try_from(page.calls).unwrap_or(i64::MAX),
                     });
                     if let Some(error) = error {
                         fetched.error = Some(FillError::Provider(error));

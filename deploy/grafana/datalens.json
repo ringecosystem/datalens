@@ -1,0 +1,120 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "id": 1,
+      "targets": [{ "expr": "sum by (chain, purpose, outcome) (rate(datalens_provider_calls_total[1m]))", "refId": "A" }],
+      "title": "Provider requests per second",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "id": 2,
+      "targets": [{ "expr": "datalens_provider_budget_tokens", "refId": "A" }],
+      "title": "Provider budget tokens",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 8 },
+      "id": 3,
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum by (le, chain) (rate(datalens_query_duration_seconds_bucket[5m])))", "legendFormat": "p50 {{chain}}", "refId": "A" },
+        { "expr": "histogram_quantile(0.95, sum by (le, chain) (rate(datalens_query_duration_seconds_bucket[5m])))", "legendFormat": "p95 {{chain}}", "refId": "B" },
+        { "expr": "histogram_quantile(0.99, sum by (le, chain) (rate(datalens_query_duration_seconds_bucket[5m])))", "legendFormat": "p99 {{chain}}", "refId": "C" }
+      ],
+      "title": "Query latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 16 },
+      "id": 4,
+      "targets": [{ "expr": "sum by (chain) (rate(datalens_queries_total{outcome=\"partial\"}[5m]))", "refId": "A" }],
+      "title": "Incomplete queries",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 16 },
+      "id": 5,
+      "targets": [{ "expr": "datalens_fill_jobs", "refId": "A" }],
+      "title": "Fill jobs",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 16 },
+      "id": 6,
+      "targets": [{ "expr": "datalens_follow_lag_blocks", "refId": "A" }],
+      "title": "Follow lag",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 24 },
+      "id": 7,
+      "targets": [{ "expr": "sum by (chain) (rate(datalens_reorgs_total[5m]))", "refId": "A" }],
+      "title": "Reorgs",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 24 },
+      "id": 8,
+      "targets": [{ "expr": "sum by (chain) (datalens_finality_violations_total)", "refId": "A" }],
+      "title": "Finality violations",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 24 },
+      "id": 9,
+      "targets": [{ "expr": "datalens_follow_halted", "refId": "A" }],
+      "title": "Follow halted",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "id": 10,
+      "targets": [{ "expr": "datalens_subscriptions", "refId": "A" }],
+      "title": "Subscriptions",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "id": 11,
+      "targets": [{ "expr": "sum by (application) (rate(datalens_queries_total[5m]))", "refId": "A" }],
+      "title": "Queries by application",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["datalens"],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "name": "ds",
+        "query": "prometheus",
+        "type": "datasource"
+      }
+    ]
+  },
+  "time": { "from": "now-6h", "to": "now" },
+  "timezone": "utc",
+  "title": "Datalens",
+  "uid": "datalens",
+  "version": 1
+}
