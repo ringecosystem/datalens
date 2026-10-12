@@ -63,6 +63,10 @@ pub enum IncompleteReason {
     ProviderError,
     BudgetExhausted,
     NotFollowedYet,
+    /// `latest_only` serves only blocks above safe. The requested blocks at or below safe are
+    /// not served, and re-polling will not serve them. `next_start` says whether hot blocks
+    /// remain.
+    BelowSafe,
 }
 
 impl IncompleteReason {
@@ -72,6 +76,7 @@ impl IncompleteReason {
             Self::ProviderError => "provider_error",
             Self::BudgetExhausted => "budget_exhausted",
             Self::NotFollowedYet => "not_followed_yet",
+            Self::BelowSafe => "below_safe",
         }
     }
 }
@@ -295,6 +300,20 @@ pub struct WatchResponse {
     pub selector_id: i64,
     pub ttl_ms: u64,
     pub follow: FollowInfo,
+}
+
+/// Body of `POST /v1/admin/follow/resume`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FollowResumeRequest {
+    pub chain: ChainName,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FollowResumeResponse {
+    pub chain: ChainName,
+    /// Why follow was halted. `None` when it was already running.
+    pub halt_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
