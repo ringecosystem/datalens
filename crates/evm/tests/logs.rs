@@ -199,6 +199,30 @@ async fn limit_halves_and_eight_successes_double_back() {
 }
 
 #[tokio::test]
+async fn limit_on_a_short_range_retries_that_window_and_does_not_halve_the_max() {
+    let mock = MockRpc::spawn().await;
+    mock.set_handler(|_| ItemOutcome::Error {
+        code: -32_000,
+        message: "query returned more than 10000 results".to_owned(),
+    });
+    let evm = client(mock.url(), 32, 20, 10_000, 16);
+    let error = evm
+        .get_logs(
+            &LogSelector::default(),
+            BlockRange::new(0, 99).unwrap(),
+            Purpose::Follow,
+            None,
+            Finality::Unsafe,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error, ProviderError::Limit);
+    let spans: Vec<u64> = mock.calls().iter().map(block_span).collect();
+    assert_eq!(spans, vec![100, 50, 25, 16]);
+    assert_eq!(evm.gateway().range_blocks(Dataset::EvmLogs), 16);
+}
+
+#[tokio::test]
 async fn limit_at_the_floor_is_not_split_further() {
     let mock = MockRpc::spawn().await;
     mock.set_handler(|_| ItemOutcome::Error {
