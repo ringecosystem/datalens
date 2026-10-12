@@ -33,13 +33,17 @@ impl Store {
             finality.push(block.finality.as_i16());
             header.push(block.header.clone());
         }
+        if let Some(block) = hash_conflict(tx, chain, &number, &hash).await? {
+            return Err(StoreError::Reorg { block });
+        }
         sqlx::query(
             "insert into evm_blocks (chain_id, number, hash, parent_hash, timestamp, finality, header)
              select $1, number, hash, parent_hash, timestamp, finality, header
              from unnest(
                 $2::bigint[], $3::bytea[], $4::bytea[], $5::bigint[], $6::smallint[], $7::jsonb[]
              ) as row(number, hash, parent_hash, timestamp, finality, header)
-             on conflict do nothing",
+             on conflict (chain_id, number) do update set finality = excluded.finality
+             where evm_blocks.finality < excluded.finality and evm_blocks.hash = excluded.hash",
         )
         .bind(chain.get())
         .bind(&number)
@@ -105,27 +109,58 @@ impl Store {
         hash.as_deref().map(b256_from_db).transpose()
     }
 
+    /// Raises weaker rows in the range to `finality` and returns how many changed.
+    ///
+    /// `end_hash` is the canonical hash of `blocks.end` the caller verified. Stored rows must
+    /// chain to it through `parent_hash`, and to the row below the range where one exists.
+    /// Any break is [`StoreError::Reorg`] at the lowest broken block, and nothing is promoted.
     pub async fn promote_blocks(
         &self,
         tx: &mut PgTx<'_>,
         chain: ChainId,
         blocks: BlockRange,
         finality: Finality,
-    ) -> Result<(), StoreError> {
+        end_hash: B256,
+    ) -> Result<u64, StoreError> {
         if finality == Finality::Unsafe {
             return Err(StoreError::invalid("promote target must be durable"));
         }
-        sqlx::query(
+        let start = u64_to_i64(blocks.start(), "block start")?;
+        let end = u64_to_i64(blocks.end(), "block end")?;
+        let broken: Option<i64> = sqlx::query_scalar(
+            "select min(number) from (
+                select number from evm_blocks
+                where chain_id = $1 and number = $3 and hash <> $4
+                union all
+                select child.number from evm_blocks child
+                join evm_blocks parent
+                  on parent.chain_id = child.chain_id and parent.number = child.number - 1
+                where child.chain_id = $1 and child.number between $2 and $3
+                  and child.parent_hash <> parent.hash
+             ) as broken",
+        )
+        .bind(chain.get())
+        .bind(start)
+        .bind(end)
+        .bind(end_hash.as_slice())
+        .fetch_one(&mut **tx)
+        .await?;
+        if let Some(block) = broken {
+            return Err(StoreError::Reorg {
+                block: i64_to_u64(block, "block number")?,
+            });
+        }
+        let result = sqlx::query(
             "update evm_blocks set finality = $4
              where chain_id = $1 and number between $2 and $3 and finality < $4",
         )
         .bind(chain.get())
-        .bind(u64_to_i64(blocks.start(), "block start")?)
-        .bind(u64_to_i64(blocks.end(), "block end")?)
+        .bind(start)
+        .bind(end)
         .bind(finality.as_i16())
         .execute(&mut **tx)
         .await?;
-        Ok(())
+        Ok(result.rows_affected())
     }
 
     pub async fn delete_unsafe_blocks_from(
@@ -145,6 +180,37 @@ impl Store {
         .await?;
         Ok(())
     }
+}
+
+/// Lowest incoming block whose hash disagrees with a stored log or block at the same height.
+pub(crate) async fn hash_conflict(
+    tx: &mut PgTx<'_>,
+    chain: ChainId,
+    numbers: &[i64],
+    hashes: &[Vec<u8>],
+) -> Result<Option<u64>, StoreError> {
+    let block: Option<i64> = sqlx::query_scalar(
+        "with incoming as (
+            select distinct number, hash from unnest($2::bigint[], $3::bytea[]) as i(number, hash)
+         )
+         select min(number) from (
+            select i.number from incoming i
+            join evm_logs l on l.chain_id = $1 and l.block_number = i.number
+            where l.block_hash <> i.hash
+            union all
+            select i.number from incoming i
+            join evm_blocks b on b.chain_id = $1 and b.number = i.number
+            where b.hash <> i.hash
+         ) as conflicts",
+    )
+    .bind(chain.get())
+    .bind(numbers)
+    .bind(hashes)
+    .fetch_one(&mut **tx)
+    .await?;
+    block
+        .map(|block| i64_to_u64(block, "block number"))
+        .transpose()
 }
 
 fn block_from_row(row: &sqlx::postgres::PgRow) -> Result<BlockRow, StoreError> {

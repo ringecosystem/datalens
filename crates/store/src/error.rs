@@ -10,6 +10,10 @@ pub enum StoreError {
     Timeout(String),
     #[error("stored row is invalid: {0}")]
     Data(String),
+    /// A stored row at `block` carries a different block hash than the incoming or canonical one.
+    /// The caller runs reorg handling instead of committing.
+    #[error("block hash mismatch at block {block}")]
+    Reorg { block: u64 },
     #[error(transparent)]
     Sqlx(#[from] sqlx::Error),
 }
@@ -35,6 +39,7 @@ impl From<StoreError> for CoreError {
             StoreError::NotFound(message)
             | StoreError::Timeout(message)
             | StoreError::Data(message) => Self::Internal(message),
+            err @ StoreError::Reorg { .. } => Self::Internal(err.to_string()),
             StoreError::Sqlx(err) => Self::Internal(err.to_string()),
         }
     }

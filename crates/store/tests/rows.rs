@@ -125,7 +125,14 @@ async fn logs_are_idempotent_filtered_paged_promoted_and_reorged(pool: PgPool) {
 
     let mut tx = pool.begin().await.unwrap();
     store
-        .promote_logs(&mut tx, chain, range(1, 3), Finality::Safe)
+        .promote_logs(
+            &mut tx,
+            chain,
+            &any_selector(),
+            range(1, 3),
+            Finality::Safe,
+            B256::repeat_byte(0x11),
+        )
         .await
         .unwrap();
     tx.commit().await.unwrap();
@@ -167,7 +174,7 @@ async fn blocks_round_trip_hash_promote_and_delete_unsafe(pool: PgPool) {
 
     let mut tx = pool.begin().await.unwrap();
     store
-        .promote_blocks(&mut tx, chain, range(10, 10), Finality::Finalized)
+        .promote_blocks(&mut tx, chain, range(10, 10), Finality::Finalized, hash)
         .await
         .unwrap();
     store

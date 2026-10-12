@@ -1,5 +1,7 @@
-use datalens_core::{BlockRange, Bytes, ChainId, Finality, LogRow, LogSelector};
+use datalens_core::{B256, BlockRange, Bytes, ChainId, Finality, LogRow, LogSelector, TopicFilter};
+use sqlx::{Postgres, QueryBuilder};
 
+use crate::blocks::hash_conflict;
 use crate::codec::{
     address_from_db, b256_from_db, finality_from_db, i32_to_u32, i64_to_u64, topic_columns,
     topics_from_columns, u32_to_i32, u64_to_i64,
@@ -50,6 +52,9 @@ impl Store {
             data.push(log.data.to_vec());
             finality.push(log.finality.as_i16());
         }
+        if let Some(block) = hash_conflict(tx, chain, &block_number, &block_hash).await? {
+            return Err(StoreError::Reorg { block });
+        }
         sqlx::query(
             "insert into evm_logs (
                 chain_id, block_number, log_index, block_hash, transaction_index,
@@ -64,7 +69,10 @@ impl Store {
                 block_number, log_index, block_hash, transaction_index, transaction_hash,
                 address, topic0, topic1, topic2, topic3, data, finality
              )
-             on conflict do nothing",
+             on conflict (chain_id, block_number, log_index) do update
+             set finality = excluded.finality
+             where evm_logs.finality < excluded.finality
+               and evm_logs.block_hash = excluded.block_hash",
         )
         .bind(chain.get())
         .bind(&block_number)
@@ -164,28 +172,66 @@ impl Store {
         Ok((logs, next))
     }
 
-    /// Raises every weaker row in the range to `finality`. `safe` can become `finalized`.
+    /// Raises weaker rows matching `selector` in the range to `finality` and returns how many
+    /// changed. `safe` can become `finalized`.
+    ///
+    /// Rows of other selectors stay as they are, because only this selector's follow group
+    /// vouched for them. `end_hash` is the canonical hash of `blocks.end` the caller verified.
+    /// A matching row at `blocks.end` with another hash, or one that disagrees with the stored
+    /// block at its height, is [`StoreError::Reorg`] and nothing is promoted.
     pub async fn promote_logs(
         &self,
         tx: &mut PgTx<'_>,
         chain: ChainId,
+        selector: &LogSelector,
         blocks: BlockRange,
         finality: Finality,
-    ) -> Result<(), StoreError> {
+        end_hash: B256,
+    ) -> Result<u64, StoreError> {
         if finality == Finality::Unsafe {
             return Err(StoreError::invalid("promote target must be durable"));
         }
-        sqlx::query(
-            "update evm_logs set finality = $4
-             where chain_id = $1 and block_number between $2 and $3 and finality < $4",
-        )
-        .bind(chain.get())
-        .bind(u64_to_i64(blocks.start(), "block start")?)
-        .bind(u64_to_i64(blocks.end(), "block end")?)
-        .bind(finality.as_i16())
-        .execute(&mut **tx)
-        .await?;
-        Ok(())
+        let start = u64_to_i64(blocks.start(), "block start")?;
+        let end = u64_to_i64(blocks.end(), "block end")?;
+
+        let mut check = QueryBuilder::<Postgres>::new(
+            "select min(l.block_number) from evm_logs l
+             left join evm_blocks b on b.chain_id = l.chain_id and b.number = l.block_number
+             where l.chain_id = ",
+        );
+        check
+            .push_bind(chain.get())
+            .push(" and l.block_number between ")
+            .push_bind(start)
+            .push(" and ")
+            .push_bind(end)
+            .push(" and (b.hash <> l.block_hash or (l.block_number = ")
+            .push_bind(end)
+            .push(" and l.block_hash <> ")
+            .push_bind(end_hash.to_vec())
+            .push("))");
+        push_selector_filter(&mut check, "l.", selector);
+        let broken: Option<i64> = check.build_query_scalar().fetch_one(&mut **tx).await?;
+        if let Some(block) = broken {
+            return Err(StoreError::Reorg {
+                block: i64_to_u64(block, "block number")?,
+            });
+        }
+
+        let mut update = QueryBuilder::<Postgres>::new("update evm_logs set finality = ");
+        update
+            .push_bind(finality.as_i16())
+            .push(" where chain_id = ")
+            .push_bind(chain.get())
+            .push(" and block_number between ")
+            .push_bind(start)
+            .push(" and ")
+            .push_bind(end)
+            .push(" and finality < ")
+            .push_bind(finality.as_i16());
+        push_selector_filter(&mut update, "", selector);
+        let result = update.build().execute(&mut **tx).await?;
+        Ok(result.rows_affected())
     }
 
     pub async fn delete_unsafe_logs_from(
@@ -204,6 +250,33 @@ impl Store {
         .execute(&mut **tx)
         .await?;
         Ok(())
+    }
+}
+
+/// Appends `and ...` predicates for the selector's constrained positions only. Separate SQL per
+/// shape lets the planner use the address index, which an `$flag or col = any(..)` guard defeats
+/// once sqlx's cached statement switches to a generic plan.
+fn push_selector_filter(qb: &mut QueryBuilder<Postgres>, alias: &str, selector: &LogSelector) {
+    let addresses: Vec<Vec<u8>> = selector.addresses.iter().map(|a| a.to_vec()).collect();
+    match addresses.as_slice() {
+        [] => {}
+        [one] => {
+            qb.push(format_args!(" and {alias}address = "))
+                .push_bind(one.clone());
+        }
+        _ => {
+            qb.push(format_args!(" and {alias}address = any("))
+                .push_bind(addresses)
+                .push(")");
+        }
+    }
+    for (position, filter) in selector.topics.iter().enumerate() {
+        if let TopicFilter::OneOf(set) = filter {
+            let topics: Vec<Vec<u8>> = set.iter().map(|topic| topic.to_vec()).collect();
+            qb.push(format_args!(" and {alias}topic{position} = any("))
+                .push_bind(topics)
+                .push(")");
+        }
     }
 }
 
