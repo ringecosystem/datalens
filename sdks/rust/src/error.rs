@@ -66,8 +66,8 @@ pub enum Error {
 }
 
 impl Error {
-    /// Rate limits, server errors, and transport failures. A 429 for a range above
-    /// `max_range_blocks` is also retried; shrink the range instead.
+    /// Rate limits (429, only the per-minute and concurrency buckets), server errors, and
+    /// transport failures.
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Api { status, .. } => *status == 429 || *status >= 500,

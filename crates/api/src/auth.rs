@@ -141,7 +141,7 @@ impl Tenant {
         let quota = &self.app.quota;
         self.allow_read(&request.chain, request.dataset, request.selector.as_ref())?;
         if request.range.len() > quota.max_range_blocks {
-            return Err(Error::QuotaExceeded(format!(
+            return Err(Error::InvalidInput(format!(
                 "range of {} blocks exceeds max_range_blocks {}",
                 request.range.len(),
                 quota.max_range_blocks

@@ -415,5 +415,5 @@ async fn max_subscriptions_rejects_a_new_head_selector(pool: PgPool) {
         )
         .await
         .unwrap_err();
-    assert!(matches!(error, Error::QuotaExceeded(_)), "{error:?}");
+    assert!(matches!(error, Error::Forbidden(_)), "{error:?}");
 }

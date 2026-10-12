@@ -101,8 +101,34 @@ async fn errors_carry_the_stable_kind_status_and_retryability(pool: PgPool) {
         .query(&logs(range(0, 5_000), QueryFinality::DurableOnly))
         .await
         .unwrap_err();
-    assert_eq!(too_wide.kind(), Some(&ApiErrorKind::QuotaExceeded));
-    assert!(too_wide.is_retryable());
+    assert_eq!(too_wide.kind(), Some(&ApiErrorKind::InvalidInput));
+    assert_eq!(too_wide.status(), Some(400));
+    assert!(!too_wide.is_retryable());
+}
+
+#[sqlx::test(migrations = false)]
+async fn follow_ends_on_a_chunk_wider_than_the_range_quota(pool: PgPool) {
+    let chain = MockChain::spawn(10_000).await;
+    let server = Server::boot(pool, &chain).await;
+    let mut request = FollowRequest::logs(ethereum(), usdc(), 0);
+    request.chunk_blocks = 5_001;
+    let events = tokio::time::timeout(
+        Duration::from_secs(30),
+        server.client().follow(request).collect::<Vec<_>>(),
+    )
+    .await
+    .expect("follow kept retrying");
+    assert!(
+        matches!(
+            events.as_slice(),
+            [Err(Error::Api {
+                kind: ApiErrorKind::InvalidInput,
+                status: 400,
+                ..
+            })]
+        ),
+        "{events:?}"
+    );
 }
 
 #[sqlx::test(migrations = false)]
