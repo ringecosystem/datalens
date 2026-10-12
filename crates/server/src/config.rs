@@ -231,6 +231,9 @@ impl Config {
         if self.server.roles.is_empty() {
             return invalid("server.roles must list at least one of api, worker".into());
         }
+        if self.metrics.bearer_token.expose().is_empty() {
+            return invalid("metrics.bearer_token must not be empty".into());
+        }
 
         let mut chain_ids = HashSet::new();
         for (name, chain) in &self.chains {
