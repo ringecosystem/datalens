@@ -2,7 +2,9 @@ mod common;
 
 use common::*;
 use datalens_core::wire::{BackfillRequest, IncompleteReason, LogRecord, SegmentSource};
-use datalens_core::{ChainName, Dataset, Finality};
+use datalens_core::{B256, ChainId, ChainName, Dataset, Finality, Heads};
+use datalens_server::config::Config;
+use datalens_store::Store;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 
@@ -115,6 +117,59 @@ async fn errors_map_to_stable_kinds_and_statuses(pool: PgPool) {
     let error = degov.metrics("wrong").await.unwrap_err();
     assert_eq!(error.status(), Some(401));
 
+    assert_eq!(count(&rpc, "eth_getLogs"), 0);
+    server.stop().await;
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_request_refused_for_concurrency_does_not_spend_the_minute_quota(pool: PgPool) {
+    let rpc = mock_chain().await;
+    datalens_store::migrate(&pool).await.unwrap();
+    let store = Store::new(pool.clone());
+    let chain_id = ChainId::new(1).unwrap();
+    store.ensure_chain(chain_id, &ethereum()).await.unwrap();
+    store
+        .upsert_heads(
+            chain_id,
+            &Heads {
+                latest: LATEST,
+                latest_hash: B256::left_padding_from(&LATEST.to_be_bytes()),
+                safe: SAFE,
+                finalized: 98_000,
+            },
+        )
+        .await
+        .unwrap();
+    let text = config_text(rpc.url())
+        .replace(r#"roles = ["api", "worker"]"#, r#"roles = ["api"]"#)
+        .replace("workers = 2", "workers = 2\ninline_workers = 0")
+        .replace(
+            "max_requests_per_minute = 600, max_concurrent_requests = 8",
+            "max_requests_per_minute = 2, max_concurrent_requests = 1",
+        );
+    let server = boot(pool, Config::from_toml(&text, &|_| None).unwrap()).await;
+    let client = server.degov();
+    let mut quick = logs_request(ethereum(), selector(&[0xa1]), range(0, 9_999));
+    quick.wait_ms = Some(0);
+    let mut slow = quick.clone();
+    slow.wait_ms = Some(1_500);
+
+    let in_flight = tokio::spawn({
+        let client = client.clone();
+        async move { client.query(&slow).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let refused = client.query(&quick).await.unwrap_err();
+    assert_eq!(
+        refused.to_string(),
+        "http 429 quota_exceeded: more than 1 concurrent requests"
+    );
+    let held = in_flight.await.unwrap().unwrap();
+    assert_eq!(held.incomplete_reason, Some(IncompleteReason::Pending));
+
+    let after = client.query(&quick).await.unwrap();
+    assert_eq!(after.served, None);
+    assert_eq!(after.incomplete_reason, Some(IncompleteReason::Pending));
     assert_eq!(count(&rpc, "eth_getLogs"), 0);
     server.stop().await;
 }

@@ -127,6 +127,15 @@ impl Tenant {
                 quota.max_range_blocks
             )));
         }
+        // The slot is taken first, so a request refused for concurrency spends no minute token.
+        let permit = Arc::clone(&self.concurrent)
+            .try_acquire_owned()
+            .map_err(|_| {
+                Error::QuotaExceeded(format!(
+                    "more than {} concurrent requests",
+                    quota.max_concurrent_requests
+                ))
+            })?;
         if !self
             .requests
             .lock()
@@ -138,14 +147,7 @@ impl Tenant {
                 quota.max_requests_per_minute
             )));
         }
-        Arc::clone(&self.concurrent)
-            .try_acquire_owned()
-            .map_err(|_| {
-                Error::QuotaExceeded(format!(
-                    "more than {} concurrent requests",
-                    quota.max_concurrent_requests
-                ))
-            })
+        Ok(permit)
     }
 }
 
