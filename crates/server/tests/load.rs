@@ -105,6 +105,7 @@ async fn arbitrum_steady_rate_and_covered_query_p95(pool: PgPool) {
         let chain = arbitrum.clone();
         query_tasks.push(tokio::spawn(async move {
             let mut queries = 0u64;
+            let mut seen_head = 0u64;
             let deadline = Instant::now() + WALL;
             while Instant::now() < deadline {
                 let Ok(heads) = querier.heads().await else {
@@ -120,6 +121,7 @@ async fn arbitrum_steady_rate_and_covered_query_p95(pool: PgPool) {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     continue;
                 };
+                seen_head = seen_head.max(latest);
                 let start = latest.saturating_sub(8).max(1);
                 let request = QueryRequest {
                     chain: chain.clone(),
@@ -136,7 +138,7 @@ async fn arbitrum_steady_rate_and_covered_query_p95(pool: PgPool) {
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
-            (*id, queries)
+            (*id, queries, seen_head)
         }));
     }
     let mut query_counts = Vec::new();
@@ -151,9 +153,14 @@ async fn arbitrum_steady_rate_and_covered_query_p95(pool: PgPool) {
     let log_calls = method_calls(fresh, "eth_getLogs");
     let simulated_seconds = WALL.as_secs_f64() * (PRODUCTION_TICK_MS / TEST_TICK_MS);
     let steady_rps = calls as f64 / simulated_seconds;
-    for (id, queries) in &query_counts {
+    for (id, queries, seen_head) in &query_counts {
         println!("arbitrum_queries_{id}={queries}");
+        println!("arbitrum_seen_head_{id}={seen_head}");
         assert!(*queries > 0, "{id} issued no Arbitrum queries");
+        assert!(
+            *seen_head > head_start + 100,
+            "{id} queried a frozen head {seen_head}, start {head_start}"
+        );
     }
     println!("arbitrum_clients={}", APPS.len());
     println!("arbitrum_subscriptions={subscriptions}");
