@@ -3,7 +3,10 @@ use axum::body::Bytes;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Query, State};
 use axum::http::HeaderMap;
-use datalens_core::wire::{BackfillRequest, BackfillResponse, CoverageResponse, JobsResponse};
+use datalens_core::wire::{
+    BackfillRequest, BackfillResponse, CoverageResponse, FollowResumeRequest, FollowResumeResponse,
+    JobsResponse,
+};
 use datalens_core::{BlockRange, ChainName, Dataset, Error, LogSelector};
 use datalens_store::JobStatus;
 use serde::Deserialize;
@@ -24,6 +27,18 @@ pub(crate) async fn backfill(
     Ok(Json(
         state.0.engine.backfill(&tenant.app.id, request).await?,
     ))
+}
+
+/// Clears a follow halt left by a fork at or below safe or deeper than the reorg window.
+pub(crate) async fn resume_follow(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<FollowResumeResponse>, ApiError> {
+    let tenant = state.0.tenants.authenticate(&headers)?;
+    tenant.require_admin()?;
+    let request: FollowResumeRequest = parse_json(&body)?;
+    Ok(Json(state.0.engine.resume_follow(&request.chain).await?))
 }
 
 #[derive(Deserialize)]

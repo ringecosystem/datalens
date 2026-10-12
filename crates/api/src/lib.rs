@@ -62,6 +62,7 @@ pub fn router(engine: QueryEngine, registry: Registry, config: ApiConfig) -> Rou
         .route("/v1/admin/backfill", post(admin::backfill))
         .route("/v1/admin/coverage", get(admin::coverage))
         .route("/v1/admin/jobs", get(admin::jobs))
+        .route("/v1/admin/follow/resume", post(admin::resume_follow))
         .route("/metrics", get(rest::metrics))
         .with_state(AppState::new(engine, registry, config))
 }

@@ -3,9 +3,11 @@ mod common;
 use std::time::{Duration, Instant};
 
 use datalens_core::wire::{
-    Anchor, FollowInfo, IncompleteReason, Segment, SegmentSource, WatchRequest,
+    Anchor, FollowInfo, FollowResumeResponse, IncompleteReason, Segment, SegmentSource,
+    WatchRequest,
 };
-use datalens_core::{B256, Dataset, Finality, LogSelector, QueryFinality};
+use datalens_core::{B256, ChainId, Dataset, Finality, LogSelector, QueryFinality};
+use datalens_store::Store;
 use sqlx::PgPool;
 
 use common::{
@@ -163,4 +165,36 @@ async fn heads_wait_answers_at_once_when_passed_and_with_current_heads_on_timeou
         .await
         .unwrap_err();
     assert_eq!(forbidden.status(), Some(403));
+}
+
+#[sqlx::test(migrations = false)]
+async fn an_admin_resumes_a_halted_follow_and_others_may_not(pool: PgPool) {
+    let rpc = mock_chain().await;
+    let store = Store::new(pool.clone());
+    let booted = boot_mock(pool, &rpc).await;
+    let degov = booted.degov();
+    let chain = ChainId::new(1).unwrap();
+
+    assert_eq!(
+        degov.resume_follow(&ethereum()).await.unwrap(),
+        FollowResumeResponse {
+            chain: ethereum(),
+            halt_reason: None,
+        }
+    );
+    store
+        .halt_follow(chain, "fork is at or below the safe head")
+        .await
+        .unwrap();
+    let narrow = booted.client("narrow", "narrow-token");
+    let forbidden = narrow.resume_follow(&ethereum()).await.unwrap_err();
+    assert_eq!(forbidden.status(), Some(403));
+    assert!(store.follow_halt(chain).await.unwrap().is_some());
+
+    let resumed = degov.resume_follow(&ethereum()).await.unwrap();
+    assert_eq!(
+        resumed.halt_reason.as_deref(),
+        Some("fork is at or below the safe head")
+    );
+    assert_eq!(store.follow_halt(chain).await.unwrap(), None);
 }
