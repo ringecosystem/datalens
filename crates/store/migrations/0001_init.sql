@@ -56,7 +56,7 @@ create table evm_logs (
   finality          smallint not null,
   primary key (chain_id, block_number, log_index)
 ) partition by list (chain_id);
-create index evm_logs_address_idx on evm_logs (chain_id, address, block_number);
+create index evm_logs_address_idx on evm_logs (chain_id, address, block_number, log_index);
 
 create table evm_tx_senders (
   chain_id         integer not null,

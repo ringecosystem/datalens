@@ -103,60 +103,31 @@ impl Store {
         if limit == 0 {
             return Err(StoreError::invalid("log page limit must be positive"));
         }
-        let addresses: Vec<Vec<u8>> = selector.addresses.iter().map(|a| a.to_vec()).collect();
-        let any_address = selector.addresses.is_empty();
-        let topics: Vec<(bool, Vec<Vec<u8>>)> = selector
-            .topics
-            .iter()
-            .map(|filter| match filter {
-                datalens_core::TopicFilter::Any => (true, Vec::new()),
-                datalens_core::TopicFilter::OneOf(set) => {
-                    (false, set.iter().map(|topic| topic.to_vec()).collect())
-                }
-            })
-            .collect();
-        let cursor_block = page
-            .map(|cursor| u64_to_i64(cursor.block_number, "cursor block"))
-            .transpose()?;
-        let cursor_index = page
-            .map(|cursor| u32_to_i32(cursor.log_index, "cursor log index"))
-            .transpose()?;
-        let rows = sqlx::query(
+        let mut query = QueryBuilder::<Postgres>::new(
             "select block_number, log_index, block_hash, transaction_index, transaction_hash,
                     address, topic0, topic1, topic2, topic3, data, finality
              from evm_logs
-             where chain_id = $1
-               and block_number between $2 and $3
-               and ($4::bool or address = any($5))
-               and ($6::bool or topic0 = any($7))
-               and ($8::bool or topic1 = any($9))
-               and ($10::bool or topic2 = any($11))
-               and ($12::bool or topic3 = any($13))
-               and (
-                    $14::bigint is null
-                    or (block_number, log_index) > ($14, $15)
-               )
-             order by block_number, log_index
-             limit $16",
-        )
-        .bind(chain.get())
-        .bind(u64_to_i64(blocks.start(), "block start")?)
-        .bind(u64_to_i64(blocks.end(), "block end")?)
-        .bind(any_address)
-        .bind(&addresses)
-        .bind(topics[0].0)
-        .bind(&topics[0].1)
-        .bind(topics[1].0)
-        .bind(&topics[1].1)
-        .bind(topics[2].0)
-        .bind(&topics[2].1)
-        .bind(topics[3].0)
-        .bind(&topics[3].1)
-        .bind(cursor_block)
-        .bind(cursor_index)
-        .bind(i64::from(limit) + 1)
-        .fetch_all(&self.pool)
-        .await?;
+             where chain_id = ",
+        );
+        query
+            .push_bind(chain.get())
+            .push(" and block_number between ")
+            .push_bind(u64_to_i64(blocks.start(), "block start")?)
+            .push(" and ")
+            .push_bind(u64_to_i64(blocks.end(), "block end")?);
+        push_selector_filter(&mut query, "", selector);
+        if let Some(cursor) = page {
+            query
+                .push(" and (block_number, log_index) > (")
+                .push_bind(u64_to_i64(cursor.block_number, "cursor block")?)
+                .push(", ")
+                .push_bind(u32_to_i32(cursor.log_index, "cursor log index")?)
+                .push(")");
+        }
+        query
+            .push(" order by block_number, log_index limit ")
+            .push_bind(i64::from(limit) + 1);
+        let rows = query.build().fetch_all(&self.pool).await?;
         let mut logs = Vec::with_capacity(rows.len());
         for row in &rows {
             logs.push(log_from_row(row)?);
