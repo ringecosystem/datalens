@@ -5,3 +5,13 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
+async-graphql.workspace = true
+axum.workspace = true
+datalens-core.workspace = true
+datalens-engine.workspace = true
+datalens-store.workspace = true
+prometheus.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
