@@ -50,7 +50,7 @@ provider = { rps = 10, burst = 20, daily_calls = 1000000, max_in_flight = 4 }
 [chains.polygon]
 chain_id = 137
 rpc_url = "${DATALENS_POLYGON_RPC_URL}"
-finality = { mode = "lag", safe_lag_blocks = 64, finalized_lag_blocks = 256 }
+finality = { mode = "lag", safe_lag_blocks = 128, finalized_lag_blocks = 512 }
 chunk_blocks = 10000
 max_get_logs_range_blocks = 10000
 max_addresses_per_query = 32
@@ -77,7 +77,7 @@ provider = { rps = 10, burst = 20, daily_calls = 1000000, max_in_flight = 4 }
 [chains.bsc]
 chain_id = 56
 rpc_url = "${DATALENS_BSC_RPC_URL}"
-finality = { mode = "lag", safe_lag_blocks = 64, finalized_lag_blocks = 256 }
+finality = { mode = "lag", safe_lag_blocks = 128, finalized_lag_blocks = 512 }
 chunk_blocks = 10000
 max_get_logs_range_blocks = 10000
 max_addresses_per_query = 32
@@ -102,8 +102,8 @@ datasets = ["evm.logs", "evm.blocks"]
 quota = { max_range_blocks = 200000, max_requests_per_minute = 1800, max_concurrent_requests = 96, max_subscriptions = 200 }
 
 [[applications]]
-id = "degov-stg"
-token = "${DATALENS_DEGOV_STG_TOKEN}"
+id = "degov-staging"
+token = "${DATALENS_DEGOV_STAGING_TOKEN}"
 chains = ["ethereum", "optimism", "darwinia", "bsc", "base", "arbitrum", "lisk"]
 datasets = ["evm.logs", "evm.blocks"]
 quota = { max_range_blocks = 200000, max_requests_per_minute = 1800, max_concurrent_requests = 96, max_subscriptions = 200 }
