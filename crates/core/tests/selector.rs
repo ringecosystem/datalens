@@ -237,7 +237,10 @@ fn batch_respects_max_addresses_and_empty_input() {
 #[test]
 fn batch_of_one_is_identity() {
     let only = sel(&[A, B], [one_of(&[T1]), any(), one_of(&[T2]), any()]);
-    assert_eq!(LogSelector::batch(std::slice::from_ref(&only), 1), Some(only));
+    assert_eq!(
+        LogSelector::batch(std::slice::from_ref(&only), 1),
+        Some(only)
+    );
     let any_address = sel(&[], [one_of(&[T1]), any(), any(), any()]);
     assert_eq!(
         LogSelector::batch(std::slice::from_ref(&any_address), 1),
