@@ -70,16 +70,46 @@ export class Client {
   }
 
   /** Every page of `request`, rows concatenated. The other fields come from the last page,
-   * whose `served` contains the rows of every earlier page. */
+   * whose `served` contains the rows of every earlier page. When two pages disagree on a
+   * block hash, a reorg landed between them, so the whole request is read again. */
   async queryAll<Row = QueryResponse["rows"][number]>(
     request: QueryRequest,
     signal?: AbortSignal,
   ): Promise<QueryResponse<Row>> {
+    for (let failures = 1; ; failures++) {
+      const merged = await this.#pages<Row>(request, signal);
+      if (merged !== undefined) {
+        return merged;
+      }
+      if (failures >= this.retry.maxAttempts) {
+        throw new DatalensError(
+          "inconsistent",
+          `datalens inconsistent: pages of ${request.range.start}..=${request.range.end} disagreed on block hashes ${failures} times`,
+        );
+      }
+      await sleep(backoffMs(this.retry, failures), signal);
+    }
+  }
+
+  /** `undefined` when a later page names a block with another hash than an earlier page. */
+  async #pages<Row>(
+    request: QueryRequest,
+    signal?: AbortSignal,
+  ): Promise<QueryResponse<Row> | undefined> {
     let merged = await this.query<Row>(request, signal);
     const rows = [...merged.rows];
+    let known = blockHashes(merged);
     while (merged.page.next_cursor !== null) {
       const page = { limit: request.page?.limit, cursor: merged.page.next_cursor };
       merged = await this.query<Row>({ ...request, page }, signal);
+      const hashes = blockHashes(merged);
+      for (const [number, hash] of hashes) {
+        const seen = known.get(number);
+        if (seen !== undefined && seen !== hash) {
+          return undefined;
+        }
+      }
+      known = new Map([...known, ...hashes]);
       rows.push(...merged.rows);
     }
     return { ...merged, rows };
@@ -189,8 +219,12 @@ export class Client {
       return undefined as T;
     }
     try {
+      assertSafeJsonIntegers(text);
       return JSON.parse(text) as T;
     } catch (cause) {
+      if (cause instanceof DatalensError) {
+        throw cause;
+      }
       throw new DatalensError("decode", `datalens decode: ${String(cause)}`, { cause });
     }
   }
@@ -214,6 +248,42 @@ function apiError(response: Response, text: string): DatalensError {
     status: response.status,
     retryAfterMs: Number.isFinite(seconds) ? seconds * 1000 : undefined,
   });
+}
+
+/** Block numbers and hashes named by rows and by segment anchors. */
+function blockHashes<Row>(response: QueryResponse<Row>): Map<number, string> {
+  const hashes = new Map<number, string>();
+  for (const segment of response.segments) {
+    if (segment.anchor) {
+      hashes.set(segment.anchor.number, segment.anchor.hash);
+    }
+  }
+  for (const row of response.rows) {
+    if (row === null || typeof row !== "object") {
+      continue;
+    }
+    const record = row as { block_number?: unknown; block_hash?: unknown; number?: unknown; hash?: unknown };
+    if (typeof record.block_number === "number" && typeof record.block_hash === "string") {
+      hashes.set(record.block_number, record.block_hash);
+    } else if (typeof record.number === "number" && typeof record.hash === "string") {
+      hashes.set(record.number, record.hash);
+    }
+  }
+  return hashes;
+}
+
+/** JSON.parse rounds integers past `Number.MAX_SAFE_INTEGER`. Reject those JSON numbers
+ * first. Digits inside strings, such as a block hash, are left alone. */
+export function assertSafeJsonIntegers(text: string): void {
+  const withoutStrings = text.replace(/"(?:\\.|[^"\\])*"/g, '""');
+  for (const match of withoutStrings.matchAll(/(?<![\d.])-?\d{16,}(?!\.\d)/g)) {
+    if (!Number.isSafeInteger(Number(match[0]))) {
+      throw new DatalensError(
+        "decode",
+        `datalens decode: integer ${match[0]} exceeds Number.MAX_SAFE_INTEGER`,
+      );
+    }
+  }
 }
 
 export function sleep(ms: number, signal?: AbortSignal): Promise<void> {

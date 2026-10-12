@@ -4,14 +4,15 @@ use std::time::Duration;
 
 use datalens_core::ChainName;
 use datalens_core::wire::{
-    ChainHeads, ErrorBody, HeadsResponse, PageRequest, QueryRequest, QueryResponse, WatchRequest,
-    WatchResponse,
+    ChainHeads, ErrorBody, FollowResumeRequest, FollowResumeResponse, HeadsResponse, PageRequest,
+    QueryRequest, QueryResponse, WatchRequest, WatchResponse,
 };
 use futures::stream::BoxStream;
 use reqwest::header::RETRY_AFTER;
 use reqwest::{RequestBuilder, Response};
 use serde::de::DeserializeOwned;
 
+use crate::cursor::block_hashes;
 use crate::error::{ApiErrorKind, Error, Result};
 use crate::follow::{FollowEvent, FollowRequest, follow};
 
@@ -134,9 +135,30 @@ impl Client {
     }
 
     /// Every page of `request`, rows concatenated. The other fields come from the last page,
-    /// whose `served` contains the rows of every earlier page.
+    /// whose `served` contains the rows of every earlier page. When two pages disagree on a
+    /// block hash, a reorg landed between them, so the whole request is read again.
     pub async fn query_all(&self, request: &QueryRequest) -> Result<QueryResponse> {
+        let mut failures = 0;
+        loop {
+            if let Some(merged) = self.pages(request).await? {
+                return Ok(merged);
+            }
+            failures += 1;
+            if failures >= self.retry.max_attempts {
+                return Err(Error::Inconsistent(format!(
+                    "pages of {}..={} disagreed on block hashes {failures} times",
+                    request.range.start(),
+                    request.range.end()
+                )));
+            }
+            tokio::time::sleep(self.retry.backoff(failures)).await;
+        }
+    }
+
+    /// `None` when a later page names a block with another hash than an earlier page.
+    async fn pages(&self, request: &QueryRequest) -> Result<Option<QueryResponse>> {
         let mut merged = self.query(request).await?;
+        let mut known = block_hashes(&merged);
         let mut paged = request.clone();
         while let Some(cursor) = merged.page.next_cursor.take() {
             paged.page = Some(PageRequest {
@@ -144,11 +166,19 @@ impl Client {
                 cursor: Some(cursor),
             });
             let mut next = self.query(&paged).await?;
+            let hashes = block_hashes(&next);
+            if hashes
+                .iter()
+                .any(|(number, hash)| known.get(number).is_some_and(|seen| seen != hash))
+            {
+                return Ok(None);
+            }
+            known.extend(hashes);
             merged.rows.append(&mut next.rows);
             next.rows = merged.rows;
             merged = next;
         }
-        Ok(merged)
+        Ok(Some(merged))
     }
 
     pub async fn heads(&self, chain: &ChainName) -> Result<ChainHeads> {
@@ -195,6 +225,15 @@ impl Client {
         })
         .await
         .map(drop)
+    }
+
+    /// Clears a persisted follow halt on `chain`. Needs an admin application.
+    pub async fn resume_follow(&self, chain: &ChainName) -> Result<FollowResumeResponse> {
+        let request = FollowResumeRequest {
+            chain: chain.clone(),
+        };
+        self.call(|| self.post("/v1/admin/follow/resume").json(&request))
+            .await
     }
 
     /// Reads `request.start..` chunk by chunk, then follows the head. See [`FollowEvent`].

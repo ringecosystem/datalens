@@ -1,59 +1,13 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+mod fake;
+
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use datalens_sdk::{ApiErrorKind, ChainName, Client, ClientConfig, Error, RetryConfig};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use datalens_sdk::{ApiErrorKind, Error};
+
+use fake::{client, ethereum, fake, http};
 
 const HEADS: &str = r#"{"chain":"ethereum","latest":10,"latest_hash":"0x00000000000000000000000000000000000000000000000000000000000000aa","safe":8,"finalized":4}"#;
-
-/// Answers request `n` (from 0) with `reply(n)`, one request per connection.
-async fn fake(reply: fn(usize) -> String) -> (String, Arc<AtomicUsize>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
-    let count = Arc::new(AtomicUsize::new(0));
-    let seen = Arc::clone(&count);
-    tokio::spawn(async move {
-        loop {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let n = seen.fetch_add(1, Ordering::SeqCst);
-            let mut request = Vec::new();
-            let mut buf = [0_u8; 1024];
-            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-                let read = socket.read(&mut buf).await.unwrap();
-                if read == 0 {
-                    break;
-                }
-                request.extend_from_slice(&buf[..read]);
-            }
-            socket.write_all(reply(n).as_bytes()).await.unwrap();
-            let _ = socket.shutdown().await;
-        }
-    });
-    (base, count)
-}
-
-fn http(status: &str, headers: &str, body: &str) -> String {
-    format!(
-        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n{headers}\r\n{body}",
-        body.len()
-    )
-}
-
-fn client(base: &str) -> Client {
-    let mut config = ClientConfig::new(base, "app", "token");
-    config.retry = RetryConfig {
-        max_attempts: 3,
-        initial_backoff: Duration::from_millis(10),
-        max_backoff: Duration::from_millis(20),
-    };
-    Client::new(config).unwrap()
-}
-
-fn ethereum() -> ChainName {
-    ChainName::new("ethereum").unwrap()
-}
 
 #[tokio::test]
 async fn server_errors_and_rate_limits_are_retried_until_success() {

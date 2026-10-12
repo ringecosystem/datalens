@@ -37,6 +37,8 @@ export interface FollowOptions {
 export type FollowEvent =
   /** One query with every page merged. Its rows cover `served`, a prefix of `requested`. */
   | { type: "batch"; response: QueryResponse }
+  /** `latest_only` does not serve `blocks`, because they are at or below the safe head. */
+  | { type: "skipped"; blocks: { start: number; end: number } }
   /** Everything up to `head` has been read. The iterator long-polls until the head passes it. */
   | { type: "caught_up"; head: number }
   /** The server stopped at `nextStart`. The iterator asks again after `retryInMs`. */
@@ -71,15 +73,23 @@ export async function* follow(
 
   while (request.end === undefined || next <= request.end) {
     try {
-      heads ??= await client.heads(request.chain, signal);
-      if (finality === "latest_only") {
-        next = Math.max(next, heads.safe + 1);
+      const current = heads ?? (await client.heads(request.chain, signal));
+      heads = undefined;
+      if (finality === "latest_only" && next <= current.safe) {
+        const last = request.end === undefined ? current.safe : Math.min(request.end, current.safe);
+        if (last >= next) {
+          yield { type: "skipped", blocks: { start: next, end: last } };
+          next = last + 1;
+        }
+        heads = current;
+        continue;
       }
-      const tip = headOf(heads, kind);
+      const tip = headOf(current, kind);
       const last = request.end === undefined ? tip : Math.min(request.end, tip);
       if (next > last) {
         if (!caughtUp) {
           caughtUp = true;
+          heads = current;
           yield { type: "caught_up", head: tip };
           continue;
         }
@@ -106,12 +116,16 @@ export async function* follow(
       if (resume > next) {
         failures = 0;
       }
+      const unservedTo = response.served === null ? resume - 1 : response.served.start - 1;
+      if (unservedTo >= next) {
+        yield { type: "skipped", blocks: { start: next, end: unservedTo } };
+      }
       next = resume;
       if (response.served !== null) {
         yield { type: "batch", response };
       }
       const reason = response.incomplete_reason;
-      if (reason !== null) {
+      if (reason !== null && reason !== "below_safe") {
         const waiting = reason === "pending" || reason === "not_followed_yet";
         const retryInMs = waiting ? pollIntervalMs : backoffMs(client.retry, ++failures);
         yield {

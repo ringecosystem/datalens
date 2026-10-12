@@ -11,13 +11,18 @@ export type IncompleteReason =
   | "pending"
   | "provider_error"
   | "budget_exhausted"
-  | "not_followed_yet";
+  | "not_followed_yet"
+  | "below_safe";
 
 export type SegmentSource = "durable" | "hot";
 
 export type HeadKind = "latest" | "safe" | "finalized";
 
-/** Inclusive block range. */
+/**
+ * Inclusive block range. Values are JS numbers, exact through `Number.MAX_SAFE_INTEGER`
+ * (2^53 − 1). A response integer outside that range is a decode error, so a block is never
+ * rounded into a skip or a duplicate.
+ */
 export interface BlockRange {
   start: number;
   end: number;

@@ -36,6 +36,7 @@ const (
 	ProviderError   IncompleteReason = "provider_error"
 	BudgetExhausted IncompleteReason = "budget_exhausted"
 	NotFollowedYet  IncompleteReason = "not_followed_yet"
+	BelowSafe       IncompleteReason = "below_safe"
 )
 
 type SegmentSource string
@@ -110,14 +111,35 @@ type LogRecord struct {
 	TransactionFrom  string   `json:"transaction_from,omitempty"`
 }
 
-// BlockRecord holds the named header fields. Decode a row into a map for the others,
-// which keep their JSON-RPC names such as gasUsed.
+// BlockRecord holds the named header fields. Extra keeps every other header field under
+// its JSON-RPC name, such as gasUsed.
 type BlockRecord struct {
-	Number     uint64   `json:"number"`
-	Hash       string   `json:"hash"`
-	ParentHash string   `json:"parent_hash"`
-	Timestamp  uint64   `json:"timestamp"`
-	Finality   Finality `json:"finality"`
+	Number     uint64                     `json:"number"`
+	Hash       string                     `json:"hash"`
+	ParentHash string                     `json:"parent_hash"`
+	Timestamp  uint64                     `json:"timestamp"`
+	Finality   Finality                   `json:"finality"`
+	Extra      map[string]json.RawMessage `json:"-"`
+}
+
+func (b *BlockRecord) UnmarshalJSON(data []byte) error {
+	type named BlockRecord
+	var header named
+	if err := json.Unmarshal(data, &header); err != nil {
+		return &Error{Type: DecodeError, Message: err.Error(), Err: err}
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return &Error{Type: DecodeError, Message: err.Error(), Err: err}
+	}
+	for _, key := range []string{"number", "hash", "parent_hash", "timestamp", "finality"} {
+		delete(raw, key)
+	}
+	*b = BlockRecord(header)
+	if len(raw) > 0 {
+		b.Extra = raw
+	}
+	return nil
 }
 
 type PageInfo struct {

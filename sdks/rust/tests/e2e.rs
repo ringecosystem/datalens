@@ -194,6 +194,7 @@ async fn follow_until(
                 on_caught_up();
             }
             FollowEvent::Stalled { .. } => {}
+            FollowEvent::Skipped { blocks } => panic!("skipped {blocks:?}"),
         }
     }
 }
@@ -341,15 +342,21 @@ async fn follow_latest_only_waits_for_the_first_follow_tick(pool: PgPool) {
     let mut stream = server.client().follow(request);
 
     let mut stalls = Vec::new();
+    let mut skipped = None;
     let batch = loop {
         match stream.next().await.unwrap().unwrap() {
             FollowEvent::Batch(batch) => break batch,
+            FollowEvent::Skipped { blocks } => {
+                assert_eq!(blocks, range(0, SAFE), "{blocks:?}");
+                assert!(skipped.replace(blocks).is_none(), "skipped twice");
+            }
             FollowEvent::Stalled {
                 next_start, reason, ..
             } => stalls.push((next_start, reason)),
             other => panic!("{other:?}"),
         }
     };
+    assert!(skipped.is_some());
     assert!(
         stalls
             .iter()
@@ -360,5 +367,49 @@ async fn follow_latest_only_waits_for_the_first_follow_tick(pool: PgPool) {
     assert_eq!(
         blocks_of(&batch.rows),
         (SAFE + 1..=START).collect::<Vec<_>>()
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn follow_latest_only_names_blocks_that_become_safe_during_catch_up(pool: PgPool) {
+    let chain = MockChain::spawn(START).await;
+    let server = Server::boot(pool, &chain).await;
+    let end = START + 24;
+    let mut request = FollowRequest::logs(ethereum(), usdc(), SAFE + 1);
+    request.finality = QueryFinality::LatestOnly;
+    request.chunk_blocks = 3;
+    request.end = Some(end);
+    request.wait_ms = Some(0);
+    request.poll_interval = Duration::from_millis(20);
+    request.heads_wait = Duration::from_millis(200);
+    let mut stream = server.client().follow(request);
+
+    let mut skipped = Vec::new();
+    let mut advanced = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let event = tokio::time::timeout_at(deadline, stream.next())
+            .await
+            .expect("follow stalled")
+            .expect("stream ended")
+            .expect("follow failed");
+        match event {
+            FollowEvent::Batch(batch) => {
+                if !advanced {
+                    chain.advance(24);
+                    advanced = true;
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                }
+                if batch.served.is_some_and(|served| served.end() >= end) {
+                    break;
+                }
+            }
+            FollowEvent::Skipped { blocks } => skipped.push(blocks),
+            FollowEvent::Stalled { .. } | FollowEvent::CaughtUp { .. } => {}
+        }
+    }
+    assert!(
+        skipped.iter().any(|blocks| blocks.start() > SAFE + 1),
+        "safe moved past unread blocks but nothing was named: {skipped:?}"
     );
 }

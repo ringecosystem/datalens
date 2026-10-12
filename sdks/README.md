@@ -38,7 +38,9 @@ while let Some(event) = events.next().await {
             write_rows(&batch.rows).await?;
             save_checkpoint(cursor.advance(&batch)).await?;
         }
-        FollowEvent::CaughtUp { .. } | FollowEvent::Stalled { .. } => {}
+        FollowEvent::CaughtUp { .. }
+        | FollowEvent::Stalled { .. }
+        | FollowEvent::Skipped { .. } => {}
     }
 }
 ```

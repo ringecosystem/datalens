@@ -14,6 +14,8 @@ const (
 	HTTPError ErrorType = "http"
 	// DecodeError means a success body was not the expected JSON.
 	DecodeError ErrorType = "decode"
+	// InconsistentError means pages of one query disagreed on a block hash.
+	InconsistentError ErrorType = "inconsistent"
 )
 
 // Error is every failure this package returns.
@@ -39,12 +41,13 @@ func (e *Error) Error() string {
 
 func (e *Error) Unwrap() error { return e.Err }
 
-// Retryable reports rate limits, server errors, and transport failures.
+// Retryable reports rate limits (429), server errors, transport failures, and a page set
+// that disagreed on a block hash. 400 and 403 are not retried.
 func (e *Error) Retryable() bool {
 	switch e.Type {
 	case APIError:
 		return e.Status == 429 || e.Status >= 500
-	case HTTPError:
+	case HTTPError, InconsistentError:
 		return true
 	default:
 		return false
