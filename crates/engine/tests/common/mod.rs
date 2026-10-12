@@ -163,6 +163,14 @@ fn filter_matches(filter: &Value, row: &LogRow) -> bool {
 pub struct MockChain {
     pub rpc: MockRpc,
     fail_from: Arc<Mutex<Vec<u64>>>,
+    senders: Arc<Mutex<SenderFaults>>,
+}
+
+/// Transactions, by the block of their log, whose sender lookup misbehaves.
+#[derive(Default)]
+struct SenderFaults {
+    failing: Vec<u64>,
+    misplaced: Vec<u64>,
 }
 
 impl MockChain {
@@ -192,6 +200,8 @@ impl MockChain {
         let rpc = MockRpc::spawn().await;
         let fail_from: Arc<Mutex<Vec<u64>>> = Arc::default();
         let failing = Arc::clone(&fail_from);
+        let senders: Arc<Mutex<SenderFaults>> = Arc::default();
+        let sender_faults = Arc::clone(&senders);
         let logs = fixture();
         rpc.set_handler(move |item| {
             let params = &item["params"];
@@ -225,7 +235,17 @@ impl MockChain {
                 }
                 "eth_getTransactionByHash" => {
                     let hash: B256 = params[0].as_str().unwrap().parse().unwrap();
-                    let block = block_of_transaction(&hash);
+                    let mut block = block_of_transaction(&hash);
+                    let faults = sender_faults.lock().unwrap();
+                    if faults.failing.contains(&block) {
+                        return ItemOutcome::Error {
+                            code: -32000,
+                            message: "internal boom".to_owned(),
+                        };
+                    }
+                    if faults.misplaced.contains(&block) {
+                        block += 1;
+                    }
                     ItemOutcome::Result(json!({
                         "from": format!("{:#x}", sender_of(&hash)),
                         "blockNumber": hex(block),
@@ -235,11 +255,29 @@ impl MockChain {
                 _ => ItemOutcome::Result(Value::Null),
             }
         });
-        Self { rpc, fail_from }
+        Self {
+            rpc,
+            fail_from,
+            senders,
+        }
     }
 
     pub fn fail_logs_from(&self, block: u64) {
         self.fail_from.lock().unwrap().push(block);
+    }
+
+    pub fn clear_log_failures(&self) {
+        self.fail_from.lock().unwrap().clear();
+    }
+
+    /// The sender lookup for the transaction logged at `block` returns a JSON-RPC error.
+    pub fn fail_sender_at(&self, block: u64) {
+        self.senders.lock().unwrap().failing.push(block);
+    }
+
+    /// The sender lookup for the transaction logged at `block` places it one block later.
+    pub fn misplace_sender_at(&self, block: u64) {
+        self.senders.lock().unwrap().misplaced.push(block);
     }
 
     /// JSON-RPC items by method, counting each item of a batch.
@@ -284,6 +322,10 @@ pub fn chain(url: &str, tick: Duration) -> Chain {
 
 /// `rps` is also the burst, so `1` admits one call per second.
 pub fn chain_with_rps(url: &str, tick: Duration, rps: u32) -> Chain {
+    chain_with(url, tick, rps, CHUNK)
+}
+
+pub fn chain_with(url: &str, tick: Duration, rps: u32, max_get_logs_range: u64) -> Chain {
     let metrics = ProviderMetrics::register(&Registry::new()).unwrap();
     let gateway = Gateway::new(
         chain_name(),
@@ -294,7 +336,7 @@ pub fn chain_with_rps(url: &str, tick: Duration, rps: u32) -> Chain {
             daily_calls: None,
             max_in_flight: NonZeroU32::new(8).unwrap(),
             min_range_blocks: NonZeroU64::new(16).unwrap(),
-            max_get_logs_range_blocks: NonZeroU64::new(CHUNK).unwrap(),
+            max_get_logs_range_blocks: NonZeroU64::new(max_get_logs_range).unwrap(),
         },
         metrics,
     )
