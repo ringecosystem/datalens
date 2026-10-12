@@ -10,6 +10,8 @@ use sqlx::PgPool;
 
 use common::{chain, range, store};
 
+const LEASE: Duration = Duration::from_secs(30);
+
 fn logs_at(byte: u8) -> Selector {
     Selector::Logs(LogSelector {
         addresses: [Address::repeat_byte(byte)].into_iter().collect(),
@@ -90,7 +92,14 @@ async fn claim_is_exclusive_until_the_lease_expires_and_done_frees_the_key(pool:
     assert_eq!(reclaimed[0].worker_id.as_deref(), Some("w3"));
 
     let mut tx = pool.begin().await.unwrap();
-    store.complete_jobs(&mut tx, &[id]).await.unwrap();
+    assert_eq!(
+        store.complete_jobs(&mut tx, "w1", &[id]).await.unwrap(),
+        Vec::new()
+    );
+    assert_eq!(
+        store.complete_jobs(&mut tx, "w3", &[id]).await.unwrap(),
+        vec![id]
+    );
     tx.commit().await.unwrap();
     let fresh = store
         .enqueue(
@@ -125,8 +134,12 @@ async fn wait_done_sees_a_job_finished_before_listen_and_wakes_when_it_completes
         )
         .await
         .unwrap();
+    store.claim("w1", LEASE, 10, None).await.unwrap();
     let mut tx = pool.begin().await.unwrap();
-    store.complete_jobs(&mut tx, &[done_id]).await.unwrap();
+    store
+        .complete_jobs(&mut tx, "w1", &[done_id])
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
     let states = store
         .wait_done(&[done_id], Duration::from_secs(2))
@@ -150,9 +163,13 @@ async fn wait_done_sees_a_job_finished_before_listen_and_wakes_when_it_completes
     let waiting = store.clone();
     let handle =
         tokio::spawn(async move { waiting.wait_done(&[pending], Duration::from_secs(5)).await });
+    store.claim("w1", LEASE, 10, None).await.unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
     let mut tx = pool.begin().await.unwrap();
-    store.complete_jobs(&mut tx, &[pending]).await.unwrap();
+    store
+        .complete_jobs(&mut tx, "w1", &[pending])
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
     let states = handle.await.unwrap().unwrap();
     assert_eq!(states[0].status, JobStatus::Done);
@@ -198,7 +215,7 @@ async fn siblings_share_a_chunk_and_a_hard_failure_is_visible(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(claimed.len(), 1);
-    let siblings = store.claim_batch_siblings(&claimed[0]).await.unwrap();
+    let siblings = store.claim_batch_siblings(&claimed[0], 10).await.unwrap();
     assert_eq!(siblings.len(), 1);
     let ids = [claimed[0].id, siblings[0].id];
     assert!(ids.contains(&left));
@@ -213,7 +230,7 @@ async fn siblings_share_a_chunk_and_a_hard_failure_is_visible(pool: PgPool) {
 
     let error = json!({"reason": "bad selector"});
     store
-        .fail_job(claimed[0].id, &error, false, Duration::ZERO)
+        .fail_job(claimed[0].id, "w1", &error, false, Duration::ZERO)
         .await
         .unwrap();
     let states = store.job_status(&[claimed[0].id]).await.unwrap();
@@ -223,6 +240,7 @@ async fn siblings_share_a_chunk_and_a_hard_failure_is_visible(pool: PgPool) {
     store
         .fail_job(
             siblings[0].id,
+            "w1",
             &json!({"reason": "later"}),
             true,
             Duration::from_secs(3600),

@@ -82,8 +82,12 @@ impl JobStatus {
 }
 
 impl Store {
-    /// Inserts a pending job. An active job with the same chunk returns that job's id.
-    /// The first creator keeps `application_id`. A `done` or `failed` row is not active.
+    /// Inserts a pending job. An active job with the same chunk returns that job's id, and
+    /// the first creator keeps `application_id`.
+    ///
+    /// A job that finished while this call ran is returned as is, so the caller sees `done`
+    /// and recomputes what is missing. A new job whose chunk the selector's coverage already
+    /// holds is stored as `done`, so no worker fetches it again.
     pub async fn enqueue(
         &self,
         chain: ChainId,
@@ -94,44 +98,72 @@ impl Store {
         application_id: &str,
     ) -> Result<JobId, StoreError> {
         let range = block_range_to_pg(blocks);
-        let inserted: Option<i64> = sqlx::query_scalar(
-            "insert into fill_jobs (
-                chain_id, dataset, selector_id, blocks, purpose, application_id, status
-             )
-             values ($1, $2, $3, $4, $5, $6, 'pending')
-             on conflict (chain_id, dataset, selector_id, blocks)
-                where status in ('pending', 'running')
-             do nothing
-             returning id",
-        )
-        .bind(chain.get())
-        .bind(dataset.as_str())
-        .bind(selector_id.get())
-        .bind(range)
-        .bind(purpose.as_str())
-        .bind(application_id)
-        .fetch_optional(&self.pool)
-        .await?;
-        let id = match inserted {
-            Some(id) => id,
-            None => {
-                sqlx::query_scalar(
-                    "select id from fill_jobs
-                     where chain_id = $1 and dataset = $2 and selector_id = $3 and blocks = $4
-                       and status in ('pending', 'running')",
+        for _ in 0..3 {
+            let mut tx = self.pool.begin().await?;
+            let inserted: Option<i64> = sqlx::query_scalar(
+                "insert into fill_jobs (
+                    chain_id, dataset, selector_id, blocks, purpose, application_id, status
+                 )
+                 values ($1, $2, $3, $4, $5, $6, 'pending')
+                 on conflict (chain_id, dataset, selector_id, blocks)
+                    where status in ('pending', 'running')
+                 do nothing
+                 returning id",
+            )
+            .bind(chain.get())
+            .bind(dataset.as_str())
+            .bind(selector_id.get())
+            .bind(range)
+            .bind(purpose.as_str())
+            .bind(application_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(id) = inserted {
+                // Runs as its own statement so it sees coverage committed after the insert began.
+                let covered: Option<i64> = sqlx::query_scalar(
+                    "update fill_jobs as job
+                     set status = 'done', updated_at = now()
+                     where job.id = $1
+                       and int8multirange(job.blocks) <@ (
+                            select range_agg(c.blocks) from coverage c
+                            where c.chain_id = job.chain_id and c.dataset = job.dataset
+                              and c.selector_id = job.selector_id and c.blocks && job.blocks
+                       )
+                     returning id",
                 )
-                .bind(chain.get())
-                .bind(dataset.as_str())
-                .bind(selector_id.get())
-                .bind(range)
-                .fetch_one(&self.pool)
-                .await?
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+                if let Some(id) = covered {
+                    notify_ids(&mut tx, &[id]).await?;
+                }
+                tx.commit().await?;
+                return Ok(JobId::from_raw(id));
             }
-        };
-        Ok(JobId::from_raw(id))
+            let latest: Option<i64> = sqlx::query_scalar(
+                "select id from fill_jobs
+                 where chain_id = $1 and dataset = $2 and selector_id = $3 and blocks = $4
+                 order by id desc
+                 limit 1",
+            )
+            .bind(chain.get())
+            .bind(dataset.as_str())
+            .bind(selector_id.get())
+            .bind(range)
+            .fetch_optional(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            if let Some(id) = latest {
+                return Ok(JobId::from_raw(id));
+            }
+        }
+        Err(StoreError::not_found(format!(
+            "fill job for {blocks:?} vanished while enqueueing"
+        )))
     }
 
     /// Claims pending jobs whose `next_run_at` has arrived, and running jobs whose lease expired.
+    /// `query` jobs go first, because a caller is waiting on them.
     pub async fn claim(
         &self,
         worker_id: &str,
@@ -156,7 +188,7 @@ impl Store {
                     or (status = 'running' and lease_until <= now())
                 )
                   and ($3::int is null or chain_id = $3)
-                order by next_run_at, id
+                order by (purpose = 'query') desc, next_run_at, id
                 limit $4
                 for update skip locked
              )
@@ -177,8 +209,13 @@ impl Store {
         Ok(jobs)
     }
 
-    /// Claims other pending jobs in the same chunk so one fetch can fill several selectors.
-    pub async fn claim_batch_siblings(&self, job: &Job) -> Result<Vec<Job>, StoreError> {
+    /// Claims up to `limit` other pending jobs in the same chunk, lowest id first, so one
+    /// fetch can fill several selectors. The caller sizes `limit` to its address cap.
+    pub async fn claim_batch_siblings(
+        &self,
+        job: &Job,
+        limit: u32,
+    ) -> Result<Vec<Job>, StoreError> {
         let Some(worker_id) = job.worker_id.as_deref() else {
             return Err(StoreError::invalid(
                 "batch siblings are claimed by a running job",
@@ -187,6 +224,9 @@ impl Store {
         let Some(lease_until) = job.lease_until else {
             return Err(StoreError::invalid("running job is missing a lease"));
         };
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let rows = sqlx::query(
             "update fill_jobs
              set status = 'running',
@@ -198,6 +238,8 @@ impl Store {
                 select id from fill_jobs
                 where chain_id = $3 and dataset = $4 and blocks = $5
                   and status = 'pending' and next_run_at <= now() and id <> $6
+                order by id
+                limit $7
                 for update skip locked
              )
              returning id, chain_id, dataset, selector_id, blocks, purpose, application_id,
@@ -209,6 +251,7 @@ impl Store {
         .bind(job.dataset.as_str())
         .bind(block_range_to_pg(job.blocks))
         .bind(job.id.get())
+        .bind(i64::from(limit))
         .fetch_all(&self.pool)
         .await?;
         let mut jobs = Vec::with_capacity(rows.len());
@@ -219,34 +262,44 @@ impl Store {
         Ok(jobs)
     }
 
+    /// Marks the jobs `done` that are still `running` under `worker_id` and returns them in
+    /// id order. A job another worker reclaimed after this lease expired is left alone.
     pub async fn complete_jobs(
         &self,
         tx: &mut PgTx<'_>,
+        worker_id: &str,
         job_ids: &[JobId],
-    ) -> Result<(), StoreError> {
+    ) -> Result<Vec<JobId>, StoreError> {
         if job_ids.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let ids: Vec<i64> = job_ids.iter().map(|id| id.get()).collect();
-        let done: Vec<i64> = sqlx::query_scalar(
+        let mut done: Vec<i64> = sqlx::query_scalar(
             "update fill_jobs
              set status = 'done', worker_id = null, lease_until = null, updated_at = now()
-             where id = any($1) and status <> 'done'
+             where id = any($1) and status = 'running' and worker_id = $2
              returning id",
         )
         .bind(&ids)
+        .bind(worker_id)
         .fetch_all(&mut **tx)
         .await?;
-        notify_ids(tx, &done).await
+        notify_ids(tx, &done).await?;
+        done.sort_unstable();
+        Ok(done.into_iter().map(JobId::from_raw).collect())
     }
 
+    /// Records a failure for a job still `running` under `worker_id`. Returns `false` when this
+    /// worker no longer holds it. A retryable failure goes back to `pending` after `backoff`.
+    /// A final one becomes `failed` and wakes its waiters.
     pub async fn fail_job(
         &self,
         job_id: JobId,
+        worker_id: &str,
         error_json: &serde_json::Value,
         retryable: bool,
         backoff: Duration,
-    ) -> Result<(), StoreError> {
+    ) -> Result<bool, StoreError> {
         let mut tx = self.pool.begin().await?;
         let updated: Option<i64> = sqlx::query_scalar(
             "update fill_jobs
@@ -259,25 +312,51 @@ impl Store {
                     else next_run_at
                  end,
                  updated_at = now()
-             where id = $1 and status in ('pending', 'running')
+             where id = $1 and status = 'running' and worker_id = $5
              returning id",
         )
         .bind(job_id.get())
         .bind(retryable)
         .bind(error_json)
         .bind(duration_millis(backoff)?)
+        .bind(worker_id)
         .fetch_optional(&mut *tx)
         .await?;
         let Some(id) = updated else {
-            return Err(StoreError::invalid(format!(
-                "job {job_id} is not pending or running"
-            )));
+            return Ok(false);
         };
         if !retryable {
             notify_ids(&mut tx, &[id]).await?;
         }
         tx.commit().await?;
-        Ok(())
+        Ok(true)
+    }
+
+    /// Moves `lease_until` to now plus `lease` for jobs still `running` under `worker_id`, and
+    /// returns them in id order. A fetch slower than its lease calls this to keep the chunk.
+    pub async fn extend_lease(
+        &self,
+        worker_id: &str,
+        job_ids: &[JobId],
+        lease: Duration,
+    ) -> Result<Vec<JobId>, StoreError> {
+        if job_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<i64> = job_ids.iter().map(|id| id.get()).collect();
+        let mut kept: Vec<i64> = sqlx::query_scalar(
+            "update fill_jobs
+             set lease_until = now() + ($3::bigint * interval '1 millisecond'), updated_at = now()
+             where id = any($1) and status = 'running' and worker_id = $2
+             returning id",
+        )
+        .bind(&ids)
+        .bind(worker_id)
+        .bind(duration_millis(lease)?)
+        .fetch_all(&self.pool)
+        .await?;
+        kept.sort_unstable();
+        Ok(kept.into_iter().map(JobId::from_raw).collect())
     }
 
     pub async fn job_status(&self, job_ids: &[JobId]) -> Result<Vec<JobState>, StoreError> {
@@ -343,6 +422,19 @@ impl Store {
         let result = sqlx::query(
             "delete from fill_jobs
              where status = 'done'
+               and updated_at <= now() - ($1::bigint * interval '1 millisecond')",
+        )
+        .bind(duration_millis(older_than)?)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Failed jobs keep `last_error` for inspection, so they usually get a longer retention.
+    pub async fn prune_failed(&self, older_than: Duration) -> Result<u64, StoreError> {
+        let result = sqlx::query(
+            "delete from fill_jobs
+             where status = 'failed'
                and updated_at <= now() - ($1::bigint * interval '1 millisecond')",
         )
         .bind(duration_millis(older_than)?)

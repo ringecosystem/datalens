@@ -100,7 +100,7 @@ async fn wait_done_wakes_on_a_hard_failure_but_not_on_a_retry(pool: PgPool) {
     let failed = Instant::now();
     let error = json!({"kind": "invalid_input"});
     store
-        .fail_job(hard, &error, false, Duration::ZERO)
+        .fail_job(hard, "w1", &error, false, Duration::ZERO)
         .await
         .unwrap();
     let states = handle.await.unwrap().unwrap();
@@ -118,6 +118,7 @@ async fn wait_done_wakes_on_a_hard_failure_but_not_on_a_retry(pool: PgPool) {
     store
         .fail_job(
             soft,
+            "w1",
             &json!({"kind": "rate_limited"}),
             true,
             Duration::from_secs(60),
