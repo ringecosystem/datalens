@@ -13,6 +13,7 @@ mod notify;
 mod selectors;
 mod subscriptions;
 mod tx_senders;
+mod unsafe_rows;
 mod usage;
 
 use std::sync::Arc;

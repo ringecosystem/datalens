@@ -97,6 +97,23 @@ impl Store {
         rows.into_iter().map(subscription_from_row).collect()
     }
 
+    /// Unexpired subscriptions of one application on every chain, for its quota.
+    pub async fn application_subscriptions(
+        &self,
+        application_id: &str,
+    ) -> Result<Vec<Subscription>, StoreError> {
+        let rows: Vec<(i32, String, i64, String, String, DateTime<Utc>)> = sqlx::query_as(
+            "select chain_id, dataset, selector_id, application_id, source, expires_at
+             from subscriptions
+             where application_id = $1 and expires_at > now()
+             order by chain_id, dataset, selector_id",
+        )
+        .bind(application_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(subscription_from_row).collect()
+    }
+
     pub async fn remove_subscription(
         &self,
         chain: ChainId,
