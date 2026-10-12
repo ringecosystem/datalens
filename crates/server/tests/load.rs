@@ -1,6 +1,7 @@
 mod common;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use common::boot;
@@ -19,6 +20,14 @@ const COVERED: u64 = 9_999;
 const WALL: Duration = Duration::from_secs(30);
 const PRODUCTION_TICK_MS: f64 = 2_000.0;
 const TEST_TICK_MS: f64 = 100.0;
+/// Production Arbitrum is about 4 blocks/s. One test tick stands for one 2 s production tick.
+const BLOCKS_PER_TICK: u64 = 8;
+const APPS: &[(&str, &str)] = &[
+    ("degov-live", "degov-live-token"),
+    ("degov-staging", "degov-staging-token"),
+    ("degov-realtime", "degov-realtime-token"),
+    ("ormp", "ormp-token"),
+];
 
 struct ChainRpc {
     name: &'static str,
@@ -40,33 +49,77 @@ async fn arbitrum_steady_rate_and_covered_query_p95(pool: PgPool) {
     let logs_for_handler = Arc::clone(&logs);
     eth.rpc
         .set_handler(move |item| ethereum_handler(item, &logs_for_handler));
+
+    let head = Arc::new(AtomicU64::new(LATEST));
+    let head_for_rpc = Arc::clone(&head);
     for chain in chains.iter().filter(|chain| chain.name != "ethereum") {
-        chain.rpc.set_handler(head_handler);
+        if chain.name == "arbitrum" {
+            let head = Arc::clone(&head_for_rpc);
+            chain
+                .rpc
+                .set_handler(move |item| arbitrum_handler(item, &head));
+        } else {
+            chain.rpc.set_handler(head_handler);
+        }
     }
 
     let config = Config::from_toml(&config_text(&chains), &|_| None).unwrap();
     let server = boot(pool, config).await;
     let client = server.client("degov-live", "degov-live-token");
-    let arbitrum = ChainName::new("arbitrum").unwrap();
-    client
-        .watch(&WatchRequest {
-            chain: arbitrum.clone(),
-            dataset: Dataset::EvmLogs,
-            selector: Some(contract_selector()),
-        })
-        .await
-        .unwrap();
+    let watch = WatchRequest {
+        chain: ChainName::new("arbitrum").unwrap(),
+        dataset: Dataset::EvmLogs,
+        selector: Some(contract_selector()),
+    };
+    for (id, token) in APPS {
+        let watcher = if *id == "degov-live" {
+            client.clone()
+        } else {
+            server.client(id, token)
+        };
+        watcher.watch(&watch).await.unwrap();
+    }
     wait_until_caught_up(&client).await;
+    let subscriptions = subscription_gauge(&client.metrics("metrics-secret").await.unwrap());
+    assert_eq!(subscriptions, APPS.len() as i64, "arbitrum watchers");
 
     let arb = chains
         .iter()
         .find(|chain| chain.name == "arbitrum")
         .unwrap();
-    let before = arb.rpc.calls().len();
+    let head_for_task = Arc::clone(&head);
+    let advancer = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_millis(TEST_TICK_MS as u64));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            head_for_task.fetch_add(BLOCKS_PER_TICK, Ordering::Relaxed);
+        }
+    });
+    let before = arb.rpc.calls();
+    let head_start = head.load(Ordering::Relaxed);
     tokio::time::sleep(WALL).await;
-    let calls = arb.rpc.calls().len() - before;
+    advancer.abort();
+    let head_end = head.load(Ordering::Relaxed);
+    let after = arb.rpc.calls();
+    let fresh = &after[before.len()..];
+    let calls = fresh.len();
+    let log_calls = method_calls(fresh, "eth_getLogs");
     let simulated_seconds = WALL.as_secs_f64() * (PRODUCTION_TICK_MS / TEST_TICK_MS);
     let steady_rps = calls as f64 / simulated_seconds;
+    println!("arbitrum_clients={}", APPS.len());
+    println!("arbitrum_subscriptions={subscriptions}");
+    println!("arbitrum_head_start={head_start}");
+    println!("arbitrum_head_end={head_end}");
+    println!("arbitrum_eth_getLogs={log_calls}");
+    assert!(
+        head_end > head_start + 100,
+        "arbitrum head did not advance ({head_start} -> {head_end})"
+    );
+    assert!(
+        log_calls > 0,
+        "advancing arbitrum head produced no eth_getLogs"
+    );
 
     let p95_ms = covered_query_p95(&client).await;
     println!("arbitrum_calls={calls}");
@@ -96,11 +149,12 @@ async fn wait_until_caught_up(client: &Client) {
             "arbitrum follow did not catch up"
         );
         let text = client.metrics("metrics-secret").await.unwrap();
-        if text.lines().any(|line| {
+        let lag_zero = text.lines().any(|line| {
             line.starts_with("datalens_follow_lag_blocks{")
                 && line.contains("chain=\"arbitrum\"")
                 && line.ends_with(" 0")
-        }) {
+        });
+        if lag_zero && subscription_gauge(&text) == APPS.len() as i64 {
             return;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -204,6 +258,60 @@ fn ethereum_handler(item: &Value, logs: &[Value]) -> ItemOutcome {
     }
 }
 
+fn subscription_gauge(text: &str) -> i64 {
+    text.lines()
+        .find(|line| {
+            line.starts_with("datalens_subscriptions{")
+                && line.contains("chain=\"arbitrum\"")
+                && line.contains("dataset=\"evm.logs\"")
+        })
+        .and_then(|line| line.rsplit(' ').next())
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+}
+
+fn method_calls(calls: &[Value], method: &str) -> usize {
+    calls.iter().map(|call| count_method(call, method)).sum()
+}
+
+fn count_method(value: &Value, method: &str) -> usize {
+    let mut count = usize::from(value.get("method").and_then(Value::as_str) == Some(method));
+    match value {
+        Value::Array(items) => {
+            count += items
+                .iter()
+                .map(|item| count_method(item, method))
+                .sum::<usize>();
+        }
+        Value::Object(map) => {
+            count += map
+                .iter()
+                .filter(|(key, _)| *key != "method")
+                .map(|(_, child)| count_method(child, method))
+                .sum::<usize>();
+        }
+        _ => {}
+    }
+    count
+}
+
+fn arbitrum_handler(item: &Value, head: &AtomicU64) -> ItemOutcome {
+    let params = &item["params"];
+    match item["method"].as_str().unwrap_or_default() {
+        "eth_getBlockByNumber" => {
+            let number = match params[0].as_str() {
+                Some("latest") => head.load(Ordering::Relaxed),
+                Some("safe") => head.load(Ordering::Relaxed).saturating_sub(64),
+                Some("finalized") => head.load(Ordering::Relaxed).saturating_sub(256),
+                _ => parse_hex(&params[0]),
+            };
+            ItemOutcome::Result(block_json(number))
+        }
+        "eth_getLogs" => ItemOutcome::Result(Value::Array(Vec::new())),
+        _ => ItemOutcome::Result(Value::Null),
+    }
+}
+
 fn head_handler(item: &Value) -> ItemOutcome {
     let params = &item["params"];
     match item["method"].as_str().unwrap_or_default() {
@@ -222,10 +330,10 @@ fn block_number(param: &Value) -> u64 {
 
 fn block_json(number: u64) -> Value {
     json!({
-        "number": hex(number.min(LATEST)),
-        "hash": hash(number.min(LATEST)),
-        "parentHash": hash(number.min(LATEST).saturating_sub(1)),
-        "timestamp": hex(1_700_000_000 + number.min(LATEST)),
+        "number": hex(number),
+        "hash": hash(number),
+        "parentHash": hash(number.saturating_sub(1)),
+        "timestamp": hex(1_700_000_000 + number),
     })
 }
 
