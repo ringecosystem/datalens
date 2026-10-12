@@ -261,6 +261,34 @@ async fn transaction_from_is_looked_up_once(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+async fn unresolved_senders_fail_the_query_but_resolved_ones_are_kept(pool: PgPool) {
+    let mock = MockChain::spawn().await;
+    mock.fail_sender_at(1_507);
+    mock.misplace_sender_at(3_007);
+    let engine = engine(&pool, &mock).await;
+    let _workers = spawn_workers(&engine, 1);
+    let mut request = logs_request(selector(&[0xa1], &[]), range(0, 9_999));
+    request.fields = Some(vec![
+        "transaction_hash".to_owned(),
+        "transaction_from".to_owned(),
+    ]);
+
+    let error = engine.query(&caller(), request.clone()).await.unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "internal: no canonical sender for 2 of 7 transactions"
+    );
+    assert_eq!(mock.count("eth_getTransactionByHash"), 8);
+
+    let error = engine.query(&caller(), request).await.unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "internal: no canonical sender for 2 of 2 transactions"
+    );
+    assert_eq!(mock.count("eth_getTransactionByHash"), 11);
+}
+
+#[sqlx::test(migrations = false)]
 async fn blocks_query_fills_headers_once(pool: PgPool) {
     let mock = MockChain::spawn().await;
     let engine = engine(&pool, &mock).await;

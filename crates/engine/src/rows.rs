@@ -204,12 +204,6 @@ impl QueryEngine {
                 )
                 .await
                 .map_err(provider_error)?;
-            if !found.failed.is_empty() {
-                return Err(Error::Internal(format!(
-                    "provider returned no sender for {} transactions",
-                    found.failed.len()
-                )));
-            }
             let blocks: HashMap<B256, (u64, B256)> = records
                 .iter()
                 .map(|record| {
@@ -220,7 +214,9 @@ impl QueryEngine {
                 })
                 .collect();
             // A sender the provider places in another block than the durable log is from a
-            // fork, so it is not stored.
+            // fork, so it is not stored. Like a failed or missing lookup, it fails the query
+            // instead of reading as a field nobody asked for. Resolved senders are stored first,
+            // so the next query asks only for the unresolved hashes.
             let rows: Vec<(B256, u64, Address, Finality)> = found
                 .senders
                 .into_iter()
@@ -239,6 +235,13 @@ impl QueryEngine {
             let mut tx = store.pool().begin().await.map_err(StoreError::from)?;
             store.insert_senders(&mut tx, chain.id(), &rows).await?;
             tx.commit().await.map_err(StoreError::from)?;
+            if rows.len() < missing.len() {
+                return Err(Error::Internal(format!(
+                    "no canonical sender for {} of {} transactions",
+                    missing.len() - rows.len(),
+                    missing.len()
+                )));
+            }
         }
         let senders = store.senders(chain.id(), &hashes).await?;
         for record in records {
