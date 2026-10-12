@@ -96,7 +96,8 @@ impl QueryEngine {
     }
 
     /// Heads are published only after follow work, so a reader that sees safe `s` finds every
-    /// followed selector already promoted through `s`.
+    /// followed selector promoted through `min(s, its follow head at the start of the tick)`.
+    /// A selector that is behind is caught up by later ticks, and queries fill the gap.
     async fn tick(&self, chain: &Chain) -> Result<Heads, Error> {
         let heads = chain
             .evm
