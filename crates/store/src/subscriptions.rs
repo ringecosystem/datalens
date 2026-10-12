@@ -43,6 +43,9 @@ impl SubscriptionSource {
 }
 
 impl Store {
+    /// Creates or renews a subscription. `explicit` is never downgraded to `auto`, and the
+    /// expiry only moves later. An `auto` renewal writes at most once a minute, because it runs
+    /// on every follow-attached query.
     pub async fn touch_subscription(
         &self,
         chain: ChainId,
@@ -58,9 +61,14 @@ impl Store {
              )
              values ($1, $2, $3, $4, $5, now(), now() + ($6::bigint * interval '1 millisecond'))
              on conflict (chain_id, dataset, selector_id, application_id) do update set
-                source = excluded.source,
+                source = case
+                    when subscriptions.source = 'explicit' then 'explicit'
+                    else excluded.source
+                end,
                 last_query_at = now(),
-                expires_at = now() + ($6::bigint * interval '1 millisecond')",
+                expires_at = greatest(subscriptions.expires_at, excluded.expires_at)
+             where excluded.source = 'explicit'
+                or subscriptions.last_query_at < now() - interval '60 seconds'",
         )
         .bind(chain.get())
         .bind(dataset.as_str())
