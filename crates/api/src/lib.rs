@@ -67,6 +67,11 @@ pub fn router(engine: QueryEngine, registry: Registry, config: ApiConfig) -> Rou
         .with_state(AppState::new(engine, registry, config))
 }
 
+/// The GraphQL schema in SDL, as committed in `schemas/native.graphql`.
+pub fn graphql_sdl() -> String {
+    graphql::schema().sdl()
+}
+
 /// `/metrics` alone, for replicas without the api role.
 pub fn metrics_router(engine: QueryEngine, registry: Registry, metrics_token: String) -> Router {
     let config = ApiConfig {

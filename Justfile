@@ -13,6 +13,9 @@ test:
 
 check: fmt-check clippy test
 
+schema:
+  cargo run -q -p datalens-api --bin export-schema > schemas/native.graphql
+
 pg-up:
   docker compose up -d --wait postgres
 

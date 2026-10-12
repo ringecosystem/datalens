@@ -1,0 +1,58 @@
+type Anchor {
+	number: Int!
+	hash: String!
+}
+
+type BlockRange {
+	start: Int!
+	end: Int!
+}
+
+"""
+A scalar that can represent any JSON value.
+"""
+scalar JSON
+
+type Page {
+	nextCursor: String
+}
+
+type QueryResult {
+	chain: String!
+	dataset: String!
+	requested: BlockRange!
+	served: BlockRange
+	nextStart: Int
+	incompleteReason: String
+	incompleteDetail: String
+	segments: [Segment!]!
+	rows: JSON!
+	page: Page!
+}
+
+type QueryRoot {
+	"""
+	Same input and result as `POST /v1/query`. `input` is the REST request body.
+	"""
+	query(input: JSON!): QueryResult!
+}
+
+type Segment {
+	start: Int!
+	end: Int!
+	source: String!
+	finality: String!
+	anchor: Anchor
+}
+
+"""
+Directs the executor to include this field or fragment only when the `if` argument is true.
+"""
+directive @include(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+"""
+Directs the executor to skip this field or fragment when the `if` argument is true.
+"""
+directive @skip(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+schema {
+	query: QueryRoot
+}
