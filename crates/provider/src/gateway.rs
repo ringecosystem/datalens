@@ -129,6 +129,22 @@ impl Gateway {
         application: Option<&str>,
         wait: TokenWait,
     ) -> Result<Value, ProviderError> {
+        self.call_counted(method, params, purpose, application, wait)
+            .await
+            .map(|(value, _)| value)
+            .map_err(|(error, _)| error)
+    }
+
+    /// Like [`Self::call`]. The count is how many times the provider was contacted,
+    /// including retries inside this call.
+    pub async fn call_counted(
+        &self,
+        method: &str,
+        params: Value,
+        purpose: Purpose,
+        application: Option<&str>,
+        wait: TokenWait,
+    ) -> Result<(Value, u64), (ProviderError, u64)> {
         let app = application_label(application);
         let body = json!({
             "jsonrpc": "2.0",
@@ -136,30 +152,37 @@ impl Gateway {
             "method": method,
             "params": params,
         });
+        let mut calls = 0;
         for attempt in 1..=ATTEMPTS {
-            self.acquire(purpose, wait).await?;
+            if let Err(error) = self.acquire(purpose, wait).await {
+                return Err((error, calls));
+            }
+            calls += 1;
             match self.dispatch(method, &body, purpose).await {
                 Ok(value) => match interpret_object(value) {
                     Ok(result) => {
                         self.count(method, purpose, app, "ok");
-                        return Ok(result);
+                        return Ok((result, calls));
                     }
                     Err(error) => {
                         self.count(method, purpose, app, error.kind());
                         if !self.consider_retry(&error, attempt).await {
-                            return Err(error);
+                            return Err((error, calls));
                         }
                     }
                 },
                 Err(error) => {
                     self.count(method, purpose, app, error.kind());
                     if !self.consider_retry(&error, attempt).await {
-                        return Err(error);
+                        return Err((error, calls));
                     }
                 }
             }
         }
-        Err(ProviderError::fatal("retry loop ended without a result"))
+        Err((
+            ProviderError::fatal("retry loop ended without a result"),
+            calls,
+        ))
     }
 
     pub async fn batch(

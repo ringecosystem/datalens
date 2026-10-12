@@ -128,6 +128,7 @@ async fn get_logs_splits_by_max_addresses() {
         .await
         .unwrap();
     assert_eq!(mock.calls().len(), 2);
+    assert_eq!(page.calls, 2);
     let first = mock.calls()[0]["params"][0]["address"].clone();
     let second = mock.calls()[1]["params"][0]["address"].clone();
     assert_eq!(
@@ -207,6 +208,7 @@ async fn limit_halves_and_eight_successes_double_back() {
     assert_eq!(page.fetched_to, Some(127));
     let spans: Vec<u64> = mock.calls().iter().map(block_span).collect();
     assert_eq!(spans, vec![32, 16, 16, 16, 16, 16, 16, 16, 16]);
+    assert_eq!(page.calls, spans.len() as u64);
     assert_eq!(evm.gateway().range_blocks(Dataset::EvmLogs), 32);
 }
 

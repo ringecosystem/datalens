@@ -30,7 +30,7 @@ impl EngineMetrics {
             .buckets(vec![
                 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 15.0, 30.0,
             ]),
-            &["chain", "dataset"],
+            &["chain", "dataset", "finality", "outcome"],
         )?;
         let fill_jobs = IntGaugeVec::new(
             Opts::new("datalens_fill_jobs", "Fill jobs by status"),
@@ -100,6 +100,7 @@ impl EngineMetrics {
         application: &str,
         chain: &str,
         dataset: &str,
+        finality: &str,
         outcome: &str,
         seconds: f64,
     ) {
@@ -107,7 +108,7 @@ impl EngineMetrics {
             .with_label_values(&[application, chain, dataset, outcome])
             .inc();
         self.query_duration
-            .with_label_values(&[chain, dataset])
+            .with_label_values(&[chain, dataset, finality, outcome])
             .observe(seconds);
     }
 

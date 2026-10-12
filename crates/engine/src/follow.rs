@@ -282,7 +282,7 @@ impl QueryEngine {
                 page.fetched_to
             )));
         }
-        let mut calls = 1;
+        let mut calls = i64::try_from(page.calls).unwrap_or(i64::MAX);
         let rows: Vec<LogRow> = page
             .rows
             .into_iter()

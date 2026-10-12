@@ -92,6 +92,7 @@ pub(crate) async fn run_query(
     let started = Instant::now();
     let chain = request.chain.to_string();
     let dataset = request.dataset.as_str();
+    let finality = request.finality.as_str();
     let result = async {
         let _permit = tenant.admit(&request)?;
         shared.engine.query(&tenant.caller(), request).await
@@ -106,6 +107,7 @@ pub(crate) async fn run_query(
         &tenant.app.id,
         &chain,
         dataset,
+        finality,
         outcome,
         started.elapsed().as_secs_f64(),
     );

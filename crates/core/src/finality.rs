@@ -33,3 +33,13 @@ pub enum QueryFinality {
     SafeToLatest,
     LatestOnly,
 }
+
+impl QueryFinality {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DurableOnly => "durable_only",
+            Self::SafeToLatest => "safe_to_latest",
+            Self::LatestOnly => "latest_only",
+        }
+    }
+}

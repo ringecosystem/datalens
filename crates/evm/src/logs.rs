@@ -14,6 +14,8 @@ pub struct LogsPage {
     pub rows: Vec<LogRow>,
     /// Last block included in `rows`. `None` when the first window failed.
     pub fetched_to: Option<u64>,
+    /// `eth_getLogs` calls that reached the provider, including retries and a failing call.
+    pub calls: u64,
 }
 
 /// `page` is the prefix fetched before `error`.
@@ -26,6 +28,7 @@ pub struct LogFetchError {
 struct Window {
     rows: Vec<LogRow>,
     end: u64,
+    calls: u64,
 }
 
 struct LogCall<'a> {
@@ -59,9 +62,11 @@ impl EvmClient {
         let mut rows = Vec::new();
         let mut cursor = range.start();
         let mut fetched_to = None;
+        let mut calls = 0;
         while cursor <= range.end() {
             match self.fetch_window(&call, cursor, range.end()).await {
                 Ok(window) => {
+                    calls += window.calls;
                     rows.extend(window.rows);
                     fetched_to = Some(window.end);
                     if window.end == range.end() {
@@ -69,15 +74,24 @@ impl EvmClient {
                     }
                     cursor = window.end + 1;
                 }
-                Err(error) => {
+                Err((error, failed_calls)) => {
+                    calls += failed_calls;
                     return Err(LogFetchError {
-                        page: LogsPage { rows, fetched_to },
+                        page: LogsPage {
+                            rows,
+                            fetched_to,
+                            calls,
+                        },
                         error,
                     });
                 }
             }
         }
-        Ok(LogsPage { rows, fetched_to })
+        Ok(LogsPage {
+            rows,
+            fetched_to,
+            calls,
+        })
     }
 
     async fn fetch_window(
@@ -85,29 +99,34 @@ impl EvmClient {
         call: &LogCall<'_>,
         cursor: u64,
         range_end: u64,
-    ) -> Result<Window, ProviderError> {
+    ) -> Result<Window, (ProviderError, u64)> {
+        let mut calls = 0;
         loop {
             let window = self.gateway.range_blocks(Dataset::EvmLogs);
             let end = cursor
                 .saturating_add(window.saturating_sub(1))
                 .min(range_end);
             match self.fetch_groups(call, cursor, end).await {
-                Ok(rows) => {
+                Ok((rows, made)) => {
+                    calls += made;
                     self.gateway.record_success(Dataset::EvmLogs);
-                    return Ok(Window { rows, end });
+                    return Ok(Window { rows, end, calls });
                 }
-                Err(ProviderError::Limit) => {
+                Err((ProviderError::Limit, made)) => {
+                    calls += made;
                     let failed_len = end - cursor + 1;
-                    self.gateway.record_limit(Dataset::EvmLogs, failed_len)?;
+                    if let Err(error) = self.gateway.record_limit(Dataset::EvmLogs, failed_len) {
+                        return Err((error, calls));
+                    }
                     let shrunk = self.gateway.range_blocks(Dataset::EvmLogs);
                     let next_end = cursor
                         .saturating_add(shrunk.saturating_sub(1))
                         .min(range_end);
                     if next_end >= end {
-                        return Err(ProviderError::Limit);
+                        return Err((ProviderError::Limit, calls));
                     }
                 }
-                Err(error) => return Err(error),
+                Err((error, made)) => return Err((error, calls + made)),
             }
         }
     }
@@ -117,30 +136,30 @@ impl EvmClient {
         call: &LogCall<'_>,
         start: u64,
         end: u64,
-    ) -> Result<Vec<LogRow>, ProviderError> {
+    ) -> Result<(Vec<LogRow>, u64), (ProviderError, u64)> {
         let mut rows = Vec::new();
+        let mut calls = 0;
         for addresses in call.groups {
             let mut narrowed = call.selector.clone();
             narrowed.addresses = addresses.clone();
-            let value = self
+            let (value, made) = self
                 .gateway
-                .call(
+                .call_counted(
                     "eth_getLogs",
                     json!([log_filter(&narrowed, start, end)]),
                     call.purpose,
                     call.application,
                     call.wait,
                 )
-                .await?;
-            rows.extend(parse_log_list(
-                &value,
-                call.finality,
-                start,
-                end,
-                &narrowed,
-            )?);
+                .await
+                .map_err(|(error, made)| (error, calls + made))?;
+            calls += made;
+            match parse_log_list(&value, call.finality, start, end, &narrowed) {
+                Ok(parsed) => rows.extend(parsed),
+                Err(error) => return Err((error, calls)),
+            }
         }
-        Ok(rows)
+        Ok((rows, calls))
     }
 }
 
