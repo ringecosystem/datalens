@@ -202,6 +202,17 @@ fn duplicate_application_id_and_token_are_rejected() {
 }
 
 #[test]
+fn empty_metrics_bearer_token_is_rejected() {
+    assert_eq!(
+        error_of(&MINIMAL.replace(
+            r#"bearer_token = "metrics-${SUFFIX}""#,
+            r#"bearer_token = """#
+        )),
+        "invalid config: metrics.bearer_token must not be empty"
+    );
+}
+
+#[test]
 fn invalid_values_are_rejected() {
     assert!(parse(&MINIMAL.replace("chain_id = 42161", "chain_id = 0")).is_err());
     assert!(parse(&MINIMAL.replace("chunk_blocks = 10000", "chunk_blocks = 0")).is_err());
@@ -241,14 +252,47 @@ fn shipped_example_config_parses() {
             ("polygon".to_owned(), 137),
         ])
     );
+    let darwinia = &config.chains[&ChainName::new("darwinia").unwrap()];
+    assert_eq!(darwinia.max_get_logs_range_blocks.get(), 1000);
     assert_eq!(
-        config.chains[&ChainName::new("darwinia").unwrap()]
-            .max_get_logs_range_blocks
-            .get(),
-        1000
+        darwinia.finality,
+        FinalityConfig::Lag {
+            safe_lag_blocks: 64,
+            finalized_lag_blocks: 256
+        }
+    );
+    assert_eq!(
+        config.chains[&ChainName::new("ethereum").unwrap()].finality,
+        FinalityConfig::Lag {
+            safe_lag_blocks: 32,
+            finalized_lag_blocks: 96
+        }
+    );
+    assert_eq!(
+        config.chains[&ChainName::new("polygon").unwrap()].finality,
+        FinalityConfig::Lag {
+            safe_lag_blocks: 128,
+            finalized_lag_blocks: 512
+        }
+    );
+    assert_eq!(
+        config.chains[&ChainName::new("bsc").unwrap()].finality,
+        FinalityConfig::Lag {
+            safe_lag_blocks: 128,
+            finalized_lag_blocks: 512
+        }
+    );
+    assert!(
+        config
+            .chains
+            .values()
+            .all(|chain| chain.max_addresses_per_query.get() == 32)
     );
     let ids: Vec<&str> = config.applications.iter().map(|a| a.id.as_str()).collect();
-    assert_eq!(ids, ["degov-live", "degov-stg", "degov-realtime", "ormp"]);
+    assert_eq!(
+        ids,
+        ["degov-live", "degov-staging", "degov-realtime", "ormp"]
+    );
     assert_eq!(
         config.server.roles,
         BTreeSet::from([Role::Api, Role::Worker])

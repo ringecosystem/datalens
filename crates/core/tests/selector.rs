@@ -201,14 +201,24 @@ fn batch_differing_later_positions_become_any() {
 }
 
 #[test]
-fn batch_any_address_member_makes_batch_any_address() {
+fn batch_mixed_any_address_does_not_merge() {
     let members = [
         sel(&[A], [one_of(&[T1]), any(), any(), any()]),
         sel(&[], [one_of(&[T2]), any(), any(), any()]),
     ];
+    assert_eq!(LogSelector::batch(&members, 32), None);
+    assert_eq!(LogSelector::batch(&members, 1), None);
+}
+
+#[test]
+fn batch_of_only_any_address_members_unions_topic0() {
+    let members = [
+        sel(&[], [one_of(&[T1]), one_of(&[T3]), any(), any()]),
+        sel(&[], [one_of(&[T2]), one_of(&[T3]), any(), any()]),
+    ];
     assert_eq!(
         LogSelector::batch(&members, 1).unwrap(),
-        sel(&[], [one_of(&[T1, T2]), any(), any(), any()])
+        sel(&[], [one_of(&[T1, T2]), one_of(&[T3]), any(), any()])
     );
 }
 
@@ -226,9 +236,11 @@ fn batch_respects_max_addresses_and_empty_input() {
 
 #[test]
 fn batch_of_one_is_identity() {
-    let only = sel(&[A], [one_of(&[T1]), any(), one_of(&[T2]), any()]);
+    let only = sel(&[A, B], [one_of(&[T1]), any(), one_of(&[T2]), any()]);
+    assert_eq!(LogSelector::batch(std::slice::from_ref(&only), 1), Some(only));
+    let any_address = sel(&[], [one_of(&[T1]), any(), any(), any()]);
     assert_eq!(
-        LogSelector::batch(std::slice::from_ref(&only), 32),
-        Some(only)
+        LogSelector::batch(std::slice::from_ref(&any_address), 1),
+        Some(any_address)
     );
 }
