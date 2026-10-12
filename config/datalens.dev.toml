@@ -26,3 +26,4 @@ token = "dev-token"
 chains = ["ethereum"]
 datasets = ["evm.logs", "evm.blocks"]
 quota = { max_range_blocks = 100000, max_requests_per_minute = 600, max_concurrent_requests = 8, max_subscriptions = 20 }
+admin = true

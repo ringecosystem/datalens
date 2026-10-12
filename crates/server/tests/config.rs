@@ -92,6 +92,10 @@ fn minimal_config_parses_with_defaults_and_interpolation() {
     assert_eq!(app.datasets, BTreeSet::from([Dataset::EvmLogs]));
     assert!(!app.quota.allow_unfiltered_logs);
     assert_eq!(app.quota.max_fill_blocks_per_minute, None);
+    assert!(!app.admin);
+    assert_eq!(config.fill.workers.get(), 4);
+    assert_eq!(config.fill.inline_workers, 2);
+    assert_eq!(config.fill.lease_s.get(), 120);
 }
 
 #[test]
@@ -291,7 +295,29 @@ fn shipped_example_config_parses() {
     let ids: Vec<&str> = config.applications.iter().map(|a| a.id.as_str()).collect();
     assert_eq!(
         ids,
-        ["degov-live", "degov-staging", "degov-realtime", "ormp"]
+        [
+            "degov-live",
+            "degov-staging",
+            "degov-realtime",
+            "ormp",
+            "ops"
+        ]
+    );
+    let admins: Vec<&str> = config
+        .applications
+        .iter()
+        .filter(|a| a.admin)
+        .map(|a| a.id.as_str())
+        .collect();
+    assert_eq!(admins, ["ops"]);
+    assert_eq!(config.fill.workers.get(), 4);
+    assert_eq!(config.fill.inline_workers, 2);
+    assert_eq!(config.fill.lease_s.get(), 120);
+    assert_eq!(
+        config.chains[&ChainName::new("arbitrum").unwrap()]
+            .header_chunk_blocks
+            .get(),
+        100
     );
     assert_eq!(
         config.server.roles,
