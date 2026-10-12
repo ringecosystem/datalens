@@ -151,7 +151,7 @@ create table selectors (
   fingerprint   text not null,
   canonical_key text not null,
   addresses     bytea[] not null default '{}',   -- 空 = 任意地址
-  topics        jsonb not null default '[]',     -- 每个位置：null=通配，[]=不匹配，[..]=任一
+  topics        jsonb not null default '[]',     -- 每个位置：null=通配，非空数组=任一；空数组在解析时拒绝
   created_at    timestamptz not null default now(),
   last_used_at  timestamptz not null default now(),
   unique (chain_id, dataset, fingerprint)
@@ -462,7 +462,7 @@ api/worker 进程内聚合，每 10 秒批量 upsert。Prometheus 指标并行�
 - quota：`max_range_blocks`、`max_requests_per_minute`、`max_concurrent_requests`、`max_subscriptions`、
   `max_fill_blocks_per_minute`；第一版不允许不带地址过滤的 `evm.logs`（`allow_unfiltered_logs = false`）。
 - 内存中按副本计数；多副本时按副本数折算（第一版 api 1–2 副本，足够）。
-- 生产配置：`degov-live`、`degov-realtime`、`ormp`；删除 `public`。建议 stg indexer 改用独立的 `degov-stg`
+- 生产配置：`degov-live`、`degov-realtime`、`ormp`；删除 `public`。建议 stg indexer 改用独立的 `degov-staging`
   application，便于用量归因。
 
 ### 8.4 SDK
@@ -576,7 +576,7 @@ services:
 | M6 SDK | Rust SDK 新类型、`follow`、cursor helpers；TS/Go SDK 同步；`schemas/native.graphql` 导出；README | SDK 测试通过；对本地 compose 服务的 e2e | 3 天 |
 | M7 degov 改造 | `apps/indexer`：升级 `datalens-sdk` rev；主索引改用 `follow`（替代固定间隔轮询）；provisional/realtime worker 改用新 `latest_only` 语义与 anchor 回退；处理 `next_start` / `incomplete_reason`；配置项更新；stg 改用独立 application | degov 现有测试通过；本地 compose（datalens + PG + degov）对一条 live 链的 e2e：回放、追头、realtime 正常 | 4 天 |
 | M8 ormp 改造 | `ormpindexer`：删除 Tron（`decoder/tron.rs`、Tron 配置与测试）；`transaction_from` 改用 `evm.logs` 的 `fields`，删除 `evm.transactions` 查询；`evm.blocks` 锚点查询与 `latest_block` 改用新 API/heads；适配新响应 | ormp 现有测试（含 legacy parity）通过；本地 e2e 对 darwinia/arbitrum 正常 | 3 天 |
-| M9 上线与清理 | 发布镜像；按 degov-stg → ormp → degov-prod 顺序切换；观察 erpc `datalens` project 用量；重写 `docs/spec`（02/03/04/07、production-runtime）与 runbook；删除过时文档；本计划转为 decision | 切换后 arbitrum 请求降到目标值；三方业务数据对账一致；文档与代码一致 | 3 天 |
+| M9 上线与清理 | 发布镜像；按 degov-staging → ormp → degov-prod 顺序切换；观察 erpc `datalens` project 用量；重写 `docs/spec`（02/03/04/07、production-runtime）与 runbook；删除过时文档；本计划转为 decision | 切换后 arbitrum 请求降到目标值；三方业务数据对账一致；文档与代码一致 | 3 天 |
 
 合计约 39 个工作日。M1 与 M2 可以并行；M6 可以在 M3 接口稳定后与 M4 并行；M7 与 M8 可以并行。
 
