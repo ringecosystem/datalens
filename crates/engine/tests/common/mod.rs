@@ -19,6 +19,8 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use tokio::sync::watch;
 
+pub mod follow_chain;
+
 pub const CHUNK: u64 = 10_000;
 pub const SAFE: u64 = 99_000;
 pub const FINALIZED: u64 = 98_000;
@@ -313,6 +315,7 @@ pub fn settings() -> EngineSettings {
         token_wait: Duration::from_secs(5),
         heads_ttl: Duration::from_millis(500),
         idle_poll: Duration::from_millis(50),
+        ..EngineSettings::default()
     }
 }
 
@@ -353,6 +356,7 @@ pub fn chain_with(url: &str, tick: Duration, rps: u32, max_get_logs_range: u64) 
                 finalized_lag_blocks: 1_064,
             },
             tick,
+            reorg_window_blocks: NonZeroU64::new(128).unwrap(),
         },
         EvmClient::new(gateway, NonZeroUsize::new(32).unwrap(), 20).unwrap(),
     )
@@ -405,6 +409,7 @@ pub fn caller() -> Caller<'static> {
     Caller {
         application: "degov",
         fill_budget: None,
+        max_subscriptions: None,
     }
 }
 

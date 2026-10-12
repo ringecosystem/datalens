@@ -20,7 +20,7 @@ use common::{
 async fn head_tracker_writes_lag_heads_from_one_latest_call(pool: PgPool) {
     let mock = MockChain::spawn().await;
     let engine = engine(&pool, &mock).await;
-    let heads = engine.track_heads_once(&chain_name()).await.unwrap();
+    let heads = engine.tick_once(&chain_name()).await.unwrap();
     let want = Heads {
         latest: LATEST,
         latest_hash: block_hash(LATEST),
@@ -45,7 +45,7 @@ async fn head_tracker_waits_while_another_replica_holds_the_chain_lock(pool: PgP
     let (stop, rx) = watch::channel(false);
     let tracker = tokio::spawn({
         let engine = engine.clone();
-        async move { engine.run_head_tracker(chain_name(), rx).await }
+        async move { engine.run_chain_leader(chain_name(), rx).await }
     });
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert_eq!(mock.count("eth_getBlockByNumber"), 0);
@@ -164,6 +164,7 @@ async fn fill_budget_stops_enqueuing_and_reports_budget_exhausted(pool: PgPool) 
     let caller = Caller {
         application: "degov",
         fill_budget: Some(&budget),
+        max_subscriptions: None,
     };
     let response = engine
         .query(
@@ -189,6 +190,7 @@ async fn a_poll_of_an_in_flight_fill_waits_on_it_without_spending_budget(pool: P
     let caller = Caller {
         application: "degov",
         fill_budget: Some(&budget),
+        max_subscriptions: None,
     };
     let mut request = logs_request(selector(&[0xa1], &[]), range(0, 9_999));
     request.wait_ms = Some(0);

@@ -1,14 +1,19 @@
-//! Query planning over PostgreSQL coverage, deduplicated fills, and the head tracker.
+//! Query planning over PostgreSQL coverage, deduplicated fills, and per-chain following of
+//! the head with reorg handling and promotion to durable rows.
 
 mod admin;
 mod budget;
 mod chain;
 mod engine;
-mod heads;
+mod follow;
+mod leader;
 mod metrics;
 mod plan;
 mod query;
+mod reorg;
+mod retention;
 mod rows;
+mod subscribe;
 mod usage;
 mod worker;
 

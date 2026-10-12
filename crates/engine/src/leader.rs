@@ -10,20 +10,20 @@ use crate::chain::Chain;
 use crate::engine::{QueryEngine, provider_error};
 
 impl QueryEngine {
-    /// One head RPC for `chain`, written to `chain_heads`.
-    pub async fn track_heads_once(&self, chain: &ChainName) -> Result<Heads, Error> {
+    /// One leader tick for `chain`: the head RPC, follow work, then `chain_heads`.
+    pub async fn tick_once(&self, chain: &ChainName) -> Result<Heads, Error> {
         let chain = self.chain(chain)?;
-        self.track(&chain).await
+        self.tick(&chain).await
     }
 
-    /// Keeps `chain_heads` fresh for one chain. Replicas elect one leader per chain with
-    /// `pg_try_advisory_lock(chain_id)` held on a dedicated connection, so a dead leader's
-    /// lock is released with its connection.
-    pub async fn run_head_tracker(&self, chain: ChainName, mut shutdown: watch::Receiver<bool>) {
+    /// Runs the head tracker, follower, finalizer, and retention for one chain. Replicas elect
+    /// one leader per chain with `pg_try_advisory_lock(chain_id)` held on a dedicated
+    /// connection, so a dead leader's lock is released with its connection.
+    pub async fn run_chain_leader(&self, chain: ChainName, mut shutdown: watch::Receiver<bool>) {
         let chain = match self.chain(&chain) {
             Ok(chain) => chain,
             Err(error) => {
-                warn!(%error, "head tracker has no chain");
+                warn!(%error, "chain leader has no chain");
                 return;
             }
         };
@@ -31,9 +31,9 @@ impl QueryEngine {
             if *shutdown.borrow() {
                 return;
             }
-            match self.lead_heads(&chain, &mut shutdown).await {
+            match self.lead(&chain, &mut shutdown).await {
                 Ok(()) => return,
-                Err(error) => warn!(chain = %chain.name(), %error, "head tracker lost its lock"),
+                Err(error) => warn!(chain = %chain.name(), %error, "chain leader lost its lock"),
             }
             tokio::select! {
                 () = tokio::time::sleep(chain.settings.tick) => {}
@@ -43,11 +43,7 @@ impl QueryEngine {
     }
 
     /// Returns `Ok` on shutdown and `Err` when the lock connection fails.
-    async fn lead_heads(
-        &self,
-        chain: &Chain,
-        shutdown: &mut watch::Receiver<bool>,
-    ) -> Result<(), Error> {
+    async fn lead(&self, chain: &Chain, shutdown: &mut watch::Receiver<bool>) -> Result<(), Error> {
         let tick = chain.settings.tick;
         let key = i64::from(chain.id().get());
         let mut conn: PgConnection = self
@@ -75,7 +71,7 @@ impl QueryEngine {
                 }
             }
         }
-        info!(chain = %chain.name(), "head tracker leads");
+        info!(chain = %chain.name(), "chain leader elected");
         let mut interval = tokio::time::interval(tick);
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
@@ -83,8 +79,8 @@ impl QueryEngine {
                 _ = interval.tick() => {}
                 _ = shutdown.changed() => break,
             }
-            if let Err(error) = self.track(chain).await {
-                warn!(chain = %chain.name(), %error, "head refresh failed");
+            if let Err(error) = self.tick(chain).await {
+                warn!(chain = %chain.name(), %error, "chain tick failed");
             }
             sqlx::query("select 1")
                 .execute(&mut conn)
@@ -99,7 +95,9 @@ impl QueryEngine {
         Ok(())
     }
 
-    async fn track(&self, chain: &Chain) -> Result<Heads, Error> {
+    /// Heads are published only after follow work, so a reader that sees safe `s` finds every
+    /// followed selector already promoted through `s`.
+    async fn tick(&self, chain: &Chain) -> Result<Heads, Error> {
         let heads = chain
             .evm
             .heads(
@@ -110,7 +108,13 @@ impl QueryEngine {
             )
             .await
             .map_err(provider_error)?;
+        if let Err(error) = self.follow_tick(chain, &heads).await {
+            warn!(chain = %chain.name(), %error, "follow tick failed");
+        }
         self.inner.store.upsert_heads(chain.id(), &heads).await?;
+        if let Err(error) = self.retain(chain, &heads).await {
+            warn!(chain = %chain.name(), %error, "retention failed");
+        }
         Ok(heads)
     }
 }
