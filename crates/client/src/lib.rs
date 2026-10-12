@@ -1,10 +1,10 @@
 //! Typed REST client over [`datalens_core::wire`].
 
-use datalens_core::ChainName;
 use datalens_core::wire::{
-    BackfillRequest, BackfillResponse, ChainHeads, ErrorBody, HeadsResponse, JobsResponse,
-    QueryRequest, QueryResponse,
+    BackfillRequest, BackfillResponse, ChainHeads, CoverageResponse, ErrorBody, HeadsResponse,
+    JobsResponse, QueryRequest, QueryResponse, WatchRequest, WatchResponse,
 };
+use datalens_core::{BlockRange, ChainName, Dataset, LogSelector};
 use reqwest::{RequestBuilder, Response};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -95,6 +95,58 @@ impl Client {
 
     pub async fn chain_heads(&self, chain: &ChainName) -> Result<ChainHeads, ClientError> {
         self.send(self.get(&format!("/v1/heads/{chain}"))).await
+    }
+
+    /// Waits until head `kind` (`latest`, `safe`, or `finalized`) passes `after`. On the
+    /// server's timeout this returns the unchanged heads.
+    pub async fn wait_heads(
+        &self,
+        chain: &ChainName,
+        after: u64,
+        kind: &str,
+        timeout_ms: u64,
+    ) -> Result<ChainHeads, ClientError> {
+        let request = self.get(&format!("/v1/heads/{chain}/wait")).query(&[
+            ("after", after.to_string()),
+            ("kind", kind.to_owned()),
+            ("timeout_ms", timeout_ms.to_string()),
+        ]);
+        self.send(request).await
+    }
+
+    pub async fn watch(&self, request: &WatchRequest) -> Result<WatchResponse, ClientError> {
+        self.send(self.post("/v1/watch").json(request)).await
+    }
+
+    pub async fn unwatch(&self, request: &WatchRequest) -> Result<(), ClientError> {
+        let delete = self.authed(self.http.delete(format!("{}/v1/watch", self.base)));
+        checked(delete.json(request).send().await?).await?;
+        Ok(())
+    }
+
+    pub async fn coverage(
+        &self,
+        chain: &ChainName,
+        dataset: Dataset,
+        selector: Option<&LogSelector>,
+        range: Option<BlockRange>,
+    ) -> Result<CoverageResponse, ClientError> {
+        let mut params = vec![
+            ("chain", chain.to_string()),
+            ("dataset", dataset.as_str().to_owned()),
+        ];
+        if let Some(selector) = selector {
+            params.push((
+                "selector",
+                serde_json::to_string(selector).expect("selector serializes"),
+            ));
+        }
+        if let Some(range) = range {
+            params.push(("start", range.start().to_string()));
+            params.push(("end", range.end().to_string()));
+        }
+        self.send(self.get("/v1/admin/coverage").query(&params))
+            .await
     }
 
     pub async fn backfill(
