@@ -8,6 +8,7 @@ members = [
   "crates/provider",
   "crates/server",
   "crates/store",
+  "sdks/rust",
 ]
 resolver = "3"
 
@@ -23,6 +24,7 @@ datalens-core = { path = "crates/core" }
 datalens-engine = { path = "crates/engine" }
 datalens-evm = { path = "crates/evm" }
 datalens-provider = { path = "crates/provider" }
+datalens-server = { path = "crates/server" }
 datalens-store = { path = "crates/store" }
 
 alloy-primitives = { version = "1.7.3", features = ["serde"] }

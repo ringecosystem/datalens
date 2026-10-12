@@ -1208,6 +1208,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "datalens-sdk"
+version = "0.1.0"
+dependencies = [
+ "datalens-core",
+ "datalens-evm",
+ "datalens-server",
+ "datalens-store",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
 name = "datalens-server"
 version = "0.1.0"
 dependencies = [

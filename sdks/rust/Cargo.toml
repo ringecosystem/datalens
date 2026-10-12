@@ -1,0 +1,22 @@
+[package]
+name = "datalens-sdk"
+description = "Rust client for the datalens query API."
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+datalens-core.workspace = true
+futures.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["time"] }
+
+[dev-dependencies]
+datalens-evm = { workspace = true, features = ["mock"] }
+datalens-server.workspace = true
+datalens-store.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
