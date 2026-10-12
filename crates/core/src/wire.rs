@@ -260,6 +260,41 @@ pub struct CoverageResponse {
     /// Within the requested range, including coverage of wider selectors.
     pub covered: Vec<BlockRange>,
     pub missing: Vec<BlockRange>,
+    /// Follow progress of this exact selector. Null when nothing follows it.
+    #[serde(default)]
+    pub follow: Option<FollowInfo>,
+}
+
+/// Where the follower stands for one selector. The follower owns every block from
+/// `from_block` on. The durable fill path owns everything below it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FollowInfo {
+    pub from_block: u64,
+    /// Highest block fetched into unsafe rows. Null before the first fetch.
+    pub head_block: Option<u64>,
+    pub head_hash: Option<B256>,
+    /// Highest block promoted into durable coverage. Null before the first promotion.
+    pub promoted_to: Option<u64>,
+}
+
+/// Body of `POST /v1/watch` and `DELETE /v1/watch`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WatchRequest {
+    pub chain: ChainName,
+    pub dataset: Dataset,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<LogSelector>,
+}
+
+/// An explicit subscription lasts `ttl_ms` from this call. Calling again renews it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatchResponse {
+    pub chain: ChainName,
+    pub dataset: Dataset,
+    pub selector_id: i64,
+    pub ttl_ms: u64,
+    pub follow: FollowInfo,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

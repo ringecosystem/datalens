@@ -1,6 +1,6 @@
 use datalens_core::wire::{
-    Anchor, BlockRecord, ErrorBody, IncompleteReason, LogRecord, PageInfo, QueryRequest,
-    QueryResponse, Segment, SegmentSource,
+    Anchor, BlockRecord, ErrorBody, FollowInfo, IncompleteReason, LogRecord, PageInfo,
+    QueryRequest, QueryResponse, Segment, SegmentSource, WatchRequest,
 };
 use datalens_core::{
     Address, B256, BlockRange, BlockRow, Bytes, ChainName, Dataset, Error, Finality, LogRow,
@@ -166,4 +166,42 @@ fn error_body_uses_the_stable_kind() {
         serde_json::from_value(json!({"error": {"kind": "forbidden", "message": "no"}})).unwrap();
     assert_eq!(parsed.error.kind, "forbidden");
     let _: Value = serde_json::to_value(parsed).unwrap();
+}
+
+#[test]
+fn watch_request_takes_a_selector_and_rejects_unknown_fields() {
+    let request: WatchRequest = serde_json::from_value(json!({
+        "chain": "arbitrum",
+        "dataset": "evm.logs",
+        "selector": {"addresses": ["0x00000000000000000000000000000000000000aa"]}
+    }))
+    .unwrap();
+    assert_eq!(request.chain.as_str(), "arbitrum");
+    assert_eq!(
+        request
+            .selector
+            .unwrap()
+            .addresses
+            .into_iter()
+            .collect::<Vec<_>>(),
+        vec![Address::with_last_byte(0xaa)]
+    );
+    let unknown = serde_json::from_value::<WatchRequest>(json!({
+        "chain": "base", "dataset": "evm.blocks", "range": {"start": 1, "end": 2}
+    }));
+    assert!(unknown.is_err());
+}
+
+#[test]
+fn follow_info_before_the_first_fetch_has_null_heads() {
+    let info = FollowInfo {
+        from_block: 101,
+        head_block: None,
+        head_hash: None,
+        promoted_to: None,
+    };
+    assert_eq!(
+        serde_json::to_value(&info).unwrap(),
+        json!({"from_block": 101, "head_block": null, "head_hash": null, "promoted_to": null})
+    );
 }
