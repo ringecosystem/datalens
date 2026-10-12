@@ -14,6 +14,7 @@ fn size_phrases_are_limit_and_bare_words_are_not() {
         "maximum block range is 10000",
         "response size exceeded",
         "log size exceeded",
+        "query exceeds max results 20000, retry with a smaller range",
     ];
     for message in limits {
         assert_eq!(

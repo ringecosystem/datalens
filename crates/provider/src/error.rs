@@ -12,6 +12,7 @@ const LIMIT_PHRASES: &[&str] = &[
     "maximum block range",
     "response size exceeded",
     "log size exceeded",
+    "exceeds max results",
 ];
 
 const BATCH_PHRASES: &[&str] = &["batch limit", "batch size"];
