@@ -235,6 +235,150 @@ async fn block_promotion_checks_parent_links_and_the_end_hash(pool: PgPool) {
     );
 }
 
+#[sqlx::test]
+async fn reorg_deletes_only_unsafe_senders_at_or_above_the_fork(pool: PgPool) {
+    let store = store(&pool).await;
+    let chain = chain();
+    let sender = Address::repeat_byte(0x33);
+    let below = B256::repeat_byte(0x21);
+    let unsafe_at_fork = B256::repeat_byte(0x22);
+    let safe_at_fork = B256::repeat_byte(0x23);
+
+    let mut tx = pool.begin().await.unwrap();
+    store
+        .insert_senders(
+            &mut tx,
+            chain,
+            &[
+                (below, 4, sender, Finality::Unsafe),
+                (unsafe_at_fork, 10, sender, Finality::Unsafe),
+                (safe_at_fork, 10, sender, Finality::Safe),
+            ],
+        )
+        .await
+        .unwrap();
+    store
+        .delete_unsafe_senders_from(&mut tx, chain, 10)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    assert_eq!(
+        store
+            .missing_hashes(chain, &[below, unsafe_at_fork, safe_at_fork])
+            .await
+            .unwrap(),
+        vec![unsafe_at_fork]
+    );
+    assert_eq!(
+        store.senders(chain, &[below, safe_at_fork]).await.unwrap(),
+        [(below, sender), (safe_at_fork, sender)]
+            .into_iter()
+            .collect()
+    );
+}
+
+#[sqlx::test]
+async fn a_stronger_insert_or_promote_raises_sender_finality(pool: PgPool) {
+    let store = store(&pool).await;
+    let chain = chain();
+    let sender = Address::repeat_byte(0x33);
+    let other = Address::repeat_byte(0x44);
+    let raised = B256::repeat_byte(0x31);
+    let conflict = B256::repeat_byte(0x32);
+    let neighbor = B256::repeat_byte(0x33);
+    let outside = B256::repeat_byte(0x34);
+
+    let mut tx = pool.begin().await.unwrap();
+    store
+        .insert_senders(
+            &mut tx,
+            chain,
+            &[
+                (raised, 8, sender, Finality::Unsafe),
+                (conflict, 8, sender, Finality::Unsafe),
+            ],
+        )
+        .await
+        .unwrap();
+    store
+        .insert_senders(
+            &mut tx,
+            chain,
+            &[
+                (raised, 8, sender, Finality::Safe),
+                (conflict, 40, other, Finality::Finalized),
+            ],
+        )
+        .await
+        .unwrap();
+    store
+        .insert_senders(&mut tx, chain, &[(raised, 8, sender, Finality::Unsafe)])
+        .await
+        .unwrap();
+    store
+        .delete_unsafe_senders_from(&mut tx, chain, 8)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(
+        store
+            .missing_hashes(chain, &[raised, conflict])
+            .await
+            .unwrap(),
+        vec![conflict]
+    );
+    assert_eq!(
+        store.senders(chain, &[raised]).await.unwrap(),
+        [(raised, sender)].into_iter().collect()
+    );
+
+    let mut tx = pool.begin().await.unwrap();
+    store
+        .insert_senders(
+            &mut tx,
+            chain,
+            &[
+                (neighbor, 9, sender, Finality::Unsafe),
+                (outside, 30, sender, Finality::Unsafe),
+            ],
+        )
+        .await
+        .unwrap();
+    let err = store
+        .promote_senders(&mut tx, chain, range(8, 9), Finality::Unsafe)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::InvalidInput(_)), "{err:?}");
+    let promoted = store
+        .promote_senders(&mut tx, chain, range(8, 9), Finality::Finalized)
+        .await
+        .unwrap();
+    let again = store
+        .promote_senders(&mut tx, chain, range(8, 9), Finality::Finalized)
+        .await
+        .unwrap();
+    store
+        .delete_unsafe_senders_from(&mut tx, chain, 0)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    assert_eq!(promoted, 2);
+    assert_eq!(again, 0);
+    assert_eq!(
+        store
+            .missing_hashes(chain, &[raised, neighbor, outside])
+            .await
+            .unwrap(),
+        vec![outside]
+    );
+    assert_eq!(
+        store.senders(chain, &[raised, neighbor]).await.unwrap(),
+        [(raised, sender), (neighbor, sender)].into_iter().collect()
+    );
+}
+
 async fn read(store: &datalens_store::Store, selector: &LogSelector) -> Vec<LogRow> {
     let (logs, cursor) = store
         .read_logs(chain(), selector, range(0, 100), None, 50)

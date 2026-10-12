@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use datalens_core::{Address, B256, ChainId};
+use datalens_core::{Address, B256, BlockRange, ChainId, Finality};
 
 use crate::codec::{address_from_db, b256_from_db, u64_to_i64};
 use crate::{PgTx, Store, StoreError};
@@ -42,7 +42,7 @@ impl Store {
         &self,
         tx: &mut PgTx<'_>,
         chain: ChainId,
-        rows: &[(B256, u64, Address)],
+        rows: &[(B256, u64, Address, Finality)],
     ) -> Result<(), StoreError> {
         if rows.is_empty() {
             return Ok(());
@@ -50,21 +50,30 @@ impl Store {
         let mut hashes = Vec::with_capacity(rows.len());
         let mut blocks = Vec::with_capacity(rows.len());
         let mut senders = Vec::with_capacity(rows.len());
-        for (hash, block, sender) in rows {
+        let mut finality = Vec::with_capacity(rows.len());
+        for (hash, block, sender, row_finality) in rows {
             hashes.push(hash.to_vec());
             blocks.push(u64_to_i64(*block, "block number")?);
             senders.push(sender.to_vec());
+            finality.push(row_finality.as_i16());
         }
         sqlx::query(
-            "insert into evm_tx_senders (chain_id, transaction_hash, block_number, sender)
-             select $1, hash, block_number, sender
-             from unnest($2::bytea[], $3::bigint[], $4::bytea[]) as row(hash, block_number, sender)
-             on conflict do nothing",
+            "insert into evm_tx_senders
+                (chain_id, transaction_hash, block_number, sender, finality)
+             select $1, hash, block_number, sender, finality
+             from unnest($2::bytea[], $3::bigint[], $4::bytea[], $5::smallint[])
+               as row(hash, block_number, sender, finality)
+             on conflict (chain_id, transaction_hash) do update
+             set finality = excluded.finality
+             where evm_tx_senders.finality < excluded.finality
+               and evm_tx_senders.block_number = excluded.block_number
+               and evm_tx_senders.sender = excluded.sender",
         )
         .bind(chain.get())
         .bind(&hashes)
         .bind(&blocks)
         .bind(&senders)
+        .bind(&finality)
         .execute(&mut **tx)
         .await?;
         Ok(())
@@ -94,17 +103,48 @@ impl Store {
         Ok(out)
     }
 
-    pub async fn delete_senders_from(
+    pub async fn delete_unsafe_senders_from(
         &self,
         tx: &mut PgTx<'_>,
         chain: ChainId,
         from_block: u64,
     ) -> Result<(), StoreError> {
-        sqlx::query("delete from evm_tx_senders where chain_id = $1 and block_number >= $2")
-            .bind(chain.get())
-            .bind(u64_to_i64(from_block, "from block")?)
-            .execute(&mut **tx)
-            .await?;
+        sqlx::query(
+            "delete from evm_tx_senders
+             where chain_id = $1 and block_number >= $2 and finality = $3",
+        )
+        .bind(chain.get())
+        .bind(u64_to_i64(from_block, "from block")?)
+        .bind(Finality::Unsafe.as_i16())
+        .execute(&mut **tx)
+        .await?;
         Ok(())
+    }
+
+    /// Raises weaker senders in the range to `finality` and returns how many changed.
+    ///
+    /// A sender row has no block hash. The caller runs this in the same transaction as the
+    /// log or block promotion that already verified the range, so a reorg rolls the raise back.
+    pub async fn promote_senders(
+        &self,
+        tx: &mut PgTx<'_>,
+        chain: ChainId,
+        blocks: BlockRange,
+        finality: Finality,
+    ) -> Result<u64, StoreError> {
+        if finality == Finality::Unsafe {
+            return Err(StoreError::invalid("promote target must be durable"));
+        }
+        let result = sqlx::query(
+            "update evm_tx_senders set finality = $4
+             where chain_id = $1 and block_number between $2 and $3 and finality < $4",
+        )
+        .bind(chain.get())
+        .bind(u64_to_i64(blocks.start(), "block start")?)
+        .bind(u64_to_i64(blocks.end(), "block end")?)
+        .bind(finality.as_i16())
+        .execute(&mut **tx)
+        .await?;
+        Ok(result.rows_affected())
     }
 }

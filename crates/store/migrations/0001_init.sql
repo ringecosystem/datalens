@@ -24,7 +24,7 @@ create table coverage (
   dataset     text not null,
   selector_id bigint not null references selectors,
   blocks      int8range not null,
-  finality    smallint not null,
+  finality    smallint not null check (finality in (2, 3)),
   updated_at  timestamptz not null default now(),
   exclude using gist (chain_id with =, dataset with =, selector_id with =, blocks with &&)
 );
@@ -63,8 +63,10 @@ create table evm_tx_senders (
   transaction_hash bytea not null,
   block_number     bigint not null,
   sender           bytea not null,
+  finality         smallint not null,
   primary key (chain_id, transaction_hash)
 );
+create index evm_tx_senders_block_idx on evm_tx_senders (chain_id, block_number);
 
 create table fill_jobs (
   id             bigserial primary key,
