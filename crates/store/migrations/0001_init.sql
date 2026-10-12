@@ -12,7 +12,7 @@ create table selectors (
   fingerprint   text not null,
   canonical_key text not null,
   addresses     bytea[] not null default '{}',
-  topics        jsonb not null default '[]',
+  topics        jsonb not null default '[]', -- each position: null = wildcard, non-empty array = one of; [] is rejected
   created_at    timestamptz not null default now(),
   last_used_at  timestamptz not null default now(),
   unique (chain_id, dataset, fingerprint)
