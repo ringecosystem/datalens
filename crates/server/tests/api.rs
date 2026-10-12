@@ -105,7 +105,7 @@ async fn errors_map_to_stable_kinds_and_statuses(pool: PgPool) {
     let error = degov.query(&over_quota).await.unwrap_err();
     assert_eq!(
         (error.status(), error.kind()),
-        (Some(429), Some("quota_exceeded"))
+        (Some(400), Some("invalid_input"))
     );
 
     let error = narrow.jobs(None).await.unwrap_err();
@@ -175,6 +175,35 @@ async fn a_request_refused_for_concurrency_does_not_spend_the_minute_quota(pool:
 }
 
 #[sqlx::test(migrations = false)]
+async fn a_rate_limited_request_gets_429_with_retry_after(pool: PgPool) {
+    let rpc = mock_chain().await;
+    let text = config_text(rpc.url()).replace(
+        "max_requests_per_minute = 600",
+        "max_requests_per_minute = 1",
+    );
+    let server = boot(pool, Config::from_toml(&text, &|_| None).unwrap()).await;
+    let http = reqwest::Client::new();
+    let mut request = logs_request(ethereum(), selector(&[0xa1]), range(0, 9));
+    request.wait_ms = Some(0);
+    let send = || {
+        http.post(format!("{}/v1/query", server.base))
+            .header("x-datalens-application", "degov")
+            .bearer_auth("degov-token")
+            .json(&request)
+            .send()
+    };
+
+    let mut refused = send().await.unwrap();
+    if refused.status() != 429 {
+        refused = send().await.unwrap();
+    }
+    assert_eq!(refused.status(), 429);
+    assert_eq!(refused.headers()["retry-after"], "1");
+    let body: Value = refused.json().await.unwrap();
+    assert_eq!(body["error"]["kind"], "quota_exceeded");
+}
+
+#[sqlx::test(migrations = false)]
 async fn graphql_returns_the_same_rows_as_rest(pool: PgPool) {
     let rpc = mock_chain().await;
     let server = boot_mock(pool, &rpc).await;
@@ -206,7 +235,7 @@ async fn graphql_returns_the_same_rows_as_rest(pool: PgPool) {
         )
         .await
         .unwrap_err();
-    assert_eq!(error.kind(), Some("quota_exceeded"));
+    assert_eq!(error.kind(), Some("invalid_input"));
     server.stop().await;
 }
 

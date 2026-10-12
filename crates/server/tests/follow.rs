@@ -74,7 +74,7 @@ async fn watch_follows_a_selector_within_quota_and_unwatch_releases_it(pool: PgP
         .watch(&watch(Some(selector(&[0xa2]))))
         .await
         .unwrap_err();
-    assert_eq!(over.status(), Some(429));
+    assert_eq!((over.status(), over.kind()), (Some(403), Some("forbidden")));
 
     degov
         .unwatch(&watch(Some(selector(&[0xa1]))))

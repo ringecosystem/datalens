@@ -149,8 +149,9 @@ impl QueryEngine {
     }
 }
 
+/// Forbidden rather than quota_exceeded: retrying does not free a subscription.
 pub(crate) fn subscription_quota(caller: &Caller<'_>) -> Error {
-    Error::QuotaExceeded(format!(
+    Error::Forbidden(format!(
         "application {} is at max_subscriptions {}",
         caller.application,
         caller.max_subscriptions.unwrap_or_default()

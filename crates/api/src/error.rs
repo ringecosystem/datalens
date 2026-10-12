@@ -1,5 +1,5 @@
 use axum::Json;
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use datalens_core::Error;
 use datalens_core::wire::ErrorBody;
@@ -16,6 +16,10 @@ pub(crate) fn status_of(error: &Error) -> StatusCode {
     }
 }
 
+/// `quota_exceeded` is only the per-minute and concurrency buckets. A slot or a token is
+/// usually back within a second.
+const RETRY_AFTER_S: &str = "1";
+
 pub(crate) struct ApiError(pub(crate) Error);
 
 impl From<Error> for ApiError {
@@ -29,7 +33,13 @@ impl IntoResponse for ApiError {
         if let Error::Internal(message) = &self.0 {
             tracing::error!(%message, "request failed");
         }
-        (status_of(&self.0), Json(ErrorBody::from(&self.0))).into_response()
+        let mut response = (status_of(&self.0), Json(ErrorBody::from(&self.0))).into_response();
+        if let Error::QuotaExceeded(_) = &self.0 {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static(RETRY_AFTER_S));
+        }
+        response
     }
 }
 
