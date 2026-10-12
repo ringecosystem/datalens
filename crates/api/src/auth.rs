@@ -4,8 +4,8 @@ use std::time::Instant;
 
 use axum::http::HeaderMap;
 use datalens_core::wire::QueryRequest;
-use datalens_core::{ChainName, Dataset, Error};
-use datalens_engine::FillBudget;
+use datalens_core::{ChainName, Dataset, Error, LogSelector};
+use datalens_engine::{Caller, FillBudget};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 pub const APPLICATION_HEADER: &str = "x-datalens-application";
@@ -17,6 +17,8 @@ pub struct Quota {
     pub max_concurrent_requests: u32,
     pub max_fill_blocks_per_minute: Option<u64>,
     pub allow_unfiltered_logs: bool,
+    /// Live subscriptions across chains. `None` means no limit.
+    pub max_subscriptions: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -36,6 +38,16 @@ pub(crate) struct Tenant {
     requests: Mutex<RequestBucket>,
     concurrent: Arc<Semaphore>,
     pub(crate) fill: Option<FillBudget>,
+}
+
+impl Tenant {
+    pub(crate) fn caller(&self) -> Caller<'_> {
+        Caller {
+            application: &self.app.id,
+            fill_budget: self.fill.as_ref(),
+            max_subscriptions: self.app.quota.max_subscriptions,
+        }
+    }
 }
 
 pub(crate) struct Tenants(HashMap<String, Arc<Tenant>>);
@@ -100,26 +112,34 @@ impl Tenant {
         }
     }
 
-    /// Allowlist and quota checks. The permit holds a concurrency slot until dropped.
-    pub(crate) fn admit(&self, request: &QueryRequest) -> Result<OwnedSemaphorePermit, Error> {
-        let quota = &self.app.quota;
-        self.allow_chain(&request.chain)?;
-        if !self.app.datasets.contains(&request.dataset) {
+    /// Chain and dataset allowlists, and the unfiltered `evm.logs` rule.
+    pub(crate) fn allow_read(
+        &self,
+        chain: &ChainName,
+        dataset: Dataset,
+        selector: Option<&LogSelector>,
+    ) -> Result<(), Error> {
+        self.allow_chain(chain)?;
+        if !self.app.datasets.contains(&dataset) {
             return Err(Error::Forbidden(format!(
-                "application {} may not read {}",
-                self.app.id, request.dataset
+                "application {} may not read {dataset}",
+                self.app.id
             )));
         }
-        let unfiltered = request.dataset == Dataset::EvmLogs
-            && request
-                .selector
-                .as_ref()
-                .is_none_or(|selector| selector.addresses.is_empty());
-        if unfiltered && !quota.allow_unfiltered_logs {
+        let unfiltered = dataset == Dataset::EvmLogs
+            && selector.is_none_or(|selector| selector.addresses.is_empty());
+        if unfiltered && !self.app.quota.allow_unfiltered_logs {
             return Err(Error::Forbidden(
                 "evm.logs queries must filter by address".to_owned(),
             ));
         }
+        Ok(())
+    }
+
+    /// Allowlist and quota checks. The permit holds a concurrency slot until dropped.
+    pub(crate) fn admit(&self, request: &QueryRequest) -> Result<OwnedSemaphorePermit, Error> {
+        let quota = &self.app.quota;
+        self.allow_read(&request.chain, request.dataset, request.selector.as_ref())?;
         if request.range.len() > quota.max_range_blocks {
             return Err(Error::QuotaExceeded(format!(
                 "range of {} blocks exceeds max_range_blocks {}",

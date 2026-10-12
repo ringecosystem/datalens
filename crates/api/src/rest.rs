@@ -1,11 +1,18 @@
 use axum::Json;
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::rejection::QueryRejection;
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use datalens_core::wire::{ChainHeads, HeadsResponse, QueryRequest, QueryResponse};
+use std::time::Duration;
+
+use datalens_core::wire::{
+    ChainHeads, HeadsResponse, QueryRequest, QueryResponse, WatchRequest, WatchResponse,
+};
 use datalens_core::{ChainName, Error};
+use datalens_store::HeadKind;
 use prometheus::{Encoder, TextEncoder};
+use serde::Deserialize;
 
 use crate::auth::{bearer, constant_time_eq};
 use crate::error::{ApiError, parse_json};
@@ -47,6 +54,78 @@ pub(crate) async fn chain_heads(
     let chain = ChainName::new(chain)?;
     tenant.allow_chain(&chain)?;
     Ok(Json(state.0.engine.chain_heads(&chain).await?))
+}
+
+/// Default and cap of a heads long-poll, below common proxy idle timeouts.
+const WAIT_DEFAULT_MS: u64 = 30_000;
+const WAIT_MAX_MS: u64 = 60_000;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WaitParams {
+    after: u64,
+    kind: Option<String>,
+    timeout_ms: Option<u64>,
+}
+
+/// Long-polls until head `kind` (default `latest`) passes `after`. A timeout is not an error.
+/// It returns the current heads with 200, so the caller compares and polls again.
+pub(crate) async fn wait_heads(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(chain): Path<String>,
+    params: Result<Query<WaitParams>, QueryRejection>,
+) -> Result<Json<ChainHeads>, ApiError> {
+    let tenant = state.0.tenants.authenticate(&headers)?;
+    let chain = ChainName::new(chain)?;
+    tenant.allow_chain(&chain)?;
+    let Query(params) = params.map_err(|error| Error::InvalidInput(error.body_text()))?;
+    let kind = match params.kind.as_deref() {
+        None | Some("latest") => HeadKind::Latest,
+        Some("safe") => HeadKind::Safe,
+        Some("finalized") => HeadKind::Finalized,
+        Some(other) => {
+            return Err(Error::InvalidInput(format!(
+                "kind must be latest, safe, or finalized, not {other:?}"
+            ))
+            .into());
+        }
+    };
+    let timeout = params
+        .timeout_ms
+        .unwrap_or(WAIT_DEFAULT_MS)
+        .min(WAIT_MAX_MS);
+    Ok(Json(
+        state
+            .0
+            .engine
+            .wait_heads(&chain, params.after, kind, Duration::from_millis(timeout))
+            .await?,
+    ))
+}
+
+/// Subscribes the selector for the configured TTL, or renews it.
+pub(crate) async fn watch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<WatchResponse>, ApiError> {
+    let tenant = state.0.tenants.authenticate(&headers)?;
+    let request: WatchRequest = parse_json(&body)?;
+    tenant.allow_read(&request.chain, request.dataset, request.selector.as_ref())?;
+    Ok(Json(state.0.engine.watch(&tenant.caller(), request).await?))
+}
+
+pub(crate) async fn unwatch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<StatusCode, ApiError> {
+    let tenant = state.0.tenants.authenticate(&headers)?;
+    let request: WatchRequest = parse_json(&body)?;
+    tenant.allow_read(&request.chain, request.dataset, request.selector.as_ref())?;
+    state.0.engine.unwatch(&tenant.app.id, request).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub(crate) async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> Response {

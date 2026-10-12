@@ -1,4 +1,5 @@
-//! HTTP API: REST and GraphQL queries, heads, admin, and metrics over [`QueryEngine`].
+//! HTTP API: REST and GraphQL queries, heads, subscriptions, admin, and metrics over
+//! [`QueryEngine`].
 
 mod admin;
 mod auth;
@@ -13,7 +14,7 @@ use axum::Router;
 use axum::routing::{get, post};
 use datalens_core::Error;
 use datalens_core::wire::{QueryRequest, QueryResponse};
-use datalens_engine::{Caller, QueryEngine};
+use datalens_engine::QueryEngine;
 use prometheus::Registry;
 
 pub use auth::{APPLICATION_HEADER, Application, Quota};
@@ -56,6 +57,8 @@ pub fn router(engine: QueryEngine, registry: Registry, config: ApiConfig) -> Rou
         .route("/graphql", post(graphql::handle))
         .route("/v1/heads", get(rest::heads))
         .route("/v1/heads/{chain}", get(rest::chain_heads))
+        .route("/v1/heads/{chain}/wait", get(rest::wait_heads))
+        .route("/v1/watch", post(rest::watch).delete(rest::unwatch))
         .route("/v1/admin/backfill", post(admin::backfill))
         .route("/v1/admin/coverage", get(admin::coverage))
         .route("/v1/admin/jobs", get(admin::jobs))
@@ -85,11 +88,7 @@ pub(crate) async fn run_query(
     let dataset = request.dataset.as_str();
     let result = async {
         let _permit = tenant.admit(&request)?;
-        let caller = Caller {
-            application: &tenant.app.id,
-            fill_budget: tenant.fill.as_ref(),
-        };
-        shared.engine.query(&caller, request).await
+        shared.engine.query(&tenant.caller(), request).await
     }
     .await;
     let outcome = match &result {
