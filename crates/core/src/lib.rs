@@ -7,6 +7,7 @@ mod finality;
 mod range;
 mod rows;
 mod selector;
+pub mod wire;
 
 pub use alloy_primitives::{Address, B256, Bytes};
 pub use chain::{ChainId, ChainName};
