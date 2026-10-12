@@ -24,6 +24,8 @@ impl HeadKind {
 }
 
 impl Store {
+    /// `latest` follows the upstream, reorgs included. `safe` and `finalized` never move back,
+    /// because a range accepted as durable must stay accepted after a lagging upstream answers.
     pub async fn upsert_heads(&self, chain: ChainId, heads: &Heads) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
         let changed: Option<i32> = sqlx::query_scalar(
@@ -32,13 +34,13 @@ impl Store {
              on conflict (chain_id) do update set
                 latest = excluded.latest,
                 latest_hash = excluded.latest_hash,
-                safe = excluded.safe,
-                finalized = excluded.finalized,
+                safe = greatest(chain_heads.safe, excluded.safe),
+                finalized = greatest(chain_heads.finalized, excluded.finalized),
                 updated_at = now()
              where chain_heads.latest is distinct from excluded.latest
                 or chain_heads.latest_hash is distinct from excluded.latest_hash
-                or chain_heads.safe is distinct from excluded.safe
-                or chain_heads.finalized is distinct from excluded.finalized
+                or chain_heads.safe < excluded.safe
+                or chain_heads.finalized < excluded.finalized
              returning chain_id",
         )
         .bind(chain.get())
