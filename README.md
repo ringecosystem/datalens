@@ -30,5 +30,6 @@ just serve
 
 ## Documentation
 
-Start with [`docs/index.md`](docs/index.md) for the documentation router and
-[`docs/policy.md`](docs/policy.md) for documentation placement rules.
+Start with [`docs/index.md`](docs/index.md). The HTTP contract is
+[`docs/spec/http-api.md`](docs/spec/http-api.md). SDKs are documented in
+[`sdks/README.md`](sdks/README.md). The load test is [`loadtest/README.md`](loadtest/README.md).

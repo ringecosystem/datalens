@@ -1,14 +1,10 @@
 {
-  "chain": { "family": "Evm", "configured_name": "ethereum", "network_id": { "kind": "numeric", "value": 1 } },
-  "dataset_key": "evm.logs",
+  "chain": "ethereum",
+  "dataset": "evm.logs",
   "selector": {
-    "kind": "evm_logs",
-    "value": {
-      "addresses": ["0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"],
-      "topics": [["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"], null, null, null]
-    }
+    "addresses": ["0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"],
+    "topics": [["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"]]
   },
-  "range": { "kind": "block", "start": "@START@", "end": "@END@" },
-  "finality": "durable_only",
-  "fields": "all"
+  "range": { "start": "@START@", "end": "@END@" },
+  "finality": "durable_only"
 }
