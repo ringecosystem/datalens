@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stop the processes this run started and delete its instance dir. Evidence is kept.
+# Stop this run's processes, drop its database, and delete its instance dir.
 # Usage: cleanup.sh RUN_ID
 set -uo pipefail
 SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -17,5 +17,8 @@ for _ in $(seq 1 20); do
   sleep 0.5
 done
 kill -9 "$SERVER_PID" "$PROXY_PID" 2>/dev/null || true
+if [ -n "${DB_NAME:-}" ]; then
+  docker exec datalens-redesign-test-pg dropdb -U datalens --if-exists "$DB_NAME" >/dev/null 2>&1 || true
+fi
 rm -rf "$RUN_DIR"
 echo "cleaned $RUN_ID; evidence kept at $EVIDENCE_DIR"

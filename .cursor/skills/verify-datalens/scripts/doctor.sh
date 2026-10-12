@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Read-only check that a verify instance is ours, up, and answering.
+# Read-only check that a verify instance is up and answering the PostgreSQL API.
 # Usage: doctor.sh RUN_ID
 set -uo pipefail
 SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -14,13 +14,10 @@ check() { if eval "$2" >/dev/null 2>&1; then echo "ok   $1"; else echo "FAIL $1"
 
 check "server pid $SERVER_PID alive" "kill -0 $SERVER_PID"
 check "proxy pid $PROXY_PID alive" "kill -0 $PROXY_PID"
-check "port $SERVER_PORT owned by server pid" "ss -ltnp | grep -E ':$SERVER_PORT\\b' | grep -q 'pid=$SERVER_PID,'"
-check "GET /health" "curl -fsS $BASE_URL/health"
-check "GET /v1/chains without credentials is 401" "[ \$(curl -s -o /dev/null -w '%{http_code}' $BASE_URL/v1/chains) = 401 ]"
-check "GET /v1/chains lists ethereum" "curl -fsS -H 'x-datalens-application: $APP' -H 'Authorization: Bearer $TOKEN' $BASE_URL/v1/chains | grep -q ethereum"
-check "auth accepted (GET /v1/discovery)" "curl -fsS -H 'x-datalens-application: $APP' -H 'Authorization: Bearer $TOKEN' $BASE_URL/v1/discovery"
-check "rpc proxy up" "curl -fsS $PROXY_URL/"
-check "upstream answers eth_blockNumber via proxy" "curl -fsS -X POST $PROXY_URL -H 'content-type: application/json' -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_blockNumber\",\"params\":[]}' | grep -q result"
-echo "info git_rev=$GIT_REV upstream=$UPSTREAM evidence=$EVIDENCE_DIR"
-echo "info note: the doctor's own eth_blockNumber probe is recorded in rpc-calls.jsonl"
+check "GET /health" "curl -fsS -m 5 $BASE_URL/health | grep -q ok"
+check "GET /ready" "curl -fsS -m 5 $BASE_URL/ready | grep -q ready"
+check "GET /v1/heads/ethereum without credentials is 401" "[ \$(curl -s -m 5 -o /dev/null -w '%{http_code}' $BASE_URL/v1/heads/ethereum) = 401 ]"
+check "GET /v1/heads/ethereum lists a head" "curl -fsS -m 10 -H \"x-datalens-application: $APP\" -H \"Authorization: Bearer $TOKEN\" $BASE_URL/v1/heads/ethereum | grep -q latest"
+check "rpc proxy up" "curl -fsS -m 5 -X POST $PROXY_URL -H 'content-type: application/json' -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_blockNumber\",\"params\":[]}' | grep -q result"
+echo "info git_rev=$GIT_REV upstream=$UPSTREAM pin=$PIN_START..$PIN_END evidence=$EVIDENCE_DIR"
 exit $fail
