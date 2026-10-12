@@ -15,6 +15,7 @@ use datalens_provider::{Gateway, ProviderConfig, ProviderMetrics};
 use prometheus::Registry;
 use serde_json::Value;
 use tokio::net::TcpListener;
+use tokio::time::Instant;
 
 pub struct Reply {
     pub status: u16,
@@ -25,12 +26,14 @@ pub struct Reply {
 pub struct Script {
     replies: Mutex<VecDeque<Reply>>,
     pub calls: Mutex<Vec<Value>>,
+    pub arrived: Mutex<Vec<Instant>>,
 }
 
 pub async fn spawn(replies: Vec<Reply>) -> (String, Arc<Script>) {
     let state = Arc::new(Script {
         replies: Mutex::new(VecDeque::from(replies)),
         calls: Mutex::new(Vec::new()),
+        arrived: Mutex::new(Vec::new()),
     });
     let app = Router::new()
         .route("/", post(handle))
@@ -50,6 +53,11 @@ async fn handle(State(state): State<Arc<Script>>, body: Bytes) -> impl IntoRespo
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .push(value.clone());
+    state
+        .arrived
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(Instant::now());
     let reply = state
         .replies
         .lock()

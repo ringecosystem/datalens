@@ -5,6 +5,7 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
+chrono.workspace = true
 datalens-core.workspace = true
 prometheus.workspace = true
 reqwest.workspace = true

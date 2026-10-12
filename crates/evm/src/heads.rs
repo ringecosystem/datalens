@@ -1,9 +1,11 @@
-use datalens_core::{Finality, Heads};
-use datalens_provider::{ProviderError, Purpose};
+use datalens_core::{BlockRow, Finality, Heads};
+use datalens_provider::{ProviderError, Purpose, TokenWait};
 use serde_json::{Value, json};
 
 use crate::client::{EvmClient, HeadMode};
 use crate::decode::parse_block;
+
+const UNSUPPORTED_SAFE: &str = "chain does not support safe tag; use lag mode";
 
 impl EvmClient {
     pub async fn heads(
@@ -11,6 +13,7 @@ impl EvmClient {
         mode: HeadMode,
         purpose: Purpose,
         application: Option<&str>,
+        wait: TokenWait,
     ) -> Result<Heads, ProviderError> {
         match mode {
             HeadMode::Lag {
@@ -24,6 +27,7 @@ impl EvmClient {
                         json!(["latest", false]),
                         purpose,
                         application,
+                        wait,
                     )
                     .await?;
                 let latest = parse_block(&value, Finality::Unsafe)?;
@@ -48,12 +52,16 @@ impl EvmClient {
                         ],
                         purpose,
                         application,
+                        wait,
                     )
                     .await?;
                 let mut results = results.into_iter();
                 let latest = parse_block(&next_item(&mut results)?, Finality::Unsafe)?;
-                let safe = parse_block(&next_item(&mut results)?, Finality::Safe)?;
+                let safe = parse_safe_tag(next_item(&mut results))?;
                 let finalized = parse_block(&next_item(&mut results)?, Finality::Finalized)?;
+                if finalized.number > safe.number || safe.number > latest.number {
+                    return Err(ProviderError::fatal("head tags are out of order"));
+                }
                 Ok(Heads {
                     latest: latest.number,
                     latest_hash: latest.hash,
@@ -63,6 +71,14 @@ impl EvmClient {
             }
         }
     }
+}
+
+fn parse_safe_tag(value: Result<Value, ProviderError>) -> Result<BlockRow, ProviderError> {
+    let value = value.map_err(|_| ProviderError::fatal(UNSUPPORTED_SAFE))?;
+    parse_block(&value, Finality::Safe).map_err(|error| match error {
+        ProviderError::NotReady => ProviderError::fatal(UNSUPPORTED_SAFE),
+        other => other,
+    })
 }
 
 fn next_item(

@@ -4,6 +4,9 @@ use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 
 use datalens_core::ChainName;
 use datalens_evm::EvmClient;
+
+#[path = "../../src/mock.rs"]
+pub mod mock;
 use datalens_provider::{Gateway, ProviderConfig, ProviderMetrics};
 use prometheus::Registry;
 
@@ -30,7 +33,7 @@ pub fn client(
         metrics,
     )
     .unwrap();
-    EvmClient::new(gateway, NonZeroUsize::new(max_addresses).unwrap(), batch)
+    EvmClient::new(gateway, NonZeroUsize::new(max_addresses).unwrap(), batch).unwrap()
 }
 
 pub fn hex_u64(text: &str) -> u64 {

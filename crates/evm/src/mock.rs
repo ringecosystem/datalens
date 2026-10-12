@@ -27,6 +27,7 @@ struct MockState {
     calls: Mutex<Vec<Value>>,
     handler: Mutex<Handler>,
     faults: Mutex<VecDeque<Fault>>,
+    batch_error: Mutex<Option<(i64, String)>>,
 }
 
 /// Local JSON-RPC server. Drop aborts the listener.
@@ -42,6 +43,7 @@ impl MockRpc {
             calls: Mutex::new(Vec::new()),
             handler: Mutex::new(Arc::new(default_handler)),
             faults: Mutex::new(VecDeque::new()),
+            batch_error: Mutex::new(None),
         });
         let app = Router::new()
             .route("/", post(handle))
@@ -73,6 +75,11 @@ impl MockRpc {
         F: Fn(&Value) -> ItemOutcome + Send + Sync + 'static,
     {
         *lock(&self.state.handler) = Arc::new(handler);
+    }
+
+    /// The next JSON-RPC batch returns one error object instead of per-item results.
+    pub fn fail_next_batch(&self, code: i64, message: impl Into<String>) {
+        *lock(&self.state.batch_error) = Some((code, message.into()));
     }
 
     /// The next `count` HTTP requests return `status` and do not run the handler.
@@ -117,6 +124,17 @@ async fn handle(State(state): State<Arc<MockState>>, Json(body): Json<Value>) ->
     }
     let handler = Arc::clone(&lock(&state.handler));
     if let Some(items) = body.as_array() {
+        if let Some((code, message)) = lock(&state.batch_error).take() {
+            return (
+                StatusCode::OK,
+                Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": Value::Null,
+                    "error": {"code": code, "message": message}
+                })),
+            )
+                .into_response();
+        }
         let results: Vec<Value> = items
             .iter()
             .map(|item| reply_item(item, handler.as_ref()))

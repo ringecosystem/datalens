@@ -9,7 +9,9 @@ fn size_phrases_are_limit_and_bare_words_are_not() {
         "Block range too large",
         "exceed maximum block range of 1000",
         "the range is too large",
-        "limit exceeded",
+        "block range is too wide",
+        "eth_getLogs is limited to a 10,000 range",
+        "maximum block range is 10000",
         "response size exceeded",
         "log size exceeded",
     ];
@@ -28,6 +30,7 @@ fn size_phrases_are_limit_and_bare_words_are_not() {
     for message in [
         "range",
         "limit",
+        "limit exceeded",
         "more than",
         "too many logs in the response",
     ] {
@@ -74,4 +77,30 @@ fn not_ready_and_rate_messages_stay_out_of_limit() {
             retry_after: Duration::ZERO
         }
     );
+}
+
+#[test]
+fn quota_and_batch_phrases_do_not_split_a_range() {
+    for message in [
+        "Monthly capacity limit exceeded.",
+        "daily request limit exceeded",
+        "compute units limit exceeded",
+        "credits exhausted",
+        "quota exceeded",
+    ] {
+        assert_eq!(
+            classify_rpc_message(-32_000, message),
+            ProviderError::RateLimited {
+                retry_after: Duration::ZERO
+            },
+            "{message}"
+        );
+    }
+    for message in ["batch limit exceeded", "batch size is too large"] {
+        assert_eq!(
+            classify_rpc_message(-32_000, message),
+            ProviderError::BatchTooLarge,
+            "{message}"
+        );
+    }
 }

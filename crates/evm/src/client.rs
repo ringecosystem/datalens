@@ -1,6 +1,19 @@
+use std::fmt;
 use std::num::NonZeroUsize;
 
 use datalens_provider::Gateway;
+
+/// `header_batch_size` was outside 20..=50.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeaderBatchSizeError(pub usize);
+
+impl fmt::Display for HeaderBatchSizeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "header_batch_size {} is outside 20..=50", self.0)
+    }
+}
+
+impl std::error::Error for HeaderBatchSizeError {}
 
 /// Inclusive block number, or one of the provider's named tags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,17 +54,20 @@ pub struct EvmClient {
 }
 
 impl EvmClient {
-    /// `header_batch_size` is clamped to 20..=50, the range block-header batches use.
+    /// `header_batch_size` must be 20..=50. Values outside that range are rejected.
     pub fn new(
         gateway: Gateway,
         max_addresses_per_query: NonZeroUsize,
         header_batch_size: usize,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, HeaderBatchSizeError> {
+        if !(20..=50).contains(&header_batch_size) {
+            return Err(HeaderBatchSizeError(header_batch_size));
+        }
+        Ok(Self {
             gateway,
             max_addresses: max_addresses_per_query.get(),
-            rpc_batch: header_batch_size.clamp(20, 50),
-        }
+            rpc_batch: header_batch_size,
+        })
     }
 
     pub fn gateway(&self) -> &Gateway {

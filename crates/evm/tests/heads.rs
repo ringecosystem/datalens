@@ -1,12 +1,14 @@
 use datalens_core::{B256, Heads};
 use datalens_evm::HeadMode;
-use datalens_evm::mock::{ItemOutcome, MockRpc};
-use datalens_provider::Purpose;
+use datalens_provider::{ProviderError, Purpose, TokenWait};
 use serde_json::json;
 
 mod common;
 
 use common::client;
+use common::mock::{ItemOutcome, MockRpc};
+
+const UNTIL: TokenWait = TokenWait::UntilToken;
 
 fn header(number: u64) -> serde_json::Value {
     json!({
@@ -34,6 +36,7 @@ async fn lag_mode_reads_latest_once() {
             },
             Purpose::Head,
             None,
+            UNTIL,
         )
         .await
         .unwrap();
@@ -65,7 +68,7 @@ async fn tag_mode_is_one_batch_of_three() {
     });
     let evm = client(mock.url(), 32, 20, 1000, 16);
     let heads = evm
-        .heads(HeadMode::Tags, Purpose::Head, None)
+        .heads(HeadMode::Tags, Purpose::Head, None, UNTIL)
         .await
         .unwrap();
     assert_eq!(
@@ -85,4 +88,46 @@ async fn tag_mode_is_one_batch_of_three() {
     assert_eq!(batch[0]["params"], json!(["latest", false]));
     assert_eq!(batch[1]["params"], json!(["safe", false]));
     assert_eq!(batch[2]["params"], json!(["finalized", false]));
+}
+
+#[tokio::test]
+async fn tag_mode_rejects_heads_that_are_out_of_order() {
+    let mock = MockRpc::spawn().await;
+    mock.set_handler(|item| {
+        let number = match item["params"][0].as_str() {
+            Some("latest") => 1000,
+            Some("safe") => 1100,
+            Some("finalized") => 800,
+            _ => 0,
+        };
+        ItemOutcome::Result(header(number))
+    });
+    let evm = client(mock.url(), 32, 20, 1000, 16);
+    let error = evm
+        .heads(HeadMode::Tags, Purpose::Head, None, UNTIL)
+        .await
+        .unwrap_err();
+    assert_eq!(error, ProviderError::fatal("head tags are out of order"));
+}
+
+#[tokio::test]
+async fn a_missing_safe_tag_names_lag_mode() {
+    let mock = MockRpc::spawn().await;
+    mock.set_handler(|item| match item["params"][0].as_str() {
+        Some("safe") => ItemOutcome::Error {
+            code: -32_000,
+            message: "unknown block".to_owned(),
+        },
+        Some("finalized") => ItemOutcome::Result(header(800)),
+        _ => ItemOutcome::Result(header(1000)),
+    });
+    let evm = client(mock.url(), 32, 20, 1000, 16);
+    let error = evm
+        .heads(HeadMode::Tags, Purpose::Head, None, UNTIL)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        ProviderError::fatal("chain does not support safe tag; use lag mode")
+    );
 }

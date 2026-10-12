@@ -6,6 +6,9 @@ mod decode;
 mod encode;
 mod heads;
 mod logs;
+#[cfg(feature = "mock")]
 pub mod mock;
 
-pub use client::{BlockRef, EvmClient, HeadMode};
+pub use blocks::{SenderLookup, TxSender};
+pub use client::{BlockRef, EvmClient, HeadMode, HeaderBatchSizeError};
+pub use logs::{LogFetchError, LogsPage};

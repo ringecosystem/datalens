@@ -49,19 +49,25 @@ impl RangeBook {
         state.updated_ms = now;
     }
 
-    /// Halves the window. At the floor the error is returned unchanged so the
-    /// caller does not keep splitting down to a single block.
-    pub(crate) fn record_limit(&mut self, dataset: Dataset) -> Result<u64, ProviderError> {
+    /// Shrinks toward the window that failed, not the shared ceiling.
+    /// Two failures of the same length land on the same value.
+    /// `Err(Limit)` means `failed_len` is already at the floor.
+    pub(crate) fn record_limit(
+        &mut self,
+        dataset: Dataset,
+        failed_len: u64,
+    ) -> Result<u64, ProviderError> {
         let now = self.clock.now_ms();
         let min = self.min;
         let state = self.state(dataset, now);
         state.successes = 0;
         state.updated_ms = now;
-        if state.current <= min {
-            return Err(ProviderError::Limit);
+        state.current = state.current.min(failed_len / 2).max(min);
+        if failed_len <= min {
+            Err(ProviderError::Limit)
+        } else {
+            Ok(state.current)
         }
-        state.current = (state.current / 2).max(min);
-        Ok(state.current)
     }
 
     fn state(&mut self, dataset: Dataset, now: u64) -> &mut RangeState {
