@@ -54,10 +54,14 @@ fn intersect_overlapping_touching_and_disjoint() {
 }
 
 #[test]
-fn align_chunks_follows_fixed_grid_and_clips_edges() {
+fn align_chunks_returns_every_full_cell_the_range_overlaps() {
     assert_eq!(
         pairs(&range(95, 312).align_chunks(chunk(100))),
-        vec![(95, 99), (100, 199), (200, 299), (300, 312)]
+        vec![(0, 99), (100, 199), (200, 299), (300, 399)]
+    );
+    assert_eq!(
+        pairs(&range(100, 100).align_chunks(chunk(100))),
+        vec![(100, 199)]
     );
 }
 
@@ -70,10 +74,14 @@ fn align_chunks_exact_grid_range_is_one_chunk() {
 }
 
 #[test]
-fn align_chunks_inside_one_cell() {
+fn align_chunks_inside_one_cell_returns_that_whole_cell() {
     assert_eq!(
         pairs(&range(10_005, 10_010).align_chunks(chunk(10_000))),
-        vec![(10_005, 10_010)]
+        vec![(10_000, 19_999)]
+    );
+    assert_eq!(
+        pairs(&range(10_020, 10_030).align_chunks(chunk(10_000))),
+        vec![(10_000, 19_999)]
     );
 }
 
@@ -90,7 +98,7 @@ fn align_chunks_near_max_end_does_not_overflow() {
     let end = BlockRange::MAX_END;
     assert_eq!(
         pairs(&range(end - 2, end).align_chunks(chunk(u64::MAX))),
-        vec![(end - 2, end)]
+        vec![(0, end)]
     );
 }
 
