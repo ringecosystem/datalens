@@ -20,8 +20,9 @@ pub use follow::{FollowEvent, FollowRequest};
 /// Validation error of [`BlockRange::new`], [`ChainName::new`], and the selector builders.
 pub use datalens_core::Error as InvalidValue;
 pub use datalens_core::wire::{
-    Anchor, BlockRecord, ChainHeads, FollowInfo, IncompleteReason, LogRecord, PageInfo,
-    PageRequest, QueryRequest, QueryResponse, Segment, SegmentSource, WatchRequest, WatchResponse,
+    Anchor, BlockRecord, ChainHeads, FollowInfo, FollowResumeRequest, FollowResumeResponse,
+    IncompleteReason, LogRecord, PageInfo, PageRequest, QueryRequest, QueryResponse, Segment,
+    SegmentSource, WatchRequest, WatchResponse,
 };
 pub use datalens_core::{
     Address, B256, BlockRange, Bytes, ChainName, Dataset, Finality, LogSelector, QueryFinality,

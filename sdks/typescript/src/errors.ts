@@ -9,7 +9,7 @@ export type ApiErrorKind =
   | "http"
   | (string & {});
 
-export type DatalensErrorType = "api" | "http" | "decode";
+export type DatalensErrorType = "api" | "http" | "decode" | "inconsistent";
 
 export class DatalensError extends Error {
   /** `api`: the server answered with an error status. `http`: the request did not complete. */
@@ -31,12 +31,14 @@ export class DatalensError extends Error {
     this.retryAfterMs = details.retryAfterMs;
   }
 
-  /** Rate limits, server errors, and transport failures. */
+  /** Rate limits (429), server errors, transport failures, and a page set that disagreed
+   * on a block hash. 400 and 403 are not retried. */
   isRetryable(): boolean {
     switch (this.type) {
       case "api":
         return this.status === 429 || (this.status ?? 0) >= 500;
       case "http":
+      case "inconsistent":
         return true;
       case "decode":
         return false;

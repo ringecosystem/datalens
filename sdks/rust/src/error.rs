@@ -63,6 +63,9 @@ pub enum Error {
     /// A success response whose body is not the expected JSON.
     #[error("datalens decode: {0}")]
     Decode(String),
+    /// Pages of one query kept disagreeing on block hashes, as during a reorg.
+    #[error("datalens inconsistent: {0}")]
+    Inconsistent(String),
 }
 
 impl Error {
@@ -73,6 +76,7 @@ impl Error {
             Self::Api { status, .. } => *status == 429 || *status >= 500,
             Self::Http(error) => !error.is_builder() && !error.is_redirect(),
             Self::Decode(_) => false,
+            Self::Inconsistent(_) => true,
         }
     }
 
@@ -94,7 +98,7 @@ impl Error {
         match self {
             Self::Api { status, .. } => Some(*status),
             Self::Http(error) => error.status().map(|status| status.as_u16()),
-            Self::Decode(_) => None,
+            Self::Decode(_) | Self::Inconsistent(_) => None,
         }
     }
 }

@@ -36,6 +36,8 @@ const (
 	// FollowCaughtUp means everything up to Head has been read. Follow long-polls until the
 	// head passes it.
 	FollowCaughtUp FollowEventKind = "caught_up"
+	// FollowSkipped means latest_only left Blocks at or below the safe head.
+	FollowSkipped FollowEventKind = "skipped"
 	// FollowStalled means the server stopped at NextStart. Follow asks again after RetryIn.
 	FollowStalled FollowEventKind = "stalled"
 	// FollowError carries Err. Follow retries after RetryIn when Err is retryable, and
@@ -46,6 +48,7 @@ const (
 type FollowEvent struct {
 	Kind      FollowEventKind
 	Response  *QueryResponse
+	Blocks    BlockRange
 	Head      uint64
 	NextStart uint64
 	Reason    IncompleteReason
@@ -120,22 +123,40 @@ func (f follower) run(ctx context.Context) {
 		}
 		return emit(FollowEvent{Kind: FollowError, Err: err, RetryIn: delay}) && pause(delay)
 	}
+	skip := func(last uint64) bool {
+		if last < next {
+			return true
+		}
+		blocks := BlockRange{Start: next, End: last}
+		next = last + 1
+		return emit(FollowEvent{Kind: FollowSkipped, Blocks: blocks})
+	}
 
 	for r.End == nil || next <= *r.End {
-		if heads == nil {
-			current, err := f.client.Heads(ctx, r.Chain)
+		current := heads
+		heads = nil
+		if current == nil {
+			fetched, err := f.client.Heads(ctx, r.Chain)
 			if err != nil {
 				if !fail(err) {
 					return
 				}
 				continue
 			}
+			current = fetched
+		}
+		if finality == LatestOnly && next <= current.Safe {
+			last := current.Safe
+			if r.End != nil {
+				last = min(last, *r.End)
+			}
+			if !skip(last) {
+				return
+			}
 			heads = current
+			continue
 		}
-		if finality == LatestOnly {
-			next = max(next, heads.Safe+1)
-		}
-		tip := heads.Of(kind)
+		tip := current.Of(kind)
 		last := tip
 		if r.End != nil {
 			last = min(last, *r.End)
@@ -143,6 +164,7 @@ func (f follower) run(ctx context.Context) {
 		if next > last {
 			if !caughtUp {
 				caughtUp = true
+				heads = current
 				if !emit(FollowEvent{Kind: FollowCaughtUp, Head: tip}) {
 					return
 				}
@@ -186,11 +208,24 @@ func (f follower) run(ctx context.Context) {
 		if resume > next {
 			failures = 0
 		}
+		var unserved *uint64
+		if response.Served != nil {
+			if response.Served.Start > 0 {
+				last := response.Served.Start - 1
+				unserved = &last
+			}
+		} else if resume > 0 {
+			last := resume - 1
+			unserved = &last
+		}
+		if unserved != nil && !skip(*unserved) {
+			return
+		}
 		next = resume
 		if response.Served != nil && !emit(FollowEvent{Kind: FollowBatch, Response: response}) {
 			return
 		}
-		if response.IncompleteReason != "" {
+		if response.IncompleteReason != "" && response.IncompleteReason != BelowSafe {
 			delay := poll
 			if response.IncompleteReason == ProviderError || response.IncompleteReason == BudgetExhausted {
 				failures++

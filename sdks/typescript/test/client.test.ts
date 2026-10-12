@@ -206,6 +206,8 @@ function summary(event: FollowEvent): unknown {
       return ["stalled", event.nextStart, event.reason];
     case "error":
       return ["error", event.error.status];
+    case "skipped":
+      return ["skipped", event.blocks];
   }
 }
 
@@ -272,4 +274,90 @@ test("follow throws a failure that is not retryable", async () => {
   });
   const iterator = client.follow({ chain: "ethereum", dataset: "evm.logs", start: 0 });
   await assert.rejects(iterator.next(), (error: DatalensError) => error.kind === "unauthorized");
+});
+
+function page(hash: string, cursor: string | null): string {
+  return JSON.stringify({
+    chain: "ethereum",
+    dataset: "evm.logs",
+    requested: { start: 10, end: 11 },
+    served: { start: 10, end: 11 },
+    next_start: null,
+    incomplete_reason: null,
+    segments: [],
+    rows: [{ block_number: 10, log_index: 0, block_hash: hash }],
+    page: { next_cursor: cursor },
+  });
+}
+
+test("queryAll reads again when a later page disagrees on a block hash", async () => {
+  const hash = (salt: string) => `0x${salt.repeat(32)}`;
+  const { fake: state, client } = await fake({
+    script: [
+      { status: 200, body: page(hash("11"), "c") },
+      { status: 200, body: page(hash("22"), null) },
+      { status: 200, body: page(hash("11"), "c") },
+      { status: 200, body: page(hash("11"), null) },
+    ],
+  });
+  const merged = await client.queryAll({
+    chain: "ethereum",
+    dataset: "evm.logs",
+    range: { start: 10, end: 11 },
+  });
+  assert.equal(merged.rows.length, 2);
+  assert.equal(state.requests.length, 4);
+});
+
+test("latest_only follow names blocks the server left below a moved safe head", async () => {
+  const headsBody = JSON.stringify({
+    chain: "ethereum",
+    latest: 17,
+    latest_hash: `0x${"aa".repeat(32)}`,
+    safe: 9,
+    finalized: 4,
+  });
+  const queryBody = JSON.stringify({
+    chain: "ethereum",
+    dataset: "evm.logs",
+    requested: { start: 10, end: 14 },
+    served: { start: 12, end: 14 },
+    next_start: null,
+    incomplete_reason: "below_safe",
+    segments: [],
+    rows: [],
+    page: { next_cursor: null },
+  });
+  const { fake: state, client } = await fake({
+    script: [
+      { status: 200, body: headsBody },
+      { status: 200, body: queryBody },
+    ],
+  });
+  const events = [];
+  for await (const event of client.follow({
+    chain: "ethereum",
+    dataset: "evm.logs",
+    finality: "latest_only",
+    start: 10,
+    end: 14,
+  })) {
+    events.push(summary(event));
+  }
+  assert.deepEqual(events, [
+    ["skipped", { start: 10, end: 11 }],
+    ["batch", { start: 12, end: 14 }, 0],
+  ]);
+  assert.equal(state.requests.length, 2);
+});
+
+test("a response integer past Number.MAX_SAFE_INTEGER is a decode error", async () => {
+  const { client } = await fake({
+    script: [{ status: 200, body: '{"latest":9007199254740993}' }],
+  });
+  await assert.rejects(client.heads("ethereum"), (error: DatalensError) => {
+    assert.equal(error.type, "decode");
+    assert.match(error.message, /9007199254740993/);
+    return true;
+  });
 });

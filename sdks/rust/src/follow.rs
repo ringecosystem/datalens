@@ -70,6 +70,9 @@ pub enum FollowEvent {
     /// One query with every page merged. Its rows cover `served`, a contiguous prefix of
     /// `requested`. The stream resumes at `next_start`, or after `requested.end` when null.
     Batch(QueryResponse),
+    /// `latest_only` does not serve `blocks`, because they are at or below the safe head.
+    /// Read them with `durable_only` or `safe_to_latest`. The stream goes on after them.
+    Skipped { blocks: BlockRange },
     /// Everything up to `head` has been read. The stream long-polls until the head passes it.
     CaughtUp { head: u64 },
     /// The server stopped at `next_start`. The stream asks again after `retry_in`.
@@ -109,7 +112,7 @@ struct Follower {
     request: FollowRequest,
     /// First block not yet read.
     next: u64,
-    /// Refreshed only by `heads/wait`, since the tip only matters once `next` passes it.
+    /// From `heads/wait`, or fetched again before every chunk so `latest_only` sees safe move.
     heads: Option<ChainHeads>,
     caught_up: bool,
     /// Consecutive failures and provider stalls, for the backoff.
@@ -154,16 +157,15 @@ impl Follower {
             self.done = true;
             return Ok(());
         }
-        let heads = match &self.heads {
-            Some(heads) => heads.clone(),
-            None => {
-                let heads = self.client.heads(&request.chain).await?;
-                self.heads = Some(heads.clone());
-                heads
-            }
+        let heads = match self.heads.take() {
+            Some(heads) => heads,
+            None => self.client.heads(&request.chain).await?,
         };
-        if request.finality == QueryFinality::LatestOnly {
-            self.next = self.next.max(heads.safe + 1);
+        if request.finality == QueryFinality::LatestOnly && self.next <= heads.safe {
+            let last = request.end.map_or(heads.safe, |end| end.min(heads.safe));
+            self.skip(last);
+            self.heads = Some(heads);
+            return Ok(());
         }
         let kind = request.head_kind();
         let tip = kind.of(&heads);
@@ -172,6 +174,7 @@ impl Follower {
             if !self.caught_up {
                 self.caught_up = true;
                 self.events.push_back(FollowEvent::CaughtUp { head: tip });
+                self.heads = Some(heads);
                 return Ok(());
             }
             let heads = self
@@ -209,9 +212,17 @@ impl Follower {
         if resume > self.next {
             self.failures = 0;
         }
+        let unserved_to = match response.served {
+            Some(served) => served.start().checked_sub(1),
+            None => resume.checked_sub(1),
+        };
+        if let Some(last) = unserved_to {
+            self.skip(last);
+        }
         self.next = resume;
         let stall = response
             .incomplete_reason
+            .filter(|reason| *reason != IncompleteReason::BelowSafe)
             .map(|reason| (reason, response.incomplete_detail.clone()));
         if response.served.is_some() {
             self.events.push_back(FollowEvent::Batch(response));
@@ -235,5 +246,13 @@ impl Follower {
             });
         }
         Ok(())
+    }
+
+    /// Reports `next..=last` as skipped and moves past it. Nothing when `last < next`.
+    fn skip(&mut self, last: u64) {
+        if let Ok(blocks) = BlockRange::new(self.next, last) {
+            self.events.push_back(FollowEvent::Skipped { blocks });
+            self.next = last + 1;
+        }
     }
 }

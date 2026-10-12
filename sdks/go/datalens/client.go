@@ -86,13 +86,40 @@ func (c *Client) Query(ctx context.Context, request *QueryRequest) (*QueryRespon
 }
 
 // QueryAll returns every page of request with rows concatenated. The other fields come
-// from the last page, whose Served contains the rows of every earlier page.
+// from the last page, whose Served contains the rows of every earlier page. When two pages
+// disagree on a block hash, a reorg landed between them, so the whole request is read again.
 func (c *Client) QueryAll(ctx context.Context, request *QueryRequest) (*QueryResponse, error) {
+	for failures := 1; ; failures++ {
+		merged, disagree, err := c.pages(ctx, request)
+		if err != nil {
+			return nil, err
+		}
+		if !disagree {
+			return merged, nil
+		}
+		if failures >= c.retry.MaxAttempts {
+			return nil, &Error{
+				Type:    InconsistentError,
+				Message: fmt.Sprintf("pages of %d..=%d disagreed on block hashes %d times", request.Range.Start, request.Range.End, failures),
+			}
+		}
+		if err := sleep(ctx, c.retry.Backoff(failures)); err != nil {
+			return nil, err
+		}
+	}
+}
+
+// pages returns disagree when a later page names a block with another hash than an earlier page.
+func (c *Client) pages(ctx context.Context, request *QueryRequest) (*QueryResponse, bool, error) {
 	merged, err := c.Query(ctx, request)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	rows := merged.Rows
+	rows := append([]json.RawMessage(nil), merged.Rows...)
+	known, err := blockHashes(merged)
+	if err != nil {
+		return nil, false, err
+	}
 	paged := *request
 	for merged.Page.NextCursor != nil {
 		page := PageRequest{Cursor: *merged.Page.NextCursor}
@@ -100,13 +127,53 @@ func (c *Client) QueryAll(ctx context.Context, request *QueryRequest) (*QueryRes
 			page.Limit = request.Page.Limit
 		}
 		paged.Page = &page
-		if merged, err = c.Query(ctx, &paged); err != nil {
-			return nil, err
+		merged, err = c.Query(ctx, &paged)
+		if err != nil {
+			return nil, false, err
+		}
+		hashes, err := blockHashes(merged)
+		if err != nil {
+			return nil, false, err
+		}
+		for number, hash := range hashes {
+			if seen, ok := known[number]; ok && seen != hash {
+				return nil, true, nil
+			}
+		}
+		for number, hash := range hashes {
+			known[number] = hash
 		}
 		rows = append(rows, merged.Rows...)
 	}
 	merged.Rows = rows
-	return merged, nil
+	return merged, false, nil
+}
+
+func blockHashes(response *QueryResponse) (map[uint64]string, error) {
+	hashes := map[uint64]string{}
+	for _, segment := range response.Segments {
+		if segment.Anchor != nil {
+			hashes[segment.Anchor.Number] = segment.Anchor.Hash
+		}
+	}
+	for _, raw := range response.Rows {
+		var row struct {
+			BlockNumber *uint64 `json:"block_number"`
+			BlockHash   *string `json:"block_hash"`
+			Number      *uint64 `json:"number"`
+			Hash        *string `json:"hash"`
+		}
+		if err := json.Unmarshal(raw, &row); err != nil {
+			return nil, &Error{Type: DecodeError, Message: err.Error(), Err: err}
+		}
+		switch {
+		case row.BlockNumber != nil && row.BlockHash != nil:
+			hashes[*row.BlockNumber] = *row.BlockHash
+		case row.Number != nil && row.Hash != nil:
+			hashes[*row.Number] = *row.Hash
+		}
+	}
+	return hashes, nil
 }
 
 func (c *Client) Heads(ctx context.Context, chain string) (*ChainHeads, error) {

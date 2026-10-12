@@ -234,6 +234,8 @@ func summary(event FollowEvent) string {
 		return fmt.Sprintf("caught_up %d", event.Head)
 	case FollowStalled:
 		return fmt.Sprintf("stalled %d %s", event.NextStart, event.Reason)
+	case FollowSkipped:
+		return fmt.Sprintf("skipped %d-%d", event.Blocks.Start, event.Blocks.End)
 	default:
 		var failure *Error
 		errors.As(event.Err, &failure)
@@ -283,6 +285,54 @@ func TestFollowReportsRetryableFailuresAndStopsOnOthers(t *testing.T) {
 
 	f.script = []reply{{401, `{"error":{"kind":"unauthorized","message":"bad token"}}`, nil}}
 	equal(t, collect(client.Follow(context.Background(), request)), []string{"error 401 retry=false"})
+}
+
+func TestQueryAllRereadsWhenALaterPageDisagreesOnABlockHash(t *testing.T) {
+	page := func(blockHash, cursor string) string {
+		next := "null"
+		if cursor != "" {
+			next = strconv.Quote(cursor)
+		}
+		return fmt.Sprintf(`{"chain":"ethereum","dataset":"evm.logs","requested":{"start":10,"end":11},"served":{"start":10,"end":11},"next_start":null,"incomplete_reason":"","segments":[],"rows":[{"block_number":10,"log_index":0,"block_hash":"%s"}],"page":{"next_cursor":%s}}`, blockHash, next)
+	}
+	f := &fake{script: []reply{
+		{200, page("0x11", "c"), nil},
+		{200, page("0x22", ""), nil},
+		{200, page("0x11", "c"), nil},
+		{200, page("0x11", ""), nil},
+	}}
+	client := serve(t, f)
+	merged, err := client.QueryAll(context.Background(), &QueryRequest{
+		Chain: "ethereum", Dataset: EvmLogs, Range: BlockRange{Start: 10, End: 11},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	equal(t, len(merged.Rows), 2)
+	equal(t, len(f.urls), 4)
+}
+
+func TestLatestOnlyFollowNamesBlocksLeftBelowAMovedSafeHead(t *testing.T) {
+	heads := `{"chain":"ethereum","latest":17,"latest_hash":"0xaa","safe":9,"finalized":4}`
+	query := `{"chain":"ethereum","dataset":"evm.logs","requested":{"start":10,"end":14},"served":{"start":12,"end":14},"next_start":null,"incomplete_reason":"below_safe","segments":[],"rows":[],"page":{"next_cursor":null}}`
+	f := &fake{script: []reply{{200, heads, nil}, {200, query, nil}}}
+	client := serve(t, f)
+	end := uint64(14)
+	events := collect(client.Follow(context.Background(), FollowRequest{
+		Chain: "ethereum", Dataset: EvmLogs, Finality: LatestOnly, Start: 10, End: &end,
+	}))
+	equal(t, events, []string{"skipped 10-11", "batch 12-14 rows=0"})
+	equal(t, len(f.urls), 2)
+}
+
+func TestBlockRecordKeepsUnknownHeaderFields(t *testing.T) {
+	raw := []byte(`{"number":1,"hash":"0x1","parent_hash":"0x0","timestamp":9,"finality":"safe","gasUsed":"0x10"}`)
+	var block BlockRecord
+	if err := json.Unmarshal(raw, &block); err != nil {
+		t.Fatal(err)
+	}
+	equal(t, block.Number, uint64(1))
+	equal(t, string(block.Extra["gasUsed"]), `"0x10"`)
 }
 
 func TestFollowStopsWhenTheContextIsCancelled(t *testing.T) {

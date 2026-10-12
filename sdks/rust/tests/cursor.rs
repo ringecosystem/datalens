@@ -175,3 +175,40 @@ fn provisional_cursor_settles_blocks_served_as_durable_and_forgets_their_hashes(
         Observation::Rollback { from: 15 }
     );
 }
+
+#[test]
+fn provisional_cursor_rolls_back_when_a_reorg_removes_a_log_while_the_head_moves() {
+    let mut cursor = ProvisionalCursor::new(10);
+    let first = response(
+        10,
+        14,
+        vec![hot(10, 14, 14, 0)],
+        (10..=12).map(|n| row(n, 0)).collect(),
+    );
+    assert_eq!(cursor.observe(&first), Observation::Consistent);
+
+    let mut removed = response(
+        10,
+        16,
+        vec![hot(10, 16, 16, 5)],
+        (10..=11).map(|n| row(n, 0)).collect(),
+    );
+    removed.page.next_cursor = Some("more".to_owned());
+    assert_eq!(
+        cursor.observe(&removed),
+        Observation::Consistent,
+        "a partial page cannot prove a log is gone"
+    );
+
+    removed.page.next_cursor = None;
+    assert_eq!(cursor.observe(&removed), Observation::Rollback { from: 12 });
+}
+
+#[test]
+fn provisional_cursor_does_not_flag_an_old_anchor_height_without_rows() {
+    let mut cursor = ProvisionalCursor::new(10);
+    let first = response(10, 14, vec![hot(10, 14, 14, 0)], vec![row(10, 0)]);
+    assert_eq!(cursor.observe(&first), Observation::Consistent);
+    let moved = response(10, 16, vec![hot(10, 16, 16, 0)], vec![row(10, 0)]);
+    assert_eq!(cursor.observe(&moved), Observation::Consistent);
+}

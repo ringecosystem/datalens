@@ -46,17 +46,26 @@ pub enum Observation {
     Rollback { from: u64 },
 }
 
+/// One height the cursor has seen in hot data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Seen {
+    hash: B256,
+    /// Some row was at this height, not only an anchor.
+    rows: bool,
+}
+
 /// Tracks hot data across repeated reads of the chain tail. It remembers the hash of every
 /// hot block it saw, from segment anchors and from row `block_hash`, and reports a rollback
-/// when a later response disagrees.
+/// when a later response disagrees: a height with another hash, or, on a complete read
+/// (`page.next_cursor` null), a height that had rows and now has none inside a hot segment.
 ///
-/// A hot segment's anchor is the follow head, often above the rows. A reorg shows as a new
-/// hash at a height seen before, so re-read the tail from [`ProvisionalCursor::settled`].
+/// A hot segment's anchor is the follow head, often above the rows. Re-read the tail from
+/// [`ProvisionalCursor::settled`] so earlier heights are compared again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvisionalCursor {
     settled: u64,
     next: u64,
-    seen: BTreeMap<u64, B256>,
+    seen: BTreeMap<u64, Seen>,
 }
 
 impl ProvisionalCursor {
@@ -80,12 +89,15 @@ impl ProvisionalCursor {
 
     pub fn observe(&mut self, response: &QueryResponse) -> Observation {
         let hashes = hot_hashes(response);
-        if let Some(from) = self.fork_point(&hashes) {
+        if let Some(from) = self.fork_point(response, &hashes) {
             self.seen.split_off(&from);
             self.next = from;
             return Observation::Rollback { from };
         }
-        self.seen.extend(hashes);
+        for (number, seen) in hashes {
+            let entry = self.seen.entry(number).or_insert(seen);
+            entry.rows |= seen.rows;
+        }
         if let Some(served) = response.served {
             self.next = self.next.max(served.end() + 1);
         }
@@ -110,41 +122,78 @@ impl ProvisionalCursor {
 
     /// Lowest block that may have changed: one above the highest height whose hash still
     /// matches below the lowest mismatch, since a matching hash commits to its ancestors.
-    fn fork_point(&self, hashes: &BTreeMap<u64, B256>) -> Option<u64> {
-        let mismatch = hashes
+    fn fork_point(&self, response: &QueryResponse, hashes: &BTreeMap<u64, Seen>) -> Option<u64> {
+        let changed = hashes
             .iter()
-            .filter(|(number, hash)| self.seen.get(number).is_some_and(|seen| seen != *hash))
-            .map(|(number, _)| *number)
-            .next()?;
+            .filter(|(number, new)| {
+                self.seen
+                    .get(number)
+                    .is_some_and(|seen| seen.hash != new.hash)
+            })
+            .map(|(number, _)| *number);
+        let complete = response.page.next_cursor.is_none();
+        let vanished = self
+            .seen
+            .iter()
+            .filter(|(number, seen)| {
+                complete
+                    && seen.rows
+                    && in_hot(response, **number)
+                    && !hashes.get(number).is_some_and(|new| new.rows)
+            })
+            .map(|(number, _)| *number);
+        let mismatch = changed.chain(vanished).min()?;
         let matched = hashes
             .range(..mismatch)
             .rev()
-            .find(|(number, hash)| self.seen.get(number) == Some(*hash))
+            .find(|(number, new)| {
+                self.seen
+                    .get(number)
+                    .is_some_and(|seen| seen.hash == new.hash)
+            })
             .map(|(number, _)| number + 1);
         Some(matched.unwrap_or(self.settled).max(self.settled))
     }
 }
 
+fn in_hot(response: &QueryResponse, number: u64) -> bool {
+    response.segments.iter().any(|segment| {
+        segment.source == SegmentSource::Hot && segment.start <= number && number <= segment.end
+    })
+}
+
 /// Heights and hashes of the hot part of `response`: anchors, then rows inside hot segments.
-fn hot_hashes(response: &QueryResponse) -> BTreeMap<u64, B256> {
-    let hot: Vec<_> = response
+fn hot_hashes(response: &QueryResponse) -> BTreeMap<u64, Seen> {
+    let mut hashes: BTreeMap<u64, Seen> = response
         .segments
         .iter()
         .filter(|segment| segment.source == SegmentSource::Hot)
+        .filter_map(|segment| segment.anchor)
+        .map(|anchor| {
+            let seen = Seen {
+                hash: anchor.hash,
+                rows: false,
+            };
+            (anchor.number, seen)
+        })
         .collect();
-    let mut hashes: BTreeMap<u64, B256> = hot
+    for (number, hash) in response.rows.iter().filter_map(row_block) {
+        if in_hot(response, number) {
+            hashes.insert(number, Seen { hash, rows: true });
+        }
+    }
+    hashes
+}
+
+/// Every height and hash `response` names, from rows and from anchors.
+pub(crate) fn block_hashes(response: &QueryResponse) -> BTreeMap<u64, B256> {
+    let mut hashes: BTreeMap<u64, B256> = response
+        .segments
         .iter()
         .filter_map(|segment| segment.anchor)
         .map(|anchor| (anchor.number, anchor.hash))
         .collect();
-    for (number, hash) in response.rows.iter().filter_map(row_block) {
-        if hot
-            .iter()
-            .any(|segment| segment.start <= number && number <= segment.end)
-        {
-            hashes.insert(number, hash);
-        }
-    }
+    hashes.extend(response.rows.iter().filter_map(row_block));
     hashes
 }
 
