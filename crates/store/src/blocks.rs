@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use datalens_core::{B256, BlockRange, BlockRow, ChainId, Finality};
 
 use crate::codec::{b256_from_db, finality_from_db, i64_to_u64, u64_to_i64};
@@ -97,6 +99,36 @@ impl Store {
             }
         });
         Ok((out, next))
+    }
+
+    /// Timestamps of the stored blocks among `numbers`.
+    pub async fn block_timestamps(
+        &self,
+        chain: ChainId,
+        numbers: &[u64],
+    ) -> Result<HashMap<u64, u64>, StoreError> {
+        if numbers.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut raw = Vec::with_capacity(numbers.len());
+        for number in numbers {
+            raw.push(u64_to_i64(*number, "block number")?);
+        }
+        let rows: Vec<(i64, i64)> = sqlx::query_as(
+            "select number, timestamp from evm_blocks where chain_id = $1 and number = any($2)",
+        )
+        .bind(chain.get())
+        .bind(&raw)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = HashMap::with_capacity(rows.len());
+        for (number, timestamp) in rows {
+            out.insert(
+                i64_to_u64(number, "block number")?,
+                i64_to_u64(timestamp, "timestamp")?,
+            );
+        }
+        Ok(out)
     }
 
     pub async fn hash_at(&self, chain: ChainId, number: u64) -> Result<Option<B256>, StoreError> {
