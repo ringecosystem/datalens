@@ -72,24 +72,27 @@ impl BlockRange {
         (start <= end).then_some(BlockRange { start, end })
     }
 
-    /// Splits the range along the fixed grid `[k * chunk, (k + 1) * chunk - 1]`, clipping the
-    /// first and last chunk to the range. Chunk boundaries depend only on the grid, never on
-    /// the query, so overlapping gaps from different callers map to the same fill jobs.
+    /// Grid cells that overlap this range. Cell `k` is `[k * chunk, (k + 1) * chunk - 1]`,
+    /// with the cell end capped at [`BlockRange::MAX_END`].
+    ///
+    /// The cells are not clipped to this range. `fill_jobs` dedupes on the exact span, so two
+    /// gaps in one cell must name that cell. The caller clips the last cell to safe.
     pub fn align_chunks(&self, chunk_blocks: NonZeroU64) -> Vec<BlockRange> {
         let chunk = chunk_blocks.get();
         let mut chunks = Vec::new();
-        let mut start = self.start;
+        let mut cell = self.start / chunk;
         loop {
-            let grid_end = (start / chunk)
+            let start = cell.saturating_mul(chunk);
+            let end = cell
                 .saturating_add(1)
                 .saturating_mul(chunk)
-                .saturating_sub(1);
-            let end = grid_end.min(self.end);
+                .saturating_sub(1)
+                .min(Self::MAX_END);
             chunks.push(BlockRange { start, end });
-            if end == self.end {
+            if end >= self.end {
                 return chunks;
             }
-            start = end + 1;
+            cell += 1;
         }
     }
 }
