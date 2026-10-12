@@ -5,3 +5,18 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
+chrono.workspace = true
+datalens-core.workspace = true
+datalens-evm.workspace = true
+datalens-provider.workspace = true
+datalens-store.workspace = true
+prometheus.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+datalens-evm = { workspace = true, features = ["mock"] }
+hex.workspace = true
