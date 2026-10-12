@@ -15,12 +15,8 @@ struct Span {
 }
 
 impl Store {
-    /// Merges the range into this selector's coverage.
-    ///
-    /// The exclusion constraint forbids overlapping ranges of any finality, so each finality
-    /// keeps its own non-overlapping rows. An overlap takes the stronger finality. That lets
-    /// promotion upgrade `safe` to `finalized` and refuses to downgrade. The selector row lock
-    /// is the serialization point: two adds of one selector must read the same merged timeline.
+    /// Merges the range into this selector's coverage. Same as [`Store::add_coverage_many`]
+    /// with one id.
     pub async fn add_coverage(
         &self,
         tx: &mut PgTx<'_>,
@@ -30,74 +26,64 @@ impl Store {
         blocks: BlockRange,
         finality: Finality,
     ) -> Result<(), StoreError> {
+        self.add_coverage_many(tx, chain, dataset, &[selector_id], blocks, finality)
+            .await
+    }
+
+    /// Merges the range into each selector's coverage.
+    ///
+    /// The exclusion constraint forbids overlapping ranges of any finality, so each finality
+    /// keeps its own non-overlapping rows. An overlap takes the stronger finality. That lets
+    /// promotion upgrade `safe` to `finalized` and refuses to downgrade. The selector row lock
+    /// is the serialization point: two adds of one selector must read the same merged timeline.
+    /// All rows are locked in one statement in id order, so a batch fill and a finalizer that
+    /// share selectors queue instead of deadlocking.
+    pub async fn add_coverage_many(
+        &self,
+        tx: &mut PgTx<'_>,
+        chain: ChainId,
+        dataset: Dataset,
+        selector_ids: &[SelectorId],
+        blocks: BlockRange,
+        finality: Finality,
+    ) -> Result<(), StoreError> {
         if finality < Finality::Safe {
             return Err(StoreError::invalid(
                 "coverage records durable finality only",
             ));
         }
-        let selector: Option<(i32, String)> =
-            sqlx::query_as("select chain_id, dataset from selectors where id = $1 for update")
-                .bind(selector_id.get())
-                .fetch_optional(&mut **tx)
-                .await?;
-        let Some((selector_chain, selector_dataset)) = selector else {
+        let mut ids: Vec<i64> = selector_ids.iter().map(|id| id.get()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let locked: Vec<(i64, i32, String)> = sqlx::query_as(
+            "select id, chain_id, dataset from selectors
+             where id = any($1)
+             order by id
+             for no key update",
+        )
+        .bind(&ids)
+        .fetch_all(&mut **tx)
+        .await?;
+        if let Some(missing) = ids
+            .iter()
+            .find(|id| !locked.iter().any(|(found, _, _)| found == *id))
+        {
             return Err(StoreError::not_found(format!(
-                "selector {selector_id} not found"
+                "selector {missing} not found"
             )));
-        };
-        if selector_chain != chain.get() || selector_dataset != dataset.as_str() {
+        }
+        if locked.iter().any(|(_, selector_chain, selector_dataset)| {
+            *selector_chain != chain.get() || selector_dataset != dataset.as_str()
+        }) {
             return Err(StoreError::invalid(
                 "coverage chain and dataset must match the selector",
             ));
         }
-
-        let rows: Vec<(PgRange<i64>, i16)> = sqlx::query_as(
-            "select blocks, finality from coverage
-             where chain_id = $1 and dataset = $2 and selector_id = $3
-             order by blocks",
-        )
-        .bind(chain.get())
-        .bind(dataset.as_str())
-        .bind(selector_id.get())
-        .fetch_all(&mut **tx)
-        .await?;
-        let mut existing = Vec::with_capacity(rows.len());
-        for (blocks, finality) in rows {
-            let range = block_range_from_pg(blocks)?;
-            existing.push(Span {
-                start: range.start() as i64,
-                end: range.end() as i64 + 1,
-                finality: finality_from_db(finality)?,
-            });
-        }
-        let merged = merge_spans(
-            &existing,
-            blocks.start() as i64,
-            blocks.end() as i64 + 1,
-            finality,
-        );
-
-        sqlx::query(
-            "delete from coverage
-             where chain_id = $1 and dataset = $2 and selector_id = $3",
-        )
-        .bind(chain.get())
-        .bind(dataset.as_str())
-        .bind(selector_id.get())
-        .execute(&mut **tx)
-        .await?;
-        for span in merged {
-            sqlx::query(
-                "insert into coverage (chain_id, dataset, selector_id, blocks, finality)
-                 values ($1, $2, $3, $4, $5)",
-            )
-            .bind(chain.get())
-            .bind(dataset.as_str())
-            .bind(selector_id.get())
-            .bind(PgRange::from(span.start..span.end))
-            .bind(span.finality.as_i16())
-            .execute(&mut **tx)
-            .await?;
+        for id in ids {
+            merge_coverage(tx, chain, dataset, id, blocks, finality).await?;
         }
         Ok(())
     }
@@ -195,6 +181,65 @@ impl Store {
         ranges.sort_by_key(|range| range.start());
         Ok(ranges)
     }
+}
+
+async fn merge_coverage(
+    tx: &mut PgTx<'_>,
+    chain: ChainId,
+    dataset: Dataset,
+    selector_id: i64,
+    blocks: BlockRange,
+    finality: Finality,
+) -> Result<(), StoreError> {
+    let rows: Vec<(PgRange<i64>, i16)> = sqlx::query_as(
+        "select blocks, finality from coverage
+         where chain_id = $1 and dataset = $2 and selector_id = $3
+         order by blocks",
+    )
+    .bind(chain.get())
+    .bind(dataset.as_str())
+    .bind(selector_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut existing = Vec::with_capacity(rows.len());
+    for (blocks, finality) in rows {
+        let range = block_range_from_pg(blocks)?;
+        existing.push(Span {
+            start: range.start() as i64,
+            end: range.end() as i64 + 1,
+            finality: finality_from_db(finality)?,
+        });
+    }
+    let merged = merge_spans(
+        &existing,
+        blocks.start() as i64,
+        blocks.end() as i64 + 1,
+        finality,
+    );
+
+    sqlx::query(
+        "delete from coverage
+         where chain_id = $1 and dataset = $2 and selector_id = $3",
+    )
+    .bind(chain.get())
+    .bind(dataset.as_str())
+    .bind(selector_id)
+    .execute(&mut **tx)
+    .await?;
+    for span in merged {
+        sqlx::query(
+            "insert into coverage (chain_id, dataset, selector_id, blocks, finality)
+             values ($1, $2, $3, $4, $5)",
+        )
+        .bind(chain.get())
+        .bind(dataset.as_str())
+        .bind(selector_id)
+        .bind(PgRange::from(span.start..span.end))
+        .bind(span.finality.as_i16())
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
