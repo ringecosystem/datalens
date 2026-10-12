@@ -225,7 +225,18 @@ async fn heads_admin_and_metrics_round_trip(pool: PgPool) {
     assert_eq!(chains, [("ethereum".to_owned(), LATEST, SAFE, 98_000)]);
     let narrow = server.client("narrow", "narrow-token");
     let base = ChainName::new("base").unwrap();
-    assert_eq!(narrow.chain_heads(&base).await.unwrap().safe, SAFE);
+    // `boot` waits for degov's chains only. Base's leader publishes on its own first tick.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let base_heads = loop {
+        match narrow.chain_heads(&base).await {
+            Ok(heads) => break heads,
+            Err(_) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            Err(error) => panic!("base never got a head: {error}"),
+        }
+    };
+    assert_eq!(base_heads.safe, SAFE);
     assert_eq!(
         narrow.chain_heads(&ethereum()).await.unwrap_err().status(),
         Some(403)

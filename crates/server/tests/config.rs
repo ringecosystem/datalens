@@ -96,6 +96,7 @@ fn minimal_config_parses_with_defaults_and_interpolation() {
     assert_eq!(config.fill.workers.get(), 4);
     assert_eq!(config.fill.inline_workers, 2);
     assert_eq!(config.fill.lease_s.get(), 120);
+    assert_eq!(config.fill.job_retention_s.get(), 86_400);
 }
 
 #[test]
@@ -313,6 +314,7 @@ fn shipped_example_config_parses() {
     assert_eq!(config.fill.workers.get(), 4);
     assert_eq!(config.fill.inline_workers, 2);
     assert_eq!(config.fill.lease_s.get(), 120);
+    assert_eq!(config.fill.job_retention_s.get(), 86_400);
     assert_eq!(
         config.chains[&ChainName::new("arbitrum").unwrap()]
             .header_chunk_blocks

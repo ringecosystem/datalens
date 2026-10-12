@@ -21,6 +21,7 @@ unsafe_retention_s = 86400
 workers = 4
 inline_workers = 2
 lease_s = 120
+job_retention_s = 86400
 
 [metrics]
 bearer_token = "${DATALENS_METRICS_TOKEN}"

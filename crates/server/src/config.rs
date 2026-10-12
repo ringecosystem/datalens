@@ -130,6 +130,8 @@ pub struct FillConfig {
     pub workers: NonZeroUsize,
     pub inline_workers: usize,
     pub lease_s: NonZeroU64,
+    /// Done and failed jobs older than this are deleted.
+    pub job_retention_s: NonZeroU64,
 }
 
 impl Default for FillConfig {
@@ -138,6 +140,7 @@ impl Default for FillConfig {
             workers: NonZeroUsize::new(4).unwrap(),
             inline_workers: 2,
             lease_s: NonZeroU64::new(120).unwrap(),
+            job_retention_s: NonZeroU64::new(86_400).unwrap(),
         }
     }
 }
