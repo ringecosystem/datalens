@@ -16,6 +16,14 @@ check: fmt-check clippy test
 schema:
   cargo run -q -p datalens-api --bin export-schema > schemas/native.graphql
 
+sdk-ts:
+  cd sdks/typescript && npm ci && npm run build && npm test
+
+sdk-go:
+  cd sdks/go && go vet ./... && go test ./...
+
+sdk: sdk-ts sdk-go
+
 pg-up:
   docker compose up -d --wait postgres
 
