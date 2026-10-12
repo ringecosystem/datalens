@@ -98,7 +98,51 @@ async fn arbitrum_steady_rate_and_covered_query_p95(pool: PgPool) {
     });
     let before = arb.rpc.calls();
     let head_start = head.load(Ordering::Relaxed);
-    tokio::time::sleep(WALL).await;
+    let arbitrum = ChainName::new("arbitrum").unwrap();
+    let mut query_tasks = Vec::new();
+    for (id, token) in APPS {
+        let querier = server.client(id, token);
+        let chain = arbitrum.clone();
+        query_tasks.push(tokio::spawn(async move {
+            let mut queries = 0u64;
+            let deadline = Instant::now() + WALL;
+            while Instant::now() < deadline {
+                let Ok(heads) = querier.heads().await else {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                };
+                let Some(latest) = heads
+                    .chains
+                    .iter()
+                    .find(|item| item.chain == chain)
+                    .map(|item| item.latest)
+                else {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                };
+                let start = latest.saturating_sub(8).max(1);
+                let request = QueryRequest {
+                    chain: chain.clone(),
+                    dataset: Dataset::EvmLogs,
+                    selector: Some(contract_selector()),
+                    range: BlockRange::new(start, latest).unwrap(),
+                    finality: QueryFinality::LatestOnly,
+                    fields: None,
+                    page: None,
+                    wait_ms: Some(1_000),
+                };
+                if querier.query(&request).await.is_ok() {
+                    queries += 1;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            (*id, queries)
+        }));
+    }
+    let mut query_counts = Vec::new();
+    for task in query_tasks {
+        query_counts.push(task.await.unwrap());
+    }
     advancer.abort();
     let head_end = head.load(Ordering::Relaxed);
     let after = arb.rpc.calls();
@@ -107,6 +151,10 @@ async fn arbitrum_steady_rate_and_covered_query_p95(pool: PgPool) {
     let log_calls = method_calls(fresh, "eth_getLogs");
     let simulated_seconds = WALL.as_secs_f64() * (PRODUCTION_TICK_MS / TEST_TICK_MS);
     let steady_rps = calls as f64 / simulated_seconds;
+    for (id, queries) in &query_counts {
+        println!("arbitrum_queries_{id}={queries}");
+        assert!(*queries > 0, "{id} issued no Arbitrum queries");
+    }
     println!("arbitrum_clients={}", APPS.len());
     println!("arbitrum_subscriptions={subscriptions}");
     println!("arbitrum_head_start={head_start}");
