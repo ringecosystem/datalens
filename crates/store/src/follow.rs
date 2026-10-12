@@ -140,6 +140,24 @@ impl Store {
         rows.into_iter().map(follow_from_row).collect()
     }
 
+    /// Deletes progress rows on `chain` whose selector has no unexpired subscription, so a
+    /// later subscription starts again at safe + 1 instead of resuming a stale head.
+    pub async fn delete_unwatched_follow(&self, chain: ChainId) -> Result<u64, StoreError> {
+        let result = sqlx::query(
+            "delete from follow_progress f
+             where f.chain_id = $1
+               and not exists (
+                 select 1 from subscriptions s
+                 where s.chain_id = f.chain_id and s.dataset = f.dataset
+                   and s.selector_id = f.selector_id and s.expires_at > now()
+               )",
+        )
+        .bind(chain.get())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     pub async fn list_follow(&self, chain: ChainId) -> Result<Vec<FollowProgress>, StoreError> {
         let rows: Vec<FollowRow> = sqlx::query_as(
             "select chain_id, dataset, selector_id, from_block, head_block, head_hash, promoted_to
