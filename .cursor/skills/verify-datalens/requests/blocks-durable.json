@@ -1,0 +1,8 @@
+{
+  "chain": { "family": "Evm", "configured_name": "ethereum", "network_id": { "kind": "numeric", "value": 1 } },
+  "dataset_key": "evm.blocks",
+  "selector": { "kind": "all" },
+  "range": { "kind": "block", "start": "@START@", "end": "@END@" },
+  "finality": "durable_only",
+  "fields": "all"
+}
