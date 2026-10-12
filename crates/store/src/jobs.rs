@@ -1,18 +1,16 @@
-use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use datalens_core::{BlockRange, ChainId, Dataset};
 use sqlx::postgres::types::PgRange;
-use sqlx::postgres::{PgListener, PgNotification};
 
 use crate::codec::{
     block_range_from_pg, block_range_to_pg, chain_from_db, dataset_from_db, duration_millis,
 };
 use crate::ids::{JobId, SelectorId};
+use crate::notify::FILL_DONE;
 use crate::{PgTx, Store, StoreError};
-
-const FILL_DONE: &str = "fill_done";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum JobPurpose {
@@ -249,6 +247,7 @@ impl Store {
         retryable: bool,
         backoff: Duration,
     ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
         let updated: Option<i64> = sqlx::query_scalar(
             "update fill_jobs
              set status = case when $2 then 'pending' else 'failed' end,
@@ -267,20 +266,17 @@ impl Store {
         .bind(retryable)
         .bind(error_json)
         .bind(duration_millis(backoff)?)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
-        if updated.is_none() {
+        let Some(id) = updated else {
             return Err(StoreError::invalid(format!(
                 "job {job_id} is not pending or running"
             )));
-        }
+        };
         if !retryable {
-            sqlx::query("select pg_notify($1, $2)")
-                .bind(FILL_DONE)
-                .bind(job_id.get().to_string())
-                .execute(&self.pool)
-                .await?;
+            notify_ids(&mut tx, &[id]).await?;
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -312,7 +308,8 @@ impl Store {
         Ok(states)
     }
 
-    /// Listens for `fill_done`, then reads status again so a commit that landed before `LISTEN` is not missed.
+    /// Waits until every job is `done` or `failed`. Status is reread on each matching
+    /// `fill_done` and at least once a second, so a dropped notification only delays the wake.
     pub async fn wait_done(
         &self,
         job_ids: &[JobId],
@@ -321,32 +318,25 @@ impl Store {
         if job_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let mut listener = PgListener::connect_with(&self.pool).await?;
-        listener.listen(FILL_DONE).await?;
-        let deadline = Instant::now() + timeout;
-        loop {
-            let states = self.job_status(job_ids).await?;
-            if states.len() != job_ids.len() {
-                return Err(StoreError::not_found("fill job not found"));
-            }
-            if states.iter().all(|state| state.status.is_terminal()) {
-                return Ok(states);
-            }
-            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                return Err(StoreError::Timeout(format!(
-                    "fill jobs {job_ids:?} not done"
-                )));
-            };
-            match tokio::time::timeout(remaining, listener.recv()).await {
-                Ok(Ok(note)) => ignore_unrelated(note),
-                Ok(Err(err)) => return Err(err.into()),
-                Err(_) => {
-                    return Err(StoreError::Timeout(format!(
-                        "fill jobs {job_ids:?} not done"
-                    )));
-                }
-            }
-        }
+        let wanted: HashSet<String> = job_ids.iter().map(|id| id.to_string()).collect();
+        let store = self;
+        let done = self
+            .wait_until(
+                timeout,
+                |channel, payload| channel == FILL_DONE && wanted.contains(payload),
+                move || async move {
+                    let states = store.job_status(job_ids).await?;
+                    if states.len() != job_ids.len() {
+                        return Err(StoreError::not_found("fill job not found"));
+                    }
+                    Ok(states
+                        .iter()
+                        .all(|state| state.status.is_terminal())
+                        .then_some(states))
+                },
+            )
+            .await?;
+        done.ok_or_else(|| StoreError::Timeout(format!("fill jobs {job_ids:?} not done")))
     }
 
     pub async fn prune_done(&self, older_than: Duration) -> Result<u64, StoreError> {
@@ -362,16 +352,15 @@ impl Store {
     }
 }
 
-fn ignore_unrelated(_note: PgNotification) {}
-
 async fn notify_ids(tx: &mut PgTx<'_>, ids: &[i64]) -> Result<(), StoreError> {
-    for id in ids {
-        sqlx::query("select pg_notify($1, $2)")
-            .bind(FILL_DONE)
-            .bind(id.to_string())
-            .execute(&mut **tx)
-            .await?;
+    if ids.is_empty() {
+        return Ok(());
     }
+    sqlx::query("select pg_notify($1, id::text) from unnest($2::bigint[]) as id")
+        .bind(FILL_DONE)
+        .bind(ids)
+        .execute(&mut **tx)
+        .await?;
     Ok(())
 }
 

@@ -9,11 +9,13 @@ mod heads;
 mod ids;
 mod jobs;
 mod logs;
+mod notify;
 mod selectors;
 mod subscriptions;
 mod tx_senders;
 mod usage;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use datalens_core::{ChainId, ChainName};
@@ -40,11 +42,17 @@ pub type PgTx<'a> = sqlx::Transaction<'a, sqlx::Postgres>;
 #[derive(Debug, Clone)]
 pub struct Store {
     pool: PgPool,
+    notifier: Arc<notify::Notifier>,
 }
 
 impl Store {
+    /// The first `wait_done` or `wait_head_change` keeps one pool connection for `LISTEN`
+    /// until the pool closes. Every waiter on this store and its clones shares it.
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            notifier: Arc::default(),
+        }
     }
 
     pub fn pool(&self) -> &PgPool {
