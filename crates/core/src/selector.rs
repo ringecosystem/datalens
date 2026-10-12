@@ -31,7 +31,8 @@ impl Deref for TopicSet {
     }
 }
 
-/// One topic position: `null` on the wire is `Any`, a non-empty array is `OneOf`.
+/// One topic position. Json `null` is [`TopicFilter::Any`]. A non-empty array is
+/// [`TopicFilter::OneOf`]. An empty array is `invalid_input`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "Option<Vec<B256>>", into = "Option<Vec<B256>>")]
 pub enum TopicFilter {
@@ -195,15 +196,23 @@ impl LogSelector {
 
     /// Smallest single selector that covers every member, for one merged `eth_getLogs`.
     ///
-    /// Addresses are unioned (any-address if a member is any-address). Topic0 is unioned
-    /// when every member constrains it, otherwise `Any`. Positions 1..=3 keep a filter only
-    /// when all members agree on it exactly. Returns `None` for no members or when the
-    /// address union exceeds `max_addresses`.
+    /// Returns `None` for no members, when the address union exceeds `max_addresses`, or
+    /// when some member matches any address and another names addresses. An unfiltered
+    /// member stays its own job (`allow_unfiltered_logs` is off). Every member already
+    /// any-address still merges. One member is returned unchanged.
+    ///
+    /// Topic0 is the union when every member constrains it, otherwise `Any`. Positions
+    /// 1..=3 keep a filter only when all members agree on it exactly.
     pub fn batch(members: &[LogSelector], max_addresses: usize) -> Option<LogSelector> {
         let (first, rest) = members.split_first()?;
+        if rest.is_empty() {
+            return Some(first.clone());
+        }
 
-        let addresses = if members.iter().any(|member| member.addresses.is_empty()) {
+        let addresses = if members.iter().all(|member| member.addresses.is_empty()) {
             BTreeSet::new()
+        } else if members.iter().any(|member| member.addresses.is_empty()) {
+            return None;
         } else {
             let union: BTreeSet<Address> = members
                 .iter()
