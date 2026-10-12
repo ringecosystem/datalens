@@ -1,0 +1,123 @@
+# Production-shaped datalens configuration. Every secret and endpoint is an env placeholder.
+
+[server]
+bind = "0.0.0.0:3000"
+roles = ["api", "worker"]
+
+[database]
+url = "${DATALENS_DATABASE_URL}"
+max_connections = 32
+
+[query]
+max_wait_ms = 15000
+page_limit = 10000
+follow_attach_blocks = 1000
+
+[follow]
+subscription_ttl_s = 900
+unsafe_retention_s = 86400
+
+[metrics]
+bearer_token = "${DATALENS_METRICS_TOKEN}"
+
+[chains.ethereum]
+chain_id = 1
+rpc_url = "${DATALENS_ETHEREUM_RPC_URL}"
+finality = { mode = "lag", safe_lag_blocks = 32, finalized_lag_blocks = 96 }
+chunk_blocks = 10000
+max_get_logs_range_blocks = 10000
+max_addresses_per_query = 32
+provider = { rps = 10, burst = 20, daily_calls = 1000000, max_in_flight = 4 }
+
+[chains.darwinia]
+chain_id = 46
+rpc_url = "${DATALENS_DARWINIA_RPC_URL}"
+finality = { mode = "lag", safe_lag_blocks = 64, finalized_lag_blocks = 256 }
+chunk_blocks = 10000
+max_get_logs_range_blocks = 1000
+max_addresses_per_query = 32
+provider = { rps = 10, burst = 20, daily_calls = 1000000, max_in_flight = 4 }
+
+[chains.base]
+chain_id = 8453
+rpc_url = "${DATALENS_BASE_RPC_URL}"
+finality = { mode = "lag", safe_lag_blocks = 64, finalized_lag_blocks = 256 }
+chunk_blocks = 10000
+max_get_logs_range_blocks = 10000
+max_addresses_per_query = 32
+provider = { rps = 10, burst = 20, daily_calls = 1000000, max_in_flight = 4 }
+
+[chains.polygon]
+chain_id = 137
+rpc_url = "${DATALENS_POLYGON_RPC_URL}"
+finality = { mode = "lag", safe_lag_blocks = 64, finalized_lag_blocks = 256 }
+chunk_blocks = 10000
+max_get_logs_range_blocks = 10000
+max_addresses_per_query = 32
+provider = { rps = 10, burst = 20, daily_calls = 1000000, max_in_flight = 4 }
+
+[chains.lisk]
+chain_id = 1135
+rpc_url = "${DATALENS_LISK_RPC_URL}"
+finality = { mode = "lag", safe_lag_blocks = 64, finalized_lag_blocks = 256 }
+chunk_blocks = 10000
+max_get_logs_range_blocks = 10000
+max_addresses_per_query = 32
+provider = { rps = 10, burst = 20, daily_calls = 1000000, max_in_flight = 4 }
+
+[chains.optimism]
+chain_id = 10
+rpc_url = "${DATALENS_OPTIMISM_RPC_URL}"
+finality = { mode = "lag", safe_lag_blocks = 64, finalized_lag_blocks = 256 }
+chunk_blocks = 10000
+max_get_logs_range_blocks = 10000
+max_addresses_per_query = 32
+provider = { rps = 10, burst = 20, daily_calls = 1000000, max_in_flight = 4 }
+
+[chains.bsc]
+chain_id = 56
+rpc_url = "${DATALENS_BSC_RPC_URL}"
+finality = { mode = "lag", safe_lag_blocks = 64, finalized_lag_blocks = 256 }
+chunk_blocks = 10000
+max_get_logs_range_blocks = 10000
+max_addresses_per_query = 32
+provider = { rps = 10, burst = 20, daily_calls = 1000000, max_in_flight = 4 }
+
+[chains.arbitrum]
+chain_id = 42161
+rpc_url = "${DATALENS_ARBITRUM_RPC_URL}"
+finality = { mode = "lag", safe_lag_blocks = 64, finalized_lag_blocks = 256 }
+tick_ms = 2000
+reorg_window_blocks = 512
+chunk_blocks = 10000
+max_get_logs_range_blocks = 10000
+max_addresses_per_query = 32
+provider = { rps = 20, burst = 40, daily_calls = 2000000, max_in_flight = 8, min_range_blocks = 16 }
+
+[[applications]]
+id = "degov-live"
+token = "${DATALENS_DEGOV_LIVE_TOKEN}"
+chains = ["ethereum", "optimism", "darwinia", "bsc", "base", "arbitrum", "lisk"]
+datasets = ["evm.logs", "evm.blocks"]
+quota = { max_range_blocks = 200000, max_requests_per_minute = 1800, max_concurrent_requests = 96, max_subscriptions = 200 }
+
+[[applications]]
+id = "degov-stg"
+token = "${DATALENS_DEGOV_STG_TOKEN}"
+chains = ["ethereum", "optimism", "darwinia", "bsc", "base", "arbitrum", "lisk"]
+datasets = ["evm.logs", "evm.blocks"]
+quota = { max_range_blocks = 200000, max_requests_per_minute = 1800, max_concurrent_requests = 96, max_subscriptions = 200 }
+
+[[applications]]
+id = "degov-realtime"
+token = "${DATALENS_DEGOV_REALTIME_TOKEN}"
+chains = ["ethereum", "optimism", "darwinia", "bsc", "base", "arbitrum", "lisk"]
+datasets = ["evm.logs", "evm.blocks"]
+quota = { max_range_blocks = 10000, max_requests_per_minute = 1800, max_concurrent_requests = 32, max_subscriptions = 200 }
+
+[[applications]]
+id = "ormp"
+token = "${DATALENS_ORMP_TOKEN}"
+chains = ["ethereum", "darwinia", "polygon", "arbitrum"]
+datasets = ["evm.logs", "evm.blocks"]
+quota = { max_range_blocks = 200000, max_requests_per_minute = 1800, max_concurrent_requests = 32, max_subscriptions = 50 }
