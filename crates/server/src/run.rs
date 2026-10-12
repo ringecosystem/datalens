@@ -83,7 +83,7 @@ pub async fn run(
         for name in engine.chain_names() {
             let engine = engine.clone();
             let stopped = stopped.clone();
-            tasks.spawn(async move { engine.run_head_tracker(name, stopped).await });
+            tasks.spawn(async move { engine.run_chain_leader(name, stopped).await });
         }
     }
     tasks.spawn(flush_usage(engine.clone(), stopped.clone()));
@@ -152,6 +152,7 @@ fn build_engine(
                 max_addresses_per_query: chain.max_addresses_per_query,
                 head_mode,
                 tick: Duration::from_millis(chain.tick_ms.get()),
+                reorg_window_blocks: chain.reorg_window_blocks,
             },
             EvmClient::new(gateway, chain.max_addresses_per_query, HEADER_BATCH)?,
         ));
@@ -160,6 +161,10 @@ fn build_engine(
         max_wait: Duration::from_millis(config.query.max_wait_ms),
         page_limit: config.query.page_limit,
         lease: Duration::from_secs(config.fill.lease_s.get()),
+        follow_attach_blocks: config.query.follow_attach_blocks,
+        subscription_ttl: Duration::from_secs(config.follow.subscription_ttl_s.get()),
+        unsafe_retention: Duration::from_secs(config.follow.unsafe_retention_s.get()),
+        job_retention: Duration::from_secs(config.fill.job_retention_s.get()),
         ..EngineSettings::default()
     };
     Ok(QueryEngine::new(store, chains, settings, registry)?)
@@ -184,6 +189,7 @@ fn api_config(config: &Config) -> ApiConfig {
                         .max_fill_blocks_per_minute
                         .map(|limit| limit.get()),
                     allow_unfiltered_logs: app.quota.allow_unfiltered_logs,
+                    max_subscriptions: Some(app.quota.max_subscriptions),
                 },
                 admin: app.admin,
             })
