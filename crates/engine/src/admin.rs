@@ -1,6 +1,6 @@
 use datalens_core::wire::{
-    BackfillRequest, BackfillResponse, CoverageResponse, CoverageSpan, FollowInfo, JobInfo,
-    JobsResponse,
+    BackfillRequest, BackfillResponse, CoverageResponse, CoverageSpan, FollowInfo,
+    FollowResumeResponse, JobInfo, JobsResponse,
 };
 use datalens_core::{BlockRange, ChainName, Dataset, Error, LogSelector};
 use datalens_store::{FollowProgress, JobPurpose, JobStatus};
@@ -49,6 +49,23 @@ impl QueryEngine {
         Ok(BackfillResponse {
             selector_id: selector_id.get(),
             jobs,
+        })
+    }
+
+    /// Clears a persisted follow halt. The next leader tick follows again from the rewound
+    /// progress.
+    pub async fn resume_follow(&self, chain: &ChainName) -> Result<FollowResumeResponse, Error> {
+        let chain = self.chain(chain)?;
+        let halt_reason = self.inner.store.resume_follow(chain.id()).await?;
+        self.inner
+            .metrics
+            .set_follow_halted(chain.name().as_str(), false);
+        if let Some(reason) = &halt_reason {
+            tracing::warn!(chain = %chain.name(), reason, "follow resumed by an operator");
+        }
+        Ok(FollowResumeResponse {
+            chain: chain.name().clone(),
+            halt_reason,
         })
     }
 

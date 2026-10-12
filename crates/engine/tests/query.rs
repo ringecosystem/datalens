@@ -425,7 +425,11 @@ async fn latest_only_entirely_at_or_below_safe_has_nothing_to_serve(pool: PgPool
     let response = engine.query(&caller(), request).await.unwrap();
     assert_eq!(response.served, None);
     assert_eq!(response.next_start, None);
-    assert_eq!(response.incomplete_reason, None);
+    assert_eq!(
+        response.incomplete_reason,
+        Some(IncompleteReason::BelowSafe)
+    );
+    assert!(response.incomplete_detail.is_some());
     assert_eq!(response.rows, Vec::<Value>::new());
     assert_eq!(engine.jobs(None, 10).await.unwrap().jobs.len(), 0);
     assert_eq!(mock.total(), 0);

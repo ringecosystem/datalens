@@ -43,8 +43,6 @@ pub struct Chain {
 /// What the chain leader keeps between ticks. Lost on restart, which only delays retention.
 #[derive(Default)]
 pub(crate) struct FollowState {
-    /// Set by a fork deeper than the reorg window or below safe. Follow stays off until restart.
-    pub(crate) halted: bool,
     /// `(when, safe)` samples. Unsafe rows at or below a sample older than the retention
     /// were passed by safe that long ago, so nothing will promote them any more.
     pub(crate) safe_samples: VecDeque<(Instant, u64)>,

@@ -2,12 +2,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use datalens_core::{B256, BlockRange, Error, Finality, Heads, LogSelector};
 use datalens_evm::BlockRef;
-use datalens_provider::{Purpose, TokenWait};
+use datalens_provider::{ProviderError, Purpose, TokenWait};
 use datalens_store::{FollowProgress, StoreError};
 use tracing::{error, warn};
 
 use crate::chain::Chain;
-use crate::engine::{QueryEngine, lock, provider_error};
+use crate::engine::{QueryEngine, provider_error};
 
 /// Canonical hashes learned during one tick. The head call already gave `latest`.
 pub(crate) struct Canon {
@@ -85,14 +85,18 @@ impl QueryEngine {
             )
             .await
             .map_err(provider_error)?
-            .ok_or_else(|| Error::Internal(format!("provider has no block {number} yet")))?;
+            // At or below latest, a missing block is a lagging provider node. The tick stops
+            // and retries without touching follow progress.
+            .ok_or_else(|| provider_error(ProviderError::NotReady))?;
         canon.known.insert(number, block.hash);
         Ok(Some(block.hash))
     }
 
-    /// Finds the lowest stored height off the canonical chain at or above the window floor,
-    /// deletes unsafe rows from there, and rewinds follow progress. Returns `false` when every
-    /// stored hash is canonical, which means the conflicting fetch was the stale side.
+    /// Finds the lowest stored height off the canonical chain, deletes unsafe rows from there,
+    /// and rewinds follow progress. The search covers `reorg_window_blocks` below the top and
+    /// widens to every unpromoted height when the whole window is off-canonical. A fork that
+    /// deep is still rolled back, then follow halts. Returns `false` when every stored hash is
+    /// canonical, which means the conflicting fetch was the stale side.
     pub(crate) async fn roll_back(
         &self,
         chain: &Chain,
@@ -109,41 +113,30 @@ impl QueryEngine {
             .max()
             .unwrap_or(detected);
         let floor = top.saturating_sub(chain.settings.reorg_window_blocks.get());
-        let points = self.points(chain, &progress, floor, top).await?;
-        let heights: Vec<u64> = points.keys().copied().collect();
-
-        let (mut low, mut high) = (0, heights.len());
-        while low < high {
-            let mid = (low + high) / 2;
-            let canonical = self.canonical(chain, canon, heights[mid]).await?;
-            if points[&heights[mid]]
-                .iter()
-                .any(|hash| Some(*hash) != canonical)
-            {
-                high = mid;
-            } else {
-                low = mid + 1;
-            }
-        }
-        let Some(&first_bad) = heights.get(low) else {
-            return Ok(false);
-        };
+        let mut points = self.points(chain, &progress, floor, top).await?;
+        let mut found = self.first_bad(chain, canon, &points).await?;
 
         let unpromoted_from = progress
             .iter()
             .filter_map(|row| u64::try_from(row.promoted_to + 1).ok())
             .min()
             .unwrap_or(floor);
-        if low == 0
-            && unpromoted_from < floor
-            && !self
+        let mut beyond_window = false;
+        if matches!(found, Some((_, true))) && unpromoted_from < floor {
+            let deeper = self
                 .points(chain, &progress, unpromoted_from, floor - 1)
-                .await?
-                .is_empty()
-        {
-            self.halt(chain, "fork is deeper than reorg_window_blocks");
-            return Ok(true);
+                .await?;
+            if !deeper.is_empty() {
+                beyond_window = true;
+                for (number, hashes) in deeper {
+                    points.entry(number).or_default().extend(hashes);
+                }
+                found = self.first_bad(chain, canon, &points).await?;
+            }
         }
+        let Some((first_bad, lowest)) = found else {
+            return Ok(false);
+        };
 
         let fork = first_bad.min(canon.latest + 1);
         let parent = match fork.checked_sub(1) {
@@ -156,7 +149,7 @@ impl QueryEngine {
         // Every searched point may be bad when the fork starts under them, for example under
         // promoted rows. A stored parent off the canonical chain shows that.
         let deeper = match fork.checked_sub(1) {
-            Some(below) if low == 0 => self
+            Some(below) if lowest => self
                 .stored_hash_at(chain, below)
                 .await?
                 .is_some_and(|stored| stored != parent),
@@ -185,11 +178,38 @@ impl QueryEngine {
         );
         if fork <= heads.safe || (deeper && fork - 1 <= heads.safe) {
             self.inner.metrics.count_finality_violation(name);
-            self.halt(chain, "fork is at or below the safe head");
-        } else if deeper {
-            self.halt(chain, "fork is deeper than reorg_window_blocks");
+            self.halt(chain, "fork is at or below the safe head")
+                .await?;
+        } else if deeper || beyond_window {
+            self.halt(chain, "fork is deeper than reorg_window_blocks")
+                .await?;
         }
         Ok(true)
+    }
+
+    /// Binary search for the lowest height whose stored hashes are not all canonical. The
+    /// flag says whether it is the lowest searched height.
+    async fn first_bad(
+        &self,
+        chain: &Chain,
+        canon: &mut Canon,
+        points: &Points,
+    ) -> Result<Option<(u64, bool)>, Error> {
+        let heights: Vec<u64> = points.keys().copied().collect();
+        let (mut low, mut high) = (0, heights.len());
+        while low < high {
+            let mid = (low + high) / 2;
+            let canonical = self.canonical(chain, canon, heights[mid]).await?;
+            if points[&heights[mid]]
+                .iter()
+                .any(|hash| Some(*hash) != canonical)
+            {
+                high = mid;
+            } else {
+                low = mid + 1;
+            }
+        }
+        Ok(heights.get(low).map(|height| (*height, low == 0)))
     }
 
     /// The hash any stored block or log row holds at `number`.
@@ -237,12 +257,15 @@ impl QueryEngine {
         Ok(points)
     }
 
-    fn halt(&self, chain: &Chain, reason: &str) {
-        lock(&chain.follow).halted = true;
+    /// Persisted, so every replica and every restart stays stopped until an operator calls
+    /// `POST /v1/admin/follow/resume`.
+    async fn halt(&self, chain: &Chain, reason: &str) -> Result<(), Error> {
+        self.inner.store.halt_follow(chain.id(), reason).await?;
         self.inner
             .metrics
             .set_follow_halted(chain.name().as_str(), true);
-        error!(chain = %chain.name(), reason, "follow stopped until restart");
+        error!(chain = %chain.name(), reason, "follow stopped until resumed");
+        Ok(())
     }
 }
 

@@ -31,6 +31,10 @@ struct State {
     latest: u64,
     /// `(from, salt)`: blocks at or above `from` carry `salt` in their hash.
     forks: Vec<(u64, u8)>,
+    /// `eth_getLogs` over more blocks than this fails with a result-size error.
+    logs_limit: Option<u64>,
+    /// `eth_getBlockByNumber` returns null for this height, like a lagging node.
+    hidden: Option<u64>,
 }
 
 impl State {
@@ -80,7 +84,7 @@ impl FollowChain {
         let rpc = MockRpc::spawn().await;
         let state = Arc::new(Mutex::new(State {
             latest,
-            forks: Vec::new(),
+            ..State::default()
         }));
         let shared = Arc::clone(&state);
         rpc.set_handler(move |item| {
@@ -91,6 +95,15 @@ impl FollowChain {
                     let filter = &params[0];
                     let from = parse_hex(&filter["fromBlock"]);
                     let to = parse_hex(&filter["toBlock"]).min(state.latest);
+                    if state
+                        .logs_limit
+                        .is_some_and(|limit| to + 1 - from.min(to + 1) > limit)
+                    {
+                        return ItemOutcome::Error {
+                            code: -32005,
+                            message: "query returned more than 10000 results".to_owned(),
+                        };
+                    }
                     ItemOutcome::Result(Value::Array(
                         (from..=to)
                             .flat_map(|number| state.logs(number))
@@ -104,7 +117,7 @@ impl FollowChain {
                         Some("latest") => state.latest,
                         _ => parse_hex(&params[0]),
                     };
-                    if number > state.latest {
+                    if number > state.latest || state.hidden == Some(number) {
                         return ItemOutcome::Result(Value::Null);
                     }
                     ItemOutcome::Result(json!({
@@ -128,6 +141,14 @@ impl FollowChain {
     /// Replaces the hash of every block from `from` on, as a reorg would.
     pub fn reorg_from(&self, from: u64, salt: u8) {
         self.state.lock().unwrap().forks.push((from, salt));
+    }
+
+    pub fn limit_logs(&self, blocks: Option<u64>) {
+        self.state.lock().unwrap().logs_limit = blocks;
+    }
+
+    pub fn hide_block(&self, number: Option<u64>) {
+        self.state.lock().unwrap().hidden = number;
     }
 
     pub fn latest(&self) -> u64 {

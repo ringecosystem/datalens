@@ -163,7 +163,17 @@ impl QueryEngine {
             None => in_scope.then_some(scope_start),
             Some(served) => (served.end() < range.end()).then(|| served.end() + 1),
         };
+        let below_safe = finality == QueryFinality::LatestOnly && range.start() <= heads.safe;
         let (incomplete_reason, incomplete_detail) = match (next_start, blocker) {
+            (None, _) if below_safe => (
+                Some(IncompleteReason::BelowSafe),
+                Some(format!(
+                    "blocks {}..={} are at or below the safe head; latest_only serves only blocks \
+                     above it, use safe_to_latest for the whole range",
+                    range.start(),
+                    range.end().min(heads.safe)
+                )),
+            ),
             (None, _) => (None, None),
             (Some(_), Some((reason, detail))) => (Some(reason), detail),
             (Some(_), None) => (Some(IncompleteReason::NotFollowedYet), None),
@@ -250,7 +260,17 @@ impl QueryEngine {
         follow: Option<&FollowProgress>,
     ) -> Result<Progress, Error> {
         let store = &self.inner.store;
-        let fill_end = match follow {
+        // Another application's follow row still owns its region even when this caller did
+        // not attach, for example over its subscription quota.
+        let existing = match follow {
+            Some(_) => None,
+            None => {
+                store
+                    .follow_progress(chain.id(), selector.dataset(), selector_id)
+                    .await?
+            }
+        };
+        let fill_end = match follow.or(existing.as_ref()) {
             Some(follow) => follow
                 .from_block
                 .checked_sub(1)

@@ -7,7 +7,7 @@ use datalens_provider::{Purpose, TokenWait};
 use datalens_store::{FollowProgress, PgTx, SelectorId, StoreError};
 
 use crate::chain::Chain;
-use crate::engine::{QueryEngine, lock, provider_error};
+use crate::engine::{QueryEngine, provider_error};
 use crate::reorg::{Canon, HeadCheck};
 use crate::usage::UsageCounts;
 
@@ -45,7 +45,9 @@ impl QueryEngine {
                 .metrics
                 .set_subscriptions(name, dataset.as_str(), count);
         }
-        if watchers.is_empty() || lock(&chain.follow).halted {
+        let halted = store.follow_halt(chain.id()).await?.is_some();
+        self.inner.metrics.set_follow_halted(name, halted);
+        if watchers.is_empty() || halted {
             self.inner.metrics.set_follow_lag(name, 0);
             return Ok(());
         }
@@ -272,6 +274,14 @@ impl QueryEngine {
             )
             .await
             .map_err(|failure| provider_error(failure.error))?;
+        if page.fetched_to != Some(span.end()) {
+            return Err(Error::Internal(format!(
+                "follow getLogs for {}..={} stopped at {:?}",
+                span.start(),
+                span.end(),
+                page.fetched_to
+            )));
+        }
         let mut calls = 1;
         let rows: Vec<LogRow> = page
             .rows
@@ -343,8 +353,9 @@ impl QueryEngine {
         }
     }
 
-    /// Promotes `(promoted_to, min(safe, head_block)]` of each verified follow row in one
-    /// transaction per row: row finality, senders, durable coverage, and `promoted_to`.
+    /// Promotes `(promoted_to, min(safe, head_block)]` of each verified follow row and raises
+    /// `(finalized_to, finalized]` to finalized, in one transaction per row: row finality,
+    /// senders, durable coverage, `promoted_to`, and `finalized_to`.
     async fn finalize(
         &self,
         chain: &Chain,
@@ -354,38 +365,55 @@ impl QueryEngine {
         canon: &mut Canon,
     ) -> Result<(), Error> {
         let store = &self.inner.store;
-        for row in progress {
+        'rows: for row in progress {
             let Ok(head) = u64::try_from(row.head_block) else {
-                continue;
-            };
-            let end = heads.safe.min(head);
-            let Ok(start) = u64::try_from(row.promoted_to + 1) else {
-                continue;
-            };
-            let Ok(segment) = BlockRange::new(start, end) else {
                 continue;
             };
             let Some(selector) = selectors.get(&row.selector_id) else {
                 continue;
             };
-            // The head hash was verified this tick and commits to every block below it, so
-            // a stored hash at a lower segment end is canonical too.
-            let end_hash = if end == head {
-                row.head_hash
-            } else {
-                match self.stored_hash(chain, selector, end).await? {
-                    Some(hash) => hash,
-                    None => continue,
-                }
-            };
-            let finality = if end <= heads.finalized {
-                Finality::Finalized
-            } else {
-                Finality::Safe
-            };
+            let promoted_to = to_i64(heads.safe.min(head)).max(row.promoted_to);
+            let finalized_to = to_i64(heads.finalized).min(promoted_to);
+            let mut parts = Vec::with_capacity(2);
+            if finalized_to > row.finalized_to {
+                parts.push((row.finalized_to + 1, finalized_to, Finality::Finalized));
+            }
+            let safe_from = row.promoted_to.max(finalized_to) + 1;
+            if promoted_to >= safe_from {
+                parts.push((safe_from, promoted_to, Finality::Safe));
+            }
+            let mut planned = Vec::with_capacity(parts.len());
+            for (start, end, finality) in parts {
+                let (Ok(start), Ok(end)) = (u64::try_from(start), u64::try_from(end)) else {
+                    continue 'rows;
+                };
+                let segment = BlockRange::new(start, end)?;
+                // The head hash was verified this tick and commits to every block below it, so
+                // a stored hash at a lower segment end is canonical too.
+                let end_hash = if end == head && row.head_hash != B256::ZERO {
+                    row.head_hash
+                } else {
+                    match self.stored_hash(chain, selector, end).await? {
+                        Some(hash) => hash,
+                        None => continue 'rows,
+                    }
+                };
+                planned.push((segment, finality, end_hash));
+            }
+            if planned.is_empty() {
+                continue;
+            }
             let mut tx = store.pool().begin().await.map_err(StoreError::from)?;
             match self
-                .promote(&mut tx, chain, row, selector, segment, finality, end_hash)
+                .promote(
+                    &mut tx,
+                    chain,
+                    row,
+                    selector,
+                    &planned,
+                    promoted_to,
+                    finalized_to,
+                )
                 .await
             {
                 Ok(()) => tx.commit().await.map_err(StoreError::from)?,
@@ -407,39 +435,60 @@ impl QueryEngine {
         chain: &Chain,
         row: &FollowProgress,
         selector: &Selector,
-        segment: BlockRange,
-        finality: Finality,
-        end_hash: B256,
+        planned: &[(BlockRange, Finality, B256)],
+        promoted_to: i64,
+        finalized_to: i64,
     ) -> Result<(), StoreError> {
         let store = &self.inner.store;
-        match selector {
-            Selector::Logs(logs) => {
-                store
-                    .promote_logs(tx, chain.id(), logs, segment, finality, end_hash)
-                    .await?;
+        for &(segment, finality, end_hash) in planned {
+            match selector {
+                Selector::Logs(logs) => {
+                    store
+                        .promote_logs(tx, chain.id(), logs, segment, finality, end_hash)
+                        .await?;
+                }
+                Selector::Blocks => {
+                    store
+                        .promote_blocks(tx, chain.id(), segment, finality, end_hash)
+                        .await?;
+                }
             }
-            Selector::Blocks => {
-                store
-                    .promote_blocks(tx, chain.id(), segment, finality, end_hash)
-                    .await?;
-            }
+            store
+                .promote_senders(tx, chain.id(), segment, finality)
+                .await?;
+            store
+                .add_coverage(
+                    tx,
+                    chain.id(),
+                    row.dataset,
+                    row.selector_id,
+                    segment,
+                    finality,
+                )
+                .await?;
         }
-        store
-            .promote_senders(tx, chain.id(), segment, finality)
-            .await?;
-        store
-            .add_coverage(
-                tx,
-                chain.id(),
-                row.dataset,
-                row.selector_id,
-                segment,
-                finality,
-            )
-            .await?;
-        store
-            .advance_follow_promoted(tx, chain.id(), row.dataset, row.selector_id, segment.end())
-            .await?;
+        if promoted_to > row.promoted_to {
+            store
+                .advance_follow_promoted(
+                    tx,
+                    chain.id(),
+                    row.dataset,
+                    row.selector_id,
+                    promoted_to as u64,
+                )
+                .await?;
+        }
+        if finalized_to > row.finalized_to {
+            store
+                .advance_follow_finalized(
+                    tx,
+                    chain.id(),
+                    row.dataset,
+                    row.selector_id,
+                    finalized_to as u64,
+                )
+                .await?;
+        }
         Ok(())
     }
 
@@ -493,4 +542,8 @@ fn next_span(head: i64, latest: u64, cap: u64) -> Option<BlockRange> {
     let start = u64::try_from(head + 1).ok()?;
     let end = latest.min(start.saturating_add(cap.max(1) - 1));
     BlockRange::new(start, end).ok()
+}
+
+fn to_i64(number: u64) -> i64 {
+    i64::try_from(number).unwrap_or(i64::MAX)
 }

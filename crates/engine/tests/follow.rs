@@ -268,10 +268,13 @@ async fn durable_only_chasing_safe_waits_for_promotion_instead_of_filling(pool: 
         .unwrap();
     assert_eq!(response.served, Some(range(9_993, START)));
     assert_eq!(response.incomplete_reason, None);
-    assert_eq!(
-        response.rows,
-        records(mock.logs(&usdc(), range(9_993, START)), Finality::Safe)
-    );
+    // Finalized is 9_993 now, so that block is promoted straight to finalized.
+    let mut expected = records(mock.logs(&usdc(), range(9_993, 9_993)), Finality::Finalized);
+    expected.extend(records(
+        mock.logs(&usdc(), range(9_994, START)),
+        Finality::Safe,
+    ));
+    assert_eq!(response.rows, expected);
 
     let before = mock.requests();
     let whole = request(

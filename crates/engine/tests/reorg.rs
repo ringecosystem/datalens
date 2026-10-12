@@ -157,6 +157,49 @@ async fn a_fork_below_safe_counts_a_violation_halts_follow_and_keeps_durable_row
     mock.advance(2);
     engine.tick_once(&ethereum()).await.unwrap();
     assert_eq!(mock.count("eth_getLogs"), get_logs);
+
+    let store = engine.store();
+    let progress = store.list_follow(chain_id()).await.unwrap();
+    assert_eq!(progress[0].promoted_to, 10_000);
+    assert_eq!(
+        store.follow_halt(chain_id()).await.unwrap().as_deref(),
+        Some("fork is at or below the safe head")
+    );
+
+    // A restarted replica reads the halt from the store and stays stopped.
+    let restarted_registry = Registry::new();
+    let restarted = follow_engine(
+        &pool,
+        vec![follow_chain("ethereum", 1, mock.rpc.url())],
+        follow_settings(),
+        &restarted_registry,
+    )
+    .await;
+    mock.advance(2);
+    restarted.tick_once(&ethereum()).await.unwrap();
+    assert_eq!(mock.count("eth_getLogs"), get_logs);
+    assert!(
+        metrics_text(&restarted_registry).contains("datalens_follow_halted{chain=\"ethereum\"} 1")
+    );
+
+    let resumed = restarted.resume_follow(&ethereum()).await.unwrap();
+    assert_eq!(
+        resumed.halt_reason.as_deref(),
+        Some("fork is at or below the safe head")
+    );
+    assert!(
+        metrics_text(&restarted_registry).contains("datalens_follow_halted{chain=\"ethereum\"} 0")
+    );
+    restarted.tick_once(&ethereum()).await.unwrap();
+    assert!(mock.count("eth_getLogs") > get_logs);
+    assert_eq!(
+        restarted
+            .resume_follow(&ethereum())
+            .await
+            .unwrap()
+            .halt_reason,
+        None
+    );
 }
 
 const CHAINS: [&str; 8] = [
