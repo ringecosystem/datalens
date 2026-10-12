@@ -1,4 +1,18 @@
-//! PostgreSQL persistence: schema migrations and per-chain partitions.
+//! PostgreSQL persistence: schema migrations, chain partitions, and repositories.
+
+mod blocks;
+mod codec;
+mod coverage;
+mod error;
+mod follow;
+mod heads;
+mod ids;
+mod jobs;
+mod logs;
+mod selectors;
+mod subscriptions;
+mod tx_senders;
+mod usage;
 
 use std::time::Duration;
 
@@ -6,7 +20,43 @@ use datalens_core::{ChainId, ChainName};
 use sqlx::migrate::{MigrateError, Migrator};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{AssertSqlSafe, PgPool};
+
+pub use blocks::BlockCursor;
+pub use coverage::longest_covered_prefix;
+pub use error::StoreError;
+pub use follow::FollowProgress;
+pub use heads::HeadKind;
+pub use ids::{JobId, SelectorId};
+pub use jobs::{Job, JobPurpose, JobState, JobStatus};
+pub use logs::LogCursor;
+pub use subscriptions::{Subscription, SubscriptionSource};
+pub use usage::{UsageDelta, UsageTotals};
+
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
+
+pub type PgTx<'a> = sqlx::Transaction<'a, sqlx::Postgres>;
+
+/// Pool plus the repositories in this crate.
+#[derive(Debug, Clone)]
+pub struct Store {
+    pool: PgPool,
+}
+
+impl Store {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    pub async fn ensure_chain(&self, id: ChainId, name: &ChainName) -> Result<(), StoreError> {
+        ensure_chain(&self.pool, id, name)
+            .await
+            .map_err(StoreError::from)
+    }
+}
 
 /// Serializes partition DDL across replicas that start at the same time.
 const ENSURE_CHAIN_LOCK: i64 = 0x6461_7461_6c65_6e73;
