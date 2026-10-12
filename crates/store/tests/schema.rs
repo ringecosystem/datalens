@@ -165,3 +165,80 @@ async fn coverage_rejects_overlapping_ranges_for_one_selector(pool: PgPool) {
     insert("[100,200)").execute(&pool).await.unwrap();
     assert!(insert("[150,250)").execute(&pool).await.is_err());
 }
+
+#[sqlx::test(migrations = false)]
+async fn coverage_rejects_finality_other_than_safe_or_finalized(pool: PgPool) {
+    datalens_store::migrate(&pool).await.unwrap();
+    datalens_store::ensure_chain(
+        &pool,
+        ChainId::new(1).unwrap(),
+        &"ethereum".parse().unwrap(),
+    )
+    .await
+    .unwrap();
+    let selector_id: i64 = sqlx::query_scalar(
+        "insert into selectors (chain_id, dataset, fingerprint, canonical_key)
+         values (1, 'evm.blocks', 'f', 'all') returning id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let insert = |range: &'static str, finality: i16| {
+        sqlx::query(
+            "insert into coverage (chain_id, dataset, selector_id, blocks, finality)
+             values (1, 'evm.blocks', $1, $2::int8range, $3)",
+        )
+        .bind(selector_id)
+        .bind(range)
+        .bind(finality)
+    };
+    for finality in [0, 1, 4] {
+        assert!(
+            insert("[0,10)", finality).execute(&pool).await.is_err(),
+            "finality {finality}"
+        );
+    }
+    insert("[0,10)", 2).execute(&pool).await.unwrap();
+    insert("[10,20)", 3).execute(&pool).await.unwrap();
+}
+
+#[sqlx::test(migrations = false)]
+async fn planner_indexes_keep_their_definitions(pool: PgPool) {
+    datalens_store::migrate(&pool).await.unwrap();
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "select indexname::text, indexdef
+         from pg_indexes
+         where schemaname = 'public'
+           and indexname in (
+             'evm_logs_address_idx',
+             'evm_tx_senders_block_idx',
+             'fill_jobs_active',
+             'selectors_addresses_idx'
+           )
+         order by 1",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "evm_logs_address_idx".to_owned(),
+                "CREATE INDEX evm_logs_address_idx ON ONLY public.evm_logs USING btree (chain_id, address, block_number, log_index)".to_owned(),
+            ),
+            (
+                "evm_tx_senders_block_idx".to_owned(),
+                "CREATE INDEX evm_tx_senders_block_idx ON public.evm_tx_senders USING btree (chain_id, block_number)".to_owned(),
+            ),
+            (
+                "fill_jobs_active".to_owned(),
+                "CREATE UNIQUE INDEX fill_jobs_active ON public.fill_jobs USING btree (chain_id, dataset, selector_id, blocks) WHERE (status = ANY (ARRAY['pending'::text, 'running'::text]))".to_owned(),
+            ),
+            (
+                "selectors_addresses_idx".to_owned(),
+                "CREATE INDEX selectors_addresses_idx ON public.selectors USING gin (addresses)".to_owned(),
+            ),
+        ]
+    );
+}
