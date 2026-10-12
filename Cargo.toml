@@ -1,0 +1,51 @@
+[workspace]
+members = [
+  "crates/api",
+  "crates/client",
+  "crates/core",
+  "crates/engine",
+  "crates/evm",
+  "crates/provider",
+  "crates/server",
+  "crates/store",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+datalens-api = { path = "crates/api" }
+datalens-client = { path = "crates/client" }
+datalens-core = { path = "crates/core" }
+datalens-engine = { path = "crates/engine" }
+datalens-evm = { path = "crates/evm" }
+datalens-provider = { path = "crates/provider" }
+datalens-store = { path = "crates/store" }
+
+alloy-primitives = { version = "1.7.3", features = ["serde"] }
+async-graphql = "7.2.1"
+async-graphql-axum = "7.2.1"
+async-stream = "0.3.6"
+axum = "0.8.9"
+bytes = "1.12.1"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde", "std"] }
+clap = { version = "4.6.7", features = ["derive"] }
+futures = "0.3.34"
+hex = "0.4.3"
+prometheus = "0.14.0"
+rand = "0.10.3"
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.0"
+sqlx = { version = "0.9.0", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls", "migrate", "macros", "json", "chrono"] }
+thiserror = "2.0.21"
+tokio = { version = "1.53.2", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "net"] }
+toml = "1.1.8"
+tower = { version = "0.5.3", features = ["util"] }
+tower-http = { version = "0.7.1", features = ["trace"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
