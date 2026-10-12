@@ -1,0 +1,16 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${DATALENS_PG_USER:-datalens}
+      POSTGRES_PASSWORD: ${DATALENS_PG_PASSWORD:-datalens}
+      POSTGRES_DB: ${DATALENS_PG_DB:-datalens}
+    ports:
+      - "${DATALENS_PG_PORT:-5432}:5432"
+    volumes:
+      - ./.data/pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
