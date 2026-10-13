@@ -19,6 +19,7 @@ pub enum ItemOutcome {
 struct Fault {
     status: u16,
     retry_after: Option<String>,
+    rpc_message: Option<String>,
 }
 
 type Handler = Arc<dyn Fn(&Value) -> ItemOutcome + Send + Sync>;
@@ -89,8 +90,18 @@ impl MockRpc {
             faults.push_back(Fault {
                 status,
                 retry_after: retry_after.clone(),
+                rpc_message: None,
             });
         }
+    }
+
+    /// The next HTTP response is `status` with a JSON-RPC error message.
+    pub fn fail_next_http_rpc(&self, status: u16, message: impl Into<String>) {
+        lock(&self.state.faults).push_back(Fault {
+            status,
+            retry_after: None,
+            rpc_message: Some(message.into()),
+        });
     }
 }
 
@@ -110,9 +121,17 @@ fn default_handler(item: &Value) -> ItemOutcome {
 async fn handle(State(state): State<Arc<MockState>>, Json(body): Json<Value>) -> impl IntoResponse {
     lock(&state.calls).push(body.clone());
     if let Some(fault) = lock(&state.faults).pop_front() {
+        let body = match fault.rpc_message {
+            Some(message) => json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": {"code": 35, "message": message}
+            }),
+            None => json!({"error": "injected"}),
+        };
         let mut response = (
             StatusCode::from_u16(fault.status).unwrap_or(StatusCode::BAD_GATEWAY),
-            Json(json!({"error": "injected"})),
+            Json(body),
         )
             .into_response();
         if let Some(retry_after) = fault.retry_after

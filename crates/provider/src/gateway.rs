@@ -437,6 +437,13 @@ impl Gateway {
                 .unwrap_or(Duration::ZERO);
             return Err(ProviderError::RateLimited { retry_after });
         }
+        if status.as_u16() == 400 {
+            let text = response.text().await.unwrap_or_default();
+            if let Some(error) = classified_http_error(&text) {
+                return Err(error);
+            }
+            return Err(ProviderError::fatal("http 400"));
+        }
         if status.is_server_error() || status.as_u16() == 403 {
             return Err(ProviderError::Transient {
                 status: Some(status.as_u16()),
@@ -544,6 +551,20 @@ fn interpret_batch(
         .into_iter()
         .map(|slot| slot.unwrap_or_else(|| Err(ProviderError::fatal("missing batch item"))))
         .collect())
+}
+
+fn classified_http_error(text: &str) -> Option<ProviderError> {
+    let value = serde_json::from_str::<Value>(text).ok()?;
+    let error = value.get("error")?;
+    let classified = if error.is_object() {
+        classify_error_value(error)
+    } else {
+        classify_rpc_message(400, error.as_str().unwrap_or(text))
+    };
+    match classified {
+        ProviderError::Fatal { .. } => None,
+        other => Some(other),
+    }
 }
 
 fn classify_error_value(error: &Value) -> ProviderError {
