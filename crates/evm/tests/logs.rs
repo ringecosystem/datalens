@@ -213,6 +213,31 @@ async fn limit_halves_and_eight_successes_double_back() {
 }
 
 #[tokio::test]
+async fn http_400_free_plan_limit_halves_the_window() {
+    let mock = MockRpc::spawn().await;
+    mock.fail_next_http_rpc(
+        400,
+        "ranges over 10000 blocks are not supported on free plan",
+    );
+    mock.set_handler(|_| ItemOutcome::Result(json!([])));
+    let evm = client(mock.url(), 32, 20, 32, 16);
+    let page = evm
+        .get_logs(
+            &LogSelector::default(),
+            BlockRange::new(0, 31).unwrap(),
+            Purpose::Follow,
+            None,
+            UNTIL,
+            Finality::Unsafe,
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.fetched_to, Some(31));
+    let spans: Vec<u64> = mock.calls().iter().map(block_span).collect();
+    assert_eq!(spans, vec![32, 16, 16]);
+}
+
+#[tokio::test]
 async fn limit_on_a_short_range_retries_that_window_and_does_not_halve_the_max() {
     let mock = MockRpc::spawn().await;
     mock.set_handler(|_| ItemOutcome::Error {
