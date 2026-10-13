@@ -437,7 +437,7 @@ impl Gateway {
                 .unwrap_or(Duration::ZERO);
             return Err(ProviderError::RateLimited { retry_after });
         }
-        if status.is_server_error() {
+        if status.is_server_error() || status.as_u16() == 403 {
             return Err(ProviderError::Transient {
                 status: Some(status.as_u16()),
             });

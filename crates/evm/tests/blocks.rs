@@ -72,6 +72,54 @@ async fn block_headers_batches_one_hundred_blocks() {
 }
 
 #[tokio::test]
+async fn http_403_is_retried_and_then_accepted() {
+    let mock = MockRpc::spawn().await;
+    mock.fail_next_http(1, 403, None);
+    mock.set_handler(|item| {
+        let tag = item["params"][0].as_str().unwrap();
+        ItemOutcome::Result(header(number_from_tag(tag)))
+    });
+    let evm = client(mock.url(), 32, 20, 1000, 16);
+    let rows = evm
+        .block_headers(
+            BlockRange::new(1, 20).unwrap(),
+            Purpose::Follow,
+            None,
+            UNTIL,
+            Finality::Unsafe,
+        )
+        .await
+        .unwrap();
+    let lens: Vec<usize> = mock.calls().iter().map(batch_len).collect();
+    assert_eq!(lens, vec![20, 20]);
+    assert_eq!(rows.len(), 20);
+}
+
+#[tokio::test]
+async fn http_403_three_times_stays_transient_and_does_not_halve() {
+    let mock = MockRpc::spawn().await;
+    mock.fail_next_http(3, 403, None);
+    mock.set_handler(|item| {
+        let tag = item["params"][0].as_str().unwrap();
+        ItemOutcome::Result(header(number_from_tag(tag)))
+    });
+    let evm = client(mock.url(), 32, 20, 1000, 16);
+    let error = evm
+        .block_headers(
+            BlockRange::new(1, 20).unwrap(),
+            Purpose::Follow,
+            None,
+            UNTIL,
+            Finality::Unsafe,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error, ProviderError::Transient { status: Some(403) });
+    let lens: Vec<usize> = mock.calls().iter().map(batch_len).collect();
+    assert_eq!(lens, vec![20, 20, 20]);
+}
+
+#[tokio::test]
 async fn http_503_retries_three_times_and_does_not_halve() {
     let mock = MockRpc::spawn().await;
     mock.fail_next_http(3, 503, None);
