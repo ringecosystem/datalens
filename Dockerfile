@@ -5,6 +5,7 @@ WORKDIR /app
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY sdks ./sdks
 
 RUN cargo build --locked --release --package datalens-server --bin datalens
 
